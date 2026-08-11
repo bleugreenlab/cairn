@@ -69,7 +69,6 @@ async fn a_thread_child_establishes_and_reaches_its_thread_session() {
             .unwrap(),
         Some(0)
     );
-
     let recipient = coordinating_job_for_child_issue(&db, CHILD_URI)
         .await
         .unwrap()
@@ -840,6 +839,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
     let snapshot = ChecksSnapshot {
         settlement: classify(&statuses, HeadTurn::Idle, false),
         statuses,
+        terminal_reason: None,
     };
     assert!(matches!(snapshot.settlement, Settlement::Settled { .. }));
 
@@ -965,6 +965,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
     let snapshot = ChecksSnapshot {
         settlement: classify(&statuses, HeadTurn::Idle, false),
         statuses,
+        terminal_reason: Some("issue merged before submission".to_string()),
     };
     let uri = "cairn://p/P/1/1/builder/checks";
     let message = format_checks_settled_message("builder", uri, &snapshot);
@@ -978,6 +979,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
         message.contains("No verdict was produced for: rust-lint"),
         "a lane nothing will run must be named, not silently absent: {message}"
     );
+    assert!(message.contains("Terminal reason: issue merged before submission"));
 }
 
 #[tokio::test(flavor = "current_thread")]

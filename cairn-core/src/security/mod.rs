@@ -103,6 +103,7 @@
 pub mod broker;
 pub mod crossing;
 pub mod lease;
+pub mod remediation;
 pub mod sanitize;
 
 // The registry, the secret material, and the streaming scrubber live in
@@ -128,6 +129,7 @@ pub use registry::{
     Detection, Detections, RegistrationRefused, RegistrySnapshot, SecretGuard, SecretMetadata,
     SecretRegistry,
 };
+pub use remediation::{Disclosure, Response as DisclosureResponse, SinkKind};
 pub use sanitize::{redaction_policy, RedactionPolicy, SanitizeMode, Sanitizer};
 pub use secret::{MatchRule, SecretCategory, SecretId, SecretMaterial};
 pub use stream::StreamingScrubber;

@@ -136,6 +136,7 @@ pub(crate) struct ChecksSnapshot {
     /// The watched lanes, in the order the `/checks` resource renders them.
     pub(crate) statuses: Vec<NodeCheckStatus>,
     pub(crate) settlement: Settlement,
+    pub(crate) terminal_reason: Option<String>,
 }
 
 impl ChecksSnapshot {
@@ -262,12 +263,36 @@ pub(crate) async fn node_checks_settlement(
         }
     };
     let turn = crate::messages::delivery::head_turn_for_job_async(orch, job_id).await;
-    let wave_in_flight =
-        orch.turn_end_checks_in_flight(job_id) || orch.write_checks_in_flight(job_id);
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let attempt = crate::execution::checks_turn_end::current_turn_end_attempt(&db, job_id).await?;
+    let durable_moving = attempt.as_ref().is_some_and(|attempt| {
+        matches!(
+            attempt.state.as_str(),
+            "requested" | "claimed" | "runtime_started" | "submitted"
+        )
+    });
+    let terminal_reason = attempt.as_ref().and_then(|attempt| {
+        (!matches!(
+            attempt.state.as_str(),
+            "requested" | "claimed" | "runtime_started" | "submitted"
+        ))
+        .then(|| {
+            attempt
+                .reason
+                .clone()
+                .unwrap_or_else(|| attempt.state.clone())
+        })
+    });
+    let wave_in_flight = durable_moving
+        || orch.turn_end_checks_in_flight(job_id)
+        || orch.write_checks_in_flight(job_id);
     let settlement = classify(&statuses, turn, wave_in_flight);
     Ok(ChecksSnapshot {
         statuses,
         settlement,
+        terminal_reason,
     })
 }
 
@@ -558,6 +583,7 @@ mod tests {
             ChecksSnapshot {
                 statuses,
                 settlement,
+                terminal_reason: None,
             }
         };
         assert_eq!(
@@ -616,11 +642,13 @@ mod tests {
         let settled = ChecksSnapshot {
             settlement: classify(&statuses, HeadTurn::Idle, false),
             statuses: statuses.clone(),
+            terminal_reason: None,
         };
         assert_eq!(settled.lane_lines(), vec!["- rust-lint [no verdict]"]);
         let moving = ChecksSnapshot {
             settlement: classify(&statuses, HeadTurn::Idle, true),
             statuses,
+            terminal_reason: None,
         };
         assert_eq!(moving.lane_lines(), vec!["- rust-lint [pending]"]);
     }

@@ -109,7 +109,7 @@ fn emit_labels_created(orch: &Orchestrator, created: &[Label]) {
 
 fn created_issue_summary(ctx: &ProjectContext, issue: &Issue) -> String {
     format!(
-        "Created issue {}-{}: \"{}\"",
+        "Created issue {}/{}: \"{}\"",
         ctx.project_key, issue.number, issue.title
     )
 }
@@ -196,7 +196,7 @@ pub async fn create_issue_in_project(
 }
 
 async fn lookup_project_by_key(db: &LocalDb, key: &str) -> Result<ProjectContext, String> {
-    let key = key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(key);
     let lookup_key = key.clone();
     db.read(|conn| {
         Box::pin(async move {
@@ -847,7 +847,7 @@ pub(crate) async fn update_issue_by_project_number(
         )
         .await
         .map_err(|e| format!("Failed to resolve issue: {e}"))?
-        .ok_or_else(|| format!("Issue {}-{} not found", ctx.project_key, issue_num))?;
+        .ok_or_else(|| format!("Issue {}/{} not found", ctx.project_key, issue_num))?;
         crate::issues::status::check_resolution(
             orch,
             &issue_id,
@@ -861,7 +861,7 @@ pub(crate) async fn update_issue_by_project_number(
     let (issue, created_labels) = update_issue_row(&owning_db, &ctx.project_id, issue_num, patch)
         .await
         .map_err(|e| format!("Failed to update issue: {e}"))?
-        .ok_or_else(|| format!("Issue {}-{} not found", ctx.project_key, issue_num))?;
+        .ok_or_else(|| format!("Issue {}/{} not found", ctx.project_key, issue_num))?;
 
     // Re-embed only when the description was part of this update; a title-only
     // or dependency-only patch leaves the stored description untouched.
@@ -907,7 +907,7 @@ pub(crate) async fn update_issue_by_project_number(
     }
 
     Ok(format!(
-        "Patched issue {}-{}{}",
+        "Patched issue {}/{}{}",
         ctx.project_key,
         issue.number,
         status.map(|s| format!(" (status={s})")).unwrap_or_default()

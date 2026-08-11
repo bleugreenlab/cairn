@@ -22,8 +22,78 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-pub use lock::{installed_packs, PackLock, PackSource, PackSourceKind};
+pub use lock::{installed_packs, PackLock, PackLockItem, PackSource, PackSourceKind};
 pub use manifest::{PackFormat, PackItem, PackItemKind, PackManifest};
+
+use crate::config::mcp_servers::McpServerConfig;
+
+/// Hashing distinguishes absent content from a present empty file or tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentHash {
+    Missing,
+    Present(String),
+}
+
+pub fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+pub fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn hash_file(path: &Path) -> Result<ContentHash, String> {
+    if !path.exists() {
+        return Ok(ContentHash::Missing);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("Failed to read resource {path:?}: {e}"))?;
+    Ok(ContentHash::Present(sha256_bytes(&bytes)))
+}
+
+pub fn hash_tree(root: &Path) -> Result<ContentHash, String> {
+    if !root.exists() {
+        return Ok(ContentHash::Missing);
+    }
+    Ok(ContentHash::Present(hash_tree_present(root)?))
+}
+
+pub fn hash_item_path(kind: PackItemKind, path: &Path) -> Result<ContentHash, String> {
+    match kind {
+        PackItemKind::Skill | PackItemKind::Workflow => hash_tree(path),
+        PackItemKind::Mcp => Err("MCP items must be hashed from their server definition".into()),
+        PackItemKind::Agent | PackItemKind::Recipe | PackItemKind::Response => hash_file(path),
+    }
+}
+
+/// Hash one MCP definition after recursively sorting every map key.
+pub fn hash_mcp_definition(config: &McpServerConfig) -> Result<String, String> {
+    let value = serde_json::to_value(config)
+        .map_err(|e| format!("Failed to serialize MCP server definition: {e}"))?;
+    let canonical = canonical_json(value);
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|e| format!("Failed to serialize MCP server definition: {e}"))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+fn canonical_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let sorted = values
+                .into_iter()
+                .map(|(key, value)| (key, canonical_json(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            serde_json::to_value(sorted).expect("JSON values always serialize")
+        }
+        other => other,
+    }
+}
 
 /// Content directories a pack may ship, and the exact subtrees a workspace
 /// install materializes. Flat dirs (`agents`, `recipes`, `responses`) are
@@ -125,6 +195,13 @@ pub fn available_pack(resource_dir: &Path, id: &str) -> Option<PackManifest> {
 /// single global `.bundle-sync` marker: an unchanged hash short-circuits that
 /// pack's sync entirely.
 pub fn content_hash(root: &Path) -> Result<String, String> {
+    if !root.exists() {
+        return hash_tree_present(root);
+    }
+    hash_tree_present(root)
+}
+
+fn hash_tree_present(root: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
     if root.exists() {
         collect_files(root, root, &mut entries)?;
@@ -134,10 +211,11 @@ pub fn content_hash(root: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     for (relative_path, bytes) in entries {
         let path_bytes = relative_path.as_bytes();
+        let file_hash = sha256_bytes(&bytes);
         hasher.update((path_bytes.len() as u64).to_le_bytes());
         hasher.update(path_bytes);
-        hasher.update((bytes.len() as u64).to_le_bytes());
-        hasher.update(bytes);
+        hasher.update((file_hash.len() as u64).to_le_bytes());
+        hasher.update(file_hash.as_bytes());
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -236,5 +314,82 @@ mod tests {
     fn a_missing_pack_root_hashes_without_error() {
         let temp = TempDir::new().unwrap();
         assert!(content_hash(&temp.path().join("absent")).is_ok());
+    }
+
+    #[test]
+    fn canonical_hashes_are_lowercase_sha256() {
+        let hash = sha256_bytes(b"abc");
+        assert_eq!(
+            hash,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert!(is_canonical_sha256(&hash));
+        assert!(!is_canonical_sha256(&hash.to_uppercase()));
+        assert!(!is_canonical_sha256("sha256:abc"));
+    }
+
+    #[test]
+    fn item_hashing_distinguishes_missing_file_and_tree() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("missing");
+        assert_eq!(hash_file(&missing).unwrap(), ContentHash::Missing);
+        assert_eq!(hash_tree(&missing).unwrap(), ContentHash::Missing);
+
+        std::fs::create_dir(&missing).unwrap();
+        let ContentHash::Present(empty_tree) = hash_tree(&missing).unwrap() else {
+            panic!("an existing empty tree must have a hash")
+        };
+        assert!(is_canonical_sha256(&empty_tree));
+    }
+
+    #[test]
+    fn tree_hashing_is_order_independent_and_path_sensitive() {
+        let left = TempDir::new().unwrap();
+        let right = TempDir::new().unwrap();
+        write(&left.path().join("a/one.md"), "one");
+        write(&left.path().join("b/two.md"), "two");
+        write(&right.path().join("b/two.md"), "two");
+        write(&right.path().join("a/one.md"), "one");
+        assert_eq!(
+            hash_tree(left.path()).unwrap(),
+            hash_tree(right.path()).unwrap()
+        );
+
+        std::fs::rename(
+            right.path().join("a/one.md"),
+            right.path().join("a/renamed.md"),
+        )
+        .unwrap();
+        assert_ne!(
+            hash_tree(left.path()).unwrap(),
+            hash_tree(right.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn mcp_hashing_canonicalizes_nested_map_order() {
+        let dir = TempDir::new().unwrap();
+        let first_path = dir.path().join("first.yaml");
+        let second_path = dir.path().join("second.yaml");
+        write(
+            &first_path,
+            "mcpServers:\n  test:\n    command: test\n    env: {B: two, A: one}\n",
+        );
+        write(
+            &second_path,
+            "mcpServers:\n  test:\n    env: {A: one, B: two}\n    command: test\n",
+        );
+        let first = mcp::parse_pack_mcp_file(&first_path)
+            .unwrap()
+            .remove("test")
+            .unwrap();
+        let second = mcp::parse_pack_mcp_file(&second_path)
+            .unwrap()
+            .remove("test")
+            .unwrap();
+        assert_eq!(
+            hash_mcp_definition(&first).unwrap(),
+            hash_mcp_definition(&second).unwrap()
+        );
     }
 }

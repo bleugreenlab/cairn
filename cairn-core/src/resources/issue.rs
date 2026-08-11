@@ -237,7 +237,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
                     Err(error) => return storage_error("Failed to decode issue", error),
                 }
             }
-            Ok(None) => return format!("Issue {}-{} not found", project_key, number),
+            Ok(None) => return format!("Issue {}/{} not found", project_key, number),
             Err(error) => return storage_error("Failed to load issue", error.into()),
         };
 
@@ -250,7 +250,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     let created_date =
         crate::clock::date(created_at as i64).unwrap_or_else(|| "Unknown".to_string());
 
-    let mut output = format!("# {}-{}: {}\n\n", project_key, number, title);
+    let mut output = format!("# {}/{}: {}\n\n", project_key, number, title);
     output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
     if !labels.is_empty() {
         output.push_str(&format!(
@@ -596,13 +596,13 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
                 Ok(id) => id,
                 Err(e) => return storage_error("Failed to decode issue", e),
             },
-            Ok(None) => return format!("Issue {}-{} not found", project_key, number),
+            Ok(None) => return format!("Issue {}/{} not found", project_key, number),
             Err(e) => return storage_error("Failed to load issue", e.into()),
         },
         Err(e) => return storage_error("Failed to load issue", e.into()),
     };
 
-    let mut output = format!("# Executions for {}-{}\n\n", project_key, number);
+    let mut output = format!("# Executions for {}/{}\n\n", project_key, number);
     let mut found = false;
     if let Ok(mut rows) = conn
         .query(
@@ -637,8 +637,8 @@ async fn resolve_issue_id_for_comments(
     match relations::issue_id_for_project_number(db, project_key, number).await {
         Ok(Some(issue_id)) => Ok(issue_id),
         Ok(None) => Err(format!(
-            "Issue {}-{} not found",
-            project_key.to_uppercase(),
+            "Issue {}/{} not found",
+            cairn_common::uri::canonical_project(project_key),
             number
         )),
         Err(error) => Err(format!("Failed to resolve issue: {error}")),
@@ -671,8 +671,8 @@ pub(super) async fn read_issue_comments(db: &LocalDb, project_key: &str, number:
         Ok(comments) => comments,
         Err(error) => return format!("Failed to load comments: {error}"),
     };
-    let project_upper = project_key.to_uppercase();
-    let mut out = format!("# Comments — {}-{}\n\n", project_upper, number);
+    let project_upper = cairn_common::uri::canonical_project(project_key);
+    let mut out = format!("# Comments — {}/{}\n\n", project_upper, number);
     out.push_str(&format!("{} comment(s)\n\n", comments.len()));
     out.push_str(
         "Edit a comment: patch its `content`; delete it: delete its URI below. \
@@ -706,10 +706,10 @@ pub(super) async fn read_issue_comment(
         .find(|comment| comment.seq == comment_seq as i64)
     {
         Some(comment) => {
-            let project_upper = project_key.to_uppercase();
+            let project_upper = cairn_common::uri::canonical_project(project_key);
             let uri = build_issue_comment_uri(&project_upper, number, comment.seq as i32);
             let mut out = format!(
-                "# Comment {} on {}-{}\n\n",
+                "# Comment {} on {}/{}\n\n",
                 comment.seq, project_upper, number
             );
             out.push_str(&render_comment(comment, &uri));
@@ -717,7 +717,7 @@ pub(super) async fn read_issue_comment(
         }
         None => format!(
             "Comment {comment_seq} not found on issue {}-{number}",
-            project_key.to_uppercase()
+            cairn_common::uri::canonical_project(project_key)
         ),
     }
 }
@@ -752,7 +752,7 @@ pub(super) async fn read_issue_execution(
                 Ok(id) => id,
                 Err(e) => return storage_error("Failed to decode issue", e),
             },
-            Ok(None) => return format!("Issue {}-{} not found", project_key, number),
+            Ok(None) => return format!("Issue {}/{} not found", project_key, number),
             Err(e) => return storage_error("Failed to load issue", e.into()),
         },
         Err(e) => return storage_error("Failed to load issue", e.into()),
@@ -770,7 +770,7 @@ pub(super) async fn read_issue_execution(
                 Ok(Some(json)) => json,
                 Ok(None) => {
                     return format!(
-                        "Execution {}-{}/{} has no snapshot",
+                        "Execution {}/{}/{} has no snapshot",
                         project_key, number, exec_seq
                     )
                 }
@@ -778,7 +778,7 @@ pub(super) async fn read_issue_execution(
             },
             Ok(None) => {
                 return format!(
-                    "Execution {}-{}/{} not found",
+                    "Execution {}/{}/{} not found",
                     project_key, number, exec_seq
                 )
             }
@@ -819,7 +819,7 @@ fn render_execution_snapshot(
     snapshot: &ExecutionSnapshot,
 ) -> String {
     let mut output = format!(
-        "# Execution snapshot {}-{} / execution {}\n\n",
+        "# Execution snapshot {}/{} / execution {}\n\n",
         project_key, number, exec_seq
     );
 

@@ -412,7 +412,7 @@ async fn issue_id_for_key_number(
     project_key: &str,
     issue_number: i32,
 ) -> Result<Option<String>, String> {
-    let project_key = project_key.to_uppercase();
+    let project_key = cairn_common::uri::canonical_project(project_key);
     db.read(|conn| {
         let project_key = project_key.clone();
         Box::pin(async move {

@@ -30,7 +30,7 @@ async fn scope(
 ) -> Result<(Option<String>, Option<PathBuf>), String> {
     if let Some(k) = p {
         Ok((
-            Some(k.to_uppercase()),
+            Some(cairn_common::uri::canonical_project(k)),
             Some(project_path_by_key(o, k).await?),
         ))
     } else {

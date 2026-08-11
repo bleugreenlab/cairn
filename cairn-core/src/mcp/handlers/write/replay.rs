@@ -141,10 +141,10 @@ fn is_this_writes_call(
 /// and stops a key the schema does not model from making them differ; comparing
 /// raw JSON is what made no terminal exit wait correlate in CAIRN-3115.
 ///
-/// The transcript contains the target the model emitted while `cairn-cmd` may
-/// deliver its canonical expansion. Canonicalizing `cairn:~` against this run's
-/// home URI makes those spellings equal without weakening target identity: two
-/// otherwise identical calls aimed at different resources remain distinct.
+/// Canonicalizing `cairn:~` against this run's current home URI preserves
+/// correlation with older transcript deliveries that may carry a client-expanded
+/// target, without weakening target identity: two otherwise identical calls aimed
+/// at different resources remain distinct.
 fn change_identity(input: &serde_json::Value, home_uri: &str) -> Option<serde_json::Value> {
     let mut payload = serde_json::from_value::<ChangePayload>(input.clone()).ok()?;
     for item in &mut payload.changes {

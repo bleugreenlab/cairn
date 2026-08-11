@@ -38,7 +38,7 @@ fn skill_not_found_message(skill_id: &str, explicit_project: Option<&str>) -> St
         Some(project) => {
             format!(
                 "Skill not found in project {}: {skill_id}",
-                project.to_uppercase()
+                cairn_common::uri::canonical_project(project)
             )
         }
         None => format!("Skill not found: {skill_id}"),

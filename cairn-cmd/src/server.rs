@@ -124,12 +124,10 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
         standalone_cli: bool,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
-        // Pooled Codex call (CAIRN-2549): Codex injects the originating thread as
-        // `_meta.threadId`. When present, forward it as `thread_id` and forward
-        // `cairn:~/` targets RAW (the host expands them from the thread-resolved
-        // run). Absent — every non-pooled caller — behaviour is unchanged.
+        // Pooled Codex calls inject the originating thread as `_meta.threadId` so
+        // the host can select the run. Home-relative targets are always forwarded
+        // raw and the host expands them from that run.
         let thread_id = Self::thread_id_from_meta(&meta);
-        let pooled = thread_id.is_some();
 
         // Validate the raw input ourselves, in one pass, before any rewrite or
         // forward. This owns the error text the model sees (the rmcp-facing
@@ -153,7 +151,7 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
             return Ok(CallToolResult::success(vec![ContentBlock::text(text)]));
         }
 
-        let rewritten = match self.rewrite_change_targets_with(&input, pooled) {
+        let rewritten = match self.rewrite_change_targets(&input) {
             Ok(rewritten) => rewritten,
             Err(message) => return Ok(CallToolResult::success(vec![ContentBlock::text(message)])),
         };
@@ -227,7 +225,6 @@ Partial failures never abort: a target that errors shows its message inline as t
         standalone_cli: bool,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let thread_id = Self::thread_id_from_meta(&meta);
-        let pooled = thread_id.is_some();
         if input.paths.is_empty() {
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "read requires a non-empty `paths` array (one or more target URIs).".to_string(),
@@ -246,7 +243,7 @@ Partial failures never abort: a target that errors shows its message inline as t
                 if path.starts_with("http://") || path.starts_with("https://") {
                     path.clone()
                 } else {
-                    self.resolve_read_target_with(path, pooled)
+                    self.resolve_read_target(path)
                         .unwrap_or_else(|_| path.clone())
                 }
             })

@@ -70,8 +70,9 @@ use sha2::{Digest, Sha256};
 use crate::execution::checks::{
     applicable_turn_end_checks, check_platform_identity, check_result_key,
     check_toolchain_identity, load_checks_contract_at_commit, resolve_check_timeout_ms,
-    run_planned_checks_at_commit, submit_planned_check_batch, CheckExecMode, CheckFailureKind,
-    CheckOutcome, PlannedCheckBatchItem, PlannedCheckBatchRequest, DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
+    run_planned_checks_at_commit_with_coordinates, submit_planned_check_batch, CheckExecMode,
+    CheckFailureKind, CheckOutcome, PlannedCheckBatchItem, PlannedCheckBatchRequest,
+    DEFAULT_REVIEW_CHECK_TIMEOUT_MS,
 };
 use crate::execution::inputs::{
     any_check_declares_inputs, ResolvedInputs, TreeBlobs, TreeSnapshot,
@@ -89,34 +90,145 @@ const CHANGED_FILES_CONTENT_ENV: &str = "CAIRN_CHECK_CHANGED_FILES_CONTENT";
 /// Chars of the live log file surfaced in the "running" render.
 const LOG_TAIL_CHARS: usize = 2_000;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnEndAttempt {
+    pub id: String,
+    pub state: String,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TurnEndDisposition {
+    Skipped(&'static str),
+    Withdrawn(String),
+    CacheCovered(&'static str),
+    Cancelled(&'static str),
+    CompletedWithDelivery,
+}
+impl TurnEndDisposition {
+    fn terminal(&self) -> (&'static str, String) {
+        match self {
+            Self::Skipped(r) => ("skipped", (*r).into()),
+            Self::Withdrawn(r) => ("withdrawn", r.clone()),
+            Self::CacheCovered(r) => ("cache_covered", (*r).into()),
+            Self::Cancelled(r) => ("cancelled", (*r).into()),
+            Self::CompletedWithDelivery => (
+                "completed",
+                "check wave completed and delivery was persisted".into(),
+            ),
+        }
+    }
+}
+
+pub(crate) fn request_turn_end_attempt(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<String, String> {
+    let attempt_id = cairn_common::ids::mint_child(job_id);
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    let stored_id = attempt_id.clone();
+    crate::storage::run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.write(move |conn| { let id=stored_id.clone(); let job=job_id.clone(); Box::pin(async move {
+            conn.execute("INSERT INTO turn_end_check_attempts(id,job_id,state,reason,created_at,updated_at) VALUES (?1,?2,'requested',NULL,unixepoch()*1000,unixepoch()*1000)",(id.as_str(),job.as_str())).await?;
+            conn.execute("UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2 AND (turn_end_check_attempt_id IS NULL OR NOT EXISTS (SELECT 1 FROM turn_end_check_attempts current WHERE current.id=jobs.turn_end_check_attempt_id AND current.state IN ('requested','claimed','runtime_started','submitted')))",(id.as_str(),job.as_str())).await?;
+            Ok::<_,crate::storage::DbError>(())
+        })}).await.map_err(|e|e.to_string())
+    })?;
+    Ok(attempt_id)
+}
+
+pub(crate) fn transition_turn_end_attempt(
+    orch: &Orchestrator,
+    job_id: &str,
+    attempt_id: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Result<(), String> {
+    let dbs = orch.db.clone();
+    let job = job_id.to_string();
+    let id = attempt_id.to_string();
+    let state = state.to_string();
+    let reason = reason.map(str::to_string);
+    crate::storage::run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job)
+            .await
+            .map_err(|e| e.to_string())?;
+        db.write(move |conn| { let job=job.clone(); let id=id.clone(); let state=state.clone(); let reason=reason.clone(); Box::pin(async move {
+            let changed=conn.execute("UPDATE turn_end_check_attempts SET state=?1,reason=?2,updated_at=unixepoch()*1000 WHERE id=?3 AND job_id=?4",(state.as_str(),reason.as_deref(),id.as_str(),job.as_str())).await?;
+            if changed != 1 { return Err(crate::storage::DbError::Row(format!("turn-end attempt {id} for job {job} was not found"))); }
+            // The in-memory single-flight winner is not necessarily the first
+            // requester. Transfer the durable pointer in the same transaction
+            // that records its claim so every observer sees the actual owner.
+            if state == "claimed" {
+                conn.execute(
+                    "UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2",
+                    (id.as_str(), job.as_str()),
+                ).await?;
+            }
+            Ok::<_,crate::storage::DbError>(())
+        })}).await.map_err(|e|e.to_string())
+    })
+}
+
+pub(crate) async fn current_turn_end_attempt(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<TurnEndAttempt>, String> {
+    db.read(|conn| { let job=job_id.to_string(); Box::pin(async move {
+        let mut rows=conn.query("SELECT a.id,a.state,a.reason FROM jobs j LEFT JOIN turn_end_check_attempts a ON a.id=j.turn_end_check_attempt_id WHERE j.id=?1",(job.as_str(),)).await?;
+        let Some(row)=rows.next().await? else{return Ok(None)}; let (Some(id),Some(state))=(row.opt_text(0)?,row.opt_text(1)?) else{return Ok(None)};
+        Ok(Some(TurnEndAttempt{id,state,reason:row.opt_text(2)?}))
+    })}).await.map_err(|e|e.to_string())
+}
+
+pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) {
+    const REASON: &str =
+        "host restarted before the turn-end check attempt reached a durable terminal state";
+    for db in orch.db.all_dbs().await {
+        if let Err(error)=db.write(|conn| Box::pin(async move {
+            conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','submitted')",(REASON,)).await?;
+            Ok::<_,crate::storage::DbError>(())
+        })).await { log::warn!("startup turn-end attempt reconciliation failed: {error}"); }
+    }
+}
+
 /// Background entry point: run the affected turn-end checks for a job, then
 /// release the single-flight slot. The caller ([`spawn_turn_end_checks`] in
 /// lifecycle) has already claimed the slot via `try_begin_turn_end_checks`; this
 /// function is responsible for releasing it on every path.
-pub(crate) async fn run_turn_end_checks(orch: Orchestrator, job_id: String, cancel: TurnEndCancel) {
-    if let Err(e) = run_turn_end_checks_inner(&orch, &job_id, &cancel).await {
-        log::warn!(
-            "turn-end checks for job {}: {}",
-            &job_id[..job_id.len().min(8)],
-            e
-        );
+pub(crate) async fn run_turn_end_checks(
+    orch: Orchestrator,
+    job_id: String,
+    attempt_id: String,
+    cancel: TurnEndCancel,
+) {
+    let result =
+        match transition_turn_end_attempt(&orch, &job_id, &attempt_id, "runtime_started", None) {
+            Ok(()) => run_turn_end_checks_inner(&orch, &job_id, &attempt_id, &cancel).await,
+            Err(error) => Err(error),
+        };
+    let terminal = match result {
+        Ok(disposition) => {
+            let (state, reason) = disposition.terminal();
+            transition_turn_end_attempt(&orch, &job_id, &attempt_id, state, Some(&reason))
+        }
+        Err(error) => {
+            log::warn!("turn-end checks for job {}: {}", short_id(&job_id), error);
+            transition_turn_end_attempt(&orch, &job_id, &attempt_id, "failed", Some(&error))
+        }
+    };
+    if let Err(error) = terminal {
+        log::error!("turn-end checks for job {}: terminal persistence failed; retaining single-flight ownership: {}",short_id(&job_id),error);
+        return;
     }
-
-    // Release the single-flight slot before the idempotent readiness recovery
-    // edge. Review creation no longer waits for detached checks, but completion
-    // remains a useful re-evaluation point if another semantic gate settled too.
     orch.end_turn_end_checks(&job_id);
-    // Every exit path lands here, so a green completion, an all-cached exit, an
-    // empty changed set, or an inner error re-evaluates whether the reviewed
-    // issue has settled. Fingerprint dedupe makes this recovery edge harmless
-    // when an earlier semantic transition already created the wake.
     if let Some(issue_id) = issue_id_for_job(&orch.db.local, &job_id).await {
         crate::orchestrator::lifecycle::evaluate_review_readiness(&orch, &issue_id).await;
     }
-    // Every exit path lands here too, which is the point: a wave that died
-    // verdictless settles its node just as truly as one that produced a full
-    // green, and a subscriber waiting on the latter must not be stranded by the
-    // former (CAIRN-3437).
     crate::orchestrator::wakes::route_checks_settled_edge(&orch, &job_id).await;
 }
 
@@ -386,14 +498,17 @@ async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
 async fn run_turn_end_checks_inner(
     orch: &Orchestrator,
     job_id: &str,
+    attempt_id: &str,
     cancel: &TurnEndCancel,
-) -> Result<(), String> {
+) -> Result<TurnEndDisposition, String> {
     // 1. Resolve the node's durable branch coordinate and base anchors.
     let owning_db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
         .await
         .map_err(|error| error.to_string())?;
     let Some(coords) = resolve_job_coords(&owning_db, job_id).await? else {
-        return Ok(());
+        return Ok(TurnEndDisposition::Skipped(
+            "job coordinates are unavailable",
+        ));
     };
     // Nothing that follows is owed if this wave may not launch: its verdicts
     // would validate a tree nobody will review again, or a workspace being taken
@@ -407,7 +522,7 @@ async fn run_turn_end_checks_inner(
             short_id(job_id),
             withdrawal.describe()
         );
-        return Ok(());
+        return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
     }
     let repo_root = PathBuf::from(&coords.repository_path);
     let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repo_root);
@@ -441,7 +556,9 @@ async fn run_turn_end_checks_inner(
                         _ => "the job has no branch of its own".to_string(),
                     }
                 );
-                return Ok(());
+                return Ok(TurnEndDisposition::Skipped(
+                    "job has no live base coordinate",
+                ));
             }
         };
 
@@ -462,7 +579,9 @@ async fn run_turn_end_checks_inner(
                     short_id(job_id),
                     sealed_commit
                 );
-                return Ok(());
+                return Ok(TurnEndDisposition::Skipped(
+                    "sealed commit declares no review checks",
+                ));
             }
         };
     // Hard assert, not a log: a definition arriving from any tree but the sealed
@@ -493,14 +612,16 @@ async fn run_turn_end_checks_inner(
             "turn-end checks for job {}: changed-file set unresolvable; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(TurnEndDisposition::Skipped(
+            "changed-file set is unresolvable",
+        ));
     };
     if changed.is_empty() {
         log::debug!(
             "turn-end checks for job {}: empty changed-file set; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(TurnEndDisposition::Skipped("changed-file set is empty"));
     }
 
     // 5. Select the applicable turn-end checks (cadence + input gate). Resolving
@@ -542,7 +663,9 @@ async fn run_turn_end_checks_inner(
             "turn-end checks for job {}: no applicable review check; nothing to run",
             short_id(job_id)
         );
-        return Ok(());
+        return Ok(TurnEndDisposition::Skipped(
+            "no review check applies to the changed files",
+        ));
     }
 
     let applicable_names = plans
@@ -683,7 +806,9 @@ async fn run_turn_end_checks_inner(
                 "turn-end checks for job {}: every applicable check is already cached for this tree; nothing to run",
                 short_id(job_id)
             );
-            return Ok(());
+            return Ok(TurnEndDisposition::CacheCovered(
+                "every applicable check is already cached",
+            ));
         }
         TurnEndLaunch::Skip(TurnEndSkip::TreeMatchesBase(names)) => {
             log::info!(
@@ -692,7 +817,9 @@ async fn run_turn_end_checks_inner(
                 short_id(job_id),
                 names.join(", ")
             );
-            return Ok(());
+            return Ok(TurnEndDisposition::CacheCovered(
+                "sealed tree matches the base tree",
+            ));
         }
     };
     log::info!(
@@ -804,8 +931,9 @@ async fn run_turn_end_checks_inner(
             withdrawal.describe(),
             to_run.len()
         );
-        return Ok(());
+        return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
     }
+    transition_turn_end_attempt(orch, job_id, attempt_id, "submitted", None)?;
     let batched_results = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -820,7 +948,7 @@ async fn run_turn_end_checks_inner(
                     .emitter
                     .emit("substrate-health-change", serde_json::json!({}));
             }
-            return Ok(());
+            return Ok(TurnEndDisposition::Cancelled("issue resolved while the check wave was submitted"));
         }
         results = submit_planned_check_batch(orch, batch) => results
             .map_err(|error| format!("turn-end check batch configuration failed: {error}"))?,
@@ -834,7 +962,18 @@ async fn run_turn_end_checks_inner(
         }
     }
     let batched_results = std::sync::Arc::new(std::sync::Mutex::new(batched_results.results));
-    let outcomes = run_planned_checks_at_commit(
+    let sealed_coordinates: Vec<_> = to_run
+        .iter()
+        .map(|(_, input_hash)| {
+            crate::execution::cache::SealedCheckCoordinate::new(
+                &sealed_commit,
+                &defined_by_commit,
+                &tree_hash,
+                input_hash,
+            )
+        })
+        .collect();
+    let outcomes = run_planned_checks_at_commit_with_coordinates(
         db.clone(),
         &coords.project_id,
         crate::execution::checks::CheckRunCommit {
@@ -844,6 +983,7 @@ async fn run_turn_end_checks_inner(
         &tree_hash,
         job_id,
         &to_run,
+        &sealed_coordinates,
         &checks_tool_id,
         CheckExecMode::Shared,
         Some(orch),
@@ -988,7 +1128,7 @@ async fn run_turn_end_checks_inner(
             );
         }
     }
-    Ok(())
+    Ok(TurnEndDisposition::CompletedWithDelivery)
 }
 
 const TURN_CHECK_FINGERPRINT_VERSION: &str = "turn-check-state-v2";
@@ -2045,15 +2185,15 @@ mod tests {
     #[test]
     fn only_a_verdict_about_the_change_is_a_genuine_failure() {
         assert!(outcome("rust", false, None, "assertion failed").is_genuine_failure());
-        assert!(
-            outcome("rust", false, Some(CheckFailureKind::TimedOut), "slow").is_genuine_failure()
-        );
         assert!(outcome("rust", false, Some(CheckFailureKind::Killed), "oom").is_genuine_failure());
         assert!(!outcome("rust", true, None, "").is_genuine_failure());
         for kind in [
             CheckFailureKind::Infrastructure,
+            CheckFailureKind::TimedOut,
             CheckFailureKind::SpawnError,
             CheckFailureKind::RunnerError,
+            CheckFailureKind::TimedOut,
+            CheckFailureKind::Capacity,
         ] {
             assert!(
                 !outcome("rust", false, Some(kind), "sccache died").is_genuine_failure(),
@@ -2164,5 +2304,40 @@ mod tests {
     fn short_id_never_panics_on_a_short_string() {
         assert_eq!(short_id("abcd"), "abcd");
         assert_eq!(short_id("0123456789"), "01234567");
+    }
+    #[test]
+    fn turn_end_dispositions_persist_distinct_terminal_states_and_reasons() {
+        let cases = [
+            (
+                TurnEndDisposition::Skipped("nothing applies"),
+                "skipped",
+                "nothing applies",
+            ),
+            (
+                TurnEndDisposition::Withdrawn("issue resolved".into()),
+                "withdrawn",
+                "issue resolved",
+            ),
+            (
+                TurnEndDisposition::CacheCovered("cached"),
+                "cache_covered",
+                "cached",
+            ),
+            (
+                TurnEndDisposition::Cancelled("cancelled"),
+                "cancelled",
+                "cancelled",
+            ),
+            (
+                TurnEndDisposition::CompletedWithDelivery,
+                "completed",
+                "check wave completed and delivery was persisted",
+            ),
+        ];
+        for (disposition, expected_state, expected_reason) in cases {
+            let (state, reason) = disposition.terminal();
+            assert_eq!(state, expected_state);
+            assert_eq!(reason, expected_reason);
+        }
     }
 }

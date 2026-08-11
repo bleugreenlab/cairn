@@ -53,6 +53,7 @@ axum = { version = "0.8", features = ["ws"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }
 futures-util = "0.3"
 async-trait = "0.1"
+teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 cairn-common = { path = "../cairn-common" }
 cairn-sandbox = { path = "../cairn-sandbox" }
 ignore = "0.4"

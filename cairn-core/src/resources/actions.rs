@@ -43,7 +43,10 @@ pub(crate) async fn read_actions_collection(
             // owning db by key first so the id (and its team prefix) is found.
             let project_db = orch.db.for_project(project).await;
             match run_context::project_id_by_key(&project_db, project).await {
-                Ok(id) => (Some(id), Some(project.to_uppercase())),
+                Ok(id) => (
+                    Some(id),
+                    Some(cairn_common::uri::canonical_project(project)),
+                ),
                 Err(e) => return e,
             }
         }
@@ -175,7 +178,7 @@ fn not_found(action_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Action not found in project {}: {action_id}",
-            project.to_uppercase()
+            cairn_common::uri::canonical_project(project)
         ),
         None => format!("Action not found: {action_id}"),
     }

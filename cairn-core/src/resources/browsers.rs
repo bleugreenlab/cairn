@@ -115,7 +115,7 @@ async fn resolve_browser_scope(
                 }
                 CairnResource::ProjectBrowser { project, slug }
                 | CairnResource::ProjectBrowserNetworkRequest { project, slug, .. } => {
-                    let lookup_key = project.to_uppercase();
+                    let lookup_key = cairn_common::uri::canonical_project(&project);
                     let mut rows = conn
                         .query(
                             "SELECT id FROM projects WHERE key = ?1 LIMIT 1",

@@ -165,7 +165,7 @@ pub async fn check_resolution(
     if status == "merged" && matches!(actor, ResolutionActor::Agent) {
         if let Some((project_key, number)) = open_merge_request_for_issue(orch, id).await? {
             return Err(ResolutionRefusal::Rejected(format!(
-                "Refusing to mark {project_key}-{number} merged: it still has an OPEN pull request. Setting status=merged records a resolution WITHOUT merging the PR — it strands the branch's commits and auto-closes the PR unmerged. Merge through the PR instead:\n  write({{changes:[{{target:\"cairn://p/{project_key}/{number}/1/builder/create-pr\",mode:\"patch\",payload:{{action:\"merge\"}}}}]}})\nThat merge resolves this issue for you. If the PR was already merged externally, refresh it instead with payload:{{action:\"refresh\"}}."
+                "Refusing to mark {project_key}/{number} merged: it still has an OPEN pull request. Setting status=merged records a resolution WITHOUT merging the PR — it strands the branch's commits and auto-closes the PR unmerged. Merge through the PR instead:\n  write({{changes:[{{target:\"cairn://p/{project_key}/{number}/1/builder/create-pr\",mode:\"patch\",payload:{{action:\"merge\"}}}}]}})\nThat merge resolves this issue for you. If the PR was already merged externally, refresh it instead with payload:{{action:\"refresh\"}}."
             )));
         }
     }

@@ -483,12 +483,12 @@ async fn failed_child_finalize_wakes_once_and_delivers_failure_to_idle_coordinat
     .await
     .unwrap();
     let db = Arc::new(db);
-    let (orch, recorder) = orchestrator(&temp, db.clone());
+    let (orch, _recorder) = orchestrator(&temp, db.clone());
 
     // This is the production failed-start sequence: finalize marks the turn/run failed,
     // recompute emits Resolved, then the turn-end edge observes the same terminal
     // issue and emits Resolved again. Durable fingerprint dedupe must collapse the
-    // second emit even though the first wake was synchronously delivered.
+    // second emit.
     finalize_run(&orch, "child-run", RunStatus::Crashed);
 
     assert_eq!(
@@ -503,15 +503,29 @@ async fn failed_child_finalize_wakes_once_and_delivers_failure_to_idle_coordinat
     );
     assert_eq!(rows[0].1, "wake");
     assert!(rows[0].2.is_some());
+    let resumed_run = cairn_core::messages::delivery::latest_run_for_job(&db, "coordinator")
+        .expect("the failed child should create a resumed coordinator run");
+    assert_ne!(
+        resumed_run, "coord-run",
+        "the failed-child wake must create the coordinator's successor run"
+    );
+
+    let coordinator_run_count = db
+        .query_one(
+            "SELECT COUNT(*) FROM runs WHERE job_id='coordinator'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap();
     assert_eq!(
-        recorder.spawn_count(),
-        1,
-        "failed resolution must resume the parent exactly once"
+        coordinator_run_count, 2,
+        "failed resolution must create exactly one successor run"
     );
     assert!(list_pending(&db, "child-builder").await.unwrap().is_empty());
 
     let body = attention_event_body(&db).await;
-    assert!(body.contains("Issue Failed"), "{body}");
+    assert!(body.contains("Child") && body.contains("failed"), "{body}");
     assert!(body.contains("retry or delegate a fix"), "{body}");
     assert!(!body.contains("Successfully"), "{body}");
     assert!(body.contains(CHILD_URI), "{body}");

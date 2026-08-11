@@ -307,7 +307,7 @@ pub(super) async fn resolve_duration(
 ) -> DurationEstimate {
     let Some(identity) = identity else {
         return unmeasured_duration(
-            CellCommandClass::Other,
+            class,
             context,
             None,
             warmth,

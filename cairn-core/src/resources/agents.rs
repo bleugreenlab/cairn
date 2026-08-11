@@ -42,7 +42,10 @@ async fn resolve_scope(
 ) -> Result<(Option<String>, Option<PathBuf>), String> {
     if let Some(project) = explicit_project {
         let path = project_path_by_key(orch, project).await?;
-        Ok((Some(project.to_uppercase()), Some(path)))
+        Ok((
+            Some(cairn_common::uri::canonical_project(project)),
+            Some(path),
+        ))
     } else {
         match current_run_project(orch, request).await {
             Some((key, path)) => Ok((Some(key), path)),
@@ -157,7 +160,7 @@ fn not_found(agent_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Agent not found in project {}: {agent_id}",
-            project.to_uppercase()
+            cairn_common::uri::canonical_project(project)
         ),
         None => format!("Agent not found: {agent_id}"),
     }

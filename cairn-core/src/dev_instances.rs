@@ -782,9 +782,9 @@ async fn canonical_selector(
             ),
         });
     };
-    let node = format!("{project}-{number}/{exec_seq}/{node_id}");
+    let node = format!("{project}/{number}/{exec_seq}/{node_id}");
     let owned_project = project_id.to_string();
-    let key = project.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project);
     let branch = orch
         .db
         .local

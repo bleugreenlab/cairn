@@ -11,12 +11,15 @@ pub use definition::{
     parse_definition, ArgumentBinding, DedupeWindow, NodePosition, RouteDefinition, RouteEdge,
     RouteNode, RouteNodeConfig, RouteSink,
 };
-pub use dispatcher::{dispatch, record_channel_outcome, ChannelSubmission, RouteContext};
+pub use dispatcher::{
+    dispatch, record_channel_outcome, test_definition, ChannelSubmission, RouteContext,
+    RouteTestResult,
+};
 pub use graph::RouteGraph;
 pub use lifecycle::{dispatch_attention, spawn_attention_routes};
 pub use predicate::{
-    matches, Fact, FactFieldShape, FactRegistry, FactSourceShape, FieldKind, FieldVocabulary,
-    Presence, TriggerClause,
+    explain_clause, matches, Fact, FactFieldShape, FactRegistry, FactSourceShape, FieldKind,
+    FieldVocabulary, Presence, TriggerClause,
 };
 pub use references::validate_references;
 

@@ -1495,7 +1495,7 @@ async fn lookup_permission_request_for_node(
                     .transpose()?
                     .ok_or_else(|| {
                         DbError::Row(format!(
-                            "permission {perm_segment} not found for {project_key}-{number}/{exec_seq}/{node_segment}"
+                            "permission {perm_segment} not found for {project_key}/{number}/{exec_seq}/{node_segment}"
                         ))
                     })
             })

@@ -113,6 +113,104 @@ pub(crate) enum CheckExecMode {
     Shared,
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_planned_checks_at_commit<F, Fut, N, E>(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    plans: &[(CheckPlan, String)],
+    tool_use_id: &str,
+    mode: CheckExecMode,
+    diagnostic_orch: Option<&Orchestrator>,
+    execute: F,
+    notify: N,
+) -> Vec<CheckOutcome>
+where
+    F: Fn(usize, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<CheckExecResult, E>>,
+    E: Into<CheckExecutionFailure>,
+    N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
+{
+    let coordinates = sealed_coordinates(commit, tree_hash, plans);
+    run_planned_checks_at_commit_with_coordinates(
+        db,
+        project_id,
+        commit,
+        tree_hash,
+        job_id,
+        plans,
+        &coordinates,
+        tool_use_id,
+        mode,
+        diagnostic_orch,
+        execute,
+        notify,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn run_planned_checks_at_commit_with_env<F, Fut, N, E>(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    plans: &[(CheckPlan, String)],
+    tool_use_id: &str,
+    mode: CheckExecMode,
+    diagnostic_orch: Option<&Orchestrator>,
+    effective_env: &[(String, String)],
+    execute: F,
+    notify: N,
+) -> Vec<CheckOutcome>
+where
+    F: Fn(usize, String, String) -> Fut,
+    Fut: std::future::Future<Output = Result<CheckExecResult, E>>,
+    E: Into<CheckExecutionFailure>,
+    N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
+{
+    let coordinates = sealed_coordinates(commit, tree_hash, plans);
+    run_planned_checks_at_commit_with_env_and_coordinates(
+        db,
+        project_id,
+        commit,
+        tree_hash,
+        job_id,
+        plans,
+        &coordinates,
+        tool_use_id,
+        mode,
+        diagnostic_orch,
+        effective_env,
+        execute,
+        notify,
+    )
+    .await
+}
+
+fn sealed_coordinates(
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    plans: &[(CheckPlan, String)],
+) -> Vec<crate::execution::cache::SealedCheckCoordinate> {
+    plans
+        .iter()
+        .map(|(_, input_hash)| {
+            crate::execution::cache::SealedCheckCoordinate::new(
+                commit.evaluated,
+                commit.defined_by,
+                tree_hash,
+                input_hash,
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub(crate) struct ReviewTreeOwner {
     pub(crate) project_key: String,
@@ -223,16 +321,19 @@ where
     E: Into<CheckExecutionFailure>,
     N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
 {
-    run_planned_checks_at_commit(
+    let commit = CheckRunCommit {
+        evaluated: tree_hash,
+        defined_by: tree_hash,
+    };
+    let coordinates = sealed_coordinates(commit, tree_hash, plans);
+    run_planned_checks_at_commit_with_coordinates(
         db,
         project_id,
-        CheckRunCommit {
-            evaluated: tree_hash,
-            defined_by: tree_hash,
-        },
+        commit,
         tree_hash,
         job_id,
         plans,
+        &coordinates,
         tool_use_id,
         mode,
         diagnostic_orch,
@@ -243,13 +344,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_planned_checks_at_commit<F, Fut, N, E>(
+pub(crate) async fn run_planned_checks_at_commit_with_coordinates<F, Fut, N, E>(
     db: Arc<LocalDb>,
     project_id: &str,
     commit: CheckRunCommit<'_>,
     tree_hash: &str,
     job_id: &str,
     plans: &[(CheckPlan, String)],
+    sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
     tool_use_id: &str,
     mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
@@ -269,6 +371,7 @@ where
         tree_hash,
         job_id,
         plans,
+        sealed_coordinates,
         tool_use_id,
         mode,
         diagnostic_orch,
@@ -282,13 +385,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_planned_checks_at_commit_with_env<F, Fut, N, E>(
+async fn run_planned_checks_at_commit_with_env_and_coordinates<F, Fut, N, E>(
     db: Arc<LocalDb>,
     project_id: &str,
     commit: CheckRunCommit<'_>,
     tree_hash: &str,
     job_id: &str,
     plans: &[(CheckPlan, String)],
+    sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
     tool_use_id: &str,
     mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
@@ -309,6 +413,7 @@ where
         tree_hash,
         job_id,
         plans,
+        sealed_coordinates,
         tool_use_id,
         mode,
         diagnostic_orch,
@@ -420,8 +525,14 @@ impl ManualCheckCacheContext {
     }
 }
 
+const UNCACHED_RETRY_PREFIX: &str = "export CAIRN_BUILD_SERVICE_UNFIT=1\n";
+
+fn uncached_retry_command(command: &str) -> String {
+    format!("{UNCACHED_RETRY_PREFIX}{command}")
+}
+
 fn require_snapshot_command(expected: &str, submitted: &str) -> Result<(), CheckExecutionFailure> {
-    if submitted == expected {
+    if submitted == expected || submitted == uncached_retry_command(expected) {
         Ok(())
     } else {
         Err(CheckExecutionFailure::substrate(
@@ -434,6 +545,7 @@ fn require_snapshot_command(expected: &str, submitted: &str) -> Result<(), Check
 #[derive(Debug, Clone)]
 struct ManualCheckContractSnapshot {
     context: ManualCheckCacheContext,
+    sealed_coordinate: crate::execution::cache::SealedCheckCoordinate,
     repository_path: String,
     /// The commit whose `.cairn/config.yaml` declared the requested check. An
     /// explicitly requested branch supplies both the definition and the content,
@@ -545,6 +657,12 @@ async fn resolve_manual_check_contract_snapshot(
         resolve_check_timeout_ms(Some(&configured_check), DEFAULT_REVIEW_CHECK_TIMEOUT_MS);
     let entry =
         crate::execution::cache::get_check_result(db, &project_id, check_name, &input_hash)?;
+    let sealed_coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+        &commit,
+        &defined_by_commit,
+        &tree_hash,
+        &input_hash,
+    );
     Ok(ManualCheckContractSnapshot {
         context: ManualCheckCacheContext {
             project_id,
@@ -556,6 +674,7 @@ async fn resolve_manual_check_contract_snapshot(
             cacheable: true,
             entry,
         },
+        sealed_coordinate,
         repository_path,
         defined_by_commit,
         configured_check,
@@ -755,6 +874,7 @@ pub async fn run_manual_configured_check_with_progress(
     let repository = PathBuf::from(&repository_path);
     let plan = contract.plan;
     let keyed = vec![(plan.clone(), context.input_hash.clone())];
+    let sealed_coordinates = vec![contract.sealed_coordinate];
     let progress_notify = progress.clone();
     let status_board = CheckStatusBoard::new(
         &keyed,
@@ -803,9 +923,10 @@ pub async fn run_manual_configured_check_with_progress(
         &context.tree_hash,
         &job_id,
         &keyed,
+        &sealed_coordinates,
         &tool_use_id,
         CheckExecMode::Shared,
-        None,
+        Some(orch),
         Some(status_board.clone()),
         &[],
         retry,
@@ -2497,6 +2618,13 @@ pub enum CheckFailureKind {
 }
 
 impl CheckFailureKind {
+    /// Whether the failure says Cairn could not obtain a verdict, rather than
+    /// saying the evaluated change failed. `TimedOut` is intentionally included:
+    /// current batches do not impose command-duration timeouts, so persisted
+    /// timeout results come from historical or mixed-version fleet budget kills.
+    /// A change-owned hang reaches today's build-slot deadline as a substrate
+    /// failure instead. Keeping that ownership here makes suppression, merge
+    /// gating, publication, and turn-end signaling share one policy.
     pub(crate) fn is_infrastructure(self) -> bool {
         matches!(
             self,
@@ -2568,6 +2696,10 @@ struct FailureClassification {
     kind: CheckFailureKind,
     reason: String,
     evidence_line: Option<usize>,
+    /// Positive evidence that sccache failed while reading a cached compiler
+    /// artifact. This is deliberately separate from the broad infrastructure
+    /// bucket so only this reviewed failure shape can trigger an uncached rerun.
+    cache_corruption: bool,
 }
 
 /// Name the way a failing check DIED when the death is not an ordinary test
@@ -2590,6 +2722,7 @@ fn classify_check_failure(
             kind: CheckFailureKind::SpawnError,
             reason: "Cairn: check process failed to spawn".to_string(),
             evidence_line: None,
+            cache_corruption: false,
         });
     }
     if timed_out {
@@ -2597,6 +2730,7 @@ fn classify_check_failure(
             kind: CheckFailureKind::TimedOut,
             reason: "Cairn: check exceeded its timeout budget".to_string(),
             evidence_line: None,
+            cache_corruption: false,
         });
     }
     if exit_code.is_none() {
@@ -2604,6 +2738,7 @@ fn classify_check_failure(
             kind: CheckFailureKind::Killed,
             reason: "Cairn: check process died without an exit code".to_string(),
             evidence_line: None,
+            cache_corruption: false,
         });
     }
     // Named failure sites — failing assertions, or files that failed to collect
@@ -2613,6 +2748,10 @@ fn classify_check_failure(
     }
 
     let lines: Vec<&str> = output.lines().collect();
+    let cache_corruption = lines.iter().position(|line| {
+        line.to_ascii_lowercase()
+            .contains("memory map must have a non-zero length")
+    });
     let explicit_infrastructure = (exit_code == Some(75))
         .then(|| {
             lines
@@ -2657,6 +2796,14 @@ fn classify_check_failure(
                 || line.contains("failed to read")
                 || line.contains("no such file or directory"))
     });
+    if let Some(evidence_line) = cache_corruption {
+        return Some(FailureClassification {
+            kind: CheckFailureKind::Infrastructure,
+            reason: "Cairn: sccache cache-read corruption matched reviewed evidence".to_string(),
+            evidence_line: Some(evidence_line),
+            cache_corruption: true,
+        });
+    }
     if let Some(evidence_line) = explicit_infrastructure
         .or(cache_or_sandbox_denial)
         .or(transport)
@@ -2669,6 +2816,7 @@ fn classify_check_failure(
                 "Cairn: infrastructure/toolchain failure matched reviewed abnormal-build evidence"
                     .to_string(),
             evidence_line: Some(evidence_line),
+            cache_corruption: false,
         });
     }
 
@@ -2699,6 +2847,7 @@ fn classify_check_failure(
             kind: CheckFailureKind::RunnerError,
             reason,
             evidence_line: unhandled,
+            cache_corruption: false,
         });
     }
 
@@ -2712,6 +2861,7 @@ fn classify_check_failure(
                      before collecting any test file"
                 .to_string(),
             evidence_line: None,
+            cache_corruption: false,
         });
     }
     None
@@ -3279,6 +3429,29 @@ async fn run_write_checks_after_seal_inner(
         .map(|published| published.commit.as_str())
         .unwrap_or(sealed_commit.as_str());
     let batched_results = Arc::new(std::sync::Mutex::new(batched_results));
+    let retry_orch = orch.clone();
+    let retry_context = run_context.clone();
+    let retry_keyed = keyed.clone();
+    let retry_checks = checks.clone();
+    let retry_timeouts = timeouts.clone();
+    let retry_commit = observation_commit.to_string();
+    let retry_env = slot_env.clone();
+    let retry_repository = resolve_check_repository(
+        orch,
+        &run_context.project_id,
+        &run_context.job_id,
+        repo_root,
+    )
+    .await
+    .ok();
+    let sealed_coordinates = sealed_coordinates(
+        CheckRunCommit {
+            evaluated: observation_commit,
+            defined_by: &defined_by_commit,
+        },
+        &tree_hash,
+        &keyed,
+    );
     let results = run_planned_checks_with_board(
         orch.db.local.clone(),
         &run_context.project_id,
@@ -3289,25 +3462,101 @@ async fn run_write_checks_after_seal_inner(
         &tree_hash,
         run_context.job_id.as_str(),
         &keyed,
+        &sealed_coordinates,
         tool_use_id,
         CheckExecMode::Shared,
         Some(orch),
         Some(status_board),
         &slot_env,
         false,
-        move |index, _command, _stream_id| {
+        move |index, command, stream_id| {
             let batched_results = batched_results.clone();
+            let orch = retry_orch.clone();
+            let context = retry_context.clone();
+            let keyed = retry_keyed.clone();
+            let checks = retry_checks.clone();
+            let timeouts = retry_timeouts.clone();
+            let sealed_commit = retry_commit.clone();
+            let env = retry_env.clone();
+            let repository = retry_repository.clone();
             async move {
-                batched_results
-                    .lock()
-                    .unwrap()
-                    .remove(&index)
-                    .unwrap_or_else(|| {
-                        Err(CheckExecutionFailure::substrate(
-                            SubstrateFailureShape::Result,
-                            format!("missing batched outcome for plan index {index}"),
-                        ))
-                    })
+                if !command.starts_with(UNCACHED_RETRY_PREFIX) {
+                    return batched_results
+                        .lock()
+                        .unwrap()
+                        .remove(&index)
+                        .unwrap_or_else(|| {
+                            Err(CheckExecutionFailure::substrate(
+                                SubstrateFailureShape::Result,
+                                format!("missing batched outcome for plan index {index}"),
+                            ))
+                        });
+                }
+                let Some((repository, store_dir)) = repository else {
+                    return Err(CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Dispatch,
+                        "could not resolve repository for uncached check retry",
+                    ));
+                };
+                let plan = &keyed[index].0;
+                let configured = checks
+                    .get(&plan.name)
+                    .expect("planned check must retain its configured definition");
+                submit_planned_check_batch(
+                    &orch,
+                    PlannedCheckBatchRequest {
+                        project_id: context.project_id.clone(),
+                        repository,
+                        store_dir,
+                        sealed_commit,
+                        requesting_job_id: context.job_id.clone(),
+                        owner: cairn_common::executor_protocol::CellOwnerRef {
+                            project_id: context.project_id.clone(),
+                            project_key: Some(context.project_key.clone()),
+                            issue_number: context.issue_number,
+                            job_id: Some(context.job_id.clone()),
+                            execution_seq: context.exec_seq,
+                            node_kind: context.job_name.clone(),
+                        },
+                        affinity_key: Some(context.job_id.clone()),
+                        priority: CellPriority::WriteCheck,
+                        env: env.clone(),
+                        items: vec![PlannedCheckBatchItem {
+                            index,
+                            name: plan.name.clone(),
+                            input_hash: keyed[index].1.clone(),
+                            resource_identity: CheckResourceIdentityInput::Configured {
+                                name: plan.name.clone(),
+                                check: configured.clone(),
+                            },
+                            command,
+                            stream_id,
+                            env,
+                            verdict_environment_names: plan.verdict_environment_names.clone(),
+                            timeout_ms: timeouts[index].into(),
+                            executor: configured.executor.clone(),
+                            verdict_platforms: crate::execution::check_identity::verdict_platforms(
+                                configured,
+                            ),
+                            resource_class: plan.resource_class,
+                        }],
+                        run_context: Some(context),
+                        mutation_policy: MutationPolicy::PureVerdict,
+                        status_board: None,
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    CheckExecutionFailure::substrate(SubstrateFailureShape::Dispatch, error)
+                })?
+                .results
+                .remove(&index)
+                .ok_or_else(|| {
+                    CheckExecutionFailure::substrate(
+                        SubstrateFailureShape::Result,
+                        format!("missing uncached retry outcome for plan index {index}"),
+                    )
+                })?
             }
         },
         move |_checks| {},
@@ -4177,9 +4426,7 @@ fn check_reuse_decision(
 #[allow(clippy::too_many_arguments)]
 fn fresh_observation_write(
     project_id: &str,
-    commit: CheckRunCommit<'_>,
-    tree_hash: &str,
-    input_hash: &str,
+    sealed_coordinate: &crate::execution::cache::SealedCheckCoordinate,
     plan: &CheckPlan,
     job_id: &str,
     tool_use_id: &str,
@@ -4238,14 +4485,15 @@ fn fresh_observation_write(
             }
         });
     FreshCheckObservationWrite {
+        sealed_coordinate: sealed_coordinate.clone(),
         id: uuid::Uuid::new_v4().to_string(),
         public_handle: uuid::Uuid::new_v4().simple().to_string()[..24].to_string(),
         project_id: project_id.to_string(),
-        commit_sha: commit.evaluated.to_string(),
-        defined_by_commit_sha: commit.defined_by.to_string(),
-        tree_hash: tree_hash.to_string(),
+        commit_sha: sealed_coordinate.evaluated_commit().to_string(),
+        defined_by_commit_sha: sealed_coordinate.defined_by_commit().to_string(),
+        tree_hash: sealed_coordinate.tree_hash().to_string(),
         check_name: plan.name.clone(),
-        input_hash: input_hash.to_string(),
+        input_hash: sealed_coordinate.input_hash().to_string(),
         environment_fingerprint,
         verdict_platform: provenance
             .and_then(|meta| meta.verdict_platform.clone())
@@ -4420,6 +4668,7 @@ async fn run_planned_checks_with_board<F, Fut, N, E>(
     tree_hash: &str,
     job_id: &str,
     plans: &[(CheckPlan, String)],
+    sealed_coordinates: &[crate::execution::cache::SealedCheckCoordinate],
     tool_use_id: &str,
     mode: CheckExecMode,
     diagnostic_orch: Option<&Orchestrator>,
@@ -4435,6 +4684,33 @@ where
     E: Into<CheckExecutionFailure>,
     N: Fn(Vec<CheckStatusEntry>) + Send + Sync + 'static,
 {
+    assert_eq!(
+        plans.len(),
+        sealed_coordinates.len(),
+        "every planned check needs a sealed coordinate witness"
+    );
+    for ((_, input_hash), coordinate) in plans.iter().zip(sealed_coordinates) {
+        assert_eq!(
+            input_hash,
+            coordinate.input_hash(),
+            "planned input must match its sealed witness"
+        );
+        assert_eq!(
+            commit.evaluated,
+            coordinate.evaluated_commit(),
+            "evaluated commit must match its sealed witness"
+        );
+        assert_eq!(
+            commit.defined_by,
+            coordinate.defined_by_commit(),
+            "defining commit must match its sealed witness"
+        );
+        assert_eq!(
+            tree_hash,
+            coordinate.tree_hash(),
+            "tree hash must match its sealed witness"
+        );
+    }
     // Checklist snapshot, seeded all-`pending` from the plan list. Each check
     // transitions ITS OWN entry and re-emits the whole snapshot, so the live line
     // is self-healing (latest snapshot wins). A std Mutex keeps the transition
@@ -4583,372 +4859,441 @@ where
             // runner-local permit taken BEFORE entering the executor's queue is
             // what let a review request hold host capacity while a later
             // write-cadence request waited behind it (CAIRN-3108).
-            board.transition(index, "running", None);
-            let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
-            let started = Instant::now();
-            let exec_outcome = execute(index, plan.command.clone(), stream_id)
-                .await
-                .map_err(Into::<CheckExecutionFailure>::into);
+            let mut uncached_retry = false;
+            let mut pending_publication = None;
+            loop {
+                board.transition(index, "running", None);
+                let stream_id = crate::mcp::handlers::run::check_stream_id(tool_use_id, index);
+                let command = if uncached_retry {
+                    uncached_retry_command(&plan.command)
+                } else {
+                    plan.command.clone()
+                };
+                let started = Instant::now();
+                let exec_outcome = execute(index, command, stream_id)
+                    .await
+                    .map_err(Into::<CheckExecutionFailure>::into);
 
-            // A refused reservation is not an execution. Submission declined to
-            // launch this command because the triple's retry budget is spent, so
-            // there is no output to parse, no verdict to classify, and nothing to
-            // store — doing any of those would invent a result for a command that
-            // never ran. Render the suppression from the last real attempt.
-            if matches!(exec_outcome, Err(CheckExecutionFailure::Suppressed)) {
-                let outcome = match get_suppressed_check_result(
-                    db.clone(),
-                    project_id,
-                    &plan.name,
-                    input_hash,
-                    job_id,
-                    commit.evaluated,
-                ) {
-                    Ok(Some(entry)) => record_suppressed_check(
-                        db,
-                        tree_hash,
+                // A refused reservation is not an execution. Submission declined to
+                // launch this command because the triple's retry budget is spent, so
+                // there is no output to parse, no verdict to classify, and nothing to
+                // store — doing any of those would invent a result for a command that
+                // never ran. Render the suppression from the last real attempt.
+                if matches!(exec_outcome, Err(CheckExecutionFailure::Suppressed)) {
+                    let outcome = match get_suppressed_check_result(
+                        db.clone(),
+                        project_id,
+                        &plan.name,
+                        input_hash,
                         job_id,
                         commit.evaluated,
-                        &plan.name,
-                        entry,
-                    ),
-                    // The row cannot normally be missing — only a suppressed
-                    // triple is ever refused — but the outcome must still say
-                    // "not run" rather than fall through to a verdict.
-                    _ => CheckOutcome {
-                        name: plan.name.clone(),
-                        passed: false,
-                        exit_code: None,
-                        failure_kind: Some(CheckFailureKind::Infrastructure),
-                        parsed: None,
-                        output_tail: suppressed_check_message(
-                            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-                            "the stored diagnostic is no longer available",
+                    ) {
+                        Ok(Some(entry)) => record_suppressed_check(
+                            db,
+                            tree_hash,
+                            job_id,
+                            commit.evaluated,
+                            &plan.name,
+                            entry,
                         ),
-                        cached: false,
-                        duration_ms: 0,
-                        suppressed_after: Some(
-                            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-                        ),
-                        recorded: None,
-                        not_recorded: None,
-                    },
-                };
-                board.transition(index, "failed", summary_annotation(&outcome));
-                return (index, outcome);
-            }
+                        // The row cannot normally be missing — only a suppressed
+                        // triple is ever refused — but the outcome must still say
+                        // "not run" rather than fall through to a verdict.
+                        _ => CheckOutcome {
+                            name: plan.name.clone(),
+                            passed: false,
+                            exit_code: None,
+                            failure_kind: Some(CheckFailureKind::Infrastructure),
+                            parsed: None,
+                            output_tail: suppressed_check_message(
+                                crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                                "the stored diagnostic is no longer available",
+                            ),
+                            cached: false,
+                            duration_ms: 0,
+                            suppressed_after: Some(
+                                crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                            ),
+                            recorded: None,
+                            not_recorded: None,
+                        },
+                    };
+                    board.transition(index, "failed", summary_annotation(&outcome));
+                    return (index, outcome);
+                }
 
-            let (
-                exit_code,
-                output,
-                timed_out,
-                spawn_error,
-                substrate_failure,
-                authoritative_duration_ms,
-                provenance,
-                publication,
-            ) = match exec_outcome {
-                Ok(CheckExecResult {
+                let (
                     exit_code,
                     output,
-                    timed_out,
-                    duration_ms,
-                    provenance,
-                    publication,
-                }) => (
-                    exit_code,
-                    output,
-                    timed_out,
-                    false,
-                    None,
-                    duration_ms,
-                    provenance,
-                    publication,
-                ),
-                Err(CheckExecutionFailure::Process(err)) => {
-                    (None, err, false, true, None, None, None, None)
-                }
-                // The two halves part here: the agent-facing message becomes
-                // the check's output, while the composed failure travels
-                // beside it — its diagnostic to the operator log record
-                // below, its applicability to the advisory gate.
-                Err(CheckExecutionFailure::Substrate(failure)) => (
-                    None,
-                    failure.agent_message(),
-                    false,
-                    false,
-                    Some(failure),
-                    None,
-                    None,
-                    None,
-                ),
-                Err(CheckExecutionFailure::Suppressed) => {
-                    unreachable!("a refused reservation returns above")
-                }
-            };
-            let duration_ms =
-                authoritative_duration_ms.unwrap_or_else(|| started.elapsed().as_millis() as i64);
-            let passed = exit_code == Some(0);
-
-            // Parse before classifying: positive assertion failures outrank any
-            // incidental infrastructure warning in the combined output.
-            let parsed = parse_check_output(&plan.command, &output);
-            let classification = if let Some(substrate) = substrate_failure.as_ref() {
-                Some(FailureClassification {
-                    kind: substrate_failure_kind(substrate),
-                    reason: "Cairn: this check produced no verdict because Cairn's own \
-                             infrastructure failed"
-                        .to_string(),
-                    evidence_line: None,
-                })
-            } else {
-                classify_check_failure(
-                    &plan.command,
-                    exit_code,
                     timed_out,
                     spawn_error,
-                    parsed.as_ref(),
-                    &output,
-                )
-            };
-            let failure_kind = classification.as_ref().map(|c| c.kind);
-            let target_results_json = parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
-            // A substrate failure's `output` is already the message composed for
-            // the agent; framing authored text as "evidence" beneath a reason
-            // header would only wrap it in a second voice.
-            let mut output_tail = if substrate_failure.is_some() {
-                tail(&output, OUTPUT_TAIL_CHARS)
-            } else {
-                classified_output_excerpt(&output, classification.as_ref())
-            };
+                    substrate_failure,
+                    authoritative_duration_ms,
+                    provenance,
+                    publication,
+                ) = match exec_outcome {
+                    Ok(CheckExecResult {
+                        exit_code,
+                        output,
+                        timed_out,
+                        duration_ms,
+                        provenance,
+                        publication,
+                    }) => (
+                        exit_code,
+                        output,
+                        timed_out,
+                        false,
+                        None,
+                        duration_ms,
+                        provenance,
+                        publication,
+                    ),
+                    Err(CheckExecutionFailure::Process(err)) => {
+                        (None, err, false, true, None, None, None, None)
+                    }
+                    // The two halves part here: the agent-facing message becomes
+                    // the check's output, while the composed failure travels
+                    // beside it — its diagnostic to the operator log record
+                    // below, its applicability to the advisory gate.
+                    Err(CheckExecutionFailure::Substrate(failure)) => (
+                        None,
+                        failure.agent_message(),
+                        false,
+                        false,
+                        Some(failure),
+                        None,
+                        None,
+                        None,
+                    ),
+                    Err(CheckExecutionFailure::Suppressed) => {
+                        unreachable!("a refused reservation returns above")
+                    }
+                };
+                let duration_ms = authoritative_duration_ms
+                    .unwrap_or_else(|| started.elapsed().as_millis() as i64);
+                let passed = exit_code == Some(0);
 
-            if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
-                let resources = crate::pressure::platform::read_process_resources();
-                let host = crate::pressure::platform::read_host_resources();
-                let process_tree = crate::pressure::process_tree::sample_ps_rows()
-                    .map(|rows| {
-                        let mut rows = crate::pressure::process_tree::select_process_tree(
-                            &rows,
-                            std::process::id(),
-                        );
-                        rows.sort_by_key(|row| std::cmp::Reverse(row.rss_kb));
-                        rows.into_iter()
-                            .take(16)
-                            .map(|row| {
-                                serde_json::json!({
-                                    "pid": row.pid,
-                                    "parentPid": row.ppid,
-                                    "cpuPercent": row.cpu_percent,
-                                    "rssKb": row.rss_kb,
-                                    "command": row.command,
-                                })
-                            })
-                            .collect::<Vec<_>>()
+                // Parse before classifying: positive assertion failures outrank any
+                // incidental infrastructure warning in the combined output.
+                let parsed = parse_check_output(&plan.command, &output);
+                let classification = if let Some(substrate) = substrate_failure.as_ref() {
+                    Some(FailureClassification {
+                        kind: substrate_failure_kind(substrate),
+                        reason: "Cairn: this check produced no verdict because Cairn's own \
+                             infrastructure failed"
+                            .to_string(),
+                        evidence_line: None,
+                        cache_corruption: false,
                     })
-                    .unwrap_or_default();
-                let build_service =
-                    diagnostic_orch.map(|orch| orch.build_service_diagnostic_snapshot("sccache"));
-                output_tail = with_build_service_advisory(
-                    output_tail,
-                    build_service.as_ref(),
-                    substrate_failure.as_ref(),
-                );
-                log::warn!(
-                    "{}",
-                    infrastructure_failure_log_line(
-                        &plan.name,
-                        substrate_failure.as_ref().map(SubstrateFailure::diagnostic),
-                        serde_json::json!({
-                            "jobId": job_id,
-                            "suiteId": tool_use_id,
-                            "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
-                            "resourceClass": plan.resource_class.as_str(),
-                            "declaredConcurrencyUnits": declared_check_reservation(plan.resource_class).concurrency_units,
-                            "durationMs": duration_ms,
-                            "exitCode": exit_code,
-                            "timedOut": timed_out,
-                            "runnerRssBytes": resources.rss_bytes,
-                            "runnerPhysicalFootprintBytes": resources.phys_footprint_bytes,
-                            "hostTotalMemoryBytes": host.total_memory_bytes,
-                            "hostAvailableMemoryBytes": host.available_memory_bytes,
-                            "hostLoadAverage": host.load_average,
-                            "processTree": process_tree,
-                            "buildService": build_service,
-                        })
-                    )
-                );
-            }
-
-            let publication_role = match publication {
-                Some(publication) => Some(publication.acquire().await),
-                None => None,
-            };
-            // Either a sibling already recorded this verdict and named the row it
-            // wrote, or this evaluation records it and names that row for every
-            // sibling. Both arms end holding the same answer to "what is this
-            // verdict's durable identity", which is what the caller reports.
-            let (recorded, published_here, not_recorded) = match publication_role {
-                Some(crate::fleet::PublicationRole::Published(Some(recorded))) => {
-                    (Some(recorded), false, None)
-                }
-                Some(crate::fleet::PublicationRole::Published(None)) => {
-                    let reason = "a coalesced sibling produced this verdict but its observation write failed".to_string();
-                    log::warn!("check {:?} was not recorded: {reason}", plan.name);
-                    (None, false, Some(reason))
-                }
-                role => {
-                    let legacy_write = CheckResultCacheWrite {
-                        project_id: project_id.to_string(),
-                        defined_by_commit_sha: Some(commit.defined_by.to_string()),
-                        tree_hash: tree_hash.to_string(),
-                        input_hash: input_hash.clone(),
-                        check_name: plan.name.clone(),
-                        exit_code: exit_code.unwrap_or(-1),
-                        passed,
-                        output_tail: output_tail.clone(),
-                        duration_ms,
-                        target_results_json,
-                        job_id: Some(job_id.to_string()),
-                        cached: Some(false),
-                        failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
-                        executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
-                        executor_device_id: provenance
-                            .as_ref()
-                            .map(|meta| meta.executor_device_id.clone()),
-                        executor_connection_generation: provenance
-                            .as_ref()
-                            .map(|meta| meta.executor_connection_generation as i64),
-                        executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
-                        executor_lease_epoch: provenance
-                            .as_ref()
-                            .map(|meta| meta.cell_epoch as i64),
-                        executor_started_at_unix_ms: provenance
-                            .as_ref()
-                            .map(|meta| meta.started_at_unix_ms as i64),
-                        executor_finished_at_unix_ms: provenance
-                            .as_ref()
-                            .map(|meta| meta.finished_at_unix_ms as i64),
-                        toolchain_fingerprint: provenance
-                            .as_ref()
-                            .and_then(|meta| meta.toolchain_fingerprint.clone())
-                            .or_else(|| Some(check_toolchain_identity().to_string())),
-                        environment_fingerprint: infra_suppression_scope(job_id, commit.evaluated),
-                        verdict_platform: provenance
-                            .as_ref()
-                            .and_then(|meta| meta.verdict_platform.clone()),
-                        verdict_arch: provenance
-                            .as_ref()
-                            .and_then(|meta| meta.verdict_arch.clone()),
-                        verdict_environment_hash: provenance
-                            .as_ref()
-                            .and_then(|meta| meta.verdict_environment_hash.clone()),
-                    };
-                    let reuse = check_reuse_decision(&plan.command, failure_kind, parsed.as_ref());
-                    let observation = fresh_observation_write(
-                        project_id,
-                        commit,
-                        tree_hash,
-                        input_hash,
-                        plan,
-                        job_id,
-                        tool_use_id,
-                        exit_code.unwrap_or(-1),
-                        failure_kind,
-                        duration_ms,
-                        &output_tail,
-                        provenance.as_ref(),
+                } else {
+                    classify_check_failure(
+                        &plan.command,
+                        exit_code,
+                        timed_out,
+                        spawn_error,
                         parsed.as_ref(),
-                        reuse,
+                        &output,
+                    )
+                };
+                let cache_corruption = classification
+                    .as_ref()
+                    .is_some_and(|classification| classification.cache_corruption);
+                let failure_kind = classification.as_ref().map(|c| c.kind);
+                let target_results_json =
+                    parsed.as_ref().and_then(|p| serde_json::to_string(p).ok());
+                // A substrate failure's `output` is already the message composed for
+                // the agent; framing authored text as "evidence" beneath a reason
+                // header would only wrap it in a second voice.
+                let mut output_tail = if substrate_failure.is_some() {
+                    tail(&output, OUTPUT_TAIL_CHARS)
+                } else {
+                    classified_output_excerpt(&output, classification.as_ref())
+                };
+
+                if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+                    let resources = crate::pressure::platform::read_process_resources();
+                    let host = crate::pressure::platform::read_host_resources();
+                    let process_tree = crate::pressure::process_tree::sample_ps_rows()
+                        .map(|rows| {
+                            let mut rows = crate::pressure::process_tree::select_process_tree(
+                                &rows,
+                                std::process::id(),
+                            );
+                            rows.sort_by_key(|row| std::cmp::Reverse(row.rss_kb));
+                            rows.into_iter()
+                                .take(16)
+                                .map(|row| {
+                                    serde_json::json!({
+                                        "pid": row.pid,
+                                        "parentPid": row.ppid,
+                                        "cpuPercent": row.cpu_percent,
+                                        "rssKb": row.rss_kb,
+                                        "command": row.command,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let build_service = diagnostic_orch
+                        .map(|orch| orch.build_service_diagnostic_snapshot("sccache"));
+                    output_tail = with_build_service_advisory(
+                        output_tail,
+                        build_service.as_ref(),
+                        substrate_failure.as_ref(),
                     );
-                    let identity = crate::execution::cache::RecordedCheckObservation {
-                        id: observation.id.clone(),
-                        public_handle: observation.public_handle.clone(),
-                        ran_at: observation.ran_at,
-                        environment_fingerprint: observation.environment_fingerprint.clone(),
-                        reusable: observation.reusable,
-                    };
-                    let (recorded, not_recorded) = match record_fresh_check_observation(
-                        db.clone(),
-                        observation,
-                    ) {
-                        Ok(()) => {
-                            let reason = provenance.as_ref().is_some_and(|meta| {
+                    log::warn!(
+                        "{}",
+                        infrastructure_failure_log_line(
+                            &plan.name,
+                            substrate_failure.as_ref().map(SubstrateFailure::diagnostic),
+                            serde_json::json!({
+                                "jobId": job_id,
+                                "suiteId": tool_use_id,
+                                "cadence": if tool_use_id.starts_with("turn-checks:") { "review" } else { "write" },
+                                "resourceClass": plan.resource_class.as_str(),
+                                "declaredConcurrencyUnits": declared_check_reservation(plan.resource_class).concurrency_units,
+                                "durationMs": duration_ms,
+                                "exitCode": exit_code,
+                                "timedOut": timed_out,
+                                "runnerRssBytes": resources.rss_bytes,
+                                "runnerPhysicalFootprintBytes": resources.phys_footprint_bytes,
+                                "hostTotalMemoryBytes": host.total_memory_bytes,
+                                "hostAvailableMemoryBytes": host.available_memory_bytes,
+                                "hostLoadAverage": host.load_average,
+                                "processTree": process_tree,
+                                "buildService": build_service,
+                            })
+                        )
+                    );
+                }
+
+                // A corruption result is provisional. The publisher retains the
+                // original execution's guard across the one uncached retry, keeping
+                // every coalesced sibling blocked until the retry is recorded.
+                let publication_role = if let Some(guard) = pending_publication.take() {
+                    Some(crate::fleet::PublicationRole::Publisher(guard))
+                } else {
+                    match publication {
+                        Some(publication) => Some(publication.acquire().await),
+                        None => None,
+                    }
+                };
+                if cache_corruption && !uncached_retry {
+                    match publication_role {
+                        Some(crate::fleet::PublicationRole::Publisher(guard)) => {
+                            pending_publication = Some(guard);
+                        }
+                        Some(crate::fleet::PublicationRole::Published(recorded)) => {
+                            let entry = get_check_result(
+                                db.clone(),
+                                project_id,
+                                &plan.name,
+                                input_hash,
+                            )
+                            .ok()
+                            .flatten()
+                            .expect("published check observation must have a canonical cache row");
+                            let parsed = entry
+                                .target_results_json
+                                .as_deref()
+                                .and_then(|json| serde_json::from_str(json).ok());
+                            let outcome = CheckOutcome {
+                                name: plan.name.clone(),
+                                passed: entry.passed,
+                                exit_code: Some(entry.exit_code),
+                                failure_kind: entry
+                                    .failure_kind
+                                    .as_deref()
+                                    .and_then(CheckFailureKind::from_stored),
+                                parsed,
+                                output_tail: entry.output_tail,
+                                cached: false,
+                                duration_ms: entry.duration_ms,
+                                suppressed_after: None,
+                                recorded,
+                                not_recorded: None,
+                            };
+                            board.transition(
+                                index,
+                                if outcome.passed { "passed" } else { "failed" },
+                                summary_annotation(&outcome),
+                            );
+                            return (index, outcome);
+                        }
+                        None => {}
+                    }
+                    if let Some(orch) = diagnostic_orch {
+                        orch.report_compile_cache_corruption(&output_tail);
+                    }
+                    uncached_retry = true;
+                    continue;
+                }
+
+                // Either a sibling already recorded this verdict and named the row it
+                // wrote, or this evaluation records it and names that row for every
+                // sibling. Both arms end holding the same answer to "what is this
+                // verdict's durable identity", which is what the caller reports.
+                let (recorded, published_here, not_recorded) = match publication_role {
+                    Some(crate::fleet::PublicationRole::Published(recorded)) => {
+                        (recorded, false, None)
+                    }
+                    role => {
+                        let legacy_write = CheckResultCacheWrite {
+                            project_id: project_id.to_string(),
+                            defined_by_commit_sha: Some(commit.defined_by.to_string()),
+                            tree_hash: tree_hash.to_string(),
+                            input_hash: input_hash.clone(),
+                            check_name: plan.name.clone(),
+                            exit_code: exit_code.unwrap_or(-1),
+                            passed,
+                            output_tail: output_tail.clone(),
+                            duration_ms,
+                            target_results_json,
+                            job_id: Some(job_id.to_string()),
+                            cached: Some(false),
+                            failure_kind: failure_kind.map(|kind| kind.as_str().to_string()),
+                            executor_id: provenance.as_ref().map(|meta| meta.executor_id.clone()),
+                            executor_device_id: provenance
+                                .as_ref()
+                                .map(|meta| meta.executor_device_id.clone()),
+                            executor_connection_generation: provenance
+                                .as_ref()
+                                .map(|meta| meta.executor_connection_generation as i64),
+                            executor_cell_id: provenance.as_ref().map(|meta| meta.cell_id.clone()),
+                            executor_lease_epoch: provenance
+                                .as_ref()
+                                .map(|meta| meta.cell_epoch as i64),
+                            executor_started_at_unix_ms: provenance
+                                .as_ref()
+                                .map(|meta| meta.started_at_unix_ms as i64),
+                            executor_finished_at_unix_ms: provenance
+                                .as_ref()
+                                .map(|meta| meta.finished_at_unix_ms as i64),
+                            toolchain_fingerprint: provenance
+                                .as_ref()
+                                .and_then(|meta| meta.toolchain_fingerprint.clone())
+                                .or_else(|| Some(check_toolchain_identity().to_string())),
+                            environment_fingerprint: infra_suppression_scope(
+                                job_id,
+                                commit.evaluated,
+                            ),
+                            verdict_platform: provenance
+                                .as_ref()
+                                .and_then(|meta| meta.verdict_platform.clone()),
+                            verdict_arch: provenance
+                                .as_ref()
+                                .and_then(|meta| meta.verdict_arch.clone()),
+                            verdict_environment_hash: provenance
+                                .as_ref()
+                                .and_then(|meta| meta.verdict_environment_hash.clone()),
+                        };
+                        let reuse =
+                            check_reuse_decision(&plan.command, failure_kind, parsed.as_ref());
+                        let observation = fresh_observation_write(
+                            project_id,
+                            &sealed_coordinates[index],
+                            plan,
+                            job_id,
+                            tool_use_id,
+                            exit_code.unwrap_or(-1),
+                            failure_kind,
+                            duration_ms,
+                            &output_tail,
+                            provenance.as_ref(),
+                            parsed.as_ref(),
+                            reuse,
+                        );
+                        let identity = crate::execution::cache::RecordedCheckObservation {
+                            id: observation.id.clone(),
+                            public_handle: observation.public_handle.clone(),
+                            ran_at: observation.ran_at,
+                            environment_fingerprint: observation.environment_fingerprint.clone(),
+                            reusable: observation.reusable,
+                        };
+                        let (recorded, not_recorded) = match record_fresh_check_observation(
+                            db.clone(),
+                            observation,
+                        ) {
+                            Ok(()) => {
+                                let reason = provenance.as_ref().is_some_and(|meta| {
                                 meta.executor_id != crate::fleet::COLOCATED_EXECUTOR_ID
                                     && meta.environment_fingerprint.is_empty()
                             }).then(|| "the selected legacy executor did not report a complete verdict environment identity".to_string());
-                            (Some(identity), reason)
+                                (Some(identity), reason)
+                            }
+                            Err(error) => {
+                                log::warn!("failed to record immutable check observation: {error}");
+                                (None, Some(format!("the observation write failed: {error}")))
+                            }
+                        };
+                        // The legacy row is retained only for infrastructure retry/suppression diagnosis.
+                        if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+                            let _ = store_check_result(db.clone(), legacy_write);
                         }
-                        Err(error) => {
-                            log::warn!("failed to record immutable check observation: {error}");
-                            (None, Some(format!("the observation write failed: {error}")))
+                        if let Some(crate::fleet::PublicationRole::Publisher(guard)) = role {
+                            guard.published(recorded.clone());
                         }
-                    };
-                    // The legacy row is retained only for infrastructure retry/suppression diagnosis.
-                    if failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
-                        let _ = store_check_result(db.clone(), legacy_write);
+                        (recorded, true, not_recorded)
                     }
-                    if let Some(crate::fleet::PublicationRole::Publisher(guard)) = role {
-                        guard.published(recorded.clone());
-                    }
-                    (recorded, true, not_recorded)
-                }
-            };
+                };
 
-            // The bound may have just been reached by the store above. Claim the
-            // ONE escalation this triple is allowed and, if we won it, put the
-            // operator's half of the story where the rest of it already lives.
-            if published_here && failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
-                match claim_infra_escalation(
-                    db.clone(),
-                    project_id,
-                    &plan.name,
-                    input_hash,
-                    job_id,
-                    commit.evaluated,
-                ) {
-                    Ok(true) => log::error!(
-                        "check infrastructure failure: {}",
-                        serde_json::json!({
-                            "escalation": "suppressed",
-                            "check": plan.name,
-                            "projectId": project_id,
-                            "inputHash": input_hash,
-                            "jobId": job_id,
-                            "suiteId": tool_use_id,
-                            "bound": crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-                            "lastDiagnostic": output_tail,
-                            "consequence": "Cairn has stopped executing this check for these inputs. It \
-                                            runs again when its inputs change, or for these same inputs \
-                                            after the substrate is repaired and Cairn restarts.",
-                        })
-                    ),
-                    Ok(false) => {}
-                    Err(error) => log::warn!(
-                        "failed to claim the infrastructure escalation for check {:?}: {error}",
-                        plan.name
-                    ),
+                // The bound may have just been reached by the store above. Claim the
+                // ONE escalation this triple is allowed and, if we won it, put the
+                // operator's half of the story where the rest of it already lives.
+                if published_here && failure_kind.is_some_and(CheckFailureKind::is_infrastructure) {
+                    match claim_infra_escalation(
+                        db.clone(),
+                        project_id,
+                        &plan.name,
+                        input_hash,
+                        job_id,
+                        commit.evaluated,
+                    ) {
+                        Ok(true) => log::error!(
+                            "check infrastructure failure: {}",
+                            serde_json::json!({
+                                "escalation": "suppressed",
+                                "check": plan.name,
+                                "projectId": project_id,
+                                "inputHash": input_hash,
+                                "jobId": job_id,
+                                "suiteId": tool_use_id,
+                                "bound": crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                                "lastDiagnostic": output_tail,
+                                "consequence": "Cairn has stopped executing this check for these inputs. It \
+                                                runs again when its inputs change, or for these same inputs \
+                                                after the substrate is repaired and Cairn restarts.",
+                            })
+                        ),
+                        Ok(false) => {}
+                        Err(error) => log::warn!(
+                            "failed to claim the infrastructure escalation for check {:?}: {error}",
+                            plan.name
+                        ),
+                    }
                 }
+
+                let outcome = CheckOutcome {
+                    name: plan.name.clone(),
+                    passed,
+                    exit_code,
+                    failure_kind,
+                    parsed,
+                    output_tail,
+                    cached: false,
+                    duration_ms,
+                    suppressed_after: None,
+                    recorded,
+                    not_recorded,
+                };
+                board.transition(
+                    index,
+                    if passed { "passed" } else { "failed" },
+                    summary_annotation(&outcome),
+                );
+                return (index, outcome);
             }
-
-            let outcome = CheckOutcome {
-                name: plan.name.clone(),
-                passed,
-                exit_code,
-                failure_kind,
-                parsed,
-                output_tail,
-                cached: false,
-                duration_ms,
-                suppressed_after: None,
-                recorded,
-                not_recorded,
-            };
-            board.transition(
-                index,
-                if passed { "passed" } else { "failed" },
-                summary_annotation(&outcome),
-            );
-            (index, outcome)
         }
     };
 
@@ -5856,16 +6201,19 @@ pub(crate) async fn verify_review_tree(
             }
         };
         let batched_results = Arc::new(std::sync::Mutex::new(batched_results));
-        run_planned_checks_at_commit_with_env(
+        let commit = CheckRunCommit {
+            evaluated: commit_id,
+            defined_by: &defined_by_commit,
+        };
+        let sealed_coordinates = sealed_coordinates(commit, tree_hash, &keyed);
+        run_planned_checks_at_commit_with_env_and_coordinates(
             result_db,
             project_id,
-            CheckRunCommit {
-                evaluated: commit_id,
-                defined_by: &defined_by_commit,
-            },
+            commit,
             tree_hash,
             requesting_job_id,
             &keyed,
+            &sealed_coordinates,
             &format!("main-health:{requesting_job_id}"),
             CheckExecMode::Shared,
             Some(orch),
@@ -5892,16 +6240,19 @@ pub(crate) async fn verify_review_tree(
         .await
     } else {
         let execution_env = env.clone();
-        run_planned_checks_at_commit_with_env(
+        let commit_coordinate = CheckRunCommit {
+            evaluated: commit_id,
+            defined_by: &defined_by_commit,
+        };
+        let sealed_coordinates = sealed_coordinates(commit_coordinate, tree_hash, &keyed);
+        run_planned_checks_at_commit_with_env_and_coordinates(
             result_db,
             project_id,
-            CheckRunCommit {
-                evaluated: commit_id,
-                defined_by: &defined_by_commit,
-            },
+            commit_coordinate,
             tree_hash,
             requesting_job_id,
             &keyed,
+            &sealed_coordinates,
             &format!("merge-gate:{requesting_job_id}"),
             CheckExecMode::Isolated,
             Some(orch),
@@ -6239,14 +6590,12 @@ mod tests {
     #[test]
     fn manual_producer_uses_the_same_observation_shape_with_manual_provenance() {
         let plan = plan("rust-tests", "bun run test:rust");
+        let coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+            "commit", "commit", "tree", "input",
+        );
         let write = fresh_observation_write(
             "project",
-            CheckRunCommit {
-                evaluated: "commit",
-                defined_by: "commit",
-            },
-            "tree",
-            "input",
+            &coordinate,
             &plan,
             "job",
             "manual-check:run-123:rust-tests",
@@ -6391,6 +6740,167 @@ mod tests {
         );
         let commit = git(&repo, &["rev-parse", "HEAD"]);
         (repo, commit)
+    }
+
+    #[tokio::test]
+    async fn dirty_checkout_cannot_change_a_sealed_check_coordinate() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, _) = committed_git_repo(&temp);
+        std::fs::create_dir_all(repo.join(".cairn")).unwrap();
+        std::fs::write(
+            repo.join(".cairn/config.yaml"),
+            "checks:\n  sealed:\n    command: grep sealed checked.txt\n    impact:\n      - checked.txt\n",
+        )
+        .unwrap();
+        git(&repo, &["add", ".cairn/config.yaml"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Cairn Test",
+                "-c",
+                "user.email=test@cairn.local",
+                "commit",
+                "-q",
+                "-m",
+                "sealed contract",
+            ],
+        );
+        let sealed_commit = git(&repo, &["rev-parse", "HEAD"]);
+        let jj = JjEnv::resolve(&orch.jj_binary_path, &orch.config_dir);
+
+        async fn identity(
+            jj: &JjEnv,
+            repo: &Path,
+            commit: &str,
+        ) -> (String, String, String, CheckPlan) {
+            let CommitChecksContract {
+                contract:
+                    ChecksContract {
+                        checks,
+                        extra_inputs,
+                    },
+                defined_by_commit,
+            } = load_checks_contract_at_commit(repo, commit)
+                .await
+                .expect("sealed commit declares the check");
+            let tree_hash = crate::jj::logical_tree_hash(jj, repo, commit).unwrap();
+            let entries = crate::jj::tree_entries(jj, repo, commit).ok();
+            let blobs = TreeBlobs {
+                jj,
+                repository: repo,
+            };
+            let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+            let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+            let check = checks.get("sealed").unwrap();
+            let input_hash = check_result_key(
+                check,
+                inputs.for_check("sealed"),
+                entries.as_deref(),
+                &tree_hash,
+                &check_platform_identity(),
+                check_toolchain_identity(),
+            );
+            let plan = plan_checks(&checks, &inputs, &[], repo)
+                .into_iter()
+                .find(|plan| plan.name == "sealed")
+                .expect("sealed check is planned from the sealed contract");
+            (defined_by_commit, tree_hash, input_hash, plan)
+        }
+
+        let clean = identity(&jj, &repo, &sealed_commit).await;
+        std::fs::write(repo.join("checked.txt"), "loose poison").unwrap();
+        std::fs::write(
+            repo.join(".cairn/config.yaml"),
+            "checks:\n  sealed:\n    command: false\n    impact:\n      - checked.txt\n",
+        )
+        .unwrap();
+        let dirty = identity(&jj, &repo, &sealed_commit).await;
+        assert_eq!(
+            (&clean.0, &clean.1, &clean.2),
+            (&dirty.0, &dirty.1, &dirty.2),
+            "loose files cannot alter sealed ownership"
+        );
+        assert_eq!(
+            dirty.3.command, clean.3.command,
+            "loose config cannot replace the sealed command"
+        );
+
+        let db = cache_db().await;
+        let plans = vec![(clean.3.clone(), clean.2.clone())];
+        let coordinates = vec![crate::execution::cache::SealedCheckCoordinate::new(
+            &sealed_commit,
+            &clean.0,
+            &clean.1,
+            &clean.2,
+        )];
+        let outcomes = run_planned_checks_at_commit_with_coordinates(
+            db.clone(),
+            "project-a",
+            CheckRunCommit {
+                evaluated: &sealed_commit,
+                defined_by: &clean.0,
+            },
+            &clean.1,
+            "job-a",
+            &plans,
+            &coordinates,
+            "manual-check:sealed",
+            CheckExecMode::Shared,
+            None,
+            |_index, command, _stream_id| async move {
+                assert_eq!(command, "grep sealed checked.txt");
+                exec_ok(Some(0), "sealed content matched")
+            },
+            |_| {},
+        )
+        .await;
+        assert!(outcomes[0].passed);
+        outcomes[0]
+            .recorded
+            .as_ref()
+            .expect("sealed verdict recorded");
+        let stored = get_check_result(db.clone(), "project-a", "sealed", &clean.2)
+            .unwrap()
+            .expect("sealed coordinate is reloadable");
+        assert_eq!(stored.tree_hash, clean.1);
+        assert_eq!(stored.input_hash, clean.2);
+        assert_eq!(
+            stored.defined_by_commit_sha.as_deref(),
+            Some(sealed_commit.as_str())
+        );
+
+        git(&repo, &["add", "checked.txt", ".cairn/config.yaml"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Cairn Test",
+                "-c",
+                "user.email=test@cairn.local",
+                "commit",
+                "-q",
+                "-m",
+                "seal poison",
+            ],
+        );
+        let changed_commit = git(&repo, &["rev-parse", "HEAD"]);
+        let changed = identity(&jj, &repo, &changed_commit).await;
+        assert_ne!(
+            clean.1, changed.1,
+            "a newly sealed tree has a new tree hash"
+        );
+        assert_ne!(
+            clean.2, changed.2,
+            "a newly sealed contract/input has a new input hash"
+        );
+        assert!(
+            get_check_result(db, "project-a", "sealed", &changed.2)
+                .unwrap()
+                .is_none(),
+            "loose-derived identity was never persisted"
+        );
     }
 
     #[tokio::test]
@@ -6831,20 +7341,6 @@ cairn-common = { path = "../cairn-common" }
     #[tokio::test]
     async fn cached_partial_observation_is_a_miss_for_main_health_full_run() {
         let db = cache_db().await;
-        // This reduced cache fixture intentionally predates migration 0146. DDL
-        // must use the exclusive migration transaction rather than LocalDb's
-        // ordinary concurrent write transaction.
-        db.exclusive(|conn| {
-            Box::pin(async move {
-                conn.execute_batch(
-                    "ALTER TABLE check_result_observations ADD COLUMN public_handle TEXT;",
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
         let configured = check(
             "bun run test:rust {changedFiles}",
             Some(&["src-tauri/**"]),
@@ -8903,13 +9399,15 @@ cairn-common = { path = "../cairn-common" }
         else {
             panic!("index 2 is a substrate failure");
         };
-        assert_eq!(
-            structural.agent_message(),
-            format!(
-                "{} {SUBSTRATE_FAILURE_CONSEQUENCE}",
-                SubstrateFailureShape::NoMachine.lead()
-            ),
-            "a refusal that was never about waiting gains no wait story"
+        let message = structural.agent_message();
+        assert!(message.starts_with(&format!(
+            "{} {SUBSTRATE_FAILURE_CONSEQUENCE}",
+            SubstrateFailureShape::NoMachine.lead()
+        )));
+        assert!(message.contains("no executor advertises matlab"));
+        assert!(
+            !message.contains("CAIRN-3414's rust-tests"),
+            "a refusal that was never about waiting gains no wait story: {message}"
         );
     }
 
@@ -9184,7 +9682,7 @@ cairn-common = { path = "../cairn-common" }
             db.clone(),
             "project-a",
             "tree-specimen",
-            "job-a",
+            "job-test",
             &[(plan("rust", "cargo test"), "input-specimen".to_string())],
             "tool",
             CheckExecMode::Shared,
@@ -9297,7 +9795,7 @@ cairn-common = { path = "../cairn-common" }
     }
 
     #[test]
-    fn merge_gate_treats_command_timeout_as_named_check_failure() {
+    fn merge_gate_treats_command_timeout_as_infrastructure_failure() {
         let result = review_tree_gate_result(vec![CheckOutcome {
             name: "rust-full".to_string(),
             passed: false,
@@ -9313,8 +9811,8 @@ cairn-common = { path = "../cairn-common" }
         }]);
         assert!(matches!(
             result,
-            ReviewTreeGateResult::CheckFailed { ref name, ref detail }
-                if name == "rust-full" && detail.contains("timed out")
+            ReviewTreeGateResult::InfrastructureFailure(ref detail)
+                if detail.contains("rust-full") && detail.contains("timed out")
         ));
     }
 
@@ -9323,6 +9821,7 @@ cairn-common = { path = "../cairn-common" }
         assert!(CheckFailureKind::TimedOut.is_infrastructure());
         assert!(CheckFailureKind::SpawnError.is_infrastructure());
         assert!(CheckFailureKind::Infrastructure.is_infrastructure());
+        assert!(CheckFailureKind::Capacity.is_infrastructure());
         assert!(CheckFailureKind::RunnerError.is_infrastructure());
         assert!(!CheckFailureKind::Killed.is_infrastructure());
     }
@@ -9557,6 +10056,12 @@ cairn-common = { path = "../cairn-common" }
         environment_fingerprint: String,
     ) -> FreshCheckObservationWrite {
         FreshCheckObservationWrite {
+            sealed_coordinate: crate::execution::cache::SealedCheckCoordinate::new(
+                "commit-source",
+                "commit-source",
+                "tree-source",
+                input_hash,
+            ),
             id: format!("obs-{check_name}"),
             public_handle: format!("handle-{check_name}"),
             project_id: "project-a".to_string(),
@@ -9964,8 +10469,8 @@ cairn-common = { path = "../cairn-common" }
             no_verdict.cause
         );
         assert!(
-            !no_verdict.cause.contains("cell link dropped"),
-            "the substrate diagnostic stays in the operator log: {}",
+            no_verdict.cause.contains("cell link dropped"),
+            "the reader gets the concrete failing step: {}",
             no_verdict.cause
         );
     }
@@ -10106,11 +10611,9 @@ cairn-common = { path = "../cairn-common" }
         std::env::set_var("CAIRN_SYNC_TESTS_OPTIONAL", "enabled");
         std::env::set_var("CAIRN_CUSTOM_VERDICT_MODE", "strict");
         let recorded = plan_environment_fingerprint(&rust);
-        record_fresh_check_observation(
-            db.clone(),
-            reusable_observation_for("rust", "input-env", recorded.clone()),
-        )
-        .unwrap();
+        let mut observation = reusable_observation_for("rust", "input-env", recorded.clone());
+        observation.verdict_environment_hash = Some(effective_verdict_environment_hash(&rust, &[]));
+        record_fresh_check_observation(db.clone(), observation).unwrap();
         assert!(!needs_execution(
             db.clone(),
             "project-a",
@@ -10295,11 +10798,25 @@ cairn-common = { path = "../cairn-common" }
         original.commit_sha = "commit-target".to_string();
         original.defined_by_commit_sha = "commit-target".to_string();
         original.tree_hash = "tree-target".to_string();
+        original.sealed_coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+            "commit-target",
+            "commit-target",
+            "tree-target",
+            "ih-frontend",
+        );
         record_fresh_check_observation(db.clone(), original).unwrap();
         let check = plan("frontend", "bunx tsc --noEmit");
         let plans = vec![(check.clone(), "ih-frontend".into())];
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
+        let coordinates = sealed_coordinates(
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            &plans,
+        );
         let results = run_planned_checks_with_board(
             db.clone(),
             "project-a",
@@ -10310,6 +10827,7 @@ cairn-common = { path = "../cairn-common" }
             "tree-target",
             "job-a",
             &plans,
+            &coordinates,
             "manual-check:run-a:frontend",
             CheckExecMode::Shared,
             None,
@@ -10354,6 +10872,100 @@ cairn-common = { path = "../cairn-common" }
         .expect("the retry observation supersedes future lookup");
         assert_eq!(reused.source_observation_id, retry_observation.id);
         assert_eq!(reused.entry.output_tail, "fresh execution");
+    }
+
+    async fn run_cache_boundary_case(
+        attempts: Vec<(Option<i32>, &'static str)>,
+    ) -> (Vec<CheckOutcome>, Vec<String>) {
+        let db = cache_db().await;
+        let plans = vec![(plan("rust", "cargo test"), "ih-rust".into())];
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = commands.clone();
+        let attempts = Arc::new(std::sync::Mutex::new(attempts.into_iter()));
+        let coordinates = sealed_coordinates(
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            &plans,
+        );
+        let results = run_planned_checks_with_board(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            &coordinates,
+            "turn-checks:job-a",
+            CheckExecMode::Isolated,
+            None,
+            None,
+            &[],
+            true,
+            move |_index, command, _stream_id| {
+                captured.lock().unwrap().push(command);
+                let attempt = attempts.lock().unwrap().next().expect("unexpected retry");
+                async move { exec_ok(attempt.0, attempt.1) }
+            },
+            |_| {},
+        )
+        .await;
+        let commands = commands.lock().unwrap().clone();
+        (results, commands)
+    }
+
+    #[tokio::test]
+    async fn cache_corruption_retries_once_uncached_and_canonicalizes_pass() {
+        let (results, commands) = run_cache_boundary_case(vec![
+            (Some(1), "sccache: memory map must have a non-zero length"),
+            (Some(0), "clean pass"),
+        ])
+        .await;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], "cargo test");
+        assert!(commands[1].starts_with(UNCACHED_RETRY_PREFIX));
+        assert!(results[0].passed);
+        assert_eq!(results[0].output_tail, "clean pass");
+    }
+
+    #[tokio::test]
+    async fn cache_corruption_retry_preserves_a_genuine_red() {
+        let (results, commands) = run_cache_boundary_case(vec![
+            (Some(1), "sccache: memory map must have a non-zero length"),
+            (Some(1), "error[E0308]: mismatched types"),
+        ])
+        .await;
+        assert_eq!(commands.len(), 2);
+        assert!(!results[0].passed);
+        assert_eq!(results[0].failure_kind, None);
+    }
+
+    #[tokio::test]
+    async fn repeated_cache_corruption_stops_after_one_retry() {
+        let (results, commands) = run_cache_boundary_case(vec![
+            (Some(1), "sccache: memory map must have a non-zero length"),
+            (Some(1), "sccache: memory map must have a non-zero length"),
+        ])
+        .await;
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            results[0].failure_kind,
+            Some(CheckFailureKind::Infrastructure)
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_failure_does_not_cross_cache_retry_boundary() {
+        let (results, commands) =
+            run_cache_boundary_case(vec![(Some(1), "error[E0308]: mismatched types")]).await;
+        assert_eq!(commands.len(), 1);
+        assert!(!results[0].passed);
+        assert_eq!(results[0].failure_kind, None);
     }
 
     #[tokio::test]
@@ -10512,11 +11124,15 @@ cairn-common = { path = "../cairn-common" }
         }
 
         let results = Arc::new(std::sync::Mutex::new(results));
-        run_planned_checks(
+        run_planned_checks_at_commit(
             db.clone(),
             "project-a",
+            CheckRunCommit {
+                evaluated: "commit-test",
+                defined_by: "commit-test",
+            },
             tree,
-            "job-a",
+            "job-test",
             plans,
             "tool",
             CheckExecMode::Shared,
@@ -10553,8 +11169,7 @@ cairn-common = { path = "../cairn-common" }
 
         let mut last = Vec::new();
         for evaluation in 1..=(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND + 1) {
-            last =
-                evaluate_infra_suite(&db, &plans, &format!("tree-{evaluation}"), &launches).await;
+            last = evaluate_infra_suite(&db, &plans, "commit-test", &launches).await;
             let expected_launches =
                 evaluation.min(crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND) as usize;
             assert_eq!(
@@ -10584,20 +11199,14 @@ cairn-common = { path = "../cairn-common" }
 
         // The row follows the current tree, so the checklist still shows the
         // check rather than dropping it silently.
-        let listed = crate::execution::cache::list_check_results(
-            db.clone(),
-            "project-a",
-            &format!(
-                "tree-{}",
-                crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND + 1
-            ),
-        )
-        .unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(
-            listed[0].infra_failure_streak,
-            crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
-            "the re-stamp must not advance the counter"
+        let listed =
+            crate::execution::cache::list_check_results(db.clone(), "project-a", "commit-test")
+                .unwrap();
+        assert!(
+            listed.iter().any(|entry| {
+                entry.infra_failure_streak == crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND
+            }),
+            "the re-stamped result must retain the bounded infrastructure streak"
         );
     }
 
@@ -10614,8 +11223,8 @@ cairn-common = { path = "../cairn-common" }
         let launches = Arc::new(AtomicUsize::new(0));
 
         // Spend every retry but the last.
-        for evaluation in 1..crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
-            evaluate_infra_suite(&db, &plans, &format!("tree-{evaluation}"), &launches).await;
+        for _ in 1..crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND {
+            evaluate_infra_suite(&db, &plans, "commit-test", &launches).await;
         }
         assert_eq!(
             launches.load(Ordering::SeqCst),
@@ -10987,6 +11596,14 @@ cairn-common = { path = "../cairn-common" }
         let mut source = reusable_observation_for("rust", "IH1", environment.clone());
         source.commit_sha = "commit-1".to_string();
         source.tree_hash = "tree-1".to_string();
+        source.sealed_coordinate = crate::execution::cache::SealedCheckCoordinate::new(
+            "commit-1",
+            "commit-source",
+            "tree-1",
+            "IH1",
+        );
+        source.verdict_environment_hash =
+            Some(effective_verdict_environment_hash(&plans[0].0, &[]));
         record_fresh_check_observation(db.clone(), source).unwrap();
 
         // Commit 2 is doc-only: the whole tree changes to tree-2, but the rust
@@ -11617,6 +12234,13 @@ cairn-common = { path = "../cairn-common" }
                 .map(|classification| classification.kind),
             Some(CheckFailureKind::Infrastructure)
         );
+        let corruption = "sccache: error: memory map must have a non-zero length";
+        let classification =
+            classify_check_failure(opaque, Some(1), false, false, None, corruption)
+                .expect("reviewed cache corruption must be classified");
+        assert_eq!(classification.kind, CheckFailureKind::Infrastructure);
+        assert!(classification.cache_corruption);
+        assert!(classification.reason.contains("cache-read corruption"));
         for signature in [
             "Failed to send data to or receive data from server",
             "failed client/server communication",
@@ -11672,6 +12296,18 @@ cairn-common = { path = "../cairn-common" }
             ),
             None,
             "real assertion failures outrank incidental infrastructure text"
+        );
+        assert_eq!(
+            classify_check_failure(
+                VITEST_COMMAND,
+                Some(1),
+                false,
+                false,
+                Some(&parsed("vitest", 2, 1)),
+                corruption
+            ),
+            None,
+            "a named test failure outranks cache-corruption text in scrollback"
         );
     }
 
@@ -11978,8 +12614,8 @@ cairn-common = { path = "../cairn-common" }
         let CheckExecutionFailure::Substrate(stale) = stale else {
             panic!("deadline must be a substrate failure");
         };
-        // Every capacity fact survives — in the operator half. The agent half is
-        // authored text that names none of it.
+        // The concise agent explanation carries the same bounded diagnostic as
+        // the operator record so the refusal is actionable without log access.
         let agent = stale.agent_message();
         let stale = stale.diagnostic();
         assert!(stale.contains("substrate=ConnectedStalled"));
@@ -11989,8 +12625,8 @@ cairn-common = { path = "../cairn-common" }
         assert!(stale.contains("activeSlots=2"));
         for fact in ["substrate=", "queueDepth", "activeSlots", "build-slot"] {
             assert!(
-                !agent.contains(fact),
-                "agent message must not carry {fact}: {agent}"
+                agent.contains(fact),
+                "agent message must carry {fact}: {agent}"
             );
         }
     }

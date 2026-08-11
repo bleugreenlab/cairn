@@ -60,7 +60,6 @@ fn write_request(target: &str, content: &str) -> McpCallbackRequest {
                 "mode": "create",
                 "payload": { "content": content },
             }],
-            "commit_msg": "crossing test",
         }),
         tool_use_id: None,
     }

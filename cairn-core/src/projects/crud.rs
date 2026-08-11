@@ -546,7 +546,7 @@ async fn local_repo_path(
     private_db: &LocalDb,
     project_key: &str,
 ) -> Result<Option<String>, CairnError> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     private_db
         .query_opt_text(
             "SELECT local_repo_path FROM project_routes WHERE project_key = ?1",
@@ -561,7 +561,7 @@ pub async fn set_local_repo_path(
     project_key: &str,
     path: &Path,
 ) -> Result<(), CairnError> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let path = path.to_string_lossy().to_string();
     private_db
         .execute(
@@ -600,7 +600,7 @@ pub(crate) async fn insert_project_route(
     project_key: &str,
     team_id: Option<&str>,
 ) -> Result<(), CairnError> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let team_id = team_id.map(str::to_string);
     let now = clock.now();
     db.write(|conn| {

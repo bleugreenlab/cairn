@@ -118,7 +118,7 @@ async fn resolve_issue_ref(
     project_key: &str,
     number: i32,
 ) -> Result<IssueRef, String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
             let key = key.clone();
@@ -138,7 +138,7 @@ async fn resolve_issue_ref(
         })
         .await
         .map_err(|e| e.to_string())?;
-    let issue_id = resolved.ok_or_else(|| format!("Issue {}-{} not found", key, number))?;
+    let issue_id = resolved.ok_or_else(|| format!("Issue {}/{} not found", key, number))?;
     Ok(IssueRef {
         project_key: key,
         number,

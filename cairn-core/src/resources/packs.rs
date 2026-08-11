@@ -15,7 +15,6 @@ use cairn_common::uri::build_pack_uri;
 
 use crate::config::mcp_servers::{workspace_mcp_entries, NotReady, WorkspaceMcpEntry};
 use crate::config::pack::{self, PackItem, PackItemKind, PackLock, PackManifest};
-use crate::services::{GitClient, RealGitClient};
 
 /// One pack as the catalog sees it: what the app ships, what the workspace
 /// installed, or both.
@@ -52,7 +51,15 @@ impl PackView {
     /// is only offered — what its source ships.
     fn items(&self) -> Vec<PackItem> {
         match (&self.installed, &self.available) {
-            (Some(lock), _) => lock.items.clone(),
+            (Some(lock), _) => lock
+                .items
+                .iter()
+                .map(|item| PackItem {
+                    kind: item.kind,
+                    id: item.id.clone(),
+                    path: item.path.clone(),
+                })
+                .collect(),
             (None, Some(manifest)) => manifest.items(),
             (None, None) => Vec::new(),
         }
@@ -103,7 +110,7 @@ impl PackState {
 /// What has happened to one item of an installed pack.
 ///
 /// This is the backend's verdict, not a hint: an update preserves an
-/// `EditedByUser` item and reports it as a conflict, an uninstall keeps it, and
+/// `EditedByUser` local copy, an uninstall keeps it, and
 /// a `RemovedByUser` item stays out until the pack is explicitly restored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -273,15 +280,11 @@ fn pack_views(resource_dir: Option<&Path>, config_dir: &Path) -> Vec<PackView> {
 
 /// The typed catalog for `config_dir`.
 pub fn pack_catalog(config_dir: &Path) -> PackCatalog {
-    pack_catalog_with(&RealGitClient, config_dir)
-}
-
-pub(crate) fn pack_catalog_with(git: &dyn GitClient, config_dir: &Path) -> PackCatalog {
     let resource_dir = pack::source_dir(config_dir);
     let mcp_entries = workspace_mcp_entries(config_dir);
     let packs = pack_views(resource_dir.as_deref(), config_dir)
         .iter()
-        .map(|view| project(git, config_dir, resource_dir.as_deref(), view, &mcp_entries))
+        .map(|view| project(config_dir, resource_dir.as_deref(), view, &mcp_entries))
         .collect();
     PackCatalog {
         source_recorded: resource_dir.is_some(),
@@ -289,38 +292,17 @@ pub(crate) fn pack_catalog_with(git: &dyn GitClient, config_dir: &Path) -> PackC
     }
 }
 
-/// Workspace-relative item paths of an installed pack whose last commit was not
-/// authored by the sync — the user has made them theirs, so an update preserves
-/// them and an uninstall keeps them.
-fn user_modified(git: &dyn GitClient, config_dir: &Path, lock: &PackLock) -> Vec<String> {
-    lock.item_paths()
-        .into_iter()
-        .filter(|path| {
-            config_dir.join(path).exists()
-                && crate::workspace::bundle::pack_file_is_user_owned(git, config_dir, path)
-                    .unwrap_or(false)
-        })
-        .collect()
-}
-
 fn project(
-    git: &dyn GitClient,
     config_dir: &Path,
     resource_dir: Option<&Path>,
     view: &PackView,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
 ) -> PackCatalogEntry {
-    let edited: Vec<String> = view
-        .installed
-        .as_ref()
-        .map(|lock| user_modified(git, config_dir, lock))
-        .unwrap_or_default();
-
     let mut items: Vec<PackCatalogItem> = view
         .items()
         .into_iter()
         .map(|item| {
-            let state = item_state(&view.id, &item, &edited, mcp_entries);
+            let state = item_state(&view.id, &item, view.installed.as_ref(), mcp_entries);
             catalog_item(item, state, mcp_entries)
         })
         .collect();
@@ -406,30 +388,34 @@ fn source_info(view: &PackView) -> PackSourceInfo {
 
 /// Whether the user has taken ownership of one live item.
 ///
-/// A file-backed item is theirs when git says its last commit was not the
-/// sync's. An MCP server has no file in the workspace tree, so the equivalent
-/// question is whether the resolved registry still attributes it to this pack:
+/// A live item is the user's copy when its install lock records a fork. An MCP
+/// server additionally becomes the user's copy when the resolved registry no
+/// longer attributes it to this pack:
 /// a user who saved their own version of a pack server shadows it in
 /// `settings.yaml`, and the entry's origin flips to `workspace`.
 fn item_state(
     pack_id: &str,
     item: &PackItem,
-    edited: &[String],
+    lock: Option<&PackLock>,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
 ) -> PackItemState {
+    let forked = lock
+        .and_then(|lock| lock.item(item.kind, &item.id))
+        .is_some_and(|item| item.forked);
     if item.kind == PackItemKind::Mcp {
         let shadowed = mcp_entries
             .get(&item.id)
             .is_some_and(|entry| entry.origin != format!("pack:{pack_id}"));
-        return if shadowed {
+        return if forked || shadowed {
             PackItemState::EditedByUser
         } else {
             PackItemState::PackOwned
         };
     }
-    match &item.path {
-        Some(path) if edited.iter().any(|edit| edit == path) => PackItemState::EditedByUser,
-        _ => PackItemState::PackOwned,
+    if forked {
+        PackItemState::EditedByUser
+    } else {
+        PackItemState::PackOwned
     }
 }
 
@@ -463,7 +449,7 @@ fn item_label(item: &PackCatalogItem) -> String {
         label.push_str(&format!(" (not ready: {})", reason.summary()));
     }
     match item.state {
-        PackItemState::EditedByUser => label.push_str(" (your edit)"),
+        PackItemState::EditedByUser => label.push_str(" (your copy)"),
         PackItemState::RemovedByUser => label.push_str(" (removed by you)"),
         PackItemState::PackOwned => {}
     }
@@ -608,10 +594,10 @@ fn render_pack(entry: &PackCatalogEntry) -> String {
 
     let edited = entry.edited_paths();
     if !edited.is_empty() {
-        out.push_str("## Your edits\n\n");
+        out.push_str("## Your copies\n\n");
         out.push_str(
-            "These items carry your changes. An update preserves them and reports them as \
-             conflicts; an uninstall keeps them.\n\n",
+            "These local copies are yours. Pack updates leave them untouched, and an uninstall \
+             keeps them. Reset an item explicitly to replace it with the current pack version.\n\n",
         );
         for path in edited {
             out.push_str(&format!("- `{path}`\n"));
@@ -700,9 +686,9 @@ mod tests {
             page.contains("Update available: the app ships 1.1.0"),
             "{page}"
         );
-        assert!(page.contains("matlab (your edit)"), "{page}");
+        assert!(page.contains("matlab (your copy)"), "{page}");
         assert!(page.contains("matlab (removed by you)"), "{page}");
-        assert!(page.contains("## Your edits"), "{page}");
+        assert!(page.contains("## Your copies"), "{page}");
         assert!(page.contains("- `skills/matlab`"), "{page}");
         assert!(page.contains("## Removed by you"), "{page}");
         assert!(page.contains("- mcp `matlab`"), "{page}");

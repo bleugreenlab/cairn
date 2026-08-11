@@ -203,6 +203,134 @@ pub fn read_leases() -> String {
     out
 }
 
+/// `cairn://grants?view=incidents` — disclosures and what was done about them.
+///
+/// Beside the grants and the leases because the three answer one question in
+/// sequence: what authority was approved, what is currently out exercising it,
+/// and what of that has leaked. An operator reading this is usually asking
+/// "what do I still have to do myself", so the rotation column is the point of
+/// the table and an unrotated incident stays visible however much was contained.
+pub async fn read_incidents(db: &LocalDb) -> String {
+    use crate::security::remediation::store;
+
+    let incidents = match store::list_incidents(db, 100).await {
+        Ok(incidents) => incidents,
+        Err(error) => {
+            return format!("# Disclosure incidents\n\nCould not read incidents: {error}")
+        }
+    };
+
+    let mut out = String::from("# Disclosure incidents\n\n");
+    if incidents.is_empty() {
+        out.push_str(
+            "No recorded disclosures. An incident appears here when a credential is known to \
+             have reached a durable record \u{2014} caught by a crossing, or declared by an \
+             operator. Recording one revokes the authority it carries, inventories every store \
+             that holds it, and withholds those records the read path can gate.\n",
+        );
+        return out;
+    }
+
+    out.push_str(
+        "Each incident names the credential by its registry id, never its value. Containment \
+         is local: revoking stops this runner handing the credential out again, and rotation \
+         at the provider is what actually ends the disclosure.\n\n\
+         Read the disposition column closely. `quarantined` means a read gate now withholds \
+         the record; `reported` means it was found in a store with no read gate and is \
+         **still being served** until you deal with it by hand. An incident holding any \
+         reported record stays at `action required` rather than `contained`.\n\n",
+    );
+    out.push_str("| Incident | Credential | Found | Status | Revoked | Rotation |\n");
+    out.push_str("| --- | --- | --- | --- | --- | --- |\n");
+    for incident in &incidents {
+        out.push_str(&format!(
+            "| `{}` | `{}` | {} | {} | {} lease(s), {} grant(s) | {} |\n",
+            incident.id,
+            incident.secret_id,
+            incident.discovered_via.as_str(),
+            if incident.status == crate::security::remediation::IncidentStatus::ActionRequired {
+                "**action required**".to_string()
+            } else {
+                incident.status.as_str().to_string()
+            },
+            incident.leases_revoked,
+            incident.grants_revoked,
+            if incident.rotation_required {
+                "**required**"
+            } else {
+                "confirmed"
+            },
+        ));
+    }
+
+    for incident in &incidents {
+        out.push_str(&format!("\n## Incident `{}`\n\n", incident.id));
+        if let Some(crossing) = &incident.crossing {
+            out.push_str(&format!("- Caught at the {crossing} crossing\n"));
+        }
+        if let Some(note) = &incident.note {
+            out.push_str(&format!("- Operator note: {note}\n"));
+        }
+
+        match store::affected_for(db, &incident.id).await {
+            Ok(records) if !records.is_empty() => {
+                out.push_str("\n### Affected records\n\n");
+                out.push_str("| Store | Record | Occurrences | Disposition |\n");
+                out.push_str("| --- | --- | --- | --- |\n");
+                let mut still_served: Vec<String> = Vec::new();
+                for (sink, locator, occurrences, disposition) in records {
+                    let flag = if disposition == "reported" {
+                        still_served.push(format!("`{sink}` `{locator}`"));
+                        " — **still served**"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(
+                        "| `{sink}` | `{locator}` | {occurrences} | {disposition}{flag} |\n"
+                    ));
+                }
+                out.push_str(
+                    "\nOccurrence counts say how much, never what: an incident report that \
+                     quoted the credential would be one more record carrying it.\n",
+                );
+                if !still_served.is_empty() {
+                    out.push_str(&format!(
+                        "\n**{} record(s) are still being served.** Cairn found them but has no \
+                         read gate on their store, so nothing is withholding them. Edit or \
+                         delete each one, and rotate the credential — rotation is what makes \
+                         the residue harmless: {}\n",
+                        still_served.len(),
+                        still_served.join(", ")
+                    ));
+                }
+            }
+            Ok(_) => out.push_str("\nNo durable record on this host carried the credential.\n"),
+            Err(error) => out.push_str(&format!("\nCould not read affected records: {error}\n")),
+        }
+
+        match store::actions_for(db, &incident.id).await {
+            Ok(actions) if !actions.is_empty() => {
+                out.push_str("\n### Response\n\n");
+                for action in actions {
+                    out.push_str(&format!(
+                        "{}. **{}** ({}) \u{2014} {}\n",
+                        action.seq,
+                        action.action,
+                        action.actor,
+                        action.detail.as_deref().unwrap_or(""),
+                    ));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                out.push_str(&format!("\nCould not read the response journal: {error}\n"))
+            }
+        }
+    }
+
+    out
+}
+
 /// `cairn://grants/{id}` — one grant and everything it authorized.
 pub async fn read_grant(db: &LocalDb, id: &str) -> String {
     let at = now();

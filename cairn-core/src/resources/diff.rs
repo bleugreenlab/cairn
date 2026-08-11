@@ -591,7 +591,7 @@ fn render_summary(
     } else {
         "none".to_string()
     };
-    let mut out = format!("# Workspace Diff - {project}-{number} / {node_id}\n\n");
+    let mut out = format!("# Workspace Diff - {project}/{number} / {node_id}\n\n");
     out.push_str(&format!(
         "- Base: `{}` at `{}`\n",
         data.base_branch,
@@ -638,7 +638,7 @@ fn render_summary(
 }
 
 fn render_commits(project: &str, number: i32, node_id: &str, data: &DiffData) -> String {
-    let mut out = format!("# Commits - {project}-{number} / {node_id}\n\n");
+    let mut out = format!("# Commits - {project}/{number} / {node_id}\n\n");
     let Some(commits) = &data.commits else {
         out.push_str(
             data.source_note
@@ -690,7 +690,7 @@ fn render_patch(
     file: Option<&str>,
     glob: Option<&str>,
 ) -> String {
-    let mut out = format!("# Patch - {project}-{number} / {node_id}");
+    let mut out = format!("# Patch - {project}/{number} / {node_id}");
     if let Some(file) = file {
         out.push_str(&format!(" / {file}"));
     } else if let Some(glob) = glob {
@@ -751,7 +751,7 @@ fn render_symbols(
     data: &DiffData,
     glob: Option<&str>,
 ) -> String {
-    let mut out = format!("# Symbols - {project}-{number} / {node_id}");
+    let mut out = format!("# Symbols - {project}/{number} / {node_id}");
     if let Some(glob) = glob {
         out.push_str(&format!(" / glob `{glob}`"));
     }
@@ -812,7 +812,7 @@ fn render_symbols(
 }
 
 fn render_check(project: &str, number: i32, node_id: &str, data: &DiffData) -> String {
-    let mut out = format!("# Diff Check - {project}-{number} / {node_id}\n\n");
+    let mut out = format!("# Diff Check - {project}/{number} / {node_id}\n\n");
     if let Some(note) = &data.source_note {
         out.push_str(&format!("> {note}\n\n"));
     }

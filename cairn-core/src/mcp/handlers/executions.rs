@@ -22,7 +22,7 @@ async fn resolve_project_and_issue(
     project_key: &str,
     number: i32,
 ) -> Result<(String, String), String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
             let key = key.clone();
@@ -45,7 +45,7 @@ async fn resolve_project_and_issue(
         })
         .await
         .map_err(|e| e.to_string())?;
-    resolved.ok_or_else(|| format!("Issue {}-{} not found", key, number))
+    resolved.ok_or_else(|| format!("Issue {}/{} not found", key, number))
 }
 
 /// Start a new execution for an issue from an append to its executions collection.
@@ -81,7 +81,7 @@ pub(crate) async fn start_execution_from_collection(
     // Wake any in-flight `watch` so the driving loop re-derives state promptly.
     orch.wake_for_issue(&issue_id).await;
 
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
     Ok(format!(
@@ -121,7 +121,7 @@ pub(crate) async fn edit_execution_agent(
 
     if dry_run {
         return Ok(format!(
-            "Would edit agent '{agent_id}' snapshot in {project_key}-{number}/{exec_seq}"
+            "Would edit agent '{agent_id}' snapshot in {project_key}/{number}/{exec_seq}"
         ));
     }
 
@@ -134,7 +134,7 @@ pub(crate) async fn edit_execution_agent(
     .await?;
 
     Ok(format!(
-        "Edited agent '{agent_id}' snapshot in {project_key}-{number}/{exec_seq}"
+        "Edited agent '{agent_id}' snapshot in {project_key}/{number}/{exec_seq}"
     ))
 }
 
@@ -185,7 +185,7 @@ async fn resolve_execution_id(
     number: i32,
     exec_seq: i32,
 ) -> Result<String, String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let resolved = db
         .read(|conn| {
             let key = key.clone();

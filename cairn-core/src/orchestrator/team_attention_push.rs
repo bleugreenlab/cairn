@@ -146,8 +146,8 @@ pub fn maybe_notify(orch: &Orchestrator, event: &AttentionEvent) {
             let device_jwt = crate::account::team_sync::read_device_jwt(&local)
                 .await?
                 .ok_or_else(|| "no connected account device JWT".to_string())?;
-            let title = format!("{project_key}-{number} {need}", need = intent.need);
-            let body = format!("{project_key}-{number}: {issue_title}");
+            let title = format!("{project_key}/{number} {need}", need = intent.need);
+            let body = format!("{project_key}/{number}: {issue_title}");
             sender
                 .send(
                     &api_url,

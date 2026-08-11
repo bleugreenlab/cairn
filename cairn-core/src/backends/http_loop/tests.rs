@@ -1,10 +1,7 @@
 use super::persist::{
     store_assistant_tool_call, store_tool_result, tool_call_usage, AssistantStreamState,
 };
-use super::tools::{
-    collapse_envelope_text, normalize_tool_payload, prepare_tool_call, render_tool_result,
-    resolve_home_target, PreparedCall,
-};
+use super::tools::{collapse_envelope_text, prepare_tool_call, render_tool_result, PreparedCall};
 use super::{Generation, TurnToolCall, TurnUsage, WireAdapter};
 use crate::agent_process::stream::{TokenCounts, TranscriptEvent};
 use crate::backends::{AgentPermissions, SessionConfig, SessionStart};
@@ -22,6 +19,28 @@ fn tool_call(name: &str, arguments: &str) -> TurnToolCall {
         id: "call-1".to_string(),
         name: name.to_string(),
         arguments: arguments.to_string(),
+    }
+}
+
+#[test]
+fn home_relative_tool_targets_pass_through_to_live_host_resolution() {
+    for (name, arguments) in [
+        ("read", r#"{"paths":["cairn:~/todos","file:src/lib.rs"]}"#),
+        (
+            "write",
+            r#"{"changes":[{"target":"cairn:~/tasks","mode":"append","payload":{}}]}"#,
+        ),
+    ] {
+        let PreparedCall::Dispatch { payload, .. } =
+            prepare_tool_call(&tool_call(name, arguments), false)
+        else {
+            panic!("valid {name} call must dispatch");
+        };
+        assert_eq!(
+            payload,
+            serde_json::from_str::<serde_json::Value>(arguments).unwrap(),
+            "the HTTP backend must not freeze a home-relative target"
+        );
     }
 }
 
@@ -75,27 +94,6 @@ fn usage_maps_token_counts() {
             cache_create: None,
             thinking: Some(2)
         }
-    );
-}
-
-#[test]
-fn normalizes_home_relative_tool_targets() {
-    let home = "cairn://p/CAIRN/1883/1/builder";
-    assert_eq!(
-        resolve_home_target("cairn:~/todos?limit=1", home),
-        "cairn://p/CAIRN/1883/1/builder/todos?limit=1"
-    );
-
-    let mut read = json!({"paths": ["cairn:~/todos", "file:src/lib.rs"]});
-    normalize_tool_payload("read", &mut read, home);
-    assert_eq!(read["paths"][0], "cairn://p/CAIRN/1883/1/builder/todos");
-    assert_eq!(read["paths"][1], "file:src/lib.rs");
-
-    let mut write = json!({"changes": [{"target": "cairn:~/messages", "mode": "append"}]});
-    normalize_tool_payload("write", &mut write, home);
-    assert_eq!(
-        write["changes"][0]["target"],
-        "cairn://p/CAIRN/1883/1/builder/messages"
     );
 }
 

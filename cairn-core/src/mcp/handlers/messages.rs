@@ -85,7 +85,7 @@ async fn ensure_issue_accepts_messages(
     project_key: &str,
     issue_number: i32,
 ) -> Result<(), String> {
-    let lookup_key = project_key.to_uppercase();
+    let lookup_key = cairn_common::uri::canonical_project(project_key);
     let requested_key = project_key.to_string();
     db.read(move |conn| {
         Box::pin(async move {
@@ -103,7 +103,7 @@ async fn ensure_issue_accepts_messages(
                 .await?;
             let Some(row) = rows.next().await? else {
                 return Err(DbError::Row(format!(
-                    "Issue {}-{} not found",
+                    "Issue {}/{} not found",
                     requested_key, issue_number
                 )));
             };
@@ -144,7 +144,7 @@ async fn resolve_channel_id(
     issue_number: Option<i32>,
 ) -> Result<String, String> {
     let requested_key = project_key.to_string();
-    let lookup_key = requested_key.to_uppercase();
+    let lookup_key = cairn_common::uri::canonical_project(&requested_key);
     db.read(|conn| {
         let lookup_key = lookup_key.clone();
         let requested_key = requested_key.clone();
@@ -175,7 +175,7 @@ async fn resolve_channel_id(
 
                 if issue_rows.next().await?.is_none() {
                     return Err(DbError::Row(format!(
-                        "Issue {}-{} not found",
+                        "Issue {}/{} not found",
                         canonical_key, number
                     )));
                 }
@@ -206,7 +206,7 @@ async fn find_recipient_job(
     node_name: &str,
     task_name: Option<&str>,
 ) -> Result<Option<(String, String)>, String> {
-    let lookup_key = project_key.to_uppercase();
+    let lookup_key = cairn_common::uri::canonical_project(project_key);
     let node_name = node_name.to_string();
     let task_name = task_name.map(str::to_string);
     db.read(|conn| {
@@ -365,11 +365,9 @@ pub async fn append_project_or_issue_message(
             ChannelType::Issue,
             format!(
                 "Appended message to issue channel {}-{}",
-                channel_id
-                    .split('/')
-                    .next()
-                    .unwrap_or(project_key)
-                    .to_uppercase(),
+                cairn_common::uri::canonical_project(
+                    channel_id.split('/').next().unwrap_or(project_key),
+                ),
                 number
             ),
         ),

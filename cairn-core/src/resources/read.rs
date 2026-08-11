@@ -1462,11 +1462,12 @@ async fn render_resource_body(
         CairnResource::Grants => match find_query_value(&params, "view") {
             Some("decisions") => crate::resources::grants::read_decisions(&orch.db.local).await,
             Some("leases") => crate::resources::grants::read_leases(),
+            Some("incidents") => crate::resources::grants::read_incidents(&orch.db.local).await,
             None | Some("grants") => crate::resources::grants::read_grants(&orch.db.local).await,
             Some(other) => {
                 format!(
-                    "Unknown view '{other}' for cairn://grants; expected grants, decisions, or \
-                     leases"
+                    "Unknown view '{other}' for cairn://grants; expected grants, decisions, \
+                     leases, or incidents"
                 )
             }
         },

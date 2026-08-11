@@ -61,6 +61,8 @@ pub struct CompletionRequest {
     pub system: Option<String>,
     pub messages: Vec<CompletionMessage>,
     pub model: String,
+    /// Project whose provider-account scope should govern backend routing.
+    pub project_id: Option<String>,
     pub extras: Value,
     pub output_schema: Option<Value>,
     pub timeout: Duration,
@@ -435,6 +437,33 @@ pub trait AgentBackend: Send + Sync {
 
     /// Discover currently available model options for this backend.
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String>;
+
+    /// Whether this backend can execute a response's tool-free, one-shot
+    /// completion with the credentials or host configuration currently in
+    /// scope. This is the canonical capability check used by both authoring and
+    /// invocation; backends that only support sessions keep the honest default.
+    fn response_completion_availability(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Result<(), String> {
+        Err(format!(
+            "{} sessions don't support one-shot completions",
+            self.name()
+        ))
+    }
+
+    /// Whether one concrete model is runnable for a response in this scope.
+    /// Providers with host-local inventories override this to keep discovery,
+    /// authoring, and routing on the same account boundary.
+    fn response_model_availability(
+        &self,
+        orch: &Orchestrator,
+        project_id: Option<&str>,
+        _model: &str,
+    ) -> Result<(), String> {
+        self.response_completion_availability(orch, project_id)
+    }
 
     /// Backend-published preset option descriptors.
     fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {

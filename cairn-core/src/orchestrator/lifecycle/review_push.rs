@@ -225,6 +225,27 @@ fn job_ships_a_pr(orch: &Orchestrator, job_id: &str) -> Result<bool, String> {
 /// already in flight for the job (single-flight).
 pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     let short = &job_id[..job_id.len().min(8)];
+    let attempt_id = match crate::execution::checks_turn_end::request_turn_end_attempt(orch, job_id)
+    {
+        Ok(id) => id,
+        Err(error) => {
+            log::warn!("turn-end checks for job {short}: could not persist arm intent ({error})");
+            return;
+        }
+    };
+    let terminal = |state: &str, reason: &str| {
+        if let Err(error) = crate::execution::checks_turn_end::transition_turn_end_attempt(
+            orch,
+            job_id,
+            &attempt_id,
+            state,
+            Some(reason),
+        ) {
+            log::error!(
+                "turn-end checks for job {short}: failed to persist terminal {state}: {error}"
+            );
+        }
+    };
     // The review cadence exists to validate the tree a human will review, so it
     // is scoped to the jobs that produce one: those whose recipe node feeds a
     // `pr` node (CAIRN-3334). Without this, every delegated sub-agent's turn end
@@ -234,6 +255,7 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     match job_ships_a_pr(orch, job_id) {
         Ok(true) => {}
         Ok(false) => {
+            terminal("skipped", "no downstream PR node in the execution topology");
             log::debug!(
                 "turn-end checks for job {short}: skipped, no downstream PR node in the execution topology"
             );
@@ -247,6 +269,7 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
         ),
     }
     if latest_turn_is_memory_review(orch, job_id) {
+        terminal("skipped", "latest turn is a memory-review turn");
         log::debug!(
             "turn-end checks for job {short}: skipped, latest turn is a memory-review turn (not a work turn)"
         );
@@ -273,6 +296,7 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     if let Some(reason) =
         crate::messages::delivery::head_turn_for_job(orch, job_id).mid_work_reason()
     {
+        terminal("skipped", reason);
         log::debug!("turn-end checks for job {short}: skipped, {reason}");
         return;
     }
@@ -283,6 +307,7 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     // re-evaluates settled jobs through `evaluate_review_readiness`, which has
     // its own origin and is not routed through here.
     if let Some(withdrawal) = withdrawn_turn_end_wave(orch, job_id) {
+        terminal("withdrawn", &withdrawal);
         log::debug!("turn-end checks for job {short}: skipped, {withdrawal}");
         return;
     }
@@ -292,10 +317,24 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     let cancel = match orch.try_begin_turn_end_checks(job_id) {
         Some(cancel) => cancel,
         None => {
+            terminal(
+                "superseded",
+                "another turn-end check attempt already owns the slot",
+            );
             log::debug!("turn-end checks for job {short}: skipped, a run is already in flight");
             return;
         }
     };
+    if let Err(error) = crate::execution::checks_turn_end::transition_turn_end_attempt(
+        orch,
+        job_id,
+        &attempt_id,
+        "claimed",
+        None,
+    ) {
+        log::error!("turn-end checks for job {short}: failed to persist claim; retaining single-flight ownership: {error}");
+        return;
+    }
     let orch_clone = orch.clone();
     let job_id_owned = job_id.to_string();
     let cancel_for_rearm = cancel.clone();
@@ -303,11 +342,13 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
     let job_id_for_rearm = job_id.to_string();
     let orch_for_release = orch.clone();
     let job_id_for_release = job_id.to_string();
+    let attempt_for_failure = attempt_id.clone();
     detach_onto_runtime(
         async move {
             crate::execution::checks_turn_end::run_turn_end_checks(
                 orch_clone,
                 job_id_owned,
+                attempt_id.clone(),
                 cancel,
             )
             .await;
@@ -322,7 +363,16 @@ pub(super) fn spawn_turn_end_checks(orch: &Orchestrator, job_id: &str) {
             // `run_turn_end_checks` (which releases the single-flight slot itself
             // on every path). This is the ONLY path where the slot would leak, so
             // release it here to let a later turn-end retry.
-            orch_for_release.end_turn_end_checks(&job_id_for_release);
+            match crate::execution::checks_turn_end::transition_turn_end_attempt(
+                &orch_for_release, &job_id_for_release, &attempt_for_failure, "failed",
+                Some("detached runtime construction failed"),
+            ) {
+                Ok(()) => orch_for_release.end_turn_end_checks(&job_id_for_release),
+                Err(error) => log::error!(
+                    "turn-end checks for job {}: detached-runtime failure was not persisted; retaining single-flight ownership: {}",
+                    &job_id_for_release[..job_id_for_release.len().min(8)], error
+                ),
+            }
         },
     );
 }

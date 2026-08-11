@@ -122,6 +122,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     spec("condition_evaluations", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("execution_history", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("jobs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
+    spec("turn_end_check_attempts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifact_content", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("artifacts", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("checkpoint_command_cache", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
@@ -570,7 +571,12 @@ fn deferred_reference_columns(table: &'static str) -> &'static [&'static str] {
         // reference temporarily cleared and restore it once the whole graph exists.
         "artifacts" => &["parent_version_id"],
         "issues" => &["parent_issue_id", "parent_job_id"],
-        "jobs" => &["parent_job_id", "current_turn_id", "resume_session_id"],
+        "jobs" => &[
+            "parent_job_id",
+            "current_turn_id",
+            "resume_session_id",
+            "turn_end_check_attempt_id",
+        ],
         "sessions" => &["replaced_by_id", "parent_session_id"],
         "turns" => &["predecessor_id"],
         _ => &[],
@@ -674,7 +680,11 @@ async fn sweep_source(db: &LocalDb, project_id: &str) -> Result<(), DbError> {
     db.write(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {
-        conn.execute("UPDATE jobs SET current_turn_id = NULL, resume_session_id = NULL WHERE project_id = ?1", (project_id.as_str(),)).await?;
+        // Runner-local rebuild notices are intentionally not copied to the team
+        // replica. Remove them while their recipient jobs still exist so their
+        // private cross-scope foreign key cannot block the source sweep.
+        conn.execute("DELETE FROM build_change_notifications WHERE recipient IN (SELECT id FROM jobs WHERE project_id = ?1)", (project_id.as_str(),)).await?;
+        conn.execute("UPDATE jobs SET current_turn_id = NULL, resume_session_id = NULL, turn_end_check_attempt_id = NULL WHERE project_id = ?1", (project_id.as_str(),)).await?;
         conn.execute("UPDATE turns SET predecessor_id = NULL WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR run_id IN (SELECT id FROM runs WHERE project_id = ?1)", (project_id.as_str(),)).await?;
         conn.execute("UPDATE sessions SET replaced_by_id = NULL, parent_session_id = NULL WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1)", (project_id.as_str(),)).await?;
         conn.execute("UPDATE artifacts SET parent_version_id = NULL WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1)", (project_id.as_str(),)).await?;
@@ -738,6 +748,7 @@ mod tests {
         let current_turn_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
         let artifact_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
         let artifact_version_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let check_attempt_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
 
         let local = Arc::new(migrated_db("move-local.db", TURSO_MIGRATIONS.to_vec()).await);
         let team = Arc::new(migrated_db("move-team.db", TEAM_MIGRATIONS.to_vec()).await);
@@ -868,6 +879,30 @@ mod tests {
             .unwrap();
         local
             .execute(
+                "INSERT INTO turn_end_check_attempts(id, job_id, state, created_at, updated_at)
+                 VALUES (?1, ?2, 'settled', 1, 2)",
+                (check_attempt_id, job_id),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
+                "UPDATE jobs SET turn_end_check_attempt_id = ?1 WHERE id = ?2",
+                (check_attempt_id, job_id),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
+                "INSERT INTO build_change_notifications(
+                    id, recipient, from_version, from_build_id, to_version, to_build_id, booted_at
+                 ) VALUES ('build-note', ?1, '1', 'old', '2', 'new', 1)",
+                (job_id,),
+            )
+            .await
+            .unwrap();
+        local
+            .execute(
                 "INSERT INTO artifacts(id, job_id, artifact_type, data, created_at, updated_at)
                  VALUES (?1, ?2, 'plan', '{}', 1, 1)",
                 (artifact_id, job_id),
@@ -903,6 +938,7 @@ mod tests {
         let team_artifact_id = rekey_to_team(artifact_id, team_id).unwrap();
         let team_artifact_version_id = rekey_to_team(artifact_version_id, team_id).unwrap();
         let team_child_issue_id = rekey_to_team(child_issue_id, team_id).unwrap();
+        let team_check_attempt_id = rekey_to_team(check_attempt_id, team_id).unwrap();
 
         assert_eq!(
             team.query_text(
@@ -925,11 +961,29 @@ mod tests {
         assert_eq!(
             team.query_text(
                 "SELECT resume_session_id FROM jobs WHERE id = ?1",
-                (team_job_id,)
+                (team_job_id.clone(),)
             )
             .await
             .unwrap(),
             Some(team_resumed_session_id.clone())
+        );
+        assert_eq!(
+            team.query_text(
+                "SELECT turn_end_check_attempt_id FROM jobs WHERE id = ?1",
+                (team_job_id.clone(),)
+            )
+            .await
+            .unwrap(),
+            Some(team_check_attempt_id.clone())
+        );
+        assert_eq!(
+            team.query_text(
+                "SELECT job_id FROM turn_end_check_attempts WHERE id = ?1",
+                (team_check_attempt_id,)
+            )
+            .await
+            .unwrap(),
+            Some(team_job_id)
         );
         assert_eq!(
             team.query_text(
@@ -982,6 +1036,17 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+        assert_eq!(
+            local
+                .query_opt_text(
+                    "SELECT id FROM build_change_notifications WHERE id = 'build-note'",
+                    ()
+                )
+                .await
+                .unwrap(),
+            None,
+            "runner-local build notifications are discarded with their swept recipient"
         );
         assert_eq!(
             local

@@ -87,7 +87,7 @@ impl RunContext {
     #[allow(dead_code)]
     pub fn issue_key(&self) -> Option<String> {
         self.issue_number
-            .map(|num| format!("{}-{}", self.project_key, num))
+            .map(|num| format!("{}/{}", self.project_key, num))
     }
 }
 

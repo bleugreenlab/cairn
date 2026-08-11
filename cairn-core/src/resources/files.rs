@@ -341,19 +341,19 @@ pub(super) async fn read_issue_changed(db: &LocalDb, project_key: &str, number: 
     };
 
     if !issue_has_jobs(&conn, &issue_id).await {
-        return format!("No jobs found for issue {}-{}", project_key, number);
+        return format!("No jobs found for issue {}/{}", project_key, number);
     }
 
     let results = load_issue_file_changes_with_agents(&conn, &issue_id).await;
 
     if results.is_empty() {
         return format!(
-            "No file changes recorded for issue {}-{}",
+            "No file changes recorded for issue {}/{}",
             project_key, number
         );
     }
 
-    let mut output = format!("# Files Changed - {}-{}\n\n", project_key, number);
+    let mut output = format!("# Files Changed - {}/{}\n\n", project_key, number);
     let mut current_agent: Option<&str> = None;
     let mut current_agent_rows: Vec<FileChangeRow> = Vec::new();
 
@@ -409,7 +409,7 @@ pub(super) async fn read_issue_changed_projection(
         Err(error) => return error,
     };
     if !issue_has_jobs(&conn, &issue_id).await {
-        return format!("No jobs found for issue {}-{}", project_key, number);
+        return format!("No jobs found for issue {}/{}", project_key, number);
     }
     let entries = file_projection_entries(load_issue_file_changes(&conn, &issue_id).await);
 

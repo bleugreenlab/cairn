@@ -387,7 +387,7 @@ async fn job_id_for_child_uri(db: &LocalDb, child_uri: &str) -> Option<String> {
             } => (project, number, exec_seq, node_id, Some(task_name)),
             _ => return None,
         };
-    let project = project.to_uppercase();
+    let project = cairn_common::uri::canonical_project(project);
     let number = number as i64;
     let exec_seq = exec_seq as i64;
     db.read(|conn| {
@@ -684,6 +684,12 @@ pub(crate) async fn render_push_resolved(
         push.wake.as_str(),
         push.content_ref
     );
+    if push.key == "build-change" {
+        return match super::build_change::resolve(&orch.db.local, &push.content_ref).await {
+            Ok(Some(change)) => super::build_change::render(&change),
+            _ => header,
+        };
+    }
     if push.key.starts_with("resolved:") {
         return match resolved_issue_confirmation(orch, &push.content_ref).await {
             Some(body) => format!("{header}\n\n{body}"),

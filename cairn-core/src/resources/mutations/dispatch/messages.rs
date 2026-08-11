@@ -43,7 +43,7 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "payload.content is required"))?;
             if dry_run {
                 format!(
-                    "Would append {} chars to issue channel {project}-{number}",
+                    "Would append {} chars to issue channel {project}/{number}",
                     content.len()
                 )
             } else {

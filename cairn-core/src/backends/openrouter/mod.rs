@@ -55,6 +55,16 @@ impl AgentBackend for OpenRouterBackend {
         OPENROUTER_BACKEND_NAME
     }
 
+    fn response_completion_availability(
+        &self,
+        orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Result<(), String> {
+        openrouter_api_key(orch)
+            .map(|_| ())
+            .ok_or_else(|| "needs an OpenRouter API key".to_string())
+    }
+
     fn complete(
         &self,
         request: CompletionRequest,

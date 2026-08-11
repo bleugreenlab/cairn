@@ -19,6 +19,7 @@ mod config_scope;
 mod continue_job_queue;
 mod coordinator_attention;
 mod ctx_self_lifecycle;
+mod disclosure_remediation;
 mod effects_checkpoint;
 mod effects_checkpoint_loop;
 mod embeddings_db;

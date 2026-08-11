@@ -1110,6 +1110,15 @@ impl ChannelProvider for IMessageProvider {
             .expect("iMessage provider supports one inbound subscriber")
     }
 
+    fn liveness(&self) -> super::ChannelLiveness {
+        let value = self.watch_liveness();
+        super::ChannelLiveness {
+            active: value.active,
+            started_at: value.started_at,
+            last_receipt_at: value.last_receipt_at,
+            last_receipt_rowid: value.last_receipt_rowid,
+        }
+    }
     fn health(&self) -> ChannelHealth {
         self.health
             .read()

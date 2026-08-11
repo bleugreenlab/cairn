@@ -10,3 +10,4 @@ pub mod api;
 pub mod credentials;
 pub mod crypto;
 pub mod manifest;
+pub mod relay;

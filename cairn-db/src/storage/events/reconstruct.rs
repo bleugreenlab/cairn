@@ -28,6 +28,21 @@
 //! Any unresolvable coordinate — a dropped pack, a missing object, drift —
 //! degrades to a labeled coordinate stub. Reconstruction never errors out of the
 //! event list.
+//!
+//! # The quarantine gate
+//!
+//! This module decides what `data` an event reader sees, which makes it the one
+//! seam where a record known to carry a disclosed credential can be withheld
+//! (CAIRN-3828). The check runs *after* reconstruction, on every return path
+//! including the identity fast path — see [`withheld`] for why running it first
+//! would silently fail on exactly the archived events that need it most.
+//!
+//! Withholding substitutes a labeled stub, the same shape an unresolvable
+//! coordinate degrades to, rather than dropping the event: a hole in a
+//! transcript that reads as a rendering bug teaches an operator nothing. The row
+//! on disk is never rewritten — it is the record of what happened, and repairing
+//! it is an explicit operator action, not something a read performs.
+//! See `cairn_core::security::remediation`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -54,7 +69,7 @@ pub const STUB_PREFIX: &str = "content no longer resolvable";
 /// module docs for per-mode behavior.
 pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> {
     if !events.iter().any(is_archived) {
-        return events;
+        return withheld(events);
     }
     // Two phases so the `ObjectStore` (which holds a non-Send `Rc`) is never
     // alive across an await: gather all coordinates and pack bytes via async DB
@@ -87,7 +102,7 @@ pub async fn reconstruct_events(db: &LocalDb, events: Vec<Event>) -> Vec<Event> 
         })
         .await
         .unwrap_or_default();
-    finish(coords, events)
+    withheld(finish(coords, events))
 }
 
 /// Connection-scoped reconstruction for callers that already hold a read
@@ -99,12 +114,30 @@ pub async fn reconstruct_events_with_conn_and_routes(
     private_route_db: Option<&LocalDb>,
 ) -> Vec<Event> {
     if !events.iter().any(is_archived) {
-        return events;
+        return withheld(events);
     }
     let run_ids = gitcoord_run_ids(&events);
     let hashes = blobbed_hashes(&events);
     let coords = Coords::load(conn, &run_ids, &hashes, store, private_route_db).await;
-    finish(coords, events)
+    withheld(finish(coords, events))
+}
+
+/// Apply the disclosure quarantine (CAIRN-3828) to fully reconstructed events.
+///
+/// Last, and that ordering is the whole correctness argument. Withholding
+/// rewrites `data`, while reconstruction *regenerates* `data` from the
+/// compressed blob or the git coordinate and pays no attention to what was
+/// there before. A gate that ran first would therefore have its stub
+/// overwritten for precisely the archived events whose stored bytes carry the
+/// credential — the gate would appear to work on plain rows and fail silently
+/// on the ones already moved to cold storage.
+///
+/// Every return path funnels through here, including the identity fast path for
+/// an all-`full` batch, so there is no way to leave this function reachable
+/// only on one branch.
+fn withheld(mut events: Vec<Event>) -> Vec<Event> {
+    crate::storage::quarantine::withhold_quarantined(&mut events);
+    events
 }
 
 /// Build the layered stores from gathered coordinates and reconstruct each
@@ -317,7 +350,7 @@ async fn load_run_meta(
 }
 
 async fn load_private_local_repo_path(private_db: &LocalDb, project_key: &str) -> Option<String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     private_db
         .query_opt_text(
             "SELECT local_repo_path FROM project_routes WHERE project_key = ?1",
@@ -382,6 +415,17 @@ async fn load_blob(
     hash: &str,
     store: Option<&dyn ContentStore>,
 ) -> Option<String> {
+    // A segment blob is addressed by its own hash and read only here, so this is
+    // its quarantine gate. It needs one of its own rather than inheriting the
+    // event's: a blob is shared by every event whose segment hashes the same, so
+    // a credential in a system prompt reaches transcripts whose own rows are
+    // clean (CAIRN-3828).
+    if let Some(incident) = crate::storage::quarantine::quarantine()
+        .snapshot()
+        .withheld_by(crate::storage::quarantine::ARCHIVAL_BLOB_SINK, hash)
+    {
+        return Some(crate::storage::quarantine::withheld_notice(incident));
+    }
     match store {
         // Team conn: the store object is the UNCOMPRESSED segment bytes, keyed by
         // their sha256. Verify the fetched bytes hash to the requested key before

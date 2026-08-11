@@ -492,10 +492,13 @@ fn settled_result(
     }
     if !verdictless.is_empty() {
         value["verdictless"] = serde_json::json!(verdictless);
+        let reason = snapshot.terminal_reason.as_deref().unwrap_or(
+            "legacy check state has no durable attempt reason; the restart-protection dwell elapsed",
+        );
+        value["terminalReason"] = serde_json::json!(reason);
         value["note"] = serde_json::json!(format!(
-            "These lanes stopped without producing a verdict for this tree \
-             (a withdrawn or interrupted wave, a suppressed check, or a tree \
-             identical to its base). Nothing is going to run them; read {uri} \
+            "These lanes stopped without producing a verdict for this tree. \
+             Terminal reason: {reason}. Nothing is going to run them; read {uri} \
              for the node's own account."
         ));
     }
@@ -917,6 +920,7 @@ mod tests {
         let snapshot = ChecksSnapshot {
             settlement: classify(&statuses, HeadTurn::Idle, false),
             statuses,
+            terminal_reason: Some("issue merged before submission".to_string()),
         };
         let uri = "cairn://p/CAIRN/3427/1/builder/checks";
         let value: serde_json::Value =
@@ -927,6 +931,7 @@ mod tests {
         assert_eq!(value["verdict"], "incomplete");
         assert_eq!(value["elapsedMs"], 1234);
         assert_eq!(value["verdictless"][0], "rust-lint");
+        assert_eq!(value["terminalReason"], "issue merged before submission");
         assert!(value["note"]
             .as_str()
             .unwrap()
@@ -941,6 +946,7 @@ mod tests {
         let clean = ChecksSnapshot {
             settlement: classify(&statuses, HeadTurn::Idle, false),
             statuses,
+            terminal_reason: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&settled_result(uri, Some("rust-tests"), &clean, 5)).unwrap();

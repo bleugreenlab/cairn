@@ -1410,7 +1410,7 @@ async fn resolve_terminal_resource_target(
                     })
                 }
                 CairnResource::ProjectTerminal { project, slug } => {
-                    let lookup_key = project.to_uppercase();
+                    let lookup_key = cairn_common::uri::canonical_project(&project);
                     let mut rows = conn
                         .query(
                             "SELECT id, repo_path FROM projects WHERE key = ?1 LIMIT 1",

@@ -102,8 +102,14 @@ async fn validate_sink_references(
         .map_err(|error| error.to_string())?;
         if found.is_none() {
             return Err(match number {
-                Some(number) => format!("Issue not found: {}-{number}", project.to_uppercase()),
-                None => format!("Project not found: {}", project.to_uppercase()),
+                Some(number) => format!(
+                    "Issue not found: {}-{number}",
+                    cairn_common::uri::canonical_project(project)
+                ),
+                None => format!(
+                    "Project not found: {}",
+                    cairn_common::uri::canonical_project(project)
+                ),
             });
         }
     }

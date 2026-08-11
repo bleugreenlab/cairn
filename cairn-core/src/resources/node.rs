@@ -95,7 +95,7 @@ pub(crate) async fn resolve_node_or_task_job_id(
                     let mut rows = conn
                         .query(
                             "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 LIMIT 1",
-                            cairn_db::turso::params![project_key.to_uppercase(), name.as_str()],
+                            cairn_db::turso::params![cairn_common::uri::canonical_project(project_key), name.as_str()],
                         )
                         .await?;
                     let thread_id = rows
@@ -805,7 +805,7 @@ pub(super) async fn read_node_question(
     let questions = load_node_questions(&conn, &job.id).await;
     let Some(question) = questions.into_iter().find(|q| q.segment == segment) else {
         return format!(
-            "Question '{}' not found for node '{}' in issue {}-{}",
+            "Question '{}' not found for node '{}' in issue {}/{}",
             segment, node_name, project_key, number
         );
     };
@@ -972,7 +972,7 @@ pub(super) async fn read_node_permission(
     let requests = load_node_permissions(&conn, &job.id).await;
     let Some(request) = requests.into_iter().find(|r| r.segment == segment) else {
         return format!(
-            "Permission '{}' not found for node '{}' in issue {}-{}",
+            "Permission '{}' not found for node '{}' in issue {}/{}",
             segment, node_name, project_key, number
         );
     };
@@ -1065,7 +1065,7 @@ pub(super) async fn read_task_permission(
     let requests = load_node_permissions(&conn, &task_job.id).await;
     let Some(request) = requests.into_iter().find(|r| r.segment == segment) else {
         return format!(
-            "Permission '{}' not found for task '{}' in node '{}' of issue {}-{}",
+            "Permission '{}' not found for task '{}' in node '{}' of issue {}/{}",
             segment, task_name, node_name, project_key, number
         );
     };
@@ -1124,7 +1124,7 @@ pub(super) async fn read_node(
                 .await;
             }
             return format!(
-                "Node '{}' not found for issue {}-{}",
+                "Node '{}' not found for issue {}/{}",
                 node_name, project_key, number
             );
         }
@@ -1997,7 +1997,7 @@ pub(super) async fn read_node_artifact(
     let body = match &artifact {
         Some(a) => render_artifact_markdown(&a.data),
         None => format!(
-            "No artifact found for node '{}' in issue {}-{}",
+            "No artifact found for node '{}' in issue {}/{}",
             node_name, project_key, number
         ),
     };
@@ -2256,7 +2256,7 @@ pub(super) async fn read_task_chat_turn(
 
     if session_ids.any(|id| id != session_id) {
         return format!(
-            "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}-{} because runs span multiple sessions",
+            "Task turn URI is ambiguous for task '{}' in node '{}' of issue {}/{} because runs span multiple sessions",
             task_name, node_name, project_key, number
         );
     }
@@ -2284,14 +2284,14 @@ pub(super) async fn read_task_chat_turn(
             Some(id) => id,
             None => {
                 return format!(
-                    "Turn {} not found for task '{}' in node '{}' of issue {}-{}",
+                    "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
                     turn_seq, task_name, node_name, project_key, number
                 )
             }
         },
         Err(_) => {
             return format!(
-                "Turn {} not found for task '{}' in node '{}' of issue {}-{}",
+                "Turn {} not found for task '{}' in node '{}' of issue {}/{}",
                 turn_seq, task_name, node_name, project_key, number
             )
         }
@@ -2308,7 +2308,7 @@ pub(super) async fn read_task_chat_turn(
 
     if event_rows.is_empty() {
         return format!(
-            "No events found for turn {} in task '{}' of node '{}' for issue {}-{}",
+            "No events found for turn {} in task '{}' of node '{}' for issue {}/{}",
             turn_seq, task_name, node_name, project_key, number
         );
     }
@@ -2336,7 +2336,7 @@ pub(super) async fn read_task_artifact(
     match get_direct_artifact_for_job(&conn, &task_job.id).await {
         Some(artifact) => render_artifact_markdown(&artifact.data),
         None => format!(
-            "No artifact found for task '{}' in node '{}' of issue {}-{}",
+            "No artifact found for task '{}' in node '{}' of issue {}/{}",
             task_name, node_name, project_key, number
         ),
     }

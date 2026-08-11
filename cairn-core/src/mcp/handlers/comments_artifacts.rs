@@ -40,22 +40,13 @@ fn apply_arc_ruling_patch(
     let operation_keys = operation
         .as_object()
         .ok_or_else(|| "Arc ruling operation payload must be an object".to_string())?;
-    let expected: &[&str] = if operation.get("ruling").is_some() {
-        &["ruling"]
-    } else {
-        &["ruling_slug", "patch"]
-    };
-    let unexpected: Vec<&str> = operation_keys
-        .keys()
-        .map(String::as_str)
-        .filter(|key| !expected.contains(key))
-        .collect();
-    if !unexpected.is_empty() {
-        return Err(format!(
-            "Arc ruling operation cannot be mixed with other fields ({}); submit them in a separate patch",
-            unexpected.join(", ")
-        ));
+    if operation_keys.contains_key("rulings") {
+        return Err(
+            "Arc patch cannot combine a ruling operation with `rulings`: both write the rulings array"
+                .to_string(),
+        );
     }
+    let field_patch = arc_ruling_field_patch(operation)?;
 
     let root = base
         .as_object_mut()
@@ -115,7 +106,22 @@ fn apply_arc_ruling_patch(
         }
         _ => return Err("Use exactly one of payload.ruling or payload.ruling_slug".to_string()),
     }
-    Ok(base)
+    Ok(merge_artifact_payload(base, &field_patch))
+}
+
+fn arc_ruling_field_patch(operation: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let mut fields = operation
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "Arc ruling operation payload must be an object".to_string())?;
+    fields.remove("ruling");
+    fields.remove("ruling_slug");
+    // In the ruling_slug form, `patch` is reserved for the addressed ruling.
+    // Keep this partition explicit if the arc schema ever gains a field named `patch`.
+    if operation.get("ruling_slug").is_some() {
+        fields.remove("patch");
+    }
+    Ok(serde_json::Value::Object(fields))
 }
 
 fn apply_arc_field_patch(
@@ -280,7 +286,7 @@ async fn append_issue_comment_canonical(
     intent_id: Option<&str>,
 ) -> Result<String, String> {
     let services = &orch.services;
-    let project_key_upper = project_key.to_uppercase();
+    let project_key_upper = cairn_common::uri::canonical_project(project_key);
     let (_comment_id, issue_id, _now) = append_issue_comment_db(
         orch,
         &project_key_upper,
@@ -320,7 +326,7 @@ async fn append_issue_comment_canonical(
     }
 
     Ok(format!(
-        "Appended comment to issue {}-{}",
+        "Appended comment to issue {}/{}",
         project_key_upper, issue_number
     ))
 }
@@ -658,8 +664,12 @@ pub(crate) async fn write_artifact_change(
         // merging it verbatim silently corrupts the stored data (CAIRN-3283).
         // Checked against the submitted payload rather than the merged result so
         // an artifact already carrying stray keys stays editable.
-        if !is_text_replacement_patch(payload) && !is_arc_ruling_operation {
-            reject_undeclared_artifact_keys(&schema_value, payload)?;
+        if !is_text_replacement_patch(payload) {
+            if is_arc_ruling_operation {
+                reject_undeclared_artifact_keys(&schema_value, &arc_ruling_field_patch(payload)?)?;
+            } else {
+                reject_undeclared_artifact_keys(&schema_value, payload)?;
+            }
         }
         validate_against_schema(&schema_value, &effective_payload)?;
     }
@@ -1027,7 +1037,7 @@ async fn append_issue_comment_db(
                     .await?;
                 let row = rows.next().await?.ok_or_else(|| {
                     DbError::Row(format!(
-                        "Issue {}-{} not found",
+                        "Issue {}/{} not found",
                         project_key_upper, issue_number
                     ))
                 })?;
@@ -1656,15 +1666,25 @@ mod tests {
     }
 
     #[test]
-    fn arc_ruling_operations_reject_mixed_fields() {
-        let error = apply_arc_ruling_patch(
+    fn arc_ruling_operations_compose_with_field_updates_but_not_rulings_replacement() {
+        let patched = apply_arc_ruling_patch(
             json!({"current_intent": "Direction", "rulings": []}),
             &json!({"ruling": {
                 "text": "X", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/P/1"]
-            }, "working": "silently lost before this guard"}),
+            }, "working": "Now composed"}),
+        )
+        .unwrap();
+        assert_eq!(patched["working"], "Now composed");
+        assert_eq!(patched["rulings"][0]["slug"], "x");
+
+        let error = apply_arc_ruling_patch(
+            patched,
+            &json!({"ruling": {
+                "text": "Z", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/P/1"]
+            }, "rulings": []}),
         )
         .unwrap_err();
-        assert!(error.contains("cannot be mixed"), "{error}");
+        assert!(error.contains("both write the rulings array"), "{error}");
     }
 
     #[test]

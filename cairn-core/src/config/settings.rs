@@ -1201,12 +1201,18 @@ externalReplies: disabled
 
     #[test]
     fn channel_settings_yaml_roundtrip_and_defaults() {
-        use crate::models::{ChannelRouteConfig, ChannelsConfig, IMessageChannelConfig};
+        use crate::models::{
+            ChannelRouteConfig, ChannelsConfig, IMessageChannelConfig, TelegramChannelConfig,
+        };
 
         let defaults: SettingsFile = serde_yaml::from_str("channels:\n  imessage: {}\n").unwrap();
         let default_channel = defaults.to_settings().channels.imessage;
         assert!(!default_channel.enabled);
         assert_eq!(default_channel.route, ChannelRouteConfig::default());
+        assert_eq!(
+            defaults.to_settings().channels.telegram,
+            TelegramChannelConfig::default()
+        );
         assert_eq!(
             defaults.to_settings().channels.default_thread,
             "cairn://p/CAIRN/3404"
@@ -1225,6 +1231,16 @@ externalReplies: disabled
                     review: true,
                 },
             },
+            telegram: TelegramChannelConfig {
+                enabled: true,
+                chat_id: "-1001234567890".to_string(),
+                allow_from: vec!["123456789".to_string()],
+                route: ChannelRouteConfig {
+                    question: true,
+                    permission: true,
+                    review: false,
+                },
+            },
         };
         let settings = Settings {
             channels: channels.clone(),
@@ -1233,6 +1249,9 @@ externalReplies: disabled
         let file = SettingsFile::from_settings(&settings);
         let yaml = serde_yaml::to_string(&file).unwrap();
         assert!(yaml.contains("allowFrom"));
+        assert!(yaml.contains("chatId"));
+        assert!(!yaml.contains("botToken"));
+        assert!(!yaml.contains("BOT_TOKEN"));
         assert_eq!(file.to_settings().channels, channels);
         assert_eq!(
             serde_yaml::from_str::<SettingsFile>(&yaml)

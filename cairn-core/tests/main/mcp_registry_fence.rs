@@ -172,10 +172,11 @@ async fn workspace_mcp_create_denied_by_fence_changes_nothing() {
     assert!(!after.contains("axon"), "server must not have been written");
 }
 
-/// Allow is the complementary check: the same write under `onEscape: allow`
-/// actually lands the server in settings.yaml.
+/// Fence allow only clears the filesystem boundary. A workspace MCP registry
+/// change still crosses the authority boundary and must suspend for operator
+/// approval before touching settings.
 #[tokio::test]
-async fn workspace_mcp_create_allowed_lands_server() {
+async fn workspace_mcp_create_allowed_by_fence_still_awaits_authority() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
     let project_id = common::create_project(&db, "MRF").await;
@@ -193,16 +194,11 @@ async fn workspace_mcp_create_allowed_lands_server() {
 
     let result = handle_write(&orch, &create_request()).await;
     assert!(
-        result.contains("Added workspace MCP server 'axon'") || result.contains("\"applied\""),
-        "expected a success report, got: {result}"
-    );
-    let written = std::fs::read_to_string(&path).expect("settings.yaml should now exist");
-    assert!(
-        written.contains("axon"),
-        "server should be in settings.yaml"
+        result.contains("suspended pending authority approval"),
+        "expected an authority suspension report, got: {result}"
     );
     assert!(
-        written.contains("npx"),
-        "command should be in settings.yaml"
+        !path.exists(),
+        "a suspended registry change must not create settings.yaml"
     );
 }

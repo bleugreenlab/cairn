@@ -17,10 +17,10 @@ use serde_json::json;
 /// session-grant key; `request` is the originating verb, embedded for resume.
 fn crossing_tool_input() -> String {
     json!({
-        "kind": "read_outside_worktree",
+        "kind": "sensitive_host_read",
         "verb": "read",
         "descriptor": "/etc/hosts",
-        "summary": "read a file outside the worktree: /etc/hosts",
+        "summary": "read a sensitive denied path: /etc/hosts",
         "request": {
             "cwd": "/wt",
             "run_id": "run-1",

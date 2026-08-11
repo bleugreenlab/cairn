@@ -880,7 +880,7 @@ async fn reconcile_jj_downstream(
             pr_number,
             issue: issue_info
                 .as_ref()
-                .map(|issue| format!("{}-{}", issue.project_key, issue.number)),
+                .map(|issue| format!("{}/{}", issue.project_key, issue.number)),
         },
     };
     reconcile_base_advance(

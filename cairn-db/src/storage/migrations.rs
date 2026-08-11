@@ -1,6 +1,37 @@
 use super::migration::RebuildCheck;
 use super::Migration;
 
+macro_rules! shared_tail_lowercase_project_keys {
+    () => {
+        Migration::new(
+            "0173",
+            "lowercase_project_keys",
+            include_str!("../../../../turso_migrations/0173_lowercase_project_keys.sql"),
+        )
+    };
+}
+
+macro_rules! private_lowercase_project_routes {
+    () => {
+        Migration::new(
+            "0174",
+            "lowercase_project_routes",
+            include_str!("../../../../turso_migrations/0174_lowercase_project_routes.sql"),
+        )
+    };
+}
+
+/// CAIRN-3897: make the two logical families sharing check_result_cache explicit.
+macro_rules! shared_tail_check_result_cache_row_family {
+    () => {
+        Migration::new(
+            "0171",
+            "check_result_cache_row_family",
+            include_str!("../../../../turso_migrations/0171_check_result_cache_row_family.sql"),
+        )
+    };
+}
+
 /// Composes a migration lineage from its head migrations plus the shared tail.
 ///
 /// The private (`TURSO_MIGRATIONS`) and team (`TEAM_MIGRATIONS`) lineages diverge
@@ -31,6 +62,26 @@ macro_rules! shared_tail {
     };
 }
 
+macro_rules! private_build_change_ride_alongs {
+    () => {
+        Migration::new(
+            "0170",
+            "build_change_ride_alongs",
+            include_str!("../../../../turso_migrations/0170_build_change_ride_alongs.sql"),
+        )
+    };
+}
+
+macro_rules! private_route_fact_samples {
+    () => {
+        Migration::new(
+            "0169",
+            "route_fact_samples",
+            include_str!("../../../../turso_migrations/0169_route_fact_samples.sql"),
+        )
+    };
+}
+
 /// CAIRN-3810: recency ordering for the semantic lane's turn sweep. `turns` is
 /// shared project state, so the index is composed once into both lineages.
 macro_rules! shared_tail_turns_created_at_index {
@@ -56,6 +107,20 @@ macro_rules! private_authority_grants {
     };
 }
 
+/// CAIRN-3828: disclosure incidents, their affected-record inventory, and the
+/// quarantine that withholds an affected record from serving. Private-only: the
+/// inventory maps exactly which records carry a credential, and syncing that map
+/// would send a disclosure hint further than the disclosure.
+macro_rules! private_disclosure_remediation {
+    () => {
+        Migration::new(
+            "0172",
+            "disclosure_remediation",
+            include_str!("../../../../turso_migrations/0172_disclosure_remediation.sql"),
+        )
+    };
+}
+
 /// CAIRN-3861: thread ownership was never stamped on a delegated child, so a
 /// task a thread spawned could not be listed or opened from the thread pane.
 /// Carries the inheritance job creation now performs back over existing rows.
@@ -65,6 +130,17 @@ macro_rules! shared_tail_inherit_thread_id_for_child_jobs {
             "0167",
             "inherit_thread_id_for_child_jobs",
             include_str!("../../../../turso_migrations/0167_inherit_thread_id_for_child_jobs.sql"),
+        )
+    };
+}
+
+/// CAIRN-3888: durable current arm attempt for turn-end check settlement.
+macro_rules! shared_tail_turn_end_check_attempts {
+    () => {
+        Migration::new(
+            "0168",
+            "turn_end_check_attempts",
+            include_str!("../../../../turso_migrations/0168_turn_end_check_attempts.sql"),
         )
     };
 }
@@ -870,6 +946,9 @@ macro_rules! team_lineage {
             shared_tail_turns_created_at_index!(),
             shared_tail_check_result_cache_ran_at_millis!(),
             shared_tail_inherit_thread_id_for_child_jobs!(),
+            shared_tail_turn_end_check_attempts!(),
+            shared_tail_check_result_cache_row_family!(),
+            shared_tail_lowercase_project_keys!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1139,6 +1218,13 @@ macro_rules! private_lineage {
             shared_tail_check_result_cache_ran_at_millis!(),
             private_authority_grants!(),
             shared_tail_inherit_thread_id_for_child_jobs!(),
+            shared_tail_turn_end_check_attempts!(),
+            private_route_fact_samples!(),
+            private_build_change_ride_alongs!(),
+            shared_tail_check_result_cache_row_family!(),
+            private_disclosure_remediation!(),
+            shared_tail_lowercase_project_keys!(),
+            private_lowercase_project_routes!(),
         ]
     };
 }
@@ -1783,6 +1869,23 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("checkpoint_runs", TableScope::ProjectScoped),
     ("comments", TableScope::ProjectScoped),
     ("condition_evaluations", TableScope::ProjectScoped),
+    // A disclosure response is this host's own record, and its inventory is a
+    // map of exactly which records carry a credential. Replicating that map
+    // would publish the locations of the very thing the subsystem exists to
+    // contain — a disclosure hint travelling further than the disclosure. A
+    // replica remediates from its own scan. See 0169's header.
+    (
+        "disclosure_actions",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "disclosure_affected_records",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
+    (
+        "disclosure_incidents",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     ("doc_references", TableScope::ProjectScoped),
     ("event_read_tokens", TableScope::ProjectScoped),
     ("event_vibes", TableScope::ProjectScoped),
@@ -1818,6 +1921,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("pr_node_port_fires", TableScope::ProjectScoped),
     ("projects", TableScope::ProjectScoped),
     ("prompts", TableScope::ProjectScoped),
+    // Which records this install withholds from serving, and why. Private for
+    // the same reason as the incident tables above.
+    (
+        "quarantined_records",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     ("queued_messages", TableScope::ProjectScoped),
     ("repl_exchanges", TableScope::ProjectScoped),
     ("resource_surfacings", TableScope::ProjectScoped),
@@ -1833,6 +1942,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("token_rollup_runs", TableScope::ProjectScoped),
     ("tool_invocation_runs", TableScope::ProjectScoped),
     ("tool_invocations", TableScope::ProjectScoped),
+    ("turn_end_check_attempts", TableScope::ProjectScoped),
     ("turns", TableScope::ProjectScoped),
     ("wake_subscriptions", TableScope::ProjectScoped),
     ("workflow_progress", TableScope::ProjectScoped),
@@ -1924,6 +2034,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "analytics_rollup_backfill_state",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    // The running app's build identity and its pending per-recipient rebuild
+    // notices describe this operator installation, never shared project state.
+    (
+        "app_boot_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "build_change_notifications",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     (
         "archival_backfill_state",
         TableScope::Private(PrivateReason::RunnerTransient),
@@ -1965,6 +2085,20 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "route_firings",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // This install's own build identity and the frozen rebuild notices derived
+    // from it: operator-install facts about one machine, not project data.
+    (
+        "app_boot_state",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "build_change_notifications",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "route_fact_samples",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -2086,6 +2220,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
             "project_id",
             "parent_job_id",
         ],
+    },
+    RekeyTableManifest {
+        table: "turn_end_check_attempts",
+        id_columns: &["id", "job_id"],
     },
     RekeyTableManifest {
         table: "agent_waits",
@@ -2242,7 +2380,9 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
             "issue_id",
             "project_id",
             "current_turn_id",
+            "turn_end_check_attempt_id",
             "resume_session_id",
+            "turn_end_check_attempt_id",
         ],
     },
     RekeyTableManifest {
@@ -2370,6 +2510,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "tool_invocations",
         id_columns: &["id", "event_id", "run_id"],
+    },
+    RekeyTableManifest {
+        table: "turn_end_check_attempts",
+        id_columns: &["id", "job_id"],
     },
     RekeyTableManifest {
         table: "turns",
@@ -2593,6 +2737,14 @@ mod tests {
                 "0165_check_result_cache_ran_at_millis".to_string(),
                 "0166_authority_grants".to_string(),
                 "0167_inherit_thread_id_for_child_jobs".to_string(),
+                "0168_turn_end_check_attempts".to_string(),
+                "0169_route_fact_samples".to_string(),
+                "0170_build_change_ride_alongs".to_string(),
+                "0171_check_result_cache_row_family".to_string(),
+                "0173_lowercase_project_keys".to_string(),
+                "0172_disclosure_remediation".to_string(),
+                "0173_lowercase_project_keys".to_string(),
+                "0174_lowercase_project_routes".to_string(),
             ]
         );
         Ok(db)
@@ -4673,6 +4825,8 @@ mod tests {
                 "0163_turns_created_at_index".to_string(),
                 "0165_check_result_cache_ran_at_millis".to_string(),
                 "0167_inherit_thread_id_for_child_jobs".to_string(),
+                "0168_turn_end_check_attempts".to_string(),
+                "0171_check_result_cache_row_family".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

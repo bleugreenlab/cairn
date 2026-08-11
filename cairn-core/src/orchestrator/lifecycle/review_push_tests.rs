@@ -23,6 +23,39 @@ async fn test_db() -> LocalDb {
 }
 
 #[tokio::test]
+async fn later_requester_that_wins_single_flight_becomes_the_durable_current_owner() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+
+    let first = crate::execution::checks_turn_end::request_turn_end_attempt(&orch, "j-prod")
+        .expect("persist first requester");
+    let winner = crate::execution::checks_turn_end::request_turn_end_attempt(&orch, "j-prod")
+        .expect("persist concurrent requester");
+
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        &orch, "j-prod", &winner, "claimed", None,
+    )
+    .expect("the later requester wins single-flight");
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        &orch,
+        "j-prod",
+        &first,
+        "superseded",
+        Some("another turn-end check attempt won the slot"),
+    )
+    .expect("terminalize the losing requester");
+
+    let current =
+        crate::execution::checks_turn_end::current_turn_end_attempt(&orch.db.local, "j-prod")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(current.id, winner);
+    assert_eq!(current.state, "claimed");
+}
+
+#[tokio::test]
 async fn cancelled_wave_rearms_after_a_dormant_nodes_base_advances() {
     let db = test_db().await;
     seed(&db, "initial").await;
@@ -1711,4 +1744,90 @@ async fn resolving_an_issue_cancels_its_jobs_turn_end_checks() {
         "resolving issue i-rev quits its builder job's in-flight suite"
     );
     orch.end_turn_end_checks("j-prod");
+}
+
+#[tokio::test]
+async fn repeated_turn_ends_preserve_attempt_history_and_current_ordering() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+
+    let owner = crate::execution::checks_turn_end::request_turn_end_attempt(&orch, "j-prod")
+        .expect("persist owner attempt");
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        &orch, "j-prod", &owner, "claimed", None,
+    )
+    .expect("claim owner");
+    let successor = crate::execution::checks_turn_end::request_turn_end_attempt(&orch, "j-prod")
+        .expect("persist successor attempt");
+    crate::execution::checks_turn_end::transition_turn_end_attempt(
+        &orch,
+        "j-prod",
+        &successor,
+        "superseded",
+        Some("owner remains active"),
+    )
+    .expect("terminalize successor");
+
+    let rows = orch.db.local.read(|conn| Box::pin(async move {
+        let mut rows = conn.query(
+            "SELECT id,state FROM turn_end_check_attempts WHERE job_id='j-prod' ORDER BY created_at,id",
+            (),
+        ).await?;
+        let mut found=Vec::new();
+        while let Some(row)=rows.next().await? { found.push((row.text(0)?,row.text(1)?)); }
+        Ok::<_,crate::storage::DbError>(found)
+    })).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&(owner.clone(), "claimed".to_string())));
+    assert!(rows.contains(&(successor.clone(), "superseded".to_string())));
+    let current =
+        crate::execution::checks_turn_end::current_turn_end_attempt(&orch.db.local, "j-prod")
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(current.id, owner);
+    assert_eq!(current.state, "claimed");
+}
+
+#[tokio::test]
+async fn startup_reconciliation_terminalizes_every_moving_attempt_with_named_reason() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    for state in ["requested", "claimed", "runtime_started", "submitted"] {
+        let id =
+            crate::execution::checks_turn_end::request_turn_end_attempt(&orch, "j-prod").unwrap();
+        crate::execution::checks_turn_end::transition_turn_end_attempt(
+            &orch, "j-prod", &id, state, None,
+        )
+        .unwrap();
+    }
+
+    crate::execution::checks_turn_end::reconcile_turn_end_attempts_on_startup(&orch).await;
+
+    let rows = orch
+        .db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT state,reason FROM turn_end_check_attempts WHERE job_id='j-prod'",
+                        (),
+                    )
+                    .await?;
+                let mut found = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    found.push((row.text(0)?, row.text(1)?));
+                }
+                Ok::<_, crate::storage::DbError>(found)
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    assert!(rows
+        .iter()
+        .all(|(state, reason)| state == "failed" && reason.contains("host restarted")));
 }

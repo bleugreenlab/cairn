@@ -309,7 +309,7 @@ async fn lookup_terminal_info(
         let task_name = task_name.clone();
         Box::pin(async move {
             let row = if node_id.is_none() {
-                let lookup_key = project_key.to_uppercase();
+                let lookup_key = cairn_common::uri::canonical_project(project_key);
                 let mut rows = conn
                     .query(
                         "
@@ -396,7 +396,7 @@ async fn list_terminal_slugs_in_scope(
         let task_name = task_name.clone();
         Box::pin(async move {
             let mut rows = if node_id.is_none() {
-                let lookup_key = project_key.to_uppercase();
+                let lookup_key = cairn_common::uri::canonical_project(project_key);
                 conn.query(
                     "
                     SELECT jt.slug

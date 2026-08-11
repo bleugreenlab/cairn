@@ -94,6 +94,7 @@ const DESTRUCTIVE_ATTEMPT_LIMIT: u32 = 3;
 /// Bounded at the seam rather than at the display, so unbounded daemon output
 /// can never become unbounded retained state or reach a UI surface.
 const DIAGNOSTIC_BYTES: usize = 600;
+const CACHE_QUARANTINE_FILE_LIMIT: usize = 100_000;
 
 /// How much of a probe's stdout is read. The sccache report is roughly 1.5 KiB;
 /// this leaves generous headroom while keeping the read bounded.
@@ -932,6 +933,37 @@ fn listener_temp_dir_live(control: &dyn ListenerProcessControl, addr: &str) -> b
 /// instance and survives slot reclamation. Passing a cache-miss compile here is
 /// the fitness claim a machine-wide daemon actually makes: it is not carrying a
 /// worktree fence inherited from, or explicitly added by, its launcher.
+const ADOPTION_ENV_KEYS: [&str; 5] = [
+    "SCCACHE_DIR",
+    "SCCACHE_SERVER_PORT",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+];
+
+fn listener_environment_mismatch(
+    control: &dyn ListenerProcessControl,
+    addr: &str,
+    cfg: &BuildServiceConfig,
+    templates: &Templates,
+) -> Option<String> {
+    let listener = control.listener(addr).ok().flatten()?;
+    let observed = control.environ(listener.pid).ok()?;
+    let mut expected = cfg.expanded_env(templates);
+    expected.extend(cfg.expanded_launch_env(templates));
+    ADOPTION_ENV_KEYS.iter().find_map(|key| {
+        let expected = expected.get(*key)?;
+        let observed = observed.get(*key)?;
+        (observed != expected).then(|| {
+            format!(
+                "listener pid {} at {} has {key}={observed:?}, expected {expected:?}",
+                listener.pid,
+                listener.executable.display()
+            )
+        })
+    })
+}
+
 fn capability_probe_dir(templates: &Templates) -> PathBuf {
     templates
         .home
@@ -972,7 +1004,7 @@ const CAPABILITY_PROBE_DEADLINE: Duration = Duration::from_secs(60);
 /// `CARGO_INCREMENTAL=0` is set explicitly: sccache refuses an incremental
 /// invocation with exit 1 before running anything, and a probe defeated by an
 /// ambient env var would read as a broken daemon.
-fn prove_daemon_cannot_compile(
+fn prove_daemon_unfit(
     spawner: &dyn ProcessSpawner,
     cfg: &BuildServiceConfig,
     templates: &Templates,
@@ -1027,16 +1059,27 @@ fn prove_daemon_cannot_compile(
 
     let mut through_daemon = vec![client, "rustc".to_string()];
     through_daemon.extend(rustc_args.iter().cloned());
-    let attempt = run_round_trip(
+    let miss = run_round_trip(
         spawner,
         &through_daemon,
         &probe_env,
         CAPABILITY_PROBE_DEADLINE,
     );
-    if attempt.healthy() {
+    let failed_leg = if miss.healthy() {
+        let hit = run_round_trip(
+            spawner,
+            &through_daemon,
+            &probe_env,
+            CAPABILITY_PROBE_DEADLINE,
+        );
+        (!hit.healthy()).then_some(("serve the cache entry it had just written", hit))
+    } else {
+        Some(("compile a trivially valid crate", miss))
+    };
+    let Some((capability, attempt)) = failed_leg else {
         cleanup();
         return None;
-    }
+    };
 
     let mut directly = vec!["rustc".to_string()];
     directly.extend(rustc_args);
@@ -1057,9 +1100,8 @@ fn prove_daemon_cannot_compile(
     }
 
     Some(format!(
-        "the daemon could not compile a trivially valid crate into {}, which rustc compiled \
-         directly without complaint — so builds that miss this cache are being failed by it \
-         rather than served: {}",
+        "the daemon could not {capability} into {}, which rustc compiled directly without \
+         complaint — so the compile cache is failing work it accepts rather than serving it: {}",
         out.display(),
         attempt.summary()
     ))
@@ -1103,9 +1145,19 @@ fn assess_service(
     };
     // Liveness is not fitness. Prove the daemon can write this runner's managed
     // build root before any client environment is allowed to route work to it.
-    if let Some(reason) = prove_daemon_cannot_compile(spawner, cfg, templates, env) {
+    if let Some(reason) = prove_daemon_unfit(spawner, cfg, templates, env) {
+        let identity = probe.tcp.as_deref().and_then(|addr| {
+            control.listener(addr).ok().flatten().map(|listener| {
+                format!(
+                    "listener pid {} at {}",
+                    listener.pid,
+                    listener.executable.display()
+                )
+            })
+        });
         observation.health = ServiceHealth::Wedged;
-        observation.unfit = Some(reason);
+        observation.unfit =
+            Some(identity.map_or(reason.clone(), |identity| format!("{identity}: {reason}")));
     }
     observation
 }
@@ -1468,18 +1520,20 @@ fn reconcile_launched_service_with_timeout(
     // taken on as-is and fail every compile routed to it. Only an unhealthy
     // listener whose executable is exactly the configured service binary is
     // eligible for termination; unrelated listeners are never killed.
-    if assess_health(
-        spawner,
-        control,
-        probe,
-        &client_env,
-        HEALTH_ROUND_TRIP_DEADLINE,
-        // Adoption is exactly where the compile probe earns its cost: the daemon
-        // being adopted was launched by some other process, with a grant this one
-        // did not choose and cannot read. Taking on a daemon that cannot compile
-        // is how a stale generation came to own the machine (CAIRN-3355).
-        Some((cfg, templates)),
-    ) == ServiceHealth::Healthy
+    let environment_mismatch = listener_environment_mismatch(control, addr, cfg, templates);
+    if environment_mismatch.is_none()
+        && assess_health(
+            spawner,
+            control,
+            probe,
+            &client_env,
+            HEALTH_ROUND_TRIP_DEADLINE,
+            // Adoption is exactly where the compile probe earns its cost: the daemon
+            // being adopted was launched by some other process, with a grant this one
+            // did not choose and cannot read. Taking on a daemon that cannot compile
+            // is how a stale generation came to own the machine (CAIRN-3355).
+            Some((cfg, templates)),
+        ) == ServiceHealth::Healthy
     {
         return Ok(None);
     }
@@ -1496,6 +1550,11 @@ fn reconcile_launched_service_with_timeout(
     // in place and reports why, which is strictly better than destroying it on a
     // verdict this process cannot yet vouch for.
     if !may_destroy {
+        if let Some(mismatch) = environment_mismatch {
+            return Err(format!(
+                "refusing to adopt the reachable build-service daemon because {mismatch}; leaving it in place"
+            ));
+        }
         return Err(format!(
             "a TCP connection to {addr} succeeded at the termination decision, but this \
              runner's health probe has not earned the confidence to terminate that listener; \
@@ -1638,6 +1697,15 @@ pub struct BuildServiceRuntimeDiagnostic {
     /// positive evidence and cleared by health, so the absence of an observation
     /// never withdraws a build from a working cache.
     pub(crate) unfit: Option<String>,
+    /// A reported corrupt artifact that quarantine could not positively remove.
+    ///
+    /// A generic capability compile uses a fresh nonce and therefore cannot prove
+    /// that the offending cache key became readable. This runtime-only latch is
+    /// not released merely because the bounded scanner removed some other empty
+    /// entry: the reviewed mmap evidence does not name a cache key, so no removed
+    /// path can be proven to be the artifact that failed.
+    #[serde(skip)]
+    pub(crate) unresolved_corruption: bool,
     /// Whether this process has ever seen the health round trip answer.
     ///
     /// Until it has, the probe is an untested instrument and its unhealthy
@@ -1660,6 +1728,25 @@ impl BuildServiceRuntimeDiagnostic {
             1
         };
         self.consecutive_failures < limit
+    }
+
+    /// Keep a stronger unresolved-corruption verdict across a generic healthy
+    /// probe, which compiles a different nonce and cannot verify the failing key.
+    fn clear_unfit_after_healthy_probe(&mut self, now_ms: u64) -> bool {
+        if !self.unresolved_corruption {
+            self.unfit = None;
+            return true;
+        }
+        let reason = self
+            .unfit
+            .clone()
+            .unwrap_or_else(|| "compile-cache corruption remains unresolved".to_string());
+        self.last_health = Some("wedged".to_string());
+        self.last_probe = Some(reason.clone());
+        self.stats_gap = Some(reason.clone());
+        self.current_failure = Some(reason);
+        self.enter("degraded", now_ms);
+        false
     }
 
     /// Move to a lifecycle state, dating the transition only when it is one.
@@ -1886,6 +1973,41 @@ fn cache_change_is_news(
 /// neither. `sccache` by name when present (it is the built-in default), and
 /// otherwise the first by name so a differently-named single service is still
 /// reported rather than silently absent.
+fn quarantine_zero_length_cache_entries(state_dir: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let mut pending = vec![(state_dir.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((dir, depth)) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if visited >= CACHE_QUARANTINE_FILE_LIMIT {
+                return removed;
+            }
+            visited += 1;
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 8 {
+                pending.push((path, depth + 1));
+            } else if kind.is_file()
+                && depth >= 2
+                && entry.metadata().is_ok_and(|metadata| metadata.len() == 0)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                log::warn!(
+                    "quarantined zero-length compile-cache entry {}",
+                    path.display()
+                );
+                removed.push(path);
+            }
+        }
+    }
+    removed
+}
+
 fn compile_cache_service(
     services: &HashMap<String, BuildServiceConfig>,
 ) -> Option<(String, BuildServiceConfig)> {
@@ -1913,6 +2035,35 @@ fn service_on_path(cfg: &BuildServiceConfig) -> bool {
 impl Orchestrator {
     fn build_service_templates(&self) -> Templates {
         settings::build_service_templates(&self.config_dir, None)
+    }
+
+    pub(crate) fn report_compile_cache_corruption(&self, evidence: &str) -> Vec<PathBuf> {
+        let services = settings::load_build_services(&self.config_dir);
+        let Some((name, cfg)) = compile_cache_service(&services) else {
+            return Vec::new();
+        };
+        let templates = self.build_service_templates();
+        let removed = cfg
+            .expanded_state_dir(&templates)
+            .map(|dir| quarantine_zero_length_cache_entries(&dir))
+            .unwrap_or_default();
+        let reason = bounded_tail(&format!("compile-cache corruption reported: {evidence}"));
+        let mut diagnostics = self.build_service_runtime.lock().unwrap();
+        let state = diagnostics.entry(name).or_default();
+        state.last_health = Some("wedged".to_string());
+        state.last_probe = Some(reason.clone());
+        state.current_failure = Some(reason.clone());
+        state.failure_config = Some(service_config_fingerprint(&cfg));
+        state.stats_gap = Some(reason.clone());
+        state.unfit = Some(reason);
+        // The mmap signature identifies the failure mode, not the cache key.
+        // Quarantining zero-length entries is useful cleanup, but removing any
+        // particular entry cannot prove it was the one this compile attempted to
+        // read. Keep routing uncached until stronger evidence (or a fresh runner
+        // lifecycle) resets this runtime-only ruling.
+        state.unresolved_corruption = true;
+        state.enter("degraded", unix_ms());
+        removed
     }
 
     /// Enabled services whose launch program is installed.
@@ -2085,7 +2236,10 @@ impl Orchestrator {
             let state = diagnostics.entry(name.to_string()).or_default();
             state.last_health = Some(health_name.to_string());
             state.last_checked_at = Some(chrono::Utc::now().timestamp());
-            state.last_probe = observation.round_trip.as_ref().map(RoundTrip::summary);
+            state.last_probe = observation
+                .unfit
+                .clone()
+                .or_else(|| observation.round_trip.as_ref().map(RoundTrip::summary));
             if observation.health == ServiceHealth::Healthy {
                 // One round trip serves both purposes: the health verdict above
                 // and the counters below. The UI never runs its own.
@@ -2108,12 +2262,20 @@ impl Orchestrator {
                             Some("this service has no statistics round trip configured".to_string())
                     }
                 }
+                state.consecutive_failures = 0;
+                state.next_attempt_unix_ms = None;
+                // This probe compiled a fresh nonce. It says the daemon works
+                // in general, not that a previously failing cache key was
+                // removed, so retain the stronger corruption diagnosis.
+                if !state.clear_unfit_after_healthy_probe(now_ms) {
+                    log::warn!(
+                        "build service '{name}' answered a generic health probe, but reported cache corruption remains unresolved"
+                    );
+                    return;
+                }
                 state.current_failure = None;
                 state.failure_config = None;
                 clear_recovery_failure(cfg, templates);
-                state.unfit = None;
-                state.consecutive_failures = 0;
-                state.next_attempt_unix_ms = None;
                 if state.generation == 0 {
                     // A daemon this process did not launch is still an
                     // incarnation, and the counters it reports belong to it.
@@ -2146,8 +2308,12 @@ impl Orchestrator {
             // its backoff still says why it is being restarted. This is also
             // what puts the condition in front of an AGENT whose build it broke
             // (see `BuildServiceDiagnosticSnapshot::agent_advisory`).
-            if let Some(reason) = observation.unfit.as_deref() {
-                log::warn!("build service '{name}' is unfit to compile: {reason}");
+            if observation.health == ServiceHealth::Wedged {
+                let reason = observation
+                    .unfit
+                    .as_deref()
+                    .unwrap_or("the reachable daemon is wedged and cannot safely accept builds");
+                log::warn!("build service '{name}' is unfit: {reason}");
                 state.current_failure = Some(bounded_tail(reason));
                 state.failure_config = Some(service_config_fingerprint(cfg));
                 state.unfit = Some(bounded_tail(reason));
@@ -2760,8 +2926,16 @@ mod tests {
         let mut spawner = MockProcessSpawner::new();
         spawner
             .expect_spawn()
+            .withf(|spawn| spawn.program == "/bin/sh")
             .times(1)
             .returning(|_| Ok(Box::new(MockChildProcess::failing(11, "", 0))));
+        // The machine-wide port may be occupied by the real supervised daemon
+        // while this test runs. Its health commands are allowed; a second
+        // launchctl submission is not.
+        spawner
+            .expect_spawn()
+            .withf(|spawn| spawn.program != "/bin/sh")
+            .returning(|_| Ok(Box::new(MockChildProcess::failing(12, "", 1))));
         let control = FakeListenerControl::new(None, 0, PathBuf::new());
 
         let error = reconcile_launched_service_with_timeout(
@@ -3293,13 +3467,11 @@ mod tests {
         // ...whose health round-trips both answer cleanly. Answering is exactly
         // what makes this daemon dangerous, so the verdict must not come from the
         // round-trip alone.
-        for id in [31, 32] {
-            spawner
-                .expect_spawn()
-                .times(1)
-                .in_sequence(&mut sequence)
-                .returning(move |_| Ok(Box::new(MockChildProcess::failing(id, "", 0))));
-        }
+        spawner
+            .expect_spawn()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(Box::new(MockChildProcess::failing(31, "", 0))));
         spawner
             .expect_spawn()
             .times(1)
@@ -4347,5 +4519,126 @@ Max cache size                       50 GiB
         let body = std::fs::read_to_string(&dest).unwrap();
         assert!(body.contains("command -v sccache"));
         assert_eq!(install_cache_wrapper(temp.path()).unwrap(), dest);
+    }
+
+    #[test]
+    fn cache_hit_read_failure_is_unfit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let probe = probe_for(listener.local_addr().unwrap().to_string());
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let mut spawner = MockProcessSpawner::new();
+        spawner.expect_spawn().returning(move |config| {
+            if config.program == "rustc" {
+                return Ok(Box::new(MockChildProcess::failing(1, "", 0)));
+            }
+            if config.args.iter().any(|arg| arg == "--show-stats") {
+                return Ok(Box::new(answering_with(SAMPLE_STATS)));
+            }
+            Ok(Box::new(if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                MockChildProcess::failing(1, "", 0)
+            } else {
+                MockChildProcess::failing(1, "memory map must have a non-zero length", 1)
+            }))
+        });
+        let control = FakeListenerControl::detached(77, PathBuf::from("/bin/sccache"));
+        let (cfg, templates, _site) = capability_service();
+        let observation = assess_service(
+            &spawner,
+            &control,
+            &probe,
+            &HashMap::new(),
+            Duration::from_secs(1),
+            Some((&cfg, &templates)),
+        );
+        assert_eq!(observation.health, ServiceHealth::Wedged);
+        let reason = observation.unfit.unwrap();
+        assert!(reason.contains("listener pid 77"), "{reason}");
+        assert!(
+            reason.contains("serve the cache entry it had just written"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("memory map must have a non-zero length"),
+            "{reason}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn adoption_environment_fingerprint_mismatch_is_positive_evidence() {
+        let cfg = default_sccache_service();
+        let templates = templates();
+        let control = FakeListenerControl::detached(41, PathBuf::from("/bin/sccache"))
+            .with_env("SCCACHE_DIR", "/wrong/cache");
+        let mismatch =
+            listener_environment_mismatch(&control, "127.0.0.1:4227", &cfg, &templates).unwrap();
+        assert!(mismatch.contains("pid 41"), "{mismatch}");
+        assert!(mismatch.contains("SCCACHE_DIR"), "{mismatch}");
+
+        let unreadable = FakeListenerControl::detached(42, PathBuf::from("/bin/sccache"))
+            .with_unreadable_environ();
+        assert!(
+            listener_environment_mismatch(&unreadable, "127.0.0.1:4227", &cfg, &templates)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unresolved_corruption_survives_a_healthy_generic_probe() {
+        let reason = "compile-cache corruption reported: corrupt archive".to_string();
+        let mut state = BuildServiceRuntimeDiagnostic {
+            last_health: Some("wedged".into()),
+            last_probe: Some(reason.clone()),
+            current_failure: Some(reason.clone()),
+            stats_gap: Some(reason.clone()),
+            unfit: Some(reason.clone()),
+            unresolved_corruption: true,
+            ..BuildServiceRuntimeDiagnostic::default()
+        };
+
+        // The healthy branch runs this exact transition after its fresh-nonce
+        // capability probe. That success is not evidence about the corrupt key.
+        assert!(!state.clear_unfit_after_healthy_probe(99));
+
+        assert_eq!(state.unfit.as_deref(), Some(reason.as_str()));
+        assert_eq!(state.current_failure.as_deref(), Some(reason.as_str()));
+        assert_eq!(state.lifecycle.as_deref(), Some("degraded"));
+    }
+
+    #[test]
+    fn unrelated_quarantined_entry_does_not_resolve_reported_corruption() {
+        let mut state = BuildServiceRuntimeDiagnostic {
+            unfit: Some("compile-cache corruption reported: corrupt archive".into()),
+            // A zero-length entry was removed, but the evidence did not identify
+            // it as the key the failed compile attempted to read.
+            unresolved_corruption: true,
+            ..BuildServiceRuntimeDiagnostic::default()
+        };
+
+        assert!(!state.clear_unfit_after_healthy_probe(99));
+        assert!(state.unfit.is_some());
+    }
+
+    #[test]
+    fn corruption_quarantine_removes_only_sharded_empty_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let shard = root.path().join("cache").join("ab").join("cd");
+        std::fs::create_dir_all(&shard).unwrap();
+        let corrupt = shard.join("corrupt");
+        let healthy = shard.join("healthy");
+        let metadata = root.path().join(".cairn-reconcile.lock");
+        std::fs::write(&corrupt, []).unwrap();
+        std::fs::write(&healthy, b"archive").unwrap();
+        std::fs::write(&metadata, []).unwrap();
+
+        assert_eq!(
+            quarantine_zero_length_cache_entries(root.path()),
+            vec![corrupt.clone()]
+        );
+        assert!(!corrupt.exists());
+        assert!(healthy.exists());
+        assert!(metadata.exists());
     }
 }

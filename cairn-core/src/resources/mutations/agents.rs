@@ -250,7 +250,7 @@ fn not_found(agent_id: &str, explicit_project: Option<&str>) -> String {
     match explicit_project {
         Some(project) => format!(
             "Agent not found in project {}: {agent_id}",
-            project.to_uppercase()
+            cairn_common::uri::canonical_project(project)
         ),
         None => format!("Agent not found: {agent_id}"),
     }

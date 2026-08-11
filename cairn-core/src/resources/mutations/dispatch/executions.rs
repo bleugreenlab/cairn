@@ -49,7 +49,7 @@ pub(super) async fn dispatch(
             let overrides = parse_launch_overrides(index, item, item.payload.as_ref())?;
             if dry_run {
                 format!(
-                    "Would start an execution for {project}-{number}{}",
+                    "Would start an execution for {project}/{number}{}",
                     recipe
                         .map(|r| format!(" (recipe '{r}')"))
                         .unwrap_or_default()

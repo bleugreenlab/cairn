@@ -12,6 +12,39 @@ pub enum FieldKind {
     List,
 }
 
+/// Explain every test in one trigger clause. This shares the exact matcher for
+/// its verdict so editor diagnostics cannot drift from dispatch behavior.
+pub fn explain_clause(clause: &BTreeMap<String, Value>, fact: &Fact<'_>) -> Vec<String> {
+    clause
+        .iter()
+        .filter_map(|(key, expected)| {
+            let one = BTreeMap::from([(key.clone(), expected.clone())]);
+            clause_matches(&one, fact)
+                .then_some(())
+                .map(|_| None)
+                .unwrap_or_else(|| {
+                    let actual = match key.as_str() {
+                        "fact" => Value::String(fact.source.into()),
+                        "presence" => Value::String(
+                            match fact.presence {
+                                Presence::Active => "active",
+                                Presence::Away => "away",
+                            }
+                            .into(),
+                        ),
+                        key if key.ends_with("Prefix") => fact
+                            .fields
+                            .get(key.trim_end_matches("Prefix"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        field => fact.fields.get(field).cloned().unwrap_or(Value::Null),
+                    };
+                    Some(format!("{key} expected {expected}, observed {actual}"))
+                })
+        })
+        .collect()
+}
+
 /// Where a field's legal values come from. Declaring this with the field is what
 /// lets an editor offer the actual values instead of a free-text box: a closed
 /// enum ships its variants inline, and the collection-backed vocabularies name a
@@ -83,8 +116,23 @@ impl Default for FactRegistry {
             ("context", FieldKind::Scalar),
             ("jobId", FieldKind::Scalar),
         ]);
+        let github_comment = HashMap::from([
+            ("project", FieldKind::Scalar),
+            ("repository", FieldKind::Scalar),
+            ("number", FieldKind::Scalar),
+            ("kind", FieldKind::Scalar),
+            ("author", FieldKind::Scalar),
+            ("url", FieldKind::Scalar),
+            ("title", FieldKind::Scalar),
+            ("body", FieldKind::Scalar),
+            ("text", FieldKind::Scalar),
+        ]);
         Self {
-            sources: HashMap::from([("attention", attention), ("thread_stream", thread)]),
+            sources: HashMap::from([
+                ("attention", attention),
+                ("thread_stream", thread),
+                ("github_comment", github_comment),
+            ]),
         }
     }
 }
@@ -242,7 +290,29 @@ mod tests {
         let described = registry.describe();
         assert_eq!(
             described.iter().map(|s| s.fact).collect::<Vec<_>>(),
-            vec!["attention", "thread_stream"]
+            vec!["attention", "github_comment", "thread_stream"]
+        );
+        let github_comment = described
+            .iter()
+            .find(|source| source.fact == "github_comment")
+            .unwrap();
+        assert_eq!(
+            github_comment
+                .fields
+                .iter()
+                .map(|field| field.name)
+                .collect::<Vec<_>>(),
+            vec![
+                "author",
+                "body",
+                "kind",
+                "number",
+                "project",
+                "repository",
+                "text",
+                "title",
+                "url",
+            ]
         );
         for source in &described {
             for field in &source.fields {

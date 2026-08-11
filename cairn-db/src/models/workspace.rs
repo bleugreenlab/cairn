@@ -20,6 +20,21 @@ pub enum ExternalReplyMode {
     Disabled,
 }
 
+/// Telegram delivery configuration. The bot token is deliberately absent: it
+/// is stored in the operating-system keychain under the Telegram credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelegramChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub chat_id: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default)]
+    pub route: ChannelRouteConfig,
+}
+
 /// Custom deserializer for nullable optional fields in UpdateSettings.
 /// Distinguishes between:
 /// - Field missing from JSON → None (no update)
@@ -44,6 +59,8 @@ pub struct ChannelsConfig {
     pub default_thread: String,
     #[serde(default)]
     pub imessage: IMessageChannelConfig,
+    #[serde(default)]
+    pub telegram: TelegramChannelConfig,
 }
 
 fn default_channel_thread() -> String {
@@ -55,6 +72,7 @@ impl Default for ChannelsConfig {
         Self {
             default_thread: default_channel_thread(),
             imessage: IMessageChannelConfig::default(),
+            telegram: TelegramChannelConfig::default(),
         }
     }
 }

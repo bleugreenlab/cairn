@@ -179,6 +179,13 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
     let mut merged: BTreeMap<String, MergedModel> = BTreeMap::new();
     for host in hosts {
         for (tag, show) in host.models {
+            if !show
+                .capabilities
+                .iter()
+                .any(|capability| capability == "completion")
+            {
+                continue;
+            }
             let entry = merged.entry(tag).or_default();
             let is_priority_host = entry.account_ids.is_empty();
             entry.account_ids.push(host.account_id.clone());
@@ -229,12 +236,37 @@ mod tests {
     }
 
     fn show(w: i64, t: bool) -> ShowResponse {
+        let mut capabilities = vec!["completion".into()];
+        if t {
+            capabilities.push("tools".into());
+        }
         ShowResponse {
-            capabilities: if t { vec!["tools".into()] } else { vec![] },
+            capabilities,
             model_info: serde_json::from_value(serde_json::json!({"llama.context_length":w}))
                 .unwrap(),
         }
     }
+
+    #[test]
+    fn excludes_models_without_completion_capability() {
+        let models = merge_hosts(vec![HostModels {
+            account_id: "host".into(),
+            models: vec![
+                ("chat".into(), show(8192, false)),
+                (
+                    "embed".into(),
+                    ShowResponse {
+                        capabilities: vec!["embedding".into()],
+                        model_info: serde_json::Map::new(),
+                    },
+                ),
+            ],
+            errors: vec![],
+        }]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].model, "chat");
+    }
+
     #[test]
     fn maps_capabilities_context_and_merges_hosts() {
         let m = merge_hosts(vec![

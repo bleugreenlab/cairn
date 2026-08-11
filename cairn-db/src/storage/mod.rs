@@ -5,6 +5,7 @@ mod local_db;
 mod migration;
 mod migrations;
 mod response_invocations;
+mod route_fact_samples;
 mod route_firings;
 mod row;
 mod search_index;
@@ -13,6 +14,7 @@ pub mod authority;
 pub mod content_store;
 pub mod events;
 pub mod pack_catalog;
+pub mod quarantine;
 pub mod render;
 
 /// Normalized team identifier. Defined here (rather than reaching up into
@@ -40,6 +42,9 @@ pub use migrations::{
 pub use response_invocations::{
     count_response_invocations, get_response_invocation, insert_response_invocation,
     list_response_invocations, NewResponseInvocation, ResponseInvocationRecord,
+};
+pub use route_fact_samples::{
+    get_route_fact_sample, list_route_fact_samples, upsert_route_fact_sample, RouteFactSample,
 };
 pub use route_firings::{
     count_route_firings, firing_snapshot, get_route_firing, has_recent_fact, insert_route_firing,

@@ -1,6 +1,5 @@
 //! Provider-agnostic tool dispatch for the HTTP turn loop: classify and execute
-//! model-emitted tool calls, normalize home-relative (`cairn:~/`) targets to
-//! absolute node URIs, collapse batch envelopes to text on the text-only tool
+//! model-emitted tool calls, collapse batch envelopes to text on the text-only tool
 //! edge, and render a dispatch result (with reminders) into tool-message text.
 //! Repairs tool names and truncated JSON arguments, refuses partial
 //! side-effecting calls, and dispatches through the Cairn MCP callback.
@@ -117,7 +116,7 @@ pub(super) fn execute_tool_call(
     tool_call: &TurnToolCall,
     suspected_truncated: bool,
 ) -> Result<DispatchOutput, String> {
-    let (tool_name, mut payload) = match prepare_tool_call(tool_call, suspected_truncated) {
+    let (tool_name, payload) = match prepare_tool_call(tool_call, suspected_truncated) {
         PreparedCall::Dispatch {
             verb,
             payload,
@@ -137,7 +136,6 @@ pub(super) fn execute_tool_call(
         // already use. A malformed tool call must not reach RunStatus::Crashed.
         PreparedCall::Reject(output) => return Ok(output),
     };
-    normalize_tool_payload(tool_name, &mut payload, &config.home_uri);
     let request = crate::mcp::types::McpCallbackRequest {
         thread_id: None,
         cwd: config.working_dir.clone(),
@@ -183,70 +181,6 @@ pub(super) fn collapse_envelope_text(content: String) -> String {
         return envelope.text;
     }
     content
-}
-
-pub(super) fn normalize_tool_payload(tool_name: &str, payload: &mut Value, home_uri: &str) {
-    match tool_name {
-        "read" => normalize_read_payload(payload, home_uri),
-        "write" => normalize_write_payload(payload, home_uri),
-        _ => {}
-    }
-}
-
-fn normalize_read_payload(payload: &mut Value, home_uri: &str) {
-    if let Some(paths) = payload.get_mut("paths").and_then(Value::as_array_mut) {
-        for path in paths {
-            if let Some(target) = path
-                .as_str()
-                .map(|target| resolve_home_target(target, home_uri))
-            {
-                *path = Value::String(target);
-            }
-        }
-    }
-    if let Some(target) = payload
-        .get("path")
-        .and_then(Value::as_str)
-        .map(|target| resolve_home_target(target, home_uri))
-    {
-        payload["path"] = Value::String(target);
-    }
-}
-
-fn normalize_write_payload(payload: &mut Value, home_uri: &str) {
-    let Some(changes) = payload.get_mut("changes").and_then(Value::as_array_mut) else {
-        return;
-    };
-    for change in changes {
-        let Some(target) = change
-            .get("target")
-            .and_then(Value::as_str)
-            .map(|target| resolve_home_target(target, home_uri))
-        else {
-            continue;
-        };
-        change["target"] = Value::String(target);
-    }
-}
-
-pub(super) fn resolve_home_target(target: &str, home_uri: &str) -> String {
-    let Some(suffix) = target.strip_prefix("cairn:~/") else {
-        return target.to_string();
-    };
-    let (suffix_identity, query) = match suffix.split_once('?') {
-        Some((identity, query)) => (identity, Some(query)),
-        None => (suffix, None),
-    };
-    let mut resolved = home_uri.trim_end_matches('/').to_string();
-    if !suffix_identity.is_empty() {
-        resolved.push('/');
-        resolved.push_str(suffix_identity.trim_start_matches('/'));
-    }
-    if let Some(query) = query {
-        resolved.push('?');
-        resolved.push_str(query);
-    }
-    resolved
 }
 
 /// Render a dispatch result into tool-message text, appending any reminders as

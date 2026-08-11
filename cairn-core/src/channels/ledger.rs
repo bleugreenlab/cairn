@@ -758,4 +758,46 @@ mod tests {
             99
         );
     }
+    #[tokio::test]
+    async fn provider_ledgers_isolate_cursors_bindings_and_message_ids() {
+        let db = migrated_test_db("channel-ledger-provider-isolation.db").await;
+        assert_eq!(advance_cursor(&db, "imessage", 42).await.unwrap(), 42);
+        assert_eq!(advance_cursor(&db, "telegram", 7).await.unwrap(), 7);
+
+        let mut imessage = intent("imessage-intent");
+        imessage.channel = "imessage";
+        let mut telegram = intent("telegram-intent");
+        telegram.channel = "telegram";
+        assert!(insert_intent(&db, &imessage).await.unwrap());
+        assert!(insert_intent(&db, &telegram).await.unwrap());
+        assert!(
+            mark_sent(&db, "imessage-intent", "shared-id", None, None, 10)
+                .await
+                .unwrap()
+        );
+        assert!(
+            mark_sent(&db, "telegram-intent", "shared-id", None, None, 11)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(get_cursor(&db, "imessage").await.unwrap(), Some(42));
+        assert_eq!(get_cursor(&db, "telegram").await.unwrap(), Some(7));
+        assert_eq!(
+            get_by_provider_guid(&db, "imessage", "shared-id")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "imessage-intent"
+        );
+        assert_eq!(
+            get_by_provider_guid(&db, "telegram", "shared-id")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            "telegram-intent"
+        );
+    }
 }

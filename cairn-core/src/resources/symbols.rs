@@ -149,7 +149,7 @@ async fn project_repo_path(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
 ) -> Result<Option<String>, String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let mut rows = conn
         .query(
             "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",

@@ -189,7 +189,7 @@ pub(crate) async fn commit_posture_refusal(
 
 /// Resolve a project's DB id by key (uppercased).
 pub(crate) async fn project_id_by_key(db: &LocalDb, key: &str) -> Result<String, String> {
-    let key = key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(key);
     db.query_text(
         "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
         (key.clone(),),
@@ -247,6 +247,33 @@ mod tests {
                 .await
                 .unwrap(),
             "cairn://p/PRJ/design"
+        );
+
+        dbs.local
+            .execute("UPDATE threads SET name='channels' WHERE id='t'", ())
+            .await
+            .unwrap();
+        let request = CallbackRequest {
+            cwd: String::new(),
+            run_id: Some("r-thread".to_string()),
+            tool: "write".to_string(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            thread_id: None,
+        };
+        let target =
+            crate::resources::resolve_home_relative_resource_uri(&dbs, &request, "cairn:~/tasks")
+                .await
+                .unwrap();
+        assert_eq!(target, "cairn://p/PRJ/channels/tasks");
+        assert!(
+            crate::resources::mutations::blocking_append_kind(&crate::mcp::types::ChangeItem {
+                target,
+                mode: crate::mcp::types::ChangeMode::Append,
+                payload: Some(serde_json::json!({})),
+            })
+            .is_some(),
+            "the live-resolved tasks URI must enter blocking task routing"
         );
     }
 

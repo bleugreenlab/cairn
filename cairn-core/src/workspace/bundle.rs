@@ -1,128 +1,120 @@
 //! Pack-aware workspace sync.
 //!
-//! `~/.cairn` is a git repository, and that history is the ownership oracle: a
-//! managed file whose most recent commit carries a subject the sync itself
-//! authored has not been touched by the user, so a newer shipped version may
-//! overwrite it in place. Any other last commit marks the file the user's, and
-//! it is preserved and reported as a skipped conflict.
-//!
-//! Packs make the SOURCE side plural while leaving the destination identical.
-//! Each shipped pack owns a subtree of `resource_dir/packs/<id>/` whose layout
-//! mirrors the flat workspace layout exactly, so installing a pack is the same
-//! copy the single monolithic bundle always performed -- just scoped to one
-//! pack's contents and recorded in that pack's install lock.
+//! Pack locks are the live ownership authority. Each installed item records the
+//! hash Cairn last materialized and a durable fork bit. Git is consulted only to
+//! classify pre-v2 locks once; migrated packs never invoke Git again.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::pack::{self, lock as pack_lock, PackLock, PackManifest, PackSource};
-use crate::services::{FileSystem, GitClient, GitOutput};
+use crate::config::mcp_servers::McpServerConfig;
+use crate::config::pack::{
+    self, lock as pack_lock, ContentHash, PackItemKind, PackLock, PackLockItem, PackManifest,
+    PackSource,
+};
+use crate::services::{FileSystem, GitClient};
 
-use super::repo::ensure_workspace_repo;
-
+#[cfg(test)]
 const DEFAULT_BRANCH: &str = "main";
-
-/// The pre-pack global sync marker: one content hash for the entire shipped
-/// tree. Superseded by each pack's own `contentHash` in its install lock, and
-/// removed once those locks exist -- its absence is what makes the migration to
-/// packs idempotent.
 const LEGACY_BUNDLE_SYNC_MARKER: &str = ".bundle-sync";
-
-/// Commit subjects the workspace sync authored before packs existed. They are
-/// retained verbatim so an existing workspace's history keeps meaning after the
-/// upgrade: every file such a user holds is still recognized as pack-owned,
-/// which is precisely what keeps the first pack-aware sync conflict-free.
 const BUNDLE_COMMIT_SUBJECTS: &[&str] = &[
     "Initialize Cairn workspace config",
     "Add missing bundled workspace defaults",
     "Sync bundled workspace defaults",
 ];
-
-/// Subject prefix for a pack-authored commit: `Sync pack resources: <id>`.
 const PACK_COMMIT_PREFIX: &str = "Sync pack resources: ";
 
-fn pack_commit_subject(pack_id: &str) -> String {
-    format!("{PACK_COMMIT_PREFIX}{pack_id}")
-}
-
-/// Whether `subject` was authored by the workspace sync rather than by the user.
 fn is_pack_authored_subject(subject: &str) -> bool {
     BUNDLE_COMMIT_SUBJECTS.contains(&subject) || subject.starts_with(PACK_COMMIT_PREFIX)
+}
+
+/// Explicitly replace every currently shipped item in one bundled pack and
+/// establish fresh ownership baselines. Unlike ordinary sync, this deliberately
+/// overwrites forks and clears tombstones because the caller has confirmed the
+/// total restore scope.
+pub fn restore_one_bundled_pack(
+    fs: &dyn FileSystem,
+    resource_dir: &Path,
+    config_dir: &Path,
+    pack_id: &str,
+) -> Result<PackSyncResult, String> {
+    let manifest = pack::available_pack(resource_dir, pack_id)
+        .ok_or_else(|| format!("No pack `{pack_id}` is shipped in {resource_dir:?}"))?;
+    fs.create_dir_all(config_dir)?;
+    ensure_workspace_content_dirs(fs, config_dir)?;
+    pack::record_source_dir(fs, resource_dir, config_dir)?;
+    pack_lock::clear_uninstall(fs, config_dir, pack_id)?;
+
+    let source_mcp = source_mcp_servers(&manifest)?;
+    let mut lock = PackLock::new(
+        &manifest,
+        pack::content_hash(&manifest.root)?,
+        PackSource::bundled(manifest.format),
+        manifest.items(),
+    );
+    let mut outcome = SyncOutcome::default();
+    for item in &mut lock.items {
+        materialize_item(fs, config_dir, pack_id, &manifest, item, &source_mcp)?;
+        item.content_hash = source_item_hash(&manifest, item, &source_mcp)?;
+        item.forked = false;
+        if let Some(path) = &item.path {
+            outcome.changed(path.clone());
+        }
+    }
+
+    lock.cairn_version = 2;
+    lock.removed.clear();
+    lock.sort_items();
+    pack_lock::write_lock(fs, config_dir, &lock)?;
+    outcome.changed_paths.sort();
+    outcome.changed_paths.dedup();
+    Ok(PackSyncResult {
+        updated: outcome.changed,
+        changed_paths: outcome.changed_paths,
+    })
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PackSyncResult {
     updated: bool,
-    /// Workspace-relative paths this sync wrote or retired. Reported so a
-    /// catalog action can say what it actually changed rather than only that
-    /// something did.
     pub changed_paths: Vec<String>,
-    pub skipped_conflicts: Vec<String>,
 }
 
 #[derive(Default)]
 struct SyncOutcome {
     changed: bool,
-    /// Workspace-relative paths written or removed by this sync. Both are
-    /// committed the same way: `git add --` records a deletion as readily as an
-    /// addition, so a retirement lands in the pack-owned commit.
-    copied_paths: Vec<String>,
-    skipped_conflicts: Vec<String>,
+    changed_paths: Vec<String>,
 }
 
 impl SyncOutcome {
-    fn merge(&mut self, other: SyncOutcome) {
-        self.changed |= other.changed;
-        self.copied_paths.extend(other.copied_paths);
-        for conflict in other.skipped_conflicts {
-            if !self.skipped_conflicts.contains(&conflict) {
-                self.skipped_conflicts.push(conflict);
-            }
-        }
+    fn changed(&mut self, path: String) {
+        self.changed = true;
+        self.changed_paths.push(path);
     }
 }
 
-/// What this sync does with one shipped pack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackAction {
-    /// Materialize this pack's contents and keep them current.
     Sync,
-    /// Available but not installed: leave it for the catalog to offer.
     Skip,
 }
 
 struct PackPlan {
     manifest: PackManifest,
-    /// Install state recorded before this sync, if any.
     lock: Option<PackLock>,
-    /// Content hash of the pack's shipped source tree.
     hash: String,
     action: PackAction,
 }
 
 impl PackPlan {
-    /// Whether the shipped pack differs from what the workspace recorded, so an
-    /// in-place update of pack-owned files may be needed. An unrecorded pack is
-    /// stale by definition.
-    fn is_stale(&self) -> bool {
-        match &self.lock {
-            Some(lock) => lock.content_hash != self.hash,
-            None => true,
-        }
-    }
-
     fn syncing(&self) -> bool {
         self.action == PackAction::Sync
     }
 }
 
-/// Sync every shipped pack into the workspace config tree.
-///
-/// Replaces the single-bundle sync: the destination layout, the ownership rules,
-/// and the conflict reporting are unchanged, but the source is now a set of
-/// packs and installation is per-pack and recorded.
 pub fn sync_workspace_packs(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
@@ -133,34 +125,19 @@ pub fn sync_workspace_packs(
     fs.create_dir_all(config_dir)?;
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack::record_source_dir(fs, resource_dir, config_dir)?;
-
     let plans = plan_packs(fs, config_dir, pack::discover_available_packs(resource_dir))?;
-    let result = apply_plans(git, fs, config_dir, &plans)?;
+    let result = apply_plans(git, fs, config_dir, plans)?;
 
-    // The pre-pack global marker is superseded by the per-pack locks. Removing
-    // it only after a FULL sync has written every lock keeps the migration
-    // idempotent: an interrupted run still finds the marker and re-derives the
-    // same plan.
-    if plans.iter().any(|plan| plan.syncing()) {
-        let marker = config_dir.join(LEGACY_BUNDLE_SYNC_MARKER);
-        if fs.exists(&marker) {
-            fs.remove_file(&marker)?;
-        }
+    let all_migrated = pack_lock::installed_packs(config_dir)
+        .iter()
+        .all(PackLock::migration_complete);
+    let marker = config_dir.join(LEGACY_BUNDLE_SYNC_MARKER);
+    if all_migrated && fs.exists(&marker) {
+        fs.remove_file(&marker)?;
     }
-
     Ok(result)
 }
 
-/// Every managed content directory exists in a synced workspace, whether or not
-/// any installed pack ships into it.
-///
-/// This is a property of the WORKSPACE, not of a pack. Code that writes a user's
-/// own agent, recipe, or workflow targets `<workspace>/<kind>/` directly and
-/// does not create the directory first, so a missing one surfaces as a bare
-/// `NotFound` from an ordinary "create a recipe" action. Before packs the
-/// invariant fell out of the sync walking one fixed directory list; now that the
-/// source side is plural and the destination is shared, no single pack implies
-/// the workspace's shape, so it is asserted here instead.
 fn ensure_workspace_content_dirs(fs: &dyn FileSystem, config_dir: &Path) -> Result<(), String> {
     for dir_name in pack::CONTENT_DIRS {
         fs.create_dir_all(&config_dir.join(dir_name))?;
@@ -168,12 +145,6 @@ fn ensure_workspace_content_dirs(fs: &dyn FileSystem, config_dir: &Path) -> Resu
     Ok(())
 }
 
-/// Install, or re-sync, ONE shipped pack by id.
-///
-/// This is the catalog's install/update action. It runs exactly the machinery
-/// the startup sync runs, with one difference: an explicit choice overrides the
-/// default-set question that decides participation on startup, so a pack the app
-/// ships as optional installs when asked for.
 pub fn sync_one_pack(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
@@ -186,69 +157,67 @@ pub fn sync_one_pack(
     fs.create_dir_all(config_dir)?;
     ensure_workspace_content_dirs(fs, config_dir)?;
     pack::record_source_dir(fs, resource_dir, config_dir)?;
-
-    // Installing is an explicit choice that supersedes an earlier uninstall.
     pack_lock::clear_uninstall(fs, config_dir, pack_id)?;
-
-    let mut plans = plan_packs(fs, config_dir, vec![manifest])?;
-    for plan in &mut plans {
-        plan.action = PackAction::Sync;
-    }
-    apply_plans(git, fs, config_dir, &plans)
+    let hash = pack::content_hash(&manifest.root)?;
+    let lock = pack_lock::read_lock(config_dir, pack_id);
+    apply_plans(
+        git,
+        fs,
+        config_dir,
+        vec![PackPlan {
+            manifest,
+            lock,
+            hash,
+            action: PackAction::Sync,
+        }],
+    )
 }
 
-/// Remove an installed pack's contents, keeping anything the user made theirs.
-///
-/// Ownership is the same git-subject question an update asks, so an item the
-/// user edited survives an uninstall and is reported rather than deleted. The
-/// pack's own `packs/<id>/` directory — its lock and MCP layer — always goes,
-/// which is what makes the pack "not installed" again.
 pub fn uninstall_pack(
-    git: &dyn GitClient,
+    _git: &dyn GitClient,
     fs: &dyn FileSystem,
     config_dir: &Path,
     pack_id: &str,
 ) -> Result<PackUninstallResult, String> {
-    let lock = pack_lock::read_lock(config_dir, pack_id)
+    let mut lock = pack_lock::read_lock(config_dir, pack_id)
         .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
-
     let mut result = PackUninstallResult::default();
-    for rel_path in lock.item_paths() {
-        let dest = config_dir.join(&rel_path);
-        if !fs.exists(&dest) {
+
+    for item in &mut lock.items {
+        if item.forked {
+            if let Some(path) = &item.path {
+                result.kept.push(path.clone());
+            }
             continue;
         }
-        if pack_file_is_user_owned(git, config_dir, &rel_path).unwrap_or(true) {
-            result.kept.push(rel_path);
+        let current = current_item_hash(config_dir, pack_id, item)?;
+        let owned = matches!(
+            (&current, item.content_hash.as_deref()),
+            (ContentHash::Present(current), Some(baseline)) if current == baseline
+        );
+        if matches!(current, ContentHash::Missing) {
             continue;
         }
-        if dest.is_dir() {
-            fs.remove_dir_all(&dest)?;
-        } else {
-            fs.remove_file(&dest)?;
+        if !owned {
+            item.forked = true;
+            if let Some(path) = &item.path {
+                result.kept.push(path.clone());
+            }
+            continue;
         }
-        result.removed.push(rel_path);
+        remove_item_content(fs, config_dir, pack_id, item)?;
+        if let Some(path) = &item.path {
+            result.removed.push(path.clone());
+        }
     }
 
-    // Replace the pack's whole directory with a record of the decision, so the
-    // next startup does not re-adopt it from an item the uninstall preserved.
     pack_lock::remove_pack_dir(fs, config_dir, pack_id)?;
     pack_lock::record_uninstall(fs, config_dir, pack_id)?;
-
-    let mut paths = result.removed.clone();
-    paths.push(format!("{}/{pack_id}", pack_lock::PACKS_DIR));
-    stage_and_commit(
-        git,
-        config_dir,
-        &format!("Uninstall pack: {pack_id}"),
-        &paths,
-    )?;
-
+    result.removed.sort();
+    result.kept.sort();
     Ok(result)
 }
 
-/// What an uninstall did: paths it removed, and paths it left alone because the
-/// user had made them theirs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PackUninstallResult {
@@ -260,146 +229,80 @@ fn apply_plans(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
     config_dir: &Path,
-    plans: &[PackPlan],
+    plans: Vec<PackPlan>,
 ) -> Result<PackSyncResult, String> {
-    // Materializing missing defaults is deliberately independent of Git. A
-    // missing or undiscoverable Git binary may prevent history management, but
-    // it must not leave a fresh workspace without usable resources.
     let mut outcome = SyncOutcome::default();
-    for plan in plans.iter().filter(|plan| plan.syncing()) {
-        outcome.merge(sync_pack_resources(git, fs, config_dir, plan, false)?);
-    }
+    for plan in plans.into_iter().filter(PackPlan::syncing) {
+        let mut lock = plan.lock.unwrap_or_else(|| {
+            PackLock::new(
+                &plan.manifest,
+                plan.hash.clone(),
+                PackSource::bundled(plan.manifest.format),
+                plan.manifest.items(),
+            )
+        });
 
-    let repo_exists = git.is_repo(config_dir)?;
-
-    if !repo_exists {
-        git.init_repo(config_dir, DEFAULT_BRANCH)?;
-        ensure_workspace_repo(git, fs, config_dir, DEFAULT_BRANCH)?;
-        initialize_pack_history(git, fs, config_dir, plans)?;
-        record_pack_state(git, fs, config_dir, plans)?;
-        return Ok(sync_result(true, outcome));
-    }
-
-    ensure_workspace_repo(git, fs, config_dir, DEFAULT_BRANCH)?;
-
-    if git.root_commit(config_dir, DEFAULT_BRANCH).is_err() {
-        // Recovery may have been interrupted after repository initialization.
-        // Rebuild the unborn repository's history with the same ownership
-        // classification used on the first recovery attempt.
-        initialize_pack_history(git, fs, config_dir, plans)?;
-        record_pack_state(git, fs, config_dir, plans)?;
-        return Ok(sync_result(true, outcome));
-    }
-
-    // Keep newly materialized defaults pack-owned without folding unrelated
-    // pending user edits into the pack commit.
-    commit_copied_defaults(git, config_dir, &outcome.copied_paths)?;
-
-    // `ensure_workspace_repo` above may have widened the tracked-file allowlist
-    // (a release that starts managing a new directory). Files it newly exposes
-    // have no history at all, so the ownership oracle fails safe to user-owned
-    // -- and the snapshot below would commit them under "Snapshot workspace
-    // config", making that permanent and freezing them against every future
-    // update. Claim the ones whose content still matches their shipped source
-    // FIRST, which is the same classification the unborn-repo path uses.
-    adopt_newly_tracked_pack_files(git, fs, config_dir, plans)?;
-
-    let stale: Vec<&PackPlan> = plans
-        .iter()
-        .filter(|plan| plan.syncing() && plan.is_stale())
-        .collect();
-
-    if !stale.is_empty() {
-        // Some pack's content changed since it was recorded, so an in-place
-        // update may overwrite managed files. Snapshot any uncommitted user
-        // edits first so an overwrite can never lose unsaved work, and so an
-        // edited file is committed under a non-pack subject that marks it
-        // user-owned.
-        snapshot_pending_user_edits(git, config_dir)?;
-    }
-
-    for plan in stale {
-        let updated = sync_pack_resources(git, fs, config_dir, plan, true)?;
-        let changed = updated.changed;
-        let paths = updated.copied_paths.clone();
-        outcome.merge(updated);
-        if changed {
-            stage_and_commit(
-                git,
-                config_dir,
-                &pack_commit_subject(&plan.manifest.id),
-                &paths,
-            )?;
+        if !lock.migration_complete() {
+            migrate_legacy_lock(git, fs, config_dir, &plan.manifest, &mut lock)?;
+            // Migration is durable before normal sync can overwrite any item.
+            pack_lock::write_lock(fs, config_dir, &lock)?;
         }
+
+        sync_pack(
+            fs,
+            config_dir,
+            &plan.manifest,
+            &plan.hash,
+            &mut lock,
+            &mut outcome,
+        )?;
     }
-
-    let recorded = record_pack_state(git, fs, config_dir, plans)?;
-    let updated = outcome.changed || recorded;
-
-    Ok(sync_result(updated, outcome))
+    outcome.changed_paths.sort();
+    outcome.changed_paths.dedup();
+    Ok(PackSyncResult {
+        updated: outcome.changed,
+        changed_paths: outcome.changed_paths,
+    })
 }
 
-fn sync_result(updated: bool, outcome: SyncOutcome) -> PackSyncResult {
-    let mut changed_paths = outcome.copied_paths;
-    changed_paths.sort();
-    changed_paths.dedup();
-    PackSyncResult {
-        updated,
-        changed_paths,
-        skipped_conflicts: outcome.skipped_conflicts,
-    }
-}
-
-/// Decide what happens to each shipped pack, before any writes, so adoption can
-/// observe the pre-sync workspace.
 fn plan_packs(
     fs: &dyn FileSystem,
     config_dir: &Path,
     manifests: Vec<PackManifest>,
 ) -> Result<Vec<PackPlan>, String> {
-    let mut plans = Vec::new();
-    for manifest in manifests {
-        let hash = pack::content_hash(&manifest.root)?;
-        let lock = pack_lock::read_lock(config_dir, &manifest.id);
-        let recorded = lock.is_some();
-        let uninstalled = pack_lock::is_uninstalled(config_dir, &manifest.id);
-        let adopted = !recorded && !uninstalled && pack_is_materialized(fs, config_dir, &manifest);
-        if adopted {
-            log::info!(
-                "Pack `{}` is already materialized in {config_dir:?}; recording it as installed",
-                manifest.id
-            );
-        }
-        // An explicit uninstall outranks BOTH adoption and the default set. An
-        // uninstall deliberately keeps items the user edited, and adoption reads
-        // a surviving item as "already installed" — so without this the next
-        // startup would silently undo the removal, and a `default: true` pack
-        // would reinstall wholesale.
-        let action = if uninstalled {
-            PackAction::Skip
-        } else if recorded || adopted || manifest.default {
-            PackAction::Sync
-        } else {
-            PackAction::Skip
-        };
-        plans.push(PackPlan {
-            manifest,
-            lock,
-            hash,
-            action,
-        });
-    }
-    Ok(plans)
+    manifests
+        .into_iter()
+        .map(|manifest| {
+            let hash = pack::content_hash(&manifest.root)?;
+            let mut lock = pack_lock::read_lock(config_dir, &manifest.id);
+            let uninstalled = pack_lock::is_uninstalled(config_dir, &manifest.id);
+            let adopted =
+                lock.is_none() && !uninstalled && pack_is_materialized(fs, config_dir, &manifest);
+            if adopted {
+                lock = Some(PackLock::new(
+                    &manifest,
+                    hash.clone(),
+                    PackSource::bundled(manifest.format),
+                    manifest.items(),
+                ));
+            }
+            let action = if uninstalled {
+                PackAction::Skip
+            } else if lock.is_some() || manifest.default {
+                PackAction::Sync
+            } else {
+                PackAction::Skip
+            };
+            Ok(PackPlan {
+                manifest,
+                lock,
+                hash,
+                action,
+            })
+        })
+        .collect()
 }
 
-/// Whether any of this pack's items already sit where an install would write
-/// them.
-///
-/// True for a workspace seeded by the pre-pack bundle sync, whose files are
-/// byte-identical and at exactly those paths. Adopting such a pack is what makes
-/// the migration a lock write with zero resource writes and zero conflicts. A
-/// user who deleted a pack's content entirely reads as false, so that pack
-/// correctly shows as available rather than being reinstalled behind their back.
 fn pack_is_materialized(fs: &dyn FileSystem, config_dir: &Path, manifest: &PackManifest) -> bool {
     manifest.items().iter().any(|item| {
         item.path
@@ -408,485 +311,328 @@ fn pack_is_materialized(fs: &dyn FileSystem, config_dir: &Path, manifest: &PackM
     })
 }
 
-/// Copy one pack's resources into the workspace config tree. Always copies files
-/// whose destination is missing. When `allow_update` is set (an established repo
-/// whose pack content changed), a file whose content differs from the shipped
-/// source is overwritten **only if it is still pack-owned** (see
-/// [`pack_file_is_user_owned`]); a user-customized file is left untouched and
-/// reported as a skipped conflict. Skill and workflow packages are multi-file
-/// directories and are only ever copy-when-missing.
-fn sync_pack_resources(
+fn migrate_legacy_lock(
     git: &dyn GitClient,
     fs: &dyn FileSystem,
     config_dir: &Path,
-    plan: &PackPlan,
-    allow_update: bool,
-) -> Result<SyncOutcome, String> {
-    let mut outcome = SyncOutcome::default();
-    let source_root = &plan.manifest.root;
-    // Items the user removed from this pack. They stay out: copy-when-missing
-    // is exactly the mechanism that would otherwise undo the removal on the
-    // next launch, which would make a per-item delete meaningless.
-    let removed: std::collections::BTreeSet<String> = plan
-        .lock
-        .as_ref()
-        .map(|lock| lock.removed_paths().into_iter().collect())
-        .unwrap_or_default();
-
-    for dir_name in pack::CONTENT_DIRS {
-        let source_dir = source_root.join(dir_name);
-        if !source_dir.exists() {
-            continue;
-        }
-        let dest_dir = config_dir.join(dir_name);
-        fs.create_dir_all(&dest_dir)?;
-
-        let mut entries = std::fs::read_dir(&source_dir)
-            .map_err(|e| format!("Failed to read pack {dir_name} directory {source_dir:?}: {e}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Failed to read pack {dir_name} entry: {e}"))?;
-        entries.sort_by_key(|entry| entry.path());
-
-        for entry in entries {
-            let source = entry.path();
-            let file_name = entry.file_name();
-            let dest = dest_dir.join(&file_name);
-            let rel_path = format!("{dir_name}/{}", file_name.to_string_lossy());
-            if removed.contains(&rel_path) {
-                continue;
-            }
-
-            // Skill and workflow packages are versioned directory trees keyed by
-            // a manifest file. In-place update of a multi-file package is out of
-            // scope, so they are copy-when-missing only -- which also means a
-            // user's edited copy is never overwritten on a later sync.
-            if let Some(manifest) = package_manifest_file(dir_name) {
-                if source.is_dir() && source.join(manifest).exists() && !fs.exists(&dest) {
-                    fs.copy_dir_recursive(&source, &dest)?;
-                    outcome.changed = true;
-                    outcome.copied_paths.push(rel_path);
-                }
-                continue;
-            }
-
-            if !(source.is_file() && pack_file_matches_dir(dir_name, &source)) {
-                continue;
-            }
-
-            if !fs.exists(&dest) {
-                fs.copy_file(&source, &dest)?;
-                outcome.changed = true;
-                outcome.copied_paths.push(rel_path);
-                continue;
-            }
-
-            if !allow_update {
-                continue;
-            }
-
-            // Dest exists and the pack changed. Overwrite only an unmodified
-            // (pack-owned) file whose content actually differs from the source.
-            if fs.read_to_string(&source)? == fs.read_to_string(&dest)? {
-                continue;
-            }
-
-            if pack_file_is_user_owned(git, config_dir, &rel_path)? {
-                outcome.skipped_conflicts.push(rel_path);
-            } else {
-                fs.copy_file(&source, &dest)?;
-                outcome.changed = true;
-                outcome.copied_paths.push(rel_path);
-            }
-        }
-    }
-
-    for rel_path in &plan.manifest.retired {
-        let dest = config_dir.join(rel_path);
-        if !fs.exists(&dest) {
-            continue;
-        }
-        // A Git failure means ownership cannot be established, and materializing
-        // defaults stays independent of Git -- so keep the file rather than
-        // deleting something that might be the user's.
-        if pack_file_is_user_owned(git, config_dir, rel_path).unwrap_or(true) {
-            outcome.skipped_conflicts.push(rel_path.clone());
-            continue;
-        }
-        fs.remove_file(&dest)?;
-        outcome.changed = true;
-        outcome.copied_paths.push(rel_path.clone());
-    }
-
-    Ok(outcome)
-}
-
-/// Write each synced pack's `packs/<id>/` state -- its MCP definitions and its
-/// install lock -- and commit them as pack-owned. The lock is what makes a pack
-/// "installed", so for an adopted pack this write IS the whole migration.
-/// Returns whether anything was written.
-fn record_pack_state(
-    git: &dyn GitClient,
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    plans: &[PackPlan],
-) -> Result<bool, String> {
-    let mut wrote_any = false;
-
-    for plan in plans.iter().filter(|plan| plan.syncing()) {
-        let id = &plan.manifest.id;
-        let mut paths = Vec::new();
-
-        if let Some(source) = plan.manifest.mcp_source() {
-            let dest = pack_lock::mcp_path(config_dir, id);
-            // Copied verbatim rather than re-serialized: YAML is a superset of
-            // JSON, so an ingested `.mcp.json` stays byte-faithful to its
-            // source and a diff against the shipped file stays meaningful.
-            let differs =
-                !fs.exists(&dest) || fs.read_to_string(&source)? != fs.read_to_string(&dest)?;
-            if differs {
-                if let Some(parent) = dest.parent() {
-                    fs.create_dir_all(parent)?;
-                }
-                fs.copy_file(&source, &dest)?;
-                paths.push(format!(
-                    "{}/{id}/{}",
-                    pack_lock::PACKS_DIR,
-                    pack::manifest::PACK_MCP_FILE
-                ));
-            }
-        }
-
-        if plan.is_stale() {
-            // A pack update must not resurrect what the user removed, so the
-            // previous lock's removals carry forward and its items are held
-            // back from the freshly discovered set.
-            let removed = plan
-                .lock
-                .as_ref()
-                .map(|lock| lock.removed.clone())
-                .unwrap_or_default();
-            let items = plan
-                .manifest
-                .items()
-                .into_iter()
-                .filter(|item| {
-                    !removed
-                        .iter()
-                        .any(|gone| gone.kind == item.kind && gone.id == item.id)
-                })
-                .collect();
-            let mut lock = PackLock::new(
-                &plan.manifest,
-                plan.hash.clone(),
-                PackSource::bundled(plan.manifest.format),
-                items,
-            );
-            lock.removed = removed;
-            pack_lock::write_lock(fs, config_dir, &lock)?;
-            paths.push(format!(
-                "{}/{id}/{}",
-                pack_lock::PACKS_DIR,
-                pack_lock::LOCK_FILE
-            ));
-        }
-
-        if paths.is_empty() {
-            continue;
-        }
-        wrote_any = true;
-        stage_and_commit(git, config_dir, &pack_commit_subject(id), &paths)?;
-    }
-
-    Ok(wrote_any)
-}
-
-fn commit_copied_defaults(
-    git: &dyn GitClient,
-    config_dir: &Path,
-    copied_paths: &[String],
+    manifest: &PackManifest,
+    lock: &mut PackLock,
 ) -> Result<(), String> {
-    if copied_paths.is_empty() {
-        return Ok(());
-    }
-    let mut paths = vec![".gitignore".to_string()];
-    paths.extend(copied_paths.iter().cloned());
-    stage_and_commit(
-        git,
-        config_dir,
-        "Add missing bundled workspace defaults",
-        &paths,
-    )
-}
-
-fn stage_and_commit(
-    git: &dyn GitClient,
-    config_dir: &Path,
-    subject: &str,
-    paths: &[String],
-) -> Result<(), String> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let mut add_args = vec!["add".to_string(), "--".to_string()];
-    add_args.extend(paths.iter().cloned());
-    let output = git.run(config_dir, add_args)?;
-    if !output.success {
-        return Err(format!(
-            "Failed to stage pack resources for `{subject}`: {}",
-            output.stderr
-        ));
-    }
-    commit_only_paths(git, config_dir, subject, paths)
-}
-
-fn commit_only_paths(
-    git: &dyn GitClient,
-    config_dir: &Path,
-    subject: &str,
-    paths: &[String],
-) -> Result<(), String> {
-    let mut args = vec![
-        "-c".to_string(),
-        "user.name=Cairn".to_string(),
-        "-c".to_string(),
-        "user.email=cairn@local.invalid".to_string(),
-        "commit".to_string(),
-        "--only".to_string(),
-        "-m".to_string(),
-        subject.to_string(),
-        "--".to_string(),
-    ];
-    args.extend(paths.iter().cloned());
-    let output = git.run(config_dir, args)?;
-    // A path-scoped commit that finds nothing to commit is a legitimate no-op:
-    // restoring a byte-identical default (a working-tree deletion reverted with
-    // identical content) leaves the named paths already matching HEAD. Git
-    // reports this with one of several phrasings depending on the surrounding
-    // tree state, all of which must succeed so a no-op restore never fails the
-    // whole sync -- and, with `--only`, an unrelated staged change is left
-    // untouched.
-    if output.success || is_nothing_to_commit(&output) {
-        Ok(())
-    } else {
-        Err(format!("git commit failed: {}", output.stderr))
-    }
-}
-
-/// Whether a failed `git commit` failed only because the requested scope had
-/// nothing to commit. Git emits one of several phrasings depending on tree
-/// state; all mean the working tree already matches HEAD for that scope.
-fn is_nothing_to_commit(output: &GitOutput) -> bool {
-    let combined = format!("{}\n{}", output.stdout, output.stderr);
-    combined.contains("nothing to commit")
-        || combined.contains("nothing added to commit")
-        || combined.contains("no changes added to commit")
-}
-
-fn initialize_pack_history(
-    git: &dyn GitClient,
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    plans: &[PackPlan],
-) -> Result<(), String> {
-    // Defaults may have been edited after an earlier Git-less provisioning
-    // pass. Build the baseline without those paths, then snapshot everything
-    // else under a user-owned subject so future upgrades cannot overwrite it.
-    let pack_owned_paths = classify_untracked_pack_paths(fs, config_dir, plans)?;
-    git.add_all(config_dir)?;
-    commit_only_paths(
-        git,
-        config_dir,
-        "Initialize Cairn workspace config",
-        &pack_owned_paths,
-    )?;
-    snapshot_pending_user_edits(git, config_dir)
-}
-
-/// Workspace paths that still match their shipped source byte-for-byte, and so
-/// belong in the pack-owned baseline commit. A path whose content already
-/// diverges is left out, to be snapshotted as the user's.
-fn classify_untracked_pack_paths(
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    plans: &[PackPlan],
-) -> Result<Vec<String>, String> {
-    let mut pack_owned = vec![".gitignore".to_string()];
-    for plan in plans.iter().filter(|plan| plan.syncing()) {
-        pack_owned.extend(pack_owned_paths(fs, config_dir, plan)?);
-    }
-    Ok(pack_owned)
-}
-
-/// One pack's workspace paths whose content still matches what it ships.
-fn pack_owned_paths(
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    plan: &PackPlan,
-) -> Result<Vec<String>, String> {
-    let mut pack_owned = Vec::new();
-
-    for dir_name in pack::CONTENT_DIRS {
-        let source_dir = plan.manifest.root.join(dir_name);
-        if !source_dir.exists() {
+    let pack_id = lock.id.clone();
+    let source_mcp = source_mcp_servers(manifest)?;
+    for item in &mut lock.items {
+        if item.content_hash.is_some() {
             continue;
         }
-        let mut entries = std::fs::read_dir(&source_dir)
-            .map_err(|error| format!("Failed to read pack {dir_name} directory: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Failed to read pack {dir_name} entry: {error}"))?;
-        entries.sort_by_key(|entry| entry.path());
-
-        for entry in entries {
-            let source = entry.path();
-            let file_name = entry.file_name();
-            let relative = format!("{dir_name}/{}", file_name.to_string_lossy());
-            let destination = config_dir.join(&relative);
-            if !fs.exists(&destination) {
-                continue;
+        let current = current_item_hash_with_mcp(config_dir, &pack_id, item, None)?;
+        match current {
+            ContentHash::Missing => {
+                // Missing content is safe to restore. Seed the shipped hash so the
+                // lock is fully migrated before the copy happens.
+                item.content_hash = source_item_hash(manifest, item, &source_mcp)?;
             }
-            if let Some(manifest) = package_manifest_file(dir_name) {
-                if source.is_dir() && source.join(manifest).exists() {
-                    pack_owned.push(relative);
-                }
-                continue;
-            }
-            if source.is_file()
-                && pack_file_matches_dir(dir_name, &source)
-                && fs.read_to_string(&source)? == fs.read_to_string(&destination)?
-            {
-                pack_owned.push(relative);
+            ContentHash::Present(hash) => {
+                let history_path = item.path.clone().unwrap_or_else(|| {
+                    format!(
+                        "{}/{}/{}",
+                        pack_lock::PACKS_DIR,
+                        lock.id,
+                        pack::manifest::PACK_MCP_FILE
+                    )
+                });
+                let owned = legacy_path_is_pack_owned(git, config_dir, &history_path);
+                item.content_hash = Some(hash);
+                item.forked = !owned;
             }
         }
     }
-
-    Ok(pack_owned)
-}
-
-/// Commit, under each pack's own subject, the workspace files that are still
-/// untracked but now inside the allowlist and still identical to what that pack
-/// ships.
-///
-/// This is the seam a widening allowlist passes through. Without it such a file
-/// is first seen by `snapshot_pending_user_edits`, which commits it under a
-/// user-owned subject -- permanently, since the oracle only ever reads the most
-/// recent commit. The next shipped change to it would then be reported as a
-/// conflict the user never caused.
-fn adopt_newly_tracked_pack_files(
-    git: &dyn GitClient,
-    fs: &dyn FileSystem,
-    config_dir: &Path,
-    plans: &[PackPlan],
-) -> Result<(), String> {
-    let untracked = untracked_paths(git, config_dir)?;
-    if untracked.is_empty() {
-        return Ok(());
-    }
-
-    for plan in plans.iter().filter(|plan| plan.syncing()) {
-        let claimable: Vec<String> = pack_owned_paths(fs, config_dir, plan)?
-            .into_iter()
-            // A package item is a directory, and `ls-files` reports files, so a
-            // directory counts as untracked when anything under it is.
-            .filter(|path| {
-                untracked.contains(path)
-                    || untracked
-                        .iter()
-                        .any(|entry| entry.starts_with(&format!("{path}/")))
-            })
-            .collect();
-        if claimable.is_empty() {
-            continue;
-        }
-        log::info!(
-            "Claiming newly tracked pack `{}` files as pack-owned: {}",
-            plan.manifest.id,
-            claimable.join(", ")
-        );
-        stage_and_commit(
-            git,
-            config_dir,
-            &pack_commit_subject(&plan.manifest.id),
-            &claimable,
-        )?;
-    }
-
+    lock.sort_items();
+    // Validate serializability/readability through the same writer boundary.
+    let _ = fs;
     Ok(())
 }
 
-/// Workspace-relative paths git currently considers untracked and not ignored.
-/// A git failure yields an empty set, which degrades to today's behavior rather
-/// than claiming files whose state could not be established.
-fn untracked_paths(
-    git: &dyn GitClient,
-    config_dir: &Path,
-) -> Result<std::collections::BTreeSet<String>, String> {
+fn legacy_path_is_pack_owned(git: &dyn GitClient, config_dir: &Path, rel_path: &str) -> bool {
     let output = git.run(
         config_dir,
         vec![
-            "ls-files".to_string(),
-            "--others".to_string(),
-            "--exclude-standard".to_string(),
+            "log".into(),
+            "-1".into(),
+            "--format=%s".into(),
+            "--".into(),
+            rel_path.into(),
         ],
-    )?;
-    if !output.success {
-        return Ok(std::collections::BTreeSet::new());
-    }
-    Ok(output
-        .stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-/// Whether a tracked managed file has been edited by the user since it was last
-/// shipped. True when the most recent commit touching `rel_path` carries a
-/// subject the sync did not author. An untracked file (no commit history) or an
-/// unreadable log is treated as user-owned so local work is never lost.
-pub(crate) fn pack_file_is_user_owned(
-    git: &dyn GitClient,
-    config_dir: &Path,
-    rel_path: &str,
-) -> Result<bool, String> {
-    let output = git.run(
-        config_dir,
-        vec![
-            "log".to_string(),
-            "-1".to_string(),
-            "--format=%s".to_string(),
-            "--".to_string(),
-            rel_path.to_string(),
-        ],
-    )?;
-    if !output.success {
-        return Ok(true);
-    }
-    let subject = output.stdout.trim();
-    if subject.is_empty() {
-        return Ok(true);
-    }
-    Ok(!is_pack_authored_subject(subject))
-}
-
-/// The manifest filename that marks a directory-package for `dir_name`, or
-/// `None` for a flat (single-file) resource dir. A package dir is copied whole
-/// when missing and never updated in place, so an edited copy is preserved.
-fn package_manifest_file(dir_name: &str) -> Option<&'static str> {
-    match dir_name {
-        "skills" => Some("SKILL.md"),
-        "workflows" => Some("workflow.yaml"),
-        _ => None,
-    }
-}
-
-fn pack_file_matches_dir(dir_name: &str, path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    match dir_name {
-        "agents" | "responses" => ext == "md",
-        "recipes" => ext == "yaml" || ext == "yml",
+    );
+    match output {
+        Ok(output) if output.success => {
+            let subject = output.stdout.trim();
+            !subject.is_empty() && is_pack_authored_subject(subject)
+        }
         _ => false,
     }
+}
+
+fn sync_pack(
+    fs: &dyn FileSystem,
+    config_dir: &Path,
+    manifest: &PackManifest,
+    pack_hash: &str,
+    lock: &mut PackLock,
+    outcome: &mut SyncOutcome,
+) -> Result<(), String> {
+    let pack_id = lock.id.clone();
+    let source_items = manifest.items();
+    let source_mcp = source_mcp_servers(manifest)?;
+    let source_keys: BTreeSet<_> = source_items
+        .iter()
+        .map(|item| (item.kind, item.id.clone()))
+        .collect();
+
+    // Retire items no longer shipped. A fork survives without a pack claim;
+    // pack-owned content and its lock record disappear.
+    let mut retained = Vec::new();
+    for mut old in std::mem::take(&mut lock.items) {
+        if source_keys.contains(&(old.kind, old.id.clone())) {
+            retained.push(old);
+            continue;
+        }
+        let current = current_item_hash(config_dir, &pack_id, &old)?;
+        let owned = !old.forked
+            && matches!(
+                (&current, old.content_hash.as_deref()),
+                (ContentHash::Present(current), Some(baseline)) if current == baseline
+            );
+        if owned {
+            remove_item_content(fs, config_dir, &pack_id, &old)?;
+            if let Some(path) = &old.path {
+                outcome.changed(path.clone());
+            }
+        } else if !matches!(current, ContentHash::Missing) {
+            // Retired forks remain as ordinary user content, no longer claimed.
+            old.forked = true;
+        }
+    }
+    lock.items = retained;
+
+    for source_item in source_items {
+        if lock.is_removed(source_item.kind, &source_item.id) {
+            continue;
+        }
+        if lock.item(source_item.kind, &source_item.id).is_none() {
+            lock.items.push(PackLockItem::legacy(source_item.clone()));
+        }
+        let item = lock.item_mut(source_item.kind, &source_item.id).unwrap();
+        if item.forked {
+            continue;
+        }
+        let source_hash = source_item_hash(manifest, item, &source_mcp)?.ok_or_else(|| {
+            format!(
+                "Pack item {:?} `{}` has no shipped content",
+                item.kind, item.id
+            )
+        })?;
+        let current = current_item_hash_with_mcp(config_dir, &pack_id, item, None)?;
+        match current {
+            ContentHash::Missing => {
+                materialize_item(fs, config_dir, &pack_id, manifest, item, &source_mcp)?;
+                item.content_hash = Some(source_hash);
+                if let Some(path) = &item.path {
+                    outcome.changed(path.clone());
+                }
+            }
+            ContentHash::Present(current_hash) => {
+                let Some(baseline) = item.content_hash.as_deref() else {
+                    // A fully migrated pack can gain a newly shipped item whose
+                    // destination already exists. With no positive ownership
+                    // evidence, the existing bytes belong to the user.
+                    item.content_hash = Some(current_hash);
+                    item.forked = true;
+                    continue;
+                };
+                if current_hash != baseline {
+                    item.forked = true;
+                } else if current_hash != source_hash {
+                    materialize_item(fs, config_dir, &pack_id, manifest, item, &source_mcp)?;
+                    item.content_hash = Some(source_hash);
+                    if let Some(path) = &item.path {
+                        outcome.changed(path.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    lock.cairn_version = 2;
+    lock.name = manifest.name.clone();
+    lock.version = manifest.version.clone();
+    lock.description = manifest.description.clone();
+    lock.author = manifest.author.clone();
+    lock.homepage = manifest.homepage.clone();
+    lock.keywords = manifest.keywords.clone();
+    lock.notes = manifest.notes.clone();
+    lock.content_hash = pack_hash.to_string();
+    lock.source = PackSource::bundled(manifest.format);
+    lock.sort_items();
+    // Content always lands before the baseline that claims it.
+    pack_lock::write_lock(fs, config_dir, lock)?;
+    Ok(())
+}
+
+fn source_item_hash(
+    manifest: &PackManifest,
+    item: &PackLockItem,
+    mcp: &BTreeMap<String, McpServerConfig>,
+) -> Result<Option<String>, String> {
+    if item.kind == PackItemKind::Mcp {
+        return mcp.get(&item.id).map(pack::hash_mcp_definition).transpose();
+    }
+    let Some(path) = &item.path else {
+        return Ok(None);
+    };
+    match pack::hash_item_path(item.kind, &manifest.root.join(path))? {
+        ContentHash::Missing => Ok(None),
+        ContentHash::Present(hash) => Ok(Some(hash)),
+    }
+}
+
+fn current_item_hash(
+    config_dir: &Path,
+    pack_id: &str,
+    item: &PackLockItem,
+) -> Result<ContentHash, String> {
+    current_item_hash_with_mcp(config_dir, pack_id, item, None)
+}
+
+fn current_item_hash_with_mcp(
+    config_dir: &Path,
+    pack_id: &str,
+    item: &PackLockItem,
+    cached_mcp: Option<&BTreeMap<String, McpServerConfig>>,
+) -> Result<ContentHash, String> {
+    if item.kind != PackItemKind::Mcp {
+        let path = item
+            .path
+            .as_ref()
+            .ok_or_else(|| "File-backed pack item has no path".to_string())?;
+        return pack::hash_item_path(item.kind, &config_dir.join(path));
+    }
+    let owned;
+    let servers = if let Some(servers) = cached_mcp {
+        servers
+    } else {
+        owned = installed_mcp_servers(config_dir, pack_id)?;
+        &owned
+    };
+    match servers.get(&item.id) {
+        Some(config) => Ok(ContentHash::Present(pack::hash_mcp_definition(config)?)),
+        None => Ok(ContentHash::Missing),
+    }
+}
+
+fn source_mcp_servers(
+    manifest: &PackManifest,
+) -> Result<BTreeMap<String, McpServerConfig>, String> {
+    match manifest.mcp_source() {
+        Some(path) => Ok(pack::mcp::parse_pack_mcp_file(&path)?.into_iter().collect()),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
+fn installed_mcp_servers(
+    config_dir: &Path,
+    pack_id: &str,
+) -> Result<BTreeMap<String, McpServerConfig>, String> {
+    let path = pack_lock::mcp_path(config_dir, pack_id);
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    Ok(pack::mcp::parse_pack_mcp_file(&path)?.into_iter().collect())
+}
+
+fn materialize_item(
+    fs: &dyn FileSystem,
+    config_dir: &Path,
+    pack_id: &str,
+    manifest: &PackManifest,
+    item: &PackLockItem,
+    source_mcp: &BTreeMap<String, McpServerConfig>,
+) -> Result<(), String> {
+    if item.kind == PackItemKind::Mcp {
+        let mut installed = installed_mcp_servers(config_dir, pack_id)?;
+        let config = source_mcp
+            .get(&item.id)
+            .ok_or_else(|| format!("Missing shipped MCP definition `{}`", item.id))?;
+        installed.insert(item.id.clone(), config.clone());
+        return write_mcp_layer(fs, config_dir, pack_id, &installed);
+    }
+    let path = item
+        .path
+        .as_ref()
+        .ok_or_else(|| "File-backed pack item has no path".to_string())?;
+    let source = manifest.root.join(path);
+    let destination = config_dir.join(path);
+    if matches!(item.kind, PackItemKind::Skill | PackItemKind::Workflow) {
+        if fs.exists(&destination) {
+            fs.remove_dir_all(&destination)?;
+        }
+        fs.copy_dir_recursive(&source, &destination)
+    } else {
+        fs.copy_file(&source, &destination)
+    }
+}
+
+fn remove_item_content(
+    fs: &dyn FileSystem,
+    config_dir: &Path,
+    pack_id: &str,
+    item: &PackLockItem,
+) -> Result<(), String> {
+    if item.kind == PackItemKind::Mcp {
+        let mut installed = installed_mcp_servers(config_dir, pack_id)?;
+        installed.remove(&item.id);
+        return write_mcp_layer(fs, config_dir, pack_id, &installed);
+    }
+    let path = item
+        .path
+        .as_ref()
+        .ok_or_else(|| "File-backed pack item has no path".to_string())?;
+    let destination = config_dir.join(path);
+    if !fs.exists(&destination) {
+        return Ok(());
+    }
+    if matches!(item.kind, PackItemKind::Skill | PackItemKind::Workflow) {
+        fs.remove_dir_all(&destination)
+    } else {
+        fs.remove_file(&destination)
+    }
+}
+
+fn write_mcp_layer(
+    fs: &dyn FileSystem,
+    config_dir: &Path,
+    pack_id: &str,
+    servers: &BTreeMap<String, McpServerConfig>,
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct McpLayer<'a> {
+        mcp_servers: &'a BTreeMap<String, McpServerConfig>,
+    }
+    let path = pack_lock::mcp_path(config_dir, pack_id);
+    if servers.is_empty() {
+        if fs.exists(&path) {
+            fs.remove_file(&path)?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs.create_dir_all(parent)?;
+    }
+    let yaml = serde_yaml::to_string(&McpLayer {
+        mcp_servers: servers,
+    })
+    .map_err(|error| format!("Failed to serialize pack MCP layer: {error}"))?;
+    fs.write_str(&path, &yaml)
 }
 
 fn marker_matches(fs: &dyn FileSystem, marker_path: &Path, hash: &str) -> bool {
@@ -897,8 +643,6 @@ fn marker_matches(fs: &dyn FileSystem, marker_path: &Path, hash: &str) -> bool {
             .unwrap_or(false)
 }
 
-/// Subdirectory of `CAIRN_HOME` (and of the app's bundled resources) holding the
-/// Cairn-owned workflow runtime: `runtime/node_modules/@cairn/{harness,sdk}`.
 const RUNTIME_DIR: &str = "runtime";
 /// Marker recording the content hash of the last-provisioned runtime, so a
 /// version change re-syncs and staleness is detectable.
@@ -937,14 +681,6 @@ pub fn provision_workflow_runtime(
     fs.copy_dir_recursive(&source, &dest)?;
     fs.write_str(&marker_path, &format!("{hash}\n"))?;
     Ok(true)
-}
-
-fn snapshot_pending_user_edits(git: &dyn GitClient, config_dir: &Path) -> Result<(), String> {
-    if !git.status(config_dir)?.trim().is_empty() {
-        git.add_all(config_dir)?;
-        git.commit(config_dir, "Snapshot workspace config")?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1067,24 +803,6 @@ mod tests {
     /// existing workspace takes.
     const LEGACY_WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/workflows/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
 
-    fn last_commit_subject(repo: &Path, rel_path: &str) -> String {
-        RealGitClient
-            .run(
-                repo,
-                vec![
-                    "log".into(),
-                    "-1".into(),
-                    "--format=%s".into(),
-                    "--".into(),
-                    rel_path.into(),
-                ],
-            )
-            .unwrap()
-            .stdout
-            .trim()
-            .to_string()
-    }
-
     /// Build a workspace exactly as the PRE-PACK bundle sync left one: every
     /// shipped file materialized flat, committed under a legacy bundle subject,
     /// and a global `.bundle-sync` marker. No `packs/` directory anywhere.
@@ -1108,19 +826,6 @@ mod tests {
         git.add_all(repo).unwrap();
         git.commit(repo, "Initialize Cairn workspace config")
             .unwrap();
-    }
-
-    fn commit_count(repo: &Path) -> usize {
-        RealGitClient
-            .run(
-                repo,
-                vec!["rev-list".into(), "--count".into(), "HEAD".into()],
-            )
-            .unwrap()
-            .stdout
-            .trim()
-            .parse()
-            .unwrap()
     }
 
     /// The acceptance path, exercised against the packs this repository actually
@@ -1222,8 +927,10 @@ mod tests {
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
                 .unwrap();
         assert!(result.updated);
-        assert!(result.skipped_conflicts.is_empty());
-        assert!(repo.join(".git").exists());
+        assert!(
+            !repo.join(".git").exists(),
+            "fresh pack sync does not initialize Git"
+        );
 
         // The default pack is installed and recorded...
         assert!(repo.join("agents/explore.md").exists());
@@ -1279,15 +986,7 @@ mod tests {
         seed_legacy_workspace(&repo, &resources, &["core", "matlab"]);
         let before = snapshot_tree(&repo);
 
-        let result =
-            sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
-                .unwrap();
-
-        assert!(
-            result.skipped_conflicts.is_empty(),
-            "an upgrade must produce no conflict noise: {:?}",
-            result.skipped_conflicts
-        );
+        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
 
         let after = snapshot_tree(&repo);
         for (path, body) in &before {
@@ -1322,28 +1021,22 @@ mod tests {
             "a pack whose content the user already has is recorded as installed"
         );
 
-        // `responses/` was outside the pre-pack allowlist, so this upgrade is
-        // the first time git can see it. It must land pack-owned: snapshotted
-        // as the user's instead, it would freeze against every future update
-        // and report the next shipped change as a conflict nobody caused.
-        let subject = last_commit_subject(&repo, "responses/conveyor.md");
-        assert!(
-            is_pack_authored_subject(&subject),
-            "a newly allowlisted file must be claimed as pack-owned, got {subject:?}"
-        );
-        assert!(!pack_file_is_user_owned(&RealGitClient, &repo, "responses/conveyor.md").unwrap());
+        let core = pack_lock::read_lock(&repo, "core").unwrap();
+        assert!(core
+            .item(PackItemKind::Response, "conveyor")
+            .unwrap()
+            .content_hash
+            .is_some());
         assert!(
             !repo.join(LEGACY_BUNDLE_SYNC_MARKER).exists(),
             "the superseded global marker is removed once every lock is written"
         );
 
         // Idempotent: a second pass changes nothing and adds no commit.
-        let commits = commit_count(&repo);
         let again =
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
                 .unwrap();
         assert!(!again.updated);
-        assert_eq!(commit_count(&repo), commits);
         assert_eq!(snapshot_tree(&repo), after);
     }
 
@@ -1371,8 +1064,6 @@ mod tests {
             "---\nname: mine\n---\n",
         )
         .unwrap();
-        git.add_all(&repo).unwrap();
-        git.commit(&repo, "My matlab tweaks").unwrap();
 
         let result = uninstall_pack(&git, &fs, &repo, "matlab").unwrap();
         assert_eq!(result.kept, vec!["skills/matlab".to_string()]);
@@ -1510,7 +1201,7 @@ mod tests {
         for subject in BUNDLE_COMMIT_SUBJECTS {
             assert!(is_pack_authored_subject(subject));
         }
-        assert!(is_pack_authored_subject(&pack_commit_subject("core")));
+        assert!(is_pack_authored_subject("Sync pack resources: core"));
         assert!(is_pack_authored_subject(
             "Sync pack resources: some-third-party"
         ));
@@ -1526,13 +1217,10 @@ mod tests {
         write_complete_resources(&resources);
 
         sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        let commits = commit_count(&repo);
-
         let again =
             sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0")
                 .unwrap();
         assert_eq!(again, PackSyncResult::default());
-        assert_eq!(commit_count(&repo), commits);
     }
 
     #[test]
@@ -1549,19 +1237,20 @@ mod tests {
         sync_workspace_packs(&git, &fs, &resources_a, &repo, "1.0.0").unwrap();
 
         std::fs::write(repo.join("agents/explore.md"), "user edit\n").unwrap();
-        git.add_all(&repo).unwrap();
-        git.commit(&repo, "User edits explore").unwrap();
 
-        let result = sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
-        // The user-edited file is preserved and surfaced as a skipped conflict
-        // even though the pack shipped a new version of it.
+        sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
+        // The user-edited file is preserved as a durable fork even though the
+        // pack shipped a new version of it.
         assert_eq!(
             std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
             "user edit\n"
         );
-        assert_eq!(
-            result.skipped_conflicts,
-            vec!["agents/explore.md".to_string()]
+        assert!(
+            pack_lock::read_lock(&repo, "core")
+                .unwrap()
+                .item(PackItemKind::Agent, "explore")
+                .unwrap()
+                .forked
         );
         // Genuinely new pack resources are still installed.
         assert!(repo.join("agents/new-agent.md").exists());
@@ -1600,32 +1289,13 @@ mod tests {
     }
 
     #[test]
-    fn retired_pack_file_is_removed_unless_the_user_edited_it() {
+    fn an_unclaimed_retired_path_is_preserved_fail_safe() {
         let git = RealGitClient;
         let fs = RealFileSystem;
         let retired = "recipes/main-coordinator.yaml";
 
-        // An install that still carries the shipped copy: the sync removes it.
-        let temp = TempDir::new().unwrap();
-        let repo = temp.path().join("home");
-        let resources = temp.path().join("resources-a");
-        write_resources_a(&resources);
-        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-
-        let stale = repo.join(retired);
-        write(&stale, "shipped copy\n");
-        git.add_all(&repo).unwrap();
-        git.commit(&repo, "Sync bundled workspace defaults")
-            .unwrap();
-
-        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
-        assert!(
-            !stale.exists(),
-            "an untouched shipped copy of a retired resource is removed"
-        );
-
-        // An install whose copy the user edited: the sync keeps it and reports
-        // the conflict rather than deleting their work.
+        // A retired path absent from the old lock has no hash baseline. It may
+        // have been created by the user, so retirement must preserve it.
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources-a");
@@ -1634,12 +1304,9 @@ mod tests {
 
         let edited = repo.join(retired);
         write(&edited, "my own version\n");
-        git.add_all(&repo).unwrap();
-        git.commit(&repo, "Keep my coordinator").unwrap();
 
-        let result = sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
         assert!(edited.exists(), "a user-owned copy survives retirement");
-        assert!(result.skipped_conflicts.contains(&retired.to_string()));
     }
 
     #[test]
@@ -1663,7 +1330,6 @@ mod tests {
         // must reach this install on upgrade.
         let result = sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
         assert!(result.updated);
-        assert!(result.skipped_conflicts.is_empty());
         assert_eq!(
             std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
             "bundle b\n"
@@ -1691,8 +1357,6 @@ mod tests {
         );
 
         std::fs::write(repo.join("agents/explore.md"), "user edit\n").unwrap();
-        git.add_all(&repo).unwrap();
-        git.commit(&repo, "User edits explore").unwrap();
 
         // Same app version, different shipped content: the pack's content hash
         // is what drives the re-sync, not the version string.
@@ -1711,123 +1375,45 @@ mod tests {
     }
 
     #[test]
-    fn missing_git_still_provisions_all_defaults_and_recovers_later() {
+    fn migrated_lock_skips_git_on_subsequent_syncs() {
         use crate::services::testing::MockGitClient;
-        use mockall::predicate::eq;
 
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
 
-        let mut unavailable_git = MockGitClient::new();
-        unavailable_git
-            .expect_is_repo()
-            .with(eq(repo.clone()))
-            .times(1)
-            .returning(|_| Err("Failed to run git: No such file or directory".to_string()));
+        let git = MockGitClient::new();
+        sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
+        let lock = pack_lock::read_lock(&repo, "core").unwrap();
+        assert!(lock.migration_complete());
 
-        let error = sync_workspace_packs(
-            &unavailable_git,
-            &RealFileSystem,
-            &resources,
-            &repo,
-            "1.0.0",
-        )
-        .unwrap_err();
-        assert!(error.contains("No such file or directory"));
-        assert!(repo.join("agents/explore.md").exists());
-        assert!(repo.join("recipes/default.yaml").exists());
-        assert!(repo.join("skills/example/SKILL.md").exists());
-        assert!(repo.join("workflows/example/workflow.yaml").exists());
-        assert!(pack_lock::read_lock(&repo, "core").is_none());
-        assert!(!repo.join(".git").exists());
-
-        // A user edit made while Git is unavailable survives recovery,
-        // including when a previous recovery stopped after repository init.
-        std::fs::write(repo.join("agents/explore.md"), "user edit\n").unwrap();
-
-        let git = RealGitClient;
-        git.init_repo(&repo, DEFAULT_BRANCH).unwrap();
-        assert!(git.root_commit(&repo, DEFAULT_BRANCH).is_err());
-
-        let recovered =
-            sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        assert!(recovered.updated);
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "user edit\n"
-        );
-        assert!(repo.join(".git").exists());
-        assert!(pack_lock::read_lock(&repo, "core").is_some());
-        assert!(git.root_commit(&repo, DEFAULT_BRANCH).is_ok());
-        let tracked = git.run(&repo, vec!["ls-files".to_string()]).unwrap();
-        for path in [
-            "agents/explore.md",
-            "recipes/default.yaml",
-            "responses/conveyor.md",
-            "skills/example/SKILL.md",
-            "workflows/example/workflow.yaml",
-            "packs/core/pack.yaml",
-        ] {
-            assert!(
-                tracked.stdout.lines().any(|tracked| tracked == path),
-                "{path} must be tracked, or its ownership can never be established"
-            );
-        }
-
-        let idempotent =
-            sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-        assert!(!idempotent.updated);
-
-        std::fs::write(
-            source_pack(&resources, "core").join("agents/explore.md"),
-            "pack upgrade\n",
-        )
-        .unwrap();
-        let upgraded =
-            sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "2.0.0").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(repo.join("agents/explore.md")).unwrap(),
-            "user edit\n"
-        );
-        assert_eq!(
-            upgraded.skipped_conflicts,
-            vec!["agents/explore.md".to_string()]
+        let second_git = MockGitClient::new();
+        let second =
+            sync_workspace_packs(&second_git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
+        assert!(
+            !second.updated,
+            "a migrated lock is hash-only and idempotent"
         );
     }
 
     #[test]
-    fn restoring_defaults_does_not_consume_an_unrelated_staged_change() {
+    fn restoring_missing_content_does_not_call_git() {
+        use crate::services::testing::MockGitClient;
+
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("home");
         let resources = temp.path().join("resources");
         write_complete_resources(&resources);
-        let git = RealGitClient;
+        let git = MockGitClient::new();
         sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
-
-        std::fs::write(repo.join("AGENTS.md"), "staged user change\n").unwrap();
-        git.run(
-            &repo,
-            vec!["add".to_string(), "--".to_string(), "AGENTS.md".to_string()],
-        )
-        .unwrap();
         std::fs::remove_file(repo.join("agents/explore.md")).unwrap();
 
+        let second_git = MockGitClient::new();
         let restored =
-            sync_workspace_packs(&git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
+            sync_workspace_packs(&second_git, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
         assert!(restored.updated);
-        let staged = git
-            .run(
-                &repo,
-                vec![
-                    "diff".to_string(),
-                    "--cached".to_string(),
-                    "--name-only".to_string(),
-                ],
-            )
-            .unwrap();
-        assert_eq!(staged.stdout.trim(), "AGENTS.md");
+        assert!(repo.join("agents/explore.md").exists());
     }
 
     #[test]
@@ -1871,6 +1457,39 @@ mod tests {
         // No `runtime/` in the bundle (the dev case): nothing provisioned.
         assert!(!provision_workflow_runtime(&RealFileSystem, &resource_dir, &cairn_home).unwrap());
         assert!(!cairn_home.join("runtime").exists());
+    }
+
+    #[test]
+    fn a_new_shipped_item_preserves_preexisting_user_content_as_a_fork() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_resources_a(&resources);
+
+        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "1.0.0").unwrap();
+        assert!(pack_lock::read_lock(&repo, "core")
+            .unwrap()
+            .migration_complete());
+
+        write(&repo.join("agents/new-agent.md"), "my agent\n");
+        write(
+            &source_pack(&resources, "core").join("agents/new-agent.md"),
+            "shipped agent\n",
+        );
+
+        sync_workspace_packs(&RealGitClient, &RealFileSystem, &resources, &repo, "2.0.0").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("agents/new-agent.md")).unwrap(),
+            "my agent\n"
+        );
+        let lock = pack_lock::read_lock(&repo, "core").unwrap();
+        let item = lock
+            .item(PackItemKind::Agent, "new-agent")
+            .expect("new shipped item is recorded");
+        assert!(item.forked);
+        assert!(item.content_hash.is_some());
+        assert!(lock.migration_complete());
     }
 
     /// A fresh workspace seeds the packed `fan-out` workflow package, the loader
@@ -1917,8 +1536,6 @@ mod tests {
         // The user edits their copy, then a CHANGED pack syncs: the edit stands
         // (copy-when-missing never overwrites an existing package).
         std::fs::write(repo.join("workflows/fan-out/main.ts"), "// user edit\n").unwrap();
-        git.add_all(&repo).unwrap();
-        git.commit(&repo, "User edits fan-out").unwrap();
         sync_workspace_packs(&git, &fs, &resources_b, &repo, "2.0.0").unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.join("workflows/fan-out/main.ts")).unwrap(),

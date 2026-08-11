@@ -105,6 +105,7 @@ type RunResponse<'f> = &'f (dyn Fn(&str, Value) -> ResponseFuture + Sync);
 /// What one sink node receives: the content its own path produced, and the
 /// record of the response nodes that produced it.
 struct Delivery<'a> {
+    node_id: &'a str,
     sink: &'a RouteSink,
     /// Ordinal among the route's sinks, which is what numbers the channel
     /// delivery key.
@@ -119,6 +120,7 @@ struct Walk<'a> {
     /// Each response node's output, by node index, so a downstream binding can
     /// read a specific node rather than only the content flowing into it.
     outputs: HashMap<usize, String>,
+    nodes: Vec<Value>,
 }
 
 /// How a node's argument bindings resolve on the path that reached it.
@@ -198,6 +200,7 @@ async fn walk<'a>(
     let mut outputs: HashMap<usize, String> = HashMap::new();
     let mut histories: HashMap<usize, Vec<Value>> = HashMap::new();
     let mut deliveries = Vec::new();
+    let mut nodes = Vec::new();
     let positions: HashMap<usize, usize> = graph
         .sinks()
         .enumerate()
@@ -208,9 +211,14 @@ async fn walk<'a>(
         let node = graph.node(index);
         if node.config.is_trigger() {
             reached[index] = trigger_matches(node, fact, presence);
+            let RouteNodeConfig::Trigger { when } = &node.config else {
+                unreachable!()
+            };
+            nodes.push(serde_json::json!({"nodeId":node.id,"kind":"trigger","reached":reached[index],"output":fact.fields,"failures":super::explain_clause(when, &Fact { source: &fact.source, fields: &fact.fields, presence })}));
             continue;
         }
         if !graph.incoming(index).iter().any(|&from| reached[from]) {
+            nodes.push(serde_json::json!({"nodeId":node.id,"kind":if node.config.is_sink(){"sink"}else{"response"},"reached":false}));
             continue;
         }
         reached[index] = true;
@@ -247,6 +255,7 @@ async fn walk<'a>(
                             "output": crate::storage::firing_snapshot(&text),
                         }));
                         outputs.insert(index, text);
+                        nodes.push(serde_json::json!({"nodeId":node.id,"kind":"response","reached":true,"status":"ok","output":outputs[&index]}));
                     }
                     Err(error) => {
                         history.push(serde_json::json!({
@@ -257,23 +266,93 @@ async fn walk<'a>(
                         // A failed step is recorded and the path continues with
                         // the content that reached it.
                         outputs.insert(index, text_of(&fields).to_owned());
+                        nodes.push(serde_json::json!({"nodeId":node.id,"kind":"response","reached":true,"status":"failed","output":outputs[&index],"error":error}));
                     }
                 }
                 histories.insert(index, history);
             }
-            RouteNodeConfig::Sink { sink } => deliveries.push(Delivery {
-                sink,
-                position: positions[&index],
-                fields,
-                transforms: history,
-            }),
+            RouteNodeConfig::Sink { sink } => {
+                nodes.push(serde_json::json!({"nodeId":node.id,"kind":"sink","reached":true,"output":fields}));
+                deliveries.push(Delivery {
+                    node_id: &node.id,
+                    sink,
+                    position: positions[&index],
+                    fields,
+                    transforms: history,
+                });
+            }
             RouteNodeConfig::Trigger { .. } => unreachable!("triggers are handled above"),
         }
     }
     Walk {
         deliveries,
         outputs,
+        nodes,
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RouteTestResult {
+    pub matched: bool,
+    pub nodes: Vec<Value>,
+    pub sink_previews: Vec<Value>,
+}
+
+/// Execute a supplied draft through real Responses while stopping before every
+/// externally visible delivery and before the route firing journal.
+pub async fn test_definition(
+    orch: &Orchestrator,
+    definition: &super::RouteDefinition,
+    fact: RouteFact,
+    presence: Presence,
+    context: RouteContext<'_>,
+) -> Result<RouteTestResult, String> {
+    definition.validate(&super::FactRegistry::default())?;
+    let graph = RouteGraph::new(definition)?;
+    let run = |response: &str, args: Value| -> ResponseFuture {
+        let (orch, response, project_id, project_path) = (
+            orch.clone(),
+            response.to_owned(),
+            context.project_id.map(str::to_owned),
+            context.project_path.map(Path::to_owned),
+        );
+        Box::pin(async move {
+            responses::invoke(
+                &orch,
+                &response,
+                &args,
+                ResponseCaller::Agent {
+                    label: Some("route editor test".into()),
+                    run_id: uuid::Uuid::new_v4().to_string(),
+                    project_id,
+                    project_path,
+                },
+            )
+            .await
+            .map(|outcome| outcome.text)
+            .map_err(|error| error.to_string())
+        })
+    };
+    let walked = walk(&graph, &fact, presence, &run).await;
+    let matched = graph
+        .triggers()
+        .any(|index| trigger_matches(graph.node(index), &fact, presence));
+    let sink_previews = walked.deliveries.iter().map(|delivery| {
+        let fields = &delivery.fields;
+        let bindings = Bindings { graph: &graph, fields, outputs: &walked.outputs };
+        match delivery.sink {
+            RouteSink::Channel { register, initiated_by } => serde_json::json!({"nodeId":delivery.node_id,"kind":"channel","register":register,"initiatedBy":initiated_by,"text":text_of(fields),"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()}),
+            RouteSink::Message { target } => serde_json::json!({"nodeId":delivery.node_id,"kind":"message","target":target,"text":text_of(fields)}),
+            RouteSink::Label { issue, labels } => match bindings.string(issue) { Ok(issue) => serde_json::json!({"nodeId":delivery.node_id,"kind":"label","issue":issue,"labels":labels}), Err(error) => serde_json::json!({"nodeId":delivery.node_id,"kind":"label","labels":labels,"error":error}) },
+            RouteSink::Issue { labels, recipe } => serde_json::json!({"nodeId":delivery.node_id,"kind":"issue","project":fields.get("project"),"title":fields.get("title").or_else(||fields.get("text")),"description":fields.get("body").or_else(||fields.get("description")),"labels":labels,"recipe":recipe}),
+        }
+    }).collect();
+    Ok(RouteTestResult {
+        matched,
+        nodes: walked.nodes,
+        sink_previews,
+    })
 }
 
 /* ---------------------------------------------------------------- delivery */
@@ -400,6 +479,27 @@ pub async fn dispatch(
 ) -> Result<Vec<ChannelSubmission>, String> {
     if fact.is_route_generated() {
         return Ok(Vec::new());
+    }
+    let observed_at = chrono::Utc::now().timestamp_millis();
+    let mut scopes = vec!["workspace".to_string()];
+    if let Some(project_id) = context.project_id {
+        scopes.push(format!("project:{project_id}"));
+    }
+    let fields_json = serde_json::to_string(&fact.fields).map_err(|error| error.to_string())?;
+    for scope_key in scopes {
+        crate::storage::upsert_route_fact_sample(
+            &orch.db.local,
+            crate::storage::RouteFactSample {
+                scope_key,
+                source: fact.source.clone(),
+                identity: fact.identity.clone(),
+                fields_json: fields_json.clone(),
+                summary: fact.summary.clone(),
+                observed_at,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     }
     let routes = config::routes::list_routes(&orch.config_dir, context.project_path)?;
     let mut submissions = Vec::new();
@@ -1077,6 +1177,43 @@ mod tests {
         .await
         .unwrap();
         assert!(submissions.is_empty());
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_definition_previews_without_delivering_or_journaling() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) = orchestrator(temp.path(), &[]).await;
+        db.execute_batch(PROJECT_FIXTURE).await.unwrap();
+        let draft = definition(&message_route("Dry run", ""));
+
+        let result = test_definition(
+            &orch,
+            &draft,
+            thread_fact("preview only"),
+            Presence::Away,
+            RouteContext {
+                project_id: Some("p"),
+                project_path: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.matched);
+        assert_eq!(result.sink_previews.len(), 1);
+        assert_eq!(result.sink_previews[0]["text"], "preview only");
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM messages", ())
+                .await
+                .unwrap(),
+            Some(0)
+        );
         assert_eq!(
             db.query_opt_i64("SELECT COUNT(*) FROM route_firings", ())
                 .await

@@ -37,11 +37,13 @@ pub(crate) fn format_checks_settled_message(
         &snapshot.settlement
     {
         if !verdictless.is_empty() {
+            let reason = snapshot.terminal_reason.as_deref().unwrap_or(
+                "legacy check state has no durable attempt reason; the restart-protection dwell elapsed",
+            );
             out.push_str(&format!(
-                "\n\nNo verdict was produced for: {}. Nothing is going to run them for this tree \
-                 \u{2014} a withdrawn or interrupted wave, a suppressed check, or a tree identical \
-                 to its base.",
-                verdictless.join(", ")
+                "\n\nNo verdict was produced for: {}. Terminal reason: {}.",
+                verdictless.join(", "),
+                reason
             ));
         }
     }

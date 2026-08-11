@@ -66,7 +66,7 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         "- externalReplies: {:?}\n\n",
         settings.external_replies
     ));
-    let channel = crate::channels::runtime_status(orch).await;
+    let channel = crate::channels::runtime_status(orch, "imessage").await;
     out.push_str("## Operator presence (read-only)\n\n");
     out.push_str(&format!("- presenceMode: {:?}\n", channel.presence_mode));
     out.push_str(&format!(

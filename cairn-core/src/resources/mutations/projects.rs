@@ -135,7 +135,7 @@ async fn resolve_project(
     project_key: &str,
 ) -> Result<(Arc<LocalDb>, String, String, Option<String>), String> {
     let db = orch.db.for_project(project_key).await;
-    let lookup = project_key.to_uppercase();
+    let lookup = cairn_common::uri::canonical_project(project_key);
     let row = db
         .read(move |conn| {
             let lookup = lookup.clone();
@@ -517,7 +517,11 @@ async fn load_project_settings_for_mutation(
         resolve_project(orch, project_key).await?;
     let repo = PathBuf::from(repo_path);
     let config = load_project_settings(&repo);
-    Ok((project_key.to_uppercase(), repo, config))
+    Ok((
+        cairn_common::uri::canonical_project(project_key),
+        repo,
+        config,
+    ))
 }
 
 fn save_project_settings_after_reference_change(

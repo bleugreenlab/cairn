@@ -211,9 +211,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
 
     // Resolve home-relative (`cairn:~/...`) targets to canonical up front, so
     // blocking-append classification — which runs on the raw target before the
-    // dispatch that would otherwise resolve it — sees the real resource. SDK
-    // writers (the workflow harness) send `cairn:~/` raw; `cairn-cmd` resolves it
-    // client-side, so canonical targets pass through unchanged.
+    // dispatch that would otherwise resolve it — sees the real resource. All
+    // clients forward `cairn:~/` raw so this lookup uses the run's current home.
     for item in payload.changes.iter_mut() {
         if item.target.starts_with("cairn:~") {
             if let Ok(resolved) =

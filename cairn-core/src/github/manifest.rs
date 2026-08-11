@@ -83,6 +83,7 @@ pub fn create_manifest(
             "check_run".to_string(),
             "check_suite".to_string(),
             "push".to_string(),
+            "issue_comment".to_string(),
         ],
     }
 }
@@ -172,7 +173,8 @@ mod tests {
                 "pull_request_review",
                 "check_run",
                 "check_suite",
-                "push"
+                "push",
+                "issue_comment"
             ]
         );
     }

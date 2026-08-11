@@ -158,8 +158,8 @@ async fn scope_project_path(
 /// The dispatch path resolves this itself, but blocking-append classification
 /// runs on the raw target BEFORE dispatch, so the write handler resolves up
 /// front to classify uniformly. A canonical or `file:` target is returned
-/// unchanged. SDK writers send `cairn:~/` raw; `cairn-cmd` resolves it
-/// client-side, so agents already send canonical targets.
+/// unchanged. Clients forward `cairn:~/` raw so the authenticated run remains
+/// the single live authority for its home.
 pub(crate) async fn resolve_change_target_uri(
     orch: &Orchestrator,
     request: &McpCallbackRequest,

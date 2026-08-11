@@ -1562,7 +1562,7 @@ pub(super) fn format_transcript_digest_with(
 
     let coordinate = match meta.coordinate {
         DigestCoordinate::Issue { number, exec_seq } => {
-            format!(" — {}-{}/{}", meta.project, number, exec_seq)
+            format!(" — {}/{}/{}", meta.project, number, exec_seq)
         }
         DigestCoordinate::Thread { name } => format!(" — {}/{}", meta.project, name),
         DigestCoordinate::Unaddressed => String::new(),

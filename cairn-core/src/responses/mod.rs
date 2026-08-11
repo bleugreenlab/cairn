@@ -32,6 +32,145 @@ pub enum ResponseCaller {
     },
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseModelCapabilities {
+    pub backends: Vec<ResponseBackendCapability>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseBackendCapability {
+    pub backend: String,
+    pub label: String,
+    pub runnable: bool,
+    pub unavailable_reason: Option<String>,
+    pub selections: Vec<ResponseModelSelection>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResponseModelSelection {
+    pub kind: String,
+    pub value: String,
+    pub label: String,
+    pub backend: String,
+    pub model: String,
+    pub legacy_values: Vec<String>,
+}
+
+/// Backend-owned response capability projected with the effective presets and
+/// discovered models that can be authored in this scope.
+pub fn model_capabilities(
+    orch: &Orchestrator,
+    project_id: Option<&str>,
+    project_path: Option<&std::path::Path>,
+) -> ResponseModelCapabilities {
+    let presets = crate::config::presets::load_effective_presets(&orch.config_dir, project_path);
+    let catalog = orch.get_model_catalog();
+    let mut backends = Vec::new();
+    for backend_name in ["claude", "codex", "openrouter", "ollama"] {
+        let backend = backend_for_name(Some(backend_name));
+        let availability = backend.response_completion_availability(orch, project_id);
+        let mut selections = Vec::new();
+        if let Some(backend_presets) = presets.backends.get(backend_name) {
+            for tier in &presets.tiers {
+                if let Some(preset) = backend_presets.get(tier) {
+                    if backend
+                        .response_model_availability(orch, project_id, preset.model.as_str())
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    let legacy_values = crate::config::presets::resolve_preset(tier, &presets)
+                        .ok()
+                        .filter(|resolved| resolved.backend == backend_name)
+                        .map(|_| vec![tier.clone()])
+                        .unwrap_or_default();
+                    selections.push(ResponseModelSelection {
+                        kind: "tier".into(),
+                        value: format!("{backend_name}/{tier}"),
+                        label: format!("{} · {}", tier.to_uppercase(), preset.model),
+                        backend: backend_name.into(),
+                        model: preset.model.to_string(),
+                        legacy_values,
+                    });
+                }
+            }
+        }
+        if let Some(entry) = catalog
+            .iter()
+            .find(|entry| entry.backend == backend_name && entry.error.is_none())
+        {
+            for model in entry.models.iter().filter(|model| !model.hidden) {
+                if backend
+                    .response_model_availability(orch, project_id, &model.model)
+                    .is_err()
+                {
+                    continue;
+                }
+                selections.push(ResponseModelSelection {
+                    kind: "model".into(),
+                    value: model.model.clone(),
+                    label: format!("Exact · {}", model.display_name),
+                    backend: backend_name.into(),
+                    model: model.model.clone(),
+                    legacy_values: Vec::new(),
+                });
+            }
+        }
+        backends.push(ResponseBackendCapability {
+            backend: backend_name.into(),
+            label: backend.name().into(),
+            runnable: availability.is_ok(),
+            unavailable_reason: availability.err(),
+            selections,
+        });
+    }
+    ResponseModelCapabilities { backends }
+}
+
+pub fn validate_runnable_model(
+    orch: &Orchestrator,
+    definition: &ResponseDefinition,
+    project_id: Option<&str>,
+    project_path: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let capabilities = model_capabilities(orch, project_id, project_path);
+    if is_offered_model_selection(definition, &capabilities) {
+        Ok(())
+    } else {
+        Err("Model configuration is not a runnable selection".into())
+    }
+}
+
+fn is_offered_model_selection(
+    definition: &ResponseDefinition,
+    capabilities: &ResponseModelCapabilities,
+) -> bool {
+    if let Some(model) = &definition.model {
+        let backend = definition.backend.as_deref().unwrap_or_default();
+        capabilities.backends.iter().any(|candidate| {
+            candidate.backend == backend
+                && candidate.runnable
+                && candidate
+                    .selections
+                    .iter()
+                    .any(|selection| selection.kind == "model" && selection.model == *model)
+        })
+    } else {
+        let tier = definition.tier.as_deref().unwrap_or("sm");
+        capabilities.backends.iter().any(|candidate| {
+            candidate.runnable
+                && candidate.selections.iter().any(|selection| {
+                    selection.kind == "tier"
+                        && (selection.value == tier
+                            || selection.legacy_values.iter().any(|legacy| legacy == tier))
+                })
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResponseOutcome {
     pub seq: i64,
@@ -197,6 +336,7 @@ pub async fn invoke(
         system: None,
         messages,
         model: model.to_string(),
+        project_id: project_id.map(str::to_string),
         extras: serde_json::to_value(extras).unwrap_or(Value::Null),
         output_schema: output_schema.clone(),
         timeout: file.definition.timeout,
@@ -399,6 +539,8 @@ pub struct ResponseVariable {
     pub required: bool,
     #[serde(default)]
     pub default: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub values: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -500,6 +642,14 @@ impl ResponseDefinition {
                     variable.name
                 ));
             }
+            if let Some(default) = &variable.default {
+                if !variable.values.is_empty() && !variable.values.contains(default) {
+                    return Err(format!(
+                        "Variable '{}' default is not one of its declared values",
+                        variable.name
+                    ));
+                }
+            }
         }
         for referenced in template_variables(&self.template) {
             if !declared.contains(referenced.as_str()) {
@@ -540,6 +690,12 @@ impl ResponseDefinition {
         for variable in &self.variables {
             match args.get(&variable.name).or(variable.default.as_ref()) {
                 Some(value) => {
+                    if !variable.values.is_empty() && !variable.values.contains(value) {
+                        return Err(format!(
+                            "Variable '{}' must be one of its declared values",
+                            variable.name
+                        ));
+                    }
                     values.insert(variable.name.as_str(), render_value(value));
                 }
                 None if variable.required => {
@@ -631,6 +787,28 @@ mod tests {
     }
 
     #[test]
+    fn validates_declared_variable_values() {
+        let response = parse_definition(
+            "---\nname: Test\ndescription: test\nvariables:\n  - name: surface\n    default: imessage\n    values: [imessage, discord]\n---\n{{surface}}",
+        )
+        .unwrap();
+        assert_eq!(response.render(&json!({})).unwrap(), "imessage");
+        assert_eq!(
+            response.render(&json!({"surface": "discord"})).unwrap(),
+            "discord"
+        );
+        assert!(response
+            .render(&json!({"surface": "email"}))
+            .unwrap_err()
+            .contains("declared values"));
+        assert!(parse_definition(
+            "---\nname: Test\ndescription: test\nvariables:\n  - name: surface\n    default: email\n    values: [imessage, discord]\n---\n{{surface}}",
+        )
+        .unwrap_err()
+        .contains("default is not one"));
+    }
+
+    #[test]
     fn rejects_undeclared_template_variable() {
         let error =
             parse_definition("---\nname: Test\ndescription: test\n---\n{{missing}}").unwrap_err();
@@ -677,5 +855,44 @@ mod tests {
             options: pinned.options,
         };
         assert_eq!(preset.to_extras().reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn closed_model_validation_accepts_only_offered_selection_identities() {
+        let capabilities = ResponseModelCapabilities {
+            backends: vec![ResponseBackendCapability {
+                backend: "openrouter".into(),
+                label: "OpenRouter".into(),
+                runnable: true,
+                unavailable_reason: None,
+                selections: vec![
+                    ResponseModelSelection {
+                        kind: "tier".into(),
+                        value: "openrouter/sm".into(),
+                        label: "SM".into(),
+                        backend: "openrouter".into(),
+                        model: "openrouter/auto".into(),
+                        legacy_values: vec!["sm".into()],
+                    },
+                    ResponseModelSelection {
+                        kind: "model".into(),
+                        value: "openrouter/auto".into(),
+                        label: "Exact".into(),
+                        backend: "openrouter".into(),
+                        model: "openrouter/auto".into(),
+                        legacy_values: vec![],
+                    },
+                ],
+            }],
+        };
+        let mut authored = definition();
+        authored.tier = Some("sm".into());
+        assert!(is_offered_model_selection(&authored, &capabilities));
+        authored.tier = Some("ghost/sm".into());
+        assert!(!is_offered_model_selection(&authored, &capabilities));
+        authored.tier = None;
+        authored.backend = Some("openrouter".into());
+        authored.model = Some("openrouter/auto".into());
+        assert!(is_offered_model_selection(&authored, &capabilities));
     }
 }

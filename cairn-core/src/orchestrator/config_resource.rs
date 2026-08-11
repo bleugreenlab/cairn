@@ -164,7 +164,7 @@ impl Orchestrator {
 
         let dbs = self.db.clone();
         let team_id = team_id.to_string();
-        let key_upper = key.to_uppercase();
+        let key_upper = cairn_common::uri::canonical_project(key);
         let path_str = ws_path.to_string_lossy().to_string();
         run_db_blocking(move || async move {
             let Some(team_db) = dbs.team_db(&team_id).await else {

@@ -796,7 +796,7 @@ pub(crate) async fn lookup_issue_for_attention_by_key(
     project_key: &str,
     number: i32,
 ) -> Result<(String, IssueAttentionContext), String> {
-    let project_key = project_key.to_uppercase();
+    let project_key = cairn_common::uri::canonical_project(project_key);
     db.read(|conn| {
         let project_key = project_key.clone();
         Box::pin(async move {

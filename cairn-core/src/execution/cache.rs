@@ -8,6 +8,25 @@ use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowFamily {
+    Verdict,
+    InfraSuppression,
+}
+
+impl RowFamily {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verdict => "verdict",
+            Self::InfraSuppression => "infra_suppression",
+        }
+    }
+
+    fn predicate(self, column: &str) -> String {
+        format!("{column} = '{}'", self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct CheckResultIdentity {
     pub project_id: String,
@@ -20,8 +39,7 @@ pub(crate) struct CheckResultIdentity {
 /// whatever this returns is what a lane renders and what "has this lane produced
 /// a verdict?" is answered from.
 ///
-/// Two row FAMILIES share `check_result_cache`, and `environment_fingerprint` is
-/// the only thing that tells them apart:
+/// Two typed row families share `check_result_cache`:
 ///
 /// * VERDICT rows, projected from an immutable observation. Their fingerprint is
 ///   the verdict environment identity that produced them — or `''` on rows
@@ -32,16 +50,9 @@ pub(crate) struct CheckResultIdentity {
 ///   commit that hit the failure so a stumble on one head cannot render on
 ///   another.
 ///
-/// So the predicate below says: every verdict row at this tree, plus
-/// infrastructure rows belonging to THIS head. It used to be spelled
-/// `fingerprint = '' OR fingerprint = scope`, which stated the same thing back
-/// when `''` was the only value a verdict row could carry. Once verdicts began
-/// carrying a real environment identity, that spelling selected exactly the
-/// NON-verdicts: every lane on every node rendered `pending` over a store full of
-/// recorded green, and settle-waits called those lanes verdictless (CAIRN-3823).
-/// Discriminate on the `infra:` prefix — the same discriminator
-/// [`clear_infra_suppressions`] uses — never on the value a verdict happens to
-/// carry today.
+/// The predicate below selects every verdict row at this tree plus infrastructure
+/// rows belonging to this head. Family membership never depends on the shape of
+/// an environment identity.
 ///
 /// One tree can hold several verdicts for one check, one per environment that
 /// ran it, so the newest row wins and the caller gets one row per check name.
@@ -61,8 +72,7 @@ pub(crate) fn list_check_results_for_head(
             let tree_hash = tree_hash.clone();
             let scope = scope.clone();
             Box::pin(async move {
-                let mut rows = conn
-                    .query(
+                let sql = format!(
                         "SELECT c.project_id, c.tree_hash, c.input_hash, c.check_name, c.exit_code,
                                 c.passed, c.output_tail, c.duration_ms, c.ran_at, c.target_results_json,
                                 c.job_id, c.cached, c.failure_kind, c.executor_id, c.executor_device_id,
@@ -77,11 +87,16 @@ pub(crate) fn list_check_results_for_head(
                                        ) AS recency_rank
                                   FROM check_result_cache r
                                  WHERE r.project_id = ?1 AND r.tree_hash = ?2
-                                   AND (r.environment_fingerprint NOT LIKE 'infra:%'
-                                        OR r.environment_fingerprint = ?3)
+                                   AND ({} OR ({} AND r.environment_fingerprint = ?3))
                            ) c
                           WHERE c.recency_rank = 1
                           ORDER BY c.check_name ASC",
+                        RowFamily::Verdict.predicate("r.row_family"),
+                        RowFamily::InfraSuppression.predicate("r.row_family"),
+                    );
+                let mut rows = conn
+                    .query(
+                        &sql,
                         params![project_id.as_str(), tree_hash.as_str(), scope.as_str()],
                     )
                     .await?;
@@ -193,20 +208,24 @@ pub(crate) fn get_check_result(
             let check_name = check_name.clone();
             let input_hash = input_hash.clone();
             Box::pin(async move {
+                let sql = format!(
+                    "
+                    SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                           passed, output_tail, duration_ms, ran_at, target_results_json,
+                           job_id, cached, failure_kind, executor_id, executor_device_id,
+                           executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                           executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                           toolchain_fingerprint, infra_failure_streak,
+                           defined_by_commit_sha
+                    FROM check_result_cache
+                    WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                      AND {} AND passed = 1 AND failure_kind IS NULL
+                    ",
+                    RowFamily::Verdict.predicate("row_family"),
+                );
                 let mut rows = conn
                     .query(
-                        "
-                        SELECT project_id, tree_hash, input_hash, check_name, exit_code,
-                               passed, output_tail, duration_ms, ran_at, target_results_json,
-                               job_id, cached, failure_kind, executor_id, executor_device_id,
-                               executor_connection_generation, executor_slot_id, executor_lease_epoch,
-                               executor_started_at_unix_ms, executor_finished_at_unix_ms,
-                               toolchain_fingerprint, infra_failure_streak,
-                               defined_by_commit_sha
-                        FROM check_result_cache
-                        WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                          AND passed = 1 AND failure_kind IS NULL
-                        ",
+                        &sql,
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
@@ -285,12 +304,13 @@ pub(crate) fn get_reusable_check_result(
                         AND c.result_schema_version=?4 AND o.runner_build_id=?5
                         AND o.verdict_environment_hash=?6
                         AND o.verdict_platform IN ({placeholders})
-                        AND c.failure_kind IS NULL AND o.reusable=1
+                        AND {} AND c.failure_kind IS NULL AND o.reusable=1
                         AND o.complete=1 AND o.failure_kind IS NULL
                         AND o.verdict IN ('passed','failed')
                         AND c.defined_by_commit_sha IS NOT NULL
                         AND o.defined_by_commit_sha IS NOT NULL
-                      ORDER BY o.ran_at DESC, o.rowid DESC LIMIT 1"
+                      ORDER BY o.ran_at DESC, o.rowid DESC LIMIT 1",
+                    RowFamily::Verdict.predicate("c.row_family"),
                 );
                 let mut values: Vec<cairn_db::turso::Value> = vec![
                     keys.0.into(), keys.1.into(), keys.2.into(),
@@ -422,21 +442,25 @@ pub(crate) fn get_suppressed_check_result(
             let input_hash = input_hash.clone();
             let scope = scope.clone();
             Box::pin(async move {
+                let sql = format!(
+                    "
+                    SELECT project_id, tree_hash, input_hash, check_name, exit_code,
+                           passed, output_tail, duration_ms, ran_at, target_results_json,
+                           job_id, cached, failure_kind, executor_id, executor_device_id,
+                           executor_connection_generation, executor_slot_id, executor_lease_epoch,
+                           executor_started_at_unix_ms, executor_finished_at_unix_ms,
+                           toolchain_fingerprint, infra_failure_streak,
+                           defined_by_commit_sha
+                    FROM check_result_cache
+                    WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                      AND {} AND environment_fingerprint = ?5
+                      AND infra_failure_streak >= ?4
+                    ",
+                    RowFamily::InfraSuppression.predicate("row_family")
+                );
                 let mut rows = conn
                     .query(
-                        "
-                        SELECT project_id, tree_hash, input_hash, check_name, exit_code,
-                               passed, output_tail, duration_ms, ran_at, target_results_json,
-                               job_id, cached, failure_kind, executor_id, executor_device_id,
-                               executor_connection_generation, executor_slot_id, executor_lease_epoch,
-                               executor_started_at_unix_ms, executor_finished_at_unix_ms,
-                               toolchain_fingerprint, infra_failure_streak,
-                               defined_by_commit_sha
-                        FROM check_result_cache
-                        WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                          AND environment_fingerprint = ?5 AND result_schema_version = 0
-                          AND infra_failure_streak >= ?4
-                        ",
+                        &sql,
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
@@ -484,13 +508,17 @@ pub(crate) fn claim_infra_escalation(
             let input_hash = input_hash.clone();
             let scope = scope.clone();
             Box::pin(async move {
-                let changed = conn
-                    .execute(
-                        "UPDATE check_result_cache SET infra_escalated_at = ?5
+                let sql = format!(
+                    "UPDATE check_result_cache SET infra_escalated_at = ?5
                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                           AND environment_fingerprint = ?6 AND result_schema_version = 0
+                           AND {} AND environment_fingerprint = ?6
                            AND infra_failure_streak >= ?4
                            AND infra_escalated_at IS NULL",
+                    RowFamily::InfraSuppression.predicate("row_family"),
+                );
+                let changed = conn
+                    .execute(
+                        &sql,
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
@@ -557,14 +585,18 @@ pub(crate) fn claim_check_execution(
             let input_hash = input_hash.clone();
             let scope = scope.clone();
             Box::pin(async move {
-                let changed = conn
-                    .execute(
-                        "UPDATE check_result_cache
+                let update_sql = format!(
+                    "UPDATE check_result_cache
                             SET infra_failure_streak = infra_failure_streak + 1
                           WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                            AND environment_fingerprint = ?5 AND result_schema_version = 0
+                            AND {} AND environment_fingerprint = ?5
                             AND infra_failure_streak >= 1
                             AND infra_failure_streak < ?4",
+                    RowFamily::InfraSuppression.predicate("row_family"),
+                );
+                let changed = conn
+                    .execute(
+                        &update_sql,
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
@@ -582,11 +614,15 @@ pub(crate) fn claim_check_execution(
                 // the triple has no open streak to ration (no row at all, or a
                 // zero after a genuine verdict), or its budget is gone. Only the
                 // stored counter distinguishes them.
+                let select_sql = format!(
+                    "SELECT infra_failure_streak FROM check_result_cache
+                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
+                            AND {} AND environment_fingerprint = ?4",
+                    RowFamily::InfraSuppression.predicate("row_family"),
+                );
                 let mut rows = conn
                     .query(
-                        "SELECT infra_failure_streak FROM check_result_cache
-                          WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
-                            AND environment_fingerprint = ?4 AND result_schema_version = 0",
+                        &select_sql,
                         params![
                             project_id.as_str(),
                             check_name.as_str(),
@@ -623,15 +659,15 @@ pub(crate) fn claim_check_execution(
 /// re-evaluation happen together rather than leaving the counter zeroed with
 /// nothing scheduled to prove it.
 pub(crate) async fn clear_infra_suppressions(db: &LocalDb) -> Result<u64, String> {
-    db.execute(
+    let sql = format!(
         "UPDATE check_result_cache
          SET infra_failure_streak = 0, infra_escalated_at = NULL
-         WHERE environment_fingerprint LIKE 'infra:%' AND result_schema_version = 0
-           AND infra_failure_streak > 0",
-        (),
-    )
-    .await
-    .map_err(|e| format!("Failed to clear check infrastructure suppressions: {e}"))
+         WHERE {} AND infra_failure_streak > 0",
+        RowFamily::InfraSuppression.predicate("row_family"),
+    );
+    db.execute(&sql, ())
+        .await
+        .map_err(|e| format!("Failed to clear check infrastructure suppressions: {e}"))
 }
 
 /// Store a project-declared check result keyed by `(project_id, check_name,
@@ -641,7 +677,13 @@ pub(crate) async fn clear_infra_suppressions(db: &LocalDb) -> Result<u64, String
 /// preserving the original executor provenance. This is a latest-row store, not
 /// complete attempt history.
 pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Result<(), String> {
-    let streak_op = result.infra_streak_op().as_param();
+    let streak = result.infra_streak_op();
+    let streak_op = streak.as_param();
+    let row_family = if streak == InfraStreakOp::OpenStreak {
+        RowFamily::InfraSuppression
+    } else {
+        RowFamily::Verdict
+    };
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
             let result = result.clone();
@@ -660,11 +702,12 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         executor_connection_generation, executor_slot_id, executor_lease_epoch,
                         executor_started_at_unix_ms, executor_finished_at_unix_ms,
                         toolchain_fingerprint, defined_by_commit_sha, infra_failure_streak,
-                        environment_fingerprint, verdict_platform, verdict_arch, verdict_environment_hash
+                        environment_fingerprint, verdict_platform, verdict_arch, verdict_environment_hash,
+                        row_family
                     )
                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?23,
-                            CASE WHEN ?22 = 1 THEN 1 ELSE 0 END, ?24, ?25, ?26, ?27)
+                            CASE WHEN ?22 = 1 THEN 1 ELSE 0 END, ?24, ?25, ?26, ?27, ?28)
                     ON CONFLICT(project_id, check_name, input_hash, environment_fingerprint,
                                 result_schema_version) DO UPDATE SET
                         tree_hash = excluded.tree_hash,
@@ -700,7 +743,11 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         END,
                         verdict_platform = excluded.verdict_platform,
                         verdict_arch = excluded.verdict_arch,
-                        verdict_environment_hash = excluded.verdict_environment_hash
+                        verdict_environment_hash = excluded.verdict_environment_hash,
+                        row_family = CASE
+                            WHEN ?22 = -1 THEN check_result_cache.row_family
+                            ELSE excluded.row_family
+                        END
                     WHERE check_result_cache.passed = 0 OR excluded.passed = 1
                     ",
                     params![
@@ -732,6 +779,7 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
                         result.environment_fingerprint.as_str(),
                         result.verdict_platform.as_deref(), result.verdict_arch.as_deref(),
                         result.verdict_environment_hash.as_deref(),
+                        row_family.as_str(),
                     ],
                 )
                 .await?;
@@ -1141,7 +1189,53 @@ pub(crate) struct CheckTestResultRow {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
+pub(crate) struct SealedCheckCoordinate {
+    evaluated_commit: String,
+    defined_by_commit: String,
+    tree_hash: String,
+    input_hash: String,
+}
+
+impl SealedCheckCoordinate {
+    pub(super) fn new(
+        evaluated_commit: impl Into<String>,
+        defined_by_commit: impl Into<String>,
+        tree_hash: impl Into<String>,
+        input_hash: impl Into<String>,
+    ) -> Self {
+        Self {
+            evaluated_commit: evaluated_commit.into(),
+            defined_by_commit: defined_by_commit.into(),
+            tree_hash: tree_hash.into(),
+            input_hash: input_hash.into(),
+        }
+    }
+
+    fn matches(&self, observation: &FreshCheckObservationWrite) -> bool {
+        self.evaluated_commit == observation.commit_sha
+            && self.defined_by_commit == observation.defined_by_commit_sha
+            && self.tree_hash == observation.tree_hash
+            && self.input_hash == observation.input_hash
+    }
+
+    pub(super) fn evaluated_commit(&self) -> &str {
+        &self.evaluated_commit
+    }
+    pub(super) fn defined_by_commit(&self) -> &str {
+        &self.defined_by_commit
+    }
+    pub(super) fn tree_hash(&self) -> &str {
+        &self.tree_hash
+    }
+    pub(super) fn input_hash(&self) -> &str {
+        &self.input_hash
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
 pub(crate) struct FreshCheckObservationWrite {
+    pub sealed_coordinate: SealedCheckCoordinate,
     pub id: String,
     pub public_handle: String,
     pub project_id: String,
@@ -1257,6 +1351,11 @@ pub(crate) fn record_fresh_check_observation(
     db: Arc<LocalDb>,
     observation: FreshCheckObservationWrite,
 ) -> Result<(), String> {
+    if observation.reusable && !observation.sealed_coordinate.matches(&observation) {
+        return Err(
+            "reusable check observation does not match its sealed check coordinate".to_string(),
+        );
+    }
     run_checkpoint_cache_db(async move {
         db.write(|conn| {
             let observation = observation.clone();
@@ -1434,9 +1533,10 @@ pub(crate) fn record_fresh_check_observation(
                             executor_id, executor_device_id, executor_connection_generation,
                             executor_slot_id, executor_lease_epoch, executor_started_at_unix_ms,
                             executor_finished_at_unix_ms, toolchain_fingerprint,
-                            defined_by_commit_sha, verdict_platform, verdict_arch, verdict_environment_hash
+                            defined_by_commit_sha, verdict_platform, verdict_arch, verdict_environment_hash,
+                            row_family
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,0,?14,
-                                   ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)
+                                   ?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)
                          ON CONFLICT(project_id, check_name, input_hash, environment_fingerprint,
                                      result_schema_version) DO UPDATE SET
                             tree_hash=excluded.tree_hash, source_observation_id=excluded.source_observation_id,
@@ -1467,13 +1567,17 @@ pub(crate) fn record_fresh_check_observation(
                             observation.toolchain_fingerprint.as_deref(),
                             observation.defined_by_commit_sha.as_str(),
                             observation.verdict_platform.as_deref(), observation.verdict_arch.as_deref(),
-                            observation.verdict_environment_hash.as_deref()],
+                            observation.verdict_environment_hash.as_deref(), RowFamily::Verdict.as_str()],
                     ).await?;
-                    conn.execute(
+                    let target_sql = format!(
                         "UPDATE check_result_cache SET target_results_json=?1
                           WHERE project_id=?2 AND check_name=?3 AND input_hash=?4
                             AND environment_fingerprint=?5 AND result_schema_version=?6
-                            AND source_observation_id=?7",
+                            AND source_observation_id=?7 AND {}",
+                        RowFamily::Verdict.predicate("row_family"),
+                    );
+                    conn.execute(
+                        &target_sql,
                         params![observation.target_results_json.as_deref(), observation.project_id.as_str(),
                             observation.check_name.as_str(), observation.input_hash.as_str(),
                             observation.environment_fingerprint.as_str(), observation.result_schema_version,
@@ -1487,12 +1591,16 @@ pub(crate) fn record_fresh_check_observation(
                 if !infrastructure {
                     if let Some(job_id) = observation.job_id.as_deref() {
                         let scope = infra_suppression_scope(job_id, &observation.commit_sha);
-                        conn.execute(
+                        let reset_sql = format!(
                             "UPDATE check_result_cache
                                 SET infra_failure_streak = 0, infra_escalated_at = NULL
                               WHERE project_id = ?1 AND check_name = ?2 AND input_hash = ?3
                                 AND environment_fingerprint = ?4
-                                AND result_schema_version = 0",
+                                AND {}",
+                            RowFamily::InfraSuppression.predicate("row_family"),
+                        );
+                        conn.execute(
+                            &reset_sql,
                             params![
                                 observation.project_id.as_str(),
                                 observation.check_name.as_str(),
@@ -1979,7 +2087,13 @@ mod tests {
     }
 
     fn observation(id: &str, commit: &str, environment: &str) -> FreshCheckObservationWrite {
-        FreshCheckObservationWrite {
+        let mut observation = FreshCheckObservationWrite {
+            sealed_coordinate: SealedCheckCoordinate::new(
+                commit,
+                commit,
+                format!("tree-{commit}"),
+                "input-rust",
+            ),
             id: id.to_string(),
             public_handle: format!("{id:0<24}"),
             project_id: "project-a".to_string(),
@@ -2028,7 +2142,25 @@ mod tests {
                 declaration_source: None,
                 flaky: false,
             }],
-        }
+        };
+        observation.sealed_coordinate = SealedCheckCoordinate::new(
+            observation.commit_sha.clone(),
+            observation.defined_by_commit_sha.clone(),
+            observation.tree_hash.clone(),
+            observation.input_hash.clone(),
+        );
+        observation
+    }
+
+    #[tokio::test]
+    async fn reusable_observation_rejects_divergent_sealed_coordinate() {
+        let db = cache_db().await;
+        let mut write = observation("obs-divergent", "commit-sealed", "env-a");
+        write.tree_hash = "tree-from-dirty-checkout".to_string();
+
+        let error = record_fresh_check_observation(db, write)
+            .expect_err("mixed sealed and loose coordinates must not become reusable evidence");
+        assert!(error.contains("sealed check coordinate"), "{error}");
     }
 
     async fn cache_db() -> Arc<LocalDb> {
@@ -2626,13 +2758,17 @@ mod tests {
         );
     }
 
-    /// Every infrastructure kind counts, and only infrastructure kinds do. A
-    /// timeout is a fact about the check's own command, so it must not spend the
-    /// substrate's budget.
+    /// Every infrastructure kind counts, and only infrastructure kinds do.
     #[tokio::test]
     async fn only_infrastructure_kinds_advance_the_counter() {
         let db = cache_db().await;
-        for kind in ["infrastructure", "spawn_error", "runner_error"] {
+        for kind in [
+            "infrastructure",
+            "spawn_error",
+            "runner_error",
+            "timed_out",
+            "capacity",
+        ] {
             let hash = format!("ih-{kind}");
             store_check_result(
                 db.clone(),
@@ -2645,7 +2781,7 @@ mod tests {
                 "{kind} is an infrastructure failure"
             );
         }
-        for kind in [Some("timed_out"), Some("killed"), None] {
+        for kind in [Some("killed"), None] {
             let hash = format!("ih-{}", kind.unwrap_or("ordinary"));
             store_check_result(db.clone(), failing_result("project-a", &hash, "rust", kind))
                 .unwrap();
@@ -3136,6 +3272,146 @@ mod tests {
         assert_eq!(row.check_name, "rust");
         assert_eq!(row.tree_hash, "tree-commit-1");
         assert_eq!(row.defined_by_commit_sha.as_deref(), Some("commit-1"));
+    }
+
+    #[tokio::test]
+    async fn observation_row_alone_retains_durable_evaluation_metadata() {
+        let db = cache_db().await;
+        let mut write = observation("obs-durable", "commit-durable", "environment-durable");
+        write.reusable = false;
+        write.non_reusable_reason = Some("unsealed execution coordinate".to_string());
+        record_fresh_check_observation(db.clone(), write).unwrap();
+
+        let metadata = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT commit_sha, tree_hash, input_hash, environment_fingerprint,
+                            executor_id, executor_device_id, executor_connection_generation,
+                            executor_slot_id, executor_lease_epoch, reusable, non_reusable_reason
+                       FROM check_result_observations WHERE id='obs-durable'",
+                            (),
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("durable observation");
+                    Ok::<_, crate::storage::DbError>((
+                        row.text(0)?,
+                        row.text(1)?,
+                        row.text(2)?,
+                        row.text(3)?,
+                        row.opt_text(4)?,
+                        row.opt_text(5)?,
+                        row.opt_i64(6)?,
+                        row.opt_text(7)?,
+                        row.opt_i64(8)?,
+                        row.i64(9)? != 0,
+                        row.opt_text(10)?,
+                    ))
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(metadata.0, "commit-durable");
+        assert_eq!(metadata.1, "tree-commit-durable");
+        assert_eq!(metadata.2, "input-rust");
+        assert_eq!(metadata.3, "environment-durable");
+        assert_eq!(metadata.4.as_deref(), Some("executor-1"));
+        assert_eq!(metadata.5.as_deref(), Some("device-1"));
+        assert_eq!(metadata.6, Some(2));
+        assert_eq!(metadata.7.as_deref(), Some("cell-1"));
+        assert_eq!(metadata.8, Some(3));
+        assert!(!metadata.9);
+        assert_eq!(
+            metadata.10.as_deref(),
+            Some("unsealed execution coordinate")
+        );
+    }
+
+    #[tokio::test]
+    async fn infra_shaped_verdict_environment_cannot_cross_row_families() {
+        let db = cache_db().await;
+        let environment = infra_suppression_scope("job-evil", "commit-x");
+        assert_eq!(environment, "infra:8:job-evil:commit-x");
+
+        let mut verdict = observation("obs-evil-1", "commit-x", &environment);
+        verdict.job_id = Some("job-evil".to_string());
+        record_fresh_check_observation(db.clone(), verdict).unwrap();
+        db.execute(
+            "UPDATE check_result_cache
+                SET infra_failure_streak=41, infra_escalated_at=123
+              WHERE row_family='verdict' AND environment_fingerprint=?1",
+            (environment.as_str(),),
+        )
+        .await
+        .unwrap();
+
+        drive_scope_to_bound(&db, "rust", "input-rust", "job-evil", "commit-x");
+        assert!(get_suppressed_check_result(
+            db.clone(),
+            "project-a",
+            "rust",
+            "input-rust",
+            "job-evil",
+            "commit-x"
+        )
+        .unwrap()
+        .is_some());
+
+        let mut second_verdict = observation("obs-evil-2", "commit-x", &environment);
+        second_verdict.job_id = Some("job-evil".to_string());
+        second_verdict.ran_at = 200;
+        record_fresh_check_observation(db.clone(), second_verdict).unwrap();
+
+        let families = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT row_family, infra_failure_streak, infra_escalated_at
+                   FROM check_result_cache
+                  WHERE project_id='project-a' AND check_name='rust' AND input_hash='input-rust'
+                  ORDER BY row_family",
+                            (),
+                        )
+                        .await?;
+                    let mut values = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        values.push((row.text(0)?, row.i64(1)?, row.opt_i64(2)?));
+                    }
+                    Ok::<_, crate::storage::DbError>(values)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            families,
+            vec![
+                ("infra_suppression".to_string(), 0, None),
+                ("verdict".to_string(), 41, Some(123)),
+            ]
+        );
+        assert!(get_suppressed_check_result(
+            db.clone(),
+            "project-a",
+            "rust",
+            "input-rust",
+            "job-evil",
+            "commit-x"
+        )
+        .unwrap()
+        .is_none());
+        assert!(get_exact_reusable_check_result(
+            db,
+            "project-a",
+            "rust",
+            "input-rust",
+            &environment,
+            1
+        )
+        .unwrap()
+        .is_some());
     }
 
     /// A row whose defining commit was never recorded cannot prove which

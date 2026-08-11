@@ -1,19 +1,8 @@
 //! Install locks: the destination-side record of which pack owns what.
 //!
-//! Ownership splits into two questions with two mechanisms.
-//!
-//! *"Has the user edited this file since we wrote it?"* is answered by git
-//! history — the last commit subject on a path (see
-//! `workspace::bundle::pack_file_is_user_owned`). That oracle predates packs,
-//! is already correct, and stays exactly where it is.
-//!
-//! *"Which pack owns this path, at what version, from where?"* is a question git
-//! history answers only by walking, so it gets a lock file at
-//! `~/.cairn/packs/<id>/pack.yaml`. One read of that file answers everything the
-//! catalog resource, an update, and an uninstall need. Provenance for a
-//! URL-installed pack lives here and deliberately NOT in a commit subject: a URL
-//! is not a stable git-subject identity, and cramming it in would make the
-//! ownership oracle stringly and fragile.
+//! The lock is the live ownership authority. Each active item records the hash
+//! Cairn last materialized and whether the user has forked that copy. Git history
+//! is consulted only while migrating a legacy lock that has no item hashes.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -22,8 +11,8 @@ use super::manifest::{PackAuthor, PackFormat, PackItem, PackItemKind, PackManife
 use crate::services::FileSystem;
 
 /// Subdirectory of the workspace config home holding per-pack locks and MCP
-/// definitions. Tracked by the workspace repo (see `workspace::repo`) so lock
-/// files are ownership-classifiable like any other managed content.
+/// definitions. The lock is the live ownership authority; workspace Git may
+/// retain these files only as passive audit history.
 pub const PACKS_DIR: &str = "packs";
 /// The lock filename inside `packs/<id>/`.
 pub const LOCK_FILE: &str = "pack.yaml";
@@ -68,7 +57,42 @@ impl PackSource {
 }
 
 fn default_cairn_version() -> u32 {
-    1
+    2
+}
+
+/// One active item and the materialization baseline Cairn owns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PackLockItem {
+    pub kind: PackItemKind,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Absent only on locks written before the v2 ownership model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forked: bool,
+}
+
+impl PackLockItem {
+    pub fn legacy(item: PackItem) -> Self {
+        Self {
+            kind: item.kind,
+            id: item.id,
+            path: item.path,
+            content_hash: None,
+            forked: false,
+        }
+    }
+
+    pub fn manifest_item(&self) -> PackItem {
+        PackItem {
+            kind: self.kind,
+            id: self.id.clone(),
+            path: self.path.clone(),
+        }
+    }
 }
 
 /// What one installed pack put in the workspace.
@@ -94,7 +118,7 @@ pub struct PackLock {
     pub content_hash: String,
     pub source: PackSource,
     #[serde(default)]
-    pub items: Vec<PackItem>,
+    pub items: Vec<PackLockItem>,
     /// Items the user removed from this pack locally.
     ///
     /// Removing one item must not mean uninstalling the pack that ships it: a
@@ -129,7 +153,7 @@ impl PackLock {
             installed_at: chrono::Utc::now().to_rfc3339(),
             content_hash,
             source,
-            items,
+            items: items.into_iter().map(PackLockItem::legacy).collect(),
             removed: Vec::new(),
             notes: manifest.notes.clone(),
         }
@@ -156,6 +180,52 @@ impl PackLock {
             .iter()
             .any(|item| item.kind == kind && item.id == id)
     }
+
+    pub fn item(&self, kind: PackItemKind, id: &str) -> Option<&PackLockItem> {
+        self.items
+            .iter()
+            .find(|item| item.kind == kind && item.id == id)
+    }
+
+    pub fn item_mut(&mut self, kind: PackItemKind, id: &str) -> Option<&mut PackLockItem> {
+        self.items
+            .iter_mut()
+            .find(|item| item.kind == kind && item.id == id)
+    }
+
+    /// Mark an item as a durable user fork. Returns whether the item exists.
+    pub fn mark_forked(&mut self, kind: PackItemKind, id: &str) -> bool {
+        let Some(item) = self.item_mut(kind, id) else {
+            return false;
+        };
+        item.forked = true;
+        true
+    }
+
+    /// Record bytes Cairn successfully materialized and reclaim ownership.
+    pub fn reset_item_baseline(
+        &mut self,
+        kind: PackItemKind,
+        id: &str,
+        content_hash: String,
+    ) -> bool {
+        let Some(item) = self.item_mut(kind, id) else {
+            return false;
+        };
+        item.content_hash = Some(content_hash);
+        item.forked = false;
+        true
+    }
+
+    /// A lock is fully migrated once every active item has a baseline hash.
+    pub fn migration_complete(&self) -> bool {
+        self.items.iter().all(|item| item.content_hash.is_some())
+    }
+
+    pub fn sort_items(&mut self) {
+        self.items
+            .sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
+    }
 }
 
 /// Record that the user removed one item from whichever installed pack ships it.
@@ -175,7 +245,7 @@ pub fn record_item_removal(
             .iter()
             .position(|item| item.kind == kind && item.id == id);
         let item = match position {
-            Some(position) => lock.items.remove(position),
+            Some(position) => lock.items.remove(position).manifest_item(),
             // A lock written by an older build may not list the item even though
             // its pack supplies it. Fall back to what the pack actually ships,
             // so a removal is never silently dropped.
@@ -192,7 +262,6 @@ pub fn record_item_removal(
         // Split apart, a `git checkout` reverts the deletion while the record
         // persists, leaving a resurrected item that no pack's `items` claims and
         // that no future sync will ever update.
-        let removed_path: Vec<String> = item.path.clone().into_iter().collect();
         lock.removed.push(item);
         lock.removed
             .sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
@@ -204,23 +273,9 @@ pub fn record_item_removal(
             );
             return None;
         }
-        commit_lock(config_dir, &pack_id, &removed_path);
         return Some(pack_id);
     }
     None
-}
-
-/// Commit a lock the moment it changes, in both directions, together with any
-/// workspace paths the change describes.
-///
-/// This is a workspace whose premise is that history IS the record. An
-/// uncommitted lock is reverted by an ordinary `git checkout` in `~/.cairn`,
-/// leaving the record and the tree disagreeing about what is installed — and a
-/// later sync resolves that disagreement in favor of the stale record.
-fn commit_lock(config_dir: &Path, pack_id: &str, workspace_paths: &[String]) {
-    let mut paths = vec![lock_path(config_dir, pack_id)];
-    paths.extend(workspace_paths.iter().map(|rel| config_dir.join(rel)));
-    crate::config::commit_config_paths(&paths, &format!("Sync pack resources: {pack_id}"));
 }
 
 fn pack_supplies_mcp(config_dir: &Path, pack_id: &str, server: &str) -> bool {
@@ -245,19 +300,30 @@ pub fn restore_removed_items(
         return Ok(Vec::new());
     }
     let restored = lock.removed.clone();
-    lock.items.append(&mut lock.removed);
+    let installed_mcp =
+        super::mcp::parse_pack_mcp_file(&mcp_path(config_dir, pack_id)).unwrap_or_default();
+    lock.items
+        .extend(std::mem::take(&mut lock.removed).into_iter().map(|item| {
+            let mut restored = PackLockItem::legacy(item);
+            // Removing an MCP item is represented by its tombstone; the
+            // shared pack layer may remain on disk for sibling servers.
+            // Restoring therefore reclaims the exact definition already in
+            // that layer instead of sending it through legacy Git migration.
+            if restored.kind == PackItemKind::Mcp {
+                restored.content_hash = installed_mcp
+                    .get(&restored.id)
+                    .and_then(|config| super::hash_mcp_definition(config).ok());
+            }
+            restored
+        }));
     lock.items
         .sort_by(|a, b| (a.kind, &a.id).cmp(&(b.kind, &b.id)));
     lock.items.dedup();
     write_lock(fs, config_dir, &lock)?;
-    // The restored files are materialized by the sync that follows and are
-    // committed there; only the record changes here.
-    commit_lock(config_dir, pack_id, &[]);
     Ok(restored)
 }
 
-/// Put a lock back exactly as it was, committing the reversal the same way the
-/// change it undoes was committed.
+/// Put a lock back exactly as it was.
 ///
 /// A recorded removal is the only trace of a decision the user made, and
 /// [`restore_removed_items`] discards it before the sync that materializes the
@@ -266,7 +332,6 @@ pub fn restore_removed_items(
 /// cannot undo. This is how that window is closed.
 pub fn rewrite_lock(fs: &dyn FileSystem, config_dir: &Path, lock: &PackLock) -> Result<(), String> {
     write_lock(fs, config_dir, lock)?;
-    commit_lock(config_dir, &lock.id, &[]);
     Ok(())
 }
 
@@ -464,5 +529,40 @@ mod tests {
         let temp = TempDir::new().unwrap();
         assert!(read_lock(temp.path(), "nope").is_none());
         assert!(installed_packs(temp.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_items_deserialize_without_claiming_migration_complete() {
+        let yaml = "cairnVersion: 1\nid: old\nname: Old\nversion: 1.0.0\ninstalledAt: now\ncontentHash: old\nsource:\n  kind: bundled\nitems:\n  - kind: agent\n    id: build\n    path: agents/build.md\n";
+        let lock: PackLock = serde_yaml::from_str(yaml).unwrap();
+        let item = lock.item(PackItemKind::Agent, "build").unwrap();
+        assert_eq!(item.content_hash, None);
+        assert!(!item.forked);
+        assert!(!lock.migration_complete());
+    }
+
+    #[test]
+    fn lock_helpers_preserve_identity_and_reset_forks() {
+        let mut lock = PackLock::new(
+            &manifest("core"),
+            "0".repeat(64),
+            PackSource::bundled(PackFormat::Cairn),
+            vec![PackItem::file(
+                PackItemKind::Agent,
+                "build",
+                "agents/build.md",
+            )],
+        );
+        assert!(!lock.migration_complete());
+        assert!(lock.mark_forked(PackItemKind::Agent, "build"));
+        assert!(lock.item(PackItemKind::Agent, "build").unwrap().forked);
+
+        let baseline = "a".repeat(64);
+        assert!(lock.reset_item_baseline(PackItemKind::Agent, "build", baseline.clone()));
+        let item = lock.item(PackItemKind::Agent, "build").unwrap();
+        assert_eq!(item.content_hash.as_deref(), Some(baseline.as_str()));
+        assert!(!item.forked);
+        assert!(lock.migration_complete());
+        assert!(!lock.mark_forked(PackItemKind::Skill, "missing"));
     }
 }

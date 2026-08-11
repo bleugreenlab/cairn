@@ -4,7 +4,10 @@ mod adapter;
 pub(crate) mod models;
 
 use crate::agent_process::process::BackendStdin;
-use crate::backends::{AgentBackend, DiscoveredModel, ResolvedTools, SessionConfig};
+use crate::backends::{
+    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
+    DiscoveredModel, ResolvedTools, SessionConfig,
+};
 use crate::identity::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
 use std::sync::atomic::Ordering;
@@ -76,6 +79,77 @@ impl AgentBackend for OllamaBackend {
     }
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         Err("Ollama discovery requires configured hosts".to_string())
+    }
+    fn response_completion_availability(
+        &self,
+        orch: &Orchestrator,
+        project_id: Option<&str>,
+    ) -> Result<(), String> {
+        let configured = orch
+            .get_identity_store()
+            .map(|store| {
+                store
+                    .accounts_for_provider(ApiProvider::Ollama, project_id)
+                    .into_iter()
+                    .any(|account| matches!(account.auth, ProviderAuth::BaseUrl { .. }))
+            })
+            .unwrap_or(false);
+        if configured {
+            Ok(())
+        } else {
+            Err("needs a configured Ollama host".to_string())
+        }
+    }
+    fn response_model_availability(
+        &self,
+        orch: &Orchestrator,
+        project_id: Option<&str>,
+        model: &str,
+    ) -> Result<(), String> {
+        self.response_completion_availability(orch, project_id)?;
+        let store = orch
+            .get_identity_store()
+            .ok_or_else(|| "needs a configured Ollama host".to_string())?;
+        let scoped_accounts: Vec<_> = store
+            .accounts_for_provider(ApiProvider::Ollama, project_id)
+            .into_iter()
+            .map(|account| account.id.as_str())
+            .collect();
+        let discovered = orch
+            .get_model_catalog()
+            .into_iter()
+            .find(|entry| entry.backend == OLLAMA_BACKEND_KEY && entry.error.is_none())
+            .and_then(|entry| {
+                entry
+                    .models
+                    .into_iter()
+                    .find(|entry| entry.model == model || entry.id == model)
+            });
+        match discovered {
+            Some(entry)
+                if entry.serving_account_ids.iter().any(|account_id| {
+                    scoped_accounts.iter().any(|scoped| *scoped == account_id)
+                }) =>
+            {
+                Ok(())
+            }
+            _ => Err(format!(
+                "{model} is not available on a configured Ollama host"
+            )),
+        }
+    }
+    fn complete(
+        &self,
+        request: CompletionRequest,
+        orch: &Orchestrator,
+    ) -> Result<CompletionOutcome, CompletionError> {
+        let adapter =
+            adapter::OllamaAdapter::new(orch, &request.model, request.project_id.as_deref())
+                .map_err(|_| CompletionError::BackendUnavailable)?;
+        adapter.complete(request)
+    }
+    fn completion_shape(&self) -> CompletionShape {
+        CompletionShape::InProcess
     }
     fn resolve_tools(&self, agent_tools: &[String], _agent_disallowed: &[String]) -> ResolvedTools {
         use crate::agent_process::toolkits;

@@ -155,7 +155,7 @@ pub(crate) async fn job_id_for_node_coordinate_conn(
         };
     }
 
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let mut rows = match task_name {
         None => {
             conn.query(

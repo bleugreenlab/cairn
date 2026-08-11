@@ -459,8 +459,48 @@ impl LeaseBook {
     /// The shape a disconnect wants: an account is signed out, and every token
     /// already derived from it stops working regardless of who holds a handle.
     pub fn revoke_source(&self, source: &CredentialSource) -> usize {
-        let wanted = source.secret_id();
+        self.revoke_secret(&source.secret_id())
+    }
+
+    /// Revoke every live lease minted from the credential registered under
+    /// `secret_id`. Returns how many.
+    ///
+    /// The shape a *disclosure* wants, which is why it exists beside
+    /// [`Self::revoke_source`]. A detection reports a `SecretId` and nothing
+    /// else — the crossing that caught the value knows what was registered, not
+    /// which store it came out of — so a response that had to name a
+    /// `CredentialSource` first could not act on its own evidence.
+    ///
+    /// Revoking does not unregister, and that is load-bearing here rather than
+    /// incidental: an incident's scan matches by registered value, so a response
+    /// that unregistered as it revoked would blind itself before it finished
+    /// looking. See `security::remediation::inventory`.
+    pub fn revoke_secret(&self, secret_id: &SecretId) -> usize {
+        let wanted = secret_id.clone();
         self.revoke_matching(move |state| state.secret_id == wanted)
+    }
+
+    /// The distinct authority scopes the leases for `secret_id` exercise.
+    ///
+    /// A disclosure names a credential; authority grants are keyed by scope. The
+    /// lease book is what already holds that correspondence — every lease
+    /// records both — so this reads it back rather than making the caller
+    /// reconstruct a `CredentialSource` it was never given.
+    ///
+    /// Process-local, so this answers for leases *this* runner minted. A
+    /// credential that has not been leased since startup yields nothing, which
+    /// is why an incident reports what it revoked rather than claiming to have
+    /// revoked everything.
+    pub fn scopes_for_secret(&self, secret_id: &SecretId) -> Vec<String> {
+        let leases = self.leases.lock().expect("lease book poisoned");
+        let mut scopes: Vec<String> = Vec::new();
+        for state in leases.values() {
+            if &state.secret_id == secret_id && !scopes.contains(&state.scope) {
+                scopes.push(state.scope.clone());
+            }
+        }
+        scopes.sort();
+        scopes
     }
 
     fn revoke_matching(&self, predicate: impl Fn(&LeaseState) -> bool) -> usize {
@@ -664,12 +704,25 @@ mod tests {
     /// exists rather than from the moment someone remembers to register it.
     #[test]
     fn a_leased_value_is_scrubbed_from_observed_output() {
+        // Its own credential, deliberately. Registering an id that is already
+        // registered recomputes that id's forms from the newest material — the
+        // behaviour a rotated value needs — so tests sharing one `SecretId`
+        // overwrite each other's scrub target. Every other test here shares
+        // `source()` harmlessly because none of them looks at the registry;
+        // this is the one that does, and a sibling issuing beside it would
+        // otherwise replace the value it is about to assert on.
+        let source = CredentialSource::GitHubInstallation {
+            installation_id: 90_001,
+        };
         let value = "ghs-Lm40Pq82Xt17Rd93";
-        let _lease = issue(
-            leases(),
-            LeaseAudience::https("api.github.com"),
-            now() + 600,
-            value,
+        let _lease = leases().issue(
+            LeaseTerms {
+                source: &source,
+                audience: LeaseAudience::https("api.github.com"),
+                expires_at: now() + 600,
+                purpose: "lease test",
+            },
+            value.to_string(),
         );
 
         let mut sanitizer = Sanitizer::exact();

@@ -443,7 +443,7 @@ fn render_project_issue_entries(
         };
         output.push_str(&format!(
             "- [{}-{}]({}) [{}] {}{}\n",
-            project_key.to_uppercase(),
+            cairn_common::uri::canonical_project(project_key),
             issue.number,
             build_issue_uri(project_key, issue.number),
             status_indicator,
@@ -474,7 +474,7 @@ fn render_recent_project_issue_entries(
         };
         output.push_str(&format!(
             "- [{}-{}]({}) [{}] {}\n",
-            project_key.to_uppercase(),
+            cairn_common::uri::canonical_project(project_key),
             number,
             build_issue_uri(project_key, *number),
             status_indicator,
@@ -571,8 +571,11 @@ pub(super) async fn read_project_images(
 
     let base = cairn_common::uri::build_project_images_uri(project_key, issue);
     let scope = match issue {
-        Some(number) => format!("{}-{number}", project_key.to_uppercase()),
-        None => project_key.to_uppercase(),
+        Some(number) => format!(
+            "{}/{number}",
+            cairn_common::uri::canonical_project(project_key)
+        ),
+        None => cairn_common::uri::canonical_project(project_key),
     };
     let mut body = format!("# Images — {scope}\n\n");
     if rows.is_empty() {
@@ -605,7 +608,7 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         Ok(conn) => conn,
         Err(error) => return error,
     };
-    let lookup_key = project_key.to_uppercase();
+    let lookup_key = cairn_common::uri::canonical_project(project_key);
     let mut project_rows = match conn
         .query(
             "
@@ -923,7 +926,7 @@ pub(super) async fn read_project_references(orch: &Orchestrator, project_key: &s
         Ok(conn) => conn,
         Err(error) => return error,
     };
-    let lookup = project_key.to_uppercase();
+    let lookup = cairn_common::uri::canonical_project(project_key);
     let mut rows = match conn
         .query(
             "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
@@ -974,7 +977,7 @@ pub(super) async fn read_project_reference(
         Ok(conn) => conn,
         Err(error) => return error,
     };
-    let lookup = project_key.to_uppercase();
+    let lookup = cairn_common::uri::canonical_project(project_key);
     let mut rows = match conn
         .query(
             "SELECT repo_path FROM projects WHERE key = ?1 LIMIT 1",
@@ -1011,7 +1014,7 @@ pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str
         Ok(conn) => conn,
         Err(error) => return error,
     };
-    let lookup = project_key.to_uppercase();
+    let lookup = cairn_common::uri::canonical_project(project_key);
     let mut rows = match conn
         .query(
             "SELECT id, repo_path, default_branch FROM projects WHERE key = ?1 LIMIT 1",
@@ -1201,7 +1204,7 @@ pub(super) async fn read_project_search(
                 {
                     Some(id) => Some(id),
                     None => {
-                        return format!("Issue {}-{} not found", project_ctx.project_key, number)
+                        return format!("Issue {}/{} not found", project_ctx.project_key, number)
                     }
                 }
             }

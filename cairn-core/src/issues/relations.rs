@@ -139,7 +139,7 @@ pub async fn list_issue_dependencies(
         let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
             continue;
         };
-        let project_key = project.to_uppercase();
+        let project_key = cairn_common::uri::canonical_project(project);
         match resolve_issue_uri(conn, &canonical).await? {
             Some(resolved) => dependencies.push(DependencyRef {
                 uri: resolved.uri,
@@ -170,7 +170,7 @@ pub(crate) async fn resolve_issue_uri(
     let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
         return Ok(None);
     };
-    let project_key = project.to_uppercase();
+    let project_key = cairn_common::uri::canonical_project(project);
     let mut rows = conn
         .query(
             "
@@ -206,7 +206,7 @@ pub(crate) async fn resolve_issue_uris(
         };
         requested.push(serde_json::json!({
             "uri": canonical,
-            "project_key": project.to_uppercase(),
+            "project_key": cairn_common::uri::canonical_project(project),
             "number": number,
         }));
     }
@@ -297,7 +297,7 @@ pub(crate) async fn issue_id_for_project_number(
     project_key: &str,
     number: i32,
 ) -> DbResult<Option<String>> {
-    let project_key = project_key.to_uppercase();
+    let project_key = cairn_common::uri::canonical_project(project_key);
     db.read(|conn| {
         let project_key = project_key.clone();
         Box::pin(async move {

@@ -122,7 +122,7 @@ pub(super) async fn dispatch(
             let content = payload_non_empty_str(payload, "content", &[])
                 .ok_or_else(|| build_failure(index, item, "payload.content is required"))?;
             if dry_run {
-                format!("Would edit comment {comment_seq} on issue {project}-{number}")
+                format!("Would edit comment {comment_seq} on issue {project}/{number}")
             } else {
                 // Route to the owning project's database (CAIRN-2132); a local
                 // project resolves to the private DB, a shared one to its replica.
@@ -133,7 +133,7 @@ pub(super) async fn dispatch(
                 crate::issues::comments::update(&db, &comment_id, content)
                     .await
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
-                format!("Edited comment {comment_seq} on issue {project}-{number}")
+                format!("Edited comment {comment_seq} on issue {project}/{number}")
             }
         }
         (
@@ -152,7 +152,7 @@ pub(super) async fn dispatch(
                 ));
             }
             if dry_run {
-                format!("Would delete comment {comment_seq} on issue {project}-{number}")
+                format!("Would delete comment {comment_seq} on issue {project}/{number}")
             } else {
                 let db = orch.db.for_project(project).await;
                 let comment_id =
@@ -161,7 +161,7 @@ pub(super) async fn dispatch(
                 crate::issues::comments::delete(&db, &comment_id)
                     .await
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
-                format!("Deleted comment {comment_seq} on issue {project}-{number}")
+                format!("Deleted comment {comment_seq} on issue {project}/{number}")
             }
         }
         (CairnResource::Issue { project, number }, ChangeMode::Patch) => {
@@ -263,10 +263,10 @@ pub(super) async fn dispatch(
                     Some(Some(uri)) => details.push(format!("parent={uri}")),
                 }
                 if details.is_empty() {
-                    format!("Would patch issue {project}-{number}")
+                    format!("Would patch issue {project}/{number}")
                 } else {
                     format!(
-                        "Would patch issue {project}-{number} ({})",
+                        "Would patch issue {project}/{number} ({})",
                         details.join(", ")
                     )
                 }
@@ -316,15 +316,15 @@ pub(super) async fn dispatch(
                     .await
                     .map_err(|error| build_failure(index, item, error.to_string()))?
                     .ok_or_else(|| {
-                        build_failure(index, item, format!("Issue {project}-{number} not found"))
+                        build_failure(index, item, format!("Issue {project}/{number} not found"))
                     })?;
             if dry_run {
-                format!("Would delete issue {project}-{number}")
+                format!("Would delete issue {project}/{number}")
             } else {
                 crate::issues::delete::delete_issue(orch, &issue_id)
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                format!("Deleted issue {project}-{number}")
+                format!("Deleted issue {project}/{number}")
             }
         }
         (CairnResource::Issue { project, number }, ChangeMode::Append) => {
@@ -333,7 +333,7 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "payload.content is required"))?;
             if dry_run {
                 format!(
-                    "Would append {} chars as a comment to issue {project}-{number}",
+                    "Would append {} chars as a comment to issue {project}/{number}",
                     content.len()
                 )
             } else {
@@ -397,7 +397,7 @@ async fn resolve_issue_comment_id(
     let issue_id = crate::issues::relations::issue_id_for_project_number(db, project, number)
         .await
         .map_err(|error| build_failure(index, item, error.to_string()))?
-        .ok_or_else(|| build_failure(index, item, format!("Issue {project}-{number} not found")))?;
+        .ok_or_else(|| build_failure(index, item, format!("Issue {project}/{number} not found")))?;
     crate::issues::comments::id_for_issue_seq(db, &issue_id, comment_seq as i64)
         .await
         .map_err(|error| build_failure(index, item, error.to_string()))?
@@ -405,7 +405,7 @@ async fn resolve_issue_comment_id(
             build_failure(
                 index,
                 item,
-                format!("Comment {comment_seq} not found on issue {project}-{number}"),
+                format!("Comment {comment_seq} not found on issue {project}/{number}"),
             )
         })
 }

@@ -236,7 +236,10 @@ pub(crate) async fn session_job_id_by_name_conn(
                  WHERE p.key = ?1 AND t.name = ?2 AND {SESSION_JOB_SHAPE}
                  ORDER BY j.created_at DESC, j.rowid DESC LIMIT 1"
             ),
-            cairn_db::turso::params![project_key.to_uppercase(), thread_name],
+            cairn_db::turso::params![
+                cairn_common::uri::canonical_project(project_key),
+                thread_name
+            ],
         )
         .await?;
     rows.next()
@@ -299,7 +302,11 @@ pub(crate) async fn task_job_id_by_name_conn(
                    AND {SESSION_JOB_SHAPE}
                  ORDER BY child.created_at DESC, child.rowid DESC LIMIT 1"
             ),
-            cairn_db::turso::params![project_key.to_uppercase(), thread_name, task_segment],
+            cairn_db::turso::params![
+                cairn_common::uri::canonical_project(project_key),
+                thread_name,
+                task_segment
+            ],
         )
         .await?;
     rows.next()

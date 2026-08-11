@@ -145,10 +145,10 @@ pub(super) async fn read_node_messages(
         Ok(messages) => {
             let label = match task_name {
                 Some(task) => format!(
-                    "{}-{}/{}/{}/task/{}",
+                    "{}/{}/{}/{}/task/{}",
                     project_key, number, exec_seq, node_name, task
                 ),
-                None => format!("{}-{}/{}/{}", project_key, number, exec_seq, node_name),
+                None => format!("{}/{}/{}/{}", project_key, number, exec_seq, node_name),
             };
             let mut out = format!("# Messages \u{2014} {}\n\n", label);
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
@@ -183,7 +183,7 @@ pub(super) async fn read_issue_messages(
         limit,
     ) {
         Ok(messages) => {
-            let mut out = format!("# Messages — {}-{}\n\n", project_key, number);
+            let mut out = format!("# Messages — {}/{}\n\n", project_key, number);
             out.push_str(&format!("{} message(s)\n\n", messages.len()));
             out.push_str(&format_messages(&messages));
             out

@@ -51,9 +51,8 @@ pub(super) async fn dispatch(
 }
 
 /// Report the same facts twice: the prose an agent reads, and the structured
-/// result a UI renderer can act on. Conflicts and kept items are the whole
-/// reason the structured form exists — flattened into a sentence they can only
-/// be re-parsed.
+/// result a UI renderer can act on. Changed and kept items are distinct facts;
+/// flattened into a sentence they can only be re-parsed.
 fn record(result: PackMutationResult, applied_data: &mut Option<serde_json::Value>) -> String {
     let summary = result.summary.clone();
     *applied_data = serde_json::to_value(result).ok();

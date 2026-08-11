@@ -55,7 +55,7 @@ pub(crate) async fn project_path_by_key(
     orch: &Orchestrator,
     project_key: &str,
 ) -> Result<PathBuf, String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let lookup_key = key.clone();
     let id = orch
         .db
@@ -196,7 +196,11 @@ pub(crate) async fn read_skills_collection(
                 let id = super::run_context::project_id_by_key(&orch.db.local, project)
                     .await
                     .ok();
-                (id, Some(project.to_uppercase()), Some(base))
+                (
+                    id,
+                    Some(cairn_common::uri::canonical_project(project)),
+                    Some(base),
+                )
             }
             Err(e) => return e,
         }
@@ -317,7 +321,7 @@ pub(crate) async fn read_skill(
                 Some(project) => {
                     format!(
                         "Skill not found in project {}: {skill_id}",
-                        project.to_uppercase()
+                        cairn_common::uri::canonical_project(project)
                     )
                 }
                 None => format!("Skill not found: {skill_id}"),
@@ -336,14 +340,14 @@ pub(crate) async fn read_skill(
         return match explicit_project {
             Some(project) => format!(
                 "Skill not found in project {}: {skill_id}",
-                project.to_uppercase()
+                cairn_common::uri::canonical_project(project)
             ),
             None => format!("Skill not found: {skill_id}"),
         };
     }
 
     let scope = match explicit_project {
-        Some(project) => SkillScopeUri::Project(project.to_uppercase()),
+        Some(project) => SkillScopeUri::Project(cairn_common::uri::canonical_project(project)),
         None => SkillScopeUri::Contextual,
     };
 

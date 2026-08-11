@@ -361,7 +361,7 @@ async fn build_trigger_context_conn(
                         {
                             issues.push(serde_json::json!({
                                 "id": id,
-                                "key": format!("{}-{}", project_key, number),
+                                "key": format!("{}/{}", project_key, number),
                                 "title": title,
                                 "description": description,
                             }));

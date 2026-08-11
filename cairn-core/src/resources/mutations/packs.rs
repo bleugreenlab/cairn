@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::pack::{self, PackItem, PackItemKind};
+use crate::config::pack::{self, ContentHash, PackItem, PackItemKind};
 use crate::orchestrator::Orchestrator;
 use crate::services::{RealFileSystem, RealGitClient};
 use crate::workspace::bundle::{sync_one_pack, uninstall_pack};
@@ -24,14 +24,11 @@ use crate::workspace::bundle::{sync_one_pack, uninstall_pack};
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PackMutationResult {
-    /// `install`, `update`, `restore`, `uninstall`, or `remove-item`.
+    /// `install`, `update`, `restore`, `uninstall`, `remove-item`, or `reset-item`.
     pub action: String,
     pub pack_id: String,
     /// Workspace-relative paths a sync wrote or retired.
     pub changed_paths: Vec<String>,
-    /// Paths an update refused to overwrite because the user had made them
-    /// theirs.
-    pub skipped_conflicts: Vec<String>,
     /// Paths an uninstall deleted.
     pub removed_paths: Vec<String>,
     /// Paths an uninstall left in place because the user had edited them.
@@ -42,6 +39,108 @@ pub struct PackMutationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed_item: Option<PackItem>,
     pub summary: String,
+}
+
+/// Replace one live local copy with the pack's currently shipped item.
+///
+/// Reset is deliberately distinct from restoring a removed item: it requires a
+/// live fork, and it is the only operation that may remove a workspace MCP
+/// shadow in favor of the pack definition.
+pub fn reset_pack_item(
+    orch: &Orchestrator,
+    pack_id: &str,
+    kind: PackItemKind,
+    item_id: &str,
+) -> Result<PackMutationResult, String> {
+    let resource_dir = source_dir(orch)?;
+    let manifest = pack::available_pack(&resource_dir, pack_id)
+        .ok_or_else(|| format!("No pack `{pack_id}` is shipped in {resource_dir:?}"))?;
+    if !manifest
+        .items()
+        .iter()
+        .any(|item| item.kind == kind && item.id == item_id)
+    {
+        return Err(format!(
+            "Pack `{pack_id}` does not currently ship {} `{item_id}`",
+            kind.as_str()
+        ));
+    }
+
+    let mut lock = pack::lock::read_lock(&orch.config_dir, pack_id)
+        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
+    let item = lock.item(kind, item_id).cloned().ok_or_else(|| {
+        format!(
+            "Pack `{pack_id}` does not carry {} `{item_id}`",
+            kind.as_str()
+        )
+    })?;
+    if !item.forked {
+        return Err(format!(
+            "{} `{item_id}` is already using pack `{pack_id}`'s version",
+            kind.as_str()
+        ));
+    }
+
+    let baseline = match kind {
+        PackItemKind::Mcp => {
+            let definitions =
+                pack::mcp::parse_pack_mcp_file(&pack::lock::mcp_path(&orch.config_dir, pack_id))?;
+            let definition = definitions.get(item_id).ok_or_else(|| {
+                format!("Installed pack `{pack_id}` has no MCP definition `{item_id}`")
+            })?;
+            pack::hash_mcp_definition(definition)?
+        }
+        _ => {
+            let path = item
+                .path
+                .as_deref()
+                .ok_or_else(|| format!("{} `{item_id}` has no materialized path", kind.as_str()))?;
+            match pack::hash_item_path(kind, &orch.config_dir.join(path))? {
+                ContentHash::Present(hash) => hash,
+                ContentHash::Missing => {
+                    return Err(format!(
+                        "{} `{item_id}` is missing; restore it instead",
+                        kind.as_str()
+                    ))
+                }
+            }
+        }
+    };
+
+    let previous_lock = lock.clone();
+    lock.reset_item_baseline(kind, item_id, baseline);
+    pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &lock)?;
+    if kind == PackItemKind::Mcp {
+        if let Err(error) =
+            crate::config::mcp_servers::delete_workspace_mcp_server(&orch.config_dir, item_id)
+        {
+            let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &previous_lock);
+            return Err(error);
+        }
+    }
+
+    let result = sync_one_pack(
+        &RealGitClient,
+        &RealFileSystem,
+        &resource_dir,
+        &orch.config_dir,
+        pack_id,
+    )
+    .inspect_err(|_| {
+        let _ = pack::lock::rewrite_lock(&RealFileSystem, &orch.config_dir, &previous_lock);
+    })?;
+
+    orch.emit_pack_registry_change();
+    Ok(PackMutationResult {
+        action: "reset-item".to_string(),
+        pack_id: pack_id.to_string(),
+        changed_paths: result.changed_paths,
+        summary: format!(
+            "Reset {} `{item_id}` to pack '{pack_id}'s version",
+            kind.as_str()
+        ),
+        ..Default::default()
+    })
 }
 
 /// The app resource directory this workspace syncs from, recorded by the last
@@ -131,7 +230,7 @@ pub fn apply_pack_action(
         }
     };
 
-    let mut summary = match action {
+    let summary = match action {
         "install" => format!("Installed pack '{pack_id}'"),
         "restore" => format!(
             "Restored {} removed item(s) to pack '{pack_id}'",
@@ -139,19 +238,11 @@ pub fn apply_pack_action(
         ),
         _ => format!("Updated pack '{pack_id}'"),
     };
-    if !result.skipped_conflicts.is_empty() {
-        summary.push_str(&format!(
-            " — kept your edits to {} (not overwritten)",
-            result.skipped_conflicts.join(", ")
-        ));
-    }
-
     orch.emit_pack_registry_change();
     Ok(PackMutationResult {
         action: action.to_string(),
         pack_id: pack_id.to_string(),
         changed_paths: result.changed_paths,
-        skipped_conflicts: result.skipped_conflicts,
         restored_items,
         summary,
         ..Default::default()
@@ -282,8 +373,18 @@ pub(super) fn dispatch_pack_action(
     pack_id: &str,
 ) -> Result<PackMutationResult, String> {
     let action = super::payload_trimmed_non_empty_str(payload, "action", &[])
-        .ok_or("payload.action is required (install | update | restore)")?;
-    apply_pack_action(orch, action, pack_id)
+        .ok_or("payload.action is required (install | update | restore | reset-item)")?;
+    if action == "reset-item" {
+        let kind = super::payload_trimmed_non_empty_str(payload, "kind", &[])
+            .ok_or("payload.kind is required for reset-item")?;
+        let item_id = super::payload_trimmed_non_empty_str(payload, "itemId", &[])
+            .ok_or("payload.itemId is required for reset-item")?;
+        let kind =
+            PackItemKind::parse(kind).ok_or_else(|| format!("Unknown pack item kind `{kind}`"))?;
+        reset_pack_item(orch, pack_id, kind, item_id)
+    } else {
+        apply_pack_action(orch, action, pack_id)
+    }
 }
 
 #[cfg(test)]
@@ -292,7 +393,7 @@ mod tests {
     use crate::db::DbState;
     use crate::resources::packs::{pack_catalog, PackItemState, PackState};
     use crate::services::testing::TestServicesBuilder;
-    use crate::services::{EventEmitter, GitClient};
+    use crate::services::EventEmitter;
     use crate::storage::SearchIndex;
     use crate::workspace::bundle::sync_workspace_packs;
     use std::path::{Path, PathBuf};
@@ -485,7 +586,8 @@ mod tests {
         for (pack_id, kind, id, _) in cases {
             assert_eq!(
                 item_state(&ws, pack_id, kind.as_str(), id),
-                Some(PackItemState::PackOwned)
+                Some(PackItemState::PackOwned),
+                "restored {kind:?} `{id}` in pack `{pack_id}` must return to pack ownership"
             );
         }
     }
@@ -494,16 +596,9 @@ mod tests {
     /// prose those names can only be re-parsed; the settings screen reports them
     /// from the structured field.
     #[tokio::test]
-    async fn an_update_reports_the_edits_it_kept_and_the_catalog_marks_them() {
+    async fn an_update_preserves_a_local_copy_and_the_catalog_marks_it() {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "mine now\n");
-        RealGitClient.add_all(&ws.home).unwrap();
-        RealGitClient.commit(&ws.home, "My agent tweak").unwrap();
-
-        assert_eq!(
-            item_state(&ws, "core", "agent", "explore"),
-            Some(PackItemState::EditedByUser)
-        );
 
         write(
             &source_pack(&ws.resources, "core").join("agents/explore.md"),
@@ -511,9 +606,10 @@ mod tests {
         );
         let result = apply_pack_action(&ws.orch, "update", "core").unwrap();
 
+        assert_eq!(result.action, "update");
         assert_eq!(
-            result.skipped_conflicts,
-            vec!["agents/explore.md".to_string()]
+            item_state(&ws, "core", "agent", "explore"),
+            Some(PackItemState::EditedByUser)
         );
         assert_eq!(
             std::fs::read_to_string(ws.home.join("agents/explore.md")).unwrap(),
@@ -528,8 +624,6 @@ mod tests {
     async fn an_uninstall_separates_what_it_removed_from_what_it_kept() {
         let ws = workspace().await;
         write(&ws.home.join("agents/explore.md"), "mine now\n");
-        RealGitClient.add_all(&ws.home).unwrap();
-        RealGitClient.commit(&ws.home, "My agent tweak").unwrap();
 
         let result = apply_pack_delete(&ws.orch, "core").unwrap();
         assert_eq!(result.action, "uninstall");

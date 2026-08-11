@@ -16,6 +16,8 @@ pub struct FileRoute {
 
 const FOLLOWED_ID: &str = "followed-thread-stream";
 const FOLLOWED: &str = include_str!("../../../../routes/followed-thread-stream.yaml");
+const GITHUB_MENTION_ID: &str = "github-mention";
+const GITHUB_MENTION: &str = include_str!("../../../../routes/github-mention.yaml");
 
 pub fn list_routes(
     config_dir: &Path,
@@ -59,6 +61,14 @@ fn list_route_dirs(
                 results.push(load(&path, id, project, &registry));
             }
         }
+    }
+    if include_bundled && seen.insert(GITHUB_MENTION_ID.into()) {
+        results.push(ConfigResult::Ok(FileRoute {
+            id: GITHUB_MENTION_ID.into(),
+            definition: parse_definition(GITHUB_MENTION, &registry)?,
+            is_project_scoped: false,
+            file_path: None,
+        }));
     }
     if include_bundled && seen.insert(FOLLOWED_ID.into()) {
         results.push(ConfigResult::Ok(FileRoute {
@@ -137,8 +147,12 @@ mod tests {
         )
         .unwrap();
         let routes = list_routes(temp.path(), Some(&project)).unwrap();
-        assert_eq!(routes.len(), 1);
-        let ConfigResult::Ok(route) = &routes[0] else {
+        assert_eq!(routes.len(), 2);
+        let ConfigResult::Ok(route) = routes
+            .iter()
+            .find(|route| matches!(route, ConfigResult::Ok(route) if route.id == FOLLOWED_ID))
+            .expect("followed route")
+        else {
             panic!("valid route")
         };
         assert!(route.is_project_scoped);

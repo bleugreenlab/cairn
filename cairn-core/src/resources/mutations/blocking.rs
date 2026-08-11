@@ -217,9 +217,10 @@ async fn run_tasks_group(
     }
 
     // Resolve the caller's node job and each append's addressed node job, then
-    // decide routing. The CLI rewrites `cairn:~/tasks` to the caller's full node
-    // URI before dispatch, so every item arrives as an explicit `NodeTasks` URI —
-    // including self-targeted ones, which resolve back to `caller_job_id`.
+    // decide routing. The write handler resolves `cairn:~/tasks` from the
+    // authenticated run before blocking classification, so every item arrives as
+    // an explicit tasks URI, including self-targeted ones that resolve back to
+    // `caller_job_id`.
     // A team run's job/run rows live in its replica (CAIRN-2182): resolve the
     // caller's owning DB by run id so `lookup_caller_job_id` and the target-node
     // lookups read the database the rows actually live in.
@@ -942,6 +943,24 @@ mod blocking_group_tests {
             .await
             .unwrap_err();
         assert!(err.contains("not found"), "unexpected error: {err}");
+
+        // A thread session remains the caller after its mutable name changes. The
+        // write handler resolves `cairn:~/tasks` to this new canonical address;
+        // routing must then resolve that address back to the existing session job.
+        for sql in [
+            "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at) VALUES ('thread-1', 'proj-1', 'channels-old', 'active', 'none', 1, 1)",
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment) VALUES ('job-thread', 'thread-1', 'proj-1', 'thread', 'thread', 'running', 1, 1, 'thread')",
+            "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at) VALUES ('run-thread', 'proj-1', 'job-thread', 'live', 1, 1)",
+            "UPDATE threads SET name='channels' WHERE id='thread-1'",
+        ] {
+            exec(&db, sql).await;
+        }
+        let renamed = node_tasks_coords("cairn://p/MCP/channels/tasks").unwrap();
+        let renamed_route = resolve_task_routing(&db, "run-thread", &[renamed])
+            .await
+            .unwrap();
+        assert_eq!(renamed_route.target_job_ids, vec!["job-thread".to_string()]);
+        assert_eq!(renamed_route.route, TaskRoute::SelfNode);
     }
 
     #[test]

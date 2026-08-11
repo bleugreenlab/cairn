@@ -10,6 +10,7 @@ pub mod attention;
 pub mod attention_delivery;
 pub mod attention_push;
 pub mod base_advance;
+pub mod build_change;
 pub mod build_services;
 pub mod config_resource;
 pub mod conflict_session;
@@ -1987,7 +1988,7 @@ impl Orchestrator {
         provider: std::sync::Arc<dyn crate::channels::ChannelProvider>,
         config: crate::models::IMessageChannelConfig,
     ) {
-        crate::channels::router::spawn(self.clone(), provider, config);
+        crate::channels::router::spawn(self.clone(), provider, "imessage", config.to, config.route);
     }
 
     /// Re-dispatch workflow runs that were in flight when the process died
@@ -2026,6 +2027,12 @@ impl Orchestrator {
     /// always-on hosts (runner, non-inert server).
     pub async fn fail_orphaned_calls_on_startup(&self) {
         crate::execution::jobs::fail_orphaned_calls_on_startup(self).await;
+    }
+
+    /// Terminalize turn-end check attempts whose ephemeral runtime ownership was
+    /// lost with the previous host process.
+    pub async fn reconcile_turn_end_check_attempts_on_startup(&self) {
+        crate::execution::checks_turn_end::reconcile_turn_end_attempts_on_startup(self).await;
     }
 
     /// Spawn the memory-triage reconciliation sweep: once immediately at

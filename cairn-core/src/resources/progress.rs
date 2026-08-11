@@ -78,7 +78,7 @@ pub(super) async fn read_node_progress(
         _ => &filtered,
     };
 
-    let label = format!("{}-{}/{}/{}", project_key, number, exec_seq, node_name);
+    let label = format!("{}/{}/{}/{}", project_key, number, exec_seq, node_name);
     let mut out = format!(
         "# Workflow progress \u{2014} {}\n\n{} entr{}\n\n",
         label,

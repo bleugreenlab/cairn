@@ -401,14 +401,6 @@ pub fn ensure_config_dirs(config_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Managed subtrees the destructive "restore bundled defaults" command wipes and
-/// re-materializes ([`mirror_bundle_resources_with`]). A strict subset of
-/// [`pack::CONTENT_DIRS`]: `workflows` is excluded because a workflow package is
-/// user-authorable and copy-when-missing everywhere else, so a wholesale reset
-/// must not delete `<CAIRN_HOME>/workflows`. A deleted built-in workflow is
-/// re-seeded non-destructively by the next startup sync instead.
-const MIRROR_RESET_DIRS: [&str; 4] = ["agents", "recipes", "responses", "skills"];
-
 /// Reset agents, recipes, responses, and skills in `config_dir` to the shipped
 /// defaults of the packs that workspace has INSTALLED.
 ///
@@ -454,7 +446,7 @@ fn restorable_packs(resource_dir: &Path, config_dir: &Path) -> Vec<pack::PackMan
 }
 
 fn mirror_bundle_resources_with(
-    git: &dyn crate::services::GitClient,
+    _git: &dyn crate::services::GitClient,
     fs: &dyn crate::services::FileSystem,
     resource_dir: &Path,
     config_dir: &Path,
@@ -462,36 +454,13 @@ fn mirror_bundle_resources_with(
     fs.create_dir_all(config_dir)?;
     let packs = restorable_packs(resource_dir, config_dir);
 
-    // Wipe first: overwriting the user's edited copies with the shipped ones is
-    // the whole point of a restore, and the install path below is deliberately
-    // copy-when-missing. Packs share the flat destination, so this happens once
-    // rather than per pack, which would erase the pack before it.
-    for dir_name in MIRROR_RESET_DIRS {
-        let dest = config_dir.join(dir_name);
-        if fs.exists(&dest) {
-            fs.remove_dir_all(&dest)?;
-        }
-        fs.create_dir_all(&dest)?;
-    }
-
-    // Re-materialize through the ordinary install, not a raw copy. That is what
-    // keeps this button and `patch cairn://packs/<id> {action:"install"}` one
-    // mechanism: each pack's lock is rewritten, its files land committed under
-    // its own subject (so they stay pack-owned and updatable), and any uninstall
-    // marker is cleared. A raw mirror left those files untracked and claimed by
-    // no pack — frozen against every future update.
     for manifest in &packs {
-        // Within its scope, a restore overrides every user decision uniformly:
-        // an edited file (the wipe above), an uninstalled default pack (the
-        // marker `sync_one_pack` clears), and an item removed from a pack. An
-        // exception for the third would have no rule behind it, and undoing an
-        // item removal has no other route a user can reach without driving
-        // Cairn through an agent. Re-removing one item is a click; discovering
-        // an agent-only resource mutation is not.
-        if pack::lock::read_lock(config_dir, &manifest.id).is_some() {
-            pack::lock::restore_removed_items(fs, config_dir, &manifest.id)?;
-        }
-        crate::workspace::bundle::sync_one_pack(git, fs, resource_dir, config_dir, &manifest.id)?;
+        crate::workspace::bundle::restore_one_bundled_pack(
+            fs,
+            resource_dir,
+            config_dir,
+            &manifest.id,
+        )?;
     }
     Ok(())
 }
@@ -761,13 +730,10 @@ pub async fn get_recipe_as_snapshot(
 mod tests {
     use super::*;
 
-    /// The destructive "restore bundled defaults" reset
-    /// ([`mirror_bundle_resources_with`]) resets agents/recipes/skills to the
-    /// bundle but must NEVER touch `<CAIRN_HOME>/workflows` — a user's authored or
-    /// edited workflow package survives a restore. Guards the decoupling of the
-    /// provisioning set from the destructive reset set.
+    /// Total restore replaces shipped workflow packages while preserving
+    /// unrelated user-authored packages.
     #[test]
-    fn restore_mirror_preserves_user_workflows() {
+    fn restore_mirror_replaces_shipped_workflows_only() {
         use crate::services::{RealFileSystem, RealGitClient};
         use tempfile::TempDir;
 
@@ -809,13 +775,14 @@ mod tests {
             std::fs::read_to_string(home.join("agents/explore.md")).unwrap(),
             "bundle\n"
         );
-        // …but every workflow package is untouched: the user-authored one still
-        // exists and the edited fan-out copy is not clobbered.
+        // The unrelated user-authored package remains, while the shipped package
+        // is deliberately reset as part of the confirmed total restore.
         assert!(home.join("workflows/my-flow/workflow.yaml").exists());
         assert_eq!(
-            std::fs::read_to_string(home.join("workflows/fan-out/main.ts")).unwrap(),
-            "// user edit\n"
+            std::fs::read_to_string(home.join("workflows/fan-out/workflow.yaml")).unwrap(),
+            "name: Fan Out\ndescription: d\n"
         );
+        assert!(!home.join("workflows/fan-out/main.ts").exists());
 
         assert_eq!(
             bundled_resource_ids(&resource_dir, &home, "agents").unwrap(),
@@ -831,7 +798,7 @@ mod tests {
     /// claimed by no pack, tracked by nothing, and skipped by every later sync.
     #[test]
     fn restore_after_uninstalling_everything_reinstalls_coherently() {
-        use crate::services::{GitClient, RealFileSystem, RealGitClient};
+        use crate::services::{RealFileSystem, RealGitClient};
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
@@ -872,13 +839,10 @@ mod tests {
         assert!(pack::lock::read_lock(&home, "core").is_some());
         assert!(home.join("agents/explore.md").exists());
 
-        // The restored file is tracked and pack-owned, so a later shipped change
-        // still reaches it.
-        let tracked = git.run(&home, vec!["ls-files".into()]).unwrap();
-        assert!(tracked
-            .stdout
-            .lines()
-            .any(|line| line == "agents/explore.md"));
+        let lock = pack::lock::read_lock(&home, "core").unwrap();
+        assert!(lock
+            .item(pack::PackItemKind::Agent, "explore")
+            .is_some_and(|item| item.content_hash.is_some() && !item.forked));
     }
 
     /// A restore overrides every user decision within its scope, uniformly. An
@@ -887,7 +851,7 @@ mod tests {
     /// it afterwards is a single click.
     #[test]
     fn restore_undoes_an_item_removal_too() {
-        use crate::services::{GitClient, RealFileSystem, RealGitClient};
+        use crate::services::{RealFileSystem, RealGitClient};
         use tempfile::TempDir;
 
         let temp = TempDir::new().unwrap();
@@ -913,14 +877,6 @@ mod tests {
         assert!(pack::lock::read_lock(&home, "core")
             .unwrap()
             .is_removed(pack::PackItemKind::Agent, "plan"));
-        // One user action, one commit: the record and the deletion it describes
-        // land together, so neither can be reverted without the other.
-        assert_eq!(
-            git.status(&home).unwrap().trim(),
-            "",
-            "a removal must leave no uncommitted state behind"
-        );
-
         mirror_bundle_resources_with(&git, &fs, &resource_dir, &home).unwrap();
 
         assert!(home.join("agents/plan.md").exists());
@@ -934,15 +890,6 @@ mod tests {
         crate::workspace::bundle::sync_workspace_packs(&git, &fs, &resource_dir, &home, "1.0.0")
             .unwrap();
         assert!(home.join("agents/plan.md").exists());
-
-        // The record and its undo are both durable. An uncommitted lock would be
-        // reverted by an ordinary `git checkout`, leaving the record and the tree
-        // disagreeing about what is installed.
-        assert_eq!(
-            git.status(&home).unwrap().trim(),
-            "",
-            "a restore must leave no uncommitted pack state behind"
-        );
     }
 
     #[test]

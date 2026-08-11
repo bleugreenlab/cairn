@@ -21,12 +21,11 @@ use crate::{
         permission::{resolve_permission_request, PermissionDecision, PermissionScope},
         planning::answer_prompt_id,
     },
-    models::IMessageChannelConfig,
+    models::ChannelRouteConfig,
     orchestrator::Orchestrator,
     storage::{LocalDb, RowExt},
 };
 
-const CHANNEL: &str = "imessage";
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 const BACKLOG_SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// One sweep DELIVERS at most this many gates, so a burst of new asks cannot
@@ -356,7 +355,7 @@ async fn cleanup_claimed_question(
 }
 
 fn review_notice(project: &str, number: i32, title: &str, content_ref: &str) -> String {
-    format!("{project}-{number} review ready — {title}\n{content_ref}")
+    format!("{project}/{number} review ready — {title}\n{content_ref}")
 }
 
 impl Gate {
@@ -451,24 +450,39 @@ struct Gate {
 pub struct ChannelRouter {
     orch: Orchestrator,
     provider: Arc<dyn ChannelProvider>,
-    config: IMessageChannelConfig,
+    provider_id: &'static str,
+    destination: String,
+    route: ChannelRouteConfig,
     claims: ClaimSet,
     deferred_attention: Mutex<HashMap<String, DeferredAttention>>,
 }
 
 impl ChannelRouter {
-    pub fn new(
+    pub fn new_for_provider(
         orch: Orchestrator,
         provider: Arc<dyn ChannelProvider>,
-        config: IMessageChannelConfig,
+        provider_id: &'static str,
+        destination: String,
+        route: ChannelRouteConfig,
     ) -> Self {
         Self {
             orch,
             provider,
-            config,
+            provider_id,
+            destination,
+            route,
             claims: ClaimSet::default(),
             deferred_attention: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(
+        orch: Orchestrator,
+        provider: Arc<dyn ChannelProvider>,
+        config: crate::models::IMessageChannelConfig,
+    ) -> Self {
+        Self::new_for_provider(orch, provider, "imessage", config.to, config.route)
     }
 
     async fn submit_gate(
@@ -506,7 +520,7 @@ impl ChannelRouter {
     ) -> Result<(), String> {
         let binding_ref = submission.binding_ref.clone();
         self.submit_gate(submission.clone(), presence, now).await?;
-        let intent = ledger::get_by_binding(self.ledger(), CHANNEL, "route", &binding_ref)
+        let intent = ledger::get_by_binding(self.ledger(), self.provider_id, "route", &binding_ref)
             .await?
             .ok_or("channel router did not accept the route intent")?;
         match intent.status.as_str() {
@@ -542,7 +556,7 @@ impl ChannelRouter {
         presence: OperatorPresence,
         now: Instant,
     ) -> Result<(), String> {
-        for record in ledger::list_unresolved(self.ledger(), CHANNEL).await? {
+        for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
             if record.kind != "route" || record.status != "pending" {
                 continue;
             }
@@ -585,10 +599,14 @@ impl ChannelRouter {
                     },
                 );
             self.deliver_or_defer(gate, presence, now).await?;
-            let updated =
-                ledger::get_by_binding(self.ledger(), CHANNEL, "route", &submission.binding_ref)
-                    .await?
-                    .ok_or("recovered route intent disappeared")?;
+            let updated = ledger::get_by_binding(
+                self.ledger(),
+                self.provider_id,
+                "route",
+                &submission.binding_ref,
+            )
+            .await?
+            .ok_or("recovered route intent disappeared")?;
             match updated.status.as_str() {
                 "pending" => {}
                 "sent" => {
@@ -656,7 +674,7 @@ impl ChannelRouter {
             fenced += result.0;
             expired_dangling += result.1;
         }
-        for follow in ledger::list_follows(self.ledger(), CHANNEL).await? {
+        for follow in ledger::list_follows(self.ledger(), self.provider_id).await? {
             // A URI that cannot PARSE is permanently unusable: skip it, with a
             // note, rather than parking the whole channel behind one dangling
             // follow forever. Everything past this point is a database error,
@@ -673,15 +691,26 @@ impl ChannelRouter {
             // for one conversation the moment the poll offers the canonical form.
             // Startup is where that is settled, once, before anything reads it.
             if parsed != target {
-                ledger::canonicalize_follow(self.ledger(), CHANNEL, &follow.uri, &target.uri())
-                    .await?;
+                ledger::canonicalize_follow(
+                    self.ledger(),
+                    self.provider_id,
+                    &follow.uri,
+                    &target.uri(),
+                )
+                .await?;
             }
             let live_edge = self.live_edge(&target).await?;
-            ledger::advance_follow_cursor(self.ledger(), CHANNEL, &target.uri(), live_edge).await?;
+            ledger::advance_follow_cursor(
+                self.ledger(),
+                self.provider_id,
+                &target.uri(),
+                live_edge,
+            )
+            .await?;
         }
         let expired = ledger::expire_undelivered(
             self.ledger(),
-            CHANNEL,
+            self.provider_id,
             chrono::Utc::now().timestamp_millis(),
         )
         .await?;
@@ -704,7 +733,7 @@ impl ChannelRouter {
             .bindings
             .get(selected_label)
             .ok_or_else(|| format!("unknown follow poll option: {selected_label}"))?;
-        if ledger::is_target_followed(self.ledger(), CHANNEL, uri).await? {
+        if ledger::is_target_followed(self.ledger(), self.provider_id, uri).await? {
             self.unfollow(uri).await
         } else {
             self.follow(uri).await
@@ -721,13 +750,13 @@ impl ChannelRouter {
         let target = self.resolve_target(uri).await?;
         let canonical = target.uri();
         let live_edge = self.live_edge(&target).await?;
-        ledger::follow_target(self.ledger(), CHANNEL, &canonical, now, live_edge).await?;
-        ledger::set_focus(self.ledger(), CHANNEL, &canonical, now).await
+        ledger::follow_target(self.ledger(), self.provider_id, &canonical, now, live_edge).await?;
+        ledger::set_focus(self.ledger(), self.provider_id, &canonical, now).await
     }
 
     async fn unfollow(&self, uri: &str) -> Result<(), String> {
-        ledger::unfollow_target(self.ledger(), CHANNEL, uri).await?;
-        for update in ledger::list_unresolved(self.ledger(), CHANNEL).await? {
+        ledger::unfollow_target(self.ledger(), self.provider_id, uri).await?;
+        for update in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
             if update.kind == "review"
                 && update.binding_ref.starts_with(&format!("{uri}:event:"))
                 && ledger::claim_outbound_cleanup(
@@ -747,7 +776,7 @@ impl ChannelRouter {
         // Unlike an answered one-shot question, a follow poll is a standing
         // control surface. Its GUID binding remains live for the lifetime of the
         // durable ledger row, including after newer polls are issued.
-        let followed = ledger::list_follows(self.ledger(), CHANNEL)
+        let followed = ledger::list_follows(self.ledger(), self.provider_id)
             .await?
             .into_iter()
             .map(|follow| follow.uri)
@@ -793,14 +822,22 @@ impl ChannelRouter {
                     .collect(),
             },
         };
-        let Some(id) = claim_gate(&self.claims, self.ledger(), conversation, "poll", &gate).await?
+        let Some(id) = claim_gate_for_provider(
+            &self.claims,
+            self.ledger(),
+            self.provider_id,
+            conversation,
+            "poll",
+            &gate,
+        )
+        .await?
         else {
             return Ok(());
         };
         let delivered = self.send_claimed(id.clone(), gate).await?;
         require_command_delivery(
             delivered,
-            ledger::get_by_binding(self.ledger(), CHANNEL, "question", &binding_ref)
+            ledger::get_by_binding(self.ledger(), self.provider_id, "question", &binding_ref)
                 .await?
                 .and_then(|record| record.last_error),
         )?;
@@ -922,14 +959,14 @@ impl ChannelRouter {
                         "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 AND {}",
                         crate::threads::SESSION_JOB_SHAPE
                     ),
-                    params![project.to_uppercase(), name.clone()],
+                    params![cairn_common::uri::canonical_project(project), name.clone()],
                 )
                 .await
             }
             FollowTarget::Issue { project, number } => {
                 db.query_opt_i64(
                     "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE p.key = ?1 AND i.number = ?2",
-                    params![project.to_uppercase(), *number],
+                    params![cairn_common::uri::canonical_project(project), *number],
                 )
                 .await
             }
@@ -953,7 +990,7 @@ impl ChannelRouter {
                         "SELECT e.rowid, e.data, p.key, t.name, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 AND {} AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
                         crate::threads::SESSION_JOB_SHAPE
                     ),
-                    params![project.to_uppercase(), name.clone(), cursor],
+                    params![cairn_common::uri::canonical_project(project), name.clone(), cursor],
                     |row| {
                         Ok(FollowedEvent {
                             rowid: row.i64(0)?,
@@ -972,12 +1009,12 @@ impl ChannelRouter {
             FollowTarget::Issue { project, number } => db
                 .query_all(
                     "SELECT e.rowid, e.data, p.key, i.number, i.title, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE p.key = ?1 AND i.number = ?2 AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
-                    params![project.to_uppercase(), *number, cursor],
+                    params![cairn_common::uri::canonical_project(project), *number, cursor],
                     |row| {
                         Ok(FollowedEvent {
                             rowid: row.i64(0)?,
                             data: row.text(1)?,
-                            context: format!("{}-{} {}", row.text(2)?, row.i64(3)?, row.text(4)?),
+                            context: format!("{}/{} {}", row.text(2)?.to_lowercase(), row.i64(3)?, row.text(4)?),
                             job_id: row.text(5)?,
                             project_id: row.text(6)?,
                             repo_path: row.text(7)?,
@@ -1000,7 +1037,7 @@ impl ChannelRouter {
                 let thread_id = db
                     .query_opt(
                         "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2",
-                        params![project.to_uppercase(), name.clone()],
+                        params![cairn_common::uri::canonical_project(project), name.clone()],
                         |row| row.text(0),
                     )
                     .await
@@ -1015,7 +1052,7 @@ impl ChannelRouter {
             FollowTarget::Issue { project, number } => {
                 let job_id = db.query_opt(
                     "SELECT j.id FROM jobs j JOIN runs r ON r.job_id = j.id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE p.key = ?1 AND i.number = ?2 AND j.parent_job_id IS NULL ORDER BY r.created_at DESC LIMIT 1",
-                    params![project.to_uppercase(), *number],
+                    params![cairn_common::uri::canonical_project(project), *number],
                     |row| row.text(0),
                 ).await.map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("{} has no addressable node", target.uri()))?;
@@ -1061,10 +1098,11 @@ impl ChannelRouter {
     /// the channel sees a gate, and `None` once an earlier sweep or an earlier
     /// session has already claimed it.
     async fn claim(&self, gate: &Gate) -> Result<Option<String>, String> {
-        claim_gate(
+        claim_gate_for_provider(
             &self.claims,
             self.ledger(),
-            &self.config.to,
+            self.provider_id,
+            &self.destination,
             self.rendering_for(&gate.ask),
             gate,
         )
@@ -1082,7 +1120,7 @@ impl ChannelRouter {
     }
 
     pub async fn sweep(&self) {
-        if !self.config.enabled || self.config.to.trim().is_empty() {
+        if self.destination.trim().is_empty() {
             return;
         }
         if let Err(error) = self.sweep_live_gates().await {
@@ -1094,7 +1132,7 @@ impl ChannelRouter {
     }
 
     async fn sweep_followed_updates(&self) -> Result<(), String> {
-        let follows = ledger::list_follows(self.ledger(), CHANNEL).await?;
+        let follows = ledger::list_follows(self.ledger(), self.provider_id).await?;
         let presence = super::operator_presence(Some(self.provider.as_ref())).await;
         let now = Instant::now();
         for follow in follows {
@@ -1178,8 +1216,13 @@ impl ChannelRouter {
                         }
                     }
                 }
-                ledger::advance_follow_cursor(self.ledger(), CHANNEL, &follow.uri, event.rowid)
-                    .await?;
+                ledger::advance_follow_cursor(
+                    self.ledger(),
+                    self.provider_id,
+                    &follow.uri,
+                    event.rowid,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -1226,7 +1269,7 @@ impl ChannelRouter {
             ledger::mark_expired(self.ledger(), &id, chrono::Utc::now().timestamp_millis()).await?;
         }
         if snapshot_complete {
-            for record in ledger::list_unresolved(self.ledger(), CHANNEL).await? {
+            for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
                 if record.kind == "question"
                     && record.status == "sent"
                     && !live.contains(&record.binding_ref)
@@ -1241,13 +1284,13 @@ impl ChannelRouter {
 
     async fn load_routed_gates(&self, db: &LocalDb) -> Result<Vec<Gate>, String> {
         let mut gates = Vec::new();
-        if self.config.route.question {
+        if self.route.question {
             gates.extend(load_questions(db).await?);
         }
-        if self.config.route.permission {
+        if self.route.permission {
             gates.extend(load_permissions(db).await?);
         }
-        if self.config.route.review {
+        if self.route.review {
             gates.extend(load_reviews(db).await?.gates);
         }
         Ok(gates)
@@ -1274,8 +1317,13 @@ impl ChannelRouter {
             }
             return self.send_claimed(deferred.id, deferred.gate).await;
         }
-        if let Some(record) =
-            ledger::get_by_binding(self.ledger(), CHANNEL, gate.kind, &gate.binding_ref).await?
+        if let Some(record) = ledger::get_by_binding(
+            self.ledger(),
+            self.provider_id,
+            gate.kind,
+            &gate.binding_ref,
+        )
+        .await?
         {
             return match record.status.as_str() {
                 // A failed intent may already have crossed the provider boundary.
@@ -1325,7 +1373,7 @@ impl ChannelRouter {
         };
         let message = OutboundMessage {
             intent_id: id.clone(),
-            conversation: self.config.to.clone(),
+            conversation: self.destination.clone(),
             initiated_by: gate.initiated_by,
             ask: gate.ask,
             context_header: gate.context,
@@ -1399,7 +1447,9 @@ impl ChannelRouter {
     }
 
     async fn resolve_bound(&self, guid: &str, sender: &str, text: &str) -> Result<(), String> {
-        if let Some(record) = ledger::get_by_provider_guid(self.ledger(), CHANNEL, guid).await? {
+        if let Some(record) =
+            ledger::get_by_provider_guid(self.ledger(), self.provider_id, guid).await?
+        {
             if record.kind == "review" {
                 if let Some(requested) = unfollow_selector(text) {
                     let bound_uri = record.binding_ref.split(":event:").next();
@@ -1410,7 +1460,7 @@ impl ChannelRouter {
                         None => bound_uri.map(str::to_string),
                         // A selector names a target the way the operator saw it:
                         // a thread by name, an issue by number.
-                        Some(selector) => ledger::list_follows(self.ledger(), CHANNEL)
+                        Some(selector) => ledger::list_follows(self.ledger(), self.provider_id)
                             .await?
                             .into_iter()
                             .find(|follow| {
@@ -1425,7 +1475,8 @@ impl ChannelRouter {
                         return self.send_notice(sender, "That follow was not found.").await;
                     };
                     let changed =
-                        ledger::is_target_followed(self.ledger(), CHANNEL, &followed_uri).await?;
+                        ledger::is_target_followed(self.ledger(), self.provider_id, &followed_uri)
+                            .await?;
                     if changed {
                         self.unfollow(&followed_uri).await?;
                     }
@@ -1453,7 +1504,9 @@ impl ChannelRouter {
         text: &str,
         selected: bool,
     ) -> Result<(), String> {
-        let Some(record) = ledger::get_by_provider_guid(self.ledger(), CHANNEL, guid).await? else {
+        let Some(record) =
+            ledger::get_by_provider_guid(self.ledger(), self.provider_id, guid).await?
+        else {
             return self.store_unsolicited(Some(guid), sender, text).await;
         };
         if record.binding_ref.starts_with(FOLLOW_POLL_PREFIX) {
@@ -1485,7 +1538,7 @@ impl ChannelRouter {
             return Ok(());
         }
         if !text.trim_start().starts_with('/') {
-            let focused = ledger::get_focus(self.ledger(), CHANNEL)
+            let focused = ledger::get_focus(self.ledger(), self.provider_id)
                 .await?
                 .unwrap_or_else(|| {
                     crate::config::settings::load_settings(&self.orch.config_dir)
@@ -1495,7 +1548,7 @@ impl ChannelRouter {
             let target = self.resolve_target(&focused).await?;
             return self.route_to_target(&target, text).await;
         }
-        let mut matches = ledger::list_unresolved(self.ledger(), CHANNEL)
+        let mut matches = ledger::list_unresolved(self.ledger(), self.provider_id)
             .await?
             .into_iter()
             .filter(|record| {
@@ -1558,7 +1611,7 @@ impl ChannelRouter {
                     .ok_or_else(|| format!("invalid question binding: {}", record.binding_ref))?;
                 let question_count = prompt_question_count(&self.orch, prompt_id).await?;
                 let answers =
-                    ledger::answered_for_prompt(self.ledger(), CHANNEL, prompt_id).await?;
+                    ledger::answered_for_prompt(self.ledger(), self.provider_id, prompt_id).await?;
                 if answers.len() == question_count {
                     let response = if question_count == 1 {
                         answers[0].1.clone()
@@ -1634,7 +1687,7 @@ impl ChannelRouter {
             db,
             &ledger::InboundRecord {
                 id: id.clone(),
-                channel: CHANNEL.into(),
+                channel: self.provider_id.into(),
                 provider_guid: guid.map(str::to_string),
                 sender: sender.into(),
                 text: text.into(),
@@ -1670,13 +1723,22 @@ impl ChannelRouter {
 pub fn spawn(
     orch: Orchestrator,
     provider: Arc<dyn ChannelProvider>,
-    config: IMessageChannelConfig,
+    provider_id: &'static str,
+    destination: String,
+    route: ChannelRouteConfig,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let router = Arc::new(ChannelRouter::new(orch, provider.clone(), config));
+    let router = Arc::new(ChannelRouter::new_for_provider(
+        orch,
+        provider.clone(),
+        provider_id,
+        destination,
+        route,
+    ));
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
-    *super::route_submission_slot()
+    super::route_submission_slot()
         .lock()
-        .expect("route submission slot poisoned") = Some(route_tx);
+        .expect("route submission slot poisoned")
+        .insert(provider_id, route_tx);
     let route_router = router.clone();
     let route_task = tokio::spawn(async move {
         while let Some(submission) = route_rx.recv().await {
@@ -1696,7 +1758,7 @@ pub fn spawn(
         // phone. Sealing it off COMPLETELY is a precondition for sweeping at all,
         // so a failure parks the sweep rather than letting it text the backlog.
         while let Err(error) = sweep.draw_the_session_line().await {
-            super::set_router_blocker(Some(error.clone()));
+            super::set_router_blocker(provider_id, Some(error.clone()));
             log::warn!(
                 "channel cannot seal the pre-session backlog, so it is not sweeping yet: {error}"
             );
@@ -1704,7 +1766,7 @@ pub fn spawn(
             // boundary. Pace that expensive work separately from ordinary sweeps.
             tokio::time::sleep(BACKLOG_SEAL_RETRY_INTERVAL).await;
         }
-        super::set_router_blocker(None);
+        super::set_router_blocker(provider_id, None);
         let mut interval = tokio::time::interval(SWEEP_INTERVAL);
         loop {
             tokio::select! {
@@ -1795,7 +1857,7 @@ async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
                     .map_err(|error| error.to_string())?;
                 result.expired_dangling += 1;
                 log::warn!(
-                    "channel expired dangling review {} because issue {project}-{number} no longer exists",
+                    "channel expired dangling review {} because issue {project}/{number} no longer exists",
                     push.id
                 );
                 continue;
@@ -1822,9 +1884,21 @@ async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
 /// that sealed off the backlog when this session opened -- already claimed it.
 /// This claim is the channel's whole once-only guarantee, and the only thing
 /// that decides whether a gate is backlog or live.
+#[cfg(test)]
 async fn claim_gate(
     claims: &ClaimSet,
     ledger: &LocalDb,
+    conversation: &str,
+    rendering: &'static str,
+    gate: &Gate,
+) -> Result<Option<String>, String> {
+    claim_gate_for_provider(claims, ledger, CHANNEL, conversation, rendering, gate).await
+}
+
+async fn claim_gate_for_provider(
+    claims: &ClaimSet,
+    ledger: &LocalDb,
+    provider_id: &'static str,
     conversation: &str,
     rendering: &'static str,
     gate: &Gate,
@@ -1838,7 +1912,7 @@ async fn claim_gate(
         ledger,
         &ledger::NewOutbound {
             id: &id,
-            channel: CHANNEL,
+            channel: provider_id,
             kind: gate.kind,
             binding_ref: &gate.binding_ref,
             conversation,
@@ -1900,9 +1974,13 @@ fn parse_permission(text: &str) -> Result<PermissionDecision, String> {
 }
 
 #[cfg(test)]
+const CHANNEL: &str = "imessage";
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::channels::ledger::expire_undelivered;
+    use crate::models::IMessageChannelConfig;
     use crate::storage::migrated_test_db;
 
     #[tokio::test]

@@ -39,7 +39,7 @@ pub(super) async fn dispatch(
                 .ok_or_else(|| build_failure(index, item, "payload.text is required"))?;
             if dry_run {
                 format!(
-                    "Would append {kind} entry ({} chars) to {project}-{number}/{exec_seq}/{node_id} progress",
+                    "Would append {kind} entry ({} chars) to {project}/{number}/{exec_seq}/{node_id} progress",
                     text.len()
                 )
             } else {
@@ -60,7 +60,7 @@ pub(super) async fn dispatch(
                     serde_json::json!({"table": "workflow_progress", "action": "append"}),
                 );
                 format!(
-                    "Appended {} entry #{} to {project}-{number}/{exec_seq}/{node_id} progress",
+                    "Appended {} entry #{} to {project}/{number}/{exec_seq}/{node_id} progress",
                     entry.kind, entry.seq
                 )
             }

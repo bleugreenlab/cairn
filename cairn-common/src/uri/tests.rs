@@ -8,31 +8,31 @@ use crate::query::QueryParam;
 #[test]
 fn the_thread_coordinate_renders_as_a_thread_address() {
     assert_eq!(
-        build_node_uri("CAIRN", 0, 0, "thread-ux"),
-        "cairn://p/CAIRN/thread-ux"
+        build_node_uri("cairn", 0, 0, "thread-ux"),
+        "cairn://p/cairn/thread-ux"
     );
     assert_eq!(
-        build_node_artifact_uri_named("CAIRN", 0, 0, "thread-ux", Some("arc")),
-        "cairn://p/CAIRN/thread-ux/arc"
+        build_node_artifact_uri_named("cairn", 0, 0, "thread-ux", Some("arc")),
+        "cairn://p/cairn/thread-ux/arc"
     );
     assert_eq!(
-        build_node_terminal_uri("CAIRN", 0, 0, "thread-ux", "smoke"),
-        "cairn://p/CAIRN/thread-ux/terminal/smoke"
+        build_node_terminal_uri("cairn", 0, 0, "thread-ux", "smoke"),
+        "cairn://p/cairn/thread-ux/terminal/smoke"
     );
     assert_eq!(
-        build_task_chat_uri("CAIRN", 0, 0, "thread-ux", "probe"),
-        "cairn://p/CAIRN/thread-ux/task/probe/chat"
+        build_task_chat_uri("cairn", 0, 0, "thread-ux", "probe"),
+        "cairn://p/cairn/thread-ux/task/probe/chat"
     );
     // The task home a delegated child reports is the same address its own
     // sub-resources hang off.
     assert_eq!(
-        build_job_base_uri("CAIRN", 0, 0, "probe", Some("thread-ux")),
-        build_thread_task_uri("CAIRN", "thread-ux", "probe")
+        build_job_base_uri("cairn", 0, 0, "probe", Some("thread-ux")),
+        build_thread_task_uri("cairn", "thread-ux", "probe")
     );
     // An ordinary node coordinate is untouched.
     assert_eq!(
-        build_node_uri("CAIRN", 12, 1, "builder"),
-        "cairn://p/CAIRN/12/1/builder"
+        build_node_uri("cairn", 12, 1, "builder"),
+        "cairn://p/cairn/12/1/builder"
     );
 }
 
@@ -42,10 +42,10 @@ fn the_thread_coordinate_renders_as_a_thread_address() {
 #[test]
 fn thread_coordinate_is_unspellable() {
     for uri in [
-        "cairn://p/CAIRN/0/0/builder",
-        "cairn://p/CAIRN/0/0/builder/todos",
-        "cairn://p/CAIRN/0/1/builder",
-        "cairn://p/CAIRN/1/0/builder",
+        "cairn://p/cairn/0/0/builder",
+        "cairn://p/cairn/0/0/builder/todos",
+        "cairn://p/cairn/0/1/builder",
+        "cairn://p/cairn/1/0/builder",
     ] {
         assert!(
             !matches!(parse_uri(uri), Some(CairnResource::Node { .. })),
@@ -63,7 +63,7 @@ fn parses_symbol_resources_all_forms() {
     assert_eq!(
         parse_uri("cairn://p/cairn/12/1/builder/symbols"),
         Some(CairnResource::NodeSymbols {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 12,
             exec_seq: 1,
             node_id: "builder".to_string(),
@@ -73,7 +73,7 @@ fn parses_symbol_resources_all_forms() {
     assert_eq!(
         parse_uri("cairn://p/cairn/12/1/builder/symbols/build_widget"),
         Some(CairnResource::NodeSymbols {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 12,
             exec_seq: 1,
             node_id: "builder".to_string(),
@@ -84,7 +84,7 @@ fn parses_symbol_resources_all_forms() {
     assert_eq!(
         parse_uri("cairn://p/cairn/12/1/builder/symbols/Foo::bar"),
         Some(CairnResource::NodeSymbols {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 12,
             exec_seq: 1,
             node_id: "builder".to_string(),
@@ -94,14 +94,14 @@ fn parses_symbol_resources_all_forms() {
     assert_eq!(
         parse_uri("cairn://p/cairn/symbols"),
         Some(CairnResource::ProjectSymbols {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             symbol: None,
         })
     );
     assert_eq!(
         parse_uri("cairn://p/cairn/symbols/build_widget"),
         Some(CairnResource::ProjectSymbols {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             symbol: Some("build_widget".to_string()),
         })
     );
@@ -140,10 +140,10 @@ fn symbols_segment_is_reserved_not_an_artifact() {
 #[test]
 fn symbol_uris_round_trip() {
     for uri in [
-        "cairn://p/CAIRN/12/1/builder/symbols",
-        "cairn://p/CAIRN/12/1/builder/symbols/build_widget",
-        "cairn://p/CAIRN/symbols",
-        "cairn://p/CAIRN/symbols/build_widget",
+        "cairn://p/cairn/12/1/builder/symbols",
+        "cairn://p/cairn/12/1/builder/symbols/build_widget",
+        "cairn://p/cairn/symbols",
+        "cairn://p/cairn/symbols/build_widget",
     ] {
         assert_eq!(parse_uri(uri).unwrap().to_uri(), uri, "round-trip {uri}");
     }
@@ -154,20 +154,20 @@ fn parses_canonical_project_resources() {
     assert_eq!(
         parse_uri("cairn://p/cairn/123/changed"),
         Some(CairnResource::Changed {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 123,
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/issues"),
+        parse_uri("cairn://p/cairn/issues"),
         Some(CairnResource::ProjectIssues {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/messages"),
+        parse_uri("cairn://p/cairn/messages"),
         Some(CairnResource::ProjectMessages {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         })
     );
 }
@@ -179,7 +179,7 @@ fn parses_and_roundtrips_node_and_task_messages() {
     assert_eq!(
         node,
         Some(CairnResource::NodeMessages {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -187,7 +187,7 @@ fn parses_and_roundtrips_node_and_task_messages() {
     );
     assert_eq!(
         node.unwrap().to_uri(),
-        "cairn://p/CAIRN/42/2/builder/messages"
+        "cairn://p/cairn/42/2/builder/messages"
     );
 
     // Task `/messages` is the sub-agent analogue.
@@ -195,7 +195,7 @@ fn parses_and_roundtrips_node_and_task_messages() {
     assert_eq!(
         task,
         Some(CairnResource::TaskMessages {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -204,12 +204,12 @@ fn parses_and_roundtrips_node_and_task_messages() {
     );
     assert_eq!(
         task.unwrap().to_uri(),
-        "cairn://p/CAIRN/42/2/builder/task/review/messages"
+        "cairn://p/cairn/42/2/builder/task/review/messages"
     );
 
     // `/messages` is not mistaken for a type-named artifact.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/messages").map(|r| r.kind()),
+        parse_uri("cairn://p/cairn/42/2/builder/messages").map(|r| r.kind()),
         Some(ResourceKind::NodeMessages)
     );
 }
@@ -230,19 +230,19 @@ fn parses_and_roundtrips_settings_family() {
     assert_eq!(
         ps,
         Some(CairnResource::ProjectSettings {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         })
     );
     let ps = ps.unwrap();
-    assert_eq!(ps.to_uri(), "cairn://p/CAIRN/settings");
+    assert_eq!(ps.to_uri(), "cairn://p/cairn/settings");
     assert_eq!(ps.kind(), ResourceKind::ProjectSettings);
-    assert_eq!(ps.project(), Some("CAIRN"));
+    assert_eq!(ps.project(), Some("cairn"));
     assert_eq!(ps.issue_number(), None);
     assert_eq!(ps.to_route(), None);
 
     // `settings` is not parsed as an issue number.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/settings").map(|r| r.kind()),
+        parse_uri("cairn://p/cairn/settings").map(|r| r.kind()),
         Some(ResourceKind::ProjectSettings)
     );
 }
@@ -331,9 +331,9 @@ fn an_executor_uri_normalizes_to_the_name_placement_accepts() {
 fn parses_type_named_node_artifact() {
     // A trailing non-reserved segment is a type-named artifact.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/plan"),
+        parse_uri("cairn://p/cairn/42/2/builder/plan"),
         Some(CairnResource::NodeArtifact {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -343,20 +343,20 @@ fn parses_type_named_node_artifact() {
     // Round-trips back to the same type-named URI.
     assert_eq!(
         CairnResource::NodeArtifact {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
             name: Some("plan".to_string()),
         }
         .to_uri(),
-        "cairn://p/CAIRN/42/2/builder/plan"
+        "cairn://p/cairn/42/2/builder/plan"
     );
     // The literal `artifact` keyword is the generic (name: None) alias.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/artifact"),
+        parse_uri("cairn://p/cairn/42/2/builder/artifact"),
         Some(CairnResource::NodeArtifact {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -369,9 +369,9 @@ fn parses_type_named_node_artifact() {
 fn reserved_segments_are_not_artifacts() {
     // `chat` is reserved and must parse as NodeChat, never an artifact named "chat".
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/chat"),
+        parse_uri("cairn://p/cairn/42/2/builder/chat"),
         Some(CairnResource::NodeChat {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -386,9 +386,9 @@ fn reserved_segments_are_not_artifacts() {
 #[test]
 fn parses_type_named_task_artifact() {
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/result"),
+        parse_uri("cairn://p/cairn/42/2/builder/task/Explore/result"),
         Some(CairnResource::TaskArtifact {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -403,12 +403,12 @@ fn parses_and_roundtrips_task_base() {
     // The task job base — the analogue of a node base. Regression: this used
     // to fall through to `None`, so a sub-agent's home URI was rejected and
     // `cairn:~/...` shorthand could not resolve.
-    let uri = "cairn://p/CAIRN/1174/1/planner/task/cairn-1171";
+    let uri = "cairn://p/cairn/1174/1/planner/task/cairn-1171";
     let parsed = parse_uri(uri);
     assert_eq!(
         parsed,
         Some(CairnResource::Task {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1174,
             exec_seq: 1,
             node_id: "planner".to_string(),
@@ -422,7 +422,7 @@ fn parses_and_roundtrips_task_base() {
 #[test]
 fn task_base_built_by_build_job_base_uri_parses() {
     // The exact path the orchestrator uses to stamp CAIRN_HOME_URI for a task.
-    let built = build_job_base_uri("CAIRN", 1174, 1, "cairn-1171", Some("planner"));
+    let built = build_job_base_uri("cairn", 1174, 1, "cairn-1171", Some("planner"));
     assert!(
         parse_uri(&built).is_some(),
         "task home URI must parse: {built}"
@@ -433,20 +433,20 @@ fn task_base_built_by_build_job_base_uri_parses() {
 fn chat_full_uri_no_longer_parses() {
     // The `full` segment was renamed to `raw`; the old spelling must 404 so
     // the removal is deliberate rather than a silent dual-name.
-    assert!(parse_uri("cairn://p/CAIRN/42/2/builder/chat/full").is_none());
-    assert!(parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/full").is_none());
+    assert!(parse_uri("cairn://p/cairn/42/2/builder/chat/full").is_none());
+    assert!(parse_uri("cairn://p/cairn/42/2/builder/task/Explore/chat/full").is_none());
 }
 
 #[test]
 fn parses_and_roundtrips_browsers() {
     let node = CairnResource::NodeBrowser {
-        project: "CAIRN".to_string(),
+        project: "cairn".to_string(),
         number: 42,
         exec_seq: 2,
         node_id: "builder".to_string(),
         slug: "main".to_string(),
     };
-    assert_eq!(node.to_uri(), "cairn://p/CAIRN/42/2/builder/browser/main");
+    assert_eq!(node.to_uri(), "cairn://p/cairn/42/2/builder/browser/main");
     assert_eq!(parse_uri(&node.to_uri()), Some(node.clone()));
     assert_eq!(node.kind(), ResourceKind::NodeBrowser);
     assert_eq!(
@@ -455,7 +455,7 @@ fn parses_and_roundtrips_browsers() {
     );
 
     let task = CairnResource::TaskBrowser {
-        project: "CAIRN".to_string(),
+        project: "cairn".to_string(),
         number: 42,
         exec_seq: 2,
         node_id: "builder".to_string(),
@@ -464,16 +464,16 @@ fn parses_and_roundtrips_browsers() {
     };
     assert_eq!(
         task.to_uri(),
-        "cairn://p/CAIRN/42/2/builder/task/Explore/browser/main"
+        "cairn://p/cairn/42/2/builder/task/Explore/browser/main"
     );
     assert_eq!(parse_uri(&task.to_uri()), Some(task.clone()));
     assert_eq!(task.kind(), ResourceKind::TaskBrowser);
 
     let project = CairnResource::ProjectBrowser {
-        project: "CAIRN".to_string(),
+        project: "cairn".to_string(),
         slug: "main".to_string(),
     };
-    assert_eq!(project.to_uri(), "cairn://p/CAIRN/browser/main");
+    assert_eq!(project.to_uri(), "cairn://p/cairn/browser/main");
     assert_eq!(parse_uri(&project.to_uri()), Some(project.clone()));
     assert_eq!(project.kind(), ResourceKind::ProjectBrowser);
     assert_eq!(
@@ -485,9 +485,9 @@ fn parses_and_roundtrips_browsers() {
 #[test]
 fn bare_browser_defaults_slug() {
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/browser"),
+        parse_uri("cairn://p/cairn/42/2/builder/browser"),
         Some(CairnResource::NodeBrowser {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -495,9 +495,9 @@ fn bare_browser_defaults_slug() {
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/browser"),
+        parse_uri("cairn://p/cairn/42/2/builder/task/Explore/browser"),
         Some(CairnResource::TaskBrowser {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -506,9 +506,9 @@ fn bare_browser_defaults_slug() {
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/browser"),
+        parse_uri("cairn://p/cairn/browser"),
         Some(CairnResource::ProjectBrowser {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             slug: "default".to_string(),
         })
     );
@@ -520,17 +520,17 @@ fn project_browser_arm_precedes_issue_arm() {
     // an issue: the `[p, project, "browser", slug]` arm must precede the
     // `[p, project, number]` issue arm.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/browser/123"),
+        parse_uri("cairn://p/cairn/browser/123"),
         Some(CairnResource::ProjectBrowser {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             slug: "123".to_string(),
         })
     );
     // And a bare numeric segment is still an issue.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/123"),
+        parse_uri("cairn://p/cairn/123"),
         Some(CairnResource::Issue {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 123,
         })
     );
@@ -539,18 +539,18 @@ fn project_browser_arm_precedes_issue_arm() {
 #[test]
 fn parses_node_and_task_resources() {
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/chat/raw"),
+        parse_uri("cairn://p/cairn/42/2/builder/chat/raw"),
         Some(CairnResource::NodeChatRaw {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/turn/3"),
+        parse_uri("cairn://p/cairn/42/2/builder/task/Explore/chat/turn/3"),
         Some(CairnResource::TaskChatTurn {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -559,9 +559,9 @@ fn parses_node_and_task_resources() {
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/chat/1/0"),
+        parse_uri("cairn://p/cairn/42/2/builder/chat/1/0"),
         Some(CairnResource::NodeChatEvent {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -570,9 +570,9 @@ fn parses_node_and_task_resources() {
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/chat/1/0"),
+        parse_uri("cairn://p/cairn/42/2/builder/task/Explore/chat/1/0"),
         Some(CairnResource::TaskChatEvent {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -587,27 +587,27 @@ fn parses_node_and_task_resources() {
 fn parses_and_roundtrips_node_tasks_and_questions() {
     let cases = [
         (
-            "cairn://p/CAIRN/42/2/builder/tasks",
+            "cairn://p/cairn/42/2/builder/tasks",
             CairnResource::NodeTasks {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
                 number: 42,
                 exec_seq: 2,
                 node_id: "builder".to_string(),
             },
         ),
         (
-            "cairn://p/CAIRN/42/2/builder/questions",
+            "cairn://p/cairn/42/2/builder/questions",
             CairnResource::NodeQuestions {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
                 number: 42,
                 exec_seq: 2,
                 node_id: "builder".to_string(),
             },
         ),
         (
-            "cairn://p/CAIRN/42/2/builder/questions/q-1",
+            "cairn://p/cairn/42/2/builder/questions/q-1",
             CairnResource::NodeQuestion {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
                 number: 42,
                 exec_seq: 2,
                 node_id: "builder".to_string(),
@@ -615,18 +615,18 @@ fn parses_and_roundtrips_node_tasks_and_questions() {
             },
         ),
         (
-            "cairn://p/CAIRN/42/2/builder/permissions",
+            "cairn://p/cairn/42/2/builder/permissions",
             CairnResource::NodePermissions {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
                 number: 42,
                 exec_seq: 2,
                 node_id: "builder".to_string(),
             },
         ),
         (
-            "cairn://p/CAIRN/42/2/builder/permissions/perm-1",
+            "cairn://p/cairn/42/2/builder/permissions/perm-1",
             CairnResource::NodePermission {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
                 number: 42,
                 exec_seq: 2,
                 node_id: "builder".to_string(),
@@ -643,9 +643,9 @@ fn parses_and_roundtrips_node_tasks_and_questions() {
 #[test]
 fn parse_uri_keeps_path_only_compatibility_with_queries() {
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/terminal/dev?full=true"),
+        parse_uri("cairn://p/cairn/42/2/builder/terminal/dev?full=true"),
         Some(CairnResource::NodeTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -653,9 +653,9 @@ fn parse_uri_keeps_path_only_compatibility_with_queries() {
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci?new=true"),
+        parse_uri("cairn://p/cairn/42/2/builder/task/Explore/terminal/ci?new=true"),
         Some(CairnResource::TaskTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -667,12 +667,12 @@ fn parse_uri_keeps_path_only_compatibility_with_queries() {
 
 #[test]
 fn parses_and_roundtrips_task_terminal() {
-    let uri = "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci";
+    let uri = "cairn://p/cairn/42/2/builder/task/Explore/terminal/ci";
     let parsed = parse_uri(uri);
     assert_eq!(
         parsed,
         Some(CairnResource::TaskTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -683,7 +683,7 @@ fn parses_and_roundtrips_task_terminal() {
     let resource = parsed.unwrap();
     assert_eq!(resource.to_uri(), uri);
     assert_eq!(resource.kind(), ResourceKind::TaskTerminal);
-    assert_eq!(resource.project(), Some("CAIRN"));
+    assert_eq!(resource.project(), Some("cairn"));
     assert_eq!(
         resource.to_route(),
         Some("/p/cairn/i/42/2/builder/task/Explore?terminalId=ci".to_string())
@@ -697,7 +697,7 @@ fn parse_resource_uri_preserves_ordered_query_params() {
         parsed,
         Some(CairnResourceUri {
             resource: CairnResource::ProjectIssues {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
             },
             params: vec![
                 QueryParam {
@@ -713,7 +713,7 @@ fn parse_resource_uri_preserves_ordered_query_params() {
     );
     assert_eq!(
         parsed.unwrap().to_uri(),
-        "cairn://p/CAIRN/issues?limit=10&status=backlog"
+        "cairn://p/cairn/issues?limit=10&status=backlog"
     );
 }
 
@@ -728,13 +728,13 @@ fn parse_resource_uri_encodes_canonical_query_params() {
             .unwrap();
     assert_eq!(
         parsed.to_uri(),
-        "cairn://p/CAIRN/issues?label=needs%2Breview&status=backlog%2Cactive"
+        "cairn://p/cairn/issues?label=needs%2Breview&status=backlog%2Cactive"
     );
 }
 
 #[test]
 fn parse_resource_uri_rejects_invalid_query_encoding() {
-    let err = parse_resource_uri("cairn://p/CAIRN/issues?status=%ZZ").unwrap_err();
+    let err = parse_resource_uri("cairn://p/cairn/issues?status=%ZZ").unwrap_err();
     assert!(err.contains("Invalid percent escape"));
 }
 
@@ -743,30 +743,30 @@ fn rejects_legacy_roots_and_invalid_paths() {
     assert!(parse_uri("cairn://CAIRN/42").is_none());
     assert!(parse_uri("cairn://ws/skills").is_none());
     assert!(parse_uri("cairn://p").is_none());
-    assert!(parse_uri("cairn://p/CAIRN/comments").is_none());
-    assert!(parse_uri("cairn://p/CAIRN/42/pr").is_none());
+    assert!(parse_uri("cairn://p/cairn/comments").is_none());
+    assert!(parse_uri("cairn://p/cairn/42/pr").is_none());
     // Note: a trailing non-reserved segment like `.../builder/diff` is now a
     // valid type-named artifact (see parses_type_named_node_artifact), not an error.
-    assert!(parse_uri("cairn://p/CAIRN/42/0/builder").is_none());
+    assert!(parse_uri("cairn://p/cairn/42/0/builder").is_none());
     assert!(parse_uri("cairn://").is_none());
 }
 
 #[test]
 fn serializes_canonical_uris() {
-    assert_eq!(build_project_uri("cairn"), "cairn://p/CAIRN");
-    assert_eq!(build_project_issues_uri("cairn"), "cairn://p/CAIRN/issues");
-    assert_eq!(build_issue_uri("cairn", 42), "cairn://p/CAIRN/42");
+    assert_eq!(build_project_uri("cairn"), "cairn://p/cairn");
+    assert_eq!(build_project_issues_uri("cairn"), "cairn://p/cairn/issues");
+    assert_eq!(build_issue_uri("cairn", 42), "cairn://p/cairn/42");
     assert_eq!(
         build_node_terminal_uri("cairn", 42, 2, "builder", "dev"),
-        "cairn://p/CAIRN/42/2/builder/terminal/dev"
+        "cairn://p/cairn/42/2/builder/terminal/dev"
     );
     assert_eq!(
         build_task_terminal_uri("cairn", 42, 2, "builder", "Explore", "ci"),
-        "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci"
+        "cairn://p/cairn/42/2/builder/task/Explore/terminal/ci"
     );
     assert_eq!(
         build_task_artifact_uri("cairn", 42, 2, "builder", "Explore"),
-        "cairn://p/CAIRN/42/2/builder/task/Explore/artifact"
+        "cairn://p/cairn/42/2/builder/task/Explore/artifact"
     );
 }
 
@@ -775,13 +775,13 @@ fn parses_issue_executions_collection() {
     assert_eq!(
         parse_uri("cairn://p/cairn/42/executions"),
         Some(CairnResource::IssueExecutions {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
         })
     );
     assert_eq!(
-        build_issue_executions_uri("CAIRN", 42),
-        "cairn://p/CAIRN/42/executions"
+        build_issue_executions_uri("cairn", 42),
+        "cairn://p/cairn/42/executions"
     );
 }
 
@@ -791,11 +791,11 @@ fn parses_first_class_thread_resources() {
     assert_eq!(
         collection,
         CairnResource::ProjectThreads {
-            project: "CAIRN".into()
+            project: "cairn".into()
         }
     );
     assert_eq!(collection.kind(), ResourceKind::ProjectThreads);
-    assert_eq!(collection.to_uri(), "cairn://p/CAIRN/threads");
+    assert_eq!(collection.to_uri(), "cairn://p/cairn/threads");
 
     for (uri, path) in [
         ("cairn://p/cairn/design-review", vec![]),
@@ -825,7 +825,7 @@ fn parses_first_class_thread_resources() {
         assert_eq!(
             resource,
             CairnResource::Thread {
-                project: "CAIRN".into(),
+                project: "cairn".into(),
                 name: "design-review".into(),
                 path: path.into_iter().map(str::to_string).collect(),
             }
@@ -837,11 +837,11 @@ fn parses_first_class_thread_resources() {
 #[test]
 fn numeric_and_reserved_segments_do_not_parse_as_thread_names() {
     assert!(matches!(
-        parse_uri("cairn://p/CAIRN/3404"),
+        parse_uri("cairn://p/cairn/3404"),
         Some(CairnResource::Issue { number: 3404, .. })
     ));
     for reserved in crate::thread_name::RESERVED_PROJECT_SEGMENTS {
-        let uri = format!("cairn://p/CAIRN/{reserved}");
+        let uri = format!("cairn://p/cairn/{reserved}");
         assert!(
             !matches!(parse_uri(&uri), Some(CairnResource::Thread { .. })),
             "{reserved}"
@@ -851,8 +851,8 @@ fn numeric_and_reserved_segments_do_not_parse_as_thread_names() {
 
 #[test]
 fn retired_thread_alias_has_a_helpful_error() {
-    assert_eq!(parse_uri("cairn://p/CAIRN/t/design-review"), None);
-    let error = parse_resource_uri("cairn://p/CAIRN/t/design-review").unwrap_err();
+    assert_eq!(parse_uri("cairn://p/cairn/t/design-review"), None);
+    let error = parse_resource_uri("cairn://p/cairn/t/design-review").unwrap_err();
     assert!(error.contains("retired"), "{error}");
     assert!(error.contains("cairn://p/PROJECT/<name>"), "{error}");
 }
@@ -862,32 +862,32 @@ fn parses_issue_comments_collection_and_member() {
     assert_eq!(
         parse_uri("cairn://p/cairn/12/comments"),
         Some(CairnResource::IssueComments {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 12,
         })
     );
     assert_eq!(
-        build_issue_comments_uri("CAIRN", 12),
-        "cairn://p/CAIRN/12/comments"
+        build_issue_comments_uri("cairn", 12),
+        "cairn://p/cairn/12/comments"
     );
 
     let member = parse_uri("cairn://p/cairn/12/comments/3").unwrap();
     assert_eq!(
         member,
         CairnResource::IssueComment {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 12,
             comment_seq: 3,
         }
     );
     assert_eq!(member.kind(), ResourceKind::IssueComment);
-    assert_eq!(member.project(), Some("CAIRN"));
+    assert_eq!(member.project(), Some("cairn"));
     assert_eq!(member.issue_number(), Some(12));
-    assert_eq!(member.to_uri(), "cairn://p/CAIRN/12/comments/3");
+    assert_eq!(member.to_uri(), "cairn://p/cairn/12/comments/3");
     // A non-numeric comment tail is not a valid member URI.
-    assert_eq!(parse_uri("cairn://p/CAIRN/12/comments/not-a-number"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/12/comments/not-a-number"), None);
 
-    let collection = parse_uri("cairn://p/CAIRN/12/comments").unwrap();
+    let collection = parse_uri("cairn://p/cairn/12/comments").unwrap();
     assert_eq!(collection.kind(), ResourceKind::IssueComments);
     assert_eq!(collection.issue_number(), Some(12));
 }
@@ -898,20 +898,20 @@ fn parses_single_execution_snapshot() {
     assert_eq!(
         resource,
         CairnResource::IssueExecution {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
         }
     );
     assert_eq!(resource.kind(), ResourceKind::IssueExecution);
-    assert_eq!(resource.project(), Some("CAIRN"));
+    assert_eq!(resource.project(), Some("cairn"));
     assert_eq!(resource.issue_number(), Some(42));
     assert_eq!(resource.to_route(), None);
     assert_eq!(
-        build_issue_execution_uri("CAIRN", 42, 2),
-        "cairn://p/CAIRN/42/executions/2"
+        build_issue_execution_uri("cairn", 42, 2),
+        "cairn://p/cairn/42/executions/2"
     );
-    assert_eq!(resource.to_uri(), "cairn://p/CAIRN/42/executions/2");
+    assert_eq!(resource.to_uri(), "cairn://p/cairn/42/executions/2");
 }
 
 /// `.../42/executions/2` and the node shape `.../42/2/builder` are both
@@ -922,7 +922,7 @@ fn single_execution_does_not_shadow_node() {
     assert_eq!(
         parse_uri("cairn://p/cairn/42/executions/2"),
         Some(CairnResource::IssueExecution {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
         })
@@ -930,7 +930,7 @@ fn single_execution_does_not_shadow_node() {
     assert_eq!(
         parse_uri("cairn://p/cairn/42/2/builder"),
         Some(CairnResource::Node {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -942,9 +942,9 @@ fn single_execution_does_not_shadow_node() {
 
 #[test]
 fn task_checks_uri_parses_and_round_trips() {
-    let uri = "cairn://p/CAIRN/42/2/builder/task/review-rust/checks";
+    let uri = "cairn://p/cairn/42/2/builder/task/review-rust/checks";
     let resource = CairnResource::TaskChecks {
-        project: "CAIRN".to_string(),
+        project: "cairn".to_string(),
         number: 42,
         exec_seq: 2,
         node_id: "builder".to_string(),
@@ -953,108 +953,108 @@ fn task_checks_uri_parses_and_round_trips() {
     assert_eq!(parse_uri(uri), Some(resource.clone()));
     assert_eq!(resource.to_uri(), uri);
     assert!(matches!(
-        parse_uri("cairn://p/CAIRN/42/2/review-rust/checks"),
+        parse_uri("cairn://p/cairn/42/2/review-rust/checks"),
         Some(CairnResource::NodeChecks { .. })
     ));
 }
 
 #[test]
 fn project_check_results_uri_parses_and_round_trips() {
-    let uri = "cairn://p/CAIRN/check-results/main";
+    let uri = "cairn://p/cairn/check-results/main";
     let resource = CairnResource::ProjectCheckResults {
-        project: "CAIRN".to_string(),
+        project: "cairn".to_string(),
         revision: "main".to_string(),
     };
     assert_eq!(parse_uri(uri), Some(resource.clone()));
     assert_eq!(resource.to_uri(), uri);
-    assert_eq!(parse_uri("cairn://p/CAIRN/check-results/"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/check-results/"), None);
 }
 
 #[test]
 fn round_trips_every_resource_family() {
     let resources = vec![
         CairnResource::Project {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::ProjectIssues {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::ProjectCheckResults {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             revision: "0123456789abcdef".to_string(),
         },
         CairnResource::Issue {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
         },
         CairnResource::ProjectThreads {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::Thread {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             name: "design-review".to_string(),
             path: vec!["chat".to_string()],
         },
         CairnResource::ProjectMessages {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::ProjectTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             slug: "build".to_string(),
         },
         CairnResource::IssueMessages {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
         },
         CairnResource::Changed {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
         },
         CairnResource::IssueExecutions {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
         },
         CairnResource::IssueComments {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
         },
         CairnResource::IssueComment {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             comment_seq: 1,
         },
         CairnResource::IssueExecution {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
         },
         CairnResource::Node {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
         },
         CairnResource::NodeChat {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
         },
         CairnResource::NodeChatRaw {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
         },
         CairnResource::NodeChatTurn {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             turn_seq: 0,
         },
         CairnResource::NodeChatEvent {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1062,27 +1062,27 @@ fn round_trips_every_resource_family() {
             event_seq: 5,
         },
         CairnResource::NodeArtifact {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             name: None,
         },
         CairnResource::NodeDiff {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
         },
         CairnResource::NodeTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             slug: "dev".to_string(),
         },
         CairnResource::TaskTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1090,21 +1090,21 @@ fn round_trips_every_resource_family() {
             slug: "ci".to_string(),
         },
         CairnResource::TaskChat {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             task_name: "Explore".to_string(),
         },
         CairnResource::TaskChatRaw {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             task_name: "Explore".to_string(),
         },
         CairnResource::TaskChatTurn {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1112,7 +1112,7 @@ fn round_trips_every_resource_family() {
             turn_seq: 2,
         },
         CairnResource::TaskChatEvent {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1121,7 +1121,7 @@ fn round_trips_every_resource_family() {
             event_seq: 3,
         },
         CairnResource::TaskArtifact {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1129,28 +1129,28 @@ fn round_trips_every_resource_family() {
             name: None,
         },
         CairnResource::JobTodos {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             task_name: None,
         },
         CairnResource::JobTodos {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             task_name: Some("Explore".to_string()),
         },
         CairnResource::TaskPermissions {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
             task_name: "Explore".to_string(),
         },
         CairnResource::TaskPermission {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1170,7 +1170,7 @@ fn parses_job_todos_node_and_task_forms() {
     assert_eq!(
         parse_uri("cairn://p/cairn/42/2/builder/todos"),
         Some(CairnResource::JobTodos {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1178,9 +1178,9 @@ fn parses_job_todos_node_and_task_forms() {
         })
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/task/Explore/todos"),
+        parse_uri("cairn://p/cairn/42/2/builder/task/Explore/todos"),
         Some(CairnResource::JobTodos {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1189,11 +1189,11 @@ fn parses_job_todos_node_and_task_forms() {
     );
     assert_eq!(
         build_job_todos_uri("cairn", 42, 2, "builder", None),
-        "cairn://p/CAIRN/42/2/builder/todos"
+        "cairn://p/cairn/42/2/builder/todos"
     );
     assert_eq!(
         build_job_todos_uri("cairn", 42, 2, "builder", Some("Explore")),
-        "cairn://p/CAIRN/42/2/builder/task/Explore/todos"
+        "cairn://p/cairn/42/2/builder/task/Explore/todos"
     );
 }
 
@@ -1201,9 +1201,9 @@ fn parses_job_todos_node_and_task_forms() {
 fn job_todos_uri_keeps_path_only_compatibility_with_queries() {
     // parse_uri strips the query; query rejection is enforced at the handler.
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/42/2/builder/todos?limit=3"),
+        parse_uri("cairn://p/cairn/42/2/builder/todos?limit=3"),
         Some(CairnResource::JobTodos {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 42,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1337,13 +1337,13 @@ fn parses_skill_resources() {
     assert_eq!(
         parse_uri("cairn://p/cairn/skills"),
         Some(CairnResource::ProjectSkills {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         })
     );
     assert_eq!(
         parse_uri("cairn://p/cairn/skills/ui/scripts/run.sh"),
         Some(CairnResource::ProjectSkill {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             skill_id: "ui".to_string(),
             path: vec!["scripts".to_string(), "run.sh".to_string()],
         })
@@ -1351,13 +1351,13 @@ fn parses_skill_resources() {
     assert_eq!(
         parse_uri("cairn://p/cairn/references"),
         Some(CairnResource::ProjectReferences {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         })
     );
     assert_eq!(
         parse_uri("cairn://p/cairn/references/openpnp"),
         Some(CairnResource::ProjectReference {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             name: "openpnp".to_string(),
         })
     );
@@ -1384,18 +1384,18 @@ fn round_trips_skill_resources() {
             ],
         },
         CairnResource::ProjectSkills {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::ProjectSkill {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             skill_id: "ui".to_string(),
             path: vec!["scripts".to_string(), "run.sh".to_string()],
         },
         CairnResource::ProjectReferences {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::ProjectReference {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             name: "openpnp".to_string(),
         },
     ];
@@ -1412,10 +1412,10 @@ fn round_trips_workflow_resources() {
             workflow_id: "deep-research".to_string(),
         },
         CairnResource::ProjectWorkflows {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::ProjectWorkflow {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             workflow_id: "deep-research".to_string(),
         },
     ];
@@ -1431,14 +1431,14 @@ fn workflow_resources_project_and_route() {
     assert_eq!(CairnResource::Workflows.to_route(), None);
     assert_eq!(
         CairnResource::ProjectWorkflows {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         }
         .project(),
-        Some("CAIRN")
+        Some("cairn")
     );
     assert_eq!(
         CairnResource::ProjectWorkflow {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             workflow_id: "deep-research".to_string(),
         }
         .to_route(),
@@ -1451,12 +1451,12 @@ fn workflow_resources_project_and_route() {
 #[test]
 fn project_reference_resources_report_project_and_kind() {
     let collection = parse_uri("cairn://p/cairn/references").unwrap();
-    assert_eq!(collection.project(), Some("CAIRN"));
+    assert_eq!(collection.project(), Some("cairn"));
     assert_eq!(collection.issue_number(), None);
     assert_eq!(collection.kind(), ResourceKind::ProjectReferences);
 
     let member = parse_uri("cairn://p/cairn/references/openpnp").unwrap();
-    assert_eq!(member.project(), Some("CAIRN"));
+    assert_eq!(member.project(), Some("cairn"));
     assert_eq!(member.issue_number(), None);
     assert_eq!(member.kind(), ResourceKind::ProjectReference);
 }
@@ -1465,20 +1465,20 @@ fn project_reference_resources_report_project_and_kind() {
 fn parses_only_node_memory_resources() {
     assert_eq!(parse_uri("cairn://memories"), None);
     assert_eq!(parse_uri("cairn://memories/abc-123"), None);
-    assert_eq!(parse_uri("cairn://p/CAIRN/memories"), None);
-    assert_eq!(parse_uri("cairn://p/CAIRN/memories/abc-123"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/memories"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/memories/abc-123"), None);
 
     let resource = CairnResource::NodeMemory {
-        project: "CAIRN".to_string(),
+        project: "cairn".to_string(),
         number: 1498,
         exec_seq: 1,
         node_id: "builder".to_string(),
         memory_seq: 2,
     };
-    let uri = "cairn://p/CAIRN/1498/1/builder/memories/2";
+    let uri = "cairn://p/cairn/1498/1/builder/memories/2";
     assert_eq!(parse_uri(uri), Some(resource.clone()));
     assert_eq!(resource.to_uri(), uri);
-    assert_eq!(resource.project(), Some("CAIRN"));
+    assert_eq!(resource.project(), Some("cairn"));
     assert_eq!(
         resource.to_route(),
         Some("/p/cairn/i/1498/1/builder/memories/2".to_string())
@@ -1496,15 +1496,15 @@ fn parses_and_round_trips_recipe_resources() {
             },
         ),
         (
-            "cairn://p/CAIRN/recipes",
+            "cairn://p/cairn/recipes",
             CairnResource::ProjectRecipes {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
             },
         ),
         (
-            "cairn://p/CAIRN/recipes/default-flow",
+            "cairn://p/cairn/recipes/default-flow",
             CairnResource::ProjectRecipe {
-                project: "CAIRN".to_string(),
+                project: "cairn".to_string(),
                 recipe_id: "default-flow".to_string(),
             },
         ),
@@ -1518,13 +1518,13 @@ fn parses_and_round_trips_recipe_resources() {
     assert_eq!(
         parse_uri("cairn://p/cairn/recipes"),
         Some(CairnResource::ProjectRecipes {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         })
     );
     assert_eq!(
         parse_uri("cairn://p/cairn/recipes/default-flow"),
         Some(CairnResource::ProjectRecipe {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             recipe_id: "default-flow".to_string(),
         })
     );
@@ -1532,11 +1532,11 @@ fn parses_and_round_trips_recipe_resources() {
     assert_eq!(CairnResource::Recipes.issue_number(), None);
     assert_eq!(
         CairnResource::ProjectRecipe {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             recipe_id: "x".to_string(),
         }
         .project(),
-        Some("CAIRN")
+        Some("cairn")
     );
     assert_eq!(CairnResource::Recipes.to_route(), None);
     assert_eq!(CairnResource::Recipes.kind(), ResourceKind::Recipes);
@@ -1548,14 +1548,14 @@ fn skill_resources_have_no_project_or_route() {
     assert_eq!(CairnResource::Skills.to_route(), None);
     assert_eq!(
         CairnResource::ProjectSkills {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         }
         .project(),
-        Some("CAIRN")
+        Some("cairn")
     );
     assert_eq!(
         CairnResource::ProjectSkill {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             skill_id: "ui".to_string(),
             path: vec![],
         }
@@ -1578,7 +1578,7 @@ fn every_resource_kind_round_trips_through_kind() {
     // kind() must agree with the table: every kind a resource reports has a contract.
     for resource in [
         CairnResource::Project {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         },
         CairnResource::Bug,
         CairnResource::Skills,
@@ -1587,7 +1587,7 @@ fn every_resource_kind_round_trips_through_kind() {
     }
     assert_eq!(
         CairnResource::Issue {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
         }
         .kind(),
@@ -1599,21 +1599,21 @@ fn every_resource_kind_round_trips_through_kind() {
 fn routes_only_navigate_supported_resources() {
     assert_eq!(
         CairnResource::Project {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         }
         .to_route(),
         Some("/p/cairn/issues".to_string())
     );
     assert_eq!(
         CairnResource::ProjectIssues {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
         }
         .to_route(),
         None
     );
     assert_eq!(
         CairnResource::ProjectTerminal {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             slug: "build".to_string(),
         }
         .to_route(),
@@ -1621,7 +1621,7 @@ fn routes_only_navigate_supported_resources() {
     );
     assert_eq!(
         CairnResource::NodeChatRaw {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             number: 1,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -1634,9 +1634,9 @@ fn routes_only_navigate_supported_resources() {
 #[test]
 fn browser_network_request_uris_round_trip_in_all_scopes() {
     let cases = [
-        "cairn://p/CAIRN/browser/default/network/realm-1",
-        "cairn://p/CAIRN/42/2/builder/browser/dev/network/realm_2.3~x",
-        "cairn://p/CAIRN/42/2/builder/task/review/browser/default/network/realm-4",
+        "cairn://p/cairn/browser/default/network/realm-1",
+        "cairn://p/cairn/42/2/builder/browser/dev/network/realm_2.3~x",
+        "cairn://p/cairn/42/2/builder/task/review/browser/default/network/realm-4",
     ];
     for uri in cases {
         let resource = parse_uri(uri).expect(uri);
@@ -1648,13 +1648,13 @@ fn browser_network_request_uris_round_trip_in_all_scopes() {
                 | ResourceKind::TaskBrowserNetworkRequest
         ));
     }
-    assert_eq!(parse_uri("cairn://p/CAIRN/browser/default/network/"), None);
+    assert_eq!(parse_uri("cairn://p/cairn/browser/default/network/"), None);
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/browser/default/network/not%2Fsafe"),
+        parse_uri("cairn://p/cairn/browser/default/network/not%2Fsafe"),
         None
     );
     assert_eq!(
-        parse_uri("cairn://p/CAIRN/browser/default/network/has space"),
+        parse_uri("cairn://p/cairn/browser/default/network/has space"),
         None
     );
 }
@@ -1664,11 +1664,11 @@ fn project_image_uri_round_trips_and_rejects_malformed_hashes() {
     let hash = "a".repeat(64);
     let uri = format!("cairn://p/cairn/images/{hash}");
     let parsed = parse_uri(&uri).unwrap();
-    assert_eq!(parsed.to_uri(), format!("cairn://p/CAIRN/images/{hash}"));
+    assert_eq!(parsed.to_uri(), format!("cairn://p/cairn/images/{hash}"));
     assert_eq!(parsed.kind(), ResourceKind::ProjectImage);
-    assert_eq!(parsed.project_key(), Some("CAIRN"));
-    assert!(parse_uri("cairn://p/CAIRN/images/abc").is_none());
-    assert!(parse_uri(&format!("cairn://p/CAIRN/images/{}", "A".repeat(64))).is_none());
+    assert_eq!(parsed.project_key(), Some("cairn"));
+    assert!(parse_uri("cairn://p/cairn/images/abc").is_none());
+    assert!(parse_uri(&format!("cairn://p/cairn/images/{}", "A".repeat(64))).is_none());
 }
 
 #[cfg(test)]
@@ -1680,7 +1680,7 @@ mod node_rebase_uri {
     /// resource is unreachable by the very name the wake tells agents to use.
     #[test]
     fn a_node_rebase_uri_round_trips() {
-        let uri = "cairn://p/CAIRN/3352/1/builder/rebase";
+        let uri = "cairn://p/cairn/3352/1/builder/rebase";
         let resource = parse_uri(uri).expect("parses");
         match &resource {
             CairnResource::NodeRebase {
@@ -1689,7 +1689,7 @@ mod node_rebase_uri {
                 exec_seq,
                 node_id,
             } => {
-                assert_eq!(project, "CAIRN");
+                assert_eq!(project, "cairn");
                 assert_eq!(*number, 3352);
                 assert_eq!(*exec_seq, 1);
                 assert_eq!(node_id, "builder");
@@ -1707,7 +1707,7 @@ mod node_rebase_uri {
     /// the segment is reserved everywhere a node sub-resource can appear.
     #[test]
     fn rebase_is_never_parsed_as_an_artifact() {
-        let resource = parse_uri("cairn://p/CAIRN/3352/1/builder/rebase").unwrap();
+        let resource = parse_uri("cairn://p/cairn/3352/1/builder/rebase").unwrap();
         assert!(
             !matches!(resource, CairnResource::NodeArtifact { .. }),
             "got {resource:?}"
@@ -1722,10 +1722,10 @@ fn response_uri_family_round_trips() {
         "cairn://responses/conveyor",
         "cairn://responses/conveyor/history",
         "cairn://responses/conveyor/history/7",
-        "cairn://p/CAIRN/responses",
-        "cairn://p/CAIRN/responses/conveyor",
-        "cairn://p/CAIRN/responses/conveyor/history",
-        "cairn://p/CAIRN/responses/conveyor/history/7",
+        "cairn://p/cairn/responses",
+        "cairn://p/cairn/responses/conveyor",
+        "cairn://p/cairn/responses/conveyor/history",
+        "cairn://p/cairn/responses/conveyor/history/7",
     ];
     for uri in cases {
         let parsed = parse_uri(uri).unwrap_or_else(|| panic!("failed to parse {uri}"));
@@ -1742,10 +1742,10 @@ fn route_uri_family_round_trips() {
         build_route_uri("notify-away"),
         build_route_history_uri("notify-away"),
         build_route_history_entry_uri("notify-away", 7),
-        build_project_routes_uri("CAIRN"),
-        build_project_route_uri("CAIRN", "notify-away"),
-        build_project_route_history_uri("CAIRN", "notify-away"),
-        build_project_route_history_entry_uri("CAIRN", "notify-away", 7),
+        build_project_routes_uri("cairn"),
+        build_project_route_uri("cairn", "notify-away"),
+        build_project_route_history_uri("cairn", "notify-away"),
+        build_project_route_history_entry_uri("cairn", "notify-away", 7),
     ];
     for uri in cases {
         let parsed = parse_uri(&uri).unwrap_or_else(|| panic!("failed to parse {uri}"));

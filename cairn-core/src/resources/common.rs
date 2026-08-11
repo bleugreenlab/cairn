@@ -173,7 +173,7 @@ pub(super) async fn lookup_project_by_key(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
 ) -> Result<ProjectContext, String> {
-    let key = project_key.to_uppercase();
+    let key = cairn_common::uri::canonical_project(project_key);
     let mut rows = conn
         .query(
             "SELECT id, key FROM projects WHERE key = ?1 LIMIT 1",
@@ -220,7 +220,7 @@ pub(super) async fn resolve_issue_id(
     let project_ctx = lookup_project_by_key(conn, project_key).await?;
     let issue_id = issue_id_for_number(conn, &project_ctx.project_id, number)
         .await
-        .ok_or_else(|| format!("Issue {}-{} not found", project_key, number))?;
+        .ok_or_else(|| format!("Issue {}/{} not found", project_key, number))?;
     Ok((project_ctx, issue_id))
 }
 
@@ -606,7 +606,7 @@ pub(crate) fn node_job_not_found_message(
             cairn_common::uri::build_thread_uri(project_key, name)
         ),
         cairn_common::uri::NodeAddress::Node { .. } => {
-            format!("Node '{node_name}' not found for issue {project_key}-{number}")
+            format!("Node '{node_name}' not found for issue {project_key}/{number}")
         }
     }
 }
@@ -1030,7 +1030,7 @@ pub(crate) async fn resolve_node_owner_id(
         return Ok(action_run.id);
     }
     Err(format!(
-        "Node '{}' not found for issue {}-{}",
+        "Node '{}' not found for issue {}/{}",
         node_name, project_key, number
     ))
 }

@@ -2,8 +2,8 @@
 
 use super::types::{CairnResource, ImageRef, PROJECT_SCOPE};
 
-pub(super) fn canonical_project(project: &str) -> String {
-    project.to_uppercase()
+pub fn canonical_project(project: impl AsRef<str>) -> String {
+    project.as_ref().to_lowercase()
 }
 
 pub fn build_project_check_observation_uri(project: &str, handle: &str) -> String {

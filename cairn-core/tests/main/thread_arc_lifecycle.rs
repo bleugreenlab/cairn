@@ -13,7 +13,8 @@
 //! - the arc is a living document: writing it auto-confirms and never arms the
 //!   turn-ending handoff a terminal artifact arms;
 //! - both patch forms work over it — appending one ruling by `payload.ruling`
-//!   (Cairn mints the slug) and replacing the array wholesale;
+//!   (Cairn mints the slug), editing one by slug, and replacing the array wholesale;
+//! - ruling operations compose atomically with ordinary arc field updates;
 //! - the schema is enforced, not merely resolvable.
 
 use crate::common;
@@ -100,6 +101,98 @@ fn slugs(arc: &Value) -> Vec<String> {
         .iter()
         .map(|ruling| ruling["slug"].as_str().expect("a minted slug").to_string())
         .collect()
+}
+
+#[tokio::test]
+async fn ruling_operations_compose_with_arc_field_updates_in_one_version() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let created = common::change_resource(
+        &orch,
+        write_to(
+            "create",
+            json!({
+                "current_intent": "Choose a pack identity.",
+                "rulings": [ruling("packs resolve by content hash", "accepted")],
+                "open_questions": []
+            }),
+        ),
+    )
+    .await;
+    assert!(created.contains("version 1"), "got: {created}");
+
+    let appended = common::change_resource(
+        &orch,
+        write_to(
+            "patch",
+            json!({
+                "ruling": ruling("published packs are immutable", "accepted"),
+                "current_intent": "Name packs without weakening immutability.",
+                "open_questions": [{"question": "who owns aliases?", "provenance": ["cairn://p/THR/2"]}]
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        appended.contains("version 2"),
+        "one mixed write must land one version: {appended}"
+    );
+    let arc = latest_arc(&db).await;
+    assert_eq!(
+        arc["current_intent"],
+        "Name packs without weakening immutability."
+    );
+    assert_eq!(arc["open_questions"].as_array().map(Vec::len), Some(1));
+    assert_eq!(arc["rulings"].as_array().map(Vec::len), Some(2));
+    let appended_slug = arc["rulings"][1]["slug"].as_str().expect("slug minted");
+
+    let edited = common::change_resource(
+        &orch,
+        write_to(
+            "patch",
+            json!({
+                "ruling_slug": appended_slug,
+                "patch": {"status": "superseded", "rationale": "Aliases now carry this responsibility"},
+                "current_intent": "Ship the alias model."
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        edited.contains("version 3"),
+        "one mixed edit must land one version: {edited}"
+    );
+    let arc = latest_arc(&db).await;
+    assert_eq!(arc["current_intent"], "Ship the alias model.");
+    assert_eq!(arc["rulings"][1]["status"], "superseded");
+
+    let ambiguous = common::change_resource(
+        &orch,
+        write_to(
+            "patch",
+            json!({
+                "ruling": ruling("a third decision", "accepted"),
+                "rulings": []
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        ambiguous.contains("both write the rulings array"),
+        "got: {ambiguous}"
+    );
+    assert!(
+        !ambiguous.contains("version 4"),
+        "ambiguous writes must not store a version: {ambiguous}"
+    );
+    assert_eq!(
+        latest_arc(&db).await,
+        arc,
+        "a refused write leaves v3 unchanged"
+    );
 }
 
 #[tokio::test]

@@ -523,7 +523,7 @@ async fn job_by_node_uri(
     node_id: &str,
     task_name: Option<&str>,
 ) -> Result<JobBranchContext, String> {
-    let project = project.to_uppercase();
+    let project = cairn_common::uri::canonical_project(project);
     let node_id = node_id.to_string();
     let task_name = task_name.map(ToOwned::to_owned);
     orch.db
@@ -582,7 +582,7 @@ async fn job_by_node_uri(
                     .transpose()?
                     .ok_or_else(|| {
                         crate::storage::DbError::Row(format!(
-                            "No job found for branch node URI '{project}-{number}/{exec_seq}/{node_id}'"
+                            "No job found for branch node URI '{project}/{number}/{exec_seq}/{node_id}'"
                         ))
                     })
             })

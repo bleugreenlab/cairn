@@ -2,19 +2,25 @@
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
 use tokio::sync::mpsc;
 
-static IMESSAGE_RUNTIME: OnceLock<Mutex<Option<Arc<imessage::IMessageProvider>>>> = OnceLock::new();
-static IMESSAGE_ROUTER_BLOCKER: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-static IMESSAGE_ADMISSION_STATE: OnceLock<Mutex<Option<(&'static str, String)>>> = OnceLock::new();
+static CHANNEL_RUNTIMES: OnceLock<Mutex<HashMap<&'static str, Arc<dyn ChannelProvider>>>> =
+    OnceLock::new();
+static ROUTER_BLOCKERS: OnceLock<Mutex<HashMap<&'static str, String>>> = OnceLock::new();
+static ADMISSION_STATES: OnceLock<Mutex<HashMap<&'static str, (&'static str, String)>>> =
+    OnceLock::new();
 static IMESSAGE_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static TELEGRAM_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static OPERATOR_PRESENCE_STATE: OnceLock<Mutex<OperatorPresenceState>> = OnceLock::new();
 static DESKTOP_ACTIVITY_STATE: OnceLock<Mutex<DesktopActivityState>> = OnceLock::new();
 static OPERATOR_PRESENCE_CHANGED: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static ROUTE_SUBMISSIONS: OnceLock<
-    Mutex<Option<mpsc::UnboundedSender<crate::routes::ChannelSubmission>>>,
+    Mutex<HashMap<&'static str, mpsc::UnboundedSender<crate::routes::ChannelSubmission>>>,
 > = OnceLock::new();
 const ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const ADMISSION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
@@ -27,9 +33,16 @@ struct AdmissionFailureReporter {
     suppressed: u64,
 }
 
+pub fn retry_telegram_admission() {
+    TELEGRAM_ADMISSION_WAKE
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_waiters();
+}
+
 fn route_submission_slot(
-) -> &'static Mutex<Option<mpsc::UnboundedSender<crate::routes::ChannelSubmission>>> {
-    ROUTE_SUBMISSIONS.get_or_init(|| Mutex::new(None))
+) -> &'static Mutex<HashMap<&'static str, mpsc::UnboundedSender<crate::routes::ChannelSubmission>>>
+{
+    ROUTE_SUBMISSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Hands a channel route to the optional external-channel runtime. Non-channel
@@ -37,19 +50,25 @@ fn route_submission_slot(
 pub fn submit_route(
     submission: crate::routes::ChannelSubmission,
 ) -> Result<(), Box<crate::routes::ChannelSubmission>> {
-    let sender = route_submission_slot()
+    let senders = route_submission_slot()
         .lock()
         .expect("route submission slot poisoned")
         .clone();
-    let Some(sender) = sender else {
+    if senders.is_empty() {
         return Err(Box::new(submission));
-    };
-    sender.send(submission).map_err(|error| {
-        *route_submission_slot()
-            .lock()
-            .expect("route submission slot poisoned") = None;
-        Box::new(error.0)
-    })
+    }
+    let mut delivered = false;
+    for (provider, sender) in senders {
+        if sender.send(submission.clone()).is_ok() {
+            delivered = true;
+        } else {
+            route_submission_slot()
+                .lock()
+                .expect("route submission slot poisoned")
+                .remove(provider);
+        }
+    }
+    delivered.then_some(()).ok_or(Box::new(submission))
 }
 
 fn resolve_presence_with_lock(
@@ -134,12 +153,8 @@ pub async fn operator_presence_status() -> OperatorPresenceStatus {
         .lock()
         .expect("channel runtime lock poisoned")
         .clone();
-    let presence = operator_presence(
-        runtime
-            .as_deref()
-            .map(|provider| provider as &dyn ChannelProvider),
-    )
-    .await;
+    let provider = runtime.get("imessage").or_else(|| runtime.values().next());
+    let presence = operator_presence(provider.map(|provider| provider.as_ref())).await;
     let mode = presence_state()
         .lock()
         .expect("operator presence state lock poisoned")
@@ -147,18 +162,26 @@ pub async fn operator_presence_status() -> OperatorPresenceStatus {
     OperatorPresenceStatus { mode, presence }
 }
 
-fn admission_state_slot() -> &'static Mutex<Option<(&'static str, String)>> {
-    IMESSAGE_ADMISSION_STATE.get_or_init(|| Mutex::new(None))
+fn admission_state_slot() -> &'static Mutex<HashMap<&'static str, (&'static str, String)>> {
+    ADMISSION_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn set_admission_state(state: Option<(&'static str, String)>) {
-    *admission_state_slot()
+fn set_admission_state(provider: &'static str, state: Option<(&'static str, String)>) {
+    let mut states = admission_state_slot()
         .lock()
-        .expect("channel admission state lock poisoned") = state;
+        .expect("channel admission state lock poisoned");
+    match state {
+        Some(state) => {
+            states.insert(provider, state);
+        }
+        None => {
+            states.remove(provider);
+        }
+    }
 }
 
-fn clear_admission_state() {
-    set_admission_state(None);
+fn clear_admission_state(provider: &'static str) {
+    set_admission_state(provider, None);
 }
 
 pub fn retry_admission() {
@@ -167,14 +190,22 @@ pub fn retry_admission() {
         .notify_waiters();
 }
 
-fn router_blocker_slot() -> &'static Mutex<Option<String>> {
-    IMESSAGE_ROUTER_BLOCKER.get_or_init(|| Mutex::new(None))
+fn router_blocker_slot() -> &'static Mutex<HashMap<&'static str, String>> {
+    ROUTER_BLOCKERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) fn set_router_blocker(error: Option<String>) {
-    *router_blocker_slot()
+pub(super) fn set_router_blocker(provider: &'static str, error: Option<String>) {
+    let mut blockers = router_blocker_slot()
         .lock()
-        .expect("channel router blocker lock poisoned") = error;
+        .expect("channel router blocker lock poisoned");
+    match error {
+        Some(error) => {
+            blockers.insert(provider, error);
+        }
+        None => {
+            blockers.remove(provider);
+        }
+    }
 }
 
 /// Why an outbound message exists. Direct operator responses remain conversation;
@@ -255,8 +286,8 @@ async fn supervise_admission<L, C, F, Fut, R, W, WFut>(
     }
 }
 
-fn runtime_slot() -> &'static Mutex<Option<Arc<imessage::IMessageProvider>>> {
-    IMESSAGE_RUNTIME.get_or_init(|| Mutex::new(None))
+fn runtime_slot() -> &'static Mutex<HashMap<&'static str, Arc<dyn ChannelProvider>>> {
+    CHANNEL_RUNTIMES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -400,13 +431,17 @@ fn classify_runtime_health(
     }
 }
 
-pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> ChannelRuntimeStatus {
+pub async fn runtime_status(
+    orch: &crate::orchestrator::Orchestrator,
+    provider_id: &'static str,
+) -> ChannelRuntimeStatus {
     let runtime = runtime_slot()
         .lock()
         .expect("channel runtime lock poisoned")
-        .clone();
+        .get(provider_id)
+        .cloned();
     let health = runtime.as_ref().map(|provider| provider.health());
-    let liveness = runtime.as_ref().map(|provider| provider.watch_liveness());
+    let liveness = runtime.as_ref().map(|provider| provider.liveness());
     let operator_presence = operator_presence(
         runtime
             .as_deref()
@@ -420,11 +455,13 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
     let router_blocker = router_blocker_slot()
         .lock()
         .expect("channel router blocker lock poisoned")
-        .clone();
+        .get(provider_id)
+        .cloned();
     let admission = admission_state_slot()
         .lock()
         .expect("channel admission state lock poisoned")
-        .clone();
+        .get(provider_id)
+        .cloned();
     let (state, detail) = if runtime.is_none() {
         admission
             .map(|(state, detail)| (state, Some(detail)))
@@ -432,7 +469,7 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
     } else {
         classify_runtime_health(health, router_blocker)
     };
-    let unsolicited_inbound = ledger::list_inbound(&orch.db.local, "imessage", 50)
+    let unsolicited_inbound = ledger::list_inbound(&orch.db.local, provider_id, 50)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -444,7 +481,7 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
         })
         .collect();
     ChannelRuntimeStatus {
-        provider: "imessage",
+        provider: provider_id,
         state,
         detail,
         feed_state: feed_state(liveness, chrono::Utc::now().timestamp()),
@@ -459,7 +496,7 @@ pub async fn runtime_status(orch: &crate::orchestrator::Orchestrator) -> Channel
 
 const RECEIPT_RECENCY_SECONDS: i64 = 5 * 60;
 
-fn feed_state(liveness: Option<imessage::WatchLiveness>, now: i64) -> &'static str {
+fn feed_state(liveness: Option<ChannelLiveness>, now: i64) -> &'static str {
     let Some(liveness) = liveness else {
         return "stopped";
     };
@@ -478,10 +515,12 @@ fn feed_state(liveness: Option<imessage::WatchLiveness>, now: i64) -> &'static s
 pub mod imessage;
 pub mod ledger;
 pub mod router;
+pub mod telegram;
 
 /// Starts the configured external channel service on runner hosts.
 pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
     crate::routes::spawn_attention_routes(orch.clone());
+    tokio::spawn(supervise_telegram(orch.clone()));
     tokio::spawn(async move {
         loop {
             let config = crate::config::settings::load_settings(&orch.config_dir)
@@ -490,10 +529,13 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
             if config.enabled && !config.to.trim().is_empty() {
                 if let Some(name) = config.executor.as_deref() {
                     if !orch.fleet.named_executor_is_connected(name) {
-                        set_admission_state(Some((
-                            "waitingForExecutor",
-                            format!("Waiting for executor `{name}` to attach"),
-                        )));
+                        set_admission_state(
+                            "imessage",
+                            Some((
+                                "waitingForExecutor",
+                                format!("Waiting for executor `{name}` to attach"),
+                            )),
+                        );
                         tokio::select! {
                             () = orch.fleet.wait_for_named_executor(name) => {},
                             () = IMESSAGE_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
@@ -511,7 +553,7 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
                     },
                     |config| spawn_imessage(orch.clone(), config),
                     |report| {
-                        set_admission_state(Some(("stopped", report.clone())));
+                        set_admission_state("imessage", Some(("stopped", report.clone())));
                         log::error!("{report}")
                     },
                     || {
@@ -539,9 +581,9 @@ pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
                     },
                 )
                 .await;
-                clear_admission_state();
+                clear_admission_state("imessage");
             } else {
-                clear_admission_state();
+                clear_admission_state("imessage");
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
         }
@@ -594,11 +636,12 @@ async fn spawn_imessage(
         executor.clone(),
         config.allow_from.clone(),
     ));
-    set_admission_state(None);
-    set_router_blocker(None);
-    *runtime_slot()
+    set_admission_state("imessage", None);
+    set_router_blocker("imessage", None);
+    runtime_slot()
         .lock()
-        .expect("channel runtime lock poisoned") = Some(provider.clone());
+        .expect("channel runtime lock poisoned")
+        .insert("imessage", provider.clone());
     let health_task = provider.spawn_health_monitor();
     let watch_provider = provider.clone();
     let cursor_db = orch.db.local.clone();
@@ -645,7 +688,9 @@ async fn spawn_imessage(
     tasks.extend(router::spawn(
         orch.clone(),
         provider.clone(),
-        config.clone(),
+        "imessage",
+        config.to.clone(),
+        config.route.clone(),
     ));
 
     loop {
@@ -658,18 +703,122 @@ async fn spawn_imessage(
                 task.abort();
             }
             executor.shutdown().await;
-            let mut runtime = runtime_slot()
+            runtime_slot()
                 .lock()
-                .expect("channel runtime lock poisoned");
-            if runtime
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &provider))
-            {
-                *runtime = None;
-            }
-            set_router_blocker(None);
+                .expect("channel runtime lock poisoned")
+                .remove("imessage");
+            set_router_blocker("imessage", None);
             return Ok(());
         }
+    }
+}
+
+async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
+    loop {
+        let config = crate::config::settings::load_settings(&orch.config_dir)
+            .channels
+            .telegram;
+        if !config.enabled {
+            clear_admission_state("telegram");
+            tokio::select! {
+                () = TELEGRAM_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+            }
+            continue;
+        }
+        let error = if config.chat_id.trim().is_empty() {
+            Some("Telegram channel requires a chat ID".to_string())
+        } else if config.chat_id.parse::<i64>().is_err() {
+            Some("Telegram chat ID must be a signed integer".to_string())
+        } else if config.allow_from.is_empty() {
+            Some("Telegram channel requires at least one allowed user ID".to_string())
+        } else {
+            None
+        };
+        let allowed = config
+            .allow_from
+            .iter()
+            .map(|id| id.parse::<u64>())
+            .collect::<Result<Vec<_>, _>>();
+        let token = crate::config::secrets::get_secret("channel/telegram", "BOT_TOKEN");
+        let validation = error
+            .or_else(|| {
+                allowed
+                    .as_ref()
+                    .err()
+                    .map(|_| "Telegram allowlist entries must be numeric user IDs".to_string())
+            })
+            .or_else(|| {
+                token
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                    .is_none()
+                    .then(|| "Telegram channel token is missing from the keychain".to_string())
+            });
+        if let Some(error) = validation {
+            set_admission_state("telegram", Some(("stopped", error)));
+            tokio::select! {
+                () = TELEGRAM_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+            }
+            continue;
+        }
+        let chat_id = config
+            .chat_id
+            .parse::<i64>()
+            .expect("validated Telegram chat ID");
+        let provider = telegram::TelegramProvider::new(
+            token.unwrap(),
+            teloxide::types::ChatId(chat_id),
+            allowed.unwrap(),
+        );
+        runtime_slot()
+            .lock()
+            .expect("channel runtime lock poisoned")
+            .insert("telegram", provider.clone());
+        clear_admission_state("telegram");
+        set_router_blocker("telegram", None);
+        let mut tasks = router::spawn(
+            orch.clone(),
+            provider.clone(),
+            "telegram",
+            config.chat_id.clone(),
+            config.route.clone(),
+        );
+        let mut polling = provider.start();
+        let mut polling_finished = false;
+        loop {
+            tokio::select! {
+                result = &mut polling => {
+                    polling_finished = true;
+                    log::warn!("Telegram polling stopped: {result:?}");
+                    break;
+                }
+                () = TELEGRAM_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {
+                    break;
+                }
+                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {
+                    let current = crate::config::settings::load_settings(&orch.config_dir).channels.telegram;
+                    if current != config { break; }
+                }
+            }
+        }
+        if !polling_finished {
+            polling.abort();
+            let _ = polling.await;
+        }
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+        runtime_slot()
+            .lock()
+            .expect("channel runtime lock poisoned")
+            .remove("telegram");
+        route_submission_slot()
+            .lock()
+            .expect("route submission slot poisoned")
+            .remove("telegram");
+        set_router_blocker("telegram", None);
     }
 }
 
@@ -757,6 +906,14 @@ pub struct PollSelectionChange {
     pub selected: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChannelLiveness {
+    pub active: bool,
+    pub started_at: Option<i64>,
+    pub last_receipt_at: Option<i64>,
+    pub last_receipt_rowid: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum ChannelHealth {
@@ -771,6 +928,9 @@ pub trait ChannelProvider: Send + Sync {
     async fn send(&self, message: &OutboundMessage) -> Result<SentIds, String>;
     fn subscribe(&self) -> mpsc::Receiver<InboundEvent>;
     fn health(&self) -> ChannelHealth;
+    fn liveness(&self) -> ChannelLiveness {
+        ChannelLiveness::default()
+    }
     /// Headless fallback for a provider running on the same console as the
     /// runner. Remotely placed providers must use the default Away result:
     /// service placement is never evidence of operator presence.
@@ -830,7 +990,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(operator_presence)]
     async fn presence_status_remains_operable_without_a_channel_runtime() {
-        assert!(runtime_slot().lock().unwrap().is_none());
+        assert!(runtime_slot().lock().unwrap().is_empty());
 
         set_operator_presence_mode(OperatorPresenceMode::Active);
         let active = operator_presence_status().await;
@@ -1069,9 +1229,9 @@ mod tests {
     #[test]
     fn not_runnable_transition_clears_waiting_or_stopped_admission_state() {
         for state in ["waitingForExecutor", "stopped"] {
-            set_admission_state(Some((state, "not runnable".into())));
-            clear_admission_state();
-            assert!(admission_state_slot().lock().unwrap().is_none());
+            set_admission_state("imessage", Some((state, "not runnable".into())));
+            clear_admission_state("imessage");
+            assert!(admission_state_slot().lock().unwrap().is_empty());
         }
     }
 
@@ -1095,7 +1255,7 @@ mod tests {
         assert_eq!(feed_state(None, now), "stopped");
         assert_eq!(
             feed_state(
-                Some(imessage::WatchLiveness {
+                Some(ChannelLiveness {
                     active: true,
                     started_at: Some(now - 10),
                     last_receipt_at: None,
@@ -1107,7 +1267,7 @@ mod tests {
         );
         assert_eq!(
             feed_state(
-                Some(imessage::WatchLiveness {
+                Some(ChannelLiveness {
                     active: true,
                     started_at: Some(now - 600),
                     last_receipt_at: Some(now - 10),
@@ -1119,7 +1279,7 @@ mod tests {
         );
         assert_eq!(
             feed_state(
-                Some(imessage::WatchLiveness {
+                Some(ChannelLiveness {
                     active: true,
                     started_at: Some(now - 600),
                     last_receipt_at: Some(now - 301),
