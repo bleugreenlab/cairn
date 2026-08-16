@@ -571,8 +571,8 @@ mod tests {
     #[test]
     fn the_restart_ledger_answers_per_terminal_and_forgets_on_request() {
         let state = PtyState::default();
-        let terminal = "cairn://p/CAIRN/1/1/builder/terminal/tests";
-        let sibling = "cairn://p/CAIRN/1/1/builder/terminal/dev";
+        let terminal = "cairn://p/cairn/1/1/builder/terminal/tests";
+        let sibling = "cairn://p/cairn/1/1/builder/terminal/dev";
 
         assert!(!state.terminal_restart_unsettled(terminal));
         state.note_terminal_restart(terminal);

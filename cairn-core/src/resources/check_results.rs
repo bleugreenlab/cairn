@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn miss_names_exact_coordinate_and_fresh_action() {
-        let body = render_miss("CAIRN", "main", "abc123", "rust-tests", "env123");
+        let body = render_miss("cairn", "main", "abc123", "rust-tests", "env123");
         assert!(body.contains("Resolved commit: abc123"));
         assert!(body.contains("Environment fingerprint: env123"));
         assert!(body.contains("Run the suite fresh"));
@@ -627,10 +627,10 @@ mod tests {
             param("limit", "2"),
         ])
         .unwrap();
-        let body = render_observation("CAIRN", "main", "target-commit", &query, &observation, None);
+        let body = render_observation("cairn", "main", "target-commit", &query, &observation, None);
         for expected in [
             "cached observation",
-            "Citation: [rust-tests@target-commi](cairn://p/CAIRN/check-results/target-commit?suite=rust-tests&environment=env-1)",
+            "Citation: [rust-tests@target-commi](cairn://p/cairn/check-results/target-commit?suite=rust-tests&environment=env-1)",
             "Resolved commit: target-commit",
             "Defined by commit: target-commit",
             "Source commit: source-commit",
@@ -660,7 +660,7 @@ mod tests {
         observation.source_defined_by_commit_sha = None;
         let query =
             parse_query(&[param("suite", "rust-tests"), param("environment", "env-1")]).unwrap();
-        let body = render_observation("CAIRN", "main", "target-commit", &query, &observation, None);
+        let body = render_observation("cairn", "main", "target-commit", &query, &observation, None);
         assert!(body.contains("Defined by commit: unrecorded (legacy row)"));
         assert!(body.contains("Source defined by commit: unrecorded (legacy row)"));
     }

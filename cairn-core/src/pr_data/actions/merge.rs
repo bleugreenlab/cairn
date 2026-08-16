@@ -362,7 +362,8 @@ fn default_landing_method(
 /// worktrees were based — stopping short of trusting the raw DB column the merge
 /// used to read directly.
 fn resolve_project_default_branch(repo_path: &str, stored_default: &str) -> String {
-    let config = crate::config::project_settings::load_project_settings(Path::new(repo_path));
+    let config =
+        crate::config::project_settings::load_project_settings_read_only(Path::new(repo_path));
     crate::config::project_settings::resolve_default_branch(&config, Some(stored_default))
 }
 
@@ -931,7 +932,7 @@ mod tests {
 
         // Coordinator child→integration PR (target ≠ default) stays local.
         let mut child = ctx.clone();
-        child.target_branch = "agent/CAIRN-1-coordinator-0".to_string();
+        child.target_branch = "agent/cairn-1-coordinator-0".to_string();
         assert!(!should_route_to_github(&child, "main"));
 
         // Workspace PRs stay on the local fold (keep-every-commit); memory-triage
@@ -1002,7 +1003,7 @@ mod tests {
     fn main_checkout_reconcile_runs_only_for_default_branch_advances() {
         assert!(should_reconcile_main_checkout_after_merge("main", "main"));
         assert!(!should_reconcile_main_checkout_after_merge(
-            "agent/CAIRN-1-coordinator-0",
+            "agent/cairn-1-coordinator-0",
             "main"
         ));
     }

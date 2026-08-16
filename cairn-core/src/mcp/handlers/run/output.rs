@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn cap_item_body_preserves_trailing_promoted_note() {
         let note = "Command still running; detached to \
-            cairn://p/CAIRN/1632/1/builder/terminal/run-1 — readable and killable there.";
+            cairn://p/cairn/1632/1/builder/terminal/run-1 — readable and killable there.";
         let body = format!("{}\n\n{}", "p".repeat(50_000), note);
         let capped = cap_item_body_tail_biased(&body, 4_000);
         assert!(capped.len() <= 4_000);

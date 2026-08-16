@@ -23,6 +23,28 @@ pub struct DispatchOutput {
     pub reminders: Vec<String>,
 }
 
+pub(crate) fn effective_read_target(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .get("uri")
+        .or_else(|| payload.get("path"))
+        .and_then(|value| value.as_str())
+}
+
+/// Explicit paging is deliberate navigation. It must never be suppressed by
+/// content dedup, even when the requested window happens to be unchanged.
+pub(crate) fn is_explicitly_paged_target(target: &str) -> bool {
+    cairn_common::query::split_target_query(target)
+        .map(|split| {
+            split.params.iter().any(|param| {
+                matches!(
+                    param.key.as_str(),
+                    "offset" | "limit" | "head_limit" | "char_offset"
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
 impl Sanitize for DispatchOutput {
     fn sanitize_observed(&mut self, sanitizer: &mut crate::security::Sanitizer<'_>) {
         sanitizer.text_in_place(&mut self.content);
@@ -356,6 +378,11 @@ async fn dispatch_with_dedup(
         return result;
     };
 
+    let target = effective_read_target(&request.payload);
+    if target.is_some_and(is_explicitly_paged_target) {
+        return result;
+    }
+
     let fp = call_fingerprint(&request.tool, &request.payload);
     let content_hash = hash_content(&result);
     match orch
@@ -366,12 +393,7 @@ async fn dispatch_with_dedup(
             count,
             distinct_dupes,
         } => {
-            let target = request
-                .payload
-                .get("uri")
-                .or_else(|| request.payload.get("path"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("this target");
+            let target = target.unwrap_or("this target");
             log::info!(
                 "flail_dedup: tool={} run={} count={} distinct_dupes={} target={}",
                 request.tool,
@@ -1132,6 +1154,33 @@ mod tests {
     }
 
     #[test]
+    fn explicit_paging_classification_uses_parsed_query_keys() {
+        for key in ["offset", "limit", "head_limit", "char_offset"] {
+            assert!(is_explicitly_paged_target(&format!("file:x?{key}=2")));
+            assert!(is_explicitly_paged_target(&format!("file:x?{key}=bad")));
+        }
+        assert!(!is_explicitly_paged_target("file:x?grep=offset=2"));
+        assert!(!is_explicitly_paged_target("file:x?branch=main"));
+        assert!(!is_explicitly_paged_target("file:x"));
+    }
+
+    #[test]
+    fn effective_read_target_prefers_uri_then_path() {
+        assert_eq!(
+            effective_read_target(&serde_json::json!({"uri":"cairn://x?limit=1","path":"file:y"})),
+            Some("cairn://x?limit=1")
+        );
+        assert_eq!(
+            effective_read_target(&serde_json::json!({"path":"file:y?offset=1"})),
+            Some("file:y?offset=1")
+        );
+        assert_eq!(
+            effective_read_target(&serde_json::json!({"paths":[]})),
+            None
+        );
+    }
+
+    #[test]
     fn hash_content_matches_identical_and_differs_on_change() {
         // Identical content hashes equal; changed content hashes differ. This is
         // the freshness signal content-aware dedup keys on.
@@ -1141,8 +1190,8 @@ mod tests {
 
     #[test]
     fn call_fingerprint_is_key_order_independent() {
-        let a = serde_json::json!({ "uri": "cairn://p/CAIRN/1", "full": true });
-        let b = serde_json::json!({ "full": true, "uri": "cairn://p/CAIRN/1" });
+        let a = serde_json::json!({ "uri": "cairn://p/cairn/1", "full": true });
+        let b = serde_json::json!({ "full": true, "uri": "cairn://p/cairn/1" });
         assert_eq!(
             call_fingerprint("read_resource", &a),
             call_fingerprint("read_resource", &b),
@@ -1176,10 +1225,10 @@ mod tests {
 
     #[test]
     fn build_dup_stub_is_content_unchanged_framed_with_target_and_count() {
-        let stub = build_dup_stub("read", "cairn://p/CAIRN/1", 2, 1);
+        let stub = build_dup_stub("read", "cairn://p/cairn/1", 2, 1);
         assert!(stub.starts_with("[duplicate call]"));
         assert!(stub.contains("call #2"));
-        assert!(stub.contains("cairn://p/CAIRN/1"));
+        assert!(stub.contains("cairn://p/cairn/1"));
         // Content-aware dedup re-executed and compared, so the stub truthfully
         // reports the content is unchanged since the earlier call.
         assert!(stub.to_lowercase().contains("unchanged"));
@@ -1220,15 +1269,15 @@ mod tests {
         );
         // Canonical node terminal URI.
         assert_eq!(
-            terminal_identity_and_slug("cairn://p/CAIRN/1/1/builder/terminal/build"),
+            terminal_identity_and_slug("cairn://p/cairn/1/1/builder/terminal/build"),
             Some((
-                "cairn://p/CAIRN/1/1/builder/terminal/build".to_string(),
+                "cairn://p/cairn/1/1/builder/terminal/build".to_string(),
                 "build".to_string()
             ))
         );
         // Non-terminal targets and deeper home-relative shapes are rejected.
         assert_eq!(terminal_identity_and_slug("file:src/lib.rs"), None);
-        assert_eq!(terminal_identity_and_slug("cairn://p/CAIRN/1"), None);
+        assert_eq!(terminal_identity_and_slug("cairn://p/cairn/1"), None);
         assert_eq!(terminal_identity_and_slug("cairn:~/terminal/a/b"), None);
         assert_eq!(terminal_identity_and_slug("cairn:~/todos"), None);
     }
@@ -1317,7 +1366,7 @@ mod tests {
         let orch = orch_with_tracked_turn("run-1", "turn-1").await;
         let req = terminal_read_request(
             "run-1",
-            serde_json::json!(["file:src/lib.rs", "cairn://p/CAIRN/1"]),
+            serde_json::json!(["file:src/lib.rs", "cairn://p/cairn/1"]),
         );
         for _ in 0..5 {
             assert!(nudge_for(&orch, &req).await.is_empty());
@@ -1346,7 +1395,7 @@ mod tests {
             .local
             .execute_script(
                 "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
-                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp',1,1);
                  INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
                  INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j','p','i','running','s',1,1);
                  INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at) VALUES('run-1','p','i','j','running',1,1);",
@@ -1357,7 +1406,7 @@ mod tests {
             &orch.db.local,
             "j",
             "process",
-            Some("cairn://p/P/1/1/builder/terminal/dev"),
+            Some("cairn://p/p/1/1/builder/terminal/dev"),
             Some(&["terminal_exit".to_string()]),
             "agent",
         )
@@ -1383,7 +1432,7 @@ mod tests {
             .local
             .execute_script(
                 "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
-                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp',1,1);
                  INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1);
                  INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j','p','i','running','s',1,1);
                  INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at) VALUES('run-1','p','i','j','running',1,1);",
@@ -1395,7 +1444,7 @@ mod tests {
             &orch.db.local,
             "j",
             "process",
-            Some("cairn://p/P/1/1/builder/terminal/axb"),
+            Some("cairn://p/p/1/1/builder/terminal/axb"),
             Some(&["terminal_exit".to_string()]),
             "agent",
         )

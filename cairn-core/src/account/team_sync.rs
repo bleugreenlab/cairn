@@ -250,7 +250,21 @@ pub async fn mint_cloud_object_grant(
         .map_err(|error| format!("Failed to request object grant: {error}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        return Err(format!("Object grant request failed ({status})"));
+        let body = response.text().await.unwrap_or_default();
+        let detail = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|body| {
+                body.get("code")
+                    .or_else(|| body.get("error"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned)
+            });
+        return Err(format!(
+            "Object grant request failed ({status}){}",
+            detail
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        ));
     }
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -404,6 +418,29 @@ mod tests {
         assert!(mint_team_sync_token(&client, "jwt", "t1", &api(base))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn object_grant_error_preserves_upstream_denial_detail() {
+        let base = mock_server(
+            "HTTP/1.1 403 Forbidden",
+            r#"{"error":"Not a member of this team"}"#,
+        );
+        let client = reqwest::Client::new();
+        let error = mint_cloud_object_grant(
+            &client,
+            "jwt",
+            "t1",
+            &"a".repeat(64),
+            CloudObjectOperation::Put,
+            Some(42),
+            &api(base),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("403 Forbidden"));
+        assert!(error.contains("Not a member of this team"));
     }
 
     #[tokio::test]

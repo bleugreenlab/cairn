@@ -393,16 +393,21 @@ async fn load_diff_coords(
 async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<DiffData> {
     let branch = coords.branch.as_deref()?;
     let repo = Path::new(&coords.repo_path);
-    let range =
-        match crate::diff::live_branch_range(&orch.config_dir, repo, branch, &coords.base_branch)
-            .await
-        {
-            Ok(range) => range,
-            Err(error) => {
-                log::debug!("node diff has no live range: {error}");
-                return None;
-            }
-        };
+    let range = match crate::diff::live_branch_range(
+        &orch.jj_binary_path,
+        &orch.config_dir,
+        repo,
+        branch,
+        &coords.base_branch,
+    )
+    .await
+    {
+        Ok(range) => range,
+        Err(error) => {
+            log::debug!("node diff has no live range: {error}");
+            return None;
+        }
+    };
     let (base, tip) = (range.base, range.tip);
     let store = ObjectStore::new(repo, None).ok()?;
     let patch = render_range_diff(&store, &base, &tip).ok()?;
@@ -1010,7 +1015,7 @@ mod tests {
             base_branch: "main".to_string(),
             fork_point: Some("0123456789abcdef".to_string()),
             current_revision: Some("fedcba9876543210".to_string()),
-            branch: Some("agent/CAIRN-42-builder".to_string()),
+            branch: Some("agent/cairn-42-builder".to_string()),
             commits_ahead: Some(1),
             rows,
             patch: None,
@@ -1041,8 +1046,8 @@ mod tests {
             vec![changed("src/lib.rs", "modified", None)],
         );
 
-        let rendered = render_summary("CAIRN", 42, 7, "sibling", &data);
-        let base = "cairn://p/CAIRN/42/7/sibling/diff";
+        let rendered = render_summary("cairn", 42, 7, "sibling", &data);
+        let base = "cairn://p/cairn/42/7/sibling/diff";
         assert!(rendered.contains(&format!("`{base}?view=patch&file=PATH`")));
         assert!(rendered.contains(&format!("`{base}?view=commits`")));
         assert!(rendered.contains(&format!("`{base}?view=patch`")));
@@ -1105,7 +1110,7 @@ mod tests {
             ],
         );
 
-        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        let rendered = render_symbols("cairn", 42, "builder", &data, None);
         assert!(rendered.contains("src/changed.rs\n1:pub fn changed()"));
         assert!(
             rendered.contains("src/changed.ts\n1:class ChangedTs"),
@@ -1124,7 +1129,7 @@ mod tests {
             vec![changed("../escape.rs", "modified", None)],
         );
 
-        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        let rendered = render_symbols("cairn", 42, "builder", &data, None);
         assert!(rendered.contains("source unavailable: invalid non-relative changed path"));
     }
 
@@ -1148,7 +1153,7 @@ mod tests {
             vec![changed("leak.rs", "modified", None)],
         );
 
-        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        let rendered = render_symbols("cairn", 42, "builder", &data, None);
         assert!(rendered.contains("source unavailable: live source is a symlink"));
         assert!(!rendered.contains("outside_secret"));
     }
@@ -1220,7 +1225,7 @@ mod tests {
             ],
         );
 
-        let rendered = render_symbols("CAIRN", 42, "builder", &data, None);
+        let rendered = render_symbols("cairn", 42, "builder", &data, None);
         assert!(rendered.contains("removed.rs\n(no current outline: file was removed)"));
         assert!(rendered.contains("notes.txt\n(no current outline: unsupported file grammar)"));
         assert!(
@@ -1250,7 +1255,7 @@ mod tests {
             .compile_matcher();
         filter_diff_data_by_glob(&mut data, &matcher);
 
-        let rendered = render_symbols("CAIRN", 42, "builder", &data, Some("legacy/**/*.rs"));
+        let rendered = render_symbols("cairn", 42, "builder", &data, Some("legacy/**/*.rs"));
         assert!(rendered.contains("src/new.rs\n1:pub fn renamed()"));
         assert!(!rendered.contains("legacy/selected.rs\n"));
     }
@@ -1316,8 +1321,8 @@ mod tests {
         );
 
         assert_eq!(
-            render_symbols("CAIRN", 42, "builder", &live, None),
-            render_symbols("CAIRN", 42, "builder", &archived, None)
+            render_symbols("cairn", 42, "builder", &live, None),
+            render_symbols("cairn", 42, "builder", &archived, None)
         );
     }
 
@@ -1332,9 +1337,9 @@ mod tests {
             rows,
         );
 
-        let symbols = render_symbols("CAIRN", 42, "builder", &data, None);
+        let symbols = render_symbols("cairn", 42, "builder", &data, None);
         assert!(symbols.contains("source unavailable: legacy cache records"));
-        let summary = render_summary("CAIRN", 42, 7, "builder", &data);
+        let summary = render_summary("cairn", 42, 7, "builder", &data);
         assert!(summary.contains("**1 files, +2 -1**"));
     }
 
@@ -1346,7 +1351,7 @@ mod tests {
             },
             Vec::new(),
         );
-        let rendered = render_symbols("CAIRN", 42, "builder", &data, Some("src/**/*.rs"));
+        let rendered = render_symbols("cairn", 42, "builder", &data, Some("src/**/*.rs"));
         assert!(rendered.contains("No changed files matched the symbols projection."));
         assert!(!rendered.contains("No structural outline entries were rendered"));
     }
@@ -1381,7 +1386,7 @@ mod tests {
         let jj = crate::jj::JjEnv::resolve(&bin, &home);
         let store = crate::jj::project_store_dir(&home, project.path());
         crate::jj::ensure_project_store(&jj, &store, project.path()).unwrap();
-        let branch = "agent/CAIRN-3150-builder";
+        let branch = "agent/cairn-3150-builder";
 
         let node = workspaces.path().join("node");
         crate::jj::add_workspace(&jj, &store, &node, branch, "main", None).unwrap();
@@ -1424,7 +1429,7 @@ mod tests {
         let orch = diff_orchestrator(home).await;
         seed_node(&orch, project.path().to_str().unwrap(), branch).await;
 
-        let summary = read_node_diff(&orch, "P", 1, 1, "builder", &[]).await;
+        let summary = read_node_diff(&orch, "p", 1, 1, "builder", &[]).await;
         assert!(
             summary.contains("**1 files, +1 -0**"),
             "the summary must be the branch's own work, not the base's landed traffic: {summary}"
@@ -1434,7 +1439,7 @@ mod tests {
 
         // File-scoped patch content is unaffected by the base change.
         let params = parse_query_params("view=patch&file=branch.rs").unwrap();
-        let patch = read_node_diff(&orch, "P", 1, 1, "builder", &params).await;
+        let patch = read_node_diff(&orch, "p", 1, 1, "builder", &params).await;
         assert!(patch.contains("+branch work"), "{patch}");
         assert!(!patch.contains("unrelated.rs"), "{patch}");
     }
@@ -1478,7 +1483,7 @@ mod tests {
                     .await?;
                     conn.execute(
                         "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                         VALUES ('proj','ws','p','P',?1,'main',1,1)",
+                         VALUES ('proj','ws','P','p',?1,'main',1,1)",
                         (repo_path.as_str(),),
                     )
                     .await?;

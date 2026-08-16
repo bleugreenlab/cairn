@@ -1,0 +1,12 @@
+[package]
+name = "cairn-tokenize"
+version.workspace = true
+edition = "2021"
+license = "BUSL-1.1"
+description = "Offline Claude token count estimator derived from ctok"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-general-category = "1"
+unicode-normalization = "0.1"

@@ -234,7 +234,7 @@ mod tests {
             team_db.execute_script(&format!(
                 "INSERT INTO teams(id,name,sync_url,replica_path,created_at) VALUES('{TEAM_ID}','Team','http://sync','/tmp/team.db',1);
                  INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+                 INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Project','proj','/tmp/repo',1,1);
                  INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('{ISSUE_ID}','p',7,'Fix the thing','waiting','active','needs_authorization',1,2);"
             )).await.unwrap();
             dbs.insert_team_db_for_test(TEAM_ID, team_db).await;
@@ -259,9 +259,9 @@ mod tests {
     fn permission_event(issue_id: &str) -> AttentionEvent {
         AttentionEvent {
             issue_id: issue_id.to_string(),
-            issue_uri: "cairn://p/PROJ/7".to_string(),
+            issue_uri: "cairn://p/proj/7".to_string(),
             fact: AttentionFact::Permission {
-                detail_uri: "cairn://p/PROJ/7/1/builder/permissions/p1".to_string(),
+                detail_uri: "cairn://p/proj/7/1/builder/permissions/p1".to_string(),
                 content: super::super::attention::PermissionContent {
                     tool_name: "run".to_string(),
                     tool_use_id: "tool-1".to_string(),
@@ -293,11 +293,11 @@ mod tests {
             let recorded = calls.lock().unwrap();
             assert_eq!(recorded.len(), 1);
             assert_eq!(recorded[0].team_id, TEAM_ID);
-            assert_eq!(recorded[0].project_key, "PROJ");
+            assert_eq!(recorded[0].project_key, "proj");
             assert_eq!(recorded[0].issue_number, 7);
             assert_eq!(recorded[0].kind, "permission");
-            assert_eq!(recorded[0].title, "PROJ-7 needs permission approval");
-            assert_eq!(recorded[0].body, "PROJ-7: Fix the thing");
+            assert_eq!(recorded[0].title, "proj/7 needs permission approval");
+            assert_eq!(recorded[0].body, "proj/7: Fix the thing");
         }
 
         let mut reentered = permission_event(ISSUE_ID);
@@ -312,9 +312,9 @@ mod tests {
         let (orch, calls, called) = setup(true, false).await;
         let event = AttentionEvent {
             issue_id: ISSUE_ID.to_string(),
-            issue_uri: "cairn://p/PROJ/7".to_string(),
+            issue_uri: "cairn://p/proj/7".to_string(),
             fact: AttentionFact::AgentIdleWithWork {
-                detail_uri: "cairn://p/PROJ/7/1/builder/pr".to_string(),
+                detail_uri: "cairn://p/proj/7/1/builder/pr".to_string(),
             },
             attention: IssueAttention::None,
             status: IssueStatus::Active,
@@ -326,7 +326,7 @@ mod tests {
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].kind, "finished");
-        assert_eq!(calls[0].title, "PROJ-7 finished and is ready for review");
+        assert_eq!(calls[0].title, "proj/7 finished and is ready for review");
     }
 
     #[tokio::test]

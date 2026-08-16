@@ -158,7 +158,7 @@ mod tests {
             "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3849/api/mcp",
             None,
-            Some("cairn://p/CAIRN/42/1/builder"),
+            Some("cairn://p/cairn/42/1/builder"),
             "dev",
             None,
             "verbose",
@@ -167,7 +167,7 @@ mod tests {
         let env = &config["mcpServers"]["cairn"]["env"];
         assert_eq!(
             env["CAIRN_HOME_URI"].as_str().unwrap(),
-            "cairn://p/CAIRN/42/1/builder"
+            "cairn://p/cairn/42/1/builder"
         );
         assert_eq!(env["CAIRN_ENV"].as_str().unwrap(), "dev");
     }
@@ -178,7 +178,7 @@ mod tests {
             "/usr/bin/cairn-cmd",
             3849,
             None,
-            Some("cairn://p/CAIRN/1/1/planner/task/agent-spawn"),
+            Some("cairn://p/cairn/1/1/planner/task/agent-spawn"),
             "prod",
             None,
             "standard",
@@ -187,7 +187,7 @@ mod tests {
             "/usr/bin/cairn-cmd",
             3849,
             None,
-            Some("cairn://p/CAIRN/1/1/planner/task/planbuild-recipe"),
+            Some("cairn://p/cairn/1/1/planner/task/planbuild-recipe"),
             "prod",
             None,
             "standard",
@@ -199,7 +199,7 @@ mod tests {
             parsed["mcpServers"]["cairn"]["env"]["CAIRN_HOME_URI"]
                 .as_str()
                 .unwrap(),
-            "cairn://p/CAIRN/1/1/planner/task/agent-spawn"
+            "cairn://p/cairn/1/1/planner/task/agent-spawn"
         );
         assert_ne!(a, b);
     }

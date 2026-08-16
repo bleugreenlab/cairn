@@ -411,8 +411,9 @@ async fn default_branch_for_project(
 
     // The project-config `defaultBranch` override wins over the stored column,
     // so branch preparation and the UI share one base coordinate.
-    let config =
-        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let config = crate::config::project_settings::load_project_settings_read_only(
+        std::path::Path::new(&repo_path),
+    );
     Ok(crate::config::project_settings::resolve_default_branch(
         &config,
         stored_default_branch.as_deref(),
@@ -498,7 +499,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'trunk', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'trunk', 1, 1)",
                     (),
                 )
                 .await?;
@@ -524,7 +525,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -575,7 +576,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'trunk', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'trunk', 1, 1)",
                     (),
                 )
                 .await?;
@@ -607,7 +608,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -659,7 +660,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -712,7 +713,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -771,7 +772,7 @@ mod tests {
                 // Stored column is the stale "main"; the config override should win.
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', ?1, 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', ?1, 'main', 1, 1)",
                     (repo_path.as_str(),),
                 )
                 .await?;

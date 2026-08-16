@@ -22,7 +22,7 @@ async fn seeded_orch() -> Orchestrator {
         .execute_script(
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
              INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at)
-             VALUES ('p','w','P','PRJ','/tmp/p',1,1);",
+             VALUES ('p','w','P','prj','/tmp/p',1,1);",
         )
         .await
         .unwrap();
@@ -50,7 +50,7 @@ fn request() -> McpCallbackRequest {
 
 fn patch(payload: serde_json::Value) -> ChangeItem {
     ChangeItem {
-        target: "cairn://p/PRJ/roadmap".to_string(),
+        target: "cairn://p/prj/roadmap".to_string(),
         mode: ChangeMode::Patch,
         payload: Some(payload),
     }
@@ -191,7 +191,7 @@ async fn a_retired_title_is_refused_on_both_create_and_patch() {
     );
 
     let create = ChangeItem {
-        target: "cairn://p/PRJ/threads".to_string(),
+        target: "cairn://p/prj/threads".to_string(),
         mode: ChangeMode::Append,
         payload: Some(serde_json::json!({ "name": "planning", "title": "Planning" })),
     };

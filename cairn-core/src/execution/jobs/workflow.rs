@@ -77,7 +77,7 @@ pub(crate) fn prepare_workflow_run(
     input: CreateWorkflowRunInput,
 ) -> Result<PreparedWorkflowRun, String> {
     // Resolve the durable branch coordinate. No workflow owns or shares a checkout.
-    let (db, project_id, issue_id, execution_id, anchor_branch, inherited_head) =
+    let (db, project_id, issue_id, thread_id, execution_id, anchor_branch, inherited_head) =
         match input.parent_job_id.clone() {
             Some(parent_job_id) => {
                 let db = run_db({
@@ -102,6 +102,7 @@ pub(crate) fn prepare_workflow_run(
                     db,
                     parent_job.project_id.clone(),
                     parent_job.issue_id.clone(),
+                    parent_job.thread_id.clone(),
                     execution_id,
                     parent_job.branch.clone().or(parent_job.base_branch.clone()),
                     parent_job.base_commit.clone(),
@@ -132,6 +133,7 @@ pub(crate) fn prepare_workflow_run(
                     db,
                     project_id,
                     input.issue_id.clone(),
+                    None,
                     Some(execution_id),
                     input.base_branch.clone(),
                     None,
@@ -207,6 +209,7 @@ pub(crate) fn prepare_workflow_run(
             "insert",
             &job_id,
             issue_id.as_deref(),
+            thread_id.as_deref(),
             execution_id.as_deref(),
             input.parent_job_id.as_deref(),
             None,
@@ -827,7 +830,7 @@ pub struct LaunchedWorkflow {
 /// The anchor is an **issue** (not a recipe-style issue-less manual execution)
 /// because a workflow's harness resolves `cairn:~/` through `lookup_home_uri`,
 /// which needs an issue NUMBER to build the node URI
-/// (`cairn://p/PROJ/N/EXEC/NODE`). Recipe agent nodes tolerate an issue-less
+/// (`cairn://p/proj/N/EXEC/NODE`). Recipe agent nodes tolerate an issue-less
 /// execution; a workflow's node addressability does not. The tradeoff (a
 /// lightweight issue per ad-hoc run) is the honest cost of reusing the
 /// issue-anchored execution model rather than inventing a parallel surface.
@@ -904,6 +907,11 @@ pub async fn launch_standalone_workflow(
             backend_override: None,
             label_ids: None,
         },
+        crate::issues::crud::installation_machine_authorship(
+            orch.anon_device_manager.device_id(),
+            orch.services.clock.now(),
+        )
+        .map_err(|error| error.to_string())?,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1086,7 +1094,7 @@ mod redispatch_tests {
             workflow_id: "deep-research".to_string(),
             project_id: "p".to_string(),
             execution_id: Some("e".to_string()),
-            anchor_branch: Some("agent/PRJ-9-parent".to_string()),
+            anchor_branch: Some("agent/prj-9-parent".to_string()),
             branch_mode: "inherit".to_string(),
             package_path: "/wf".to_string(),
             script_path: "/wf/main.ts".to_string(),
@@ -1117,7 +1125,7 @@ mod redispatch_tests {
             // FK chain: workspace -> project -> issue -> execution -> job ->
             // session, then the crashed run + orphaned turns.
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',4,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-wf','e','i','p','running','flow','Flow','workflow',1,1)",
@@ -1165,7 +1173,7 @@ mod redispatch_tests {
     async fn seed_chain(db: &LocalDb) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',9,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
         ] {
@@ -1278,7 +1286,7 @@ mod redispatch_tests {
         assert_eq!(rows[0].script_path, "/wf/main.ts");
         assert_eq!(rows[0].project_id, "p");
         assert_eq!(rows[0].execution_id.as_deref(), Some("e"));
-        assert_eq!(rows[0].anchor_branch.as_deref(), Some("agent/PRJ-9-parent"));
+        assert_eq!(rows[0].anchor_branch.as_deref(), Some("agent/prj-9-parent"));
         assert_eq!(rows[0].branch_mode, "inherit");
         assert_eq!(rows[0].package_path, "/wf");
         assert_eq!(rows[0].args_json, "{\"q\":1}");
@@ -1379,7 +1387,7 @@ mod redispatch_tests {
         .unwrap();
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i','p',3,'T','active','none',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','workflow-fan-out','i','p','running',1,1)",
         ] {

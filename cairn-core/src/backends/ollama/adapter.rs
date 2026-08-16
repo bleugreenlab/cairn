@@ -1,9 +1,8 @@
 use super::{ollama_host_for_model_in_project, OLLAMA_BACKEND_KEY, OLLAMA_BACKEND_NAME};
-use crate::backends::http_loop::{
-    render_tool_result, repair, Connection, Generation, TurnToolCall, WireAdapter,
-};
+use crate::backends::http_loop::{render_tool_result, Connection, Generation, WireAdapter};
+use crate::backends::openai_compat::generation::into_generation;
 use crate::backends::openai_compat::http::{post_chat_completion_streaming, Endpoint};
-use crate::backends::openai_compat::wire::{ChatContent, ChatMessage, ChatResponse};
+use crate::backends::openai_compat::wire::{ChatContent, ChatMessage};
 use crate::backends::openai_compat::{context, conversation};
 use crate::backends::SessionConfig;
 use crate::backends::{
@@ -162,75 +161,24 @@ impl WireAdapter for OllamaAdapter {
         cancel: &Arc<AtomicBool>,
     ) -> Result<Generation<ChatMessage>, String> {
         let body = json!({"model": model, "messages": outgoing, "tools": crate::backends::openai_compat::tool_schemas(), "tool_choice": "auto", "stream": true, "stream_options": {"include_usage": true}});
-        into_generation(post_chat_completion_streaming(
-            orch,
-            run_db,
-            &self.endpoint,
-            body,
-            run_id,
-            session_id,
-            turn_id,
-            cancel,
-        )?)
+        into_generation(
+            post_chat_completion_streaming(
+                orch,
+                run_db,
+                &self.endpoint,
+                body,
+                run_id,
+                session_id,
+                turn_id,
+                cancel,
+            )?,
+            OLLAMA_BACKEND_NAME,
+        )
     }
     fn render_tool_result_message(&self, id: &str, output: DispatchOutput) -> ChatMessage {
         ChatMessage::tool(id.to_string(), render_tool_result(output))
     }
 }
-fn into_generation(response: ChatResponse) -> Result<Generation<ChatMessage>, String> {
-    let ChatResponse {
-        id,
-        model,
-        choices,
-        usage,
-        streamed_text,
-        finish_reason,
-    } = response;
-    let Some(choice) = choices.into_iter().next() else {
-        return Err("Ollama response did not include choices".to_string());
-    };
-    let mut assistant_message = choice.message;
-    if let Some(calls) = assistant_message.tool_calls.as_mut() {
-        for call in calls {
-            if let Some(verb) = repair::normalize_tool_name(&call.function.name) {
-                call.function.name = verb.to_string();
-            }
-        }
-    }
-    let assistant_text = assistant_message
-        .content
-        .as_ref()
-        .and_then(ChatContent::as_text)
-        .unwrap_or_default()
-        .to_string();
-    let tool_calls = assistant_message
-        .tool_calls
-        .as_ref()
-        .map(|calls| {
-            calls
-                .iter()
-                .map(|call| TurnToolCall {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let reasoning_details = assistant_message.reasoning_details.clone();
-    Ok(Generation {
-        assistant_message,
-        assistant_text,
-        tool_calls,
-        reasoning_details,
-        usage,
-        finish_reason,
-        generation_id: id,
-        response_model: model,
-        streamed_text,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

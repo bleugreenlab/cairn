@@ -452,7 +452,7 @@ mod tests {
                 Box::pin(async move {
                     conn.execute(
                         "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                         VALUES ('p1', 'default', 'Proj', 'PROJ', ?1, 1, 1, 0)",
+                         VALUES ('p1', 'default', 'Proj', 'proj', ?1, 1, 1, 0)",
                         (repo_path.as_str(),),
                     )
                     .await?;
@@ -473,7 +473,7 @@ mod tests {
             id: "planner".to_string(),
         };
         let mut settings =
-            crate::config::project_settings::load_project_settings(project_dir.path());
+            crate::config::project_settings::load_project_settings_read_only(project_dir.path());
         settings
             .contextual_packages
             .get_or_insert_default()
@@ -487,7 +487,7 @@ mod tests {
             .any(|a| a.id == "planner"));
 
         let mut settings =
-            crate::config::project_settings::load_project_settings(project_dir.path());
+            crate::config::project_settings::load_project_settings_read_only(project_dir.path());
         settings
             .contextual_packages
             .get_or_insert_default()

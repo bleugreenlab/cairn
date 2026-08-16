@@ -14,6 +14,9 @@ use crate::models::{ExecutionSnapshot, Fence, TurnStartReason, TurnState, TurnYi
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::authorization::AuthorityLifetimeKind;
+use cairn_common::identity::{
+    AppearanceSnapshot, AppearanceTransport, PrincipalPosition, PrincipalRef,
+};
 use cairn_common::ids;
 use cairn_db::turso::params;
 
@@ -36,6 +39,61 @@ pub(crate) enum PermissionWait {
     /// Inline budget expired or the channel closed; the run was durably
     /// suspended (no auto-deny). Resume continues from the real answer.
     Suspended,
+    /// The prompt could not be persisted, so no answerable request exists. This
+    /// fails the operation closed without pretending that a human denied it.
+    Unavailable(String),
+}
+
+pub(super) async fn retire_outer_run_batch_waits(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+    tool_use_id: &str,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
+         WHERE run_id=?1 AND tool_use_id=?2 AND state IN ('pending','resolving') \
+         AND successor_turn_id IS NULL AND result_stored_at IS NULL",
+        params![
+            run_id,
+            tool_use_id,
+            r#"{"outcome":"transferred_to_permission"}"#,
+            chrono::Utc::now().timestamp_millis()
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+pub(crate) fn recovered_permission_answer(
+    decision: PermissionDecision,
+    provenance: &crate::channels::ledger::AskResolution,
+) -> Result<PermissionAnswer, String> {
+    let transport =
+        serde_json::from_value(serde_json::Value::String(provenance.winner_surface.clone()))
+            .map_err(|error| {
+                format!(
+                    "invalid stored permission winner surface {:?}: {error}",
+                    provenance.winner_surface
+                )
+            })?;
+    let surface = AnswerSurface::from_transport(transport)?;
+    let mut answer = PermissionAnswer::from_surface(decision, surface)
+        .with_containment_scope(PermissionScope::Once);
+    answer.provenance_resolution_id = Some(provenance.resolution_id.clone());
+    if !provenance.winner_actor.is_empty() {
+        answer = answer.with_actor(provenance.winner_actor.clone());
+    }
+
+    if transport == AppearanceTransport::ChannelReply
+        && !provenance.winner_provider.is_empty()
+        && !provenance.winner_conversation.is_empty()
+    {
+        answer = answer.with_channel(
+            provenance.winner_provider.clone(),
+            provenance.winner_conversation.clone(),
+        );
+    }
+    Ok(answer)
 }
 
 /// Shared suspend primitive for permission requests — the legacy tool prompt and
@@ -164,6 +222,11 @@ pub(crate) async fn await_permission_decision(
                 )
                 .await?;
 
+                // The permission row is now the durable owner of this exact tool
+                // call. Retire an outer run-batch wait in the same transaction so
+                // no serialization order can leave two continuation owners.
+                retire_outer_run_batch_waits(conn, &run_id, &tool_use_id).await?;
+
                 let yielded_turn = if let Some(ref turn_id) = current_turn_id {
                     match yield_turn_for_host(conn, turn_id, TurnYieldReason::Permission).await {
                         Ok(yielded) => yielded,
@@ -201,10 +264,9 @@ pub(crate) async fn await_permission_decision(
     {
         Ok(values) => values,
         Err(e) => {
-            return PermissionWait::Decided(deny_response(&format!(
-                "Failed to store request: {}",
-                e
-            )))
+            return PermissionWait::Unavailable(format!(
+                "permission service unavailable: failed to store request: {e}"
+            ))
         }
     };
 
@@ -415,7 +477,7 @@ async fn emit_permission_attention(
                 &detail_uri,
                 crate::orchestrator::attention_push::Wake::Wake,
                 crate::orchestrator::attention_push::Boundary::Event,
-                &format!("permission:{issue_uri}"),
+                &format!("permission:{detail_uri}"),
             )
             .await
             {
@@ -612,6 +674,36 @@ impl AnswerSurface {
             AnswerSurface::LocalInvoke => "local_invoke",
         }
     }
+
+    /// Reconstruct a non-authoritative answering surface from durable
+    /// appearance provenance. Authenticated transports are deliberately not
+    /// recoverable from their label alone: recreating an operator answer
+    /// requires the original verified [`OperatorApproval`].
+    pub fn from_transport(transport: AppearanceTransport) -> Result<Self, String> {
+        match transport {
+            AppearanceTransport::ResourcePatch => Ok(Self::ResourcePatch),
+            AppearanceTransport::ChannelReply => Ok(Self::ChannelReply),
+            AppearanceTransport::RemoteIntent => Ok(Self::RemoteIntent),
+            AppearanceTransport::NonOperatorInvoke => Ok(Self::NonOperatorInvoke),
+            AppearanceTransport::LocalInvoke => Ok(Self::LocalInvoke),
+            AppearanceTransport::AuthenticatedOperator
+            | AppearanceTransport::AuthenticatedDesktop => Err(format!(
+                "cannot reconstruct {transport:?} permission authority without verified operator approval"
+            )),
+        }
+    }
+}
+
+impl From<AnswerSurface> for AppearanceTransport {
+    fn from(value: AnswerSurface) -> Self {
+        match value {
+            AnswerSurface::ResourcePatch => Self::ResourcePatch,
+            AnswerSurface::ChannelReply => Self::ChannelReply,
+            AnswerSurface::RemoteIntent => Self::RemoteIntent,
+            AnswerSurface::NonOperatorInvoke => Self::NonOperatorInvoke,
+            AnswerSurface::LocalInvoke => Self::LocalInvoke,
+        }
+    }
 }
 
 /// How far an answer's claim to be the operator has actually been checked.
@@ -649,16 +741,20 @@ impl OperatorTransport {
         }
     }
 
-    /// The issuer this transport is journaled as. Both variants are real
-    /// verifications — one of a person, one of the desktop process — so both
-    /// are recorded as `operator_prompt`. An answer that verified neither never
-    /// becomes an [`OperatorApproval`] at all; it stays an [`AnswerSurface`]
-    /// and is journaled as the surface it actually came from.
     pub fn issuer(self) -> &'static str {
         match self {
             OperatorTransport::AuthenticatedOperator | OperatorTransport::AuthenticatedDesktop => {
                 OPERATOR_PROMPT_ISSUER
             }
+        }
+    }
+}
+
+impl From<OperatorTransport> for AppearanceTransport {
+    fn from(value: OperatorTransport) -> Self {
+        match value {
+            OperatorTransport::AuthenticatedOperator => Self::AuthenticatedOperator,
+            OperatorTransport::AuthenticatedDesktop => Self::AuthenticatedDesktop,
         }
     }
 }
@@ -682,40 +778,30 @@ impl OperatorTransport {
 /// previous shape let any caller flip a `&'static str` field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperatorApproval {
-    operator: String,
-    transport: OperatorTransport,
+    actor: PrincipalRef,
+    appearance: AppearanceSnapshot,
 }
 
 impl OperatorApproval {
-    /// Build an operator capability from an identity the caller **authenticated**.
-    ///
-    /// Fails closed on an identity that is missing or blank: a grant has to be
-    /// attributable to someone, and "approved by nobody in particular" is not an
-    /// audit trail. Callers that cannot establish who the operator is must
-    /// refuse the answer rather than pass a placeholder.
     pub fn authenticated(
-        operator: impl Into<String>,
-        transport: OperatorTransport,
+        actor: PrincipalRef,
+        appearance: AppearanceSnapshot,
     ) -> Result<Self, String> {
-        let operator = operator.into().trim().to_string();
-        if operator.is_empty() {
-            return Err(
-                "an authority approval requires an authenticated operator identity".to_string(),
-            );
+        actor
+            .validate_at(PrincipalPosition::DecisionActor)
+            .map_err(|error| error.to_string())?;
+        appearance.validate().map_err(|error| error.to_string())?;
+        if appearance.principal() != &actor {
+            return Err("the approval actor must equal the appearance principal".to_string());
         }
-        Ok(Self {
-            operator,
-            transport,
-        })
+        Ok(Self { actor, appearance })
     }
 
-    /// The authenticated operator this approval is attributable to.
-    pub fn operator(&self) -> &str {
-        &self.operator
+    pub fn actor(&self) -> &PrincipalRef {
+        &self.actor
     }
-
-    pub fn transport(&self) -> OperatorTransport {
-        self.transport
+    pub fn appearance(&self) -> &AppearanceSnapshot {
+        &self.appearance
     }
 }
 
@@ -723,7 +809,7 @@ impl OperatorApproval {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answerer {
     /// An authenticated operator. The only answerer that can mint authority.
-    Operator(OperatorApproval),
+    Operator(Box<OperatorApproval>),
     /// Any other surface. May deny or cancel anything, and may allow a
     /// containment crossing, but never mints an authority grant.
     Surface(AnswerSurface),
@@ -754,6 +840,14 @@ pub struct PermissionAnswer {
     /// Optional absolute expiry (unix seconds) for the minted grant.
     pub expires_at: Option<i64>,
     answerer: Answerer,
+    authenticated_appearance: Option<(PrincipalRef, AppearanceSnapshot)>,
+    /// Compatibility representation for admitted channel/resource principals.
+    /// Structured as provider/namespace/id so it can be wrapped as
+    /// `PrincipalRef::External` without a data migration.
+    provenance_actor: Option<String>,
+    provenance_provider: Option<String>,
+    provenance_conversation: Option<String>,
+    provenance_resolution_id: Option<String>,
 }
 
 impl PermissionAnswer {
@@ -764,7 +858,12 @@ impl PermissionAnswer {
             scope: PermissionScope::Once,
             lifetime: None,
             expires_at: None,
-            answerer: Answerer::Operator(approval),
+            answerer: Answerer::Operator(Box::new(approval)),
+            authenticated_appearance: None,
+            provenance_actor: None,
+            provenance_provider: None,
+            provenance_conversation: None,
+            provenance_resolution_id: None,
         }
     }
 
@@ -776,7 +875,86 @@ impl PermissionAnswer {
             lifetime: None,
             expires_at: None,
             answerer: Answerer::Surface(surface),
+            authenticated_appearance: None,
+            provenance_actor: None,
+            provenance_provider: None,
+            provenance_conversation: None,
+            provenance_resolution_id: None,
         }
+    }
+
+    pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
+        self.provenance_actor = Some(actor.into());
+        self
+    }
+
+    pub fn with_channel(
+        mut self,
+        provider: impl Into<String>,
+        conversation: impl Into<String>,
+    ) -> Self {
+        self.provenance_provider = Some(provider.into());
+        self.provenance_conversation = Some(conversation.into());
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn channel_provenance(&self) -> (Option<&str>, Option<&str>) {
+        (
+            self.provenance_provider.as_deref(),
+            self.provenance_conversation.as_deref(),
+        )
+    }
+
+    pub(crate) fn resolution_provenance(
+        &self,
+    ) -> Result<(String, AppearanceTransport, String, Option<String>), String> {
+        let transport: AppearanceTransport = match &self.answerer {
+            Answerer::Operator(approval) => approval.appearance().evidence().transport,
+            Answerer::Surface(surface) => (*surface).into(),
+        };
+        let surface = serde_json::to_string(&transport)
+            .map_err(|error| error.to_string())?
+            .trim_matches('"')
+            .to_string();
+        let actor = self
+            .decision_attribution()
+            .map(|(actor, _)| serde_json::to_string(actor).map_err(|error| error.to_string()))
+            .transpose()?
+            .or_else(|| self.provenance_actor.clone());
+        if matches!(
+            transport,
+            AppearanceTransport::ChannelReply | AppearanceTransport::ResourcePatch
+        ) && actor.as_deref().is_none_or(|value| value.trim().is_empty())
+        {
+            return Err(format!(
+                "{surface} resolution requires an authenticated actor"
+            ));
+        }
+        Ok((
+            self.provenance_resolution_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            transport,
+            surface,
+            actor,
+        ))
+    }
+
+    pub fn with_authenticated_appearance(
+        mut self,
+        actor: PrincipalRef,
+        appearance: AppearanceSnapshot,
+    ) -> Result<Self, String> {
+        actor
+            .validate_at(PrincipalPosition::DecisionActor)
+            .map_err(|error| error.to_string())?;
+        appearance.validate().map_err(|error| error.to_string())?;
+        if appearance.principal() != &actor {
+            return Err("the answer actor must equal the appearance principal".to_string());
+        }
+        self.authenticated_appearance = Some((actor, appearance));
+        Ok(self)
     }
 
     /// Set the **containment** reuse scope (fence crossing / legacy tool prompt).
@@ -810,7 +988,7 @@ impl PermissionAnswer {
     /// even when it denies something an operator would also have denied.
     pub fn issuer(&self) -> &'static str {
         match &self.answerer {
-            Answerer::Operator(approval) => approval.transport().issuer(),
+            Answerer::Operator(_) => OPERATOR_PROMPT_ISSUER,
             Answerer::Surface(surface) => surface.as_str(),
         }
     }
@@ -818,8 +996,14 @@ impl PermissionAnswer {
     /// The approver a grant records. Only ever the authenticated operator
     /// identity — a non-operator answer has no approver, rather than an
     /// unverified name.
-    pub fn approver(&self) -> Option<&str> {
-        self.operator_approval().map(OperatorApproval::operator)
+    pub fn decision_attribution(&self) -> Option<(&PrincipalRef, &AppearanceSnapshot)> {
+        match &self.answerer {
+            Answerer::Operator(approval) => Some((approval.actor(), approval.appearance())),
+            Answerer::Surface(_) => self
+                .authenticated_appearance
+                .as_ref()
+                .map(|(actor, appearance)| (actor, appearance)),
+        }
     }
 
     fn grant_lifetime(&self) -> AuthorityLifetimeKind {
@@ -1012,8 +1196,8 @@ pub async fn allow_all_for_request(
     // actually verified, never anything the payload claimed.
     log::info!(
         "permission {request_id}: operator {} ({}) turned off agent '{}' containment fence for execution {}",
-        approval.operator(),
-        approval.transport().as_str(),
+        serde_json::to_string(approval.actor()).unwrap_or_else(|_| "<invalid actor>".to_string()),
+        serde_json::to_string(&approval.appearance().evidence().transport).unwrap_or_else(|_| "<invalid transport>".to_string()),
         target.agent_id,
         target.execution_id,
     );
@@ -1178,9 +1362,29 @@ pub async fn resolve_permission_request(
     request_id: &str,
     answer: PermissionAnswer,
 ) -> Result<ResolveOutcome, String> {
-    let PermissionAnswer {
-        decision, scope, ..
-    } = answer;
+    resolve_permission_request_impl(orch, request_id, answer, true).await
+}
+
+pub(crate) async fn resolve_permission_request_domain(
+    orch: &Orchestrator,
+    request_id: &str,
+    answer: PermissionAnswer,
+) -> Result<ResolveOutcome, String> {
+    resolve_permission_request_impl(orch, request_id, answer, false).await
+}
+
+async fn resolve_permission_request_impl(
+    orch: &Orchestrator,
+    request_id: &str,
+    answer: PermissionAnswer,
+    use_gate: bool,
+) -> Result<ResolveOutcome, String> {
+    let (resolution_id, resolution_transport, resolution_surface, resolution_actor) =
+        answer.resolution_provenance()?;
+    let resolution_provider = answer.provenance_provider.clone();
+    let resolution_conversation = answer.provenance_conversation.clone();
+    let decision = answer.decision;
+    let scope = answer.scope;
     let now = chrono::Utc::now().timestamp() as i32;
     // Resolve the owning database ONCE (fail-closed, CAIRN-2227): a team
     // execution's permission_requests/runs/turns/issue rows live WHOLLY in its
@@ -1215,6 +1419,7 @@ pub async fn resolve_permission_request(
     // does allowing a containment crossing, which is a different layer.
     if let Some(detail) = authority.as_ref() {
         if matches!(decision, PermissionDecision::Allow) && answer.operator_approval().is_none() {
+            journal_permission_authority_refusal(orch, &record, detail, &answer).await;
             return Err(format!(
                 "Refused: allowing this request mints a workspace authority grant, which only an \
                  authenticated operator can do. This answer came from '{}', which may deny or \
@@ -1261,11 +1466,95 @@ pub async fn resolve_permission_request(
         PermissionDecision::Allow => "allowed",
         PermissionDecision::Deny => "denied",
     };
+    // The winning answer is recovered after an independently leased domain
+    // action, including after process loss. Persist session scope in the claim;
+    // keeping it only in this invocation would narrow a recovered allow to once.
     let behavior = match (decision, scope) {
         (PermissionDecision::Deny, _) => "deny",
         (PermissionDecision::Allow, PermissionScope::Once) => "allow",
-        (PermissionDecision::Allow, PermissionScope::Session) => "allow",
+        (PermissionDecision::Allow, PermissionScope::Session) => "allow_session",
     };
+
+    if use_gate {
+        let claim = crate::channels::ledger::claim_ask_resolution(
+            &owning_db,
+            request_id,
+            behavior,
+            resolution_transport,
+            None,
+            None,
+            resolution_actor.as_deref(),
+            "permission",
+            request_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?;
+        let winner = match claim {
+            crate::channels::ledger::AskClaim::Won(winner)
+            | crate::channels::ledger::AskClaim::Existing(winner) => winner,
+        };
+        let (winning_decision, winning_scope) = match winner.answer.as_str() {
+            "allow" => (PermissionDecision::Allow, PermissionScope::Once),
+            "allow_session" => (PermissionDecision::Allow, PermissionScope::Session),
+            "deny" => (PermissionDecision::Deny, PermissionScope::Once),
+            value => return Err(format!("invalid stored permission winner answer {value:?}")),
+        };
+        let mut winning_answer = match recovered_permission_answer(winning_decision, &winner) {
+            Ok(answer) => answer.with_containment_scope(winning_scope),
+            Err(_error)
+                if matches!(
+                    resolution_transport,
+                    AppearanceTransport::AuthenticatedOperator
+                        | AppearanceTransport::AuthenticatedDesktop
+                ) && answer.operator_approval().is_some()
+                    && winner.winner_surface == resolution_surface
+                    && winner.winner_actor == resolution_actor.as_deref().unwrap_or_default() =>
+            {
+                // A verified caller may carry the unpersistable operator
+                // capability across a retry, but only for the exact transport
+                // and actor that won durably. Stored labels alone still cannot
+                // recreate authority, and the stored answer below remains the
+                // decision that executes.
+                answer
+            }
+            Err(error) => return Err(error),
+        };
+        winning_answer.decision = winning_decision;
+        winning_answer.provenance_resolution_id = Some(winner.resolution_id.clone());
+        let now = chrono::Utc::now().timestamp_millis();
+        let Some(lease) =
+            crate::channels::ledger::try_lease_ask_action(&owning_db, request_id, now, 60_000)
+                .await?
+        else {
+            return Ok(ResolveOutcome {
+                duplicate: true,
+                issue_id: None,
+            });
+        };
+        let result = Box::pin(resolve_permission_request_impl(
+            orch,
+            request_id,
+            winning_answer,
+            false,
+        ))
+        .await;
+        return match result {
+            Ok(outcome) => {
+                crate::channels::ledger::finalize_ask_resolution(
+                    &owning_db,
+                    request_id,
+                    &format!("✓ answered: {behavior}"),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                Ok(outcome)
+            }
+            Err(error) => {
+                crate::channels::ledger::release_ask_action(&owning_db, &lease, &error).await?;
+                Err(error)
+            }
+        };
+    }
 
     // An authority request answers with the same minimal `{behavior}` shape a
     // fence crossing does: both re-drive the originating verb, so the waiting
@@ -1276,6 +1565,22 @@ pub async fn resolve_permission_request(
     let resume = record_permission_response(&owning_db, request_id, status, &response_json, now)
         .await
         .map_err(|e| e.to_string())?;
+
+    if !resume.duplicate {
+        owning_db
+            .execute(
+                "UPDATE permission_requests SET resolution_id = ?2, resolution_surface = ?3, resolution_provider = ?4, resolution_conversation = ?5, resolution_actor = ?6 WHERE id = ?1",
+                params![request_id.to_string(), resolution_id.clone(), resolution_surface.clone(), resolution_provider.clone(), resolution_conversation.clone(), resolution_actor.clone()],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    if !resume.duplicate && matches!(decision, PermissionDecision::Deny) {
+        if let Some(detail) = authority.as_ref() {
+            journal_permission_authority_refusal(orch, &record, detail, &answer).await;
+        }
+    }
 
     // Mint the grant BEFORE any resume: the re-dispatched verb re-runs the same
     // authorization check, so the grant has to already be on disk for it to find
@@ -1376,6 +1681,14 @@ pub async fn resolve_permission_request(
     let should_resume =
         should_resume_permission_response(crossing.as_ref(), &resume, inline_waiter_was_present);
     if should_resume {
+        let receipt = cairn_db::models::ResolutionReceipt {
+            id: Some(resolution_id.clone()),
+            surface: resolution_surface.clone(),
+            provider: resolution_provider.clone(),
+            conversation: resolution_conversation.clone(),
+            actor: resolution_actor.clone(),
+            resolved_at: now as i64 * 1000,
+        };
         if let Err(e) = resume_suspended_permission(
             orch,
             &owning_db,
@@ -1387,6 +1700,7 @@ pub async fn resolve_permission_request(
             mint_failure.as_deref(),
             decision,
             scope,
+            &receipt,
         )
         .await
         {
@@ -1453,7 +1767,7 @@ async fn lookup_permission_request_for_node(
     node_segment: &str,
     perm_segment: &str,
 ) -> Result<String, String> {
-    let project_key = project_key.to_string();
+    let project_key = cairn_common::uri::canonical_project(project_key);
     let node_segment = node_segment.to_string();
     let perm_segment = perm_segment.to_string();
     orch.db
@@ -1463,6 +1777,26 @@ async fn lookup_permission_request_for_node(
             let node_segment = node_segment.clone();
             let perm_segment = perm_segment.clone();
             Box::pin(async move {
+                let mut project_rows = conn
+                    .query(
+                        "SELECT id FROM projects WHERE key = ?1 COLLATE NOCASE LIMIT 2",
+                        params![project_key.as_str()],
+                    )
+                    .await?;
+                let project_id = project_rows
+                    .next()
+                    .await?
+                    .map(|row| row.text(0))
+                    .transpose()?
+                    .ok_or_else(|| {
+                        DbError::Row(format!("project {project_key} not found"))
+                    })?;
+                if project_rows.next().await?.is_some() {
+                    return Err(DbError::Row(format!(
+                        "project key {project_key} is ambiguous"
+                    )));
+                }
+
                 let mut rows = conn
                     .query(
                         "
@@ -1472,8 +1806,7 @@ async fn lookup_permission_request_for_node(
                         JOIN jobs j ON COALESCE(pr.job_id, r.job_id) = j.id
                         JOIN executions e ON j.execution_id = e.id
                         JOIN issues i ON j.issue_id = i.id
-                        JOIN projects p ON i.project_id = p.id
-                        WHERE p.key = ?1
+                        WHERE i.project_id = ?1
                           AND i.number = ?2
                           AND e.seq = ?3
                           AND j.uri_segment = ?4
@@ -1481,7 +1814,7 @@ async fn lookup_permission_request_for_node(
                         LIMIT 1
                         ",
                         params![
-                            project_key.as_str(),
+                            project_id.as_str(),
                             number as i64,
                             exec_seq as i64,
                             node_segment.as_str(),
@@ -1581,6 +1914,7 @@ async fn resume_suspended_permission(
     mint_failure: Option<&str>,
     decision: PermissionDecision,
     scope: PermissionScope,
+    resolution: &cairn_db::models::ResolutionReceipt,
 ) -> Result<(), String> {
     let Some(session_id) = resume.session_id.as_deref() else {
         log::warn!(
@@ -1616,11 +1950,14 @@ async fn resume_suspended_permission(
                 resume,
                 session_id,
                 job_id,
-                format!(
-                    "Approval could not be recorded, so it did not take effect: {error}. \
-                     Nothing was changed; ask again."
+                (
+                    format!(
+                        "Approval could not be recorded, so it did not take effect: {error}. \
+                         Nothing was changed; ask again."
+                    ),
+                    true,
                 ),
-                true,
+                resolution,
             );
         }
         let (content, is_error) = match decision {
@@ -1643,7 +1980,15 @@ async fn resume_suspended_permission(
                 (result, false)
             }
         };
-        return finish_resume(orch, record, resume, session_id, job_id, content, is_error);
+        return finish_resume(
+            orch,
+            record,
+            resume,
+            session_id,
+            job_id,
+            (content, is_error),
+            resolution,
+        );
     }
 
     let (content, is_error) = match crossing {
@@ -1685,7 +2030,15 @@ async fn resume_suspended_permission(
         None => (response_json.to_string(), false),
     };
 
-    finish_resume(orch, record, resume, session_id, job_id, content, is_error)
+    finish_resume(
+        orch,
+        record,
+        resume,
+        session_id,
+        job_id,
+        (content, is_error),
+        resolution,
+    )
 }
 
 /// Attach the synthetic tool result to the call the agent is waiting on and
@@ -1697,11 +2050,12 @@ fn finish_resume(
     resume: &PermissionResponseResume,
     session_id: &str,
     job_id: &str,
-    content: String,
-    is_error: bool,
+    result: (String, bool),
+    resolution: &cairn_db::models::ResolutionReceipt,
 ) -> Result<(), String> {
+    let (content, is_error) = result;
     let now = chrono::Utc::now().timestamp() as i32;
-    crate::execution::jobs::store_tool_result_event_with_turn(
+    crate::execution::jobs::store_tool_result_event_with_resolution(
         orch,
         &resume.run_id,
         session_id,
@@ -1710,6 +2064,7 @@ fn finish_resume(
         is_error,
         now,
         resume.predecessor_turn_id.as_deref(),
+        Some(resolution),
     )?;
 
     let prompt_resume = crate::execution::jobs::ResumeContext {
@@ -1734,6 +2089,39 @@ fn finish_resume(
 /// in (an approval that expired the instant the agent resumed would authorize
 /// nothing), and a `session` grant anchors to the run's durable session so it
 /// survives a runner restart.
+async fn journal_permission_authority_refusal(
+    orch: &Orchestrator,
+    record: &PermissionRequestRecord,
+    detail: &super::authority::AuthorityPromptDetail,
+    answer: &PermissionAnswer,
+) {
+    let (decision_actor, appearance_snapshot) = answer
+        .decision_attribution()
+        .map(|(actor, snapshot)| (Some(actor.clone()), Some(snapshot.clone())))
+        .unwrap_or((None, None));
+    let event = cairn_db::storage::authority::NewAuthorizationEvent {
+        scope: detail.authority.scope.clone(),
+        mutation: detail.authority.mutation.as_str().to_string(),
+        summary: detail.authority.summary.clone(),
+        outcome: "forbidden".to_string(),
+        reason: detail.reason.as_str().to_string(),
+        principal: detail.principal.clone(),
+        audience: detail.audience.clone(),
+        run_id: detail.request.run_id.clone(),
+        request_uri: Some(record.id.clone()),
+        grant_id: None,
+        decision_actor,
+        appearance_snapshot,
+        decided_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(error) = cairn_db::storage::authority::append_event(&orch.db.local, event).await {
+        log::warn!(
+            "permission {}: failed to journal refused authority decision: {error}",
+            record.id
+        );
+    }
+}
+
 async fn mint_authority_grant(
     orch: &Orchestrator,
     record: &PermissionRequestRecord,
@@ -1766,6 +2154,19 @@ async fn mint_authority_grant(
             .push(cairn_common::authorization::AuthorityConstraint::McpConfig { fingerprint });
     }
 
+    let (decision_actor, appearance_snapshot) = answer.decision_attribution().ok_or_else(|| {
+        "an authority grant requires authenticated decision attribution".to_string()
+    })?;
+    decision_actor
+        .validate_at(PrincipalPosition::DecisionActor)
+        .map_err(|error| error.to_string())?;
+    appearance_snapshot
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if appearance_snapshot.principal() != decision_actor {
+        return Err("the durable grant actor must equal the appearance principal".to_string());
+    }
+
     let issue = crate::authorization::GrantIssue {
         request: detail.authority.clone(),
         principal: detail.principal.clone(),
@@ -1785,7 +2186,9 @@ async fn mint_authority_grant(
         // identity rather than a name someone typed.
         provenance: cairn_common::authorization::AuthorityProvenance {
             issuer: answer.issuer().to_string(),
-            approver: answer.approver().map(ToOwned::to_owned),
+            decision_actor: Some(decision_actor.clone()),
+            appearance_snapshot: Some(appearance_snapshot.clone()),
+            approver: None,
             request_uri: Some(record.id.clone()),
             node_uri: detail.principal.node_uri.clone(),
             rationale: None,
@@ -1973,7 +2376,7 @@ pub async fn record_permission_response(
                                 log::warn!(
                                     "permission {request_id}: stored turn_id was NULL; \
                                      recovered predecessor from jobs.current_turn_id \
-                                     (warm-reuse race, CAIRN-2123)"
+                                     (warm-reuse race, cairn-2123)"
                                 );
                             }
                             recovered
@@ -2552,6 +2955,47 @@ mod tests {
     use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
     use std::sync::Arc;
 
+    #[test]
+    fn answer_and_operator_transports_map_exhaustively() {
+        assert_eq!(
+            AppearanceTransport::from(AnswerSurface::ResourcePatch),
+            AppearanceTransport::ResourcePatch
+        );
+        assert_eq!(
+            AppearanceTransport::from(AnswerSurface::ChannelReply),
+            AppearanceTransport::ChannelReply
+        );
+        assert_eq!(
+            AppearanceTransport::from(AnswerSurface::RemoteIntent),
+            AppearanceTransport::RemoteIntent
+        );
+        assert_eq!(
+            AppearanceTransport::from(AnswerSurface::NonOperatorInvoke),
+            AppearanceTransport::NonOperatorInvoke
+        );
+        assert_eq!(
+            AppearanceTransport::from(AnswerSurface::LocalInvoke),
+            AppearanceTransport::LocalInvoke
+        );
+        assert_eq!(
+            AppearanceTransport::from(OperatorTransport::AuthenticatedOperator),
+            AppearanceTransport::AuthenticatedOperator
+        );
+        assert_eq!(
+            AppearanceTransport::from(OperatorTransport::AuthenticatedDesktop),
+            AppearanceTransport::AuthenticatedDesktop
+        );
+    }
+
+    #[test]
+    fn operator_approval_rejects_actor_snapshot_mismatch() {
+        let approval = desktop_approval();
+        let other = PrincipalRef::Machine {
+            device_id: "other-device".to_string(),
+        };
+        assert!(OperatorApproval::authenticated(other, approval.appearance().clone()).is_err());
+    }
+
     async fn test_orchestrator() -> Orchestrator {
         let root = tempfile::tempdir().unwrap().keep();
         let db_path = root.join("test.db");
@@ -2604,7 +3048,7 @@ mod tests {
                 "
                 INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','Workspace',1,1);
                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('project-1','ws','Project','PRJ','/tmp/project',1,1);
+                 VALUES ('project-1','ws','Project','prj','/tmp/project',1,1);
                 INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
                  VALUES ('issue-1','project-1',1,'Issue','active','active','none',1,1);
                 INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
@@ -2667,6 +3111,324 @@ mod tests {
     /// This is deliberately not a test about the invoke boundary. Closing one
     /// switch there left two others open, because the boundary tests pinned the
     /// gate rather than the property.
+    fn desktop_approval() -> OperatorApproval {
+        use cairn_common::identity::{
+            Address, AppearanceEvidence, CredentialRef, VerificationMethod, VerificationRecord,
+            VerificationStatus, VerificationStrength,
+        };
+        let actor = PrincipalRef::Machine {
+            device_id: "test-device".to_string(),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::DesktopCredential,
+            VerificationStatus::Verified,
+            None,
+            None,
+            None,
+            Some(CredentialRef::new("desktop_operator_credential").unwrap()),
+            VerificationStrength::new("local_shared_secret").unwrap(),
+            1,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::AuthenticatedDesktop,
+            Address::Desktop {
+                device_id: "test-device".to_string(),
+            },
+            verification,
+            1,
+            None,
+        )
+        .unwrap();
+        let snapshot = AppearanceSnapshot::new(actor.clone(), evidence, Vec::new(), None).unwrap();
+        OperatorApproval::authenticated(actor, snapshot).unwrap()
+    }
+
+    #[tokio::test]
+    async fn migrated_telegram_winner_is_executed_by_a_desktop_retry() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let local = LocalDb::open(root.join("test.db")).await.unwrap();
+        let (migration_0190, before_0190) = TURSO_MIGRATIONS
+            .split_last()
+            .expect("migration 0190 is the final local migration");
+        MigrationRunner::new(before_0190.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db = Arc::new(DbState::new(Arc::new(local), search));
+        let orch =
+            Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build();
+        seed_allow_all_permission(&orch).await;
+        crate::channels::ledger::claim_ask_resolution(
+            &orch.db.local,
+            "perm-request-1",
+            "Approve",
+            AppearanceTransport::ChannelReply,
+            Some("telegram"),
+            Some("telegram:8771562567"),
+            Some("8771562567"),
+            "permission",
+            "perm-request-1",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            MigrationRunner::new(vec![*migration_0190])
+                .run(&orch.db.local)
+                .await
+                .unwrap(),
+            vec!["0190_canonicalize_channel_permission_answers".to_string()]
+        );
+        assert_eq!(
+            crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .answer,
+            "allow"
+        );
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+        )
+        .await
+        .expect("a later desktop response must execute the canonical channel winner");
+
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text(
+                    "SELECT resolution_provider FROM permission_requests WHERE id = 'perm-request-1'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("telegram")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_stored_channel_winner_fails_closed() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        crate::channels::ledger::claim_ask_resolution(
+            &orch.db.local,
+            "perm-request-1",
+            "unknown",
+            AppearanceTransport::ChannelReply,
+            Some("telegram"),
+            Some("telegram:1"),
+            Some("1"),
+            "permission",
+            "perm-request-1",
+            10,
+        )
+        .await
+        .unwrap();
+
+        let error = resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+        )
+        .await
+        .expect_err("unknown historical answers must remain invalid");
+        assert!(error.contains("invalid stored permission winner answer"));
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+    }
+
+    #[tokio::test]
+    async fn persisted_resource_permission_claim_is_executed_once_by_direct_retry() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        let winner_actor = "cairn://p/PRJ/1/1/builder";
+        crate::channels::ledger::claim_ask_resolution(
+            &orch.db.local,
+            "perm-request-1",
+            "allow_session",
+            AppearanceTransport::ResourcePatch,
+            None,
+            None,
+            Some(winner_actor),
+            "permission",
+            "perm-request-1",
+            10,
+        )
+        .await
+        .unwrap();
+
+        let retry = || {
+            resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                PermissionAnswer::from_surface(
+                    PermissionDecision::Deny,
+                    AnswerSurface::ResourcePatch,
+                )
+                .with_actor("cairn://p/PRJ/1/1/retry"),
+            )
+        };
+        let (first, second) = tokio::join!(retry(), retry());
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| !outcome.duplicate).count(),
+            1,
+            "only the action-lease winner may execute the permission effect"
+        );
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+        assert!(
+            orch.session_allowed_tools.lock().unwrap().contains("read"),
+            "a retry that executes a persisted session winner must install its session grant"
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text(
+                    "SELECT resolution_actor FROM permission_requests WHERE id = 'perm-request-1'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(winner_actor),
+            "the persisted winner, not the retrying caller, owns provenance"
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text(
+                    "SELECT CAST(attempt_count AS TEXT) FROM channel_ask_action WHERE action_ref = 'perm-request-1'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_authenticated_claim_accepts_only_matching_fresh_proof() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        let approval = desktop_approval();
+        let winner_actor = serde_json::to_string(approval.actor()).unwrap();
+        crate::channels::ledger::claim_ask_resolution(
+            &orch.db.local,
+            "perm-request-1",
+            "allow",
+            AppearanceTransport::AuthenticatedDesktop,
+            None,
+            None,
+            Some(&winner_actor),
+            "permission",
+            "perm-request-1",
+            10,
+        )
+        .await
+        .unwrap();
+
+        let retry = || {
+            resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                PermissionAnswer::from_operator(PermissionDecision::Deny, desktop_approval()),
+            )
+        };
+        let (first, second) = tokio::join!(retry(), retry());
+        let outcomes = [first.unwrap(), second.unwrap()];
+        assert_eq!(
+            outcomes.iter().filter(|outcome| !outcome.duplicate).count(),
+            1,
+            "only one matching retry may execute the stored winner"
+        );
+        assert_eq!(
+            perm_status(&orch).await.as_deref(),
+            Some("allowed"),
+            "the persisted decision, not the retry's decision, must execute"
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text(
+                    "SELECT CAST(attempt_count AS TEXT) FROM channel_ask_action WHERE action_ref = 'perm-request-1'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_authenticated_claim_rejects_mismatched_actor_or_transport_before_lease() {
+        for (winner_transport, winner_actor) in [
+            (
+                AppearanceTransport::AuthenticatedDesktop,
+                serde_json::to_string(&PrincipalRef::Machine {
+                    device_id: "other-device".to_string(),
+                })
+                .unwrap(),
+            ),
+            (
+                AppearanceTransport::AuthenticatedOperator,
+                serde_json::to_string(desktop_approval().actor()).unwrap(),
+            ),
+        ] {
+            let orch = test_orchestrator().await;
+            seed_allow_all_permission(&orch).await;
+            crate::channels::ledger::claim_ask_resolution(
+                &orch.db.local,
+                "perm-request-1",
+                "allow",
+                winner_transport,
+                None,
+                None,
+                Some(&winner_actor),
+                "permission",
+                "perm-request-1",
+                10,
+            )
+            .await
+            .unwrap();
+
+            resolve_permission_request(
+                &orch,
+                "perm-request-1",
+                PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+            )
+            .await
+            .expect_err("mismatched fresh proof must not recover authenticated authority");
+
+            assert_eq!(perm_status(&orch).await.as_deref(), Some("pending"));
+            assert_eq!(
+                orch.db
+                    .local
+                    .query_opt_text(
+                        "SELECT CAST(attempt_count AS TEXT) FROM channel_ask_action WHERE action_ref = 'perm-request-1'",
+                        (),
+                    )
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some("0"),
+                "a proof mismatch must fail before leasing or executing the effect"
+            );
+        }
+    }
+
+    fn agent_resource_answer(decision: PermissionDecision) -> PermissionAnswer {
+        PermissionAnswer::from_surface(decision, AnswerSurface::ResourcePatch)
+            .with_actor("cairn://p/prj/1/1/builder")
+    }
+
     #[tokio::test]
     async fn an_agent_cannot_self_approve_an_unsandboxed_command_escape() {
         for scope in [PermissionScope::Once, PermissionScope::Session] {
@@ -2684,11 +3446,7 @@ mod tests {
             let refusal = resolve_permission_request(
                 &orch,
                 "perm-request-1",
-                PermissionAnswer::from_surface(
-                    PermissionDecision::Allow,
-                    AnswerSurface::ResourcePatch,
-                )
-                .with_containment_scope(scope),
+                agent_resource_answer(PermissionDecision::Allow).with_containment_scope(scope),
             )
             .await
             .expect_err("an agent must not be able to lift its own sandbox");
@@ -2724,11 +3482,7 @@ mod tests {
         )
         .await;
 
-        let approval = OperatorApproval::authenticated(
-            "local:test-device",
-            OperatorTransport::AuthenticatedDesktop,
-        )
-        .expect("operator capability");
+        let approval = desktop_approval();
         resolve_permission_request(
             &orch,
             "perm-request-1",
@@ -2759,7 +3513,7 @@ mod tests {
         resolve_permission_request(
             &orch,
             "perm-request-1",
-            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch),
+            agent_resource_answer(PermissionDecision::Allow),
         )
         .await
         .expect("a path-scoped crossing stays answerable by the agent");
@@ -2806,7 +3560,7 @@ mod tests {
         resolve_permission_request(
             &orch,
             "perm-request-1",
-            PermissionAnswer::from_surface(PermissionDecision::Allow, AnswerSurface::ResourcePatch),
+            agent_resource_answer(PermissionDecision::Allow),
         )
         .await
         .expect_err("a legacy command crossing must not be self-approvable");
@@ -2831,7 +3585,7 @@ mod tests {
         resolve_permission_request(
             &orch,
             "perm-request-1",
-            PermissionAnswer::from_surface(PermissionDecision::Deny, AnswerSurface::ResourcePatch),
+            agent_resource_answer(PermissionDecision::Deny),
         )
         .await
         .expect("deny stays open to every surface");
@@ -2859,11 +3613,7 @@ mod tests {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
 
-        let approval = OperatorApproval::authenticated(
-            "local:test-device",
-            OperatorTransport::AuthenticatedDesktop,
-        )
-        .expect("operator capability");
+        let approval = desktop_approval();
         allow_all_for_request(&orch, "perm-request-1", &approval)
             .await
             .unwrap();

@@ -18,7 +18,7 @@ use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
 use serde_json::json;
 
-const PROJECT: &str = "CAIRN";
+const PROJECT: &str = "cairn";
 const THREAD: &str = "thread-ux";
 const TASK: &str = "probe";
 
@@ -28,7 +28,7 @@ const TASK: &str = "probe";
 async fn seed_thread_with_task(db: &LocalDb) {
     db.execute(
         "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
-         VALUES ('th', 'project-CAIRN', ?1, 'active', 'none', 1, 1)",
+         VALUES ('th', 'project-cairn', ?1, 'active', 'none', 1, 1)",
         params![THREAD],
     )
     .await
@@ -36,7 +36,7 @@ async fn seed_thread_with_task(db: &LocalDb) {
     db.execute(
         "INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, node_name,
                            created_at, updated_at)
-         VALUES ('j-session', 'th', 'project-CAIRN', 'running', 'thread', 'Thread', 1, 1)",
+         VALUES ('j-session', 'th', 'project-cairn', 'running', 'thread', 'Thread', 1, 1)",
         (),
     )
     .await
@@ -44,14 +44,14 @@ async fn seed_thread_with_task(db: &LocalDb) {
     db.execute(
         "INSERT INTO jobs (id, parent_job_id, project_id, status, uri_segment, node_name,
                            created_at, updated_at)
-         VALUES ('j-task', 'j-session', 'project-CAIRN', 'running', ?1, 'Explore', 2, 2)",
+         VALUES ('j-task', 'j-session', 'project-cairn', 'running', ?1, 'Explore', 2, 2)",
         params![TASK],
     )
     .await
     .unwrap();
     db.execute(
         "INSERT INTO runs (id, job_id, project_id, status, created_at, updated_at)
-         VALUES ('r-task', 'j-task', 'project-CAIRN', 'live', 2, 2)",
+         VALUES ('r-task', 'j-task', 'project-cairn', 'live', 2, 2)",
         (),
     )
     .await

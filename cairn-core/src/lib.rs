@@ -27,6 +27,7 @@ pub mod pressure;
 pub mod projects;
 pub mod repl_host;
 pub mod runs;
+pub mod runtime;
 pub mod scratch;
 pub mod search;
 pub mod sessions;
@@ -34,6 +35,7 @@ pub use cairn_symbols::symbols;
 pub mod terminal_host;
 pub mod threads;
 pub mod todos;
+pub mod token_meters;
 pub mod turns;
 pub mod workflow_journal;
 pub mod workflow_progress;
@@ -97,6 +99,7 @@ mod resume_timing;
 mod services;
 mod storage;
 mod team_remote_intents;
+mod voice;
 mod workspace;
 
 // Cross-engine parity tests comparing the fff worktree index (cairn-symbols)

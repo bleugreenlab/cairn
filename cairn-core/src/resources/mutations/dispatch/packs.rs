@@ -1,6 +1,8 @@
 //! Resource-pack mutation dispatch.
 
-use super::super::packs::{apply_pack_delete, dispatch_pack_action, PackMutationResult};
+use super::super::packs::{
+    apply_pack_delete, dispatch_pack_action, import_agent_plugin, PackMutationResult,
+};
 use super::super::{build_failure, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
@@ -16,6 +18,23 @@ pub(super) async fn dispatch(
     applied_data: &mut Option<serde_json::Value>,
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
+        (CairnResource::Packs, ChangeMode::Create) => {
+            let payload = item
+                .payload
+                .as_ref()
+                .ok_or_else(|| build_failure(index, item, "mode=create requires payload.path"))?;
+            let path = super::super::payload_trimmed_non_empty_str(payload, "path", &[])
+                .ok_or_else(|| build_failure(index, item, "payload.path is required"))?;
+            if dry_run {
+                format!("Would import Agent Plugin from '{path}'")
+            } else {
+                record(
+                    import_agent_plugin(orch, std::path::Path::new(path))
+                        .map_err(|e| build_failure(index, item, e))?,
+                    applied_data,
+                )
+            }
+        }
         (CairnResource::Pack { pack_id }, ChangeMode::Patch) => {
             if dry_run {
                 format!("Would install or update pack '{pack_id}'")
@@ -42,9 +61,6 @@ pub(super) async fn dispatch(
                 )
             }
         }
-        // `cairn://packs` itself is read-only: installing from a URL lands
-        // in CAIRN-3773, and the contract advertises no mutation for it, so
-        // the gate rejects one straight from the table.
         _ => return Ok(None),
     };
     Ok(Some(summary))

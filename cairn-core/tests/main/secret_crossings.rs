@@ -29,6 +29,50 @@ fn register(id: &str, value: &str) -> SecretGuard<'static> {
         .expect("test credential is registerable")
 }
 
+#[test]
+fn go_html_safe_json_secret_cannot_cross_the_final_response_guard() {
+    const SECRET: &str = "SYNTH-é-<>&\u{2028}\u{2029}-Q7m2Zx9-RedTeam";
+    let _guard = register("crossing-go-json-string", SECRET);
+    // Independently authored Go encoding/json output. Go leaves `é` literal but
+    // escapes HTML-sensitive ASCII and both Unicode line separators.
+    let serialized = r#"{"credential":"SYNTH-é-\u003c\u003e\u0026\u2028\u2029-Q7m2Zx9-RedTeam"}"#;
+
+    let output = ObservedSafe::observe(
+        cairn_core::internal::dispatch::DispatchOutput {
+            content: serialized.to_string(),
+            reminders: Vec::new(),
+        },
+        Crossing::FinalResponse,
+    );
+
+    assert_eq!(output.content, r#"{"credential":"[REDACTED]"}"#);
+    assert!(!output
+        .content
+        .contains(r#"SYNTH-é-\u003c\u003e\u0026\u2028\u2029-Q7m2Zx9-RedTeam"#));
+}
+
+#[test]
+fn json_stringified_secret_cannot_cross_the_final_response_guard() {
+    const SECRET: &str = "SYNTH-é-😀/Q7\"m2Zx9-RedTeam";
+    let _guard = register("crossing-json-string", SECRET);
+    // Independently authored ASCII-only JSON as emitted by Python's default
+    // json.dumps, not serde_json (which leaves Unicode literal).
+    let serialized = r#"{"credential":"SYNTH-\u00e9-\ud83d\ude00/Q7\"m2Zx9-RedTeam"}"#.to_string();
+
+    let output = ObservedSafe::observe(
+        cairn_core::internal::dispatch::DispatchOutput {
+            content: serialized.clone(),
+            reminders: Vec::new(),
+        },
+        Crossing::FinalResponse,
+    );
+
+    assert_eq!(output.content, r#"{"credential":"[REDACTED]"}"#);
+    assert!(!output
+        .content
+        .contains(r#"SYNTH-\u00e9-\ud83d\ude00/Q7\"m2Zx9-RedTeam"#));
+}
+
 fn register_run(orch: &Orchestrator, run_id: &str) {
     let mut processes = orch.process_state.processes.lock().unwrap();
     let child = Arc::new(Mutex::new(None));

@@ -100,6 +100,7 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["dev", "db"] => Some(CairnResource::DevDb),
         ["dev", "pid"] => Some(CairnResource::DevPid),
         ["logs"] => Some(CairnResource::Logs),
+        ["channels", "conversations"] => Some(CairnResource::ChannelsConversations),
         ["executors"] => Some(CairnResource::Executors),
         ["grants"] => Some(CairnResource::Grants),
         ["grants", id] => Some(CairnResource::Grant {
@@ -301,6 +302,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             project: canonical_project(project),
             agent_id: (*agent_id).to_string(),
         }),
+        ["posts"] => Some(CairnResource::Posts),
+        ["posts", id] => Some(CairnResource::Post {
+            id: id.parse::<i64>().ok().filter(|id| *id > 0)?,
+        }),
         ["actions"] => Some(CairnResource::Actions),
         ["actions", action_id] => Some(CairnResource::Action {
             action_id: (*action_id).to_string(),
@@ -323,6 +328,9 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
             symbol: Some((*symbol).to_string()),
         }),
         [PROJECT_SCOPE, project] => Some(CairnResource::Project {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "posts"] => Some(CairnResource::ProjectPosts {
             project: canonical_project(project),
         }),
         [PROJECT_SCOPE, project, "issues"] => Some(CairnResource::ProjectIssues {
@@ -516,6 +524,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 task_name: None,
             })
         }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "feed"] => {
+            Some(CairnResource::HomeFeed {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: None,
+            })
+        }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "tasks"] => {
             Some(CairnResource::NodeTasks {
                 project: canonical_project(project),
@@ -600,6 +617,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         }
         [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "todos"] => {
             Some(CairnResource::JobTodos {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                task_name: Some((*task_name).to_string()),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "task", task_name, "feed"] => {
+            Some(CairnResource::HomeFeed {
                 project: canonical_project(project),
                 number: parse_positive_i32(number)?,
                 exec_seq: parse_positive_i32(exec_seq)?,

@@ -80,7 +80,7 @@ async fn team_gitcoord_read_stubs_until_private_local_repo_path_is_set() {
         .unwrap();
     private_db
         .execute(
-            "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('P', 'teamABC123', 1)",
+            "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('p', 'teamABC123', 1)",
             (),
         )
         .await
@@ -109,7 +109,7 @@ async fn team_gitcoord_read_stubs_until_private_local_repo_path_is_set() {
 
     private_db
         .execute(
-            "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = 'P'",
+            "UPDATE project_routes SET local_repo_path = ?1 WHERE project_key = 'p'",
             (fx.origin.to_str().unwrap(),),
         )
         .await

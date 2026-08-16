@@ -28,7 +28,7 @@ use cairn_db::turso::params;
 /// A job with an open session and no runs yet. Runs and turns are added per test
 /// so each one states the exact shape it is about.
 async fn seed_job(db: &LocalDb) {
-    let project_id = common::create_project(db, "REAP").await;
+    let project_id = common::create_project(db, "reap").await;
     db.write(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {

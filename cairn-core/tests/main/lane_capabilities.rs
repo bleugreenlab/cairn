@@ -161,43 +161,12 @@ fn jj() -> Capability {
 /// nested profile — because macOS sandboxes do not nest.
 #[cfg(target_os = "macos")]
 fn nested_sandbox_exec() -> Capability {
-    let outcome = tempfile::tempdir().map(|dir| {
-        let root = dir.path().canonicalize().unwrap_or_else(|_| dir.path().into());
-        let probe = root.join("probe");
-        let profile = format!(
-            "(version 1)(allow default)(deny file-write* (subpath \"/\"))(allow file-write* (subpath \"{}\"))",
-            root.display()
-        );
-        let ran = Command::new("sandbox-exec")
-            .args([
-                "-p",
-                &profile,
-                "/bin/sh",
-                "-c",
-                &format!("echo ok > {}", probe.display()),
-            ])
-            .output();
-        match ran {
-            Ok(out) if out.status.success() && probe.exists() => {
-                (true, "an in-bounds write succeeded under a nested profile".to_string())
-            }
-            Ok(out) => (
-                false,
-                format!(
-                    "in-bounds write refused (exit {:?}): {}",
-                    out.status.code(),
-                    first_line(&out.stderr)
-                ),
-            ),
-            Err(error) => (false, format!("{error}")),
-        }
-    });
-    let (present, detail) = outcome.unwrap_or_else(|error| (false, format!("{error}")));
+    let probe = cairn_sandbox::probe_nested_sandbox_write();
     Capability {
         name: "nested-sandbox-exec",
         required: false,
-        present,
-        detail,
+        present: probe.available,
+        detail: probe.detail,
         remedy: None,
     }
 }

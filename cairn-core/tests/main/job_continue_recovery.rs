@@ -5,7 +5,7 @@ use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
 
 async fn insert_job_session_run_turn(db: &LocalDb, turn_state: &str, run_id: Option<&str>) {
-    let project_id = common::create_project(db, "CONT").await;
+    let project_id = common::create_project(db, "cont").await;
     let turn_state = turn_state.to_string();
     let run_id = run_id.map(str::to_string);
     db.write(|conn| {

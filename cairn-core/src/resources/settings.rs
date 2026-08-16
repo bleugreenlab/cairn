@@ -76,8 +76,15 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
 
     // --- Backends ---
     out.push_str("## Backends\n\n");
-    out.push_str(&format!("- activeBackend: `{}`\n", settings.active_backend));
-    out.push_str(&format!("- tiers: {}\n\n", settings.tiers.join(", ")));
+    out.push_str(&format!("- tiers: {}\n", settings.tiers.join(", ")));
+    out.push_str("- tierDefaults:\n");
+    for tier in &settings.tiers {
+        match settings.tier_defaults.get(tier) {
+            Some(backend) => out.push_str(&format!("  - {tier}: `{backend}`\n")),
+            None => out.push_str(&format!("  - {tier}: (first defined provider)\n")),
+        }
+    }
+    out.push('\n');
     let mut backend_names: Vec<&String> = settings.backends.keys().collect();
     backend_names.sort();
     for backend in backend_names {

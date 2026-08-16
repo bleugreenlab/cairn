@@ -239,6 +239,7 @@ pub async fn store_image(
 pub async fn resolve_image_hash(
     db: &LocalDb,
     project_id: &str,
+    project_key: &str,
     reference: &ImageRef,
 ) -> Result<String, ImageError> {
     let (issue_number, ordinal) = match reference {
@@ -258,7 +259,7 @@ pub async fn resolve_image_hash(
         message: error.to_string(),
     })?
     .ok_or_else(|| ImageError::Unregistered {
-        uri: build_project_image_uri("", reference),
+        uri: build_project_image_uri(project_key, reference),
     })
 }
 
@@ -327,9 +328,10 @@ pub async fn list_image_refs(
 pub async fn fetch_image_by_reference(
     db: &LocalDb,
     project_id: &str,
+    project_key: &str,
     reference: &ImageRef,
 ) -> Result<StoredImage, ImageError> {
-    let hash = resolve_image_hash(db, project_id, reference).await?;
+    let hash = resolve_image_hash(db, project_id, project_key, reference).await?;
     fetch_image(db, &hash).await
 }
 
@@ -348,7 +350,7 @@ mod tests {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p','w','P','CAIRN','/tmp/p',1,1)",
+             VALUES ('p','w','P','cairn','/tmp/p',1,1)",
         ] {
             db.execute(sql, ()).await.unwrap();
         }
@@ -360,7 +362,7 @@ mod tests {
     }
 
     fn scope(issue: Option<i32>) -> ImageScope {
-        ImageScope::new("p", "CAIRN").in_issue(issue)
+        ImageScope::new("p", "cairn").in_issue(issue)
     }
 
     #[tokio::test]
@@ -369,7 +371,7 @@ mod tests {
         let uri = store_image_bytes(&db, &scope(Some(3242)), png())
             .await
             .unwrap();
-        assert_eq!(uri, "cairn://p/CAIRN/3242/images/1");
+        assert_eq!(uri, "cairn://p/cairn/3242/images/1");
         assert!(!uri.contains(&content_hash(&png())));
     }
 
@@ -387,12 +389,12 @@ mod tests {
             .unwrap();
         let projectwide = store_image_bytes(&db, &scope(None), png()).await.unwrap();
 
-        assert_eq!(first, "cairn://p/CAIRN/7/images/1");
+        assert_eq!(first, "cairn://p/cairn/7/images/1");
         // Identical bytes mint a SECOND reference to the one deduped blob:
         // a reference records an act of attaching, not a distinct object.
-        assert_eq!(second, "cairn://p/CAIRN/7/images/2");
-        assert_eq!(other_issue, "cairn://p/CAIRN/8/images/1");
-        assert_eq!(projectwide, "cairn://p/CAIRN/images/1");
+        assert_eq!(second, "cairn://p/cairn/7/images/2");
+        assert_eq!(other_issue, "cairn://p/cairn/8/images/1");
+        assert_eq!(projectwide, "cairn://p/cairn/images/1");
     }
 
     #[tokio::test]
@@ -404,7 +406,7 @@ mod tests {
                 Some(cairn_common::uri::CairnResource::ProjectImage { reference, .. }) => reference,
                 other => panic!("{uri} did not parse as an image: {other:?}"),
             };
-            let image = fetch_image_by_reference(&db, "p", &reference)
+            let image = fetch_image_by_reference(&db, "p", "cairn", &reference)
                 .await
                 .unwrap();
             assert_eq!(image.bytes, png());
@@ -422,7 +424,7 @@ mod tests {
             .unwrap();
         let reference = ImageRef::Hash(content_hash(&png()));
         assert_eq!(
-            fetch_image_by_reference(&db, "p", &reference)
+            fetch_image_by_reference(&db, "p", "cairn", &reference)
                 .await
                 .unwrap()
                 .bytes,
@@ -434,7 +436,7 @@ mod tests {
     async fn an_unminted_reference_is_reported_not_silently_empty() {
         let (_dir, db) = seeded_db().await;
         assert!(matches!(
-            resolve_image_hash(&db, "p", &ImageRef::Project { ordinal: 4 }).await,
+            resolve_image_hash(&db, "p", "cairn", &ImageRef::Project { ordinal: 4 }).await,
             Err(ImageError::Unregistered { .. })
         ));
     }
@@ -514,13 +516,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(first, "cairn://p/CAIRN/444/images/1");
-        assert_eq!(second, "cairn://p/CAIRN/444/images/2");
+        assert_eq!(first, "cairn://p/cairn/444/images/1");
+        assert_eq!(second, "cairn://p/cairn/444/images/2");
 
         // Built by hand from the collection URI, never returned by a lookup.
         let constructed = format!(
             "{}/2",
-            cairn_common::uri::build_project_images_uri("CAIRN", Some(444))
+            cairn_common::uri::build_project_images_uri("cairn", Some(444))
         );
         let Some(cairn_common::uri::CairnResource::ProjectImage { reference, .. }) =
             cairn_common::uri::parse_uri(&constructed)
@@ -528,11 +530,31 @@ mod tests {
             panic!("a constructed sibling address must parse: {constructed}");
         };
         assert_eq!(
-            fetch_image_by_reference(&db, "p", &reference)
+            fetch_image_by_reference(&db, "p", "cairn", &reference)
                 .await
                 .unwrap()
                 .bytes,
             gif
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_reference_preserves_the_lowercase_project_key() {
+        let (_dir, db) = seeded_db().await;
+        let error = resolve_image_hash(
+            &db,
+            "p",
+            "cairn",
+            &ImageRef::Issue {
+                number: 3242,
+                ordinal: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "no stored image is registered at cairn://p/cairn/3242/images/1"
         );
     }
 

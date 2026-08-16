@@ -79,16 +79,24 @@ pub(super) async fn matching_subscriptions_for_source(
 }
 
 /// Every persisted subscription on one source, unfiltered by fact kind and
-/// ungrouped. A `peer` row with no `source_ref` watches every peer, so it is
-/// included for any peer reference.
+/// ungrouped. A ref-less row of a standing-watch kind watches every reference of
+/// that kind, so it is included for any reference of it — see
+/// [`unscoped_row_is_a_standing_watch`].
+///
+/// The query is already narrowed to a single `source_kind`, so whether its
+/// ref-less rows are standing watches is settled before the statement runs.
+/// Deciding it in Rust and binding the verdict keeps that rule stated once
+/// rather than restated as a kind list inside the SQL, where a newly added kind
+/// would silently fail to match instead of failing to compile.
 pub(super) async fn subscriptions_for_source(
     db: &LocalDb,
     source_kind: &str,
     source_ref: Option<&str>,
 ) -> Result<Vec<WakeSubscription>, String> {
+    let standing_watch = i64::from(unscoped_row_is_a_standing_watch(source_kind));
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(ToString::to_string);
-    db.read(|conn| {
+    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
+    db.read(move |conn| {
         let source_kind = source_kind.clone();
         let source_ref = source_ref.clone();
         Box::pin(async move {
@@ -100,9 +108,9 @@ pub(super) async fn subscriptions_for_source(
                      FROM wake_subscriptions
                      WHERE source_kind = ?1
                        AND (COALESCE(source_ref, '') = COALESCE(?2, '')
-                            OR (source_kind = 'peer' AND source_ref IS NULL))
+                            OR (?3 = 1 AND source_ref IS NULL))
                      ORDER BY job_id ASC, created_at ASC, id ASC",
-                    params![source_kind.as_str(), source_ref.as_deref()],
+                    params![source_kind.as_str(), source_ref.as_deref(), standing_watch],
                 )
                 .await?;
             let mut subscriptions = Vec::new();
@@ -127,18 +135,24 @@ fn best_matching_subscription(
         .filter(|sub| {
             sub.source_kind == source_kind
                 && (sub.source_ref.as_deref() == source_ref
-                    || (sub.source_kind == SOURCE_KIND_PEER && sub.source_ref.is_none()))
-                && sub
-                    .fact_kinds
-                    .as_ref()
-                    .map(|kinds| {
-                        kinds.iter().any(|subscription_kind| {
-                            fact_kind_matches(subscription_kind, fact_kind)
-                        })
-                    })
-                    .unwrap_or(true)
+                    || (sub.source_ref.is_none()
+                        && unscoped_row_is_a_standing_watch(&sub.source_kind)))
+                && subscription_accepts_fact(sub, fact_kind)
         })
         .max_by_key(subscription_match_score)
+}
+
+/// Whether a subscription's fact scope admits `fact_kind`. A row with no
+/// `fact_kinds` watches every fact on its source.
+pub(super) fn subscription_accepts_fact(sub: &WakeSubscription, fact_kind: &str) -> bool {
+    sub.fact_kinds
+        .as_ref()
+        .map(|kinds| {
+            kinds
+                .iter()
+                .any(|subscription_kind| fact_kind_matches(subscription_kind, fact_kind))
+        })
+        .unwrap_or(true)
 }
 
 fn fact_kind_matches(subscription_kind: &str, event_kind: &str) -> bool {

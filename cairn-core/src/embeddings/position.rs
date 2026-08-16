@@ -495,14 +495,14 @@ mod tests {
         let now = Instant::now();
         engine.register_session(
             "s",
-            Some("cairn://p/PROJ/1/1/builder".to_string()),
+            Some("cairn://p/proj/1/1/builder".to_string()),
             None,
             now,
         );
         // sum = 1*[1,0] + 3*[0,1] = [1,3]; centroid = norm([1,3]).
         engine.fold("s", &[1.0, 0.0], 1.0, now);
         engine.fold("s", &[0.0, 1.0], 3.0, now);
-        let centroid = normalize(&engine.owners["cairn://p/PROJ/1/1/builder"].sum);
+        let centroid = normalize(&engine.owners["cairn://p/proj/1/1/builder"].sum);
         let expected = normalize(&[1.0, 3.0]);
         assert!(approx(&centroid, &expected), "got {centroid:?}");
     }
@@ -522,7 +522,7 @@ mod tests {
         let mut engine = PositionEngine::new(PositionConfig::default());
         engine.register_session(
             "s",
-            Some("cairn://p/PROJ/1/1/builder".to_string()),
+            Some("cairn://p/proj/1/1/builder".to_string()),
             Some(vec![0.0, 5.0]),
             now,
         );

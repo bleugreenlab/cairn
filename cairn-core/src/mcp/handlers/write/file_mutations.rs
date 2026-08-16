@@ -1696,6 +1696,12 @@ pub(super) async fn finalize_file_commit(
     .await;
     match publication {
         Ok(result) => {
+            if let Some((run, _)) = routed_run.as_ref() {
+                orch.invalidate_node_check_status(
+                    &run.job_id,
+                    "logical-head-tree-or-contract-change",
+                );
+            }
             let publication = routed_run.as_ref().map(|(run, db)| PostSealPublication {
                 db: db.clone(),
                 project_id: run.project_id.clone(),

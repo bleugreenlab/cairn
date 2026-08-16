@@ -21,10 +21,18 @@ use serde_json::json;
 // plain cwd.
 
 fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
+    make_request_as_run(cwd, payload, None)
+}
+
+fn make_request_as_run(
+    cwd: &str,
+    payload: serde_json::Value,
+    run_id: Option<&str>,
+) -> McpCallbackRequest {
     McpCallbackRequest {
         thread_id: None,
         cwd: cwd.to_string(),
-        run_id: None,
+        run_id: run_id.map(str::to_string),
         tool: "write".to_string(),
         payload,
         tool_use_id: None,
@@ -76,7 +84,7 @@ fn make_read_request(cwd: &str, path: &str) -> McpCallbackRequest {
 }
 
 async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
-    let project_id = common::create_project(db, "PREVIEW").await;
+    let project_id = common::create_project(db, "preview").await;
     db.write(|conn| {
         let project_id = project_id.clone();
         let data = json!({
@@ -239,7 +247,7 @@ impl ChangeTestRepo {
         let branch = "agent/CHG-1-builder-0";
         common::provision_jj_workspace(config.path(), project.path(), dir.path(), branch);
         let project_id =
-            common::insert_project_with_repo(&orch.db.local, "CHG", project.path()).await;
+            common::insert_project_with_repo(&orch.db.local, "chg", project.path()).await;
         let base_commit = common::head_sha(project.path());
         seed_change_run(
             &orch.db.local,
@@ -493,13 +501,13 @@ async fn a_thread_still_writes_resources() {
     repo.become_a_thread().await;
 
     // Project messages, not the converted issue's: a first-class thread has no
-    // backing issue, so `cairn://p/CHG/1/messages` names a row the conversion
+    // backing issue, so `cairn://p/chg/1/messages` names a row the conversion
     // deletes. The target has to be one a thread session genuinely still writes,
     // or the batch fails on a missing resource and says nothing about the guard.
     let report = repo
         .change_report(json!({
             "changes": [{
-                "target": "cairn://p/CHG/messages",
+                "target": "cairn://p/chg/messages",
                 "mode": "append",
                 "payload": { "content": "a thread speaking on its project" }
             }]
@@ -779,7 +787,7 @@ async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
                     "payload": { "patch": "*** Begin Patch\n*** Add File: mixed.rs\n+mixed();\n*** End Patch\n" }
                 },
                 {
-                    "target": "cairn://p/CHG/messages",
+                    "target": "cairn://p/chg/messages",
                     "mode": "append",
                     "payload": { "content": "Unified patch landed" }
                 }
@@ -812,7 +820,7 @@ async fn change_atomic_promote_amend_rolls_back_decision() {
     };
     repo.write("canon.md", "old canon\n");
     repo.seal_base("initial canon");
-    let project_id = common::create_project(&repo.orch.db.local, "MCP").await;
+    let project_id = common::create_project(&repo.orch.db.local, "mcp").await;
     repo.orch
         .db
         .local
@@ -839,7 +847,7 @@ async fn change_atomic_promote_amend_rolls_back_decision() {
                     "payload": { "old_string": "old canon", "new_string": "new canon" }
                 },
                 {
-                    "target": "cairn://p/MCP/1/1/builder/memories/1",
+                    "target": "cairn://p/mcp/1/1/builder/memories/1",
                     "mode": "patch",
                     "payload": { "action": "promote", "reason": "ready for canon" }
                 }
@@ -893,7 +901,7 @@ async fn node_memory_append_uses_target_node_and_scope_owner() {
         )
         .await
         .unwrap();
-    let project_id = common::create_project(&orch.db.local, "MCP").await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
     let issue_id = insert_issue(&orch.db.local, &project_id, 1, "Memory target").await;
     orch.db
         .local
@@ -913,7 +921,7 @@ async fn node_memory_append_uses_target_node_and_scope_owner() {
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/1/1/reviewer/memories",
+                "target": "cairn://p/mcp/1/1/reviewer/memories",
                 "mode": "append",
                 "payload": {
                     "name": "workspace fact",
@@ -928,10 +936,10 @@ async fn node_memory_append_uses_target_node_and_scope_owner() {
     assert_successful_change(&report, 1);
     let summary = report["applied"][0]["summary"].as_str().unwrap();
     assert!(
-        summary.contains("cairn://p/MCP/1/1/reviewer/memories/1"),
+        summary.contains("cairn://p/mcp/1/1/reviewer/memories/1"),
         "{summary}"
     );
-    let resolved = memory_db::resolve_node_memory_id(&orch.db.local, "MCP", 1, 1, "reviewer", 1)
+    let resolved = memory_db::resolve_node_memory_id(&orch.db.local, "mcp", 1, 1, "reviewer", 1)
         .await
         .unwrap();
     let memory_id = resolved.expect("returned node URI resolves");
@@ -954,14 +962,14 @@ async fn node_memory_append_uses_target_node_and_scope_owner() {
 #[tokio::test]
 async fn change_default_non_atomic_resource_batch_continues_after_failure() {
     let orch = test_file_change_orchestrator().await;
-    common::create_project(&orch.db.local, "MCP").await;
+    common::create_project(&orch.db.local, "mcp").await;
 
     let request = make_request(
         "/tmp/test-repo",
         json!({
             "changes": [
-                { "target": "cairn://p/MISSING/messages", "mode": "append", "payload": { "content": "Lost" } },
-                { "target": "cairn://p/MCP/messages", "mode": "append", "payload": { "content": "Applied after failure" } }
+                { "target": "cairn://p/missing/messages", "mode": "append", "payload": { "content": "Lost" } },
+                { "target": "cairn://p/mcp/messages", "mode": "append", "payload": { "content": "Applied after failure" } }
             ]
         }),
     );
@@ -975,7 +983,7 @@ async fn change_default_non_atomic_resource_batch_continues_after_failure() {
     assert_eq!(
         count_rows(
             &orch.db.local,
-            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'MCP' AND content = 'Applied after failure'"
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'mcp' AND content = 'Applied after failure'"
         )
         .await,
         1
@@ -990,8 +998,8 @@ async fn change_default_non_atomic_failures_are_reported_with_blocking_appends()
         "/tmp/test-repo",
         json!({
             "changes": [
-                { "target": "cairn://p/MISSING/messages", "mode": "append", "payload": { "content": "Lost" } },
-                { "target": "cairn://p/MCP/1/1/builder/tasks", "mode": "append", "payload": { "subagentType": "Explore", "description": "noop", "prompt": "noop" } }
+                { "target": "cairn://p/missing/messages", "mode": "append", "payload": { "content": "Lost" } },
+                { "target": "cairn://p/mcp/1/1/builder/tasks", "mode": "append", "payload": { "subagentType": "Explore", "description": "noop", "prompt": "noop" } }
             ]
         }),
     );
@@ -1002,7 +1010,7 @@ async fn change_default_non_atomic_failures_are_reported_with_blocking_appends()
     assert_eq!(report["applied"].as_array().unwrap().len(), 0);
     assert_eq!(failure_count(&report), 1, "{report:?}");
     assert_eq!(report["failures"][0]["index"], 0);
-    assert!(result.contains("No project found with key 'MISSING'"));
+    assert!(result.contains("No project found with key 'missing'"));
 }
 
 #[tokio::test]
@@ -1040,17 +1048,25 @@ async fn change_allows_resource_only_batch_without_commit_msg() {
     // Resource-only batches never touch git, so they must still work without a
     // commit_msg.
     let orch = test_file_change_orchestrator().await;
-    common::create_project(&orch.db.local, "MCP").await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    common::seed_authenticated_thread_run(
+        &orch.db.local,
+        &project_id,
+        "fixture",
+        "run-resource-write",
+    )
+    .await;
 
-    let request = make_request(
+    let request = make_request_as_run(
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/issues",
+                "target": "cairn://p/mcp/issues",
                 "mode": "append",
                 "payload": { "title": "No commit msg needed" }
             }]
         }),
+        Some("run-resource-write"),
     );
 
     let result = handle_write(&orch, &request).await;
@@ -1063,13 +1079,20 @@ async fn change_allows_resource_only_batch_without_commit_msg() {
 #[tokio::test]
 async fn change_creates_issue_resource_without_nested_runtime_panic() {
     let orch = test_file_change_orchestrator().await;
-    common::create_project(&orch.db.local, "MCP").await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    common::seed_authenticated_thread_run(
+        &orch.db.local,
+        &project_id,
+        "fixture",
+        "run-resource-write",
+    )
+    .await;
 
-    let request = make_request(
+    let request = make_request_as_run(
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/issues",
+                "target": "cairn://p/mcp/issues",
                 "mode": "append",
                 "payload": {
                     "title": "Created through change",
@@ -1077,17 +1100,18 @@ async fn change_creates_issue_resource_without_nested_runtime_panic() {
                 }
             }]
         }),
+        Some("run-resource-write"),
     );
 
     let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
-    assert_eq!(report["applied"].as_array().unwrap().len(), 1);
     assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
     assert!(report["applied"][0]["summary"]
         .as_str()
         .unwrap()
-        .contains("Created issue MCP-"));
+        .contains("Created issue mcp/"));
     assert_eq!(
         count_rows(
             &orch.db.local,
@@ -1101,14 +1125,14 @@ async fn change_creates_issue_resource_without_nested_runtime_panic() {
 #[tokio::test]
 async fn change_appends_issue_comment_without_nested_runtime_panic() {
     let orch = test_file_change_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "MCP").await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
     insert_issue(&orch.db.local, &project_id, 1, "Comment target").await;
 
     let request = make_request(
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/1",
+                "target": "cairn://p/mcp/1",
                 "mode": "append",
                 "payload": { "content": "Regression comment" }
             }]
@@ -1118,11 +1142,11 @@ async fn change_appends_issue_comment_without_nested_runtime_panic() {
     let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
-    assert_eq!(report["applied"].as_array().unwrap().len(), 1);
     assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
     assert_eq!(
         report["applied"][0]["summary"].as_str().unwrap(),
-        "Appended comment to issue MCP-1"
+        "Appended comment to issue mcp/1"
     );
     assert_eq!(
         count_rows(
@@ -1137,14 +1161,14 @@ async fn change_appends_issue_comment_without_nested_runtime_panic() {
 #[tokio::test]
 async fn change_appends_project_and_issue_messages_without_nested_runtime_panic() {
     let orch = test_file_change_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "MCP").await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
     insert_issue(&orch.db.local, &project_id, 1, "Message target").await;
 
     let project_request = make_request(
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/messages",
+                "target": "cairn://p/mcp/messages",
                 "mode": "append",
                 "payload": { "content": "Project regression message" }
             }]
@@ -1154,7 +1178,7 @@ async fn change_appends_project_and_issue_messages_without_nested_runtime_panic(
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/1/messages",
+                "target": "cairn://p/mcp/1/messages",
                 "mode": "append",
                 "payload": { "content": "Issue regression message" }
             }]
@@ -1169,7 +1193,7 @@ async fn change_appends_project_and_issue_messages_without_nested_runtime_panic(
     assert_eq!(
         count_rows(
             &orch.db.local,
-            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'MCP' AND content = 'Project regression message'"
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'mcp' AND content = 'Project regression message'"
         )
         .await,
         1
@@ -1177,7 +1201,7 @@ async fn change_appends_project_and_issue_messages_without_nested_runtime_panic(
     assert_eq!(
         count_rows(
             &orch.db.local,
-            "SELECT COUNT(*) FROM messages WHERE channel_type = 'issue' AND channel_id = 'MCP/1' AND content = 'Issue regression message'"
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'issue' AND channel_id = 'mcp/1' AND content = 'Issue regression message'"
         )
         .await,
         1
@@ -1187,14 +1211,14 @@ async fn change_appends_project_and_issue_messages_without_nested_runtime_panic(
 #[tokio::test]
 async fn change_patches_issue_resource_without_nested_runtime_panic() {
     let orch = test_file_change_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "MCP").await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
     insert_issue(&orch.db.local, &project_id, 1, "Patch target").await;
 
     let request = make_request(
         "/tmp/test-repo",
         json!({
             "changes": [{
-                "target": "cairn://p/MCP/1",
+                "target": "cairn://p/mcp/1",
                 "mode": "patch",
                 "payload": { "title": "Patched through change" }
             }]
@@ -1204,11 +1228,11 @@ async fn change_patches_issue_resource_without_nested_runtime_panic() {
     let result = handle_write(&orch, &request).await;
     let report = parse_report(&result);
 
-    assert_eq!(report["applied"].as_array().unwrap().len(), 1);
     assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
     assert_eq!(
         report["applied"][0]["summary"].as_str().unwrap(),
-        "Patched issue MCP-1"
+        "Patched issue mcp/1"
     );
     assert_eq!(
         count_rows(
@@ -1808,7 +1832,7 @@ async fn a_resource_only_write_is_deduplicated_by_the_replay_guard() {
     };
     let payload = json!({
         "changes": [{
-            "target": "cairn://p/CHG/messages",
+            "target": "cairn://p/chg/messages",
             "mode": "append",
             "payload": { "content": "a message" }
         }]
@@ -1844,7 +1868,7 @@ async fn a_failed_resource_only_write_replays_its_failure() {
     let payload = json!({
         "atomic": true,
         "changes": [{
-            "target": "cairn://p/MISSING/messages",
+            "target": "cairn://p/missing/messages",
             "mode": "append",
             "payload": { "content": "never appended" }
         }]

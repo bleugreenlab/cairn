@@ -154,6 +154,7 @@ fn init_git_repo(repo: &Path) {
 
 fn agent_snapshot() -> AgentSnapshot {
     AgentSnapshot {
+        edited_at: None,
         id: "agent-1".to_string(),
         name: "Builder".to_string(),
         description: String::new(),
@@ -279,7 +280,7 @@ async fn setup_with_executor(
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
     let db = Arc::new(db);
-    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
+    let project_id = common::insert_project_with_repo(&db, "rhg", &project_repo).await;
     let worktree = temp.path().join("worktree");
     let branch = "agent/RHG-1-builder-0";
     let base_commit = common::head_sha(&project_repo);
@@ -628,7 +629,7 @@ async fn setup_impatient_machine(
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
     let db = Arc::new(db);
-    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
+    let project_id = common::insert_project_with_repo(&db, "rhg", &project_repo).await;
     let worktree = temp.path().join("worktree");
     let branch = "agent/RHG-1-builder-0";
     let base_commit = common::head_sha(&project_repo);
@@ -2153,6 +2154,89 @@ async fn code_item_resolves_bare_package_import_from_worktree_node_modules() {
     );
 }
 
+/// The other half of the resolution story, and the one the runner-owned SDK
+/// depends on: a checkout with NO `node_modules` of its own resolves a bare
+/// `@cairn/sdk` from the Cairn-owned tree installed ABOVE it. That upward walk
+/// is bun's, not ours -- which is exactly why it is worth a test. A bun release
+/// that stopped walking would not fail loudly here; it would silently return
+/// this promise to the broken state the field reported it in.
+///
+/// The same fixture pins the precedence rule, because precedence is the reason
+/// placement was chosen over a resolver hook: a project that genuinely depends
+/// on the SDK has its own copy NEARER the importer, so it wins by the resolution
+/// algorithm rather than by code of ours that could get it wrong.
+#[test]
+fn a_runner_installed_ancestor_tree_resolves_a_bare_specifier() {
+    if !binary_available("bun") {
+        eprintln!(
+            "skipping a_runner_installed_ancestor_tree_resolves_a_bare_specifier: bun not resolvable"
+        );
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    // Mirror a real cell coordinate: `<root>/build-slots/<project>/slot-N`.
+    let checkout = temp.path().join("build-slots/demo/slot-1");
+    std::fs::create_dir_all(&checkout).unwrap();
+
+    let package = |marker: &str| {
+        vec![
+            cairn_common::executor_protocol::ResidentRuntimeAsset {
+                path: "@cairn/sdk/package.json".into(),
+                data: br#"{"name":"@cairn/sdk","type":"module","exports":{".":"./index.ts"}}"#
+                    .to_vec(),
+            },
+            cairn_common::executor_protocol::ResidentRuntimeAsset {
+                path: "@cairn/sdk/index.ts".into(),
+                data: format!("export const marker = \"{marker}\";\n").into_bytes(),
+            },
+        ]
+    };
+
+    let parent = cairn_common::runtime::shared_runtime_parent(&checkout)
+        .expect("a build-slot checkout has a Cairn-owned parent");
+    let assets = package("ANCESTOR_SDK");
+    let version = cairn_common::runtime::assets_version(&assets);
+    let root = cairn_common::runtime::install_shared_runtime(&parent, &assets, &version).unwrap();
+    assert_eq!(root, temp.path().join("build-slots/demo/node_modules"));
+
+    let resolve = || {
+        let output = Command::new("bun")
+            .args([
+                "-e",
+                "import { marker } from \"@cairn/sdk\"; console.log(marker)",
+            ])
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    let from_ancestor = resolve();
+    assert!(
+        from_ancestor.contains("ANCESTOR_SDK"),
+        "a checkout with no node_modules of its own must resolve the runner tree above it: {from_ancestor}"
+    );
+
+    // Now give the checkout its own copy, as a project that really depends on
+    // the SDK would have after installing its dependencies.
+    let local = checkout.join("node_modules/@cairn/sdk");
+    std::fs::create_dir_all(&local).unwrap();
+    for asset in package("PROJECT_SDK") {
+        let name = asset.path.rsplit('/').next().unwrap();
+        std::fs::write(local.join(name), &asset.data).unwrap();
+    }
+
+    let from_project = resolve();
+    assert!(
+        from_project.contains("PROJECT_SDK"),
+        "a project's own node_modules is nearer the importer and must win: {from_project}"
+    );
+}
+
 #[tokio::test]
 async fn code_item_nonzero_exit_is_reported_as_failure() {
     if !binary_available("python3") {
@@ -2511,7 +2595,7 @@ async fn setup_with_emitter(
     let project_repo = temp.path().join("project");
     init_git_repo(&project_repo);
     let db = Arc::new(db);
-    let project_id = common::insert_project_with_repo(&db, "RHG", &project_repo).await;
+    let project_id = common::insert_project_with_repo(&db, "rhg", &project_repo).await;
     let worktree = temp.path().join("worktree");
     let branch = "agent/RHG-1-builder-0";
     let base_commit = common::head_sha(&project_repo);

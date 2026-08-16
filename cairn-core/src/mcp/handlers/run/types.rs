@@ -368,7 +368,7 @@ mod tests {
             serde_json::json!({"duration":25}),
             serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/tests","on":"exit"}),
             serde_json::json!({"kind":"terminal","ref":"cairn:~/terminal/dev","on":"output","phrase":"ready"}),
-            serde_json::json!({"kind":"checks","ref":"cairn://p/CAIRN/3427/1/builder/checks","on":"settled"}),
+            serde_json::json!({"kind":"checks","ref":"cairn://p/cairn/3427/1/builder/checks","on":"settled"}),
             serde_json::json!({"kind":"checks","ref":"cairn:~/checks","on":"verdict","suite":"rust-tests"}),
         ] {
             let parsed: WaitFor = serde_json::from_value(wire.clone()).unwrap();

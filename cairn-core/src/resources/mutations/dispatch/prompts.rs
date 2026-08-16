@@ -72,7 +72,7 @@ fn parse_permission_answer(
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
-    _request: &McpCallbackRequest,
+    request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
     dry_run: bool,
@@ -179,8 +179,24 @@ pub(super) async fn dispatch(
                     segment, project, number, exec_seq, node_id
                 )
             } else {
+                let actor = crate::authorization::resolve_actor(orch, request)
+                    .await
+                    .and_then(|actor| actor.principal.node_uri)
+                    .ok_or_else(|| {
+                        build_failure(
+                            index,
+                            item,
+                            "permission resolution requires an authenticated run",
+                        )
+                    })?;
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
-                    orch, project, *number, *exec_seq, node_id, segment, answer,
+                    orch,
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                    segment,
+                    answer.with_actor(actor),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -214,11 +230,27 @@ pub(super) async fn dispatch(
                     segment, project, number, exec_seq, node_id, task_name
                 )
             } else {
+                let actor = crate::authorization::resolve_actor(orch, request)
+                    .await
+                    .and_then(|actor| actor.principal.node_uri)
+                    .ok_or_else(|| {
+                        build_failure(
+                            index,
+                            item,
+                            "permission resolution requires an authenticated run",
+                        )
+                    })?;
                 // The permission resource keys on the OWNING job's own
                 // `uri_segment`; for a sub-agent task that is the task segment,
                 // so the task name addresses the request directly (issue #143).
                 let outcome = crate::mcp::handlers::permission::answer_node_permission(
-                    orch, project, *number, *exec_seq, task_name, segment, answer,
+                    orch,
+                    project,
+                    *number,
+                    *exec_seq,
+                    task_name,
+                    segment,
+                    answer.with_actor(actor),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;

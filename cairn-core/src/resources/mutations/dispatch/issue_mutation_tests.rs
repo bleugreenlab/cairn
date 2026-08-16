@@ -7,7 +7,7 @@ use crate::orchestrator::OrchestratorBuilder;
 use crate::projects::crud as project_crud;
 use crate::services::testing::TestServicesBuilder;
 use crate::services::RealClock;
-use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+use crate::storage::{LocalDb, MigrationRunner, PostScope, SearchIndex, TURSO_MIGRATIONS};
 use std::sync::Arc;
 
 async fn seeded_orch() -> Orchestrator {
@@ -50,7 +50,7 @@ async fn route_preview_performs_apply_validation_without_writing() {
                 "name": "",
                 "description": "invalid",
                 "when": [{"fact": "attention"}],
-                "to": {"kind": "message", "target": "cairn://p/CAIRN"}
+                "to": {"kind": "message", "target": "cairn://p/cairn"}
             }})),
         ),
     )
@@ -73,7 +73,7 @@ async fn route_preview_performs_apply_validation_without_writing() {
     )
     .await
     .unwrap_err();
-    assert!(missing_target.error.contains("Project not found: MISSING"));
+    assert!(missing_target.error.contains("Project not found: missing"));
 
     let summary = preview(
         &orch,
@@ -84,7 +84,7 @@ async fn route_preview_performs_apply_validation_without_writing() {
                 "name": "Valid",
                 "description": "valid",
                 "when": [{"fact": "attention"}],
-                "to": {"kind": "message", "target": "cairn://p/CAIRN"}
+                "to": {"kind": "message", "target": "cairn://p/cairn"}
             }})),
         ),
     )
@@ -172,7 +172,7 @@ async fn merged_issue_refuses_channel_messages() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{number}"),
+            &format!("cairn://p/cairn/{number}"),
             ChangeMode::Patch,
             Some(serde_json::json!({"status": "merged"})),
         ),
@@ -183,7 +183,7 @@ async fn merged_issue_refuses_channel_messages() {
     let error = apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{number}/messages"),
+            &format!("cairn://p/cairn/{number}/messages"),
             ChangeMode::Append,
             Some(serde_json::json!({"content": "too late"})),
         ),
@@ -200,7 +200,7 @@ async fn agent_on_merged_issue_refuses_direct_messages() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{number}"),
+            &format!("cairn://p/cairn/{number}"),
             ChangeMode::Patch,
             Some(serde_json::json!({"status": "merged"})),
         ),
@@ -211,7 +211,7 @@ async fn agent_on_merged_issue_refuses_direct_messages() {
     let error = apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{number}/1/builder/messages"),
+            &format!("cairn://p/cairn/{number}/1/builder/messages"),
             ChangeMode::Append,
             Some(serde_json::json!({"content": "too late"})),
         ),
@@ -236,7 +236,7 @@ async fn checks_alias_mute_and_unmute_use_the_canonical_condition_source() {
         ))
         .await
         .unwrap();
-    let target = format!("cairn://p/CAIRN/{number}/1/builder/wakes");
+    let target = format!("cairn://p/cairn/{number}/1/builder/wakes");
     apply(
         &orch,
         &change_item(
@@ -256,7 +256,7 @@ async fn checks_alias_mute_and_unmute_use_the_canonical_condition_source() {
     assert_eq!(subscriptions[0].source_kind, "condition");
     assert_eq!(
         subscriptions[0].source_ref.as_deref(),
-        Some(format!("cairn://p/CAIRN/{number}/1/builder/checks").as_str())
+        Some(format!("cairn://p/cairn/{number}/1/builder/checks").as_str())
     );
 
     apply(
@@ -278,7 +278,7 @@ async fn checks_alias_mute_and_unmute_use_the_canonical_condition_source() {
         subscriptions[0].state,
         crate::orchestrator::wakes::WakeSubscriptionState::Active
     );
-    let checks_uri = format!("cairn://p/CAIRN/{number}/1/builder/checks");
+    let checks_uri = format!("cairn://p/cairn/{number}/1/builder/checks");
     let (_, effective_wake) = crate::orchestrator::attention_push::push_with_fingerprint(
         &orch.db.local,
         "job-checks",
@@ -310,7 +310,7 @@ async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
         &CreateProject {
             id: None,
             name: "Cairn".to_string(),
-            key: "CAIRN".to_string(),
+            key: "cairn".to_string(),
             repo_path,
             team_id: None,
         },
@@ -327,6 +327,7 @@ async fn seed_issue(orch: &Orchestrator) -> (String, i32) {
             backend_override: None,
             label_ids: None,
         },
+        issue_crud::installation_machine_authorship("test-installation", 1).unwrap(),
     )
     .await
     .unwrap();
@@ -368,17 +369,17 @@ async fn seed_comment(
 #[tokio::test]
 async fn creating_an_issue_with_an_unknown_label_creates_the_label() {
     let orch = seeded_orch().await;
-    seed_issue(&orch).await;
+    let (_, _, run_id) = seed_running_node(&orch).await;
 
     let item = change_item(
-        "cairn://p/CAIRN/issues",
+        "cairn://p/cairn/issues",
         ChangeMode::Append,
         Some(serde_json::json!({
             "title": "Labelled issue",
             "labels": ["execution-fabric"],
         })),
     );
-    apply(&orch, &item).await.unwrap();
+    apply_as_run(&orch, &item, &run_id).await.unwrap();
 
     let vocabulary = crate::labels::crud::list_labels(&orch.db.local)
         .await
@@ -388,7 +389,7 @@ async fn creating_an_issue_with_an_unknown_label_creates_the_label() {
         vec!["execution-fabric"]
     );
 
-    let rendered = crate::resources::issue::read_issue(&orch.db.local, "CAIRN", 2).await;
+    let rendered = crate::resources::issue::read_issue(&orch.db.local, "cairn", 2).await;
     assert!(rendered.contains("execution-fabric"), "in: {rendered}");
 }
 
@@ -398,7 +399,7 @@ async fn patching_an_issue_with_an_unknown_label_creates_the_label() {
     let (_issue_id, number) = seed_issue(&orch).await;
 
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"labels": ["Execution Fabric", "urgent"]})),
     );
@@ -415,7 +416,7 @@ async fn patching_an_issue_with_an_unknown_label_creates_the_label() {
     // Re-attaching by the slug of a label created from prose reuses that label
     // instead of minting a second row for the same words.
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"labels": ["execution-fabric"]})),
     );
@@ -446,7 +447,7 @@ async fn read_collection_lists_comments_with_seq_source_and_content() {
     let c1 = seed_comment(&orch, &issue_id, "first comment").await;
     let _c2 = seed_comment(&orch, &issue_id, "second comment").await;
     let rendered =
-        crate::resources::issue::read_issue_comments(&orch.db.local, "CAIRN", number).await;
+        crate::resources::issue::read_issue_comments(&orch.db.local, "cairn", number).await;
     assert!(rendered.contains("### comment 1"), "in: {rendered}");
     assert!(rendered.contains("### comment 2"), "in: {rendered}");
     assert!(rendered.contains("first comment"));
@@ -458,7 +459,7 @@ async fn read_collection_lists_comments_with_seq_source_and_content() {
     // Each comment surfaces its addressable member URI so edit/delete are
     // discoverable from the collection view.
     assert!(
-        rendered.contains(&format!("cairn://p/CAIRN/{number}/comments/1")),
+        rendered.contains(&format!("cairn://p/cairn/{number}/comments/1")),
         "missing member URI in: {rendered}"
     );
     assert!(rendered.contains("edit/delete:"), "in: {rendered}");
@@ -480,7 +481,7 @@ async fn edit_comment_by_seq_updates_only_that_comment() {
     let c1 = seed_comment(&orch, &issue_id, "first").await;
     let c2 = seed_comment(&orch, &issue_id, "second").await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/comments/{}", c1.seq),
+        &format!("cairn://p/cairn/{number}/comments/{}", c1.seq),
         ChangeMode::Patch,
         Some(serde_json::json!({"content": "edited"})),
     );
@@ -503,7 +504,7 @@ async fn delete_comment_by_seq_removes_only_that_comment() {
     let c1 = seed_comment(&orch, &issue_id, "first").await;
     let c2 = seed_comment(&orch, &issue_id, "second").await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/comments/{}", c1.seq),
+        &format!("cairn://p/cairn/{number}/comments/{}", c1.seq),
         ChangeMode::Delete,
         None,
     );
@@ -518,7 +519,7 @@ async fn edit_missing_comment_seq_is_clean_not_found() {
     let orch = seeded_orch().await;
     let (_issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/comments/999"),
+        &format!("cairn://p/cairn/{number}/comments/999"),
         ChangeMode::Patch,
         Some(serde_json::json!({"content": "edited"})),
     );
@@ -531,7 +532,7 @@ async fn delete_missing_comment_seq_is_clean_not_found() {
     let orch = seeded_orch().await;
     let (_issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/comments/999"),
+        &format!("cairn://p/cairn/{number}/comments/999"),
         ChangeMode::Delete,
         None,
     );
@@ -544,7 +545,7 @@ async fn issue_uri_append_still_creates_a_comment() {
     let orch = seeded_orch().await;
     let (issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Append,
         Some(serde_json::json!({"content": "a fresh comment"})),
     );
@@ -600,6 +601,7 @@ async fn add_issue(orch: &Orchestrator, project_id: &str, title: &str) -> (Strin
             backend_override: None,
             label_ids: None,
         },
+        issue_crud::installation_machine_authorship("test-installation", 1).unwrap(),
     )
     .await
     .unwrap();
@@ -709,7 +711,7 @@ async fn create_issue_as_run(
     }
     apply_as_run(
         orch,
-        &change_item("cairn://p/CAIRN/issues", ChangeMode::Append, Some(payload)),
+        &change_item("cairn://p/cairn/issues", ChangeMode::Append, Some(payload)),
         run_id,
     )
     .await
@@ -842,7 +844,7 @@ async fn node_patch_stop_interrupts_live_run() {
     let orch = seeded_orch().await;
     let (number, _job_id, run_id) = seed_running_node(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/1/builder"),
+        &format!("cairn://p/cairn/{number}/1/builder"),
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "stop"})),
     );
@@ -876,7 +878,7 @@ async fn node_patch_stop_without_live_run_idles_nonterminal_job() {
     )
     .await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/1/builder"),
+        &format!("cairn://p/cairn/{number}/1/builder"),
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "stop"})),
     );
@@ -903,7 +905,7 @@ async fn node_patch_stop_terminal_job_reports_no_active_run() {
     )
     .await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/1/builder"),
+        &format!("cairn://p/cairn/{number}/1/builder"),
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "stop"})),
     );
@@ -919,7 +921,7 @@ async fn node_patch_merge_without_pr_still_errors() {
     let orch = seeded_orch().await;
     let (number, _job_id, _run_id) = seed_running_node(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/1/builder"),
+        &format!("cairn://p/cairn/{number}/1/builder"),
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "merge"})),
     );
@@ -932,7 +934,7 @@ async fn node_patch_stop_dry_run_describes_without_stopping() {
     let orch = seeded_orch().await;
     let (number, _job_id, run_id) = seed_running_node(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/1/builder"),
+        &format!("cairn://p/cairn/{number}/1/builder"),
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "stop"})),
     );
@@ -956,7 +958,7 @@ async fn patch_status_closed_resolves_issue() {
     let orch = seeded_orch().await;
     let (issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"status": "closed"})),
     );
@@ -974,7 +976,7 @@ async fn patch_status_merged_resolves_issue() {
     let orch = seeded_orch().await;
     let (issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"status": "merged"})),
     );
@@ -1013,7 +1015,7 @@ async fn patch_status_closed_with_live_work_asks_to_confirm() {
     let orch = seeded_orch().await;
     let (number, _job_id, run_id) = seed_running_node(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"status": "closed"})),
     );
@@ -1048,7 +1050,7 @@ async fn a_refused_resolution_leaves_the_rest_of_the_patch_unapplied() {
     let orch = seeded_orch().await;
     let (number, _job_id, _run_id) = seed_running_node(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"title": "Renamed", "status": "closed"})),
     );
@@ -1070,7 +1072,7 @@ async fn patch_status_closed_with_confirm_resolves_and_stops_live_work() {
     let orch = seeded_orch().await;
     let (number, _job_id, run_id) = seed_running_node(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"status": "closed", "confirm": true})),
     );
@@ -1092,7 +1094,7 @@ async fn patch_confirm_without_a_resolution_is_rejected() {
     let orch = seeded_orch().await;
     let (_issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"title": "Renamed", "confirm": true})),
     );
@@ -1115,7 +1117,7 @@ async fn patch_invalid_status_is_rejected() {
     // to leave the rest of the write unapplied too.
     for bad in ["backlog", "active", "frobnicate"] {
         let item = change_item(
-            &format!("cairn://p/CAIRN/{number}"),
+            &format!("cairn://p/cairn/{number}"),
             ChangeMode::Patch,
             Some(serde_json::json!({"title": "Renamed", "status": bad})),
         );
@@ -1144,7 +1146,7 @@ async fn patch_title_leaves_status_untouched() {
     let orch = seeded_orch().await;
     let (issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"title": "Renamed"})),
     );
@@ -1164,9 +1166,9 @@ async fn patch_parent_adopts_issue() {
     let project_id = project_id_of(&orch, &child_id).await;
     let (parent_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{parent_num}")})),
+        Some(serde_json::json!({"parent": format!("cairn://p/cairn/{parent_num}")})),
     );
     apply(&orch, &item).await.unwrap();
     assert_eq!(
@@ -1180,7 +1182,7 @@ async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     let orch = seeded_orch().await;
     let (number, job_id, run_id) = seed_running_node(&orch).await;
     let running_issue =
-        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "CAIRN", number)
+        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "cairn", number)
             .await
             .unwrap()
             .unwrap();
@@ -1188,9 +1190,9 @@ async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     let (parent_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
     let (child_id, child_num) = add_issue(&orch, &project_id, "Child").await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{parent_num}")})),
+        Some(serde_json::json!({"parent": format!("cairn://p/cairn/{parent_num}")})),
     );
     apply_as_run(&orch, &item, &run_id).await.unwrap();
     assert_eq!(
@@ -1204,7 +1206,7 @@ async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     assert!(
         crate::orchestrator::wakes::watcher_jobs_for_issue(
             &orch.db.local,
-            &format!("cairn://p/CAIRN/{child_num}")
+            &format!("cairn://p/cairn/{child_num}")
         )
         .await
         .unwrap()
@@ -1226,7 +1228,7 @@ async fn patch_parent_hands_child_attention_to_the_parents_coordinator() {
     assert_eq!(
         crate::orchestrator::wakes::watcher_jobs_for_issue(
             &orch.db.local,
-            &format!("cairn://p/CAIRN/{child_num}")
+            &format!("cairn://p/cairn/{child_num}")
         )
         .await
         .unwrap(),
@@ -1239,7 +1241,7 @@ async fn patch_parent_null_orphans_issue() {
     let orch = seeded_orch().await;
     let (number, _job_id, run_id) = seed_running_node(&orch).await;
     let running_issue =
-        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "CAIRN", number)
+        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "cairn", number)
             .await
             .unwrap()
             .unwrap();
@@ -1247,15 +1249,15 @@ async fn patch_parent_null_orphans_issue() {
     let (_parent_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
     let (child_id, child_num) = add_issue(&orch, &project_id, "Child").await;
     let adopt = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{parent_num}")})),
+        Some(serde_json::json!({"parent": format!("cairn://p/cairn/{parent_num}")})),
     );
     apply_as_run(&orch, &adopt, &run_id).await.unwrap();
     assert!(parent_issue_id_of(&orch, &child_id).await.is_some());
 
     let orphan = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"parent": serde_json::Value::Null})),
     );
@@ -1268,9 +1270,9 @@ async fn patch_parent_self_rejected() {
     let orch = seeded_orch().await;
     let (_child_id, child_num) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{child_num}")})),
+        Some(serde_json::json!({"parent": format!("cairn://p/cairn/{child_num}")})),
     );
     let err = apply(&orch, &item).await.unwrap_err();
     assert!(err.error.contains("its own parent"), "got: {}", err.error);
@@ -1281,9 +1283,9 @@ async fn patch_parent_unknown_uri_rejected() {
     let orch = seeded_orch().await;
     let (_child_id, child_num) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": "cairn://p/CAIRN/9999"})),
+        Some(serde_json::json!({"parent": "cairn://p/cairn/9999"})),
     );
     let err = apply(&orch, &item).await.unwrap_err();
     assert!(
@@ -1306,9 +1308,9 @@ async fn patch_parent_adopts_issue_under_a_thread() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux"})),
+            Some(serde_json::json!({"parent": "cairn://p/cairn/thread-ux"})),
         ),
     )
     .await
@@ -1323,13 +1325,13 @@ async fn patch_parent_adopts_issue_under_a_thread() {
     let overview = crate::resources::read::produce_cairn_resource(
         &orch,
         &request(),
-        "cairn://p/CAIRN/thread-ux",
+        "cairn://p/cairn/thread-ux",
     )
     .await;
     assert!(
         overview
             .content
-            .contains(&format!("cairn://p/CAIRN/{child_num}")),
+            .contains(&format!("cairn://p/cairn/{child_num}")),
         "the thread's census should list the adopted issue: {}",
         overview.content
     );
@@ -1339,13 +1341,13 @@ async fn patch_parent_adopts_issue_under_a_thread() {
     let child = crate::resources::read::produce_cairn_resource(
         &orch,
         &request(),
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
     )
     .await;
     assert!(
         child
             .content
-            .contains("Parent: `cairn://p/CAIRN/thread-ux`"),
+            .contains("Parent: `cairn://p/cairn/thread-ux`"),
         "the adopted issue should name its thread parent: {}",
         child.content
     );
@@ -1363,9 +1365,9 @@ async fn patch_parent_accepts_a_migrated_thread_number() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"parent": "cairn://p/CAIRN/3404"})),
+            Some(serde_json::json!({"parent": "cairn://p/cairn/3404"})),
         ),
     )
     .await
@@ -1392,9 +1394,9 @@ async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux"})),
+            Some(serde_json::json!({"parent": "cairn://p/cairn/thread-ux"})),
         ),
     )
     .await
@@ -1403,7 +1405,7 @@ async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
     assert_eq!(
         crate::orchestrator::wakes::watcher_jobs_for_issue(
             &orch.db.local,
-            &format!("cairn://p/CAIRN/{child_num}")
+            &format!("cairn://p/cairn/{child_num}")
         )
         .await
         .unwrap(),
@@ -1414,7 +1416,7 @@ async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
         .local
         .query_all(
             "SELECT job_id FROM wake_subscriptions WHERE source_kind = 'issue' AND source_ref = ?1",
-            (format!("cairn://p/CAIRN/{child_num}"),),
+            (format!("cairn://p/cairn/{child_num}"),),
             |row| crate::storage::RowExt::text(row, 0),
         )
         .await
@@ -1428,7 +1430,7 @@ async fn an_adopted_child_wakes_the_thread_without_minting_a_subscription() {
         crate::orchestrator::wakes::coordinated_child_issue_uris_for_job(&orch.db.local, &session)
             .await
             .unwrap(),
-        vec![format!("cairn://p/CAIRN/{child_num}")]
+        vec![format!("cairn://p/cairn/{child_num}")]
     );
 }
 
@@ -1462,20 +1464,20 @@ async fn an_issue_filed_from_a_thread_defaults_to_that_thread() {
     let overview = crate::resources::read::produce_cairn_resource(
         &orch,
         &request(),
-        "cairn://p/CAIRN/thread-ux",
+        "cairn://p/cairn/thread-ux",
     )
     .await;
     assert!(
         overview
             .content
-            .contains(&format!("cairn://p/CAIRN/{child_num}")),
+            .contains(&format!("cairn://p/cairn/{child_num}")),
         "the thread's census should list the issue it filed: {}",
         overview.content
     );
 
     // Attention reaches the thread's live session by the parent edge alone, the
     // same way an adopted child's does — creation mints no subscription either.
-    let child_uri = format!("cairn://p/CAIRN/{child_num}");
+    let child_uri = format!("cairn://p/cairn/{child_num}");
     assert_eq!(
         crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, &child_uri)
             .await
@@ -1551,7 +1553,7 @@ async fn an_explicit_parent_beats_the_creating_thread() {
         &orch,
         &run_id,
         "Handed to another thread",
-        Some("cairn://p/CAIRN/thread-ops"),
+        Some("cairn://p/cairn/thread-ops"),
     )
     .await;
     assert_eq!(
@@ -1565,7 +1567,7 @@ async fn an_explicit_parent_beats_the_creating_thread() {
         &orch,
         &run_id,
         "Filed under an issue",
-        Some(&format!("cairn://p/CAIRN/{parent_num}")),
+        Some(&format!("cairn://p/cairn/{parent_num}")),
     )
     .await;
     assert_eq!(
@@ -1584,9 +1586,9 @@ async fn an_explicit_parent_beats_the_creating_thread() {
     );
 }
 
-/// Outside a thread nothing changes: an agent on an issue's execution, and a
-/// caller with no run identity at all, both still create an unparented issue
-/// when the payload names no parent.
+/// Outside a thread nothing changes: agents on an issue execution create an
+/// unparented issue when the payload names no parent, regardless of which
+/// authenticated builder performs the write.
 #[tokio::test]
 async fn an_issue_filed_outside_a_thread_stays_unparented() {
     let orch = seeded_orch().await;
@@ -1596,13 +1598,14 @@ async fn an_issue_filed_outside_a_thread_stays_unparented() {
     assert_eq!(parent_thread_id_of(&orch, &from_execution).await, None);
     assert_eq!(parent_issue_id_of(&orch, &from_execution).await, None);
 
-    apply(
+    apply_as_run(
         &orch,
         &change_item(
-            "cairn://p/CAIRN/issues",
+            "cairn://p/cairn/issues",
             ChangeMode::Append,
-            Some(serde_json::json!({"title": "Filed by a person"})),
+            Some(serde_json::json!({"title": "Filed by another builder"})),
         ),
+        &run_id,
     )
     .await
     .unwrap();
@@ -1610,7 +1613,7 @@ async fn an_issue_filed_outside_a_thread_stays_unparented() {
         .db
         .local
         .query_all(
-            "SELECT parent_issue_id, parent_thread_id FROM issues WHERE title = 'Filed by a person'",
+            "SELECT parent_issue_id, parent_thread_id FROM issues WHERE title = 'Filed by another builder'",
             (),
             |row| {
                 Ok((
@@ -1691,7 +1694,7 @@ async fn adopting_under_a_thread_drops_the_inherited_branch() {
     let orch = seeded_orch().await;
     let (parent_num, _job_id, _run_id) = seed_running_node(&orch).await;
     let parent_issue =
-        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "CAIRN", parent_num)
+        crate::issues::relations::issue_id_for_project_number(&orch.db.local, "cairn", parent_num)
             .await
             .unwrap()
             .unwrap();
@@ -1702,9 +1705,9 @@ async fn adopting_under_a_thread_drops_the_inherited_branch() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{parent_num}")})),
+            Some(serde_json::json!({"parent": format!("cairn://p/cairn/{parent_num}")})),
         ),
     )
     .await
@@ -1718,9 +1721,9 @@ async fn adopting_under_a_thread_drops_the_inherited_branch() {
     apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux"})),
+            Some(serde_json::json!({"parent": "cairn://p/cairn/thread-ux"})),
         ),
     )
     .await
@@ -1748,9 +1751,9 @@ async fn parent_round_trips_between_thread_issue_and_none() {
     let project_id = project_id_of(&orch, &child_id).await;
     let thread_id = add_thread(&orch, &project_id, "thread-ux", None).await;
     let (parent_id, parent_num) = add_issue(&orch, &project_id, "Parent").await;
-    let child_uri = format!("cairn://p/CAIRN/{child_num}");
-    let thread = serde_json::json!("cairn://p/CAIRN/thread-ux");
-    let issue = serde_json::json!(format!("cairn://p/CAIRN/{parent_num}"));
+    let child_uri = format!("cairn://p/cairn/{child_num}");
+    let thread = serde_json::json!("cairn://p/cairn/thread-ux");
+    let issue = serde_json::json!(format!("cairn://p/cairn/{parent_num}"));
     let none = serde_json::Value::Null;
 
     let steps: [(serde_json::Value, Option<&str>, Option<&str>); 6] = [
@@ -1794,9 +1797,9 @@ async fn patch_parent_unknown_thread_rejected() {
     let orch = seeded_orch().await;
     let (_child_id, child_num) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-nobody"})),
+        Some(serde_json::json!({"parent": "cairn://p/cairn/thread-nobody"})),
     );
     let err = apply(&orch, &item).await.unwrap_err();
     assert!(
@@ -1831,7 +1834,7 @@ async fn patch_parent_cross_project_thread_rejected() {
     add_thread(&orch, &other.id, "thread-elsewhere", None).await;
 
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"parent": "cairn://p/AGG/thread-elsewhere"})),
     );
@@ -1852,9 +1855,9 @@ async fn patch_parent_rejects_descendant_and_home_relative_uris() {
     let descendant = apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
-            Some(serde_json::json!({"parent": "cairn://p/CAIRN/thread-ux/chat"})),
+            Some(serde_json::json!({"parent": "cairn://p/cairn/thread-ux/chat"})),
         ),
     )
     .await
@@ -1868,7 +1871,7 @@ async fn patch_parent_rejects_descendant_and_home_relative_uris() {
     let home_relative = apply(
         &orch,
         &change_item(
-            &format!("cairn://p/CAIRN/{child_num}"),
+            &format!("cairn://p/cairn/{child_num}"),
             ChangeMode::Patch,
             Some(serde_json::json!({"parent": "cairn:~/"})),
         ),
@@ -1909,7 +1912,7 @@ async fn patch_parent_cross_project_rejected() {
     .unwrap();
     let (_agg_id, agg_num) = add_issue(&orch, &other.id, "AggParent").await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"parent": format!("cairn://p/AGG/{agg_num}")})),
     );
@@ -1925,16 +1928,16 @@ async fn patch_parent_cycle_rejected() {
     let (_b_id, b_num) = add_issue(&orch, &project_id, "B").await;
     // A adopts B as its parent.
     let adopt = change_item(
-        &format!("cairn://p/CAIRN/{a_num}"),
+        &format!("cairn://p/cairn/{a_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{b_num}")})),
+        Some(serde_json::json!({"parent": format!("cairn://p/cairn/{b_num}")})),
     );
     apply(&orch, &adopt).await.unwrap();
     // Adopting B under A would close the loop A -> B -> A.
     let cycle = change_item(
-        &format!("cairn://p/CAIRN/{b_num}"),
+        &format!("cairn://p/cairn/{b_num}"),
         ChangeMode::Patch,
-        Some(serde_json::json!({"parent": format!("cairn://p/CAIRN/{a_num}")})),
+        Some(serde_json::json!({"parent": format!("cairn://p/cairn/{a_num}")})),
     );
     let err = apply(&orch, &cycle).await.unwrap_err();
     assert!(err.error.contains("cycle"), "got: {}", err.error);
@@ -1945,7 +1948,7 @@ async fn patch_parent_malformed_uri_rejected() {
     let orch = seeded_orch().await;
     let (_child_id, child_num) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{child_num}"),
+        &format!("cairn://p/cairn/{child_num}"),
         ChangeMode::Patch,
         Some(serde_json::json!({"parent": "not-a-uri"})),
     );
@@ -1958,7 +1961,7 @@ async fn delete_removes_issue() {
     let orch = seeded_orch().await;
     let (issue_id, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Delete,
         None,
     );
@@ -1974,13 +1977,22 @@ async fn delete_rejects_payload() {
     let orch = seeded_orch().await;
     let (_, number) = seed_issue(&orch).await;
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}"),
+        &format!("cairn://p/cairn/{number}"),
         ChangeMode::Delete,
         Some(serde_json::json!({"force": true})),
     );
     let err = apply(&orch, &item).await.unwrap_err();
+    // The contract gate owns this now, and says more than the hand-rolled check
+    // it replaced: which key was not understood, and that the mutation takes
+    // none at all.
     assert!(
-        err.error.contains("does not accept payload"),
+        err.error.contains("Unknown payload key"),
+        "got: {}",
+        err.error
+    );
+    assert!(err.error.contains("`force`"), "got: {}", err.error);
+    assert!(
+        err.error.contains("takes no payload keys"),
         "got: {}",
         err.error
     );
@@ -1990,7 +2002,7 @@ async fn delete_rejects_payload() {
 async fn delete_unknown_issue_errors() {
     let orch = seeded_orch().await;
     seed_issue(&orch).await;
-    let item = change_item("cairn://p/CAIRN/9999", ChangeMode::Delete, None);
+    let item = change_item("cairn://p/cairn/9999", ChangeMode::Delete, None);
     let err = apply(&orch, &item).await.unwrap_err();
     assert!(err.error.contains("not found"), "got: {}", err.error);
 }
@@ -2031,7 +2043,7 @@ async fn patch_execution_agent_snapshot_updates_stored_snapshot() {
             .unwrap();
 
     let item = change_item(
-        &format!("cairn://p/CAIRN/{number}/executions/1"),
+        &format!("cairn://p/cairn/{number}/executions/1"),
         ChangeMode::Patch,
         Some(serde_json::json!({
             "agent": "builder",
@@ -2058,6 +2070,7 @@ fn dummy_value(ty: cairn_common::contract::KeyType) -> serde_json::Value {
         KeyType::Str => serde_json::json!("sample"),
         KeyType::Bool => serde_json::json!(true),
         KeyType::Int => serde_json::json!(1),
+        KeyType::Float => serde_json::json!(1.0),
         KeyType::Array => serde_json::json!([]),
         KeyType::Object => serde_json::json!({}),
         KeyType::Any => serde_json::Value::Null,
@@ -2092,77 +2105,80 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
                 "cairn://mcp/playwright"
             }
         }
-        K::Project => "cairn://p/CAIRN",
+        K::Project => "cairn://p/cairn",
         K::Settings => "cairn://settings",
         K::Projects => "cairn://projects",
-        K::ProjectSettings => "cairn://p/CAIRN/settings",
-        K::ProjectIssues => "cairn://p/CAIRN/issues",
-        K::ProjectThreads => "cairn://p/CAIRN/threads",
-        K::Thread => "cairn://p/CAIRN/design-review",
-        K::ProjectMessages => "cairn://p/CAIRN/messages",
-        K::ProjectTerminal => "cairn://p/CAIRN/terminal/dev",
-        K::ProjectBrowser => "cairn://p/CAIRN/browser/main",
-        K::NodeBrowser => "cairn://p/CAIRN/1/1/builder/browser/main",
-        K::TaskBrowser => "cairn://p/CAIRN/1/1/builder/task/sub/browser/main",
-        K::Issue => "cairn://p/CAIRN/1",
-        K::IssueExecutions => "cairn://p/CAIRN/1/executions",
-        K::IssueExecution => "cairn://p/CAIRN/1/executions/2",
-        K::IssueMessages => "cairn://p/CAIRN/1/messages",
-        K::IssueComment => "cairn://p/CAIRN/1/comments/1",
-        K::Node => "cairn://p/CAIRN/1/1/builder",
-        K::NodeMessages => "cairn://p/CAIRN/1/1/builder/messages",
-        K::NodeProgress => "cairn://p/CAIRN/1/1/builder/progress",
-        K::NodeRebase => "cairn://p/CAIRN/1/1/builder/rebase",
-        K::NodeArtifact => "cairn://p/CAIRN/1/1/builder/plan",
-        K::NodeTerminal => "cairn://p/CAIRN/1/1/builder/terminal/dev",
-        K::NodeRepl => "cairn://p/CAIRN/1/1/builder/repl/analysis",
-        K::TaskTerminal => "cairn://p/CAIRN/1/1/builder/task/sub/terminal/dev",
-        K::TaskMessages => "cairn://p/CAIRN/1/1/builder/task/sub/messages",
-        K::TaskArtifact => "cairn://p/CAIRN/1/1/builder/task/sub/result",
-        K::JobTodos => "cairn://p/CAIRN/1/1/builder/todos",
-        K::NodeWakes => "cairn://p/CAIRN/1/1/builder/wakes",
-        K::NodeTasks => "cairn://p/CAIRN/1/1/builder/tasks",
-        K::NodeQuestions => "cairn://p/CAIRN/1/1/builder/questions",
-        K::NodeQuestion => "cairn://p/CAIRN/1/1/builder/questions/q-1",
-        K::NodePermission => "cairn://p/CAIRN/1/1/builder/permissions/perm-1",
-        K::TaskPermission => "cairn://p/CAIRN/1/1/builder/task/sub/permissions/perm-1",
-        K::TaskPermissions => "cairn://p/CAIRN/1/1/builder/task/sub/permissions",
+        K::ProjectSettings => "cairn://p/cairn/settings",
+        K::ProjectIssues => "cairn://p/cairn/issues",
+        K::Posts => "cairn://posts",
+        K::Post => "cairn://posts/1",
+        K::ProjectThreads => "cairn://p/cairn/threads",
+        K::Thread => "cairn://p/cairn/design-review",
+        K::ProjectMessages => "cairn://p/cairn/messages",
+        K::ProjectTerminal => "cairn://p/cairn/terminal/dev",
+        K::ProjectBrowser => "cairn://p/cairn/browser/main",
+        K::NodeBrowser => "cairn://p/cairn/1/1/builder/browser/main",
+        K::TaskBrowser => "cairn://p/cairn/1/1/builder/task/sub/browser/main",
+        K::Issue => "cairn://p/cairn/1",
+        K::IssueExecutions => "cairn://p/cairn/1/executions",
+        K::IssueExecution => "cairn://p/cairn/1/executions/2",
+        K::IssueMessages => "cairn://p/cairn/1/messages",
+        K::IssueComment => "cairn://p/cairn/1/comments/1",
+        K::Node => "cairn://p/cairn/1/1/builder",
+        K::NodeMessages => "cairn://p/cairn/1/1/builder/messages",
+        K::NodeProgress => "cairn://p/cairn/1/1/builder/progress",
+        K::NodeRebase => "cairn://p/cairn/1/1/builder/rebase",
+        K::NodeArtifact => "cairn://p/cairn/1/1/builder/plan",
+        K::NodeTerminal => "cairn://p/cairn/1/1/builder/terminal/dev",
+        K::NodeRepl => "cairn://p/cairn/1/1/builder/repl/analysis",
+        K::TaskTerminal => "cairn://p/cairn/1/1/builder/task/sub/terminal/dev",
+        K::TaskMessages => "cairn://p/cairn/1/1/builder/task/sub/messages",
+        K::TaskArtifact => "cairn://p/cairn/1/1/builder/task/sub/result",
+        K::JobTodos => "cairn://p/cairn/1/1/builder/todos",
+        K::HomeFeed => "cairn://p/cairn/1/1/builder/feed",
+        K::NodeWakes => "cairn://p/cairn/1/1/builder/wakes",
+        K::NodeTasks => "cairn://p/cairn/1/1/builder/tasks",
+        K::NodeQuestions => "cairn://p/cairn/1/1/builder/questions",
+        K::NodeQuestion => "cairn://p/cairn/1/1/builder/questions/q-1",
+        K::NodePermission => "cairn://p/cairn/1/1/builder/permissions/perm-1",
+        K::TaskPermission => "cairn://p/cairn/1/1/builder/task/sub/permissions/perm-1",
+        K::TaskPermissions => "cairn://p/cairn/1/1/builder/task/sub/permissions",
         K::Bug => "cairn://bug",
         K::Skills => "cairn://skills",
         K::Skill => "cairn://skills/testing",
-        K::ProjectSkills => "cairn://p/CAIRN/skills",
-        K::ProjectSkill => "cairn://p/CAIRN/skills/testing",
-        K::ProjectReferences => "cairn://p/CAIRN/references",
-        K::ProjectReference => "cairn://p/CAIRN/references/openpnp",
+        K::ProjectSkills => "cairn://p/cairn/skills",
+        K::ProjectSkill => "cairn://p/cairn/skills/testing",
+        K::ProjectReferences => "cairn://p/cairn/references",
+        K::ProjectReference => "cairn://p/cairn/references/openpnp",
         K::Packs => "cairn://packs",
         K::Pack => "cairn://packs/matlab",
         K::Labels => "cairn://labels",
         K::Label => "cairn://labels/bug",
-        K::NodeMemories => "cairn://p/CAIRN/1/1/builder/memories",
-        K::NodeMemory => "cairn://p/CAIRN/1/1/builder/memories/1",
+        K::NodeMemories => "cairn://p/cairn/1/1/builder/memories",
+        K::NodeMemory => "cairn://p/cairn/1/1/builder/memories/1",
         K::Recipes => "cairn://recipes",
         K::Recipe => "cairn://recipes/build",
-        K::ProjectRecipes => "cairn://p/CAIRN/recipes",
-        K::ProjectRecipe => "cairn://p/CAIRN/recipes/build",
+        K::ProjectRecipes => "cairn://p/cairn/recipes",
+        K::ProjectRecipe => "cairn://p/cairn/recipes/build",
         K::Agents => "cairn://agents",
         K::Agent => "cairn://agents/build",
-        K::ProjectAgents => "cairn://p/CAIRN/agents",
-        K::ProjectAgent => "cairn://p/CAIRN/agents/build",
+        K::ProjectAgents => "cairn://p/cairn/agents",
+        K::ProjectAgent => "cairn://p/cairn/agents/build",
         K::Actions => "cairn://actions",
         K::Action => "cairn://actions/example",
-        K::ProjectActions => "cairn://p/CAIRN/actions",
-        K::ProjectAction => "cairn://p/CAIRN/actions/example",
-        K::NodeCalls => "cairn://p/CAIRN/1/1/builder/calls",
+        K::ProjectActions => "cairn://p/cairn/actions",
+        K::ProjectAction => "cairn://p/cairn/actions/example",
+        K::NodeCalls => "cairn://p/cairn/1/1/builder/calls",
         K::Executors => "cairn://executors",
         K::Executor => "cairn://executors/bglab-ub",
         K::Routes => "cairn://routes",
         K::Route => "cairn://routes/notify-on-attention",
-        K::ProjectRoutes => "cairn://p/CAIRN/routes",
-        K::ProjectRoute => "cairn://p/CAIRN/routes/notify-on-attention",
+        K::ProjectRoutes => "cairn://p/cairn/routes",
+        K::ProjectRoute => "cairn://p/cairn/routes/notify-on-attention",
         K::Responses => "cairn://responses",
         K::Response => "cairn://responses/summarize",
-        K::ProjectResponses => "cairn://p/CAIRN/responses",
-        K::ProjectResponse => "cairn://p/CAIRN/responses/summarize",
+        K::ProjectResponses => "cairn://p/cairn/responses",
+        K::ProjectResponse => "cairn://p/cairn/responses/summarize",
         K::Grant => "cairn://grants/grant-1",
         other => {
             panic!("sample_resource: {other:?} carries a mutation but has no sample URI; add one")
@@ -2225,7 +2241,7 @@ async fn thread_subtree_mutations_all_have_dispatch_arms() {
         .local
         .execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p-thr', 'default', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+             VALUES ('p-thr', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO threads (id, project_id, name, created_at, updated_at)
              VALUES ('t-dr', 'p-thr', 'design-review', 2, 2);",
         )
@@ -2256,7 +2272,7 @@ async fn thread_subtree_mutations_all_have_dispatch_arms() {
         "task/probe/terminal/build",
         "task/probe/browser",
     ] {
-        let uri = format!("cairn://p/CAIRN/design-review/{path}");
+        let uri = format!("cairn://p/cairn/design-review/{path}");
         let delegated = crate::resources::threads::delegate_thread_descendant(
             cairn_common::uri::parse_uri(&uri).expect("a thread path parses"),
         )
@@ -2305,7 +2321,7 @@ async fn thread_subtree_mutations_resolve_their_owning_job() {
         .local
         .execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p-thr', 'default', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+             VALUES ('p-thr', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO threads (id, project_id, name, created_at, updated_at)
              VALUES ('t-dr', 'p-thr', 'design-review', 2, 2);",
         )
@@ -2347,7 +2363,7 @@ async fn thread_subtree_mutations_resolve_their_owning_job() {
             Some(serde_json::json!({"todos": []})),
         ),
     ] {
-        let uri = format!("cairn://p/CAIRN/design-review/{path}");
+        let uri = format!("cairn://p/cairn/design-review/{path}");
         let item = change_item(&uri, mode, payload);
         if let Err(failure) = dispatch_resource_change(&orch, &request(), 0, &item, false).await {
             // The signatures of an owner that could not be resolved: the reserved
@@ -2448,7 +2464,7 @@ fn agent_frontmatter_honors_model_alias_for_tier() {
 async fn executions_append_refuses_a_malformed_override_before_starting() {
     let orch = seeded_orch().await;
     let (_, number) = seed_issue(&orch).await;
-    let target = format!("cairn://p/CAIRN/{number}/executions");
+    let target = format!("cairn://p/cairn/{number}/executions");
 
     let append = |overrides: serde_json::Value| {
         change_item(
@@ -2502,7 +2518,7 @@ async fn issue_create_reports_override_failures_under_its_own_key() {
     let failure = preview(
         &orch,
         &change_item(
-            "cairn://p/CAIRN/issues",
+            "cairn://p/cairn/issues",
             ChangeMode::Append,
             Some(serde_json::json!({
                 "title": "tiny fix",
@@ -2523,4 +2539,417 @@ async fn issue_create_reports_override_failures_under_its_own_key() {
         "the collection-append coordinates must not leak into the create door: {}",
         failure.error
     );
+}
+
+#[tokio::test]
+async fn posts_require_a_live_authenticated_identity_and_reject_forged_provenance() {
+    let orch = seeded_orch().await;
+    let item = change_item(
+        "cairn://posts",
+        ChangeMode::Append,
+        Some(serde_json::json!({"content": "identity required"})),
+    );
+    let error = apply(&orch, &item).await.unwrap_err();
+    assert!(
+        error.error.contains("run") || error.error.contains("authenticated"),
+        "got: {}",
+        error.error
+    );
+    assert!(orch
+        .db
+        .local
+        .list_posts(PostScope::Corpus, None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let forged = change_item(
+        "cairn://posts",
+        ChangeMode::Append,
+        Some(serde_json::json!({
+            "content": "forged",
+            "author": {"kind": "machine", "deviceId": "attacker"}
+        })),
+    );
+    let error = apply(&orch, &forged).await.unwrap_err();
+    assert!(error.error.contains("provenance is server-captured"));
+    assert!(orch
+        .db
+        .local
+        .list_posts(PostScope::Corpus, None, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn posts_capture_live_agent_authorship_and_only_accept_own_project_scope() {
+    let orch = seeded_orch().await;
+    let (number, _, run_id) = seed_running_node(&orch).await;
+
+    let workspace = change_item(
+        "cairn://posts",
+        ChangeMode::Append,
+        Some(serde_json::json!({"title": "Workspace", "content": "shared"})),
+    );
+    apply_as_run(&orch, &workspace, &run_id).await.unwrap();
+
+    let project = change_item(
+        "cairn://posts",
+        ChangeMode::Append,
+        Some(serde_json::json!({
+            "title": "Project",
+            "content": "scoped",
+            "scope": "CAIRN"
+        })),
+    );
+    apply_as_run(&orch, &project, &run_id).await.unwrap();
+
+    let posts = orch
+        .db
+        .local
+        .list_posts(PostScope::Corpus, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(posts.len(), 2);
+    let captured = posts
+        .iter()
+        .find(|post| post.title.as_deref() == Some("Project"))
+        .unwrap();
+    assert!(captured.project_id.is_some());
+    assert_eq!(
+        captured.author,
+        cairn_common::identity::PrincipalRef::Agent {
+            node: format!("cairn://p/cairn/{number}/1/builder"),
+            run_id: Some(run_id.clone()),
+        }
+    );
+    assert_eq!(captured.appearance.principal(), &captured.author);
+    let evidence = captured.appearance.evidence();
+    assert_eq!(
+        evidence.transport,
+        cairn_common::identity::AppearanceTransport::ResourcePatch
+    );
+    assert_eq!(
+        evidence.verification.status(),
+        cairn_common::identity::VerificationStatus::Verified
+    );
+    assert_eq!(evidence.verification.session(), Some(run_id.as_str()));
+
+    let project_posts = orch
+        .db
+        .local
+        .list_posts(PostScope::Project("cairn"), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(project_posts.len(), 1);
+    assert_eq!(project_posts[0].title.as_deref(), Some("Project"));
+
+    let unrelated = change_item(
+        "cairn://posts",
+        ChangeMode::Append,
+        Some(serde_json::json!({
+            "content": "must not land",
+            "scope": "OTHER"
+        })),
+    );
+    let error = apply_as_run(&orch, &unrelated, &run_id).await.unwrap_err();
+    assert!(error.error.contains("own project key"));
+    assert_eq!(
+        orch.db
+            .local
+            .list_posts(PostScope::Corpus, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn post_reads_are_complete_ordered_and_search_before_limit_without_mutating_query() {
+    let orch = seeded_orch().await;
+    let (_, _, run_id) = seed_running_node(&orch).await;
+    let matching = change_item(
+        "cairn://posts",
+        ChangeMode::Append,
+        Some(serde_json::json!({"title": "Needle", "content": "old match"})),
+    );
+    apply_as_run(&orch, &matching, &run_id).await.unwrap();
+    let post = orch
+        .db
+        .local
+        .list_posts(PostScope::Corpus, Some("needle"), 1)
+        .await
+        .unwrap()
+        .remove(0);
+
+    for title in ["Newer one", "Newer two"] {
+        let item = change_item(
+            "cairn://posts",
+            ChangeMode::Append,
+            Some(serde_json::json!({"title": title, "content": "not a match"})),
+        );
+        apply_as_run(&orch, &item, &run_id).await.unwrap();
+    }
+    let params = vec![
+        cairn_common::query::QueryParam {
+            key: "search".into(),
+            value: "needle".into(),
+        },
+        cairn_common::query::QueryParam {
+            key: "limit".into(),
+            value: "1".into(),
+        },
+    ];
+    let original = params.clone();
+    let rendered =
+        crate::resources::posts::read_posts(&orch.db.local, PostScope::Corpus, &params).await;
+    assert!(rendered.contains("Needle") && rendered.contains("old match"));
+    assert!(!rendered.contains("Newer one"));
+    assert_eq!(
+        params, original,
+        "reading must not consume or rewrite query state"
+    );
+
+    for content in ["first comment", "second comment"] {
+        let comment = change_item(
+            &format!("cairn://posts/{}", post.id),
+            ChangeMode::Append,
+            Some(serde_json::json!({"content": content})),
+        );
+        apply_as_run(&orch, &comment, &run_id).await.unwrap();
+    }
+
+    let json_params = vec![cairn_common::query::QueryParam {
+        key: "format".into(),
+        value: "json".into(),
+    }];
+    let json: serde_json::Value = serde_json::from_str(
+        &crate::resources::posts::read_post(&orch.db.local, post.id, &json_params).await,
+    )
+    .unwrap();
+    assert_eq!(json["post"]["content"], "old match");
+    assert!(json["post"]["author"].is_object());
+    assert!(json["post"]["appearance"].is_object());
+    assert_eq!(json["comments"].as_array().unwrap().len(), 2);
+    assert!(json["comments"][0]["author"].is_object());
+    assert!(json["comments"][0]["appearance"].is_object());
+
+    let markdown = crate::resources::posts::read_post(&orch.db.local, post.id, &[]).await;
+    let first = markdown.find("first comment").unwrap();
+    let second = markdown.find("second comment").unwrap();
+    assert!(first < second, "comments must render in creation order");
+    assert!(markdown.contains("# Needle") && markdown.contains("## Comments"));
+}
+
+/// A second project alongside the `cairn` one `seed_issue` creates, so a scoped
+/// post has somewhere to live that is not the caller's own. Returns its id.
+async fn seed_other_project(orch: &Orchestrator) -> String {
+    project_crud::create_db(
+        &orch.db.local,
+        &RealClock,
+        &CreateProject {
+            id: None,
+            name: "Other".to_string(),
+            key: "other".to_string(),
+            repo_path: tempfile::tempdir()
+                .unwrap()
+                .keep()
+                .to_string_lossy()
+                .to_string(),
+            team_id: None,
+        },
+    )
+    .await
+    .unwrap()
+    .id
+}
+
+/// A post at a chosen scope, written straight to storage. Authorship is not what
+/// the corpus-window tests are about, so it is minted here rather than routed
+/// through a second live run.
+async fn seed_post(
+    orch: &Orchestrator,
+    project_id: Option<&str>,
+    title: &str,
+    content: &str,
+) -> i64 {
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+        VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+    };
+    let author = PrincipalRef::Human {
+        issuer: "https://identity.example".to_string(),
+        subject: "author".to_string(),
+        organization: None,
+    };
+    let verification = VerificationRecord::new(
+        VerificationMethod::JwtOperator,
+        VerificationStatus::Verified,
+        Some("https://identity.example".to_string()),
+        Some("author".to_string()),
+        None,
+        None,
+        VerificationStrength::new("strong").unwrap(),
+        900,
+    )
+    .unwrap();
+    let evidence = AppearanceEvidence::new(
+        AppearanceTransport::AuthenticatedOperator,
+        Address::Invoke { origin: None },
+        verification,
+        900,
+        None,
+    )
+    .unwrap();
+    let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None).unwrap();
+    orch.db
+        .local
+        .create_post(crate::models::CreatePost {
+            project_id: project_id.map(str::to_string),
+            title: Some(title.to_string()),
+            content: content.to_string(),
+            author,
+            appearance,
+        })
+        .await
+        .unwrap()
+        .id
+}
+
+/// Read a resource as a given run identity would — `None` for a request that
+/// carries none at all, which is what an operator's own read looks like.
+async fn read_as(orch: &Orchestrator, run_id: Option<&str>, uri: &str) -> String {
+    let request = McpCallbackRequest {
+        thread_id: None,
+        cwd: "/tmp".to_string(),
+        run_id: run_id.map(str::to_string),
+        tool: "read".to_string(),
+        payload: serde_json::json!({}),
+        tool_use_id: None,
+    };
+    crate::resources::read_cairn_resource(orch, &request, uri).await
+}
+
+/// Scope is a relevance filter on the UNADDRESSED corpus: an agent asking "what
+/// is there" gets the workspace-wide posts plus its own project's, and never
+/// another project's scoped post — the same window the feed and the desktop
+/// timeline render, applied to the one surface that answers with everything.
+///
+/// `?search=` narrows inside that window rather than around it: a term that
+/// matches only another project's post finds nothing.
+#[tokio::test]
+async fn the_unaddressed_corpus_renders_only_the_caller_s_own_window() {
+    let orch = seeded_orch().await;
+    let (_, _, run_id) = seed_running_node(&orch).await;
+    let other = seed_other_project(&orch).await;
+    let own = project_id_for_key(&orch, "cairn").await;
+
+    seed_post(&orch, None, "Everyone", "a workspace observation").await;
+    seed_post(&orch, Some(&own), "Ours", "a cairn observation").await;
+    seed_post(&orch, Some(&other), "Theirs", "an unrelated observation").await;
+
+    let corpus = read_as(&orch, Some(&run_id), "cairn://posts").await;
+    assert!(corpus.contains("Everyone"), "{corpus}");
+    assert!(corpus.contains("Ours"), "{corpus}");
+    assert!(
+        !corpus.contains("Theirs") && !corpus.contains("an unrelated observation"),
+        "another project's scoped post must not appear in the unaddressed corpus: {corpus}"
+    );
+
+    let searched = read_as(&orch, Some(&run_id), "cairn://posts?search=unrelated").await;
+    assert!(
+        !searched.contains("Theirs") && !searched.contains("an unrelated observation"),
+        "search must narrow inside the window, not around it: {searched}"
+    );
+    assert!(searched.contains("No posts found"), "{searched}");
+
+    // Narrowing the corpus leaves its ordering alone: what survives the window
+    // still renders newest first.
+    assert!(
+        corpus.find("Ours").unwrap() < corpus.find("Everyone").unwrap(),
+        "the window must not disturb newest-first ordering: {corpus}"
+    );
+}
+
+/// The addressed surfaces stay workspace-open, and that is the INTENT rather
+/// than an oversight: naming another project's posts collection, naming a post
+/// by id, or commenting on one is a deliberate act, and it reaches across
+/// projects exactly as reading another project's issues does. A future pass that
+/// "fixes" this by adding an ACL has to delete this test to do it.
+#[tokio::test]
+async fn deliberately_addressed_posts_stay_readable_and_commentable_across_projects() {
+    let orch = seeded_orch().await;
+    let (_, _, run_id) = seed_running_node(&orch).await;
+    let other = seed_other_project(&orch).await;
+    let theirs = seed_post(&orch, Some(&other), "Theirs", "an unrelated observation").await;
+
+    let collection = read_as(&orch, Some(&run_id), "cairn://p/other/posts").await;
+    assert!(
+        collection.contains("Theirs") && collection.contains("an unrelated observation"),
+        "another project's posts collection is addressed, so it renders: {collection}"
+    );
+
+    let post = read_as(&orch, Some(&run_id), &format!("cairn://posts/{theirs}")).await;
+    assert!(
+        post.contains("an unrelated observation"),
+        "a post named by id renders whoever asks: {post}"
+    );
+
+    let comment = change_item(
+        &format!("cairn://posts/{theirs}"),
+        ChangeMode::Append,
+        Some(serde_json::json!({"content": "replying from another project"})),
+    );
+    apply_as_run(&orch, &comment, &run_id)
+        .await
+        .expect("commenting across projects is allowed");
+    assert_eq!(
+        orch.db
+            .local
+            .list_post_comments(theirs)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// Fail-closed, in the one direction that matters. A request claiming a run that
+/// cannot be resolved has an unknown window, and an unknown window is not the
+/// whole workspace: the read errors and carries nothing it could not place.
+///
+/// The other direction is deliberate and asserted beside it: a request carrying
+/// no run identity at all is an operator's own, and an operator stands in no
+/// project, so the whole corpus is theirs.
+#[tokio::test]
+async fn an_unresolvable_caller_errors_while_an_operator_reads_the_whole_corpus() {
+    let orch = seeded_orch().await;
+    seed_running_node(&orch).await;
+    let other = seed_other_project(&orch).await;
+    seed_post(&orch, Some(&other), "Theirs", "an unrelated observation").await;
+
+    let refused = read_as(&orch, Some("ghost"), "cairn://posts").await;
+    assert!(
+        refused.contains("cannot resolve") && refused.contains("ghost"),
+        "the refusal must say the window is unknown and name the run: {refused}"
+    );
+    assert!(
+        !refused.contains("an unrelated observation"),
+        "an unresolvable identity must not degrade to the unfiltered corpus: {refused}"
+    );
+
+    let operator = read_as(&orch, None, "cairn://posts").await;
+    assert!(
+        operator.contains("an unrelated observation"),
+        "an operator holds no project jurisdiction, so nothing is withheld: {operator}"
+    );
+}
+
+/// The project key a seeded project was created under, as a row id.
+async fn project_id_for_key(orch: &Orchestrator, key: &str) -> String {
+    crate::mcp::handlers::run_context::project_id_by_key(&orch.db.local, key)
+        .await
+        .unwrap()
 }

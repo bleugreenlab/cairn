@@ -329,6 +329,17 @@ async fn load_session_conn(
 /// Read and clear the job's `needs_fresh_session` flag, returning whether it was
 /// set. A prompt edit sets it; the continue path consumes it once, between
 /// turns, to rotate the session so the edited system prompt takes effect.
+pub(super) async fn needs_fresh_session(db: Arc<LocalDb>, job_id: String) -> Result<bool, String> {
+    db.query_opt(
+        "SELECT needs_fresh_session FROM jobs WHERE id = ?1",
+        (job_id,),
+        |row| row.i64(0),
+    )
+    .await
+    .map(|value| value.unwrap_or(0) != 0)
+    .map_err(|e| db_error("Failed to read needs_fresh_session", e))
+}
+
 pub(super) async fn take_needs_fresh_session(
     db: Arc<LocalDb>,
     job_id: String,
@@ -847,7 +858,7 @@ mod project_path_tests {
             .unwrap();
         private
             .execute(
-                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('PRJ', ?1, 1)",
+                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('prj', ?1, 1)",
                 (TEAM_ID,),
             )
             .await
@@ -859,7 +870,7 @@ mod project_path_tests {
                 "
                 INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','w',1,1);
                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('{}','ws','Project','PRJ','/creator/repo',1,1);
+                 VALUES ('{}','ws','Project','prj','/creator/repo',1,1);
                 ",
                 PROJECT_ID
             ))
@@ -871,7 +882,7 @@ mod project_path_tests {
         let dbs = Arc::new(crate::db::DbState::new(private, index));
         dbs.register_team_db_for_test(TEAM_ID.to_string(), team_db)
             .await;
-        dbs.set_route("PRJ", Some(TEAM_ID.to_string())).await;
+        dbs.set_route("prj", Some(TEAM_ID.to_string())).await;
         dbs
     }
 
@@ -892,7 +903,7 @@ mod project_path_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn load_project_repo_and_key_uses_team_local_repo_path_when_cloned() {
         let dbs = routed_team_project_state().await;
-        crate::projects::crud::set_local_repo_path(&dbs.local, "PRJ", Path::new("/member/repo"))
+        crate::projects::crud::set_local_repo_path(&dbs.local, "prj", Path::new("/member/repo"))
             .await
             .unwrap();
 
@@ -901,7 +912,7 @@ mod project_path_tests {
             .unwrap();
 
         assert_eq!(repo_path, "/member/repo");
-        assert_eq!(key, "PRJ");
+        assert_eq!(key, "prj");
     }
 }
 
@@ -916,7 +927,7 @@ mod prepare_session_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             VALUES ('proj', 'default', 'Project', 'prj', '/repo', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
              VALUES ('iss', 'proj', 1, 'Issue', 'active', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, created_at, updated_at)
@@ -999,7 +1010,7 @@ mod pack_anchor_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+             VALUES ('proj', 'default', 'Project', 'prj', '/repo', 'main', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
              VALUES ('iss', 'proj', 1, 'Top-level', 'active', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, base_branch, created_at, updated_at)
@@ -1031,7 +1042,7 @@ mod pack_anchor_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+             VALUES ('proj', 'default', 'Project', 'prj', '/repo', 'main', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
              VALUES ('parent', 'proj', 1, 'Parent', 'active', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
@@ -1082,7 +1093,7 @@ mod pack_anchor_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+             VALUES ('proj', 'default', 'Project', 'prj', '/repo', 'main', 1, 1);
             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
              VALUES ('thread', 'proj', 'thread', 'active', 'none', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, parent_thread_id, created_at, updated_at)
@@ -1137,7 +1148,7 @@ mod pack_anchor_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+             VALUES ('proj', 'default', 'Project', 'prj', '/repo', 'main', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
              VALUES ('iss', 'proj', 1, 'Issue', 'active', 1, 1);
             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -1199,7 +1210,7 @@ mod pack_anchor_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PRJ', '/repo', 'main', 1, 1);
+             VALUES ('proj', 'default', 'Project', 'prj', '/repo', 'main', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
              VALUES ('gp', 'proj', 1, 'Grandparent', 'active', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
@@ -1273,7 +1284,7 @@ mod load_run_tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-1', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             VALUES ('proj-1', 'default', 'Project', 'prj', '/repo', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
              VALUES ('iss-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, created_at, updated_at)

@@ -353,11 +353,11 @@ mod tests {
         git.expect_run().returning(|_, _| {
             Ok(git_output(
                 true,
-                "deadbeefcafe1234\trefs/heads/agent/PROJ-1-builder\n",
+                "deadbeefcafe1234\trefs/heads/agent/proj-1-builder\n",
                 "",
             ))
         });
-        let tip = origin_branch_tip(&git, Path::new("/repo"), "agent/PROJ-1-builder").unwrap();
+        let tip = origin_branch_tip(&git, Path::new("/repo"), "agent/proj-1-builder").unwrap();
         assert_eq!(tip.as_deref(), Some("deadbeefcafe1234"));
     }
 
@@ -369,10 +369,10 @@ mod tests {
         let mut git = MockGitClient::new();
         git.expect_run()
             .returning(|_, _| Ok(git_output(true, "", "")));
-        let tip = origin_branch_tip(&git, Path::new("/repo"), "agent/PROJ-1-builder").unwrap();
+        let tip = origin_branch_tip(&git, Path::new("/repo"), "agent/proj-1-builder").unwrap();
         assert_eq!(tip, None);
         assert!(
-            !live_origin_branch_exists(&git, Path::new("/repo"), "agent/PROJ-1-builder").unwrap()
+            !live_origin_branch_exists(&git, Path::new("/repo"), "agent/proj-1-builder").unwrap()
         );
     }
 
@@ -487,12 +487,12 @@ mod tests {
     #[test]
     fn head_branch_query_asks_for_every_state() {
         assert_eq!(
-            gh_pr_list_args("agent/PROJ-1-builder"),
+            gh_pr_list_args("agent/proj-1-builder"),
             [
                 "pr",
                 "list",
                 "--head",
-                "agent/PROJ-1-builder",
+                "agent/proj-1-builder",
                 "--state",
                 "all",
                 "--json",
@@ -578,9 +578,9 @@ mod tests {
 
     #[test]
     fn summaries_speak_about_the_work_not_the_machinery() {
-        let absent = publication_summary(&Publication::BranchAbsent, "agent/PROJ-1-builder");
+        let absent = publication_summary(&Publication::BranchAbsent, "agent/proj-1-builder");
         assert!(absent.contains("has not reached GitHub yet"), "{absent}");
-        let no_pr = publication_summary(&Publication::NoPullRequest, "agent/PROJ-1-builder");
+        let no_pr = publication_summary(&Publication::NoPullRequest, "agent/proj-1-builder");
         assert!(no_pr.contains("no pull request has been opened"), "{no_pr}");
         for text in [&absent, &no_pr] {
             for jargon in ["bookmark", "export", "coordinate", "revset", "jj "] {
@@ -599,7 +599,7 @@ mod tests {
             branch_head: "bbbbbbbbbbbbbbbbbbbb".to_string(),
             pr_is_behind: true,
         };
-        let note = behind.note("agent/PROJ-1-builder");
+        let note = behind.note("agent/proj-1-builder");
         assert!(note.contains("older version"), "{note}");
         assert!(note.contains("aaaaaaaaaaaa"), "{note}");
         assert!(note.contains("bbbbbbbbbbbb"), "{note}");
@@ -609,7 +609,7 @@ mod tests {
             ..behind
         };
         assert!(parted
-            .note("agent/PROJ-1-builder")
+            .note("agent/proj-1-builder")
             .contains("different version"));
     }
 }

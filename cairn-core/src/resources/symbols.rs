@@ -1,9 +1,9 @@
 //! Symbol-navigation resource reads: node-scoped and project-scoped structural
 //! code navigation, backed by the in-process ast-grep engine (`crate::symbols`).
 //!
-//! The node-scoped resource (`cairn://p/PROJ/N/EXEC/NODE/symbols[/<symbol>]`)
+//! The node-scoped resource (`cairn://p/proj/N/EXEC/NODE/symbols[/<symbol>]`)
 //! resolves the node's authenticated branch coordinate; the project-scoped
-//! fallback (`cairn://p/PROJ/symbols[/<symbol>]`) roots at the user's explicit
+//! fallback (`cairn://p/proj/symbols[/<symbol>]`) roots at the user's explicit
 //! live checkout. Both parse files on demand with no language-server index.
 
 use std::path::{Path, PathBuf};

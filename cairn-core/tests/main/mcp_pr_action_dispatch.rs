@@ -87,7 +87,7 @@ async fn change_target(
 
 /// Target the builder node's `pr` artifact (the NodeArtifact patch arm).
 async fn change(orch: &Orchestrator, payload: serde_json::Value, preview: bool) -> String {
-    change_target(orch, "cairn://p/PRA/1/1/builder/pr", payload, preview).await
+    change_target(orch, "cairn://p/pra/1/1/builder/pr", payload, preview).await
 }
 
 /// Seed a first-class `pr` action node: an action_run with `uri_segment = 'pr'`
@@ -109,7 +109,7 @@ async fn insert_pr_action_run(db: &LocalDb, project_id: &str, issue_id: &str) {
 async fn pr_action_node_fixture() -> (tempfile::TempDir, Arc<LocalDb>, String, String) {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "PRA").await;
+    let project_id = common::create_project(&db, "pra").await;
     let issue_id = uuid::Uuid::new_v4().to_string();
     insert_node(&db, &project_id, &issue_id).await;
     (temp, db, project_id, issue_id)
@@ -183,7 +183,7 @@ async fn pr_node_merge_resolves_through_parent_job() {
 
     let result = change_target(
         &orch,
-        "cairn://p/PRA/1/1/pr",
+        "cairn://p/pra/1/1/pr",
         json!({ "action": "merge", "method": "squash" }),
         true,
     )

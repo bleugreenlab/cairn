@@ -60,11 +60,16 @@ pub(crate) async fn resolve_current_for_read(
     let project_path = project
         .project_path
         .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;
-    let managed_store = crate::jj::project_store_dir(&orch.config_dir, &project_path);
-    let repository_path = if crate::jj::is_jj_dir(&managed_store) {
-        managed_store
-    } else {
-        project_path.clone()
+    let repository_path = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = project_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("coordinate repository task failed: {error}"))??
     };
     let commit_id = resolve_coordinate_repairing_conflicts(
         orch,
@@ -324,11 +329,16 @@ pub(crate) async fn resolve_for_read(
     let project_path = project
         .project_path
         .ok_or_else(|| format!("project '{}' has no local repository", project.project_id))?;
-    let managed_store = crate::jj::project_store_dir(&orch.config_dir, &project_path);
-    let repository_path = if crate::jj::is_jj_dir(&managed_store) {
-        managed_store
-    } else {
-        project_path.clone()
+    let repository_path = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = project_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("coordinate repository task failed: {error}"))??
     };
     let requested = branch.to_string();
     let commit_id = resolve_coordinate_repairing_conflicts(
@@ -463,8 +473,9 @@ async fn project_context_by_id_in_db(
             let repo_path = row.opt_text(0)?;
             let stored_default = row.opt_text(1)?;
             let default_branch = if let Some(path) = repo_path.as_deref() {
-                let settings =
-                    crate::config::project_settings::load_project_settings(Path::new(path));
+                let settings = crate::config::project_settings::load_project_settings_read_only(
+                    Path::new(path),
+                );
                 crate::config::project_settings::resolve_default_branch(
                     &settings,
                     stored_default.as_deref(),
@@ -606,11 +617,11 @@ mod tests {
     fn job_rev_prefers_its_own_branch() {
         assert_eq!(
             resolve_job_rev(
-                Some("agent/CAIRN-1-builder-1".into()),
-                Some("agent/CAIRN-1-coordinator-0".into()),
+                Some("agent/cairn-1-builder-1".into()),
+                Some("agent/cairn-1-coordinator-0".into()),
                 "main"
             ),
-            "agent/CAIRN-1-builder-1"
+            "agent/cairn-1-builder-1"
         );
     }
 
@@ -620,8 +631,8 @@ mod tests {
         // the coordinate it was launched from, which for a child issue is its
         // parent's integration branch — not the project default.
         assert_eq!(
-            resolve_job_rev(None, Some("agent/CAIRN-1-coordinator-0".into()), "main"),
-            "agent/CAIRN-1-coordinator-0"
+            resolve_job_rev(None, Some("agent/cairn-1-coordinator-0".into()), "main"),
+            "agent/cairn-1-coordinator-0"
         );
     }
 
@@ -638,12 +649,12 @@ mod tests {
     #[test]
     fn the_conflicted_branch_refusal_offers_a_way_forward_in_plain_language() {
         let text = BranchRefResolutionError::Conflicted {
-            requested: "agent/CAIRN-1-builder-1".into(),
+            requested: "agent/cairn-1-builder-1".into(),
             versions: vec!["aaaa1111".into(), "bbbb2222".into()],
         }
         .to_string();
 
-        assert!(text.contains("agent/CAIRN-1-builder-1"), "{text}");
+        assert!(text.contains("agent/cairn-1-builder-1"), "{text}");
         assert!(
             text.contains("aaaa1111") && text.contains("bbbb2222"),
             "{text}"

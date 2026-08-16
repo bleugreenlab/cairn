@@ -130,7 +130,7 @@ fn compile_derived_thread_scopes(
             );
         }
         scopes.push(DerivedThreadScope {
-            source_ref: source_ref.to_string(),
+            source_ref: cairn_common::uri::canonicalize_uri_identity(source_ref),
             fact_kinds: vec!["resolved".to_string()],
         });
     }
@@ -180,7 +180,7 @@ async fn exact_subscription(
 ) -> Result<Option<WakeSubscription>, String> {
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(ToString::to_string);
+    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
     let fact_kinds_json = fact_kinds_json(fact_kinds);
     db.read(|conn| {
         let job_id = job_id.clone();
@@ -616,7 +616,7 @@ async fn update_state_matching(
 ) -> Result<usize, String> {
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(ToString::to_string);
+    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
     let now = chrono::Utc::now().timestamp();
     let state_str = state.as_str().to_string();
     db.write(|conn| {
@@ -678,10 +678,10 @@ async fn upsert_subscription(
     let id = uuid::Uuid::new_v4().to_string();
     let job_id = job_id.to_string();
     let source_kind = source_kind.to_string();
-    let source_ref = source_ref.map(ToString::to_string);
+    let source_ref = source_ref.map(cairn_common::uri::canonicalize_uri_identity);
     let fact_kinds_json = fact_kinds_json(fact_kinds);
     let until_kind = until_kind.map(ToString::to_string);
-    let until_ref = until_ref.map(ToString::to_string);
+    let until_ref = until_ref.map(cairn_common::uri::canonicalize_uri_identity);
     let created_by = created_by.to_string();
     let state_str = state.as_str().to_string();
     let match_phrase = match_phrase.map(ToString::to_string);

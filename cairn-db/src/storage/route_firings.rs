@@ -85,6 +85,11 @@ fn from_row(row: &crate::turso::Row) -> DbResult<RouteFiringRecord> {
     })
 }
 pub async fn insert_route_firing(db: &LocalDb, new: NewRouteFiring) -> DbResult<RouteFiringRecord> {
+    let mut new = new;
+    new.fact_identity = cairn_common::uri::canonicalize_uri_identity(&new.fact_identity);
+    new.sink_ref = new
+        .sink_ref
+        .map(|value| cairn_common::uri::canonicalize_uri_identity(&value));
     let id = uuid::Uuid::new_v4().to_string();
     let result_id = id.clone();
     let scope = new.scope_key.clone();
@@ -142,7 +147,8 @@ pub async fn has_recent_fact(
     identity: &str,
     since: i64,
 ) -> DbResult<bool> {
-    Ok(db.query_opt_i64("SELECT 1 FROM route_firings WHERE scope_key=?1 AND route_id=?2 AND fact_identity=?3 AND status IN ('fired','dropped') AND created_at>=?4 LIMIT 1",(scope.to_string(),route.to_string(),identity.to_string(),since)).await?.is_some())
+    let identity = cairn_common::uri::canonicalize_uri_identity(identity);
+    Ok(db.query_opt_i64("SELECT 1 FROM route_firings WHERE scope_key=?1 AND route_id=?2 AND fact_identity=?3 AND status IN ('fired','dropped') AND created_at>=?4 LIMIT 1",(scope.to_string(),route.to_string(),identity,since)).await?.is_some())
 }
 #[cfg(test)]
 mod tests {

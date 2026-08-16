@@ -25,7 +25,7 @@ async fn seed_job(db: &LocalDb, turn_state: &str) {
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('proj-1', 'default', 'Test Project', 'PROJ', '/tmp/test-repo', 1, 1)",
+                 VALUES ('proj-1', 'default', 'Test Project', 'proj', '/tmp/test-repo', 1, 1)",
                 (),
             )
             .await?;

@@ -61,6 +61,10 @@ pub(crate) fn envelope_reports_run_failure(text: &str) -> bool {
         .any(|opening| text.starts_with(opening))
 }
 
+fn batch_is_suspended(outcomes: &[ItemOutcome]) -> bool {
+    outcomes.iter().any(|outcome| outcome.suspended)
+}
+
 async fn run_transcript_event_uri(
     orch: &Orchestrator,
     db: &crate::storage::LocalDb,
@@ -633,6 +637,13 @@ async fn publish_visible_slot_delta(
             mode,
         )
         .await?;
+    if let Some(job_id) = request
+        .owner
+        .as_ref()
+        .and_then(|owner| owner.job_id.as_deref())
+    {
+        orch.invalidate_node_check_status(job_id, "logical-head-tree-or-contract-change");
+    }
     // Against the head actually published onto, never the routed base: after an
     // integration those differ, and diffing from the routed base would attribute
     // every line the advance carried to this batch.
@@ -868,7 +879,7 @@ mod slot_publication_tests {
 
         git(path, &["init", "-q", "-b", "main"]);
         git(path, &["config", "user.email", "p@e.com"]);
-        git(path, &["config", "user.name", "P"]);
+        git(path, &["config", "user.name", "p"]);
         std::fs::write(path.join("advanced.rs"), "before\n").unwrap();
         std::fs::write(path.join("mine.rs"), "base\n").unwrap();
         git(path, &["add", "-A"]);
@@ -989,7 +1000,7 @@ mod slot_publication_tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('project', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('project', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -1414,7 +1425,7 @@ mod publication_mode_tests {
             let path = std::fs::canonicalize(repo.path()).unwrap();
             crate::jj::tests::git(&path, &["init", "-q", "-b", "main"]);
             crate::jj::tests::git(&path, &["config", "user.email", "p@e.com"]);
-            crate::jj::tests::git(&path, &["config", "user.name", "P"]);
+            crate::jj::tests::git(&path, &["config", "user.name", "p"]);
             std::fs::write(path.join("shared.rs"), "one\ntwo\nthree\n").unwrap();
             crate::jj::tests::git(&path, &["add", "-A"]);
             crate::jj::tests::git(&path, &["commit", "-q", "-m", "base"]);
@@ -2331,12 +2342,6 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         outcomes
     };
 
-    // If any item durably suspended on a worktree-fence approval, return the
-    // suspend marker for the whole call; the run re-drives the batch on resume.
-    if outcomes.iter().any(|o| o.suspended) {
-        return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
-    }
-
     let settlement = RunBatchSettlement {
         request: request.clone(),
         run_context,
@@ -2355,6 +2360,9 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         marker_escape,
     };
     let settled = settle_run_batch(orch, &settlement, outcomes, None, None, None).await;
+    if settled.suspended {
+        return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
+    }
     run_envelope(settled.text, settled.images)
 }
 
@@ -2521,6 +2529,7 @@ struct RunBatchSettlement {
 struct SettledRunBatch {
     text: String,
     images: Vec<cairn_common::read::ImageBlock>,
+    suspended: bool,
 }
 
 impl SettledRunBatch {
@@ -2528,6 +2537,15 @@ impl SettledRunBatch {
         Self {
             text,
             images: Vec::new(),
+            suspended: false,
+        }
+    }
+
+    fn suspended() -> Self {
+        Self {
+            text: String::new(),
+            images: Vec::new(),
+            suspended: true,
         }
     }
 }
@@ -2641,6 +2659,9 @@ async fn run_routed_batch(
     match tokio::time::timeout(run_grace_window(), &mut handle).await {
         Ok(joined) => {
             let settled = settle_joined_batch(orch, &settlement, joined, None).await;
+            if settled.suspended {
+                return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
+            }
             run_envelope(settled.text, settled.images)
         }
         Err(_) => {
@@ -2826,6 +2847,9 @@ async fn suspend_until_batch_settles(
         // open rather than abandoning a running batch.
         let joined = handle.await;
         let settled = settle_joined_batch(orch, &settlement, joined, None).await;
+        if settled.suspended {
+            return run_envelope(RUN_ITEM_SUSPENDED_MARKER.to_string(), Vec::new());
+        }
         return run_envelope(settled.text, settled.images);
     };
 
@@ -2854,6 +2878,13 @@ async fn suspend_until_batch_settles(
                 "run batch suspension {} was never parked; leaving it for startup reconciliation",
                 record.id
             );
+            return;
+        }
+        // The item's permission request owns the continuation. Never resolve the
+        // outer batch wait with a marker that could become a model-facing result.
+        if settled.suspended {
+            // Permission insertion atomically retires this outer row, while outer
+            // admission refuses to race ahead of an existing permission row.
             return;
         }
         // A suspended batch cannot carry images: only an MCP gateway call
@@ -3203,6 +3234,12 @@ async fn settle_run_batch(
     >,
     publication_request: Option<&CellRequest>,
 ) -> SettledRunBatch {
+    // Suspension is backend control flow, not item output. This guard is the
+    // common settlement boundary for host-local and routed batches and must run
+    // before image promotion, composition, publication, or commit handling.
+    if batch_is_suspended(&outcomes) {
+        return SettledRunBatch::suspended();
+    }
     for outcome in &mut outcomes {
         crate::mcp::handlers::durable_images::promote_images(
             orch,
@@ -3261,6 +3298,7 @@ async fn settle_run_batch(
         return SettledRunBatch {
             text,
             images: collect_run_images(outcomes),
+            suspended: false,
         };
     }
 
@@ -3584,6 +3622,7 @@ async fn settle_run_batch(
     SettledRunBatch {
         text,
         images: collect_run_images(outcomes),
+        suspended: false,
     }
 }
 
@@ -3630,6 +3669,22 @@ fn placed_batch_env(
 mod tests {
     use super::*;
     use cairn_common::executor_protocol::CellCommandClass;
+
+    #[test]
+    fn a_suspended_item_controls_the_whole_batch_before_ordinary_tail_results() {
+        let ordinary = ItemOutcome::failed("first".to_string(), "ordinary failure");
+        let suspended = ItemOutcome {
+            header: "permission".to_string(),
+            body: "executor transport text must not escape".to_string(),
+            succeeded: false,
+            suspended: true,
+            images: Vec::new(),
+            tracked_modifications: None,
+        };
+        let tail = ItemOutcome::failed("tail".to_string(), "later failure");
+
+        assert!(batch_is_suspended(&[ordinary, suspended, tail]));
+    }
 
     fn local_home() -> HomeExecutor {
         HomeExecutor {
@@ -4066,10 +4121,10 @@ mod tests {
     #[test]
     fn placed_batch_env_covers_managed_and_explicit_branch_routes() {
         assert_eq!(
-            placed_batch_env(None, None, Some("agent/CAIRN-2929-builder-0")),
+            placed_batch_env(None, None, Some("agent/cairn-2929-builder-0")),
             [(
                 "CAIRN_WORKTREE_BRANCH".into(),
-                "agent/CAIRN-2929-builder-0".into()
+                "agent/cairn-2929-builder-0".into()
             )]
         );
         assert_eq!(
@@ -4093,12 +4148,12 @@ mod tests {
     #[test]
     fn a_placed_batch_carries_the_run_its_commands_act_with() {
         assert_eq!(
-            placed_batch_env(Some("run-7"), None, Some("agent/CAIRN-3381-builder-0")),
+            placed_batch_env(Some("run-7"), None, Some("agent/cairn-3381-builder-0")),
             [
                 ("CAIRN_RUN_ID".into(), "run-7".into()),
                 (
                     "CAIRN_WORKTREE_BRANCH".into(),
-                    "agent/CAIRN-3381-builder-0".into()
+                    "agent/cairn-3381-builder-0".into()
                 )
             ]
         );

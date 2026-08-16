@@ -440,6 +440,7 @@ impl ServiceLease {
                     },
                     reservation: None,
                     process: ResidentProcessSpec {
+                        runtime_packages: Vec::new(),
                         program: program.to_string(),
                         args,
                         cwd: String::new(),
@@ -630,7 +631,9 @@ pub(crate) mod tests {
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-    use cairn_common::executor_protocol::{ExecutorMessage, LOCAL_EXECUTOR_NAME};
+    use cairn_common::executor_protocol::{
+        ExecutorMessage, ResidencyRuntimeConfig, LOCAL_EXECUTOR_NAME,
+    };
     use cairn_executor::{ExecutorRuntime, Fleet as ExecutorPool};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
@@ -691,11 +694,14 @@ pub(crate) mod tests {
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
                 match message {
-                    ExecutorMessage::Configure { config } => pool.configure(config),
                     ExecutorMessage::ResidencyRequest {
                         correlation_id,
+                        config,
                         operation,
                     } => {
+                        if let ResidencyRuntimeConfig::Install(config) = config {
+                            pool.configure(config);
+                        }
                         let (pool, fleet) = (pool.clone(), fleet.clone());
                         tokio::spawn(async move {
                             let result = pool.operate_residency(operation).await;

@@ -213,7 +213,7 @@ pub(crate) use crate::storage::events::columns::{
     event_from_row, EVENT_COLUMNS, EVENT_COLUMN_COUNT,
 };
 
-const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id";
+const PROMPT_COLUMNS: &str = "id, run_id, questions, response, created_at, answered_at, turn_id, resolution_id, resolution_surface, resolution_provider, resolution_conversation, resolution_actor";
 
 /// Exit reason for a stale run whose surviving process this sweep stopped. Kept
 /// distinct from the blanket `crash` so a row says whether the death was caused
@@ -933,6 +933,7 @@ async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Resul
     #[derive(Clone)]
     struct Candidate {
         event_id: String,
+        run_id: String,
         body: Option<String>,
         expected: Vec<String>,
         is_read: bool,
@@ -954,6 +955,7 @@ async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Resul
         };
         candidates.push(Candidate {
             event_id: event.id.clone(),
+            run_id: event.run_id.clone(),
             body: parsed.tool_result,
             expected,
             is_read,
@@ -1009,8 +1011,13 @@ async fn apply_lean_read_projection(db: &LocalDb, events: &mut [Event]) -> Resul
                         std::collections::HashMap::new();
                     for cand in backfill {
                         let body = cand.body.unwrap_or_default();
-                        let segs =
-                            crate::runs::read_tokens::read_segment_tokens(&body, &cand.expected);
+                        let meter =
+                            crate::token_meters::meter_for_run_conn(conn, &cand.run_id).await?;
+                        let segs = crate::runs::read_tokens::read_segment_tokens(
+                            &body,
+                            &cand.expected,
+                            meter,
+                        );
                         let total: i64 = segs.iter().map(|s| s.tokens).sum();
                         let json = serde_json::to_string(&segs).unwrap_or_default();
                         conn.execute(
@@ -1390,13 +1397,27 @@ pub(crate) fn run_from_row(row: &Row) -> DbResult<Run> {
 }
 
 fn prompt_from_row(row: &Row) -> DbResult<Prompt> {
+    let created_at = row.i64(4)?;
+    let answered_at = row.opt_i64(5)?;
+    let resolution = match row.opt_text(8)? {
+        Some(surface) => Some(cairn_db::models::ResolutionReceipt {
+            id: row.opt_text(7)?,
+            surface,
+            provider: row.opt_text(9)?,
+            conversation: row.opt_text(10)?,
+            actor: row.opt_text(11)?,
+            resolved_at: answered_at.unwrap_or(created_at),
+        }),
+        None => None,
+    };
     Ok(Prompt {
         id: row.text(0)?,
         run_id: row.text(1)?,
         questions: row.text(2)?,
         response: row.opt_text(3)?,
-        created_at: row.i64(4)?,
-        answered_at: row.opt_i64(5)?,
+        created_at,
+        answered_at,
+        resolution,
     })
 }
 

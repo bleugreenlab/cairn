@@ -14,8 +14,8 @@
 //!
 //! Correctness always wins over comment preservation: anything the merge cannot
 //! reason about safely (parse error, non-mapping root, multiple documents,
-//! anchors/aliases) returns `Err`, and the caller falls back to a full
-//! re-serialization.
+//! anchors/aliases) returns `Err`, and the caller's transactional save fails
+//! closed rather than rewriting the file lossily.
 
 use std::collections::HashSet;
 use std::ops::Range;
@@ -41,9 +41,9 @@ struct Edit {
 /// authoritative (an absent key is deleted).
 ///
 /// Returns `Err` when the document is something the merge refuses to reason about
-/// (the caller should fall back to full re-serialization). Returns the original
-/// bytes unchanged when nothing semantically differs, so a no-op save produces a
-/// byte-identical file and stages no git change.
+/// (the caller's save fails closed). Returns the original bytes unchanged when
+/// nothing semantically differs, so a no-op save produces a byte-identical file
+/// and stages no git change.
 pub(crate) fn merge_into_yaml(
     original: &str,
     target: &Mapping,
@@ -53,6 +53,11 @@ pub(crate) fn merge_into_yaml(
         serde_yaml::from_str(original).map_err(|e| format!("parse original yaml: {e}"))?;
     let orig_map = match &orig_value {
         Value::Mapping(m) => m,
+        // Comment-only or empty document (what `create_default_project_config`
+        // generates) parses as null: there is nothing to diff or delete, so
+        // every target key is appended after the existing bytes, preserving the
+        // comment template verbatim.
+        Value::Null => return append_all_pairs(original, target),
         _ => return Err("original yaml root is not a mapping".to_string()),
     };
 
@@ -201,6 +206,27 @@ fn merge_level(
         });
     }
     Ok(())
+}
+
+/// Append every target pair at column 0 after a document with no mapping to
+/// merge into. The original bytes (the comment template) survive verbatim.
+fn append_all_pairs(original: &str, target: &Mapping) -> Result<String, String> {
+    let mut rendered = String::new();
+    for (k, v) in target {
+        let key = k
+            .as_str()
+            .ok_or_else(|| "non-string key in target".to_string())?;
+        rendered.push_str(&render_pair(key, v)?);
+    }
+    if rendered.is_empty() {
+        return Ok(original.to_string());
+    }
+    let mut out = original.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&rendered);
+    Ok(out)
 }
 
 /// The `block_mapping_pair` children of a mapping node as
@@ -397,7 +423,7 @@ mod tests {
             "defaultBranch",
             "references",
             "worktree",
-            "activeBackend",
+            "tierDefaults",
             "backends",
             "mcpServers",
             "ciCommands",
@@ -410,6 +436,25 @@ mod tests {
             Value::Mapping(m) => m,
             _ => panic!("not a mapping"),
         }
+    }
+
+    #[test]
+    fn comment_only_document_appends_keys_and_keeps_comments() {
+        let original = "# Cairn Project Configuration\n#\n# setupCommands:\n#   - npm install\n";
+        let target = map_of("defaultBranch: develop\nsetupCommands:\n- bun install\n");
+        let out = merge_into_yaml(original, &target, managed()).unwrap();
+        assert!(out.starts_with(original), "out:\n{out}");
+        assert!(out.contains("defaultBranch: develop"), "out:\n{out}");
+        assert!(out.contains("- bun install"), "out:\n{out}");
+        // The appended document round-trips to the target semantics.
+        assert_eq!(map_of(&out), target);
+    }
+
+    #[test]
+    fn comment_only_document_with_empty_target_is_byte_identical() {
+        let original = "# only comments\n";
+        let out = merge_into_yaml(original, &Mapping::new(), managed()).unwrap();
+        assert_eq!(out, original);
     }
 
     #[test]

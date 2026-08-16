@@ -1273,9 +1273,9 @@ mod tests {
     /// did not ask.
     #[test]
     fn a_superseded_base_is_named_wherever_the_standing_is_reported() {
-        let note = standing(Some("agent/CAIRN-1-planner-0")).superseded_note();
+        let note = standing(Some("agent/cairn-1-planner-0")).superseded_note();
         assert!(
-            note.contains("agent/CAIRN-1-planner-0")
+            note.contains("agent/cairn-1-planner-0")
                 && note.contains("no longer exists")
                 && note.contains("parent merged"),
             "the note names the vanished base and why it vanished: {note}"

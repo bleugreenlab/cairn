@@ -19,13 +19,76 @@ use cairn_common::authorization::{
 
 use super::{DbError, DbResult, LocalDb, RowExt};
 use crate::turso::params;
+use cairn_common::identity::{AppearanceSnapshot, PrincipalPosition, PrincipalRef};
 
 const GRANT_COLUMNS: &str = "id,scope_json,constraints_json,principal_json,audience_json,\
-     lifetime_kind,lifetime_anchor,provenance_json,created_at,expires_at,consumed_at,revoked_at";
+     lifetime_kind,lifetime_anchor,provenance_json,created_at,expires_at,consumed_at,revoked_at,\
+     actor_principal_json,appearance_snapshot_json";
 
 fn decode<T: serde::de::DeserializeOwned>(what: &str, json: &str) -> DbResult<T> {
     serde_json::from_str(json)
         .map_err(|e| DbError::internal(format!("unreadable authority {what}: {e}")))
+}
+
+fn decode_attribution(
+    actor_json: Option<String>,
+    snapshot_json: Option<String>,
+) -> DbResult<(Option<PrincipalRef>, Option<AppearanceSnapshot>)> {
+    match (actor_json, snapshot_json) {
+        (None, None) => Ok((None, None)),
+        (Some(actor_json), Some(snapshot_json)) => {
+            let actor = decode::<PrincipalRef>("decision actor", &actor_json)?;
+            actor
+                .validate_at(PrincipalPosition::DecisionActor)
+                .map_err(|e| DbError::internal(format!("invalid authority decision actor: {e}")))?;
+            let snapshot = decode::<AppearanceSnapshot>("appearance snapshot", &snapshot_json)?;
+            snapshot.validate().map_err(|e| {
+                DbError::internal(format!("invalid authority appearance snapshot: {e}"))
+            })?;
+            if snapshot.principal() != &actor {
+                return Err(DbError::internal(
+                    "authority decision actor does not match appearance snapshot principal",
+                ));
+            }
+            Ok((Some(actor), Some(snapshot)))
+        }
+        _ => Err(DbError::internal(
+            "authority attribution must contain both actor and appearance snapshot or neither",
+        )),
+    }
+}
+
+fn encode_attribution(
+    actor: Option<&PrincipalRef>,
+    snapshot: Option<&AppearanceSnapshot>,
+) -> DbResult<(Option<String>, Option<String>)> {
+    match (actor, snapshot) {
+        (None, None) => Ok((None, None)),
+        (Some(actor), Some(snapshot)) => {
+            actor
+                .validate_at(PrincipalPosition::DecisionActor)
+                .map_err(|e| DbError::internal(format!("invalid authority decision actor: {e}")))?;
+            snapshot.validate().map_err(|e| {
+                DbError::internal(format!("invalid authority appearance snapshot: {e}"))
+            })?;
+            if snapshot.principal() != actor {
+                return Err(DbError::internal(
+                    "authority decision actor does not match appearance snapshot principal",
+                ));
+            }
+            Ok((
+                Some(serde_json::to_string(actor).map_err(|e| {
+                    DbError::internal(format!("decision actor is not serializable: {e}"))
+                })?),
+                Some(serde_json::to_string(snapshot).map_err(|e| {
+                    DbError::internal(format!("appearance snapshot is not serializable: {e}"))
+                })?),
+            ))
+        }
+        _ => Err(DbError::internal(
+            "authority attribution must contain both actor and appearance snapshot or neither",
+        )),
+    }
 }
 
 fn grant_from_row(row: &crate::turso::Row) -> DbResult<AuthorityGrant> {
@@ -43,6 +106,18 @@ fn grant_from_row(row: &crate::turso::Row) -> DbResult<AuthorityGrant> {
             )))
         }
     };
+    let mut provenance = decode::<AuthorityProvenance>("provenance", &row.text(7)?)?;
+    let (decision_actor, appearance_snapshot) =
+        decode_attribution(row.opt_text(12)?, row.opt_text(13)?)?;
+    if provenance.decision_actor != decision_actor
+        || provenance.appearance_snapshot != appearance_snapshot
+    {
+        return Err(DbError::internal(
+            "authority grant attribution columns do not match provenance",
+        ));
+    }
+    provenance.decision_actor = decision_actor;
+    provenance.appearance_snapshot = appearance_snapshot;
     Ok(AuthorityGrant {
         id: row.text(0)?,
         scope: decode::<AuthorityScope>("scope", &row.text(1)?)?,
@@ -50,7 +125,7 @@ fn grant_from_row(row: &crate::turso::Row) -> DbResult<AuthorityGrant> {
         principal: decode::<AuthorityPrincipal>("principal", &row.text(3)?)?,
         audience: decode::<AuthorityAudience>("audience", &row.text(4)?)?,
         lifetime,
-        provenance: decode::<AuthorityProvenance>("provenance", &row.text(7)?)?,
+        provenance,
         created_at: row.i64(8)?,
         expires_at: row.opt_i64(9)?,
         consumed_at: row.opt_i64(10)?,
@@ -70,6 +145,10 @@ pub async fn insert_grant(db: &LocalDb, grant: &AuthorityGrant) -> DbResult<()> 
         .map_err(|e| DbError::internal(format!("audience is not serializable: {e}")))?;
     let provenance_json = serde_json::to_string(&grant.provenance)
         .map_err(|e| DbError::internal(format!("provenance is not serializable: {e}")))?;
+    let (actor_principal_json, appearance_snapshot_json) = encode_attribution(
+        grant.provenance.decision_actor.as_ref(),
+        grant.provenance.appearance_snapshot.as_ref(),
+    )?;
 
     let id = grant.id.clone();
     let scope_key = grant.scope.shorthand();
@@ -96,15 +175,32 @@ pub async fn insert_grant(db: &LocalDb, grant: &AuthorityGrant) -> DbResult<()> 
             lifetime_anchor.clone(),
             provenance_json.clone(),
         );
+        let actor_principal_json = actor_principal_json.clone();
+        let appearance_snapshot_json = appearance_snapshot_json.clone();
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO authority_grants (id,scope_key,place_kind,action,scope_json,\
                  constraints_json,principal_json,audience_json,workspace_id,lifetime_kind,\
-                 lifetime_anchor,provenance_json,created_at,expires_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                 lifetime_anchor,provenance_json,created_at,expires_at,actor_principal_json,\
+                 appearance_snapshot_json) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
-                    values.0, values.1, values.2, values.3, values.4, values.5, values.6, values.7,
-                    values.8, values.9, values.10, values.11, created_at, expires_at
+                    values.0,
+                    values.1,
+                    values.2,
+                    values.3,
+                    values.4,
+                    values.5,
+                    values.6,
+                    values.7,
+                    values.8,
+                    values.9,
+                    values.10,
+                    values.11,
+                    created_at,
+                    expires_at,
+                    actor_principal_json,
+                    appearance_snapshot_json
                 ],
             )
             .await?;
@@ -134,6 +230,39 @@ pub async fn candidate_grants(
         grant_from_row,
     )
     .await
+}
+
+pub async fn grants_by_actor(
+    db: &LocalDb,
+    workspace_id: &str,
+    actor: &PrincipalRef,
+    limit: i64,
+) -> DbResult<Vec<AuthorityGrant>> {
+    actor
+        .validate_at(PrincipalPosition::DecisionActor)
+        .map_err(|e| DbError::internal(format!("invalid authority decision actor: {e}")))?;
+    let actor_json = serde_json::to_string(actor)
+        .map_err(|e| DbError::internal(format!("decision actor is not serializable: {e}")))?;
+    let grants = db
+        .query_all(
+            format!(
+                "SELECT {GRANT_COLUMNS} FROM authority_grants \
+                 WHERE workspace_id=?1 AND actor_principal_json=?2 \
+                 ORDER BY created_at DESC, rowid DESC LIMIT ?3"
+            ),
+            (workspace_id.to_string(), actor_json, limit.clamp(1, 500)),
+            grant_from_row,
+        )
+        .await?;
+    if grants
+        .iter()
+        .any(|grant| grant.provenance.decision_actor.as_ref() != Some(actor))
+    {
+        return Err(DbError::internal(
+            "authority actor index returned a grant for a different typed actor",
+        ));
+    }
+    Ok(grants)
 }
 
 pub async fn get_grant(db: &LocalDb, id: &str) -> DbResult<Option<AuthorityGrant>> {
@@ -237,6 +366,8 @@ pub struct NewAuthorizationEvent {
     pub request_uri: Option<String>,
     /// Required for `allowed_by_grant`: the grant the decision cites.
     pub grant_id: Option<String>,
+    pub decision_actor: Option<PrincipalRef>,
+    pub appearance_snapshot: Option<AppearanceSnapshot>,
     pub decided_at: i64,
 }
 
@@ -254,13 +385,18 @@ pub struct AuthorizationEventRecord {
     pub run_id: Option<String>,
     pub request_uri: Option<String>,
     pub grant_id: Option<String>,
+    pub decision_actor: Option<PrincipalRef>,
+    pub appearance_snapshot: Option<AppearanceSnapshot>,
     pub decided_at: i64,
 }
 
 const EVENT_COLUMNS: &str = "id,scope_json,mutation,summary,outcome,reason,principal_json,\
-     audience_json,run_id,request_uri,grant_id,decided_at";
+     audience_json,run_id,request_uri,grant_id,decided_at,actor_principal_json,\
+     appearance_snapshot_json";
 
 fn event_from_row(row: &crate::turso::Row) -> DbResult<AuthorizationEventRecord> {
+    let (decision_actor, appearance_snapshot) =
+        decode_attribution(row.opt_text(12)?, row.opt_text(13)?)?;
     Ok(AuthorizationEventRecord {
         id: row.text(0)?,
         scope: decode::<AuthorityScope>("scope", &row.text(1)?)?,
@@ -273,6 +409,8 @@ fn event_from_row(row: &crate::turso::Row) -> DbResult<AuthorizationEventRecord>
         run_id: row.opt_text(8)?,
         request_uri: row.opt_text(9)?,
         grant_id: row.opt_text(10)?,
+        decision_actor,
+        appearance_snapshot,
         decided_at: row.i64(11)?,
     })
 }
@@ -294,6 +432,10 @@ pub async fn append_event(db: &LocalDb, event: NewAuthorizationEvent) -> DbResul
         .map_err(|e| DbError::internal(format!("principal is not serializable: {e}")))?;
     let audience_json = serde_json::to_string(&event.audience)
         .map_err(|e| DbError::internal(format!("audience is not serializable: {e}")))?;
+    let (actor_principal_json, appearance_snapshot_json) = encode_attribution(
+        event.decision_actor.as_ref(),
+        event.appearance_snapshot.as_ref(),
+    )?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let result = id.clone();
@@ -321,12 +463,15 @@ pub async fn append_event(db: &LocalDb, event: NewAuthorizationEvent) -> DbResul
         let request_uri = event.request_uri.clone();
         let grant_id = event.grant_id.clone();
         let decided_at = event.decided_at;
+        let actor_principal_json = actor_principal_json.clone();
+        let appearance_snapshot_json = appearance_snapshot_json.clone();
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO authorization_events (id,scope_key,place_kind,action,scope_json,\
                  mutation,summary,outcome,reason,principal_json,audience_json,workspace_id,\
-                 run_id,request_uri,grant_id,decided_at) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                 run_id,request_uri,grant_id,decided_at,actor_principal_json,\
+                 appearance_snapshot_json) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 params![
                     values.0,
                     values.1,
@@ -343,7 +488,9 @@ pub async fn append_event(db: &LocalDb, event: NewAuthorizationEvent) -> DbResul
                     run_id,
                     request_uri,
                     grant_id,
-                    decided_at
+                    decided_at,
+                    actor_principal_json,
+                    appearance_snapshot_json
                 ],
             )
             .await?;
@@ -371,6 +518,39 @@ pub async fn list_events(
     .await
 }
 
+pub async fn events_by_actor(
+    db: &LocalDb,
+    workspace_id: &str,
+    actor: &PrincipalRef,
+    limit: i64,
+) -> DbResult<Vec<AuthorizationEventRecord>> {
+    actor
+        .validate_at(PrincipalPosition::DecisionActor)
+        .map_err(|e| DbError::internal(format!("invalid authority decision actor: {e}")))?;
+    let actor_json = serde_json::to_string(actor)
+        .map_err(|e| DbError::internal(format!("decision actor is not serializable: {e}")))?;
+    let events = db
+        .query_all(
+            format!(
+                "SELECT {EVENT_COLUMNS} FROM authorization_events \
+                 WHERE workspace_id=?1 AND actor_principal_json=?2 \
+                 ORDER BY decided_at DESC, rowid DESC LIMIT ?3"
+            ),
+            (workspace_id.to_string(), actor_json, limit.clamp(1, 500)),
+            event_from_row,
+        )
+        .await?;
+    if events
+        .iter()
+        .any(|event| event.decision_actor.as_ref() != Some(actor))
+    {
+        return Err(DbError::internal(
+            "authority actor index returned an event for a different typed actor",
+        ));
+    }
+    Ok(events)
+}
+
 /// Every decision that cited a given grant — the audit trail for one approval.
 pub async fn events_citing_grant(
     db: &LocalDb,
@@ -393,6 +573,10 @@ mod tests {
     use cairn_common::authorization::{
         AuthorityAction, AuthorityConstraint, AuthorityContext, AuthorityMutation, AuthorityPlace,
         AuthorityRequest, AuthorityScope, McpConfigFingerprint, ToolKind,
+    };
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceTransport, VerificationMethod, VerificationRecord,
+        VerificationStatus, VerificationStrength,
     };
 
     fn tool_scope(name: &str) -> AuthorityScope {
@@ -454,6 +638,35 @@ mod tests {
         crate::storage::migrated_test_db("authority-grants.db").await
     }
 
+    fn attribution(subject: &str) -> (PrincipalRef, AppearanceSnapshot) {
+        let actor = PrincipalRef::Human {
+            issuer: "https://identity.example".to_string(),
+            subject: subject.to_string(),
+            organization: Some("acme".to_string()),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::JwtOperator,
+            VerificationStatus::Verified,
+            Some("https://identity.example".to_string()),
+            Some(subject.to_string()),
+            None,
+            None,
+            VerificationStrength::new("strong").unwrap(),
+            900,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::AuthenticatedOperator,
+            Address::Invoke { origin: None },
+            verification,
+            900,
+            None,
+        )
+        .unwrap();
+        let snapshot = AppearanceSnapshot::new(actor.clone(), evidence, vec![], None).unwrap();
+        (actor, snapshot)
+    }
+
     #[tokio::test]
     async fn a_grant_round_trips_through_storage() {
         let db = db().await;
@@ -473,6 +686,59 @@ mod tests {
 
         let read_back = get_grant(&db, "g1").await.unwrap().expect("grant exists");
         assert_eq!(read_back, original);
+    }
+
+    #[tokio::test]
+    async fn typed_grant_attribution_round_trips_and_queries_by_actor() {
+        let db = db().await;
+        let (actor, snapshot) = attribution("operator-1");
+        let mut original = grant("typed", tool_scope("linear"), AuthorityLifetime::Standing);
+        original.provenance.decision_actor = Some(actor.clone());
+        original.provenance.appearance_snapshot = Some(snapshot.clone());
+        insert_grant(&db, &original).await.unwrap();
+
+        assert_eq!(get_grant(&db, "typed").await.unwrap(), Some(original));
+        let found = grants_by_actor(&db, "default", &actor, 10).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].provenance.appearance_snapshot.as_ref(),
+            Some(&snapshot)
+        );
+
+        let (other, _) = attribution("operator-2");
+        assert!(grants_by_actor(&db, "default", &other, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_or_partial_grant_attribution_is_refused() {
+        let db = db().await;
+        let (actor, snapshot) = attribution("operator-1");
+        let mut partial = grant("partial", tool_scope("linear"), AuthorityLifetime::Standing);
+        partial.provenance.decision_actor = Some(actor.clone());
+        assert!(insert_grant(&db, &partial).await.is_err());
+
+        let mut mismatched = grant(
+            "mismatch",
+            tool_scope("linear"),
+            AuthorityLifetime::Standing,
+        );
+        let (other, _) = attribution("operator-2");
+        mismatched.provenance.decision_actor = Some(other);
+        mismatched.provenance.appearance_snapshot = Some(snapshot);
+        assert!(insert_grant(&db, &mismatched).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn historical_null_attribution_decodes_without_fabrication() {
+        let db = db().await;
+        let original = grant("legacy", tool_scope("linear"), AuthorityLifetime::Standing);
+        insert_grant(&db, &original).await.unwrap();
+        let decoded = get_grant(&db, "legacy").await.unwrap().unwrap();
+        assert!(decoded.provenance.decision_actor.is_none());
+        assert!(decoded.provenance.appearance_snapshot.is_none());
     }
 
     #[tokio::test]
@@ -652,6 +918,8 @@ mod tests {
             run_id: Some("run-1".to_string()),
             request_uri: None,
             grant_id: None,
+            decision_actor: None,
+            appearance_snapshot: None,
             decided_at: 3000,
         };
         assert!(append_event(&db, base.clone()).await.is_err());
@@ -665,6 +933,58 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].outcome, "allowed_by_grant");
         assert_eq!(events[0].scope, tool_scope("linear"));
+    }
+
+    #[tokio::test]
+    async fn typed_event_attribution_round_trips_and_queries_by_actor() {
+        let db = db().await;
+        let (actor, snapshot) = attribution("operator-1");
+        append_event(
+            &db,
+            NewAuthorizationEvent {
+                scope: tool_scope("linear"),
+                mutation: "create".to_string(),
+                summary: "install linear".to_string(),
+                outcome: "approval_required".to_string(),
+                reason: "workspace_tool_capability".to_string(),
+                principal: AuthorityPrincipal::default(),
+                audience: AuthorityAudience::workspace("default"),
+                run_id: Some("run-1".to_string()),
+                request_uri: None,
+                grant_id: None,
+                decision_actor: Some(actor.clone()),
+                appearance_snapshot: Some(snapshot.clone()),
+                decided_at: 3000,
+            },
+        )
+        .await
+        .unwrap();
+
+        let events = events_by_actor(&db, "default", &actor, 10).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].appearance_snapshot.as_ref(), Some(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_snapshot_transport_fails_closed() {
+        let db = db().await;
+        let (actor, snapshot) = attribution("operator-1");
+        let mut original = grant(
+            "invalid-snapshot",
+            tool_scope("linear"),
+            AuthorityLifetime::Standing,
+        );
+        original.provenance.decision_actor = Some(actor);
+        original.provenance.appearance_snapshot = Some(snapshot);
+        insert_grant(&db, &original).await.unwrap();
+        db.write(move |conn| Box::pin(async move {
+            conn.execute(
+                "UPDATE authority_grants SET appearance_snapshot_json = replace(appearance_snapshot_json, 'authenticated_operator', 'future_transport') WHERE id='invalid-snapshot'",
+                (),
+            ).await?;
+            Ok(())
+        })).await.unwrap();
+        assert!(get_grant(&db, "invalid-snapshot").await.is_err());
     }
 
     #[tokio::test]
@@ -683,6 +1003,8 @@ mod tests {
                 run_id: Some("run-1".to_string()),
                 request_uri: None,
                 grant_id: None,
+                decision_actor: None,
+                appearance_snapshot: None,
                 decided_at: 3000,
             },
         )

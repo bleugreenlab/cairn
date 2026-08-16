@@ -40,6 +40,32 @@ pub fn current_process_is_confined() -> bool {
     false
 }
 
+/// Evidence that this process can launch a nested macOS Seatbelt profile and
+/// perform a write which that profile explicitly permits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedSandboxWriteProbe {
+    pub available: bool,
+    pub detail: String,
+}
+
+/// Measure the kernel capability sandbox lifecycle tests actually need.
+///
+/// This deliberately does not consult `CAIRN_SANDBOXED`: that marker records a
+/// Cairn policy decision, while an inherited Seatbelt profile is kernel state.
+#[cfg(target_os = "macos")]
+pub fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
+    static PROBE: std::sync::OnceLock<NestedSandboxWriteProbe> = std::sync::OnceLock::new();
+    PROBE.get_or_init(macos::probe_nested_sandbox_write).clone()
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
+    NestedSandboxWriteProbe {
+        available: false,
+        detail: format!("not applicable on {}", std::env::consts::OS),
+    }
+}
+
 /// A per-spawn filesystem confinement profile.
 ///
 /// Built fresh for each spawn from the current worktree and the session's

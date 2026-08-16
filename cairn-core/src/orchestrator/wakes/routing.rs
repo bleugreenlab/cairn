@@ -288,16 +288,19 @@ async fn deliver_active_wake(
     subscription: &WakeSubscription,
     prefix: Option<&str>,
 ) -> Result<(), String> {
-    let (job_id, message) = match &event.delivery {
+    let (job_id, sender_name, message) = match &event.delivery {
         WakeDelivery::Targeted {
             subscriber_job_id,
+            sender_name,
             message,
         } => (
             subscriber_job_id.as_str(),
+            sender_name.as_deref(),
             format_message_with_prefix(prefix, message),
         ),
         WakeDelivery::Broadcast { message } => (
             subscription.job_id.as_str(),
+            None,
             format_message_with_prefix(prefix, message),
         ),
         WakeDelivery::MessageDigest { .. } => {
@@ -306,7 +309,13 @@ async fn deliver_active_wake(
             return Ok(());
         }
     };
-    crate::orchestrator::parent_wake::queue_or_resume_parent(orch, job_id, &message, event.urgency);
+    crate::orchestrator::parent_wake::queue_or_resume_parent(
+        orch,
+        job_id,
+        sender_name,
+        &message,
+        event.urgency,
+    );
     Ok(())
 }
 

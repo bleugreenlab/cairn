@@ -2,6 +2,7 @@ use super::*;
 use cairn_db::storage::{LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
 use cairn_db::turso::params;
 use std::collections::HashMap;
+use std::time::Instant;
 use tempfile::tempdir;
 
 async fn fixture_db() -> LocalDb {
@@ -82,6 +83,149 @@ async fn fixture_db() -> LocalDb {
     // as startup does for pre-seam historical events.
     queries::fold_token_rollup(&db).await.unwrap();
     db
+}
+
+#[tokio::test]
+async fn tool_summary_recovers_next_maximum_after_result_update() {
+    let db = fixture_db().await;
+    db.execute_script(
+        "INSERT INTO tool_invocations(id,event_id,tool_use_id,run_id,ts,verb,tool_name,target_scheme,target_kind,target_path,is_error,result_ts)
+         VALUES ('max-a','max-a','a','run-claude',90000,'read','read','file','rs','same.rs',0,90010),
+                ('max-b','max-b','b','run-claude',90000,'read','read','file','rs','same.rs',0,90008);
+         UPDATE tool_invocations SET result_ts = 90005 WHERE id = 'max-a';",
+    ).await.unwrap();
+    let max = db
+        .query_opt_i64(
+            "SELECT max_duration_s FROM tool_analytics_hourly WHERE target_path='same.rs'",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(max, Some(8));
+}
+
+#[tokio::test]
+async fn same_group_inserts_do_not_scan_raw_facts() {
+    let db = fixture_db().await;
+    let plan = db.query_all(
+        "EXPLAIN QUERY PLAN INSERT INTO tool_invocations(id,event_id,tool_use_id,run_id,ts,verb,tool_name,target_scheme,target_kind,target_path,is_error,result_ts)
+         VALUES ('plan','plan','plan','run-claude',90000,'read','read','file','rs','same.rs',0,90001)",
+        (), |row| row.text(3),
+    ).await.unwrap().join(" ");
+    assert!(
+        !plan.contains("SCAN ti"),
+        "insert trigger must not scan raw facts: {plan}"
+    );
+}
+
+#[tokio::test]
+async fn tool_queries_preserve_non_aligned_half_open_ranges() {
+    let db = fixture_db().await;
+    db.execute_script(
+        "INSERT INTO tool_invocations(id,event_id,tool_use_id,run_id,ts,verb,tool_name,target_scheme,target_kind,target_path,is_error,result_ts)
+         VALUES ('edge-a','edge-a','a','run-claude',37799,'read','read','file','rs','a.rs',0,37800),
+                ('edge-b','edge-b','b','run-claude',37800,'read','read','file','rs','b.rs',1,37802),
+                ('edge-c','edge-c','c','run-claude',37801,'run','run','shell','cargo','cargo test',0,37804);",
+    ).await.unwrap();
+    let range = TimeRange::new(Some(37800), Some(37801));
+    let breakdown = target_breakdown(&db, &Scope::default(), &range)
+        .await
+        .unwrap();
+    assert_eq!(breakdown.total, 1);
+    assert_eq!(breakdown.shapes[0].error_count, 1);
+    let errors = tool_error_rate(&db, &Scope::default(), &range, Bucket::Hour)
+        .await
+        .unwrap();
+    assert_eq!((errors[0].total, errors[0].errors), (1, 1));
+}
+
+#[tokio::test]
+async fn tool_summary_bounds_large_fixture_reads_and_avoids_raw_scan() {
+    let db = fixture_db().await;
+    db.execute_script(
+        r#"
+        WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM n WHERE x < 10000)
+        INSERT INTO tool_invocations
+            (id, event_id, tool_use_id, run_id, ts, verb, tool_name,
+             target_scheme, target_kind, target_path, is_error, result_ts)
+        SELECT 'perf-' || x, 'perf-event-' || x, 'perf-tool-' || x,
+               'run-claude', 90000 + (x % 2592000),
+               CASE WHEN x % 3 = 0 THEN 'run' ELSE 'read' END,
+               'read', 'file', 'rs', 'src/file-' || (x % 100) || '.rs',
+               x % 17 = 0, 90001 + (x % 2592000)
+        FROM n;
+        "#,
+    )
+    .await
+    .unwrap();
+    let raw = db
+        .query_opt_i64("SELECT COUNT(*) FROM tool_invocations", ())
+        .await
+        .unwrap()
+        .unwrap();
+    let summary = db
+        .query_opt_i64("SELECT COUNT(*) FROM tool_analytics_hourly", ())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        summary * 10 < raw,
+        "summary {summary} should stay at least 10x below raw {raw}"
+    );
+
+    let plan = db
+        .query_all(
+            "EXPLAIN QUERY PLAN SELECT verb, target_scheme, target_kind,
+             SUM(invocation_count), SUM(error_count)
+         FROM tool_analytics_hourly
+         WHERE project_id = 'proj' AND bucket_start >= 86400
+         GROUP BY verb, target_scheme, target_kind",
+            (),
+            |row| row.text(3),
+        )
+        .await
+        .unwrap()
+        .join(" ");
+    assert!(plan.contains("idx_tool_analytics_hourly_scope"), "{plan}");
+    assert!(!plan.contains("tool_invocations"), "{plan}");
+
+    let started = Instant::now();
+    let _ = target_breakdown(
+        &db,
+        &Scope::new(Some("proj".into())),
+        &TimeRange::new(Some(86400), None),
+    )
+    .await
+    .unwrap();
+    let _ = tool_time_mix(
+        &db,
+        &Scope::new(Some("proj".into())),
+        &TimeRange::new(Some(86400), None),
+        Bucket::Day,
+    )
+    .await
+    .unwrap();
+    let _ = command_durations(
+        &db,
+        &Scope::new(Some("proj".into())),
+        &TimeRange::new(Some(86400), None),
+        25,
+    )
+    .await
+    .unwrap();
+    let _ = tool_error_rate(
+        &db,
+        &Scope::new(Some("proj".into())),
+        &TimeRange::new(Some(86400), None),
+        Bucket::Day,
+    )
+    .await
+    .unwrap();
+    assert!(
+        started.elapsed().as_millis() < 500,
+        "four summary reads took {:?}",
+        started.elapsed()
+    );
 }
 
 fn econ<'a>(rows: &'a [EconomicsRow], key: &str) -> &'a EconomicsRow {

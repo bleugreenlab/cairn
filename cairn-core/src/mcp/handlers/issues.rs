@@ -1,14 +1,13 @@
 //! Issue-related MCP handlers.
 //!
 use crate::orchestrator::Orchestrator;
-use cairn_common::ids;
 use cairn_db::turso::params;
 
 use super::ProjectContext;
 use crate::issues::relations;
 use crate::labels::attach;
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{Issue, IssueAttention, IssueProgress, IssueStatus, Label};
+use crate::models::{Issue, Label};
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 // ============================================================================
@@ -43,6 +42,7 @@ async fn insert_issue_with_context(
     parent_uri: Option<String>,
     labels: Option<Vec<String>>,
     caller_run_id: Option<String>,
+    authorship: crate::issues::crud::IssueAuthorship,
 ) -> Result<Issue, String> {
     let services = &orch.services;
     let embed_text = description.clone().unwrap_or_default();
@@ -50,17 +50,50 @@ async fn insert_issue_with_context(
     // replica for a team project, the private DB for a local one), resolved by
     // the caller via `for_project` so the row lands in the same DB it is read
     // back from (CAIRN-2181).
-    let (issue, created_labels) = create_issue_row(
-        owning_db,
-        &ctx.project_id,
+    let (parent_job_id, inferred_parent_thread_id) = match caller_run_id.as_deref() {
+        Some(run_id) => {
+            let execution_db = crate::execution::routing::routing_db_for_id(&orch.db, run_id)
+                .await
+                .map_err(|e| format!("Failed to resolve creating run: {e}"))?;
+            let parent_job_id = execution_db
+                .read(|conn| {
+                    let run_id = run_id.to_string();
+                    Box::pin(async move { owning_node_job_for_run(conn, &run_id).await })
+                })
+                .await
+                .map_err(|e| format!("Failed to resolve creating node: {e}"))?;
+            let inferred_thread = execution_db
+                .read(|conn| {
+                    let run_id = run_id.to_string();
+                    let project_id = ctx.project_id.clone();
+                    Box::pin(async move { owning_thread_for_run(conn, &project_id, &run_id).await })
+                })
+                .await
+                .map_err(|e| format!("Failed to resolve creating thread: {e}"))?;
+            (parent_job_id, inferred_thread)
+        }
+        None => (None, None),
+    };
+    let input = crate::models::CreateIssue {
+        project_id: ctx.project_id.clone(),
         title,
         description,
-        parent_uri,
-        labels,
-        caller_run_id,
+        backend_override: None,
+        label_ids: labels,
+    };
+    let (issue, created_labels) = crate::issues::crud::create_with_context(
+        owning_db,
+        &crate::services::RealClock,
+        input,
+        authorship,
+        crate::issues::crud::IssueCreationContext {
+            parent_uri,
+            inferred_parent_thread_id,
+            parent_job_id,
+        },
     )
     .await
-    .map_err(|e| format!("Failed to create issue: {}", e))?;
+    .map_err(|e| format!("Failed to create issue: {e}"))?;
 
     // No subscription row is minted here. `create_issue_row` records WHICH node
     // filed the child (`issues.parent_job_id`); who that child's facts reach is
@@ -75,6 +108,7 @@ async fn insert_issue_with_context(
     ) {
         log::error!("Failed to emit db-change event: {}", e);
     }
+    orch.invalidate_sidebar_active_issues();
     emit_labels_created(orch, &created_labels);
     if !issue.labels.is_empty() {
         if let Err(e) = services.emitter.emit(
@@ -136,6 +170,7 @@ pub async fn create_issue_in_project(
     execution: Option<CreateExecutionSpec>,
     parent_uri: Option<String>,
     caller_run_id: Option<String>,
+    authorship: crate::issues::crud::IssueAuthorship,
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
@@ -148,6 +183,7 @@ pub async fn create_issue_in_project(
         parent_uri,
         labels,
         caller_run_id,
+        authorship,
     )
     .await?;
     let summary = created_issue_summary(&ctx, &issue);
@@ -202,7 +238,7 @@ async fn lookup_project_by_key(db: &LocalDb, key: &str) -> Result<ProjectContext
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT id, key FROM projects WHERE key = ?1 LIMIT 1",
+                    "SELECT id, key FROM projects WHERE key = ?1 COLLATE NOCASE LIMIT 1",
                     (lookup_key.as_str(),),
                 )
                 .await?;
@@ -404,33 +440,9 @@ async fn owning_thread_for_run(
     }
 }
 
-/// The parent an issue hangs from: exactly one of another issue or a thread.
-///
-/// The `issues` table holds these as two nullable columns, but they are one
-/// relationship carrying two different meanings. An issue parent routes
-/// attention AND derives branches — the child branches from, and merges into,
-/// the parent's integration branch. A thread parent takes only the routing
-/// meaning: a thread owns no branch, so its children base off the project
-/// (`relations::resolve_parent_branch`). Which of the two a URI names is settled
-/// once, here, so create and patch cannot drift apart on the answer.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ParentEdge {
-    Issue(String),
-    Thread(String),
-}
-
-/// The canonical form of a parent URI, or a message naming what is accepted.
-///
-/// Syntax only: existence, same-project, and cycle checks belong to
-/// [`resolve_parent_edge`], which runs them inside the write transaction. A
-/// numeric address stays an issue address here — a number vacated by the thread
-/// cutover resolves to its thread at the database, where the issue row's
-/// absence is knowable.
+/// Validate and canonicalize an issue or thread parent URI before insertion.
 pub(crate) fn canonicalize_parent_uri(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
-    // `cairn:~/` is home-relative to the node doing the writing, so it can never
-    // name the intended parent from any session but that node's own. Naming the
-    // mis-resolution beats resolving it somewhere surprising.
     if trimmed.starts_with("cairn:~") {
         return Err(format!(
             "payload.parent must be the parent's canonical URI; cairn:~/ resolves to the node making this write, not the parent: {trimmed}"
@@ -440,212 +452,15 @@ pub(crate) fn canonicalize_parent_uri(value: &str) -> Result<String, String> {
         Some(cairn_common::uri::CairnResource::Issue { project, number }) => {
             Ok(cairn_common::uri::build_issue_uri(&project, number))
         }
-        Some(cairn_common::uri::CairnResource::Thread {
-            project,
-            name,
-            path,
-        }) if path.is_empty() => Ok(cairn_common::uri::build_thread_uri(&project, &name)),
+        Some(cairn_common::uri::CairnResource::Thread { project, name, path })
+            if path.is_empty() =>
+        {
+            Ok(cairn_common::uri::build_thread_uri(&project, &name))
+        }
         _ => Err(format!(
             "payload.parent must be a canonical issue URI like cairn://p/CAIRN/123 or a canonical thread URI like cairn://p/CAIRN/thread-name: {trimmed}"
         )),
     }
-}
-
-/// Resolve `parent_uri` to the edge it names, inside the caller's transaction.
-///
-/// An issue address that has an issue row is an issue parent. Everything else
-/// falls through to thread resolution, which takes both canonical thread names
-/// and the numeric aliases the thread cutover vacated
-/// (`threads::resolve_parent_thread_uri_conn`).
-async fn resolve_parent_edge(
-    conn: &cairn_db::turso::Connection,
-    project_id: &str,
-    parent_uri: &str,
-) -> DbResult<ParentEdge> {
-    let resolved_issue = match cairn_common::uri::parse_uri(parent_uri) {
-        Some(cairn_common::uri::CairnResource::Issue { .. }) => {
-            relations::resolve_issue_uri(conn, parent_uri).await?
-        }
-        _ => None,
-    };
-    if let Some(resolved) = resolved_issue {
-        // Same-project: a cross-project issue parent would branch from another
-        // repo, and a cross-project thread would route attention out of the
-        // project that owns the work.
-        let mut project_rows = conn
-            .query(
-                "SELECT project_id FROM issues WHERE id = ?1 LIMIT 1",
-                params![resolved.issue_id.as_str()],
-            )
-            .await?;
-        let parent_project_id = project_rows
-            .next()
-            .await?
-            .ok_or_else(|| DbError::Row(parent_not_found(parent_uri)))?
-            .text(0)?;
-        if parent_project_id != project_id {
-            return Err(DbError::Row(same_project_required(parent_uri)));
-        }
-        return Ok(ParentEdge::Issue(resolved.issue_id));
-    }
-    if let Some((thread_id, thread_project_id, _)) =
-        crate::threads::resolve_parent_thread_uri_conn(conn, parent_uri).await?
-    {
-        if thread_project_id != project_id {
-            return Err(DbError::Row(same_project_required(parent_uri)));
-        }
-        return Ok(ParentEdge::Thread(thread_id));
-    }
-    Err(DbError::Row(parent_not_found(parent_uri)))
-}
-
-fn parent_not_found(parent_uri: &str) -> String {
-    format!("parent issue or thread not found: {parent_uri}")
-}
-
-fn same_project_required(parent_uri: &str) -> String {
-    format!("parent issue or thread must be in the same project: {parent_uri}")
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn create_issue_row(
-    db: &LocalDb,
-    project_id: &str,
-    title: String,
-    description: Option<String>,
-    parent_uri: Option<String>,
-    labels: Option<Vec<String>>,
-    caller_run_id: Option<String>,
-) -> DbResult<(Issue, Vec<Label>)> {
-    let project_id = project_id.to_string();
-    db.write(|conn| {
-        let project_id = project_id.clone();
-        let title = title.clone();
-        let description = description.clone();
-        let parent_uri = parent_uri.clone();
-        let labels = labels.clone();
-        let caller_run_id = caller_run_id.clone();
-        Box::pin(async move {
-            let (parent_issue_id, parent_thread_id) = match parent_uri.as_deref() {
-                Some(parent_uri) => {
-                    match resolve_parent_edge(conn, &project_id, parent_uri).await? {
-                        ParentEdge::Issue(issue_id) => (Some(issue_id), None),
-                        ParentEdge::Thread(thread_id) => (None, Some(thread_id)),
-                    }
-                }
-                // No parent named: an issue an agent files while acting for a
-                // thread belongs to that thread. The thread is where the work
-                // was decided on, so it is where the issue's attention has to
-                // return — an unparented issue routes nowhere and the thread
-                // loses sight of what it just asked for. A caller that wants
-                // something else says so, and says it in the same key that
-                // names any other parent.
-                None => match caller_run_id.as_deref() {
-                    Some(run_id) => (None, owning_thread_for_run(conn, &project_id, run_id).await?),
-                    None => (None, None),
-                },
-            };
-
-            // Record the node that filed this child — the caller's owning node,
-            // walking past delegated tasks only: a delegated sub-task is acting
-            // for the node that spawned it, so the child belongs to that node,
-            // while an authored node that merely inherits a branch owns what it
-            // files itself. Whether this record still
-            // NAMES the recipient is re-decided on every wake
-            // (`wakes::coordinating_job_for_child`) — it is a durable fact about
-            // who filed the child, not a cached route.
-            //
-            // content→execution boundary (CAIRN-2181): this reads runs/jobs from
-            // whatever DB the insert targets. A user-driven create carries no
-            // caller_run_id so it never fires; an agent filing a child into a
-            // team project hits an empty runs table in the replica and degrades
-            // to NULL (routing falls back to the parent's current driver) —
-            // cross-DB job resolution is execution-slice work for CAIRN-2182.
-            let parent_job_id = match (parent_issue_id.as_deref(), caller_run_id.as_deref()) {
-                (Some(_), Some(run_id)) => owning_node_job_for_run(conn, run_id).await?,
-                _ => None,
-            };
-
-            let mut rows = conn
-                .query(
-                    "SELECT next_issue_number FROM projects WHERE id = ?1",
-                    (project_id.as_str(),),
-                )
-                .await?;
-            let row = rows
-                .next()
-                .await?
-                .ok_or_else(|| DbError::Row(format!("project not found: {}", project_id)))?;
-            let number = row.opt_i64(0)?.unwrap_or(1) as i32;
-            let now = chrono::Utc::now().timestamp() as i32;
-            let id = ids::mint_child(project_id.as_str());
-
-            conn.execute(
-                "UPDATE projects SET next_issue_number = ?1, updated_at = ?2 WHERE id = ?3",
-                params![number + 1, now, project_id.as_str()],
-            )
-            .await?;
-
-            conn.execute(
-                "
-                INSERT INTO issues (
-                    id, project_id, number, title, description, status, progress,
-                    attention, priority, created_at, updated_at, model, parent_issue_id,
-                    parent_job_id, parent_thread_id
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, NULL, ?7, ?8, ?9)
-                ",
-                params![
-                    id.as_str(),
-                    project_id.as_str(),
-                    number,
-                    title.as_str(),
-                    description.as_deref(),
-                    now,
-                    parent_issue_id.as_deref(),
-                    parent_job_id.as_deref(),
-                    parent_thread_id.as_deref()
-                ],
-            )
-            .await?;
-
-            let created_labels = match labels {
-                Some(labels) => attach::replace_issue_labels(conn, &id, &labels, now as i64)
-                    .await
-                    .map_err(DbError::Row)?,
-                None => Vec::new(),
-            };
-
-            let issue = crate::issues::crud::load_conn(conn, &id)
-                .await
-                .unwrap_or_else(|_| Issue {
-                    id,
-                    project_id,
-                    number,
-                    title,
-                    description: description.unwrap_or_default(),
-                    status: IssueStatus::Backlog,
-                    progress: IssueProgress::Backlog,
-                    attention: IssueAttention::None,
-                    priority: 0,
-                    completed_at: None,
-                    dismissed_at: None,
-                    created_at: now as i64,
-                    updated_at: now as i64,
-                    backend_override: None,
-                    merged_at: None,
-                    closed_at: None,
-                    parent_issue_id,
-                    parent_thread_id,
-                    unmet_dependency_count: 0,
-                    depends_on: Vec::new(),
-                    unmet_depends_on: Vec::new(),
-                    labels: Vec::new(),
-                });
-            Ok((issue, created_labels))
-        })
-    })
-    .await
 }
 
 pub(crate) struct IssuePatchFields {
@@ -745,8 +560,10 @@ async fn update_issue_row(
                 // occurs, so there is nothing to record here. The two columns
                 // are one edge, so each branch sets its own and clears the other.
                 Some(Some(parent_uri)) => {
-                    match resolve_parent_edge(conn, &project_id, &parent_uri).await? {
-                        ParentEdge::Issue(parent_issue_id) => {
+                    match crate::issues::crud::resolve_parent_edge(conn, &project_id, &parent_uri)
+                        .await?
+                    {
+                        crate::issues::crud::ParentEdge::Issue(parent_issue_id) => {
                             if parent_issue_id == issue_id {
                                 return Err(DbError::Row(
                                     "an issue cannot be its own parent".into(),
@@ -768,7 +585,7 @@ async fn update_issue_row(
                         // stale `parent_job_id` of a previous issue parent stays
                         // inert, since routing only consults it alongside a
                         // parent issue it belongs to.
-                        ParentEdge::Thread(thread_id) => {
+                        crate::issues::crud::ParentEdge::Thread(thread_id) => {
                             conn.execute(
                                 "UPDATE issues
                                  SET parent_thread_id = ?1, parent_issue_id = NULL, updated_at = ?2
@@ -876,6 +693,7 @@ pub(crate) async fn update_issue_by_project_number(
     ) {
         log::error!("Failed to emit db-change event: {}", e);
     }
+    orch.invalidate_sidebar_active_issues();
     emit_labels_created(orch, &created_labels);
     if labels_changed {
         if let Err(e) = orch.services.emitter.emit(
@@ -935,7 +753,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+             VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
              VALUES('coord', 'p', 'running', 1, 1);
             INSERT INTO jobs(id, project_id, status, parent_job_id, created_at, updated_at)
@@ -986,7 +804,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w2', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES('p2', 'w2', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+             VALUES('p2', 'w2', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
              VALUES('parent', 'p2', 1, 'Parent', 'active', 'active', 'none', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
@@ -998,7 +816,7 @@ mod tests {
             INSERT INTO runs(id, job_id, status, created_at, updated_at)
              VALUES('run-coord', 'coord', 'running', 1, 1);
             INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state, created_by, created_at, updated_at, one_shot)
-             VALUES('manual-sub', 'manual', 'issue', 'cairn://p/PROJ/2', 'active', 'agent', 1, 1, 0);
+             VALUES('manual-sub', 'manual', 'issue', 'cairn://p/proj/2', 'active', 'agent', 1, 1, 0);
             ",
         )
         .await
@@ -1008,7 +826,7 @@ mod tests {
         update_issue_by_project_number(
             &orch,
             &request(Some("run-coord")),
-            "PROJ",
+            "proj",
             2,
             IssuePatchFields {
                 title: None,
@@ -1017,7 +835,7 @@ mod tests {
                 labels: None,
                 status: None,
                 confirm: false,
-                parent: Some(Some("cairn://p/PROJ/1".to_string())),
+                parent: Some(Some("cairn://p/proj/1".to_string())),
             },
         )
         .await
@@ -1026,7 +844,7 @@ mod tests {
         // The adopting coordinator watches the child immediately, with nothing
         // persisted on its behalf.
         assert_eq!(
-            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/PROJ/2")
+            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/proj/2")
                 .await
                 .unwrap(),
             vec!["manual".to_string(), "coord".to_string()]
@@ -1042,7 +860,7 @@ mod tests {
         update_issue_by_project_number(
             &orch,
             &request(Some("run-coord")),
-            "PROJ",
+            "proj",
             2,
             IssuePatchFields {
                 title: None,
@@ -1060,7 +878,7 @@ mod tests {
         // Orphaned: the derived watch is gone with the parent edge, and the
         // manual watcher is untouched.
         assert_eq!(
-            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/PROJ/2")
+            crate::orchestrator::wakes::watcher_jobs_for_issue(&orch.db.local, "cairn://p/proj/2")
                 .await
                 .unwrap(),
             vec!["manual".to_string()],
@@ -1126,7 +944,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',2,1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',2,1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('parent','p',1,'Parent','active','active','none',1,1);
             ",
@@ -1177,13 +995,14 @@ mod tests {
 
         let outcome = create_issue_in_project(
             &orch,
-            "PROJ",
+            "proj",
             "Child".to_string(),
             None,
             None,
             None,
-            Some("cairn://p/PROJ/1".to_string()),
+            Some("cairn://p/proj/1".to_string()),
             Some("run-coordinator".to_string()),
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
         )
         .await
         .unwrap();
@@ -1208,13 +1027,14 @@ mod tests {
 
         let outcome = create_issue_in_project(
             &orch,
-            "PROJ",
+            "proj",
             "Child".to_string(),
             None,
             None,
             None,
-            Some("cairn://p/PROJ/1".to_string()),
+            Some("cairn://p/proj/1".to_string()),
             Some("run-subtask".to_string()),
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
         )
         .await
         .unwrap();
@@ -1250,13 +1070,14 @@ mod tests {
 
         let outcome = create_issue_in_project(
             &orch,
-            "PROJ",
+            "proj",
             "Child".to_string(),
             None,
             None,
             None,
-            Some("cairn://p/PROJ/1".to_string()),
+            Some("cairn://p/proj/1".to_string()),
             Some("run-subtask".to_string()),
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
         )
         .await
         .unwrap();
@@ -1291,13 +1112,14 @@ mod tests {
 
         let by_human = create_issue_in_project(
             &orch,
-            "PROJ",
+            "proj",
             "Human child".to_string(),
             None,
             None,
             None,
-            Some("cairn://p/PROJ/1".to_string()),
+            Some("cairn://p/proj/1".to_string()),
             None,
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
         )
         .await
         .unwrap();
@@ -1308,13 +1130,14 @@ mod tests {
 
         let unparented = create_issue_in_project(
             &orch,
-            "PROJ",
+            "proj",
             "Root issue".to_string(),
             None,
             None,
             None,
             None,
             Some("run-coord".to_string()),
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
         )
         .await
         .unwrap();
@@ -1335,13 +1158,14 @@ mod tests {
 
         let outcome = create_issue_in_project(
             &orch,
-            "PROJ",
+            "proj",
             "Local issue".to_string(),
             Some("body".to_string()),
             None,
             None,
             None,
             None,
+            crate::issues::crud::installation_machine_authorship("test-installation", 1).unwrap(),
         )
         .await
         .unwrap();

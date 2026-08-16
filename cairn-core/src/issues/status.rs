@@ -246,10 +246,39 @@ pub async fn update_status(
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("Issue not found after status update: {id}"))?;
+    if is_terminal_state {
+        let discord = crate::config::settings::load_settings(&orch.config_dir)
+            .channels
+            .discord;
+        if discord.enabled {
+            let guild_id = discord
+                .guild_id
+                .parse::<u64>()
+                .map_err(|_| "Discord guild ID must be an unsigned integer".to_string())?;
+            let project = crate::projects::crud::get_db(&owning_db, &issue.project_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    format!("Project not found for terminal issue: {}", issue.project_id)
+                })?;
+            let target = format!("cairn://p/{}/{}", project.key, issue.number);
+            if crate::channels::discord_surfaces::request_issue_lock(
+                &owning_db,
+                guild_id,
+                &target,
+                chrono::Utc::now().timestamp(),
+            )
+            .await?
+            {
+                crate::channels::wake_discord_surfaces();
+            }
+        }
+    }
     let _ = orch.services.emitter.emit(
         "db-change",
         crate::notify::issue_db_change(&issue, "update"),
     );
+    orch.invalidate_sidebar_active_issues();
 
     orch.wake_for_issue(id).await;
 
@@ -707,7 +736,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES('p-1', 'w', 'Proj', 'PROJ', '/tmp/proj', 1, 1);
+             VALUES('p-1', 'w', 'Proj', 'proj', '/tmp/proj', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
              VALUES('issue-1', 'p-1', 1, 'Issue', 'active', 'idle', 'none', 1, 1);
             INSERT INTO jobs(id, project_id, issue_id, node_name, status, created_at, updated_at)

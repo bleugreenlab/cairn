@@ -73,6 +73,9 @@ pub enum AuthorityGate {
     /// The run durably suspended awaiting approval; the verb handler returns a
     /// suspend marker and the run re-drives the verb on resume.
     Suspended,
+    /// Approval could not be requested because its durable backing service was
+    /// unavailable. This is not an operator decision.
+    Unavailable(String),
 }
 
 /// Adjudicate a normalized authority request, prompting the operator when
@@ -172,6 +175,7 @@ pub async fn raise_authority(
             }
         }
         PermissionWait::Suspended => AuthorityGate::Suspended,
+        PermissionWait::Unavailable(error) => AuthorityGate::Unavailable(error),
     }
 }
 

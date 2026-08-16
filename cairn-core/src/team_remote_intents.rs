@@ -399,7 +399,7 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
         ) => {
             validate_target(db, &intent.execution_id, &project, number, exec_seq).await?;
             let payload: PromptPayload = decode(&intent.payload_json)?;
-            let outcome = crate::mcp::handlers::planning::answer_node_question(
+            let outcome = crate::mcp::handlers::planning::answer_node_question_with_provenance(
                 orch,
                 &project,
                 number,
@@ -407,6 +407,10 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
                 &node_id,
                 &segment,
                 &json!({"response": payload.response}),
+                crate::turns::queries::ResolutionProvenance::new(
+                    cairn_common::identity::AppearanceTransport::RemoteIntent,
+                    None,
+                ),
             )
             .await?;
             Ok(json!({"outcome": if outcome.duplicate {"duplicate"} else {"created"}}))
@@ -561,7 +565,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO teams(id,name,created_at,updated_at) VALUES('team','Team',1,1);
              INSERT INTO projects(id,team_id,name,key,repo_path,created_at,updated_at)
-               VALUES('project','team','Project','PROJ','/tmp/project',1,1);
+               VALUES('project','team','Project','proj','/tmp/project',1,1);
              INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at)
                VALUES('issue','project',1,'Issue','active',1,1);
              INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,runner_device_id)
@@ -577,7 +581,7 @@ mod tests {
     async fn insert_intent(db: &LocalDb, id: &str, execution_id: &str) {
         db.execute(
             "INSERT INTO remote_intents(id,execution_id,kind,target_uri,payload_json,status,created_at,updated_at)
-             VALUES(?1,?2,'issue_comment','cairn://p/PROJ/1','{\"content\":\"hello\"}','pending',1,1)",
+             VALUES(?1,?2,'issue_comment','cairn://p/proj/1','{\"content\":\"hello\"}','pending',1,1)",
             params![id, execution_id],
         ).await.unwrap();
     }
@@ -622,7 +626,7 @@ mod tests {
     #[tokio::test]
     async fn mismatch_and_malformed_payload_fail_without_mutation() {
         let (_temp, db) = team_db().await;
-        assert!(validate_target(&db, "exec-owned", "PROJ", 1, 2)
+        assert!(validate_target(&db, "exec-owned", "proj", 1, 2)
             .await
             .is_err());
         assert!(decode::<CommentPayload>(r#"{"content":"","unknown":1}"#).is_err());

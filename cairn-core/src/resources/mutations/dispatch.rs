@@ -16,6 +16,7 @@ mod browsers;
 mod bug;
 mod executions;
 mod executors;
+mod feed;
 mod grants;
 mod issues;
 mod labels;
@@ -24,6 +25,7 @@ mod memories;
 mod messages;
 mod nodes;
 mod packs;
+mod posts;
 mod progress;
 mod projects;
 mod prompts;
@@ -52,7 +54,7 @@ use super::{
 };
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::contract::{contract_for, mutation_spec, MutationSpec, ResourceKind};
+use cairn_common::contract::{contract_for, MutationSpec, ResourceKind};
 use cairn_common::uri::CairnResource;
 
 fn append_payload(index: usize, item: &ChangeItem) -> ResourceMutationResult<&serde_json::Value> {
@@ -116,26 +118,138 @@ fn missing_required_keys<'a>(
         .collect()
 }
 
-/// Table-authoritative gate: confirm the (kind, mode) pair is supported and
-/// shallow-check required payload keys. Deep validation happens in the dispatch
-/// arm afterwards.
+/// Build the "unknown payload key" rejection naming the offending keys and
+/// enumerating what the mutation does accept, mirroring the missing-key
+/// rejection so one round trip teaches the correct payload.
+fn render_unknown_keys(spec: &MutationSpec, unknown: &[&str]) -> String {
+    let accepted = match spec.accepted_keys_display() {
+        Some(keys) => format!("Accepted keys: {keys}."),
+        None => "This mutation takes no payload keys.".to_string(),
+    };
+    format!(
+        "Unknown payload key(s) for '{}': {}. {} Example: {}",
+        spec.label,
+        unknown
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        accepted,
+        spec.example
+    )
+}
+
+/// Collect the top-level payload keys the spec neither requires nor accepts.
+/// Aliases count as known, mirroring `missing_required_keys`. A non-object or
+/// absent payload contributes no keys.
+///
+/// Only the top level is checked: the contract enumerates a mutation's payload
+/// shape, while the interior of a nested value (`{snapshot:{...}}`, a todo item,
+/// a settings sub-object) stays the handler's to validate.
+fn unknown_payload_keys<'a>(
+    spec: &MutationSpec,
+    payload: Option<&'a serde_json::Value>,
+) -> Vec<&'a str> {
+    payload
+        .and_then(|p| p.as_object())
+        .map(|map| {
+            map.keys()
+                .map(String::as_str)
+                .filter(|key| !spec.accepts_key(key))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Table-authoritative gate: confirm the (kind, mode) pair is supported, then
+/// shallow-check the payload's top-level keys against the contract in both
+/// directions — required keys must be present, and every key present must be
+/// one the mutation declares. Deep validation happens in the dispatch arm
+/// afterwards.
+///
+/// Rejecting unknown keys is what keeps a caller error from becoming phantom
+/// success: before this, a mistyped or unsupported key was silently dropped and
+/// the write reported as delivered (CAIRN #4136).
 fn gate_resource_change(
     index: usize,
     item: &ChangeItem,
     resource: &CairnResource,
 ) -> ResourceMutationResult<&'static MutationSpec> {
     let kind = resource.kind();
-    let spec = mutation_spec(kind, item.mode)
-        .ok_or_else(|| build_failure(index, item, render_unsupported(kind, item.mode)))?;
-    let missing = missing_required_keys(spec, item.payload.as_ref());
-    if !missing.is_empty() {
+    let candidates = candidate_specs(kind, item.mode);
+    if candidates.is_empty() {
         return Err(build_failure(
             index,
             item,
-            render_missing_keys(spec, &missing),
+            render_unsupported(kind, item.mode),
         ));
     }
-    Ok(spec)
+    let schema_resolved = kind.payload_keys_are_schema_resolved();
+    let payload = item.payload.as_ref();
+
+    // Track the closest near-miss so a rejection quotes the shape the caller was
+    // evidently reaching for rather than whichever one happens to be first.
+    let mut closest: Option<(usize, &'static MutationSpec, Vec<&str>, Vec<&str>)> = None;
+    for spec in &candidates {
+        let missing = missing_required_keys(spec, payload);
+        let unknown = if schema_resolved {
+            Vec::new()
+        } else {
+            unknown_payload_keys(spec, payload)
+        };
+        if missing.is_empty() && unknown.is_empty() {
+            return Ok(spec);
+        }
+        let distance = missing.len() + unknown.len();
+        if closest.as_ref().is_none_or(|(best, ..)| distance < *best) {
+            closest = Some((distance, spec, missing, unknown));
+        }
+    }
+
+    let (_, spec, missing, unknown) = closest.expect("candidates is non-empty");
+    // A missing required key is reported ahead of an unknown one: it is the more
+    // fundamental error, and naming it first keeps the correction ordered.
+    let mut error = if missing.is_empty() {
+        render_unknown_keys(spec, &unknown)
+    } else {
+        render_missing_keys(spec, &missing)
+    };
+    if candidates.len() > 1 {
+        error.push_str(&render_alternatives(&candidates, spec));
+    }
+    Err(build_failure(index, item, error))
+}
+
+/// Every mutation this resource declares for `mode`. More than one means the
+/// mutation accepts alternative payload shapes.
+fn candidate_specs(kind: ResourceKind, mode: ChangeMode) -> Vec<&'static MutationSpec> {
+    contract_for(kind)
+        .map(|contract| {
+            contract
+                .mutations
+                .iter()
+                .filter(|spec| spec.mode == mode)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Name the payload shapes a rejection did not quote, so a caller who aimed at
+/// the other one is not told to fix the wrong thing.
+fn render_alternatives(candidates: &[&'static MutationSpec], quoted: &MutationSpec) -> String {
+    let mut out = String::from(" This mode also accepts a different payload shape:");
+    for spec in candidates {
+        if std::ptr::eq(*spec, quoted) {
+            continue;
+        }
+        out.push_str(&format!(
+            " '{}' ({}).",
+            spec.label,
+            spec.accepted_keys_display()
+                .unwrap_or_else(|| "no payload".to_string())
+        ));
+    }
+    out
 }
 
 /// Single dispatcher for resource-target mutations. `dry_run` selects between
@@ -163,6 +277,14 @@ pub(crate) async fn dispatch_resource_change(
     let mut promoted_memory = None;
 
     let summary = if let Some(summary) =
+        posts::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        feed::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
         threads::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary

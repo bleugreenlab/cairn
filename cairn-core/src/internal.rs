@@ -163,6 +163,10 @@ pub mod team_remote_intents {
     pub use crate::team_remote_intents::*;
 }
 
+pub mod voice {
+    pub use crate::voice::*;
+}
+
 pub mod workspace {
     pub use crate::workspace::*;
 }

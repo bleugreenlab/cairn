@@ -83,6 +83,30 @@ pub(crate) enum Condition {
     },
 }
 
+/// Retire a wait whose continuation has been taken over by a more specific
+/// durable suspension on the same tool call. No result or successor is created:
+/// the new owner is solely responsible for both. The pending-state CAS makes the
+/// transfer idempotent and refuses to steal from a resolver already in flight.
+pub(crate) async fn relinquish_to_inner_wait(db: &LocalDb, r: &Record) -> Result<bool, String> {
+    let id = r.id.clone();
+    let now = chrono::Utc::now().timestamp_millis();
+    let resolution = serde_json::json!({"outcome":"transferred_to_inner_wait"}).to_string();
+    db.write(|c| {
+        let (id, resolution) = (id.clone(), resolution.clone());
+        Box::pin(async move {
+            let changed = c
+                .execute(
+                    "UPDATE agent_waits SET state='resolved',resolution_json=?2,resolved_at=?3 WHERE id=?1 AND state='pending' AND successor_turn_id IS NULL AND result_stored_at IS NULL",
+                    params![id, resolution, now],
+                )
+                .await?;
+            Ok(changed > 0)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 impl Condition {
     /// A short, human-readable name for the call this suspension parked.
     ///
@@ -294,7 +318,21 @@ pub(crate) async fn suspend(
 async fn insert(db: &LocalDb, r: &Record) -> Result<bool, String> {
     let run_id = r.run_id.clone();
     let r = r.clone();
-    db.write(|c|{let r=r.clone();Box::pin(async move{let json=serde_json::to_string(&r.condition).map_err(|e|DbError::internal(e.to_string()))?;c.execute("INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9)",params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),json,r.deadline,r.created]).await?;let yielded=yield_turn_for_host(c,&r.turn_id,TurnYieldReason::Wait).await.map_err(|e|DbError::internal(e.to_string()))?;Ok(yielded)})}).await.map_err(|error|{log::warn!("durable suspension insert failed for run {run_id}: {error}");SUSPENSION_UNAVAILABLE.to_string()})
+    db.write(|c|{let r=r.clone();Box::pin(async move{
+        if matches!(r.condition, Condition::RunBatch { .. }) {
+            let mut rows = c.query(
+                "SELECT 1 FROM permission_requests WHERE run_id=?1 AND tool_use_id=?2 AND status='pending' LIMIT 1",
+                params![r.run_id.as_str(), r.tool_use_id.as_str()],
+            ).await?;
+            if rows.next().await?.is_some() {
+                return Err(DbError::internal("permission request already owns this tool call"));
+            }
+        }
+        let json=serde_json::to_string(&r.condition).map_err(|e|DbError::internal(e.to_string()))?;
+        c.execute("INSERT INTO agent_waits(id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,condition_json,deadline_ms,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9)",params![r.id.as_str(),r.job_id.as_str(),r.run_id.as_str(),r.session_id.as_str(),r.turn_id.as_str(),r.tool_use_id.as_str(),json,r.deadline,r.created]).await?;
+        let yielded=yield_turn_for_host(c,&r.turn_id,TurnYieldReason::Wait).await.map_err(|e|DbError::internal(e.to_string()))?;
+        Ok(yielded)
+    })}).await.map_err(|error|{log::warn!("durable suspension insert failed for run {run_id}: {error}");SUSPENSION_UNAVAILABLE.to_string()})
 }
 
 /// What answering one suspension's call needs: which row, and which tool call in
@@ -1386,7 +1424,7 @@ mod tests {
             .unwrap();
         for sql in [
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at) VALUES ('i','p',1,'T','active',1,1)",
             "INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('job-1','e','i','p','Builder','running',1,1,'builder')",
@@ -1451,6 +1489,92 @@ mod tests {
             commits,
             label: label.map(str::to_string),
         }
+    }
+
+    fn ownership_test_run_batch_record(mut record: Record) -> Record {
+        record.condition = Condition::RunBatch {
+            request_id: "request".to_string(),
+            commits: false,
+            label: None,
+        };
+        record
+    }
+
+    async fn seed_pending_permission(db: &LocalDb, record: &Record) {
+        let record = record.clone();
+        db.write(|conn| {
+            let record = record.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO permission_requests(id,run_id,job_id,tool_use_id,tool_name,tool_input,status,created_at,turn_id) VALUES(?1,?2,?3,?4,'run','{}','pending',?5,?6)",
+                    params![
+                        format!("permission-{}", record.id),
+                        record.run_id,
+                        record.job_id,
+                        record.tool_use_id,
+                        chrono::Utc::now().timestamp() as i32,
+                        record.turn_id,
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn active_wait_count_for_call(db: &LocalDb, record: &Record) -> i64 {
+        let (run_id, tool_use_id) = (record.run_id.clone(), record.tool_use_id.clone());
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT COUNT(*) FROM agent_waits WHERE run_id=?1 AND tool_use_id=?2 AND state IN ('pending','resolving')",
+                        params![run_id, tool_use_id],
+                    )
+                    .await?;
+                Ok(rows.next().await?.unwrap().i64(0)?)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn permission_first_refuses_a_second_outer_run_batch_owner() {
+        let (orch, record, _) = durable_env().await;
+        let record = ownership_test_run_batch_record(record);
+        seed_pending_permission(&orch.db.local, &record).await;
+
+        assert!(insert(&orch.db.local, &record).await.is_err());
+        assert_eq!(active_wait_count_for_call(&orch.db.local, &record).await, 0);
+    }
+
+    #[tokio::test]
+    async fn outer_first_permission_transaction_retires_the_outer_owner() {
+        let (orch, record, _) = durable_env().await;
+        let record = ownership_test_run_batch_record(record);
+        insert(&orch.db.local, &record).await.unwrap();
+
+        let (run_id, tool_use_id) = (record.run_id.clone(), record.tool_use_id.clone());
+        orch.db
+            .local
+            .write(|conn| {
+                let (run_id, tool_use_id) = (run_id.clone(), tool_use_id.clone());
+                Box::pin(async move {
+                    super::super::permission::retire_outer_run_batch_waits(
+                        conn,
+                        &run_id,
+                        &tool_use_id,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(active_wait_count_for_call(&orch.db.local, &record).await, 0);
     }
 
     /// A second call parked by the SAME turn: its own row and its own provider
@@ -2279,7 +2403,7 @@ mod tests {
     async fn terminal_condition_durable_path_resolves_and_resumes() {
         let (orch, mut record, _) = durable_env().await;
         record.condition = Condition::Terminal {
-            uri: "cairn://p/PRJ/1/1/builder/terminal/tests".into(),
+            uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
             slug: "tests".into(),
             on: TerminalWaitEvent::Exit,
             phrase: None,
@@ -2970,7 +3094,7 @@ mod tests {
             ),
             parked(
                 Condition::Terminal {
-                    uri: "cairn://p/PRJ/1/1/builder/terminal/dev".into(),
+                    uri: "cairn://p/prj/1/1/builder/terminal/dev".into(),
                     slug: "dev".into(),
                     on: TerminalWaitEvent::Output,
                     phrase: Some("ready".into()),

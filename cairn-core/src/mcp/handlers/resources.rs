@@ -924,27 +924,27 @@ mod tests {
         // The CAIRN-1489 repro set: bare, the universal grammar, and the
         // terminal-specific params — all must parse instead of being rejected.
         for uri in [
-            "cairn://p/CAIRN/terminal/ci",
-            "cairn://p/CAIRN/terminal/ci?limit=50",
-            "cairn://p/CAIRN/terminal/ci?grep=foo",
-            "cairn://p/CAIRN/terminal/ci?offset=-20",
-            "cairn://p/CAIRN/terminal/ci?head_limit=10&grep=foo",
-            "cairn://p/CAIRN/terminal/ci?new=true",
-            "cairn://p/CAIRN/terminal/ci?full=true",
-            "cairn://p/CAIRN/terminal/ci?annotations=none",
-            "cairn://p/CAIRN/42/2/builder/terminal/dev?limit=5",
-            "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci?limit=5",
-            "cairn://p/CAIRN/42/2/builder/task/Explore/terminal/ci?new=true",
+            "cairn://p/cairn/terminal/ci",
+            "cairn://p/cairn/terminal/ci?limit=50",
+            "cairn://p/cairn/terminal/ci?grep=foo",
+            "cairn://p/cairn/terminal/ci?offset=-20",
+            "cairn://p/cairn/terminal/ci?head_limit=10&grep=foo",
+            "cairn://p/cairn/terminal/ci?new=true",
+            "cairn://p/cairn/terminal/ci?full=true",
+            "cairn://p/cairn/terminal/ci?annotations=none",
+            "cairn://p/cairn/42/2/builder/terminal/dev?limit=5",
+            "cairn://p/cairn/42/2/builder/task/Explore/terminal/ci?limit=5",
+            "cairn://p/cairn/42/2/builder/task/Explore/terminal/ci?new=true",
         ] {
             assert!(parse_terminal_uri(uri).is_ok(), "expected Ok for {uri}");
         }
         assert!(
-            parse_terminal_uri("cairn://p/CAIRN/terminal/ci?new=true")
+            parse_terminal_uri("cairn://p/cairn/terminal/ci?new=true")
                 .unwrap()
                 .new
         );
         assert!(
-            !parse_terminal_uri("cairn://p/CAIRN/terminal/ci")
+            !parse_terminal_uri("cairn://p/cairn/terminal/ci")
                 .unwrap()
                 .new
         );
@@ -959,53 +959,53 @@ mod tests {
     /// then be told its own URI was not a terminal shape.
     #[test]
     fn a_threads_terminal_parses_at_both_levels() {
-        let session = parse_terminal_uri("cairn://p/THR/design-review/terminal/dev").unwrap();
+        let session = parse_terminal_uri("cairn://p/thr/design-review/terminal/dev").unwrap();
         assert_eq!(session.slug, "dev");
         assert_eq!(session.node_id.as_deref(), Some("design-review"));
         assert_eq!(session.task_name, None);
         assert_eq!((session.issue_number, session.exec_seq), (Some(0), Some(0)));
         assert_eq!(
-            session.anchor_uri, "cairn://p/THR/design-review/terminal/dev",
+            session.anchor_uri, "cairn://p/thr/design-review/terminal/dev",
             "the anchor renders the thread address, never a 0/0 placeholder"
         );
 
         let task =
-            parse_terminal_uri("cairn://p/THR/design-review/task/probe/terminal/build").unwrap();
+            parse_terminal_uri("cairn://p/thr/design-review/task/probe/terminal/build").unwrap();
         assert_eq!(task.slug, "build");
         assert_eq!(task.node_id.as_deref(), Some("design-review"));
         assert_eq!(task.task_name.as_deref(), Some("probe"));
         assert_eq!(
             task.anchor_uri,
-            "cairn://p/THR/design-review/task/probe/terminal/build"
+            "cairn://p/thr/design-review/task/probe/terminal/build"
         );
     }
 
     #[test]
     fn parse_rejects_unknown_param_naming_it() {
-        let err = parse_terminal_uri("cairn://p/CAIRN/terminal/ci?bogus=1").unwrap_err();
+        let err = parse_terminal_uri("cairn://p/cairn/terminal/ci?bogus=1").unwrap_err();
         assert!(err.contains("bogus"), "{err}");
         assert!(err.contains("Supported"), "{err}");
     }
 
     #[test]
     fn parse_non_terminal_uri_explains_shape() {
-        let err = parse_terminal_uri("cairn://p/CAIRN/1").unwrap_err();
+        let err = parse_terminal_uri("cairn://p/cairn/1").unwrap_err();
         assert!(err.contains("Expected"), "{err}");
     }
 
     #[test]
     fn parse_accepts_task_terminal_shape() {
-        let parsed = parse_terminal_uri("cairn://p/CAIRN/1/1/builder/task/Explore/terminal/ci")
+        let parsed = parse_terminal_uri("cairn://p/cairn/1/1/builder/task/Explore/terminal/ci")
             .expect("task terminal URI should parse");
-        assert_eq!(parsed.project_key, "CAIRN");
+        assert_eq!(parsed.project_key, "cairn");
         assert_eq!(parsed.node_id.as_deref(), Some("builder"));
         assert_eq!(parsed.task_name.as_deref(), Some("Explore"));
         assert_eq!(parsed.slug, "ci");
         assert!(
-            task_terminal_hint("cairn://p/CAIRN/1/1/builder/task/Explore/terminal/ci").is_none()
+            task_terminal_hint("cairn://p/cairn/1/1/builder/task/Explore/terminal/ci").is_none()
         );
         let err =
-            parse_terminal_uri("cairn://p/CAIRN/1/1/builder/task/Explore/terminal").unwrap_err();
+            parse_terminal_uri("cairn://p/cairn/1/1/builder/task/Explore/terminal").unwrap_err();
         assert!(err.contains("missing a slug"), "{err}");
     }
 
@@ -1186,7 +1186,7 @@ mod tests {
         exec(
             orch,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-nt', 'ws-nt', 'NT', 'NT', '/tmp/repo', 1, 1)",
+             VALUES ('proj-nt', 'ws-nt', 'NT', 'nt', '/tmp/repo', 1, 1)",
         )
         .await;
         exec(
@@ -1240,7 +1240,7 @@ mod tests {
         exec(
             orch,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-t', 'default', 'TM', 'TM', '/tmp/repo', 1, 1)",
+             VALUES ('proj-t', 'default', 'TM', 'tm', '/tmp/repo', 1, 1)",
         )
         .await;
         exec(
@@ -1258,7 +1258,7 @@ mod tests {
         exec(
             orch,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-th', 'default', 'TH', 'TH', '/tmp/repo', 1, 1)",
+             VALUES ('proj-th', 'default', 'th', 'th', '/tmp/repo', 1, 1)",
         )
         .await;
         exec(
@@ -1313,7 +1313,7 @@ mod tests {
         let orch = seeded_orch().await;
         seed_thread_terminals(&orch).await;
 
-        let session = read_terminal(&orch, "cairn://p/TH/thread-ux/terminal/smoke2").await;
+        let session = read_terminal(&orch, "cairn://p/th/thread-ux/terminal/smoke2").await;
         assert_eq!(session.status, "exited", "{}", session.output);
         assert!(
             session.output.contains("thread-output"),
@@ -1321,7 +1321,7 @@ mod tests {
             session.output
         );
 
-        let task = read_terminal(&orch, "cairn://p/TH/thread-ux/task/probe/terminal/build").await;
+        let task = read_terminal(&orch, "cairn://p/th/thread-ux/task/probe/terminal/build").await;
         assert_eq!(task.status, "exited", "{}", task.output);
         assert!(task.output.contains("task-output"), "{}", task.output);
         assert!(!task.output.contains("thread-output"), "{}", task.output);
@@ -1336,7 +1336,7 @@ mod tests {
         let orch = seeded_orch().await;
         seed_thread_terminals(&orch).await;
 
-        let missing = read_terminal(&orch, "cairn://p/TH/thread-ux/terminal/nope").await;
+        let missing = read_terminal(&orch, "cairn://p/th/thread-ux/terminal/nope").await;
         assert_eq!(missing.status, "error");
         assert!(
             missing
@@ -1346,7 +1346,7 @@ mod tests {
             missing.output
         );
 
-        let dormant = read_terminal(&orch, "cairn://p/TH/dormant/terminal/smoke2").await;
+        let dormant = read_terminal(&orch, "cairn://p/th/dormant/terminal/smoke2").await;
         assert_eq!(dormant.status, "error");
         assert!(
             dormant.output.contains("has no session yet"),
@@ -1361,12 +1361,12 @@ mod tests {
         seed_node_and_task_terminals(&orch).await;
 
         let parent = read_terminal(&orch, "cairn://p/NT/42/2/builder/terminal/ci").await;
-        assert_eq!(parent.status, "exited");
+        assert_eq!(parent.status, "exited", "{}", parent.output);
         assert!(parent.output.contains("parent-output"), "{}", parent.output);
         assert!(!parent.output.contains("task-output"), "{}", parent.output);
 
         let task = read_terminal(&orch, "cairn://p/NT/42/2/builder/task/Explore/terminal/ci").await;
-        assert_eq!(task.status, "exited");
+        assert_eq!(task.status, "exited", "{}", task.output);
         assert!(task.output.contains("task-output"), "{}", task.output);
         assert!(!task.output.contains("parent-output"), "{}", task.output);
 
@@ -1425,8 +1425,8 @@ mod tests {
         let second = read_terminal(&orch, "cairn://p/TM/terminal/ci").await;
         // No live session, so both report the same buffer state and never flip to
         // "(no new output)" the way a consuming read would.
-        assert_eq!(first.status, "running");
-        assert_eq!(second.status, "running");
+        assert_eq!(first.status, "running", "{}", first.output);
+        assert_eq!(second.status, "running", "{}", second.output);
         assert_eq!(first.total_bytes, second.total_bytes);
         assert!(first.output.contains("(no output yet)"));
         assert!(second.output.contains("(no output yet)"));

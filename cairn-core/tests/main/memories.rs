@@ -54,7 +54,7 @@ async fn create_node_memory(
         project_id,
         Some(job_id),
         Some(node_seq),
-        Some("cairn://p/CAIRN/1/1/builder/chat/turn/3"),
+        Some("cairn://p/cairn/1/1/builder/chat/turn/3"),
     )
     .await
     .unwrap()
@@ -87,7 +87,7 @@ async fn create_and_load_node_memory() {
     assert_eq!(memory.node_seq, Some(1));
     assert_eq!(
         memory.provenance_uri.as_deref(),
-        Some("cairn://p/CAIRN/1/1/builder/chat/turn/3")
+        Some("cairn://p/cairn/1/1/builder/chat/turn/3")
     );
 
     let loaded = db::load_memory(&local_db, "memory-1").await.unwrap();
@@ -159,14 +159,14 @@ async fn command_create_allows_missing_name() {
 #[tokio::test]
 async fn append_creates_draft_memory_with_only_content_and_reads_by_uri() {
     let (temp, local_db) = common::migrated_db().await;
-    seed_node(&local_db, "APP", 1, 1, "builder").await;
+    seed_node(&local_db, "app", 1, 1, "builder").await;
     let db = Arc::new(local_db);
     let orch = common::orchestrator(&temp, db.clone());
 
     let report = common::change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/APP/1/1/builder/memories",
+            "target": "cairn://p/app/1/1/builder/memories",
             "mode": "append",
             "payload": { "content": "Append-only content" }
         }]),
@@ -180,7 +180,7 @@ async fn append_creates_draft_memory_with_only_content_and_reads_by_uri() {
     );
     assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
 
-    let memory_id = db::resolve_node_memory_id(&db, "APP", 1, 1, "builder", 1)
+    let memory_id = db::resolve_node_memory_id(&db, "app", 1, 1, "builder", 1)
         .await
         .unwrap()
         .expect("memory URI should resolve");
@@ -190,9 +190,9 @@ async fn append_creates_draft_memory_with_only_content_and_reads_by_uri() {
     assert_eq!(memory.status, MemoryStatus::Draft);
     assert_eq!(memory.scope, MemoryScope::Project);
 
-    let uri = "cairn://p/APP/1/1/builder/memories/1";
+    let uri = "cairn://p/app/1/1/builder/memories/1";
     let rendered = common::read_resource(&orch, uri).await;
-    assert!(rendered.contains("# Memory `cairn://p/APP/1/1/builder/memories/1`"));
+    assert!(rendered.contains("# Memory `cairn://p/app/1/1/builder/memories/1`"));
     assert!(rendered.contains("Append-only content"));
 }
 
@@ -208,7 +208,7 @@ async fn append_role_memory_scopes_by_agent_role_not_node_name() {
         "Builder role prompt.",
     )
     .unwrap();
-    let project_id = common::insert_project_with_repo(&local_db, "ROLE", &repo).await;
+    let project_id = common::insert_project_with_repo(&local_db, "role", &repo).await;
 
     // The recipe node segment is `agent-1`, but it runs the `builder` role.
     local_db
@@ -229,7 +229,7 @@ async fn append_role_memory_scopes_by_agent_role_not_node_name() {
     let report = common::change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/ROLE/1/1/agent-1/memories",
+            "target": "cairn://p/role/1/1/agent-1/memories",
             "mode": "append",
             "payload": { "content": "Role-scoped insight", "scope": "role" }
         }]),
@@ -242,7 +242,7 @@ async fn append_role_memory_scopes_by_agent_role_not_node_name() {
         "{report:?}"
     );
 
-    let memory_id = db::resolve_node_memory_id(&db, "ROLE", 1, 1, "agent-1", 1)
+    let memory_id = db::resolve_node_memory_id(&db, "role", 1, 1, "agent-1", 1)
         .await
         .unwrap()
         .expect("memory URI should resolve");
@@ -257,11 +257,11 @@ async fn append_role_memory_scopes_by_agent_role_not_node_name() {
 #[tokio::test]
 async fn node_memories_affordance_advertises_append_with_optional_name() {
     let (temp, local_db) = common::migrated_db().await;
-    seed_node(&local_db, "AFF", 1, 1, "builder").await;
+    seed_node(&local_db, "aff", 1, 1, "builder").await;
     let db = Arc::new(local_db);
     let orch = common::orchestrator(&temp, db);
 
-    let rendered = common::read_resource(&orch, "cairn://p/AFF/1/1/builder/memories").await;
+    let rendered = common::read_resource(&orch, "cairn://p/aff/1/1/builder/memories").await;
     assert!(
         rendered.contains("mode:\"append\"") || rendered.contains("mode=append"),
         "{rendered}"
@@ -274,7 +274,7 @@ async fn node_memories_affordance_advertises_append_with_optional_name() {
 #[tokio::test]
 async fn node_memory_sequence_confirms_and_resolves_uri() {
     let (_temp, local_db) = common::migrated_db().await;
-    let (project_id, job_id) = seed_node(&local_db, "SEQ", 7, 3, "builder").await;
+    let (project_id, job_id) = seed_node(&local_db, "seq", 7, 3, "builder").await;
 
     let first = create_node_memory(
         &local_db,
@@ -305,8 +305,8 @@ async fn node_memory_sequence_confirms_and_resolves_uri() {
     let uri = db::build_node_memory_uri_for_memory(&local_db, &first)
         .await
         .unwrap();
-    assert_eq!(uri, "cairn://p/SEQ/7/3/builder/memories/1");
-    let resolved = db::resolve_node_memory_id(&local_db, "SEQ", 7, 3, "builder", 1)
+    assert_eq!(uri, "cairn://p/seq/7/3/builder/memories/1");
+    let resolved = db::resolve_node_memory_id(&local_db, "seq", 7, 3, "builder", 1)
         .await
         .unwrap();
     assert_eq!(resolved.as_deref(), Some("first"));
@@ -322,7 +322,7 @@ async fn node_memory_sequence_confirms_and_resolves_uri() {
     // confirm path it asserts.
     local_db
         .execute(
-            "UPDATE issues SET merged_at = 1 WHERE id = 'issue-SEQ-7'",
+            "UPDATE issues SET merged_at = 1 WHERE id = 'issue-seq-7'",
             (),
         )
         .await
@@ -405,7 +405,7 @@ async fn load_all_memories_scopes_by_project() {
 #[tokio::test]
 async fn similar_memory_neighbors_use_node_uris() {
     let (_temp, local_db) = common::migrated_db().await;
-    let (project_id, job_id) = seed_node(&local_db, "SIM", 1, 1, "builder").await;
+    let (project_id, job_id) = seed_node(&local_db, "sim", 1, 1, "builder").await;
     let query = create_node_memory(
         &local_db,
         "query",
@@ -451,5 +451,5 @@ async fn similar_memory_neighbors_use_node_uris() {
         .unwrap();
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].memory.id, "neighbor");
-    assert_eq!(neighbors[0].uri, "cairn://p/SIM/1/1/builder/memories/2");
+    assert_eq!(neighbors[0].uri, "cairn://p/sim/1/1/builder/memories/2");
 }

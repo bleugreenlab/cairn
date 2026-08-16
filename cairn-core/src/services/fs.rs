@@ -2,7 +2,247 @@
 //!
 //! Abstracts filesystem access to enable testing without real files.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
+
+pub const GUARDED_TREE_MAX_FILES: usize = 500;
+pub const GUARDED_TREE_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+pub const GUARDED_TREE_MAX_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct GuardedTreeFile {
+    pub relative_path: PathBuf,
+    pub resolved_path: PathBuf,
+    pub size: u64,
+}
+
+#[cfg(target_os = "macos")]
+fn rename_exclusive(from: &Path, to: &Path) -> Result<(), String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const RENAME_EXCL: u32 = 0x0000_0004;
+
+    #[link(name = "System")]
+    unsafe extern "C" {
+        fn renamex_np(
+            from: *const std::os::raw::c_char,
+            to: *const std::os::raw::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|_| format!("Source path contains an interior NUL byte: {from:?}"))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|_| format!("Destination path contains an interior NUL byte: {to:?}"))?;
+
+    if unsafe { renamex_np(from.as_ptr(), to.as_ptr(), RENAME_EXCL) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+fn remove_staged_clone(path: &Path, operation_error: String) -> String {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => operation_error,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => operation_error,
+        Err(error) => format!(
+            "{operation_error}; additionally failed to clean staged clone {path:?}: {error}"
+        ),
+    }
+}
+
+pub fn guarded_resolve_file(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve guarded tree root {root:?}: {e}"))?;
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| format!("Guarded file {path:?} is outside root {root:?}"))?;
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => validate_tree_component(name)?,
+            _ => return Err(format!("Unsafe guarded file path: {path:?}")),
+        }
+    }
+    let resolved = path
+        .canonicalize()
+        .map_err(|e| format!("Dangling or unreadable guarded file {path:?}: {e}"))?;
+    if !resolved.starts_with(&canonical_root) {
+        return Err(format!("Guarded tree path escapes its root: {path:?}"));
+    }
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|e| format!("Failed to inspect guarded file {path:?}: {e}"))?;
+    if !metadata.is_file() {
+        return Err(format!("Guarded path is not a regular file: {path:?}"));
+    }
+    if metadata.len() > GUARDED_TREE_MAX_FILE_BYTES {
+        return Err(format!(
+            "Guarded tree file {path:?} exceeds the per-file size limit"
+        ));
+    }
+    Ok(resolved)
+}
+
+pub fn guarded_copy_file(root: &Path, source: &Path, destination: &Path) -> Result<(), String> {
+    let resolved = guarded_resolve_file(root, source)?;
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create guarded destination {parent:?}: {e}"))?;
+    }
+    std::fs::copy(&resolved, destination)
+        .map_err(|e| format!("Failed to copy guarded file {resolved:?}: {e}"))?;
+    Ok(())
+}
+
+/// Enumerate regular files beneath 'root'. Links are allowed only when their
+/// resolved targets remain within the canonical root.
+pub fn guarded_tree_files(root: &Path) -> Result<Vec<GuardedTreeFile>, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve guarded tree root {root:?}: {e}"))?;
+    if !canonical_root.is_dir() {
+        return Err(format!("Guarded tree root is not a directory: {root:?}"));
+    }
+    let mut files = Vec::new();
+    let mut visited = HashSet::new();
+    let mut total = 0u64;
+    walk_guarded_dir(
+        &canonical_root,
+        &canonical_root,
+        Path::new(""),
+        &mut visited,
+        &mut files,
+        &mut total,
+    )?;
+    files.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(files)
+}
+
+fn walk_guarded_dir(
+    canonical_root: &Path,
+    dir: &Path,
+    relative_dir: &Path,
+    visited: &mut HashSet<PathBuf>,
+    files: &mut Vec<GuardedTreeFile>,
+    total: &mut u64,
+) -> Result<(), String> {
+    let resolved_dir = dir
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve guarded directory {dir:?}: {e}"))?;
+    if !resolved_dir.starts_with(canonical_root) {
+        return Err(format!("Guarded tree path escapes its root: {dir:?}"));
+    }
+    if !visited.insert(resolved_dir.clone()) {
+        return Err(format!(
+            "Guarded tree contains a directory link cycle at {dir:?}"
+        ));
+    }
+    let mut children = std::fs::read_dir(&resolved_dir)
+        .map_err(|e| format!("Failed to read guarded directory {dir:?}: {e}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Failed to read guarded directory entry: {e}"))?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        let name = child.file_name();
+        validate_tree_component(&name)?;
+        let relative_path = relative_dir.join(&name);
+        let path = child.path();
+        let link_metadata = std::fs::symlink_metadata(&path)
+            .map_err(|e| format!("Failed to inspect guarded path {path:?}: {e}"))?;
+        let resolved = path
+            .canonicalize()
+            .map_err(|e| format!("Dangling or unreadable guarded path {path:?}: {e}"))?;
+        if !resolved.starts_with(canonical_root) {
+            return Err(format!("Guarded tree path escapes its root: {path:?}"));
+        }
+        let metadata = std::fs::metadata(&path)
+            .map_err(|e| format!("Failed to inspect guarded target {path:?}: {e}"))?;
+        if metadata.is_dir() {
+            walk_guarded_dir(
+                canonical_root,
+                &resolved,
+                &relative_path,
+                visited,
+                files,
+                total,
+            )?;
+        } else if metadata.is_file() {
+            let size = metadata.len();
+            if size > GUARDED_TREE_MAX_FILE_BYTES {
+                return Err(format!(
+                    "Guarded tree file {path:?} exceeds the per-file size limit"
+                ));
+            }
+            *total = total
+                .checked_add(size)
+                .ok_or_else(|| "Guarded tree total size overflowed".to_string())?;
+            if *total > GUARDED_TREE_MAX_TOTAL_BYTES {
+                return Err("Guarded tree exceeds the total size limit".into());
+            }
+            files.push(GuardedTreeFile {
+                relative_path,
+                resolved_path: resolved,
+                size,
+            });
+            if files.len() > GUARDED_TREE_MAX_FILES {
+                return Err("Guarded tree exceeds the file count limit".into());
+            }
+        } else {
+            let kind = if link_metadata.file_type().is_symlink() {
+                "symbolic-link target"
+            } else {
+                "special file"
+            };
+            return Err(format!(
+                "Guarded tree contains unsupported {kind}: {path:?}"
+            ));
+        }
+    }
+    visited.remove(&resolved_dir);
+    Ok(())
+}
+
+fn validate_tree_component(name: &std::ffi::OsStr) -> Result<(), String> {
+    let text = name
+        .to_str()
+        .ok_or_else(|| format!("Guarded tree path is not valid UTF-8: {name:?}"))?;
+    if text.is_empty()
+        || text.contains('\0')
+        || text.contains('\\')
+        || matches!(text, "." | "..")
+        || (text.len() >= 2
+            && text.as_bytes()[0].is_ascii_alphabetic()
+            && text.as_bytes()[1] == b':')
+    {
+        return Err(format!("Unsafe guarded tree path component: {text:?}"));
+    }
+    if Path::new(text)
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(format!("Unsafe guarded tree path component: {text:?}"));
+    }
+    Ok(())
+}
+
+pub fn guarded_copy_tree(root: &Path, destination: &Path) -> Result<(), String> {
+    let files = guarded_tree_files(root)?;
+    std::fs::create_dir_all(destination)
+        .map_err(|e| format!("Failed to create guarded destination {destination:?}: {e}"))?;
+    for file in files {
+        let target = destination.join(&file.relative_path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create guarded destination {parent:?}: {e}"))?;
+        }
+        std::fs::copy(&file.resolved_path, &target)
+            .map_err(|e| format!("Failed to copy guarded file {:?}: {e}", file.resolved_path))?;
+    }
+    Ok(())
+}
 
 #[cfg(any(test, feature = "test-utils"))]
 use mockall::automock;
@@ -167,14 +407,39 @@ impl FileSystem for RealFileSystem {
                 to
             ));
         }
-        if let Some(parent) = to.parent() {
+        if let Some(parent) = to.parent().filter(|parent| !parent.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create parent directory: {}", e))?;
         }
 
         #[cfg(target_os = "macos")]
         {
-            clonefile_dir(from, to)
+            let parent = to
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let destination_name = to
+                .file_name()
+                .ok_or_else(|| format!("COW clone destination has no file name: {to:?}"))?
+                .to_string_lossy();
+            let staging = parent.join(format!(
+                ".{destination_name}.cairn-clone-{}",
+                uuid::Uuid::new_v4()
+            ));
+
+            if let Err(error) = clonefile_dir(from, &staging) {
+                return Err(remove_staged_clone(
+                    &staging,
+                    format!("Failed to COW-clone directory {from:?}: {error}"),
+                ));
+            }
+            if let Err(error) = rename_exclusive(&staging, to) {
+                return Err(remove_staged_clone(
+                    &staging,
+                    format!("Failed to atomically publish COW clone at {to:?}: {error}"),
+                ));
+            }
+            Ok(())
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -253,6 +518,55 @@ mod tests {
 
     fn real_fs_fixture() -> (TempDir, RealFileSystem) {
         (TempDir::new().unwrap(), RealFileSystem)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_tree_allows_contained_file_links_and_copies_bytes() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("tree");
+        let destination = temp.path().join("copy");
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(root.join("content/value.txt"), "safe").unwrap();
+        std::os::unix::fs::symlink("content/value.txt", root.join("linked.txt")).unwrap();
+
+        let files = guarded_tree_files(&root).unwrap();
+        assert_eq!(files.len(), 2);
+        guarded_copy_tree(&root, &destination).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("linked.txt")).unwrap(),
+            "safe"
+        );
+        assert!(!destination.join("linked.txt").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_tree_rejects_escape_and_dangling_links() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(temp.path().join("secret"), "outside").unwrap();
+        std::os::unix::fs::symlink("../secret", root.join("escape")).unwrap();
+        assert!(guarded_tree_files(&root)
+            .unwrap_err()
+            .contains("escapes its root"));
+
+        std::fs::remove_file(root.join("escape")).unwrap();
+        std::os::unix::fs::symlink("missing", root.join("dangling")).unwrap();
+        assert!(guarded_tree_files(&root).unwrap_err().contains("Dangling"));
+    }
+
+    #[test]
+    fn guarded_tree_enforces_per_file_size_limit() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("tree");
+        std::fs::create_dir_all(&root).unwrap();
+        let file = std::fs::File::create(root.join("large")).unwrap();
+        file.set_len(GUARDED_TREE_MAX_FILE_BYTES + 1).unwrap();
+        assert!(guarded_tree_files(&root)
+            .unwrap_err()
+            .contains("per-file size limit"));
     }
 
     #[test]
@@ -388,6 +702,69 @@ mod tests {
         fs.reflink_file(&src, &dst).unwrap();
 
         assert_eq!(fs.read_to_string(&dst).unwrap(), "new content");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_fs_clone_dir_cow_publishes_complete_independent_tree() {
+        let (temp, fs) = real_fs_fixture();
+        let source = temp.path().join("catalog");
+        let destination = temp.path().join("slot-target");
+        fs.create_dir_all(&source.join("debug/deps")).unwrap();
+        fs.write_str(&source.join("debug/deps/library.rlib"), "artifact")
+            .unwrap();
+
+        fs.try_clone_dir_cow(&source, &destination).unwrap();
+        assert_eq!(
+            fs.read_to_string(&destination.join("debug/deps/library.rlib"))
+                .unwrap(),
+            "artifact"
+        );
+
+        fs.remove_dir_all(&source).unwrap();
+        assert_eq!(
+            fs.read_to_string(&destination.join("debug/deps/library.rlib"))
+                .unwrap(),
+            "artifact"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_fs_clone_dir_cow_refuses_existing_destination_without_modifying_it() {
+        let (temp, fs) = real_fs_fixture();
+        let source = temp.path().join("catalog");
+        let destination = temp.path().join("slot-target");
+        fs.create_dir_all(&source).unwrap();
+        fs.write_str(&source.join("new"), "new").unwrap();
+        fs.create_dir_all(&destination).unwrap();
+        fs.write_str(&destination.join("existing"), "existing")
+            .unwrap();
+
+        let error = fs.try_clone_dir_cow(&source, &destination).unwrap_err();
+
+        assert!(error.contains("Destination already exists"));
+        assert_eq!(
+            fs.read_to_string(&destination.join("existing")).unwrap(),
+            "existing"
+        );
+        assert!(!destination.join("new").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn real_fs_clone_dir_cow_cleans_staging_after_clone_failure() {
+        let (temp, fs) = real_fs_fixture();
+        let source = temp.path().join("missing-catalog");
+        let destination = temp.path().join("slot-target");
+
+        assert!(fs.try_clone_dir_cow(&source, &destination).is_err());
+        assert!(!destination.exists());
+        let names = std::fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert!(names.is_empty(), "staging residue remained: {names:?}");
     }
 
     #[test]

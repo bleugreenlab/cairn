@@ -16,6 +16,7 @@ use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::models::UpdateSettings;
 use crate::orchestrator::Orchestrator;
 use cairn_common::authorization::AuthorityRequest;
+use cairn_common::contract::{mutation_spec, ResourceKind};
 use cairn_common::uri::{parse_uri, CairnResource};
 
 /// Scalar/app-pref + backend keys that route to `orch.update_settings`.
@@ -37,7 +38,7 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "threadCompactThreshold",
     "externalReplies",
     "subscriptionFees",
-    "activeBackend",
+    "tierDefaults",
     "tiers",
     "backends",
     "openrouterRouting",
@@ -91,10 +92,16 @@ pub(crate) fn workspace_settings_authority(
         .collect()
 }
 
-/// Reject out-of-scope and unknown top-level settings keys before any section
-/// applies. GitHub is read-only; removed/deprecated fields are not writable;
-/// everything else must be a known pref or section key.
+/// Reject out-of-scope settings keys before the authority gate raises a card for
+/// a write that cannot land anyway.
+///
+/// The accepted set is the contract's, not a second list: the write gate rejects
+/// undeclared keys for every resource, and this consults the same `MutationSpec`
+/// so the two cannot disagree. What it adds is a reason for the keys that are
+/// *recognizable but deliberately unwritable*, where "not in the accepted list"
+/// would be a weaker answer than saying why.
 fn validate_settings_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<(), String> {
+    let spec = mutation_spec(ResourceKind::Settings, ChangeMode::Patch);
     for key in keys {
         match key {
             "github" => {
@@ -106,7 +113,7 @@ fn validate_settings_keys<'a>(keys: impl Iterator<Item = &'a str>) -> Result<(),
             "systemPrompt" | "autoStartJobs" => {
                 return Err(format!("'{key}' is deprecated and not writable"))
             }
-            other if PREF_KEYS.contains(&other) || SECTION_KEYS.contains(&other) => {}
+            other if spec.is_some_and(|spec| spec.accepts_key(other)) => {}
             other => {
                 return Err(format!(
                     "unknown settings key '{other}'. Accepted: {}, {}",
@@ -206,7 +213,7 @@ fn string_array(value: &Value, key: &str) -> Result<Vec<String>, String> {
 fn parse_provider(value: &str) -> Result<ApiProvider, String> {
     serde_json::from_value(Value::String(value.to_string())).map_err(|_| {
         format!(
-            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|ollama|github"
+            "unknown provider '{value}'; expected anthropic|openai|google|openrouter|opencode|ollama|github"
         )
     })
 }
@@ -222,10 +229,9 @@ fn parse_auth(auth_type: &str, auth_value: Option<String>) -> Result<ProviderAut
         "base_url" => ProviderAuth::base_url(
             &auth_value.ok_or("authValue is required for authType=base_url")?,
         ),
-        "local_cli" => Ok(ProviderAuth::LocalCli),
         "claude_profile" => Ok(ProviderAuth::ClaudeProfile),
         other => Err(format!(
-            "unknown authType '{other}'; expected api_key|oauth_token|base_url|local_cli|claude_profile (OAuth browser add stays UI-only)"
+            "unknown authType '{other}'; expected api_key|oauth_token|base_url|claude_profile (OAuth browser add stays UI-only)"
         )),
     }
 }
@@ -239,10 +245,6 @@ pub(super) async fn apply_settings_patch(
     let obj = payload
         .as_object()
         .ok_or("payload must be an object of settings sections")?;
-
-    // Validate keys up front so a typo or an out-of-scope write fails before any
-    // section applies.
-    validate_settings_keys(obj.keys().map(String::as_str))?;
 
     // The final authorization check, immediately before anything persists. The
     // write handler's gate decided whether to prompt; this decides whether THIS
@@ -435,10 +437,36 @@ mod tests {
         validate_settings_keys(keys.iter().copied())
     }
 
+    /// The routing lists and the contract must name the same keys. The contract
+    /// decides what the write gate lets through; these lists decide where an
+    /// accepted key is then stored. A key in one but not the other is either a
+    /// key that gates in and routes nowhere, or a key that routes but can never
+    /// arrive — both are the silent-drop class this surface exists to prevent.
+    #[test]
+    fn routing_lists_and_contract_declare_the_same_keys() {
+        let spec = mutation_spec(ResourceKind::Settings, ChangeMode::Patch)
+            .expect("cairn://settings supports patch");
+        let declared: std::collections::BTreeSet<&str> = spec
+            .required
+            .iter()
+            .chain(spec.optional.iter())
+            .map(|key| key.key)
+            .collect();
+        let routed: std::collections::BTreeSet<&str> = PREF_KEYS
+            .iter()
+            .chain(SECTION_KEYS.iter())
+            .copied()
+            .collect();
+        assert_eq!(
+            declared, routed,
+            "cairn://settings patch contract and its routing lists disagree"
+        );
+    }
+
     #[test]
     fn accepts_known_pref_and_section_keys() {
         assert!(validate(&["mergeType", "gitIdentities", "keybinds", "buildServices"]).is_ok());
-        assert!(validate(&["activeBackend", "tiers", "backends", "accounts"]).is_ok());
+        assert!(validate(&["tierDefaults", "tiers", "backends", "accounts"]).is_ok());
     }
 
     #[test]

@@ -54,7 +54,9 @@ axum-extra = { version = "0.10", features = ["typed-header"] }
 futures-util = "0.3"
 async-trait = "0.1"
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 cairn-common = { path = "../cairn-common" }
+cairn-tokenize = { path = "../cairn-tokenize" }
 cairn-sandbox = { path = "../cairn-sandbox" }
 ignore = "0.4"
 globset = "0.4"

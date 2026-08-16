@@ -81,7 +81,7 @@ async fn create_test_event(
 async fn upsert_and_get_resource_embedding() {
     let (_temp, db) = common::migrated_db().await;
     let bytes = vector::to_bytes(&[1.0_f32, 2.0, 3.0]);
-    let uri = "cairn://p/PROJ/1";
+    let uri = "cairn://p/proj/1";
     queries::upsert_resource_embedding_async(&db, uri, &bytes, "cohere-embed-v4", 3)
         .await
         .unwrap();
@@ -155,7 +155,7 @@ async fn delete_resource_embedding_removes_row() {
 #[tokio::test]
 async fn blank_resource_text_deletes_existing_row() {
     let (_temp, db) = common::migrated_db().await;
-    let uri = "cairn://p/PROJ/7";
+    let uri = "cairn://p/proj/7";
     queries::upsert_resource_embedding_async(&db, uri, &vector::to_bytes(&[1.0, 2.0]), "m", 2)
         .await
         .unwrap();

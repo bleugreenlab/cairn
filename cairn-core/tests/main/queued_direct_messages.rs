@@ -52,13 +52,13 @@ async fn dispatch_tool_augments_result_with_queued_direct_messages() {
     // the recipient's next tool boundary drains it as a reminder, exactly once
     // (CAIRN-1900 replaced the raw-message pull with the push queue).
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
+    insert_dm_recipient(&orch.db.local, "proj", "running").await;
 
     let send = callback_request("write", None);
     append_direct_message(
         &orch,
         &send,
-        "PROJ",
+        "proj",
         42,
         1,
         "builder",
@@ -215,7 +215,7 @@ async fn latest_direct_to(db: &LocalDb, recipient_run_id: &str) -> Option<String
 #[tokio::test(flavor = "current_thread")]
 async fn append_direct_message_queues_when_head_turn_is_running() {
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
+    insert_dm_recipient(&orch.db.local, "proj", "running").await;
 
     let before_turns = turn_count(&orch.db.local, "job-1").await;
 
@@ -224,7 +224,7 @@ async fn append_direct_message_queues_when_head_turn_is_running() {
     let request = callback_request("write", None);
 
     let result = append_direct_message(
-        &orch, &request, "PROJ", 42, 1, "builder", None, "ping", false,
+        &orch, &request, "proj", 42, 1, "builder", None, "ping", false,
     )
     .await
     .unwrap();
@@ -255,12 +255,12 @@ async fn append_direct_message_queues_when_head_turn_is_pending() {
     // active-turn guard inside the turn-creation paths refuses both pending
     // and running, so the queue path must treat them the same.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_dm_recipient(&orch.db.local, "PEND", "pending").await;
+    insert_dm_recipient(&orch.db.local, "pend", "pending").await;
 
     let request = callback_request("write", None);
 
     let result = append_direct_message(
-        &orch, &request, "PEND", 42, 1, "builder", None, "ping", false,
+        &orch, &request, "pend", 42, 1, "builder", None, "ping", false,
     )
     .await
     .unwrap();
@@ -369,7 +369,7 @@ async fn insert_node_and_subtask(db: &LocalDb, project_key: &str) {
 #[tokio::test(flavor = "current_thread")]
 async fn append_direct_message_resolves_subtask_addressed_as_node_slash_task() {
     // CAIRN-1200: the canonical address for a sub-task is
-    // cairn://p/PROJ/N/SEQ/<parent>/task/<segment>. parse_message_target
+    // cairn://p/proj/N/SEQ/<parent>/task/<segment>. parse_message_target
     // turns that into (node_name=<parent>, task_name=Some(<segment>)).
     // Before the fix, the bug was upstream (the URI advertised in the
     // prompt's Active Peers list was wrong), not in this resolver — so
@@ -377,14 +377,14 @@ async fn append_direct_message_resolves_subtask_addressed_as_node_slash_task() {
     // continues to resolve the right job when the caller addresses the
     // canonical URI.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_node_and_subtask(&orch.db.local, "PROJ").await;
+    insert_node_and_subtask(&orch.db.local, "proj").await;
 
     let request = callback_request("write", None);
 
     let result = append_direct_message(
         &orch,
         &request,
-        "PROJ",
+        "proj",
         42,
         1,
         "builder",
@@ -410,19 +410,19 @@ async fn append_direct_message_resolves_subtask_addressed_as_node_slash_task() {
 async fn append_direct_message_subtask_addressed_as_top_level_surfaces_canonical_uri() {
     // The producer bug that prompted this issue: an agent reads a peer
     // listing or a lifecycle channel message that names the sub-task with
-    // the wrong URI shape — cairn://p/PROJ/42/1/review instead of
-    // cairn://p/PROJ/42/1/builder/task/review — and DMs that broken URI.
+    // the wrong URI shape — cairn://p/proj/42/1/review instead of
+    // cairn://p/proj/42/1/builder/task/review — and DMs that broken URI.
     // The resolver should still correctly reject it (no top-level `review`
     // node exists) but the error must now echo the addressed URI verbatim
     // and explain which scope was searched, so the bug is one-glance
     // diagnosable instead of a debug round trip.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_node_and_subtask(&orch.db.local, "PROJ").await;
+    insert_node_and_subtask(&orch.db.local, "proj").await;
 
     let request = callback_request("write", None);
 
     let err = append_direct_message(
-        &orch, &request, "PROJ", 42, 1,
+        &orch, &request, "proj", 42, 1,
         "review", // wrong: review is a sub-task, not a top-level node
         None, "hello", false,
     )
@@ -430,7 +430,7 @@ async fn append_direct_message_subtask_addressed_as_top_level_surfaces_canonical
     .expect_err("top-level lookup of a sub-task uri_segment must miss");
 
     assert!(
-        err.contains("cairn://p/PROJ/42/1/review"),
+        err.contains("cairn://p/proj/42/1/review"),
         "error must echo the addressed URI verbatim, got: {err}"
     );
     assert!(
@@ -448,14 +448,14 @@ async fn append_direct_message_subtask_with_wrong_parent_names_parent_in_error()
     // Bonus from the fix: a sub-task lookup that misses because the parent
     // is wrong should mention the parent so the caller can fix the URI.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_node_and_subtask(&orch.db.local, "PROJ").await;
+    insert_node_and_subtask(&orch.db.local, "proj").await;
 
     let request = callback_request("write", None);
 
     let err = append_direct_message(
         &orch,
         &request,
-        "PROJ",
+        "proj",
         42,
         1,
         "planner", // wrong parent
@@ -467,7 +467,7 @@ async fn append_direct_message_subtask_with_wrong_parent_names_parent_in_error()
     .expect_err("sub-task under a non-existent parent must miss");
 
     assert!(
-        err.contains("cairn://p/PROJ/42/1/planner/task/review"),
+        err.contains("cairn://p/proj/42/1/planner/task/review"),
         "error must echo the addressed sub-task URI, got: {err}"
     );
     assert!(
@@ -505,10 +505,10 @@ async fn sender_name_for_subtask_sender_is_canonical_task_uri() {
     // their identity through sender_name_for_run, which stamps every
     // outbound message's sender_name and surfaces in the reply-to hint a
     // DM recipient receives. Before the fix this was the broken top-level
-    // shape cairn://p/PROJ/42/1/review — every reply to a sub-task then
+    // shape cairn://p/proj/42/1/review — every reply to a sub-task then
     // hit `No agent found` because the addressed URI was unreachable.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_node_and_subtask(&orch.db.local, "PROJ").await;
+    insert_node_and_subtask(&orch.db.local, "proj").await;
 
     // Sender is the review sub-task; recipient is the builder. Both jobs
     // exist and both runs have `issue_id` so lookup_run resolves the
@@ -516,7 +516,7 @@ async fn sender_name_for_subtask_sender_is_canonical_task_uri() {
     let request = callback_request("write", Some("run-review"));
 
     let result = append_direct_message(
-        &orch, &request, "PROJ", 42, 1, "builder", None, "ack", false,
+        &orch, &request, "proj", 42, 1, "builder", None, "ack", false,
     )
     .await
     .expect("sub-task should be able to DM its sibling builder");
@@ -529,24 +529,24 @@ async fn sender_name_for_subtask_sender_is_canonical_task_uri() {
         .await
         .expect("DM should be inserted with sender_name set");
     assert_eq!(
-        sender_name, "cairn://p/PROJ/42/1/builder/task/review",
-        "sub-task sender_name must be the canonical /task/ URI, not the broken cairn://p/PROJ/42/1/review (which the reply-to hint would echo and fail to resolve)"
+        sender_name, "cairn://p/proj/42/1/builder/task/review",
+        "sub-task sender_name must be the canonical /task/ URI, not the broken cairn://p/proj/42/1/review (which the reply-to hint would echo and fail to resolve)"
     );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn sender_name_for_top_level_sender_unchanged() {
     // Regression pin alongside the sub-task fix: top-level node senders
-    // continue to record cairn://p/PROJ/N/SEQ/<segment>.
+    // continue to record cairn://p/proj/N/SEQ/<segment>.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_node_and_subtask(&orch.db.local, "PROJ").await;
+    insert_node_and_subtask(&orch.db.local, "proj").await;
 
     let request = callback_request("write", Some("run-builder"));
 
     let _ = append_direct_message(
         &orch,
         &request,
-        "PROJ",
+        "proj",
         42,
         1,
         "builder",
@@ -561,7 +561,7 @@ async fn sender_name_for_top_level_sender_unchanged() {
         .await
         .expect("DM should be inserted with sender_name set");
     assert_eq!(
-        sender_name, "cairn://p/PROJ/42/1/builder",
+        sender_name, "cairn://p/proj/42/1/builder",
         "top-level sender_name shape must not regress"
     );
 }
@@ -586,7 +586,7 @@ async fn flush_pending_directs_on_idle_is_noop_without_pending() {
     // CAIRN-1297: the end-of-turn flush must not resume a healthy idle run when
     // nothing is queued for it — guards against spurious wakes / resume loops.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
+    insert_dm_recipient(&orch.db.local, "proj", "running").await;
 
     let before = turn_count(&orch.db.local, "job-1").await;
     cairn_core::messages::delivery::flush_pending_directs_on_idle(&orch, "run-1");
@@ -603,7 +603,7 @@ async fn node_messages_append_routes_like_bare_node() {
     // deliver identically to the bare-node append path. Recipient turn is running,
     // so the message queues just like the bare-node path.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
+    insert_dm_recipient(&orch.db.local, "proj", "running").await;
 
     let request = McpCallbackRequest {
         thread_id: None,
@@ -612,7 +612,7 @@ async fn node_messages_append_routes_like_bare_node() {
         tool: "write".to_string(),
         payload: serde_json::json!({
             "changes": [{
-                "target": "cairn://p/PROJ/42/1/builder/messages",
+                "target": "cairn://p/proj/42/1/builder/messages",
                 "mode": "append",
                 "payload": { "content": "ping via /messages" }
             }]
@@ -639,7 +639,7 @@ async fn node_messages_read_returns_directs() {
     // CAIRN-1329: read/append symmetry — reading `.../NODE/messages` returns the
     // node's direct-message stream.
     let (_temp, orch) = common::test_orchestrator().await;
-    insert_dm_recipient(&orch.db.local, "PROJ", "running").await;
+    insert_dm_recipient(&orch.db.local, "proj", "running").await;
     let _ = insert_pending_direct(&orch, "run-1", "hello builder");
 
     let request = McpCallbackRequest {
@@ -647,7 +647,7 @@ async fn node_messages_read_returns_directs() {
         cwd: "/tmp".to_string(),
         run_id: None,
         tool: "read".to_string(),
-        payload: serde_json::json!({ "uri": "cairn://p/PROJ/42/1/builder/messages" }),
+        payload: serde_json::json!({ "uri": "cairn://p/proj/42/1/builder/messages" }),
         tool_use_id: None,
     };
 

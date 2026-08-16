@@ -70,11 +70,13 @@ pub fn parse_pack_mcp_file(path: &Path) -> Result<HashMap<String, McpServerConfi
             command: _,
             args: _,
             env: _,
+            cwd: _,
             url: _,
             headers: _,
             enabled: _,
             oauth: _,
             secrets,
+            agent_plugin_runtime: _,
         } = config;
         if secrets.is_empty() {
             continue;
@@ -110,10 +112,19 @@ pub fn load_pack_mcp_servers(config_dir: &Path) -> BTreeMap<String, PackMcpServe
         match parse_pack_mcp_file(&path) {
             Ok(servers) => {
                 for (name, config) in servers {
+                    let mut config = config;
                     // A server the user removed stays out of every layer,
                     // without them having had to uninstall the pack around it.
                     if lock.is_removed(super::PackItemKind::Mcp, &name) {
                         continue;
+                    }
+                    let plugin_root = super::lock::pack_dir(config_dir, &lock.id).join("source");
+                    if plugin_root.join("plugin.json").is_file() {
+                        config.agent_plugin_runtime =
+                            Some(crate::config::mcp_servers::AgentPluginRuntime {
+                                root: plugin_root,
+                                data: config_dir.join("plugin-data").join(&lock.id),
+                            });
                     }
                     layer.insert(
                         name,

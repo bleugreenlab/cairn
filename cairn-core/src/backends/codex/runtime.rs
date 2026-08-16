@@ -24,14 +24,17 @@ use crate::storage::{LocalDb, RowExt};
 use crate::transcripts::stream_store::append_chunks;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const CODEX_TURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CODEX_POST_TOOL_SILENCE_TIMEOUT: Duration = Duration::from_secs(45);
 const CODEX_TURN_WATCHDOG_POLL: Duration = Duration::from_secs(1);
+const CODEX_TURN_WATCHDOG_HEARTBEAT: Duration = Duration::from_secs(15);
 const CAPACITY_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(2),
     Duration::from_secs(8),
@@ -52,6 +55,325 @@ fn normalize_capacity_error(message: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+impl From<CodexTurnWatchdogPhase> for crate::runs::watchdog_ledger::WatchdogPhase {
+    fn from(phase: CodexTurnWatchdogPhase) -> Self {
+        match phase {
+            CodexTurnWatchdogPhase::ProviderProgress => Self::ProviderProgress,
+            CodexTurnWatchdogPhase::ToolOutstanding => Self::ToolOutstanding,
+            CodexTurnWatchdogPhase::PostToolContinuation => Self::PostToolContinuation,
+        }
+    }
+}
+
+fn watchdog_db<T>(
+    db: Arc<LocalDb>,
+    operation: impl std::future::Future<Output = crate::storage::DbResult<T>> + Send + 'static,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+{
+    let _ = db;
+    crate::storage::run_db_blocking(
+        move || async move { operation.await.map_err(|e| e.to_string()) },
+    )
+}
+
+fn watchdog_lifecycle(
+    db: Arc<LocalDb>,
+    identity: crate::runs::watchdog_ledger::WatchdogIdentity,
+    kind: crate::runs::watchdog_ledger::WatchdogLifecycleKind,
+    phase: Option<CodexTurnWatchdogPhase>,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let event = crate::runs::watchdog_ledger::NewWatchdogLifecycle {
+        id: Uuid::new_v4().to_string(),
+        identity,
+        kind,
+        phase: phase.map(Into::into),
+        reason,
+        details: None,
+        successor_run_id: None,
+        successor_turn_id: None,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    watchdog_db(db.clone(), async move {
+        crate::runs::watchdog_ledger::append_watchdog_lifecycle(&db, event).await
+    })
+}
+
+struct OwnedCodexWatchdog {
+    state: Arc<Mutex<CodexTurnProgressWatchdog>>,
+    identity: Arc<Mutex<Option<crate::runs::watchdog_ledger::WatchdogIdentity>>>,
+    cancel: mpsc::Sender<()>,
+    join: Option<thread::JoinHandle<()>>,
+    db: Arc<LocalDb>,
+    run_id: String,
+    session_id: Option<String>,
+    runner_boot_id: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WatchdogArmError {
+    MissingSession,
+    OwnershipConflict,
+    Database(String),
+}
+
+impl std::fmt::Display for WatchdogArmError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSession => write!(formatter, "the run has no session id"),
+            Self::OwnershipConflict => {
+                write!(formatter, "an active lease already owns this provider turn")
+            }
+            Self::Database(error) => {
+                write!(formatter, "the watchdog database write failed: {error}")
+            }
+        }
+    }
+}
+
+fn checked_watchdog_arm(outcome: Result<bool, String>) -> Result<(), WatchdogArmError> {
+    match outcome {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(WatchdogArmError::OwnershipConflict),
+        Err(error) => Err(WatchdogArmError::Database(error)),
+    }
+}
+
+fn required_watchdog_session(session_id: Option<String>) -> Result<String, WatchdogArmError> {
+    session_id.ok_or(WatchdogArmError::MissingSession)
+}
+
+impl OwnedCodexWatchdog {
+    fn spawn(
+        orch: &Orchestrator,
+        db: Arc<LocalDb>,
+        run_id: &str,
+        session_id: Option<String>,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
+            CODEX_TURN_NO_PROGRESS_TIMEOUT,
+            CODEX_POST_TOOL_SILENCE_TIMEOUT,
+        )));
+        let identity = Arc::new(Mutex::new(
+            None::<crate::runs::watchdog_ledger::WatchdogIdentity>,
+        ));
+        let (cancel, cancelled) = mpsc::channel();
+        let worker_state = state.clone();
+        let worker_identity = identity.clone();
+        let worker_db = db.clone();
+        let worker_orch = orch.clone();
+        let worker_run_id = run_id.to_string();
+        let worker_name = format!("codex-turn-watchdog-{}", &run_id[..run_id.len().min(8)]);
+        let join = thread::Builder::new().name(worker_name).spawn(move || {
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut last_phase = None;
+                let mut last_persisted_progress = 0;
+                let mut last_heartbeat = Instant::now();
+                loop {
+                    match cancelled.recv_timeout(CODEX_TURN_WATCHDOG_POLL) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => return true,
+                        Err(RecvTimeoutError::Timeout) => {}
+                    }
+                    let snapshot = match worker_state.lock() {
+                        Ok(mut guard) => {
+                            let now = Instant::now();
+                            let expiry = guard.expired(now);
+                            let phase = guard.active_turn_id.as_ref().map(|_| guard.phase);
+                            let deadline = guard.deadline_at(now, chrono::Utc::now().timestamp());
+                            (phase, deadline, expiry, guard.progress_sequence)
+                        }
+                        Err(poisoned) => {
+                            drop(poisoned.into_inner());
+                            log::error!("Codex watchdog state poisoned for run {}; worker exiting for durable reconciliation", worker_run_id);
+                            return false;
+                        }
+                    };
+                    let current_identity = worker_identity.lock().ok().and_then(|guard| guard.clone());
+                    let Some(current_identity) = current_identity else { continue };
+                    let wall_now = chrono::Utc::now().timestamp();
+                    if let (Some(phase), Some(deadline)) = (snapshot.0, snapshot.1) {
+                        if last_phase != Some(phase) || last_persisted_progress != snapshot.3 {
+                            let id = current_identity.clone();
+                            let phase_db = worker_db.clone();
+                            match watchdog_db(phase_db.clone(), async move {
+                                crate::runs::watchdog_ledger::refresh_watchdog_progress(
+                                    &phase_db, &id, phase.into(), deadline, wall_now, wall_now,
+                                ).await
+                            }) {
+                                Ok(true) => {
+                                    let phase_changed = last_phase.is_some() && last_phase != Some(phase);
+                                    last_persisted_progress = snapshot.3;
+                                    if phase_changed {
+                                    if let Err(error) = watchdog_lifecycle(worker_db.clone(), current_identity.clone(), crate::runs::watchdog_ledger::WatchdogLifecycleKind::PhaseTransition, Some(phase), None) {
+                                        log::error!("Failed to persist Codex watchdog phase lifecycle for {:?}: {}", current_identity, error);
+                                    }
+                                    }
+                                }
+                                Ok(false) if last_phase.is_some() => log::error!("Codex watchdog phase CAS lost for {:?}", current_identity),
+                                Ok(false) => {}
+                                Err(error) => log::error!("Failed to persist Codex watchdog phase for {:?}: {}", current_identity, error),
+                            }
+                            last_phase = Some(phase);
+                        }
+                    }
+                    if last_heartbeat.elapsed() >= CODEX_TURN_WATCHDOG_HEARTBEAT {
+                        let id = current_identity.clone();
+                        let heartbeat_db = worker_db.clone();
+                        match watchdog_db(heartbeat_db.clone(), async move { crate::runs::watchdog_ledger::heartbeat_watchdog(&heartbeat_db, &id, wall_now).await }) {
+                            Ok(true) => {}
+                            Ok(false) => log::error!("Codex watchdog heartbeat lost active lease for {:?}", current_identity),
+                            Err(error) => log::error!("Failed to persist Codex watchdog heartbeat for {:?}: {}", current_identity, error),
+                        }
+                        last_heartbeat = Instant::now();
+                    }
+                    if let Some(expiry) = snapshot.2 {
+                        let id = current_identity.clone();
+                        let expiry_db = worker_db.clone();
+                        let expired = watchdog_db(expiry_db.clone(), async move { crate::runs::watchdog_ledger::expire_watchdog(&expiry_db, &id, wall_now).await });
+                        match expired {
+                            Ok(true) => {
+                                if let Err(error) = watchdog_lifecycle(worker_db.clone(), current_identity.clone(), crate::runs::watchdog_ledger::WatchdogLifecycleKind::Expired, Some(expiry.phase), Some(format!("no provider progress for {:?}", expiry.elapsed))) {
+                                    log::error!("Failed to persist Codex watchdog expiry lifecycle for {:?}: {}", current_identity, error);
+                                }
+                                if let Err(error) = crate::orchestrator::lifecycle::recover_provider_watchdog(
+                                    &worker_orch,
+                                    &current_identity,
+                                    wall_now,
+                                ) {
+                                    log::error!("Codex watchdog recovery failed for {:?}: {}", current_identity, error);
+                                }
+                            }
+                            Ok(false) => log::error!("Codex watchdog expiry lost active lease for {:?}", current_identity),
+                            Err(error) => log::error!("Failed to persist Codex watchdog expiry for {:?}: {}", current_identity, error),
+                        }
+                        return true;
+                    }
+                }
+            }));
+            if !matches!(outcome, Ok(true)) {
+                let kind = if outcome.is_err() { crate::runs::watchdog_ledger::WatchdogLifecycleKind::WorkerPanicked } else { crate::runs::watchdog_ledger::WatchdogLifecycleKind::WorkerExitedUnexpectedly };
+                if let Some(id) = worker_identity.lock().ok().and_then(|guard| guard.clone()) {
+                    if let Err(error) = watchdog_lifecycle(worker_db.clone(), id.clone(), kind, None, Some("owned watchdog worker exited before disarm".into())) {
+                        log::error!("Failed to diagnose Codex watchdog worker exit for {:?}: {}", id, error);
+                    }
+                }
+            }
+        }).expect("spawn owned Codex turn watchdog");
+        Self {
+            state,
+            identity,
+            cancel,
+            join: Some(join),
+            db,
+            run_id: run_id.to_string(),
+            session_id,
+            runner_boot_id: orch.boot_at.to_string(),
+        }
+    }
+
+    fn arm(&self, turn_id: &str) -> Result<(), WatchdogArmError> {
+        let session_id = required_watchdog_session(self.session_id.clone())?;
+        self.disarm("provider_turn_replaced");
+        let identity = crate::runs::watchdog_ledger::WatchdogIdentity {
+            run_id: self.run_id.clone(),
+            session_id,
+            provider_turn_id: turn_id.to_string(),
+            generation: Uuid::new_v4().to_string(),
+        };
+        let now = chrono::Utc::now().timestamp();
+        let lease = crate::runs::watchdog_ledger::NewWatchdogLease {
+            identity: identity.clone(),
+            runner_boot_id: self.runner_boot_id.clone(),
+            phase: crate::runs::watchdog_ledger::WatchdogPhase::ProviderProgress,
+            phase_deadline_at: now + CODEX_TURN_NO_PROGRESS_TIMEOUT.as_secs() as i64,
+            now,
+        };
+        let arm_db = self.db.clone();
+        checked_watchdog_arm(watchdog_db(arm_db.clone(), async move {
+            crate::runs::watchdog_ledger::arm_watchdog(&arm_db, lease, Uuid::new_v4().to_string())
+                .await
+        }))?;
+        if let Ok(mut guard) = self.identity.lock() {
+            *guard = Some(identity);
+        }
+        match self.state.lock() {
+            Ok(mut guard) => guard.start_turn(turn_id, Instant::now()),
+            Err(_) => log::error!(
+                "Codex watchdog state poisoned after durably arming run {}",
+                self.run_id
+            ),
+        }
+        Ok(())
+    }
+
+    fn disarm_turn(&self, provider_turn_id: Option<&str>, reason: &str) {
+        let identity = self.identity.lock().ok().and_then(|guard| guard.clone());
+        if provider_turn_id.is_some_and(|turn_id| {
+            identity.as_ref().map(|id| id.provider_turn_id.as_str()) != Some(turn_id)
+        }) {
+            return;
+        }
+        if let Some(identity) = identity {
+            let now = chrono::Utc::now().timestamp();
+            let id = identity.clone();
+            let db = self.db.clone();
+            let durable_reason = reason.to_string();
+            match watchdog_db(db.clone(), async move {
+                crate::runs::watchdog_ledger::disarm_watchdog(&db, &id, &durable_reason, now).await
+            }) {
+                Ok(true) => {
+                    if let Err(error) = watchdog_lifecycle(
+                        self.db.clone(),
+                        identity,
+                        crate::runs::watchdog_ledger::WatchdogLifecycleKind::Disarmed,
+                        None,
+                        Some(reason.to_string()),
+                    ) {
+                        log::error!(
+                            "Failed to persist Codex watchdog disarm lifecycle for run {}: {}",
+                            self.run_id,
+                            error
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => log::error!(
+                    "Failed to durably disarm Codex watchdog for run {}: {}",
+                    self.run_id,
+                    error
+                ),
+            }
+        }
+        if let Ok(mut guard) = self.state.lock() {
+            guard.clear_turn();
+        }
+        if let Ok(mut guard) = self.identity.lock() {
+            *guard = None;
+        }
+    }
+
+    fn disarm(&self, reason: &str) {
+        self.disarm_turn(None, reason);
+    }
+}
+
+impl Drop for OwnedCodexWatchdog {
+    fn drop(&mut self) {
+        self.disarm("reader_shutdown");
+        let _ = self.cancel.send(());
+        if let Some(join) = self.join.take() {
+            if join.join().is_err() {
+                log::error!(
+                    "Codex watchdog join observed a panic for run {}",
+                    self.run_id
+                );
+            }
+        }
+    }
 }
 
 fn is_selected_model_capacity_error(message: &str) -> bool {
@@ -511,59 +833,122 @@ fn codex_compaction_event_from_completed_item(msg: &Value) -> Option<TranscriptE
     Some(build_codex_compaction_event(item.clone()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTurnWatchdogPhase {
+    ProviderProgress,
+    ToolOutstanding,
+    PostToolContinuation,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CodexTurnWatchdogExpiry {
+    turn_id: String,
+    phase: CodexTurnWatchdogPhase,
+    elapsed: Duration,
+}
+
 #[derive(Debug)]
 struct CodexTurnProgressWatchdog {
     active_turn_id: Option<String>,
     last_forward_progress_at: Instant,
-    timeout: Duration,
-    pending_tool_count: usize,
+    general_timeout: Duration,
+    post_tool_timeout: Duration,
+    phase: CodexTurnWatchdogPhase,
+    outstanding_tool_ids: HashSet<String>,
     fired: bool,
+    progress_sequence: u64,
 }
 
 impl CodexTurnProgressWatchdog {
-    fn new(timeout: Duration) -> Self {
+    fn new(general_timeout: Duration, post_tool_timeout: Duration) -> Self {
         Self {
             active_turn_id: None,
             last_forward_progress_at: Instant::now(),
-            timeout,
-            pending_tool_count: 0,
+            general_timeout,
+            post_tool_timeout,
+            phase: CodexTurnWatchdogPhase::ProviderProgress,
+            outstanding_tool_ids: HashSet::new(),
             fired: false,
+            progress_sequence: 0,
         }
     }
 
     fn start_turn(&mut self, turn_id: &str, now: Instant) {
         self.active_turn_id = Some(turn_id.to_string());
         self.last_forward_progress_at = now;
-        self.pending_tool_count = 0;
+        self.phase = CodexTurnWatchdogPhase::ProviderProgress;
+        self.outstanding_tool_ids.clear();
         self.fired = false;
+        self.progress_sequence = self.progress_sequence.wrapping_add(1);
     }
 
     fn clear_turn(&mut self) {
         self.active_turn_id = None;
-        self.pending_tool_count = 0;
+        self.phase = CodexTurnWatchdogPhase::ProviderProgress;
+        self.outstanding_tool_ids.clear();
         self.fired = false;
     }
 
     fn record_forward_progress(&mut self, now: Instant) {
         if self.active_turn_id.is_some() {
             self.last_forward_progress_at = now;
+            self.progress_sequence = self.progress_sequence.wrapping_add(1);
+            if self.outstanding_tool_ids.is_empty() {
+                self.phase = CodexTurnWatchdogPhase::ProviderProgress;
+            }
         }
     }
 
-    fn set_pending_tool_count(&mut self, count: usize) {
-        self.pending_tool_count = count;
+    fn start_tool(&mut self, tool_id: String, now: Instant) {
+        if self.active_turn_id.is_some() {
+            self.outstanding_tool_ids.insert(tool_id);
+            self.phase = CodexTurnWatchdogPhase::ToolOutstanding;
+            self.last_forward_progress_at = now;
+            self.progress_sequence = self.progress_sequence.wrapping_add(1);
+        }
     }
 
-    fn expired(&mut self, now: Instant) -> Option<String> {
-        if self.fired || self.pending_tool_count > 0 {
+    fn complete_tool(&mut self, tool_id: Option<&str>, now: Instant) -> bool {
+        let matched = tool_id.is_some_and(|id| self.outstanding_tool_ids.remove(id));
+        if self.outstanding_tool_ids.is_empty() {
+            self.phase = CodexTurnWatchdogPhase::PostToolContinuation;
+            self.last_forward_progress_at = now;
+            self.progress_sequence = self.progress_sequence.wrapping_add(1);
+        }
+        matched
+    }
+
+    fn deadline_at(&self, now: Instant, wall_now: i64) -> Option<i64> {
+        self.active_turn_id.as_ref()?;
+        let timeout = match self.phase {
+            CodexTurnWatchdogPhase::ProviderProgress => self.general_timeout,
+            CodexTurnWatchdogPhase::PostToolContinuation => self.post_tool_timeout,
+            CodexTurnWatchdogPhase::ToolOutstanding => self.general_timeout,
+        };
+        let elapsed = now.duration_since(self.last_forward_progress_at);
+        Some(wall_now.saturating_add(timeout.saturating_sub(elapsed).as_secs() as i64))
+    }
+
+    fn expired(&mut self, now: Instant) -> Option<CodexTurnWatchdogExpiry> {
+        if self.fired || self.phase == CodexTurnWatchdogPhase::ToolOutstanding {
             return None;
         }
         let turn_id = self.active_turn_id.as_ref()?;
-        if now.duration_since(self.last_forward_progress_at) < self.timeout {
+        let elapsed = now.duration_since(self.last_forward_progress_at);
+        let timeout = match self.phase {
+            CodexTurnWatchdogPhase::ProviderProgress => self.general_timeout,
+            CodexTurnWatchdogPhase::PostToolContinuation => self.post_tool_timeout,
+            CodexTurnWatchdogPhase::ToolOutstanding => return None,
+        };
+        if elapsed < timeout {
             return None;
         }
         self.fired = true;
-        Some(turn_id.clone())
+        Some(CodexTurnWatchdogExpiry {
+            turn_id: turn_id.clone(),
+            phase: self.phase,
+            elapsed,
+        })
     }
 }
 
@@ -596,64 +981,9 @@ impl CodexBackend {
         let mut tool_output_chars: HashMap<String, i32> = HashMap::new();
         let mut terminal_tool_suspended = false;
         let mut provider_turn_failures: HashMap<String, ProviderTurnFailureState> = HashMap::new();
-        let progress_watchdog = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
-            CODEX_TURN_NO_PROGRESS_TIMEOUT,
-        )));
-        if let Some(turn_id) = current_turn_id.lock().ok().and_then(|guard| guard.clone()) {
-            if let Ok(mut watchdog) = progress_watchdog.lock() {
-                watchdog.start_turn(&turn_id, Instant::now());
-            }
-        }
-        let watchdog_alive = Arc::new(AtomicBool::new(true));
-        {
-            let watchdog = progress_watchdog.clone();
-            let alive = watchdog_alive.clone();
-            let orch = orch.clone();
-            let run_id = run_id.to_string();
-            let client = client.clone();
-            let ephemeral_wd = ephemeral;
-            thread::spawn(move || {
-                while alive.load(Ordering::Acquire) {
-                    thread::sleep(CODEX_TURN_WATCHDOG_POLL);
-                    if !alive.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let Some(turn_id) = watchdog
-                        .lock()
-                        .ok()
-                        .and_then(|mut guard| guard.expired(Instant::now()))
-                    else {
-                        continue;
-                    };
-                    log::error!(
-                        "Codex turn {} for run {} made no forward progress for {:?}; aborting app-server stream",
-                        turn_id,
-                        &run_id[..run_id.len().min(8)],
-                        CODEX_TURN_NO_PROGRESS_TIMEOUT
-                    );
-                    insert_error_event(
-                        &orch,
-                        &run_id,
-                        None,
-                        &format!(
-                            "Codex turn made no forward progress for {} seconds; aborting so it can retry.",
-                            CODEX_TURN_NO_PROGRESS_TIMEOUT.as_secs()
-                        ),
-                    );
-                    // A pooled call shares the app-server with other live calls,
-                    // so NEVER shut the transport down here; `kill_session_with_reason`
-                    // interrupts only this call's turn (turn/interrupt) and, with a
-                    // null child, leaves the shared process running.
-                    if !ephemeral_wd {
-                        client.shutdown();
-                    }
-                    let _ = crate::orchestrator::lifecycle::kill_session_with_reason(
-                        &orch, &run_id, "crash",
-                    );
-                    break;
-                }
-            });
-        }
+        let owned_watchdog =
+            OwnedCodexWatchdog::spawn(orch, run_db.clone(), run_id, session_id.clone());
+        let progress_watchdog = owned_watchdog.state.clone();
 
         let init_event = TranscriptEvent {
             event_type: "system:init".to_string(),
@@ -853,16 +1183,35 @@ impl CodexBackend {
             match method {
                 Some("turn/started") => {
                     if let Some(turn_id) = msg.pointer("/params/turn/id").and_then(|v| v.as_str()) {
+                        if let Err(error) = owned_watchdog.arm(turn_id) {
+                            let evidence = format!(
+                                "Codex provider turn {turn_id} was interrupted because durable watchdog ownership could not be acquired: {error}"
+                            );
+                            log::error!("{evidence} (run {run_id})");
+                            insert_error_event(orch, run_id, session_id.as_deref(), &evidence);
+                            if let Err(terminalize_error) =
+                                crate::orchestrator::lifecycle::kill_session_with_reason(
+                                    orch,
+                                    run_id,
+                                    crate::orchestrator::lifecycle::WATCHDOG_ARM_FAILED_EXIT_REASON,
+                                )
+                            {
+                                log::error!(
+                                    "Failed to terminalize unowned Codex provider turn {turn_id} for run {run_id}: {terminalize_error}"
+                                );
+                            }
+                            break;
+                        }
                         if let Ok(mut guard) = current_turn_id.lock() {
                             *guard = Some(turn_id.to_string());
-                        }
-                        if let Ok(mut watchdog) = progress_watchdog.lock() {
-                            watchdog.start_turn(turn_id, Instant::now());
                         }
                     }
                     usage_accumulator.start_turn();
                 }
                 Some("item/agentMessage/delta") => {
+                    if let Ok(mut watchdog) = progress_watchdog.lock() {
+                        watchdog.record_forward_progress(Instant::now());
+                    }
                     if let Some(delta) = extract_app_server_delta(&msg) {
                         handle_agent_message_delta(
                             orch,
@@ -876,6 +1225,9 @@ impl CodexBackend {
                     }
                 }
                 Some("item/reasoning/textDelta") | Some("item/reasoning/summaryTextDelta") => {
+                    if let Ok(mut watchdog) = progress_watchdog.lock() {
+                        watchdog.record_forward_progress(Instant::now());
+                    }
                     if let Some(text) = extract_app_server_delta(&msg) {
                         handle_reasoning_delta(
                             orch,
@@ -905,8 +1257,7 @@ impl CodexBackend {
                                     .unwrap_or_else(|| Uuid::new_v4().to_string());
                                 pending_tool_ids.insert(tool_use_id.clone());
                                 if let Ok(mut watchdog) = progress_watchdog.lock() {
-                                    watchdog.record_forward_progress(Instant::now());
-                                    watchdog.set_pending_tool_count(pending_tool_ids.len());
+                                    watchdog.start_tool(tool_use_id.clone(), Instant::now());
                                 }
                                 let (command_display, command_vec) = extract_command_execution(
                                     msg.pointer("/params/item/command").unwrap_or(&Value::Null),
@@ -961,8 +1312,7 @@ impl CodexBackend {
                                     .unwrap_or_else(|| Uuid::new_v4().to_string());
                                 pending_tool_ids.insert(tool_use_id.clone());
                                 if let Ok(mut watchdog) = progress_watchdog.lock() {
-                                    watchdog.record_forward_progress(Instant::now());
-                                    watchdog.set_pending_tool_count(pending_tool_ids.len());
+                                    watchdog.start_tool(tool_use_id.clone(), Instant::now());
                                 }
                                 let mut tool_input = serde_json::json!({});
                                 if let Value::Object(ref mut map) = tool_input {
@@ -1018,8 +1368,7 @@ impl CodexBackend {
                                     .unwrap_or_else(|| Uuid::new_v4().to_string());
                                 pending_tool_ids.insert(tool_use_id.clone());
                                 if let Ok(mut watchdog) = progress_watchdog.lock() {
-                                    watchdog.record_forward_progress(Instant::now());
-                                    watchdog.set_pending_tool_count(pending_tool_ids.len());
+                                    watchdog.start_tool(tool_use_id.clone(), Instant::now());
                                 }
                                 let server = msg
                                     .pointer("/params/item/server")
@@ -1077,11 +1426,11 @@ impl CodexBackend {
                     if let Some(item_type) =
                         msg.pointer("/params/item/type").and_then(|v| v.as_str())
                     {
-                        if let Ok(mut watchdog) = progress_watchdog.lock() {
-                            watchdog.record_forward_progress(Instant::now());
-                        }
                         match item_type {
                             "agentMessage" => {
+                                if let Ok(mut watchdog) = progress_watchdog.lock() {
+                                    watchdog.record_forward_progress(Instant::now());
+                                }
                                 if terminal_tool_called_for_run(orch, run_id) {
                                     continue;
                                 }
@@ -1135,7 +1484,7 @@ impl CodexBackend {
                                     pending_tool_ids.remove(id);
                                 }
                                 if let Ok(mut watchdog) = progress_watchdog.lock() {
-                                    watchdog.set_pending_tool_count(pending_tool_ids.len());
+                                    watchdog.complete_tool(tool_use_id.as_deref(), Instant::now());
                                 }
                                 interrupt_terminal_tool_at_boundary!();
                             }
@@ -1163,7 +1512,7 @@ impl CodexBackend {
                                     pending_tool_ids.remove(id);
                                 }
                                 if let Ok(mut watchdog) = progress_watchdog.lock() {
-                                    watchdog.set_pending_tool_count(pending_tool_ids.len());
+                                    watchdog.complete_tool(tool_use_id.as_deref(), Instant::now());
                                 }
                                 interrupt_terminal_tool_at_boundary!();
                             }
@@ -1191,7 +1540,7 @@ impl CodexBackend {
                                     pending_tool_ids.remove(id);
                                 }
                                 if let Ok(mut watchdog) = progress_watchdog.lock() {
-                                    watchdog.set_pending_tool_count(pending_tool_ids.len());
+                                    watchdog.complete_tool(tool_use_id.as_deref(), Instant::now());
                                 }
                                 interrupt_terminal_tool_at_boundary!();
                             }
@@ -1355,6 +1704,10 @@ impl CodexBackend {
                         ephemeral,
                         failure_disposition,
                     );
+                    owned_watchdog.disarm_turn(
+                        completed_provider_turn_id.as_deref(),
+                        "provider_turn_completed",
+                    );
                     clear_provider_turn_if_current(
                         completed_provider_turn_id.as_deref(),
                         &current_turn_id,
@@ -1395,6 +1748,8 @@ impl CodexBackend {
                     if let Some(turn_id) = aborted_provider_turn_id.as_deref() {
                         provider_turn_failures.remove(turn_id);
                     }
+                    owned_watchdog
+                        .disarm_turn(aborted_provider_turn_id.as_deref(), "provider_turn_aborted");
                     clear_provider_turn_if_current(
                         aborted_provider_turn_id.as_deref(),
                         &current_turn_id,
@@ -1520,7 +1875,33 @@ impl CodexBackend {
                             .cloned()
                             .unwrap_or(Value::Null),
                     ) {
-                        orch.store_provider_usage_snapshot(snapshot);
+                        // Attribute the update to the subscription that spent
+                        // the tokens. The usage panel reads per (backend,
+                        // account), and routing needs a measured window per
+                        // account rather than one global number, so a session
+                        // running is itself a usage probe for its own account.
+                        let account_id = oauth_state
+                            .as_ref()
+                            .and_then(|state| state.lock().ok())
+                            .and_then(|guard| guard.cairn_account_id());
+                        if let Some(account_id) = account_id.as_deref() {
+                            // An exhausted window blocks the account only until
+                            // it rolls over, which is what its reset time says.
+                            let blocked_until = snapshot
+                                .windows
+                                .iter()
+                                .filter(|window| window.remaining_percent <= 0.0)
+                                .filter_map(|window| window.resets_at)
+                                .max();
+                            if let Err(error) = orch.record_account_health(
+                                account_id,
+                                snapshot.windows.clone(),
+                                blocked_until,
+                            ) {
+                                log::warn!("Failed to record Codex account health: {error}");
+                            }
+                        }
+                        orch.store_provider_account_usage_snapshot(account_id, snapshot);
                     }
                 }
                 Some("item/commandExecution/outputDelta") => {
@@ -1556,7 +1937,7 @@ impl CodexBackend {
             }
         }
 
-        watchdog_alive.store(false, Ordering::Release);
+        owned_watchdog.disarm("notification_stream_closed");
         finalize_streaming(
             orch,
             &run_db,
@@ -1579,6 +1960,30 @@ impl CodexBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn watchdog_arm_missing_session_is_a_failure() {
+        assert_eq!(
+            required_watchdog_session(None),
+            Err(WatchdogArmError::MissingSession)
+        );
+    }
+
+    #[test]
+    fn watchdog_arm_ownership_conflict_is_a_failure() {
+        assert_eq!(
+            checked_watchdog_arm(Ok(false)),
+            Err(WatchdogArmError::OwnershipConflict)
+        );
+    }
+
+    #[test]
+    fn watchdog_arm_database_error_is_a_failure() {
+        assert_eq!(
+            checked_watchdog_arm(Err("database unavailable".into())),
+            Err(WatchdogArmError::Database("database unavailable".into()))
+        );
+    }
 
     fn notification(total_tokens: i64, last_tokens: i64) -> Value {
         usage_notification(
@@ -1657,53 +2062,98 @@ mod tests {
     }
 
     #[test]
-    fn turn_progress_watchdog_expires_without_forward_progress() {
-        let timeout = Duration::from_secs(10);
+    fn turn_progress_watchdog_uses_phase_deadlines_and_fires_once_after_jump() {
         let start = Instant::now();
-        let mut watchdog = CodexTurnProgressWatchdog::new(timeout);
+        let general = Duration::from_secs(10);
+        let mut watchdog = CodexTurnProgressWatchdog::new(general, Duration::from_secs(3));
         watchdog.start_turn("turn-1", start);
 
         assert_eq!(
-            watchdog.expired(start + timeout - Duration::from_millis(1)),
+            watchdog.expired(start + general - Duration::from_millis(1)),
             None
         );
+        let expiry = watchdog
+            .expired(start + general + Duration::from_secs(20))
+            .expect("elapsed jump expires once");
+        assert_eq!(expiry.turn_id, "turn-1");
+        assert_eq!(expiry.phase, CodexTurnWatchdogPhase::ProviderProgress);
+        assert_eq!(expiry.elapsed, Duration::from_secs(30));
+        assert_eq!(watchdog.expired(start + Duration::from_secs(31)), None);
+    }
+
+    #[test]
+    fn exact_tool_ids_hold_the_watchdog_until_every_tool_completes() {
+        let start = Instant::now();
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
+        watchdog.start_turn("turn-1", start);
+        watchdog.start_tool("tool-1".to_string(), start);
+        watchdog.start_tool("tool-2".to_string(), start);
+
+        assert_eq!(watchdog.expired(start + Duration::from_secs(60)), None);
+        assert!(watchdog.complete_tool(Some("tool-1"), start + Duration::from_secs(60)));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ToolOutstanding);
+        assert_eq!(watchdog.expired(start + Duration::from_secs(90)), None);
+        assert!(watchdog.complete_tool(Some("tool-2"), start + Duration::from_secs(90)));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::PostToolContinuation);
         assert_eq!(
-            watchdog.expired(start + timeout),
-            Some("turn-1".to_string())
-        );
-        assert_eq!(
-            watchdog.expired(start + timeout + Duration::from_secs(1)),
-            None
+            watchdog
+                .expired(start + Duration::from_secs(93))
+                .unwrap()
+                .phase,
+            CodexTurnWatchdogPhase::PostToolContinuation
         );
     }
 
     #[test]
-    fn turn_progress_watchdog_resets_on_progress_and_ignores_pending_tools() {
-        let timeout = Duration::from_secs(10);
+    fn unmatched_completion_preserves_known_outstanding_tools() {
         let start = Instant::now();
-        let mut watchdog = CodexTurnProgressWatchdog::new(timeout);
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
         watchdog.start_turn("turn-1", start);
-        watchdog.record_forward_progress(start + Duration::from_secs(7));
+        watchdog.start_tool("started-id".to_string(), start);
 
-        assert_eq!(watchdog.expired(start + Duration::from_secs(12)), None);
-        watchdog.set_pending_tool_count(1);
-        assert_eq!(watchdog.expired(start + Duration::from_secs(30)), None);
-        watchdog.set_pending_tool_count(0);
+        assert!(!watchdog.complete_tool(Some("different-id"), start + Duration::from_secs(1)));
         assert_eq!(
-            watchdog.expired(start + Duration::from_secs(30)),
-            Some("turn-1".to_string())
+            watchdog.outstanding_tool_ids,
+            HashSet::from(["started-id".to_string()])
+        );
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ToolOutstanding);
+        assert_eq!(watchdog.expired(start + Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn only_provider_continuation_leaves_post_tool_phase() {
+        let start = Instant::now();
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
+        watchdog.start_turn("turn-1", start);
+        watchdog.start_tool("tool-1".to_string(), start);
+        watchdog.complete_tool(Some("tool-1"), start + Duration::from_secs(1));
+
+        watchdog.record_forward_progress(start + Duration::from_secs(2));
+        assert_eq!(watchdog.phase, CodexTurnWatchdogPhase::ProviderProgress);
+        assert_eq!(watchdog.expired(start + Duration::from_secs(11)), None);
+        assert_eq!(
+            watchdog
+                .expired(start + Duration::from_secs(12))
+                .unwrap()
+                .phase,
+            CodexTurnWatchdogPhase::ProviderProgress
         );
     }
 
     #[test]
-    fn turn_progress_watchdog_clear_turn_disarms() {
-        let timeout = Duration::from_secs(10);
+    fn turn_progress_watchdog_clear_turn_disarms_and_clears_tools() {
         let start = Instant::now();
-        let mut watchdog = CodexTurnProgressWatchdog::new(timeout);
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
         watchdog.start_turn("turn-1", start);
+        watchdog.start_tool("tool-1".to_string(), start);
         watchdog.clear_turn();
 
-        assert_eq!(watchdog.expired(start + timeout), None);
+        assert!(watchdog.outstanding_tool_ids.is_empty());
+        assert_eq!(watchdog.expired(start + Duration::from_secs(60)), None);
     }
 
     #[test]
@@ -1841,10 +2291,27 @@ mod tests {
     }
 
     #[test]
+    fn watchdog_progress_revision_tracks_each_deadline_refresh() {
+        let start = Instant::now();
+        let mut watchdog =
+            CodexTurnProgressWatchdog::new(Duration::from_secs(10), Duration::from_secs(3));
+        assert_eq!(watchdog.progress_sequence, 0);
+        watchdog.start_turn("turn-1", start);
+        assert_eq!(watchdog.progress_sequence, 1);
+        watchdog.record_forward_progress(start + Duration::from_secs(1));
+        assert_eq!(watchdog.progress_sequence, 2);
+        watchdog.start_tool("tool-1".to_string(), start + Duration::from_secs(2));
+        assert_eq!(watchdog.progress_sequence, 3);
+        watchdog.complete_tool(Some("tool-1"), start + Duration::from_secs(3));
+        assert_eq!(watchdog.progress_sequence, 4);
+    }
+
+    #[test]
     fn late_completion_does_not_clear_newer_provider_turn() {
         let current = Arc::new(Mutex::new(Some("turn-2".to_string())));
         let watchdog = Arc::new(Mutex::new(CodexTurnProgressWatchdog::new(
             Duration::from_secs(10),
+            Duration::from_secs(3),
         )));
         watchdog
             .lock()

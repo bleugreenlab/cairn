@@ -3,20 +3,156 @@
 use crate::error::CairnError;
 use crate::issues::relations;
 use crate::labels::attach;
-use crate::models::{CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus, UpdateIssue};
+use crate::models::{
+    CreateIssue, Issue, IssueAttention, IssueProgress, IssueStatus, Label, UpdateIssue,
+};
 use crate::services::Clock;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use crate::transitions::Resolution;
+use cairn_common::identity::{
+    Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalPosition,
+    PrincipalRef, VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+};
 use cairn_common::ids;
 use cairn_db::turso::params;
 use std::sync::Arc;
 
 const ISSUE_COLUMNS: &str = "id, project_id, number, title, description, status, progress,
     attention, priority, completed_at, dismissed_at, created_at, updated_at, model,
-    merged_at, closed_at, parent_issue_id, parent_thread_id";
+    merged_at, closed_at, parent_issue_id, parent_thread_id, author_principal_json,
+    appearance_snapshot_json";
 
 fn db_internal(message: impl Into<String>) -> DbError {
     DbError::internal(message.into())
+}
+
+/// Capture authorship for a decision made autonomously by this Cairn installation.
+///
+/// The stable installation device is the actor. `LocalInvoke` records that the
+/// decision arose inside the local process, while an unverified record avoids
+/// fabricating a human, agent, credential, or external authentication event.
+pub fn installation_machine_authorship(
+    device_id: impl Into<String>,
+    decided_at: i64,
+) -> DbResult<IssueAuthorship> {
+    let author = PrincipalRef::Machine {
+        device_id: device_id.into(),
+    };
+    let verification = VerificationRecord::new(
+        VerificationMethod::DesktopCredential,
+        VerificationStatus::None,
+        None,
+        None,
+        None,
+        None,
+        VerificationStrength::new("local_process")
+            .map_err(|e| db_internal(format!("invalid installation verification: {e}")))?,
+        decided_at,
+    )
+    .map_err(|e| db_internal(format!("invalid installation verification: {e}")))?;
+    let evidence = AppearanceEvidence::new(
+        AppearanceTransport::LocalInvoke,
+        Address::None,
+        verification,
+        decided_at,
+        None,
+    )
+    .map_err(|e| db_internal(format!("invalid installation appearance evidence: {e}")))?;
+    let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None)
+        .map_err(|e| db_internal(format!("invalid installation appearance snapshot: {e}")))?;
+    IssueAuthorship::new(author, appearance)
+}
+
+/// Validated, immutable provenance captured when an issue is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueAuthorship {
+    pub author: PrincipalRef,
+    pub appearance: AppearanceSnapshot,
+}
+
+impl IssueAuthorship {
+    pub fn new(author: PrincipalRef, appearance: AppearanceSnapshot) -> DbResult<Self> {
+        author
+            .validate_at(PrincipalPosition::DecisionActor)
+            .map_err(|e| db_internal(format!("invalid issue author: {e}")))?;
+        appearance
+            .validate()
+            .map_err(|e| db_internal(format!("invalid issue appearance snapshot: {e}")))?;
+        if appearance.principal() != &author {
+            return Err(db_internal(
+                "issue author does not match appearance snapshot principal",
+            ));
+        }
+        Ok(Self { author, appearance })
+    }
+}
+
+pub fn encode_issue_authorship(authorship: &IssueAuthorship) -> DbResult<(String, String)> {
+    let validated = IssueAuthorship::new(authorship.author.clone(), authorship.appearance.clone())?;
+    let author_json = serde_json::to_string(&validated.author)
+        .map_err(|e| db_internal(format!("issue author is not serializable: {e}")))?;
+    let appearance_json = serde_json::to_string(&validated.appearance).map_err(|e| {
+        db_internal(format!(
+            "issue appearance snapshot is not serializable: {e}"
+        ))
+    })?;
+    Ok((author_json, appearance_json))
+}
+
+pub fn decode_issue_authorship(
+    author_json: Option<String>,
+    appearance_json: Option<String>,
+) -> DbResult<Option<IssueAuthorship>> {
+    match (author_json, appearance_json) {
+        (None, None) => Ok(None),
+        (Some(author_json), Some(appearance_json)) => {
+            let author = serde_json::from_str::<PrincipalRef>(&author_json)
+                .map_err(|e| db_internal(format!("unreadable issue author: {e}")))?;
+            let appearance = serde_json::from_str::<AppearanceSnapshot>(&appearance_json)
+                .map_err(|e| db_internal(format!("unreadable issue appearance snapshot: {e}")))?;
+            IssueAuthorship::new(author, appearance).map(Some)
+        }
+        _ => Err(db_internal(
+            "issue authorship must contain both author and appearance snapshot or neither",
+        )),
+    }
+}
+
+/// Return only the rows that can contribute to the Nav/tray active projection.
+///
+/// Callers merge one bounded result from each open database and truncate the
+/// global ordering. Keeping the visibility predicate and ordering in this one
+/// query prevents the tray from developing a second definition of the Nav list.
+pub async fn list_sidebar_active(
+    db: &LocalDb,
+    limit: usize,
+) -> Result<Vec<crate::models::SidebarActiveIssue>, CairnError> {
+    db.query_all(
+        "SELECT p.id, p.name, i.number, i.title,
+                CASE i.status WHEN 'active' THEN 0 ELSE 1 END
+         FROM projects p
+         JOIN issues i ON i.project_id = p.id
+         WHERE p.hidden = 0
+           AND NOT (p.is_workspace != 0 AND p.workspace_id != 'default')
+           AND i.dismissed_at IS NULL
+           AND i.status IN ('active', 'waiting')
+         ORDER BY p.name ASC,
+                  CASE i.status WHEN 'active' THEN 0 ELSE 1 END ASC,
+                  i.number DESC
+         LIMIT ?1",
+        params![limit as i64],
+        |row| {
+            Ok(crate::models::SidebarActiveIssue {
+                project_id: row.text(0)?,
+                project_name: row.text(1)?,
+                issue_number: row.i64(2)? as i32,
+                issue_title: row.text(3)?,
+                status_rank: row.i64(4)? as i32,
+            })
+        },
+    )
+    .await
+    .map_err(CairnError::from)
 }
 
 /// Resolve the database that owns the issue with this `id`. An O(1) prefix parse,
@@ -51,9 +187,10 @@ pub async fn create_routed(
     dbs: &crate::db::DbState,
     clock: &dyn Clock,
     input: CreateIssue,
+    authorship: IssueAuthorship,
 ) -> Result<(Issue, Arc<LocalDb>), CairnError> {
     let owning_db = crate::projects::crud::owning_db(dbs, &input.project_id).await?;
-    let issue = create(&owning_db, clock, input).await?;
+    let issue = create(&owning_db, clock, input, authorship).await?;
     Ok((issue, owning_db))
 }
 
@@ -82,6 +219,7 @@ pub async fn list_children(db: &LocalDb, parent_issue_id: &str) -> Result<Vec<Is
 }
 
 fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
+    let authorship = decode_issue_authorship(row.opt_text(18)?, row.opt_text(19)?)?;
     Ok(Issue {
         id: row.text(0)?,
         project_id: row.text(1)?,
@@ -96,6 +234,7 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
         dismissed_at: row.opt_i64(10)?,
         created_at: row.i64(11)?,
         updated_at: row.i64(12)?,
+        author: authorship.map(|value| value.author),
         backend_override: row.opt_text(13)?,
         merged_at: row.opt_i64(14)?,
         closed_at: row.opt_i64(15)?,
@@ -183,11 +322,92 @@ pub(crate) async fn load_conn(conn: &cairn_db::turso::Connection, id: &str) -> D
         .ok_or_else(|| db_internal(format!("issue not found: {id}")))
 }
 
+/// Additional immutable relationships established by the canonical issue insert.
+#[derive(Debug, Clone, Default)]
+pub struct IssueCreationContext {
+    pub parent_uri: Option<String>,
+    pub inferred_parent_thread_id: Option<String>,
+    pub parent_job_id: Option<String>,
+}
+
+/// The parent an issue hangs from: exactly one of another issue or a thread.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ParentEdge {
+    Issue(String),
+    Thread(String),
+}
+
+pub(crate) async fn resolve_parent_edge(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    parent_uri: &str,
+) -> DbResult<ParentEdge> {
+    let resolved_issue = match cairn_common::uri::parse_uri(parent_uri) {
+        Some(cairn_common::uri::CairnResource::Issue { .. }) => {
+            relations::resolve_issue_uri(conn, parent_uri).await?
+        }
+        _ => None,
+    };
+    if let Some(resolved) = resolved_issue {
+        let mut rows = conn
+            .query(
+                "SELECT project_id FROM issues WHERE id = ?1 LIMIT 1",
+                params![resolved.issue_id.as_str()],
+            )
+            .await?;
+        let parent_project_id = rows
+            .next()
+            .await?
+            .ok_or_else(|| DbError::Row(format!("parent issue or thread not found: {parent_uri}")))?
+            .text(0)?;
+        if parent_project_id != project_id {
+            return Err(DbError::Row(format!(
+                "parent issue or thread must be in the same project: {parent_uri}"
+            )));
+        }
+        return Ok(ParentEdge::Issue(resolved.issue_id));
+    }
+    if let Some((thread_id, thread_project_id, _)) =
+        crate::threads::resolve_parent_thread_uri_conn(conn, parent_uri).await?
+    {
+        if thread_project_id != project_id {
+            return Err(DbError::Row(format!(
+                "parent issue or thread must be in the same project: {parent_uri}"
+            )));
+        }
+        return Ok(ParentEdge::Thread(thread_id));
+    }
+    Err(DbError::Row(format!(
+        "parent issue or thread not found: {parent_uri}"
+    )))
+}
+
 pub async fn create(
     db: &LocalDb,
     clock: &dyn Clock,
     input: CreateIssue,
+    authorship: IssueAuthorship,
 ) -> Result<Issue, CairnError> {
+    let (issue, _) = create_with_context(
+        db,
+        clock,
+        input,
+        authorship,
+        IssueCreationContext::default(),
+    )
+    .await?;
+    Ok(issue)
+}
+
+/// Allocate and insert one issue, including provenance, parent edges and labels,
+/// in a single transaction. All issue creation paths terminate here.
+pub async fn create_with_context(
+    db: &LocalDb,
+    clock: &dyn Clock,
+    input: CreateIssue,
+    authorship: IssueAuthorship,
+    context: IssueCreationContext,
+) -> Result<(Issue, Vec<Label>), CairnError> {
     let CreateIssue {
         project_id,
         title,
@@ -197,6 +417,7 @@ pub async fn create(
     } = input;
     let id = ids::mint_child(&project_id);
     let now = clock.now();
+    let (author_json, appearance_json) = encode_issue_authorship(&authorship)?;
 
     db.write(|conn| {
         let id = id.clone();
@@ -205,7 +426,24 @@ pub async fn create(
         let description = description.clone();
         let backend_override = backend_override.clone();
         let label_ids = label_ids.clone();
+        let context = context.clone();
+        let author_json = author_json.clone();
+        let appearance_json = appearance_json.clone();
         Box::pin(async move {
+            let (parent_issue_id, parent_thread_id) = match context.parent_uri.as_deref() {
+                Some(parent_uri) => match resolve_parent_edge(conn, &project_id, parent_uri).await?
+                {
+                    ParentEdge::Issue(id) => (Some(id), None),
+                    ParentEdge::Thread(id) => (None, Some(id)),
+                },
+                None => (None, context.inferred_parent_thread_id),
+            };
+            let parent_job_id = if parent_issue_id.is_some() {
+                context.parent_job_id
+            } else {
+                None
+            };
+
             let mut rows = conn
                 .query(
                     "SELECT next_issue_number FROM projects WHERE id = ?1",
@@ -216,19 +454,20 @@ pub async fn create(
                 DbError::Row(format!("project not found: {}", project_id.as_str()))
             })?;
             let number = row.opt_i64(0)?.unwrap_or(1) as i32;
-
             conn.execute(
                 "UPDATE projects SET next_issue_number = ?1, updated_at = ?2 WHERE id = ?3",
                 params![number + 1, now, project_id.as_str()],
             )
             .await?;
-
             conn.execute(
                 "INSERT INTO issues (
                     id, project_id, number, title, description, status, progress, attention,
-                    priority, created_at, updated_at, model
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7)",
+                    priority, created_at, updated_at, model, parent_issue_id, parent_job_id,
+                    parent_thread_id, author_principal_json, appearance_snapshot_json
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, 'backlog', 'backlog', 'none', 0, ?6, ?6, ?7,
+                    ?8, ?9, ?10, ?11, ?12
+                 )",
                 params![
                     id.as_str(),
                     project_id.as_str(),
@@ -236,43 +475,23 @@ pub async fn create(
                     title.as_str(),
                     description.as_deref(),
                     now,
-                    backend_override.as_deref()
+                    backend_override.as_deref(),
+                    parent_issue_id.as_deref(),
+                    parent_job_id.as_deref(),
+                    parent_thread_id.as_deref(),
+                    author_json.as_str(),
+                    appearance_json.as_str()
                 ],
             )
             .await?;
-
-            if let Some(labels) = label_ids {
-                attach::replace_issue_labels(conn, &id, &labels, now)
+            let created_labels = match label_ids {
+                Some(labels) => attach::replace_issue_labels(conn, &id, &labels, now)
                     .await
-                    .map_err(DbError::Row)?;
-            }
-
-            let mut issue = Issue {
-                id,
-                project_id,
-                number,
-                title,
-                description: description.unwrap_or_default(),
-                status: IssueStatus::Backlog,
-                progress: IssueProgress::Backlog,
-                attention: IssueAttention::None,
-                priority: 0,
-                completed_at: None,
-                dismissed_at: None,
-                created_at: now,
-                updated_at: now,
-                backend_override,
-                merged_at: None,
-                closed_at: None,
-                parent_issue_id: None,
-                parent_thread_id: None,
-                unmet_dependency_count: 0,
-                depends_on: Vec::new(),
-                unmet_depends_on: Vec::new(),
-                labels: Vec::new(),
+                    .map_err(DbError::Row)?,
+                None => Vec::new(),
             };
-            hydrate_issue_relations(conn, std::slice::from_mut(&mut issue)).await?;
-            Ok(issue)
+            let issue = load_conn(conn, &id).await?;
+            Ok((issue, created_labels))
         })
     })
     .await
@@ -559,6 +778,133 @@ pub async fn delete_db(db: &LocalDb, issue_id: &str) -> Result<(), CairnError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceTransport, VerificationMethod, VerificationRecord,
+        VerificationStatus, VerificationStrength,
+    };
+
+    fn authorship(author: PrincipalRef) -> IssueAuthorship {
+        let verification = VerificationRecord::new(
+            VerificationMethod::NodeSession,
+            VerificationStatus::Verified,
+            None,
+            None,
+            Some("session-1".into()),
+            None,
+            VerificationStrength::new("session-bound").unwrap(),
+            1,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::ResourcePatch,
+            Address::Resource {
+                node: "cairn://p/demo/1/1/builder".into(),
+            },
+            verification,
+            2,
+            None,
+        )
+        .unwrap();
+        IssueAuthorship::new(
+            author.clone(),
+            AppearanceSnapshot::new(author, evidence, Vec::new(), None).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn installation_machine_authorship_is_local_and_decision_timed() {
+        let authorship = installation_machine_authorship("installation-1", 42).unwrap();
+        assert_eq!(
+            authorship.author,
+            PrincipalRef::Machine {
+                device_id: "installation-1".into()
+            }
+        );
+        let evidence = authorship.appearance.evidence();
+        assert_eq!(evidence.transport, AppearanceTransport::LocalInvoke);
+        assert_eq!(evidence.address, Address::None);
+        assert_eq!(evidence.at, 42);
+        assert_eq!(evidence.verification.status(), VerificationStatus::None);
+        assert_eq!(evidence.verification.verified_at(), 42);
+        assert_eq!(evidence.verification.strength().as_str(), "local_process");
+        assert!(authorship.appearance.delegation().is_empty());
+        assert!(authorship.appearance.terminal_represented().is_none());
+
+        assert!(installation_machine_authorship("", 42).is_err());
+        assert!(installation_machine_authorship("installation-1", -1).is_err());
+    }
+
+    #[test]
+    fn issue_authorship_codec_is_paired_and_fail_closed() {
+        let valid = authorship(PrincipalRef::Agent {
+            node: "cairn://p/demo/1/1/builder".into(),
+            run_id: Some("run-1".into()),
+        });
+        let (author_json, appearance_json) = encode_issue_authorship(&valid).unwrap();
+        assert_eq!(
+            decode_issue_authorship(Some(author_json.clone()), Some(appearance_json.clone()))
+                .unwrap(),
+            Some(valid)
+        );
+        assert_eq!(decode_issue_authorship(None, None).unwrap(), None);
+        assert!(decode_issue_authorship(Some(author_json.clone()), None).is_err());
+        assert!(decode_issue_authorship(None, Some(appearance_json.clone())).is_err());
+        assert!(decode_issue_authorship(Some("{}".into()), Some(appearance_json.clone())).is_err());
+        assert!(decode_issue_authorship(
+            Some(
+                serde_json::to_string(&PrincipalRef::Machine {
+                    device_id: "other".into()
+                })
+                .unwrap()
+            ),
+            Some(appearance_json)
+        )
+        .is_err());
+        assert!(IssueAuthorship::new(
+            PrincipalRef::Agent {
+                node: "cairn://p/demo/1/1/builder".into(),
+                run_id: None,
+            },
+            authorship(PrincipalRef::Machine {
+                device_id: "machine".into(),
+            })
+            .appearance,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn sidebar_active_query_is_visible_ordered_and_bounded() {
+        let db = crate::storage::migrated_test_db("sidebar-active-query.db").await;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+            VALUES('team-1', 'Team', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, hidden, is_workspace, created_at, updated_at)
+            VALUES
+              ('alpha', 'default', 'Alpha', 'ALP', '/tmp/alpha', 0, 0, 1, 1),
+              ('hidden', 'default', 'Hidden', 'HID', '/tmp/hidden', 1, 0, 1, 1),
+              ('team-home', 'team-1', 'Team config', 'TEAM', '/tmp/team', 0, 1, 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+            VALUES
+              ('waiting-high', 'alpha', 99, 'Waiting high', 'waiting', 'waiting', 'none', 1, 1),
+              ('active-low', 'alpha', 1, 'Active low', 'active', 'active', 'none', 1, 1),
+              ('dismissed', 'alpha', 2, 'Dismissed', 'active', 'active', 'none', 1, 1),
+              ('hidden-issue', 'hidden', 1, 'Hidden', 'active', 'active', 'none', 1, 1),
+              ('team-home-issue', 'team-home', 1, 'Config', 'active', 'active', 'none', 1, 1);
+            UPDATE issues SET dismissed_at = 2 WHERE id = 'dismissed';",
+        )
+        .await
+        .unwrap();
+
+        let rows = list_sidebar_active(&db, 2).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].issue_title, "Active low");
+        assert_eq!(rows[0].status_rank, 0);
+        assert_eq!(rows[1].issue_title, "Waiting high");
+        assert_eq!(rows[1].status_rank, 1);
+    }
 
     async fn seeded_relation_db() -> LocalDb {
         let db = crate::storage::migrated_test_db("issue-list-relations.db").await;
@@ -629,7 +975,7 @@ mod tests {
         );
         assert_eq!(
             issue_one.unmet_depends_on,
-            vec!["cairn://p/TWO/1", "cairn://p/MISSING/9"]
+            vec!["cairn://p/two/1", "cairn://p/missing/9"]
         );
         assert_eq!(issue_one.unmet_dependency_count, 2);
         assert_eq!(
@@ -759,7 +1105,7 @@ mod tests {
         db.execute_script(
             "
             INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1);
+             VALUES ('project-1', 'default', 'Project', 'prj', '/tmp/prj', 1, 1);
             INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
              VALUES ('issue-1', 'project-1', 1, 'Issue', 1, 1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -795,7 +1141,7 @@ mod tests {
         db.execute_script(
             "
             INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1);
+             VALUES ('project-1', 'default', 'Project', 'prj', '/tmp/prj', 1, 1);
             INSERT INTO issues(id, project_id, number, title, created_at, updated_at)
              VALUES ('issue-1', 'project-1', 1, 'Issue', 1, 1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)

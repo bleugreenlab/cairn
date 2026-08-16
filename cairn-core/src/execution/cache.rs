@@ -1937,11 +1937,16 @@ pub(crate) async fn resolve_job_logical_head(
         .await
         .map_err(|error| error.to_string())?;
     let repository = std::path::PathBuf::from(repository);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &repository);
-    let coordinate_repository = if crate::jj::is_jj_dir(&store) {
-        store
-    } else {
-        repository
+    let coordinate_repository = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = repository.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("logical head coordinate repository task failed: {error}"))??
     };
     cairn_vcs::resolve_coordinate(&coordinate_repository, &branch)
         .await
@@ -2754,7 +2759,7 @@ mod tests {
             launched,
             OBSERVED_INFRA_FAILURE_BOUND + 1,
             "exactly one un-deduplicated concurrent first attempt above the bound \
-             — the overshoot CAIRN-3271 removes"
+             — the overshoot cairn-3271 removes"
         );
     }
 

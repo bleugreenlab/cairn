@@ -964,7 +964,7 @@ mod tests {
         // `\.` is a regex escape and not a JSON one, so the payload dies on a
         // grep pattern that reached the wire singly escaped.
         let raw =
-            r#"{"paths": ["cairn://p/CAIRN/2802/1/coordinator/chat?grep=\.cairn/logs|jsonl"]}"#;
+            r#"{"paths": ["cairn://p/cairn/2802/1/coordinator/chat?grep=\.cairn/logs|jsonl"]}"#;
         assert_eq!(defect_of(raw), InputDefect::InvalidEscape);
     }
 

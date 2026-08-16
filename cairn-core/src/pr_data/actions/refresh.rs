@@ -1052,7 +1052,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-u', 'default', 'P', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-u', 'default', 'P', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -1076,7 +1076,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, body, source_branch, target_branch, status, opened_at, updated_at, is_local, github_pr_number, additions, deletions)
-                     VALUES ('mr-u', ?1, 'proj-u', 'issue-u', 'A change', 'Body', 'agent/PROJ-1-builder', 'main', 'open', 1, 1, 0, ?2, 2126840, 30)",
+                     VALUES ('mr-u', ?1, 'proj-u', 'issue-u', 'A change', 'Body', 'agent/proj-1-builder', 'main', 'open', 1, 1, 0, ?2, 2126840, 30)",
                     params![job_id.as_str(), recorded_number],
                 )
                 .await?;
@@ -1213,7 +1213,7 @@ mod tests {
                 Box::pin(async move {
                     conn.execute(
                         "INSERT INTO action_runs (id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, error_message, completed_at, created_at, parent_job_id)
-                         VALUES ('ar-u', 'exec-u', 'pr', 'builtin:pr', 'issue-u', 'proj-u', 'failed', 'gh pr create failed: No commits between main and agent/PROJ-1-builder', 5, 2, 'job-u')",
+                         VALUES ('ar-u', 'exec-u', 'pr', 'builtin:pr', 'issue-u', 'proj-u', 'failed', 'gh pr create failed: No commits between main and agent/proj-1-builder', 5, 2, 'job-u')",
                         (),
                     )
                     .await?;
@@ -1248,7 +1248,7 @@ mod tests {
                 Box::pin(async move {
                     conn.execute(
                         "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                         VALUES ('proj-l', 'default', 'P', 'PROJ', '/repo', 'main', 1, 1)",
+                         VALUES ('proj-l', 'default', 'P', 'proj', '/repo', 'main', 1, 1)",
                         (),
                     )
                     .await?;
@@ -1260,7 +1260,7 @@ mod tests {
                     .await?;
                     conn.execute(
                         "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, is_local)
-                         VALUES ('mr-l', 'job-l', 'proj-l', 'issue-l', 'A change', 'agent/PROJ-1-builder', 'main', 'open', 1, 1, 1)",
+                         VALUES ('mr-l', 'job-l', 'proj-l', 'issue-l', 'A change', 'agent/proj-1-builder', 'main', 'open', 1, 1, 1)",
                         (),
                     )
                     .await?;
@@ -1391,7 +1391,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-r', 'default', 'P', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-r', 'default', 'P', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -1403,7 +1403,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
-                     VALUES ('mr-r', ?1, 'proj-r', 'issue-r', 'Team PR', 'agent/PROJ-1-builder', 'main', 'closed', 1, 1)",
+                     VALUES ('mr-r', ?1, 'proj-r', 'issue-r', 'Team PR', 'agent/proj-1-builder', 'main', 'closed', 1, 1)",
                     params![job_id.as_str()],
                 )
                 .await?;

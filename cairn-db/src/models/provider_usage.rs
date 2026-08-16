@@ -127,9 +127,9 @@ impl ProviderUsageSnapshot {
 
     /// Relative richness of this snapshot for the Backends usage panel.
     ///
-    /// The manual probe sources carry the canonical 5-hour + weekly windows;
-    /// the live Claude `rate_limit_event` only carries a single coarse status
-    /// window. The store path uses this so a coarse live snapshot never
+    /// Claude's usage endpoint and Codex's rate-limit report carry the
+    /// canonical 5-hour + weekly windows; the live Claude `rate_limit_event`
+    /// only carries a single coarse status window. The store path uses this so a coarse live snapshot never
     /// downgrades a richer one already on display, keeping the panel's shape
     /// stable regardless of which source last fired. Errors and unsupported
     /// results rank lowest so a real snapshot always wins over a failed probe.
@@ -138,7 +138,7 @@ impl ProviderUsageSnapshot {
             return 0;
         }
         match self.source.as_str() {
-            "claude_usage_tui" | "codex_rate_limits" => 2,
+            "claude_usage_oauth" | "codex_rate_limits" => 2,
             _ => 1,
         }
     }
@@ -191,14 +191,14 @@ mod tests {
         assert_eq!(json["modelBreakdown"][0]["runs"], 3);
 
         // A window-based snapshot omits the key entirely (Claude/Codex unchanged).
-        let without = snapshot("claude_usage_tui");
+        let without = snapshot("claude_usage_oauth");
         let json = serde_json::to_value(&without).unwrap();
         assert!(json.get("modelBreakdown").is_none());
     }
 
     #[test]
     fn panel_rank_prefers_rich_probe_sources_over_coarse_live() {
-        assert_eq!(snapshot("claude_usage_tui").panel_rank(), 2);
+        assert_eq!(snapshot("claude_usage_oauth").panel_rank(), 2);
         assert_eq!(snapshot("codex_rate_limits").panel_rank(), 2);
         assert_eq!(snapshot("claude_rate_limit_event").panel_rank(), 1);
     }
@@ -206,11 +206,11 @@ mod tests {
     #[test]
     fn panel_rank_zero_for_error_and_unsupported() {
         assert_eq!(
-            ProviderUsageSnapshot::error("claude", "claude_usage_tui", "boom", None).panel_rank(),
+            ProviderUsageSnapshot::error("claude", "claude_usage_oauth", "boom", None).panel_rank(),
             0
         );
         assert_eq!(
-            ProviderUsageSnapshot::unsupported("claude", "claude_usage_tui", "nope").panel_rank(),
+            ProviderUsageSnapshot::unsupported("claude", "claude_usage_oauth", "nope").panel_rank(),
             0
         );
     }

@@ -234,17 +234,21 @@ pub struct BranchRange {
 /// `integration_target` is what `jobs.base_branch` records. An unresolvable
 /// endpoint is an error, never a silent fall back to a recorded coordinate.
 pub async fn live_branch_range(
+    jj_binary_path: &str,
     config_dir: &Path,
     repo_path: &Path,
     branch: &str,
     integration_target: &str,
 ) -> Result<BranchRange, String> {
-    let managed_store = crate::jj::project_store_dir(config_dir, repo_path);
-    let repository = if crate::jj::is_jj_dir(&managed_store) {
-        managed_store
-    } else {
-        repo_path.to_path_buf()
-    };
+    let jj_binary_path = jj_binary_path.to_string();
+    let config_dir = config_dir.to_path_buf();
+    let project_repo = repo_path.to_path_buf();
+    let repository = tokio::task::spawn_blocking(move || {
+        let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+        crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+    })
+    .await
+    .map_err(|error| format!("coordinate repository task failed: {error}"))??;
     let resolved = cairn_vcs::merge_base(&repository, branch, integration_target)
         .await
         .map_err(|error| format!("resolving '{branch}' against '{integration_target}': {error}"))?;
@@ -270,6 +274,7 @@ pub async fn live_branch_range(
 pub async fn live_job_branch_range(
     db: &LocalDb,
     job_id: &str,
+    jj_binary_path: &str,
     config_dir: &Path,
 ) -> Result<Option<BranchRange>, String> {
     let Some(coords) = load_diff_coords(db, job_id)
@@ -282,6 +287,7 @@ pub async fn live_job_branch_range(
         return Ok(None);
     };
     live_branch_range(
+        jj_binary_path,
         config_dir,
         Path::new(&coords.repo_path),
         branch,
@@ -327,6 +333,7 @@ async fn load_execution_history(
 pub async fn node_base_tip_diff(
     db: &LocalDb,
     job_id: &str,
+    jj_binary_path: &str,
     config_dir: &Path,
 ) -> Result<Option<NodeDiff>, String> {
     let Some(coords) = load_diff_coords(db, job_id)
@@ -338,7 +345,15 @@ pub async fn node_base_tip_diff(
     let repo = Path::new(&coords.repo_path);
     let live = match coords.branch.as_deref() {
         Some(branch) => {
-            match live_branch_range(config_dir, repo, branch, &coords.integration_target).await {
+            match live_branch_range(
+                jj_binary_path,
+                config_dir,
+                repo,
+                branch,
+                &coords.integration_target,
+            )
+            .await
+            {
                 Ok(range) => Some(range),
                 Err(error) => {
                     log::debug!("node {job_id} has no live diff range: {error}");
@@ -450,7 +465,7 @@ mod tests {
                     .await?;
                     conn.execute(
                         "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                         VALUES ('proj','ws','p','P',?1,'main',1,1)",
+                         VALUES ('proj','ws','P','p',?1,'main',1,1)",
                         (repo_path.as_str(),),
                     )
                     .await?;
@@ -510,6 +525,46 @@ mod tests {
         }
 
         #[tokio::test]
+        #[serial_test::serial(jj)]
+        async fn thread_style_job_creates_coordinate_store_on_demand() {
+            let Some(bin) = crate::jj::tests::jj_bin() else {
+                eprintln!(
+                    "skipping thread_style_job_creates_coordinate_store_on_demand: jj not resolvable"
+                );
+                return;
+            };
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            crate::jj::tests::init_project(project.path());
+
+            let db = migrated_db().await;
+            seed_worktree_group(&db, project.path().to_str().unwrap(), "main").await;
+            db.execute(
+                "UPDATE jobs SET execution_id = NULL, recipe_node_id = NULL WHERE id = 'owner'",
+                (),
+            )
+            .await
+            .unwrap();
+
+            let store = crate::jj::project_store_dir(home.path(), project.path());
+            assert!(
+                !crate::jj::is_jj_dir(&store),
+                "the fixture must start without a managed store"
+            );
+
+            let range = live_job_branch_range(&db, "owner", &bin, home.path())
+                .await
+                .unwrap()
+                .expect("the thread-style job has a branch coordinate");
+
+            assert_eq!(range.base, range.tip);
+            assert!(
+                crate::jj::is_jj_dir(&store),
+                "coordinate resolution must create the managed store on first use"
+            );
+        }
+
+        #[tokio::test]
         async fn change_summary_aggregates_across_branch_children() {
             let db = migrated_db().await;
             seed_worktree_group(&db, "/repo", "agent/test").await;
@@ -545,7 +600,7 @@ mod tests {
             // execution history, so neither endpoint resolves and the surface
             // reports the diff as unavailable rather than inventing a base.
             seed_worktree_group(&db, "/nonexistent/repo", "agent/test").await;
-            let diff = node_base_tip_diff(&db, "owner", std::path::Path::new("/tmp"))
+            let diff = node_base_tip_diff(&db, "owner", "", std::path::Path::new("/tmp"))
                 .await
                 .unwrap();
             assert!(diff.is_none());
@@ -613,14 +668,14 @@ mod tests {
             crate::jj::tests::init_project(project.path());
             let jj = crate::jj::JjEnv::resolve(&bin, home.path());
             let store = crate::jj::project_store_dir(home.path(), project.path());
-            let branch = "agent/CAIRN-3150-builder";
+            let branch = "agent/cairn-3150-builder";
             let cut_coordinate =
                 advance_base_under_branch(&jj, &store, project.path(), workspaces.path(), branch);
 
             let db = migrated_db().await;
             seed_worktree_group(&db, project.path().to_str().unwrap(), branch).await;
 
-            let diff = node_base_tip_diff(&db, "owner", home.path())
+            let diff = node_base_tip_diff(&db, "owner", &bin, home.path())
                 .await
                 .unwrap()
                 .expect("the live range resolves from the store");
@@ -648,7 +703,7 @@ mod tests {
             )
             .unwrap();
 
-            let rebased = node_base_tip_diff(&db, "owner", home.path())
+            let rebased = node_base_tip_diff(&db, "owner", &bin, home.path())
                 .await
                 .unwrap()
                 .expect("the live range resolves after a rebase");
@@ -717,7 +772,7 @@ mod tests {
             crate::jj::tests::init_project(project.path());
             let jj = crate::jj::JjEnv::resolve(&bin, home.path());
             let store = crate::jj::project_store_dir(home.path(), project.path());
-            let branch = "agent/CAIRN-3224-builder";
+            let branch = "agent/cairn-3224-builder";
             let cut_coordinate =
                 advance_base_under_branch(&jj, &store, project.path(), workspaces.path(), branch);
 
@@ -731,7 +786,7 @@ mod tests {
             .await
             .unwrap();
 
-            let before = live_job_branch_range(&db, "owner", home.path())
+            let before = live_job_branch_range(&db, "owner", &bin, home.path())
                 .await
                 .unwrap()
                 .expect("the branch has a live range");
@@ -754,7 +809,7 @@ mod tests {
             )
             .unwrap();
 
-            let after = live_job_branch_range(&db, "owner", home.path())
+            let after = live_job_branch_range(&db, "owner", &bin, home.path())
                 .await
                 .unwrap()
                 .expect("the branch has a live range after the rebase");

@@ -53,7 +53,7 @@ async fn seed_job_row(db: &LocalDb, review_state: Option<&str>, is_task: bool) {
             let review_state = review_state.map(str::to_string);
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-review','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-review','w-review','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-review','p-review',2,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-review','recipe','i-review','p-review','running',1,1)", ()).await?;
                 let parent_job_id = if is_task {
@@ -212,11 +212,11 @@ async fn review_artifact_ref_nests_subtask_artifact_under_parent_task() {
     let db = test_db().await;
     seed_job_row(&db, None, false).await;
     insert_artifact(&db).await;
-    let (node_uri, _fp) = review_artifact_ref(&db, "PRJ", 2, "j-review")
+    let (node_uri, _fp) = review_artifact_ref(&db, "prj", 2, "j-review")
         .await
         .unwrap()
         .expect("artifact ref for node job");
-    assert_eq!(node_uri, "cairn://p/PRJ/2/1/builder/create-pr");
+    assert_eq!(node_uri, "cairn://p/prj/2/1/builder/create-pr");
     assert!(
         matches!(
             parse_uri(&node_uri),
@@ -230,13 +230,13 @@ async fn review_artifact_ref_nests_subtask_artifact_under_parent_task() {
     let task_db = test_db().await;
     seed_job_row(&task_db, None, true).await;
     insert_artifact(&task_db).await;
-    let (task_uri, _fp) = review_artifact_ref(&task_db, "PRJ", 2, "j-review")
+    let (task_uri, _fp) = review_artifact_ref(&task_db, "prj", 2, "j-review")
         .await
         .unwrap()
         .expect("artifact ref for task job");
     assert_eq!(
         task_uri,
-        "cairn://p/PRJ/2/1/coordinator/task/builder/create-pr"
+        "cairn://p/prj/2/1/coordinator/task/builder/create-pr"
     );
     assert!(
         task_uri.contains("/task/"),
@@ -259,8 +259,8 @@ async fn review_artifact_ref_nests_subtask_artifact_under_parent_task() {
     // The old flat form named the task's own segment as a top-level node;
     // that URI cannot resolve to the sub-task job.
     let broken =
-        cairn_common::uri::build_node_artifact_uri_named("PRJ", 2, 1, "builder", Some("create-pr"));
-    assert_eq!(broken, "cairn://p/PRJ/2/1/builder/create-pr");
+        cairn_common::uri::build_node_artifact_uri_named("prj", 2, 1, "builder", Some("create-pr"));
+    assert_eq!(broken, "cairn://p/prj/2/1/builder/create-pr");
     assert_ne!(broken, task_uri);
 }
 

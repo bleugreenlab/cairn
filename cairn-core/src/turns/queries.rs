@@ -23,6 +23,52 @@ pub struct NewTurn<'a> {
     updated_at: i32,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolutionProvenance {
+    pub id: String,
+    pub surface: cairn_common::identity::AppearanceTransport,
+    pub provider: Option<String>,
+    pub conversation: Option<String>,
+    pub actor: Option<String>,
+}
+
+impl ResolutionProvenance {
+    pub fn new(
+        surface: cairn_common::identity::AppearanceTransport,
+        actor: Option<String>,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            surface,
+            provider: None,
+            conversation: None,
+            actor,
+        }
+    }
+
+    pub fn surface_name(&self) -> String {
+        serde_json::to_string(&self.surface)
+            .expect("AppearanceTransport serialization cannot fail")
+            .trim_matches('"')
+            .to_string()
+    }
+}
+
+#[cfg(test)]
+mod resolution_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn persists_canonical_appearance_transport_surface() {
+        let provenance = ResolutionProvenance::new(
+            cairn_common::identity::AppearanceTransport::ResourcePatch,
+            Some("cairn://p/CAIRN/1/1/builder".to_string()),
+        );
+
+        assert_eq!(provenance.surface_name(), "resource_patch");
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UpdateTurnChangeset<'a> {
     pub run_id: Option<Option<&'a str>>,
@@ -321,13 +367,16 @@ pub async fn record_prompt_response(
     response: &str,
     answered_at: i32,
     emitter: &dyn EventEmitter,
+    provenance: ResolutionProvenance,
 ) -> Result<HostWaitResume, String> {
     let prompt_id = prompt_id.to_string();
     let response = response.to_string();
+    let provenance_for_write = provenance.clone();
     let resume = db
         .write(|conn| {
             let prompt_id = prompt_id.clone();
             let response = response.clone();
+            let provenance = provenance_for_write.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
@@ -354,11 +403,23 @@ pub async fn record_prompt_response(
                 let duplicate = if already_answered {
                     true
                 } else {
+                    let surface = provenance.surface_name();
                     conn.execute(
                         "UPDATE prompts
-                         SET response = ?1, answered_at = ?2
+                         SET response = ?1, answered_at = ?2, resolution_id = ?4,
+                             resolution_surface = ?5, resolution_provider = ?6,
+                             resolution_conversation = ?7, resolution_actor = ?8
                          WHERE id = ?3 AND response IS NULL",
-                        params![response.as_str(), answered_at, prompt_id.as_str()],
+                        params![
+                            response.as_str(),
+                            answered_at,
+                            prompt_id.as_str(),
+                            provenance.id,
+                            surface,
+                            provenance.provider,
+                            provenance.conversation,
+                            provenance.actor
+                        ],
                     )
                     .await?
                         == 0
@@ -794,7 +855,7 @@ mod tests {
     async fn seed_job_and_turn(db: &LocalDb) {
         db.execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project', 'default', 'Project', 'PRJ', '/repo', 1, 1);
+             VALUES ('project', 'default', 'Project', 'prj', '/repo', 1, 1);
              INSERT INTO jobs (id, project_id, status, current_turn_id, created_at, updated_at)
              VALUES ('job', 'project', 'running', NULL, 1, 1);
              INSERT INTO sessions (id, job_id, backend, status, created_at, updated_at)

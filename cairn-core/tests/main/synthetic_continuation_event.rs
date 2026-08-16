@@ -14,7 +14,7 @@ use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
 
 async fn insert_project_job_run_turn(db: &LocalDb) {
-    let project_id = common::create_project(db, "CONTIN").await;
+    let project_id = common::create_project(db, "contin").await;
     db.write(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {

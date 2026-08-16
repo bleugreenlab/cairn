@@ -1,11 +1,7 @@
 use crate::effects::types::WorkflowEffect;
-use crate::models::{
-    AgentConfig, DelegatedStatus, ExecutionSnapshot, RecipeSnapshot, RecipeTrigger, TriggerContext,
-    TriggerType,
-};
+use crate::models::{AgentConfig, DelegatedStatus};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_common::ids;
 
 use crate::execution::delegation::{
     create_call_packet, create_or_reuse_task_packet, CreateCallPacketInput,
@@ -17,7 +13,6 @@ pub(super) struct ParentRunContext {
     pub(super) run_id: String,
     pub(super) job_id: String,
     pub(super) execution_id: Option<String>,
-    pub(super) issue_id: Option<String>,
     pub(super) project_id: String,
     pub(super) project_key: String,
 }
@@ -129,25 +124,6 @@ pub(super) async fn select_optional_text(
     .await
 }
 
-pub(super) async fn select_optional_i64(
-    db: &LocalDb,
-    sql: &'static str,
-    id: &str,
-) -> DbResult<Option<i64>> {
-    let id = id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn.query(sql, (id.as_str(),)).await?;
-            rows.next()
-                .await?
-                .map(|row| row.opt_i64(0))
-                .transpose()
-                .map(Option::flatten)
-        })
-    })
-    .await
-}
-
 pub(super) async fn project_repo_path(db: &LocalDb, project_id: &str) -> Option<String> {
     select_optional_text(
         db,
@@ -195,7 +171,7 @@ async fn lookup_run_context_by_id(
     let mut rows = conn
         .query(
             "
-            SELECT r.id, r.job_id, j.execution_id, r.issue_id, j.project_id, p.key
+            SELECT r.id, r.job_id, j.execution_id, j.project_id, p.key
             FROM runs r
             JOIN jobs j ON r.job_id = j.id
             JOIN projects p ON j.project_id = p.id
@@ -216,9 +192,8 @@ fn run_context_from_row(row: &cairn_db::turso::Row, _job_type: &str) -> DbResult
         run_id: row.text(0)?,
         job_id: row.text(1)?,
         execution_id: row.opt_text(2)?,
-        issue_id: row.opt_text(3)?,
-        project_id: row.text(4)?,
-        project_key: row.text(5)?,
+        project_id: row.text(3)?,
+        project_key: row.text(4)?,
     })
 }
 
@@ -231,65 +206,42 @@ pub(super) async fn ensure_task_execution_context(
     }
 
     let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id).await?;
-    let existing_execution_id = select_optional_text(
-        &db,
-        "SELECT execution_id FROM jobs WHERE id = ?1",
-        &parent_ctx.job_id,
-    )
-    .await
-    .map_err(|e| format!("Failed to load parent job execution context: {}", e))?;
-    if let Some(execution_id) = existing_execution_id {
+    let job = db
+        .read({
+            let job_id = parent_ctx.job_id.clone();
+            move |conn| {
+                let job_id = job_id.clone();
+                Box::pin(async move { crate::execution::jobs::load_job_conn(conn, &job_id).await })
+            }
+        })
+        .await
+        .map_err(|e| format!("Failed to load parent job execution context: {}", e))?
+        .ok_or_else(|| format!("Parent job not found: {}", parent_ctx.job_id))?;
+    if let Some(execution_id) = job.execution_id.clone() {
         return Ok(execution_id);
     }
 
-    let now = chrono::Utc::now().timestamp() as i32;
-
-    let snapshot = ExecutionSnapshot {
-        branch_target: Default::default(),
-        // A synthetic delegation host runs no agent node of its own, so there is
-        // nothing for a routing table to have decided.
-        model_routing: None,
-        recipe: RecipeSnapshot {
-            id: format!("delegation-{}", parent_ctx.job_id),
-            name: "Delegated Work".to_string(),
-            description: Some("Synthetic execution for task delegation".to_string()),
-            trigger: RecipeTrigger::Manual,
-            nodes: vec![],
-            edges: vec![],
-        },
-        agents: std::collections::HashMap::new(),
-        skills: std::collections::HashMap::new(),
-        trigger_context: TriggerContext {
-            issue_id: parent_ctx.issue_id.clone(),
-            project_id: parent_ctx.project_id.clone(),
-            trigger_type: TriggerType::Manual,
-            event_payload: None,
-            initiated_via: None,
-        },
-        presets: None,
-        delegated_packets: vec![],
-        created_at: now as i64,
-    };
-    let snapshot_json = snapshot.to_json()?;
-
-    let seq = match parent_ctx.issue_id.as_deref() {
-        Some(issue_id) => Some(next_execution_seq(&db, issue_id).await?),
-        None => None,
-    };
-
-    let execution_id = ids::mint_child(&parent_ctx.job_id);
-    insert_synthetic_execution(
-        &db,
-        &execution_id,
-        &snapshot.recipe.id,
-        parent_ctx,
-        now,
-        &snapshot_json,
-        seq,
+    // One creation path. The host execution a delegating job needs and the one a
+    // job's own turn needs are the same object created at different moments, and
+    // it is seeded with the host's OWN agent — so the fence walk never lands on a
+    // snapshot missing the agent that is running. Delegated agents join this same
+    // map later through the entry API and will not clobber it.
+    let project_path = project_repo_path(&db, &job.project_id)
+        .await
+        .map(std::path::PathBuf::from);
+    crate::execution::jobs::ensure_host_agent_snapshot(
+        orch,
+        &job,
+        project_path.as_deref(),
+        crate::execution::jobs::SnapshotFreshness::for_job(&job),
     )
-    .await?;
-
-    Ok(execution_id)
+    .await?
+    .ok_or_else(|| {
+        format!(
+            "Failed to create host execution for job {}",
+            parent_ctx.job_id
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -485,76 +437,6 @@ async fn lookup_packet_run(
         return Ok(None);
     };
     Ok(Some((packet, job_id, run_id)))
-}
-
-async fn next_execution_seq(db: &LocalDb, issue_id: &str) -> Result<i32, String> {
-    let value = select_optional_i64(
-        db,
-        "SELECT MAX(seq) FROM executions WHERE issue_id = ?1",
-        issue_id,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(value.map(|value| value as i32 + 1).unwrap_or(1))
-}
-
-async fn insert_synthetic_execution(
-    db: &LocalDb,
-    execution_id: &str,
-    recipe_id: &str,
-    parent_ctx: &ParentRunContext,
-    now: i32,
-    snapshot_json: &str,
-    seq: Option<i32>,
-) -> Result<(), String> {
-    let execution_id = execution_id.to_string();
-    let recipe_id = recipe_id.to_string();
-    let issue_id = parent_ctx.issue_id.clone();
-    let project_id = if parent_ctx.issue_id.is_none() {
-        Some(parent_ctx.project_id.clone())
-    } else {
-        None
-    };
-    let parent_job_id = parent_ctx.job_id.clone();
-    let snapshot_json = snapshot_json.to_string();
-    db.write(|conn| {
-        let execution_id = execution_id.clone();
-        let recipe_id = recipe_id.clone();
-        let issue_id = issue_id.clone();
-        let project_id = project_id.clone();
-        let parent_job_id = parent_job_id.clone();
-        let snapshot_json = snapshot_json.clone();
-        Box::pin(async move {
-            conn.execute(
-                "
-                INSERT INTO executions (
-                    id, recipe_id, issue_id, project_id, status, started_at,
-                    completed_at, snapshot, seq, initiator_sub,
-                    initiator_org_id, triggered_by
-                )
-                VALUES (?1, ?2, ?3, ?4, 'running', ?5, NULL, ?6, ?7, NULL, NULL, 'manual')
-                ",
-                (
-                    execution_id.as_str(),
-                    recipe_id.as_str(),
-                    issue_id.as_deref(),
-                    project_id.as_deref(),
-                    now,
-                    snapshot_json.as_str(),
-                    seq,
-                ),
-            )
-            .await?;
-            conn.execute(
-                "UPDATE jobs SET execution_id = ?1 WHERE id = ?2",
-                (execution_id.as_str(), parent_job_id.as_str()),
-            )
-            .await?;
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| e.to_string())
 }
 
 async fn update_execution_snapshot(

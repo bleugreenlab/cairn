@@ -1257,6 +1257,7 @@ pub async fn run_launch_session(
                     source: ResourceReservationSource::Declared,
                 }),
                 process: ResidentProcessSpec {
+                    runtime_packages: Vec::new(),
                     program: "bun".into(),
                     args,
                     cwd: String::new(),
@@ -1641,7 +1642,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', ?1, 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', ?1, 'main', 1, 1)",
                     params![repository.as_str()],
                 )
                 .await?;
@@ -1760,12 +1761,12 @@ mod tests {
     #[test]
     fn a_launch_session_is_keyed_by_the_instance_it_names() {
         assert_eq!(
-            launch_session_key(&resolution("agent/CAIRN-1-builder-0")),
-            launch_session_key(&resolution("agent/CAIRN-1-builder-0")),
+            launch_session_key(&resolution("agent/cairn-1-builder-0")),
+            launch_session_key(&resolution("agent/cairn-1-builder-0")),
         );
         assert_ne!(
             launch_session_key(&resolution("main")),
-            launch_session_key(&resolution("agent/CAIRN-1-builder-0")),
+            launch_session_key(&resolution("agent/cairn-1-builder-0")),
         );
         assert!(launch_session_key(&resolution("main")).starts_with("proj-1:"));
     }
@@ -1822,7 +1823,7 @@ mod tests {
         commit_runtime_entrypoint(checkout.path());
         git(
             checkout.path(),
-            &["checkout", "-q", "-b", "agent/PROJ-3232-builder-1"],
+            &["checkout", "-q", "-b", "agent/proj-3232-builder-1"],
         );
         for step in ["first", "second"] {
             std::fs::write(checkout.path().join(format!("{step}.rs")), step).unwrap();
@@ -1842,7 +1843,7 @@ mod tests {
                 "add",
                 "--detach",
                 cell.to_str().unwrap(),
-                "agent/PROJ-3232-builder-1",
+                "agent/proj-3232-builder-1",
             ],
         );
         assert!(
@@ -1858,7 +1859,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            resolved.selector, "agent/PROJ-3232-builder-1",
+            resolved.selector, "agent/proj-3232-builder-1",
             "the branch at the commit names the instance; the commit is a storage address"
         );
         assert_eq!(
@@ -1970,10 +1971,12 @@ mod tests {
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
                 logical_cores: 1,
+                concurrency_capacity: None,
                 toolchains: Vec::new(),
                 projects_served: Vec::new(),
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
+                sandbox: None,
                 toolchain_detection: None,
             },
             current_load: 0,
@@ -2030,7 +2033,7 @@ mod tests {
         // branch before its first commit lands, not a contrived edge.
         git(
             checkout.path(),
-            &["branch", "agent/PROJ-3241-builder-1", "main"],
+            &["branch", "agent/proj-3241-builder-1", "main"],
         );
 
         let worktrees = tempfile::TempDir::new().unwrap();
@@ -2042,7 +2045,7 @@ mod tests {
                 "add",
                 "--detach",
                 cell.to_str().unwrap(),
-                "agent/PROJ-3241-builder-1",
+                "agent/proj-3241-builder-1",
             ],
         );
         assert_eq!(
@@ -2069,7 +2072,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch)
-                     VALUES ('job-3241', 'exec-1', 'issue-1', 'proj-1', 'Builder', 'running', 1, 1, 'builder', 'agent/PROJ-3241-builder-1')",
+                     VALUES ('job-3241', 'exec-1', 'issue-1', 'proj-1', 'Builder', 'running', 1, 1, 'builder', 'agent/proj-3241-builder-1')",
                     (),
                 )
                 .await?;
@@ -2109,7 +2112,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            owned.selector, "agent/PROJ-3241-builder-1",
+            owned.selector, "agent/proj-3241-builder-1",
             "the job the cell is held for names the instance, so provenance has to be asked \
              before the commit is inverted"
         );
@@ -2141,8 +2144,8 @@ mod tests {
         let checkout = tempfile::TempDir::new().unwrap();
         init_project(checkout.path());
         commit_runtime_entrypoint(checkout.path());
-        git(checkout.path(), &["branch", "agent/PROJ-1-builder-0"]);
-        git(checkout.path(), &["branch", "agent/PROJ-2-builder-0"]);
+        git(checkout.path(), &["branch", "agent/proj-1-builder-0"]);
+        git(checkout.path(), &["branch", "agent/proj-2-builder-0"]);
 
         let worktrees = tempfile::TempDir::new().unwrap();
         let cell = worktrees.path().join("slot-1");
@@ -2303,11 +2306,11 @@ mod tests {
         let (orch, _config, _checkout) =
             orchestrator_with_a_builder_node("dev-instance-owner.db").await;
 
-        let owner = issue_owner_for_selector(&orch, "proj-1", "agent/PROJ-3104-builder-1")
+        let owner = issue_owner_for_selector(&orch, "proj-1", "agent/proj-3104-builder-1")
             .await
             .expect("an agent branch names the issue its job belongs to");
         assert_eq!(owner.issue_number, Some(3104));
-        assert_eq!(owner.project_key.as_deref(), Some("PROJ"));
+        assert_eq!(owner.project_key.as_deref(), Some("proj"));
         assert_eq!(
             owner.node_kind.as_deref(),
             Some("Builder"),
@@ -2351,7 +2354,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch)
-                     VALUES ('job-1', 'exec-1', 'issue-1', 'proj-1', 'Builder', 'running', 1, 1, 'builder', 'agent/PROJ-3104-builder-1')",
+                     VALUES ('job-1', 'exec-1', 'issue-1', 'proj-1', 'Builder', 'running', 1, 1, 'builder', 'agent/proj-3104-builder-1')",
                     (),
                 )
                 .await?;
@@ -2373,13 +2376,13 @@ mod tests {
         };
 
         assert_eq!(
-            canonical("cairn://p/PROJ/3104/1/builder").await.unwrap(),
-            "agent/PROJ-3104-builder-1",
+            canonical("cairn://p/proj/3104/1/builder").await.unwrap(),
+            "agent/proj-3104-builder-1",
             "a node URI names work, and the branch that node minted is what gets built"
         );
         assert_eq!(
-            canonical("agent/PROJ-3104-builder-1").await.unwrap(),
-            "agent/PROJ-3104-builder-1",
+            canonical("agent/proj-3104-builder-1").await.unwrap(),
+            "agent/proj-3104-builder-1",
             "both spellings key one instance, so they share its home, database, ports, and cache"
         );
         assert_eq!(
@@ -2391,11 +2394,11 @@ mod tests {
         // The launch refuses what it cannot resolve rather than handing a URI
         // to the revision resolver, which would report it as an unknown commit.
         assert!(matches!(
-            canonical("cairn://p/PROJ/9999/1/builder").await,
+            canonical("cairn://p/proj/9999/1/builder").await,
             Err(DevInstanceLaunchFailure::SelectorNotFound { .. })
         ));
         assert!(matches!(
-            canonical("cairn://p/PROJ/3104").await,
+            canonical("cairn://p/proj/3104").await,
             Err(DevInstanceLaunchFailure::InvalidSelector { .. })
         ));
     }
@@ -2405,7 +2408,7 @@ mod tests {
         let (orch, _config, _checkout) =
             orchestrator_with_a_builder_node("dev-instance-node-uri-owner.db").await;
 
-        let selector = canonical_selector(&orch, "proj-1", "cairn://p/PROJ/3104/1/builder", None)
+        let selector = canonical_selector(&orch, "proj-1", "cairn://p/proj/3104/1/builder", None)
             .await
             .unwrap();
         let owner = issue_owner_for_selector(&orch, "proj-1", &selector)
@@ -2521,12 +2524,12 @@ mod tests {
                 instance_id: "proj-1:feature".into(),
             }),
         );
-        matching.residency.as_mut().unwrap().selector = Some("agent/PROJ-1-builder-0".into());
+        matching.residency.as_mut().unwrap().selector = Some("agent/proj-1-builder-0".into());
         matching.cell_epoch = 7;
 
         let mut other_branch = matching.clone();
         other_branch.cell_id = "other-branch".into();
-        other_branch.residency.as_mut().unwrap().selector = Some("agent/PROJ-2-builder-0".into());
+        other_branch.residency.as_mut().unwrap().selector = Some("agent/proj-2-builder-0".into());
 
         let mut terminal = matching.clone();
         terminal.cell_id = "terminal".into();
@@ -2540,7 +2543,7 @@ mod tests {
                 ..Default::default()
             },
             "proj-1",
-            "agent/PROJ-1-builder-0",
+            "agent/proj-1-builder-0",
         );
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].cell_epoch, 7);
@@ -2591,13 +2594,13 @@ mod tests {
         );
         completed.residency.as_mut().unwrap().owner_ref = Some(CellOwnerRef {
             project_id: "proj-1".into(),
-            project_key: Some("PROJ".into()),
+            project_key: Some("proj".into()),
             issue_number: Some(1),
             job_id: Some("completed-job".into()),
             execution_seq: Some(1),
             node_kind: Some("builder".into()),
         });
-        completed.residency.as_mut().unwrap().selector = Some("agent/PROJ-1-builder".into());
+        completed.residency.as_mut().unwrap().selector = Some("agent/proj-1-builder".into());
 
         let mut active = completed.clone();
         active.cell_id = "active".into();
@@ -2617,7 +2620,7 @@ mod tests {
             },
             "proj-1",
             &["completed-job".into()],
-            &["agent/PROJ-1-builder".into()],
+            &["agent/proj-1-builder".into()],
         );
         assert_eq!(fences.len(), 1);
         assert_eq!(
@@ -2637,7 +2640,7 @@ mod tests {
                 instance_id: "proj-1:orphan".into(),
             }),
         );
-        orphan.residency.as_mut().unwrap().selector = Some("agent/PROJ-1-builder".into());
+        orphan.residency.as_mut().unwrap().selector = Some("agent/proj-1-builder".into());
 
         let fences = issue_instance_fences(
             cairn_common::executor_protocol::FleetSnapshot {
@@ -2646,7 +2649,7 @@ mod tests {
             },
             "proj-1",
             &["completed-job".into()],
-            &["agent/PROJ-1-builder".into()],
+            &["agent/proj-1-builder".into()],
         );
         assert_eq!(fences.len(), 1);
     }

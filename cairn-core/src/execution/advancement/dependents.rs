@@ -174,7 +174,7 @@ mod tests {
             resolved_issue_id.split('~').next().unwrap()
         );
         db.execute(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'TP', '/tmp/team-project', 1, 1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'tp', '/tmp/team-project', 1, 1)",
             params![project_id.as_str()],
         )
         .await
@@ -192,7 +192,7 @@ mod tests {
         .await
         .unwrap();
         db.execute(
-            "INSERT INTO issue_dependencies (issue_id, depends_on_uri, created_at) VALUES (?1, 'cairn://p/TP/10', 1)",
+            "INSERT INTO issue_dependencies (issue_id, depends_on_uri, created_at) VALUES (?1, 'cairn://p/tp/10', 1)",
             params![dependent_issue_id],
         )
         .await

@@ -203,6 +203,7 @@ pub(crate) fn classify_unavailable(
         CellUnavailableReason::Provisioning
         | CellUnavailableReason::Checkout
         | CellUnavailableReason::Spawn
+        | CellUnavailableReason::RunnerContext
         | CellUnavailableReason::Preparation
         | CellUnavailableReason::ObjectInfrastructure(_) => PlacementVerdict::Structural,
         // No executor is connected. Usually that is a machine that is not there,
@@ -339,6 +340,7 @@ mod tests {
             | CellUnavailableReason::Provisioning
             | CellUnavailableReason::Checkout
             | CellUnavailableReason::Spawn
+            | CellUnavailableReason::RunnerContext
             | CellUnavailableReason::Preparation
             | CellUnavailableReason::SlotUnhealthy
             | CellUnavailableReason::ExecutorUnavailable
@@ -360,6 +362,7 @@ mod tests {
             CellUnavailableReason::Provisioning,
             CellUnavailableReason::Checkout,
             CellUnavailableReason::Spawn,
+            CellUnavailableReason::RunnerContext,
             CellUnavailableReason::Preparation,
             CellUnavailableReason::ExecutorUnavailable,
             CellUnavailableReason::NoMatchingExecutor,

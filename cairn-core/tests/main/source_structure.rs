@@ -230,6 +230,8 @@ fn brokered_plaintext_is_unwrapped_only_where_it_is_injected() {
             "mcp/handlers/search_web.rs",
             "mcp/handlers/fetch_web.rs",
             "account/team_token_minter.rs",
+            // Channel provider clients inject credentials into their SDK transports.
+            "channels/mod.rs",
             // The runner's own callback credential, which predates the broker
             // and is minted rather than resolved from a store.
             "mcp/auth.rs",

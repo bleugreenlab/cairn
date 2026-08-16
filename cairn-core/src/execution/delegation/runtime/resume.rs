@@ -999,7 +999,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
-                     VALUES ('proj', 'default', 'P', 'PROJ', '/tmp/p', 0, 0)",
+                     VALUES ('proj', 'default', 'P', 'proj', '/tmp/p', 0, 0)",
                     (),
                 )
                 .await?;
@@ -1137,7 +1137,7 @@ mod background_completion_tests {
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
-               VALUES('p','w','P','PRJ','/tmp/repo',1,1);
+               VALUES('p','w','P','prj','/tmp/repo',1,1);
              INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
                VALUES('i','p',7,'I','active','active','none',1,1);",
         )
@@ -1407,7 +1407,7 @@ mod background_completion_tests {
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
-               VALUES('p','w','P','PRJ','/tmp/repo',1,1);
+               VALUES('p','w','P','prj','/tmp/repo',1,1);
              INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
                VALUES('i','p',7,'I','active','active','none',1,1);",
         )

@@ -351,6 +351,7 @@ impl MigrationRunner {
         let version = migration.version.to_string();
         let name = migration.name.to_string();
         let sql = migration.sql;
+        let db_path = db.path().display().to_string();
         db.exclusive(|conn| {
             let version = version.clone();
             let name = name.clone();
@@ -367,6 +368,13 @@ impl MigrationRunner {
         })
         .await
         .map_err(|error| {
+            if migration.version == "0191"
+                && error.to_string().contains("UNIQUE constraint failed")
+            {
+                return DbError::Migration(format!(
+                    "Migration 0191 refused for database {db_path}: two or more projects' keys differ only by letter case, and project keys are canonically lowercase. Cairn will not merge or silently skip them. List them: SELECT id, key, name, repo_path FROM projects WHERE lower(key) IN (SELECT lower(key) FROM projects GROUP BY lower(key) HAVING COUNT(*) > 1); Resolve by giving one project a distinct key, updating both rows together: UPDATE projects SET key = '<new-key>' WHERE id = '<id>'; UPDATE project_routes SET project_key = '<new-key>' WHERE project_key = '<old-key>'; then restart. Renaming a key does not rewrite prose or links that already reference the old one."
+                ));
+            }
             DbError::Migration(format!(
                 "{}_{} failed: {}",
                 migration.version, migration.name, error

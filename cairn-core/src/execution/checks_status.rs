@@ -15,6 +15,141 @@ use crate::execution::selection::plan_checks;
 use crate::jj::{logical_changed_files, logical_tree_hash, JjEnv};
 use crate::orchestrator::Orchestrator;
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+type SettledStatusCell = tokio::sync::OnceCell<Option<Vec<NodeCheckStatus>>>;
+
+#[derive(Default)]
+struct NodeCheckStatusCacheState {
+    generations: HashMap<String, u64>,
+    cells: HashMap<(String, u64), Arc<SettledStatusCell>>,
+    projects: HashMap<String, String>,
+}
+
+/// In-process materialization of the exact settled check planner projection.
+///
+/// The generation is the cache's correctness key: every mutation of a job's
+/// logical head/tree, live base, contract, results, runtime attempt, or lifecycle
+/// advances it. Keeping the generation beside the single-flight cell closes the
+/// invalidation-during-compute race: a reader whose miss finishes after an
+/// invalidation retries against the new generation instead of returning stale
+/// work.
+#[derive(Default)]
+pub(crate) struct NodeCheckStatusCache {
+    state: Mutex<NodeCheckStatusCacheState>,
+}
+
+impl NodeCheckStatusCache {
+    fn bind_project(&self, job_id: &str, project_id: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state
+                .projects
+                .insert(job_id.to_string(), project_id.to_string());
+        }
+    }
+
+    pub(crate) fn invalidate_project_results(&self, project_id: &str) {
+        let jobs = self
+            .state
+            .lock()
+            .map(|state| {
+                state
+                    .projects
+                    .iter()
+                    .filter(|(_, cached_project)| cached_project.as_str() == project_id)
+                    .map(|(job_id, _)| job_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for job_id in jobs {
+            self.invalidate(&job_id, "project-check-result");
+        }
+    }
+
+    pub(crate) fn invalidate(&self, job_id: &str, reason: &'static str) {
+        if let Ok(mut state) = self.state.lock() {
+            let generation = state.generations.entry(job_id.to_string()).or_default();
+            *generation = generation.wrapping_add(1);
+            let generation = *generation;
+            state
+                .cells
+                .retain(|(cached_job, _), _| cached_job != job_id);
+            log::debug!(
+                "node check projection cache invalidated job={job_id} generation={generation} reason={reason}"
+            );
+        }
+    }
+
+    async fn get_or_compute<F, Fut>(&self, job_id: &str, compute: F) -> Option<Vec<NodeCheckStatus>>
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Option<Vec<NodeCheckStatus>>>,
+    {
+        loop {
+            let (generation, cell, state_kind) = {
+                let mut state = self.state.lock().ok()?;
+                let generation = *state.generations.entry(job_id.to_string()).or_default();
+                let key = (job_id.to_string(), generation);
+                let state_kind = state.cells.get(&key).map_or("miss", |cell| {
+                    if cell.get().is_some() {
+                        "hit"
+                    } else {
+                        "coalesced"
+                    }
+                });
+                let cell = state
+                    .cells
+                    .entry(key)
+                    .or_insert_with(|| Arc::new(SettledStatusCell::new()))
+                    .clone();
+                (generation, cell, state_kind)
+            };
+            log::debug!(
+                "node check projection cache {} job={job_id} generation={} reason={}",
+                state_kind,
+                generation,
+                if state_kind == "hit" {
+                    "same-generation"
+                } else {
+                    "not-materialized"
+                }
+            );
+            let started = Instant::now();
+            let value = cell.get_or_init(&compute).await.clone();
+            if state_kind == "miss" {
+                log::info!(
+                    "node check projection computed job={job_id} generation={} duration_ms={}",
+                    generation,
+                    started.elapsed().as_millis()
+                );
+            }
+            let current = self
+                .state
+                .lock()
+                .ok()?
+                .generations
+                .get(job_id)
+                .copied()
+                .unwrap_or_default();
+            if current == generation && value.is_some() {
+                return value;
+            }
+            if current == generation {
+                if let Ok(mut state) = self.state.lock() {
+                    state.cells.remove(&(job_id.to_string(), generation));
+                }
+                return None;
+            }
+            log::debug!(
+                "node check projection cache retry job={job_id} generation={} current_generation={} reason=invalidated-during-compute",
+                generation,
+                current
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +201,22 @@ pub async fn node_check_statuses(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Option<Vec<NodeCheckStatus>> {
+    // Running lanes deliberately bypass the settled projection. Their planner
+    // inputs come from the sealed runtime snapshot and their output tails live on
+    // disk, so each read remains current without rebuilding the settled jj/diff
+    // projection.
+    if orch.turn_end_checks_in_flight(job_id) || orch.write_checks_in_flight(job_id) {
+        return compute_node_check_statuses(orch, job_id).await;
+    }
+    orch.node_check_status_cache
+        .get_or_compute(job_id, || compute_node_check_statuses(orch, job_id))
+        .await
+}
+
+async fn compute_node_check_statuses(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Option<Vec<NodeCheckStatus>> {
     // Route to the database that owns this job (team replica or private DB); the
     // job coordinates and cached check results for a team node live in its
     // replica. A closed replica yields no statuses rather than a wrong read
@@ -74,12 +225,20 @@ pub async fn node_check_statuses(
         .await
         .ok()?;
     let coords = resolve_job_coords(&db, job_id).await.ok().flatten()?;
+    orch.node_check_status_cache
+        .bind_project(job_id, &coords.project_id);
     let project_root = std::path::PathBuf::from(&coords.repository_path);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &project_root);
-    let logical_repository = if crate::jj::is_jj_dir(&store) {
-        store
-    } else {
-        project_root.clone()
+    let logical_repository = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = project_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .ok()?
+        .ok()?
     };
     let logical_head = crate::execution::cache::resolve_job_logical_head(orch, job_id)
         .await
@@ -87,14 +246,15 @@ pub async fn node_check_statuses(
     // The same live fork point the review cadence gates on. Reading the
     // recorded `jobs.base_commit` here would show a node checks that its own
     // suite never planned, because that row does not follow a base advance.
-    let live_base = crate::diff::live_job_branch_range(&db, job_id, &orch.config_dir)
-        .await
-        .map_err(|error| {
-            log::debug!("node {job_id} check status: no live base coordinate ({error})");
-        })
-        .ok()
-        .flatten()
-        .map(|range| range.base);
+    let live_base =
+        crate::diff::live_job_branch_range(&db, job_id, &orch.jj_binary_path, &orch.config_dir)
+            .await
+            .map_err(|error| {
+                log::debug!("node {job_id} check status: no live base coordinate ({error})");
+            })
+            .ok()
+            .flatten()
+            .map(|range| range.base);
     // The status a node renders must be the suite its own cadences plan, so the
     // contract comes from the node's logical head — the same commit the cadences
     // read it from. Reading the project checkout here would show a node checks
@@ -700,6 +860,128 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn settled_projection_coalesces_concurrent_misses_and_reuses_warm_value() {
+        let cache = Arc::new(NodeCheckStatusCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            readers.push(tokio::spawn(async move {
+                cache
+                    .get_or_compute("job", || {
+                        let calls = calls.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::task::yield_now().await;
+                            Some(Vec::new())
+                        }
+                    })
+                    .await
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), Some(Vec::new()));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            cache
+                .get_or_compute("job", || async {
+                    panic!("warm projection recomputed");
+                })
+                .await,
+            Some(Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalidation_during_compute_retries_new_generation() {
+        let cache = Arc::new(NodeCheckStatusCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let reader = {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                cache
+                    .get_or_compute("job", || {
+                        let calls = calls.clone();
+                        let entered = entered.clone();
+                        let release = release.clone();
+                        async move {
+                            let call = calls.fetch_add(1, Ordering::SeqCst);
+                            if call == 0 {
+                                entered.notify_one();
+                                release.notified().await;
+                            }
+                            Some(Vec::new())
+                        }
+                    })
+                    .await
+            })
+        };
+        entered.notified().await;
+        cache.invalidate("job", "test-boundary");
+        release.notify_one();
+        assert_eq!(reader.await.unwrap(), Some(Vec::new()));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn invalidation_is_scoped_to_one_job() {
+        let cache = NodeCheckStatusCache::default();
+        let calls = AtomicUsize::new(0);
+        for job in ["a", "b"] {
+            cache
+                .get_or_compute(job, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(Vec::new())
+                })
+                .await;
+        }
+        cache.invalidate("a", "lifecycle");
+        for job in ["a", "b"] {
+            cache
+                .get_or_compute(job, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(Vec::new())
+                })
+                .await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn project_result_invalidates_every_bound_job_but_not_other_projects() {
+        let cache = NodeCheckStatusCache::default();
+        let calls = AtomicUsize::new(0);
+        for (job, project) in [("a", "project"), ("b", "project"), ("c", "other")] {
+            cache.bind_project(job, project);
+            cache
+                .get_or_compute(job, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(Vec::new())
+                })
+                .await;
+        }
+        cache.invalidate_project_results("project");
+        for job in ["a", "b", "c"] {
+            cache
+                .get_or_compute(job, || async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Some(Vec::new())
+                })
+                .await;
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
 
     fn verdict_row(name: &str, passed: bool) -> CheckResultCacheEntry {
         CheckResultCacheEntry {

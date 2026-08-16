@@ -140,6 +140,7 @@ fn build_uri(
 
     match content_type {
         SearchContentType::Issue | SearchContentType::Comment => issue_or_project(),
+        SearchContentType::Post | SearchContentType::PostComment => "cairn://posts".to_string(),
         SearchContentType::Message => issue_number
             .map(|number| build_issue_messages_uri(project_key, number))
             .unwrap_or_else(|| build_project_messages_uri(project_key)),
@@ -494,10 +495,32 @@ impl Enrichment {
 
     /// One hit, one row — the shape every non-transcript content type keeps.
     fn single_result(&self, hit: SearchIndexHit) -> Option<SearchResult> {
-        let project_key = self.project_keys.get(&hit.project_id)?.clone();
+        // Posts are global resources even when their visibility is narrowed to a
+        // project. Workspace posts intentionally have no project id, so requiring
+        // project enrichment here would silently discard the default post scope.
+        let project_key = if matches!(
+            hit.content_type,
+            SearchContentType::Post | SearchContentType::PostComment
+        ) {
+            None
+        } else {
+            Some(self.project_keys.get(&hit.project_id)?.clone())
+        };
         let (issue_number, issue_title) = self.issue_context(&hit);
         let nav = hit.job_id.as_ref().and_then(|id| self.job_nav.get(id));
-        let uri = build_uri(&project_key, &hit.content_type, nav, issue_number, None);
+        let uri = match hit.content_type {
+            SearchContentType::Post => format!("cairn://posts/{}", hit.id),
+            SearchContentType::PostComment => "cairn://posts".to_string(),
+            _ => build_uri(
+                project_key
+                    .as_deref()
+                    .expect("non-post project was enriched"),
+                &hit.content_type,
+                nav,
+                issue_number,
+                None,
+            ),
+        };
 
         // An issue hit IS the issue; repeating its own number and title as
         // "context" would say nothing.
@@ -965,41 +988,41 @@ mod tests {
 
     #[test]
     fn test_build_uri_issue() {
-        let uri = build_uri("TEST", &SearchContentType::Issue, None, Some(42), None);
-        assert_eq!(uri, "cairn://p/TEST/42");
+        let uri = build_uri("test", &SearchContentType::Issue, None, Some(42), None);
+        assert_eq!(uri, "cairn://p/test/42");
     }
 
     #[test]
     fn test_build_uri_comment() {
-        let uri = build_uri("TEST", &SearchContentType::Comment, None, Some(42), None);
-        assert_eq!(uri, "cairn://p/TEST/42");
+        let uri = build_uri("test", &SearchContentType::Comment, None, Some(42), None);
+        assert_eq!(uri, "cairn://p/test/42");
     }
 
     #[test]
     fn test_build_uri_message_uses_message_resources() {
-        let project_uri = build_uri("TEST", &SearchContentType::Message, None, None, None);
-        assert_eq!(project_uri, "cairn://p/TEST/messages");
+        let project_uri = build_uri("test", &SearchContentType::Message, None, None, None);
+        assert_eq!(project_uri, "cairn://p/test/messages");
 
-        let issue_uri = build_uri("TEST", &SearchContentType::Message, None, Some(42), None);
-        assert_eq!(issue_uri, "cairn://p/TEST/42/messages");
+        let issue_uri = build_uri("test", &SearchContentType::Message, None, Some(42), None);
+        assert_eq!(issue_uri, "cairn://p/test/42/messages");
     }
 
     #[test]
     fn test_build_uri_artifact_prefers_node_artifact_when_job_navigation_exists() {
         let uri = build_uri(
-            "TEST",
+            "test",
             &SearchContentType::Artifact,
             Some(&node_nav("builder-1", 3)),
             Some(42),
             None,
         );
-        assert_eq!(uri, "cairn://p/TEST/42/3/builder-1/artifact");
+        assert_eq!(uri, "cairn://p/test/42/3/builder-1/artifact");
     }
 
     #[test]
     fn test_build_uri_artifact_falls_back_when_job_navigation_missing() {
         let issue_uri = build_uri(
-            "TEST",
+            "test",
             &SearchContentType::Artifact,
             Some(&JobNav {
                 node_segment: Some("builder-1".to_string()),
@@ -1008,34 +1031,34 @@ mod tests {
             Some(42),
             None,
         );
-        assert_eq!(issue_uri, "cairn://p/TEST/42");
+        assert_eq!(issue_uri, "cairn://p/test/42");
 
-        let project_uri = build_uri("TEST", &SearchContentType::Artifact, None, None, None);
-        assert_eq!(project_uri, "cairn://p/TEST");
+        let project_uri = build_uri("test", &SearchContentType::Artifact, None, None, None);
+        assert_eq!(project_uri, "cairn://p/test");
     }
 
     #[test]
     fn test_build_uri_event_prefers_node_chat_when_job_navigation_exists() {
         let uri = build_uri(
-            "TEST",
+            "test",
             &SearchContentType::Event,
             Some(&node_nav("builder-1", 3)),
             Some(42),
             None,
         );
-        assert_eq!(uri, "cairn://p/TEST/42/3/builder-1/chat");
+        assert_eq!(uri, "cairn://p/test/42/3/builder-1/chat");
     }
 
     #[test]
     fn test_build_uri_event_addresses_the_turn_when_one_is_resolvable() {
         let uri = build_uri(
-            "TEST",
+            "test",
             &SearchContentType::Event,
             Some(&node_nav("builder", 1)),
             Some(42),
             Some(7),
         );
-        assert_eq!(uri, "cairn://p/TEST/42/1/builder/chat/turn/7");
+        assert_eq!(uri, "cairn://p/test/42/1/builder/chat/turn/7");
     }
 
     #[test]
@@ -1048,30 +1071,30 @@ mod tests {
         };
         assert_eq!(
             build_uri(
-                "TEST",
+                "test",
                 &SearchContentType::Event,
                 Some(&nav),
                 Some(42),
                 Some(3)
             ),
-            "cairn://p/TEST/42/1/builder/task/explore/chat/turn/3"
+            "cairn://p/test/42/1/builder/task/explore/chat/turn/3"
         );
         assert_eq!(
             build_uri(
-                "TEST",
+                "test",
                 &SearchContentType::Event,
                 Some(&nav),
                 Some(42),
                 None
             ),
-            "cairn://p/TEST/42/1/builder/task/explore/chat"
+            "cairn://p/test/42/1/builder/task/explore/chat"
         );
     }
 
     #[test]
     fn test_build_uri_event_falls_back_when_job_navigation_missing() {
         let issue_uri = build_uri(
-            "TEST",
+            "test",
             &SearchContentType::Event,
             Some(&JobNav {
                 exec_seq: Some(3),
@@ -1080,10 +1103,10 @@ mod tests {
             Some(42),
             None,
         );
-        assert_eq!(issue_uri, "cairn://p/TEST/42");
+        assert_eq!(issue_uri, "cairn://p/test/42");
 
-        let project_uri = build_uri("TEST", &SearchContentType::Event, None, None, None);
-        assert_eq!(project_uri, "cairn://p/TEST");
+        let project_uri = build_uri("test", &SearchContentType::Event, None, None, None);
+        assert_eq!(project_uri, "cairn://p/test");
     }
 
     #[test]
@@ -1096,8 +1119,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            build_uri("TEST", &SearchContentType::Event, Some(&nav), None, Some(3)),
-            "cairn://p/TEST/general/chat/turn/3"
+            build_uri("test", &SearchContentType::Event, Some(&nav), None, Some(3)),
+            "cairn://p/test/general/chat/turn/3"
         );
 
         let task = JobNav {
@@ -1105,8 +1128,8 @@ mod tests {
             ..nav
         };
         assert_eq!(
-            build_uri("TEST", &SearchContentType::Event, Some(&task), None, None),
-            "cairn://p/TEST/general/task/map-settings/chat"
+            build_uri("test", &SearchContentType::Event, Some(&task), None, None),
+            "cairn://p/test/general/task/map-settings/chat"
         );
     }
 
@@ -1150,7 +1173,7 @@ mod tests {
             INSERT INTO workspaces(id, name, created_at, updated_at)
              VALUES ('workspace-1', 'Workspace', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'workspace-1', 'Project', 'PROJ', '/tmp/project', 1, 1);
+             VALUES ('project-1', 'workspace-1', 'Project', 'proj', '/tmp/project', 1, 1);
             INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
              VALUES ('issue-1', 'project-1', 7, 'Turso migration', 'issue body', 1, 1);
             INSERT INTO comments(id, issue_id, content, source, created_at)
@@ -1184,7 +1207,7 @@ mod tests {
         let result = &results[0];
         assert_eq!(result.id, "comment-1");
         assert_eq!(result.content_type, SearchContentType::Comment);
-        assert_eq!(result.uri, "cairn://p/PROJ/7");
+        assert_eq!(result.uri, "cairn://p/proj/7");
         assert_eq!(result.issue_number, Some(7));
         assert_eq!(result.issue_title.as_deref(), Some("Turso migration"));
         assert_eq!(result.hit_count, 1);
@@ -1206,7 +1229,7 @@ mod tests {
             snippet: id.to_string(),
             rank,
             created_at: 100,
-            uri: format!("cairn://p/PROJ/12/1/{job}/chat"),
+            uri: format!("cairn://p/proj/12/1/{job}/chat"),
             issue_number: Some(12),
             issue_title: None,
             node_segment: Some(job.to_string()),
@@ -1384,7 +1407,7 @@ mod tests {
             INSERT INTO workspaces(id, name, created_at, updated_at)
              VALUES ('workspace-1', 'Workspace', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'workspace-1', 'Project', 'PROJ', '/tmp/project', 1, 1);
+             VALUES ('project-1', 'workspace-1', 'Project', 'proj', '/tmp/project', 1, 1);
             INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
              VALUES ('issue-1', 'project-1', 12, 'Search hotspots', 'issue body', 1, 1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -1437,7 +1460,7 @@ mod tests {
         assert!(
             hotspot
                 .uri
-                .starts_with("cairn://p/PROJ/12/1/builder/chat/turn/"),
+                .starts_with("cairn://p/proj/12/1/builder/chat/turn/"),
             "expected a turn link, got {}",
             hotspot.uri
         );
@@ -1445,7 +1468,7 @@ mod tests {
         let distant = &results[1];
         assert_eq!(distant.hit_count, 1);
         assert_eq!(distant.turn_start, Some(40));
-        assert_eq!(distant.uri, "cairn://p/PROJ/12/1/builder/chat/turn/40");
+        assert_eq!(distant.uri, "cairn://p/proj/12/1/builder/chat/turn/40");
         assert!(
             hotspot.rank > distant.rank,
             "the denser stretch must outrank the lone mention"
@@ -1480,7 +1503,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].uri, "cairn://p/PROJ/12/1/builder/chat");
+        assert_eq!(results[0].uri, "cairn://p/proj/12/1/builder/chat");
         assert_eq!(results[0].turn_start, None);
     }
 
@@ -1514,10 +1537,57 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].uri,
-            "cairn://p/PROJ/12/1/builder/task/explore/chat/turn/1"
+            "cairn://p/proj/12/1/builder/task/explore/chat/turn/1"
         );
         assert_eq!(results[0].node_segment.as_deref(), Some("builder"));
         assert_eq!(results[0].task_segment.as_deref(), Some("explore"));
         assert_eq!(results[0].title, "explore");
+    }
+
+    #[tokio::test]
+    async fn search_content_keeps_workspace_posts_and_comments_navigable() {
+        let db = migrated_db().await;
+        db.execute_script(
+            "INSERT INTO posts(id, title, content, author_principal_json, appearance_snapshot_json, created_at)
+             VALUES (41, 'Workspace note', 'globally searchable cairnbench', '{}', '{}', 1);
+             INSERT INTO post_comments(id, post_id, content, author_principal_json, appearance_snapshot_json, created_at)
+             VALUES (42, 41, 'cairnbench followup', '{}', '{}', 2);",
+        )
+        .await
+        .unwrap();
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        index.rebuild(&db).await.unwrap();
+        let results = search_content(
+            &db,
+            &index,
+            "cairnbench",
+            Some(SearchFilters {
+                content_types: Some(vec!["post".to_string(), "post_comment".to_string()]),
+                limit: Some(10),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result.project_id.is_empty()));
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result.content_type == SearchContentType::Post)
+                .map(|result| result.uri.as_str()),
+            Some("cairn://posts/41")
+        );
+        assert_eq!(
+            results
+                .iter()
+                .find(|result| result.content_type == SearchContentType::PostComment)
+                .map(|result| result.uri.as_str()),
+            Some("cairn://posts")
+        );
     }
 }

@@ -439,7 +439,7 @@ mod tests {
         local
             .execute(
                 "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                 VALUES ('proj1', 'default', 'Proj One', 'PROJ', ?1, 1, 1, 0)",
+                 VALUES ('proj1', 'default', 'Proj One', 'proj', ?1, 1, 1, 0)",
                 (repo,),
             )
             .await

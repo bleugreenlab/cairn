@@ -82,26 +82,19 @@ pub(super) fn post_chat_completion(
 }
 
 /// Inject the native structured-output constraint into an OpenRouter request
-/// body for a schema-constrained call (CAIRN-2505). `response_format` json_schema
-/// with `strict` demands conformance; `provider.require_parameters` routes ONLY
-/// to providers that honor it, so a routed provider can't silently drop the
-/// schema. Cairn's server-side validation of the stored artifact is the backstop
-/// if one still does — non-conformance is a loud failure, never corrupt data. A
-/// model with no schema-capable provider then fails the request loudly (an HTTP
-/// error naming the model), which is the intended behavior. A no-op when the run
-/// carries no output schema, leaving schema-less sessions bit-for-bit unchanged.
+/// body for a schema-constrained call (CAIRN-2505). The `response_format`
+/// json_schema half is shared with every OpenAI-compatible provider; what is
+/// OpenRouter's alone is `provider.require_parameters`, which routes ONLY to
+/// providers that honor the schema, so a routed provider can't silently drop it.
+/// Cairn's server-side validation of the stored artifact is the backstop if one
+/// still does — non-conformance is a loud failure, never corrupt data. A model
+/// with no schema-capable provider then fails the request loudly (an HTTP error
+/// naming the model), which is the intended behavior.
 pub(super) fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
-    let Some(schema) = schema else {
+    crate::backends::openai_compat::http::apply_output_schema(body, schema);
+    if schema.is_none() {
         return;
-    };
-    body["response_format"] = json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "cairn_output",
-            "strict": true,
-            "schema": schema,
-        }
-    });
+    }
     match body.get_mut("provider").and_then(Value::as_object_mut) {
         Some(obj) => {
             obj.insert("require_parameters".to_string(), json!(true));

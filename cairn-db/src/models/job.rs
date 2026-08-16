@@ -111,6 +111,7 @@ pub struct Job {
     // Job metadata
     pub agent_config_id: Option<String>,
     pub issue_id: Option<String>,
+    pub thread_id: Option<String>,
     pub project_id: String,
     pub task_description: Option<String>,
     pub model: Option<crate::models::Model>,
@@ -173,6 +174,7 @@ impl TryFrom<crate::db_records::DbJob> for Job {
             status,
             agent_config_id: db.agent_config_id,
             issue_id: db.issue_id,
+            thread_id: db.thread_id,
             project_id: db.project_id,
             task_description: db.task_description,
             model,

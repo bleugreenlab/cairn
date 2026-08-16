@@ -1071,8 +1071,8 @@ mod tests {
     use crate::storage::migrated_test_db;
 
     const THREAD_JOB: &str = "job-thread";
-    const DONE_CHILD: &str = "cairn://p/PRJ/20";
-    const OPEN_CHILD: &str = "cairn://p/PRJ/21";
+    const DONE_CHILD: &str = "cairn://p/prj/20";
+    const OPEN_CHILD: &str = "cairn://p/prj/21";
 
     /// Composition time for every test. The fixture's newest event is at 141, so
     /// a child's last activity reads as a couple of hours old.
@@ -1082,7 +1082,7 @@ mod tests {
     fn ruling_slug_survives_into_the_rebuilt_seed() {
         let rendered = render_arc_data(&serde_json::json!({"rulings": [{
             "slug": "no-budget-kills", "text": "No budget kills", "status": "accepted",
-            "rationale": "Quality wins", "provenance": ["cairn://p/CAIRN/3404"]
+            "rationale": "Quality wins", "provenance": ["cairn://p/cairn/3404"]
         }]}));
         assert!(rendered.contains("slug: `no-budget-kills`"));
     }
@@ -1107,7 +1107,7 @@ mod tests {
         let db = migrated_test_db(name).await;
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p','default','P','PRJ','/tmp/p',1,1);
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('i-thread','p',1,'Platform thread','active','none',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_issue_id)
@@ -1252,7 +1252,7 @@ mod tests {
                 "text": "Do not rebuild the fleet view",
                 "status": "rejected",
                 "rationale": "premature until residency leases settle",
-                "provenance": ["cairn://p/PRJ/20"]
+                "provenance": ["cairn://p/prj/20"]
             }],
             "open_questions": [{ "question": "Who owns lease renewal?" }]
         })
@@ -1405,7 +1405,7 @@ mod tests {
         // builder of the superseded attempt is not where this work stands.
         assert!(
             seed.content.contains(
-                "- `cairn://p/PRJ/21` **active** · Lease renewal backoff\n  \
+                "- `cairn://p/prj/21` **active** · Lease renewal backoff\n  \
                  builder ✓ review ◐ · PR #892 open · checks 1✓ 1✗ (lint) · \
                  1 unanswered question · active 15m ago\n"
             ),
@@ -1417,7 +1417,7 @@ mod tests {
         // table of contents below already addresses it.
         assert!(
             seed.content.contains(
-                "- `cairn://p/PRJ/20` **merged** · Running panel for the executor fleet\n"
+                "- `cairn://p/prj/20` **merged** · Running panel for the executor fleet\n"
             ),
             "the merged child's census line is wrong: {}",
             seed.content
@@ -1467,7 +1467,7 @@ mod tests {
         let db = migrated_test_db("thread-seed-childless.db").await;
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p','default','P','PRJ','/tmp/p',1,1);
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('i-thread','p',1,'Platform thread','active','none',1,1);
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -1744,7 +1744,7 @@ mod tests {
         let db = migrated_test_db("thread-seed-empty.db").await;
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p','default','P','PRJ','/tmp/p',1,1);
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('i-thread','p',1,'Platform thread','active','none',1,1);
              INSERT INTO jobs(id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
@@ -1782,19 +1782,19 @@ mod tests {
 
     #[test]
     fn an_issue_uri_is_not_matched_inside_a_longer_one() {
-        // `cairn://p/PRJ/33` sits inside `cairn://p/PRJ/339`, and attributing one
+        // `cairn://p/prj/33` sits inside `cairn://p/prj/339`, and attributing one
         // child's turns to another would compact the wrong range.
         assert!(mentions_uri(
-            "work on cairn://p/PRJ/33 today",
-            "cairn://p/PRJ/33"
+            "work on cairn://p/prj/33 today",
+            "cairn://p/prj/33"
         ));
         assert!(mentions_uri(
-            "see cairn://p/PRJ/33/1/builder",
-            "cairn://p/PRJ/33"
+            "see cairn://p/prj/33/1/builder",
+            "cairn://p/prj/33"
         ));
         assert!(!mentions_uri(
-            "work on cairn://p/PRJ/339",
-            "cairn://p/PRJ/33"
+            "work on cairn://p/prj/339",
+            "cairn://p/prj/33"
         ));
     }
 

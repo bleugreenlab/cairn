@@ -87,6 +87,7 @@ fn init_repo(repo: &Path) {
 
 fn agent_snapshot() -> AgentSnapshot {
     AgentSnapshot {
+        edited_at: None,
         id: "agent-1".to_string(),
         name: "Builder".to_string(),
         description: String::new(),
@@ -203,7 +204,7 @@ async fn fixture() -> Fixture {
     let db = Arc::new(db);
     let repo = temp.path().join("project");
     init_repo(&repo);
-    let project_id = common::insert_project_with_repo(&db, "EXH", &repo).await;
+    let project_id = common::insert_project_with_repo(&db, "exh", &repo).await;
     let branch = "agent/EXH-1-builder-0";
     let base_commit = common::head_sha(&repo);
     seed(&db, &project_id, branch, &base_commit).await;
@@ -277,7 +278,7 @@ impl Fixture {
                 // interactive shell. That keeps these tests about the shared
                 // environment rather than about shell startup behavior.
                 payload: json!({ "changes": [{
-                    "target": format!("cairn://p/EXH/1/1/builder/terminal/{slug}"),
+                    "target": format!("cairn://p/exh/1/1/builder/terminal/{slug}"),
                     "mode": "create",
                     "payload": { "command": command, "wake": "exit" }
                 }]}),
@@ -298,7 +299,7 @@ impl Fixture {
                 run_id: Some("r-1".to_string()),
                 tool: "write".to_string(),
                 payload: json!({ "changes": [{
-                    "target": format!("cairn://p/EXH/1/1/builder/terminal/{slug}"),
+                    "target": format!("cairn://p/exh/1/1/builder/terminal/{slug}"),
                     "mode": "append",
                     "payload": { "content": line }
                 }]}),

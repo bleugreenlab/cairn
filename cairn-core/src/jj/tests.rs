@@ -4360,8 +4360,8 @@ fn fold_exports_so_a_later_child_bases_on_the_folded_tip() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let int = "agent/CAIRN-1940-coordinator-0";
-    let child_a = "agent/CAIRN-1-builder-0";
+    let int = "agent/cairn-1940-coordinator-0";
+    let child_a = "agent/cairn-1-builder-0";
     add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
     let ws_a = wts.path().join("a");
     add_workspace(&jj, &store, &ws_a, child_a, int, None).unwrap();
@@ -4388,7 +4388,7 @@ fn fold_exports_so_a_later_child_bases_on_the_folded_tip() {
     // Provision a later child exactly as worktrees.rs does: rev-parse the base
     // ref in the project, then add_workspace off that commit id.
     let base_rev = git_stdout(proj.path(), &["rev-parse", int]);
-    let child_b = "agent/CAIRN-2-builder-0";
+    let child_b = "agent/cairn-2-builder-0";
     let ws_b = wts.path().join("b");
     add_workspace(&jj, &store, &ws_b, child_b, &base_rev, None).unwrap();
     assert_eq!(
@@ -4413,8 +4413,8 @@ fn fold_child_leaving_coordinator_stale(
     PathBuf, /* ws_coord */
     String,  /* int branch */
 ) {
-    let int = "agent/CAIRN-1987-coordinator-0";
-    let child = "agent/CAIRN-1988-builder-0";
+    let int = "agent/cairn-1987-coordinator-0";
+    let child = "agent/cairn-1988-builder-0";
     let ws_coord = wts.join("coord");
     add_workspace(jj, store, &ws_coord, int, "main", None).unwrap();
     let ws_child = wts.join("child");
@@ -4513,7 +4513,7 @@ fn seal_refuses_conflicted_branch_with_distinct_error() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-2081-builder-0";
+    let branch = "agent/cairn-2081-builder-0";
     let ws = wts.path().join("job");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
 
@@ -4637,7 +4637,7 @@ fn scoped_dirty_measures_whole_and_scoped_paths() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
     let ws = wts.path().join("w");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+    add_workspace(&jj, &store, &ws, "agent/cairn-1-builder-0", "main", None).unwrap();
 
     // Clean working copy: nothing dirty either way.
     assert!(!scoped_dirty(&jj, &ws, &[]).unwrap());
@@ -4674,7 +4674,7 @@ fn sealed_commit_is_lost_flags_empty_and_divergent_not_clean() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
     let ws = wts.path().join("w");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+    add_workspace(&jj, &store, &ws, "agent/cairn-1-builder-0", "main", None).unwrap();
 
     // A real, non-empty seal is NOT lost even with pre-commit dirt measured.
     std::fs::write(ws.join("a.txt"), "v1\n").unwrap();
@@ -4743,7 +4743,7 @@ fn seal_paths_detects_and_backs_out_a_lost_seal() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
     let ws = wts.path().join("w");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+    add_workspace(&jj, &store, &ws, "agent/cairn-1-builder-0", "main", None).unwrap();
 
     // A clean seal succeeds normally (the no-false-positive baseline).
     std::fs::write(ws.join("a.txt"), "v1\n").unwrap();
@@ -4753,7 +4753,7 @@ fn seal_paths_detects_and_backs_out_a_lost_seal() {
         "seal1",
         None,
         &[],
-        Some("agent/CAIRN-1-builder-0"),
+        Some("agent/cairn-1-builder-0"),
     )
     .expect("a clean seal succeeds");
     assert!(!ok.sha.is_empty());
@@ -4779,7 +4779,7 @@ fn seal_paths_detects_and_backs_out_a_lost_seal() {
         &[
             "bookmark",
             "set",
-            "agent/CAIRN-1-builder-0",
+            "agent/cairn-1-builder-0",
             "-r",
             "@-",
             "--ignore-working-copy",
@@ -4795,7 +4795,7 @@ fn seal_paths_detects_and_backs_out_a_lost_seal() {
         "seal2",
         None,
         &[],
-        Some("agent/CAIRN-1-builder-0"),
+        Some("agent/cairn-1-builder-0"),
     )
     .expect_err("a lost seal must surface as Err, not Ok with a phantom sha");
     assert!(
@@ -4842,8 +4842,8 @@ fn discard_self_heals_stale_working_copy_with_loose_edits() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let int = "agent/CAIRN-1-coordinator-0";
-    let child = "agent/CAIRN-2-builder-0";
+    let int = "agent/cairn-1-coordinator-0";
+    let child = "agent/cairn-2-builder-0";
     let ws_coord = wts.path().join("coord");
     add_workspace(&jj, &store, &ws_coord, int, "main", None).unwrap();
     let ws_child = wts.path().join("child");
@@ -5032,7 +5032,7 @@ fn seal_paths_commits_path_with_fileset_metacharacters() {
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
     let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-2019-builder-0", "main", None).unwrap();
+    add_workspace(&jj, &store, &ws, "agent/cairn-2019-builder-0", "main", None).unwrap();
 
     // Edit a file under a parens route-group directory, then path-scope seal it.
     let rel = "apps/quarry/src/app/(app)/drawings/page.tsx";
@@ -5046,7 +5046,7 @@ fn seal_paths_commits_path_with_fileset_metacharacters() {
         "add drawings page",
         None,
         &[rel],
-        Some("agent/CAIRN-2019-builder-0"),
+        Some("agent/cairn-2019-builder-0"),
     )
     .unwrap();
     assert!(
@@ -5143,7 +5143,7 @@ fn resolve_base_rev_keeps_store_only_bookmark() {
 
     // And it provisions, the way a child workspace bases off the coordinator.
     let ws = wts.path().join("child");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-9-builder-0", &got, None).unwrap();
+    add_workspace(&jj, &store, &ws, "agent/cairn-9-builder-0", &got, None).unwrap();
     assert!(
         is_jj_dir(&ws),
         "workspace based on the store bookmark provisions"
@@ -5198,7 +5198,7 @@ fn resolve_base_rev_uses_root_for_unborn_repo() {
     // Unborn repo: an initialized repo with the branch set but no commit.
     git(proj.path(), &["init", "-q", "-b", "main"]);
     git(proj.path(), &["config", "user.email", "p@e.com"]);
-    git(proj.path(), &["config", "user.name", "P"]);
+    git(proj.path(), &["config", "user.name", "p"]);
     let jj = JjEnv::resolve(&bin, home.path());
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
@@ -5243,7 +5243,7 @@ fn update_stale_on_fresh_workspace_is_a_clean_noop() {
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
     let ws = wts.path().join("job");
-    add_workspace(&jj, &store, &ws, "agent/CAIRN-1-builder-0", "main", None).unwrap();
+    add_workspace(&jj, &store, &ws, "agent/cairn-1-builder-0", "main", None).unwrap();
 
     update_stale(&jj, &ws).expect("update-stale on a fresh workspace is a clean no-op");
     assert_eq!(is_working_copy_dirty(&jj, &ws), Ok(false));
@@ -5341,7 +5341,7 @@ fn seal_amend_converts_to_child_when_target_commit_is_shared() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-1-builder-0";
+    let branch = "agent/cairn-1-builder-0";
     let ws = wts.path().join("job");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
 
@@ -5449,7 +5449,7 @@ fn seal_amend_squashes_when_target_commit_is_not_shared() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-1-builder-0";
+    let branch = "agent/cairn-1-builder-0";
     let ws = wts.path().join("job");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
 
@@ -5799,7 +5799,7 @@ fn reconcile_clears_a_conflicted_default_bookmark_after_a_github_squash() {
         &fx.jj,
         &fx.store,
         &ws,
-        "agent/CAIRN-1-builder-0",
+        "agent/cairn-1-builder-0",
         "main",
         None,
     )
@@ -5963,7 +5963,7 @@ fn a_conflicted_agent_branch_settles_on_the_target_that_contains_the_rest() {
         return;
     };
     let fx = setup_tracked_origin(&bin);
-    let branch = "agent/CAIRN-1-builder-1";
+    let branch = "agent/cairn-1-builder-1";
     let (tip, git_side) = conflict_agent_branch(&fx, branch);
     assert_ne!(tip, git_side);
 
@@ -5996,7 +5996,7 @@ fn a_genuinely_divergent_branch_is_reported_rather_than_settled() {
         return;
     };
     let fx = setup_tracked_origin(&bin);
-    let branch = "agent/CAIRN-2-builder-1";
+    let branch = "agent/cairn-2-builder-1";
 
     let exported = store_child_of(&fx, "main", "agent work");
     create_bookmark_at(&fx.jj, &fx.store, branch, &exported).unwrap();
@@ -6106,7 +6106,7 @@ fn a_verified_export_detects_and_repairs_a_frozen_git_ref() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-2765-builder-0";
+    let branch = "agent/cairn-2765-builder-0";
     jj.run(
         &store,
         &["new", "main", "-m", "agent work", "--ignore-working-copy"],
@@ -6311,7 +6311,7 @@ fn origin_confirmation_catches_a_push_origin_did_not_record() {
         return;
     };
     let fx = setup_tracked_origin(&bin);
-    let branch = "agent/CAIRN-3189-builder-0";
+    let branch = "agent/cairn-3189-builder-0";
 
     // Nothing has been pushed yet: origin has no such branch.
     let error = confirm_origin_tip(&fx.store, branch, &fx.base)
@@ -6389,8 +6389,8 @@ fn a_fold_repairs_a_frozen_integration_ref_instead_of_reporting_success() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let integration = "agent/CAIRN-1-coordinator-0";
-    let child = "agent/CAIRN-2-builder-0";
+    let integration = "agent/cairn-1-coordinator-0";
+    let child = "agent/cairn-2-builder-0";
     let base = git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]);
     create_bookmark_at(&jj, &store, integration, &base).unwrap();
     jj.run(
@@ -6562,7 +6562,7 @@ fn setup_conflicting_advance(bin: &str) -> ConflictingAdvance {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-3197-builder-0";
+    let branch = "agent/cairn-3197-builder-0";
     let ws = wts.path().join("agent");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
     std::fs::write(ws.join("shared.rs"), "AGENT-SIDE\n").unwrap();
@@ -6571,7 +6571,7 @@ fn setup_conflicting_advance(bin: &str) -> ConflictingAdvance {
     let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
 
     // The base advances out of band with a conflicting edit to the same file.
-    let oob = "agent/CAIRN-9-oob-0";
+    let oob = "agent/cairn-9-oob-0";
     let ws_oob = wts.path().join("oob");
     add_workspace(&jj, &store, &ws_oob, oob, "main", None).unwrap();
     std::fs::write(ws_oob.join("shared.rs"), "MAIN-SIDE\n").unwrap();
@@ -6626,7 +6626,7 @@ fn the_base_drift_probe_answers_only_for_the_paths_it_is_given() {
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
     // Two branches that AGREE on `shared.rs` and differ on `own.rs`.
-    let left = "agent/CAIRN-3337-left-0";
+    let left = "agent/cairn-3337-left-0";
     let ws_left = wts.path().join("left");
     add_workspace(&jj, &store, &ws_left, left, "main", None).unwrap();
     std::fs::write(ws_left.join("shared.rs"), "AGREED\n").unwrap();
@@ -6634,7 +6634,7 @@ fn the_base_drift_probe_answers_only_for_the_paths_it_is_given() {
     seal(&jj, &ws_left, "left", None).unwrap();
     let left_tip = bookmark_commit(&jj, &store, left).unwrap();
 
-    let right = "agent/CAIRN-3337-right-0";
+    let right = "agent/cairn-3337-right-0";
     let ws_right = wts.path().join("right");
     add_workspace(&jj, &store, &ws_right, right, "main", None).unwrap();
     std::fs::write(ws_right.join("shared.rs"), "AGREED\n").unwrap();
@@ -6787,18 +6787,18 @@ fn the_rollback_undoes_only_the_conflicting_siblings_rebase() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let int = "agent/CAIRN-3197-coordinator-0";
+    let int = "agent/cairn-3197-coordinator-0";
     add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
 
     // Sibling A touches only its own file, so it rebases cleanly.
-    let clean = "agent/CAIRN-1-builder-0";
+    let clean = "agent/cairn-1-builder-0";
     let ws_clean = wts.path().join("clean");
     add_workspace(&jj, &store, &ws_clean, clean, int, None).unwrap();
     std::fs::write(ws_clean.join("clean.rs"), "clean work\n").unwrap();
     seal(&jj, &ws_clean, "clean sibling work", None).unwrap();
 
     // Sibling B edits the file the base is about to change.
-    let conflicting = "agent/CAIRN-2-builder-0";
+    let conflicting = "agent/cairn-2-builder-0";
     let ws_conflicting = wts.path().join("conflicting");
     add_workspace(&jj, &store, &ws_conflicting, conflicting, int, None).unwrap();
     std::fs::write(ws_conflicting.join("shared.rs"), "BRANCH-SIDE\n").unwrap();
@@ -6862,7 +6862,7 @@ fn a_clean_rebase_names_the_files_both_sides_changed() {
     // A file long enough that two edits at opposite ends merge without conflict.
     git(proj.path(), &["init", "-q", "-b", "main"]);
     git(proj.path(), &["config", "user.email", "p@e.com"]);
-    git(proj.path(), &["config", "user.name", "P"]);
+    git(proj.path(), &["config", "user.name", "p"]);
     let body: String = (0..40).map(|n| format!("line {n}\n")).collect();
     std::fs::write(proj.path().join("shared.rs"), &body).unwrap();
     git(proj.path(), &["add", "-A"]);
@@ -6872,7 +6872,7 @@ fn a_clean_rebase_names_the_files_both_sides_changed() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-3197-builder-0";
+    let branch = "agent/cairn-3197-builder-0";
     let ws = wts.path().join("agent");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
     std::fs::write(
@@ -6885,7 +6885,7 @@ fn a_clean_rebase_names_the_files_both_sides_changed() {
     let pre_tip = bookmark_commit(&jj, &store, branch).unwrap();
 
     // The base edits the far end of the SAME file, plus a file of its own.
-    let oob = "agent/CAIRN-9-oob-0";
+    let oob = "agent/cairn-9-oob-0";
     let ws_oob = wts.path().join("oob");
     add_workspace(&jj, &store, &ws_oob, oob, "main", None).unwrap();
     std::fs::write(
@@ -6950,7 +6950,7 @@ fn pin_validated_delta_refuses_a_tree_carrying_conflict_scaffolding() {
     let repo = TempDir::new().unwrap();
     git(repo.path(), &["init", "-q", "-b", "main"]);
     git(repo.path(), &["config", "user.email", "p@e.com"]);
-    git(repo.path(), &["config", "user.name", "P"]);
+    git(repo.path(), &["config", "user.name", "p"]);
     std::fs::write(repo.path().join("shared.rs"), "clean\n").unwrap();
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-q", "-m", "base"]);
@@ -7008,7 +7008,7 @@ fn straddle_fixture(
     };
     git(repo, &["init", "-q", "-b", "main"]);
     git(repo, &["config", "user.email", "p@e.com"]);
-    git(repo, &["config", "user.name", "P"]);
+    git(repo, &["config", "user.name", "p"]);
     write_all(base_files);
     git(repo, &["add", "-A"]);
     git(repo, &["commit", "-q", "-m", "base"]);
@@ -7232,7 +7232,7 @@ fn a_straddled_delta_integrates_onto_the_moved_bookmark_and_lands() {
 
     git(path, &["init", "-q", "-b", "main"]);
     git(path, &["config", "user.email", "p@e.com"]);
-    git(path, &["config", "user.name", "P"]);
+    git(path, &["config", "user.name", "p"]);
     std::fs::write(path.join("advanced.rs"), "before\n").unwrap();
     std::fs::write(path.join("mine.rs"), "base\n").unwrap();
     git(path, &["add", "-A"]);
@@ -7382,7 +7382,7 @@ fn a_clean_tip_over_conflicted_history_is_never_folded() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-3197-builder-0";
+    let branch = "agent/cairn-3197-builder-0";
     let ws = wts.path().join("agent");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
     std::fs::write(ws.join("shared.rs"), "BRANCH-SIDE\n").unwrap();
@@ -7390,7 +7390,7 @@ fn a_clean_tip_over_conflicted_history_is_never_folded() {
 
     // `main` advances conflictingly, and the branch is rebased UNGUARDED — the
     // pre-guard shape this has to keep coping with.
-    let oob = "agent/CAIRN-9-oob-0";
+    let oob = "agent/cairn-9-oob-0";
     let ws_oob = wts.path().join("oob");
     add_workspace(&jj, &store, &ws_oob, oob, "main", None).unwrap();
     std::fs::write(ws_oob.join("shared.rs"), "MAIN-SIDE\n").unwrap();
@@ -7817,7 +7817,7 @@ async fn three_successive_publications_each_reach_the_backing_branch_ref() {
     let store = home.path().join("jj-stores").join("proj");
     ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-    let branch = "agent/CAIRN-3270-coordinator-0";
+    let branch = "agent/cairn-3270-coordinator-0";
     let base = bookmark_commit(&jj, &store, "main").unwrap();
     create_bookmark_at(&jj, &store, branch, &base).unwrap();
 
@@ -7958,7 +7958,7 @@ fn stale_publication_fixture() -> Option<StalePublicationFixture> {
     let jj = JjEnv::resolve(&bin, home.path());
     let store = home.path().join("jj-stores").join("publication");
     ensure_project_store(&jj, &store, project.path()).unwrap();
-    let branch = "agent/CAIRN-3307-builder-0".to_string();
+    let branch = "agent/cairn-3307-builder-0".to_string();
     let workspace = workspaces.path().join("builder");
     add_workspace(&jj, &store, &workspace, &branch, "main", None).unwrap();
     std::fs::write(workspace.join("published.rs"), "published\n").unwrap();

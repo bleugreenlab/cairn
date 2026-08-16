@@ -14,6 +14,7 @@
 //! - [`mcp`] carries a pack's MCP server definitions and the layer they form
 //!   beneath the user's own settings.
 
+pub mod agent_plugin;
 pub mod lock;
 pub mod manifest;
 pub mod mcp;
@@ -26,6 +27,7 @@ pub use lock::{installed_packs, PackLock, PackLockItem, PackSource, PackSourceKi
 pub use manifest::{PackFormat, PackItem, PackItemKind, PackManifest};
 
 use crate::config::mcp_servers::McpServerConfig;
+use crate::services::{guarded_resolve_file, guarded_tree_files};
 
 /// Hashing distinguishes absent content from a present empty file or tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,11 +63,17 @@ pub fn hash_tree(root: &Path) -> Result<ContentHash, String> {
     Ok(ContentHash::Present(hash_tree_present(root)?))
 }
 
-pub fn hash_item_path(kind: PackItemKind, path: &Path) -> Result<ContentHash, String> {
+pub fn hash_item_path(kind: PackItemKind, root: &Path, path: &Path) -> Result<ContentHash, String> {
     match kind {
         PackItemKind::Skill | PackItemKind::Workflow => hash_tree(path),
         PackItemKind::Mcp => Err("MCP items must be hashed from their server definition".into()),
-        PackItemKind::Agent | PackItemKind::Recipe | PackItemKind::Response => hash_file(path),
+        PackItemKind::Agent | PackItemKind::Recipe | PackItemKind::Response => {
+            if !path.exists() {
+                return Ok(ContentHash::Missing);
+            }
+            let resolved = guarded_resolve_file(root, path)?;
+            hash_file(&resolved)
+        }
     }
 }
 
@@ -204,7 +212,17 @@ pub fn content_hash(root: &Path) -> Result<String, String> {
 fn hash_tree_present(root: &Path) -> Result<String, String> {
     let mut entries = Vec::new();
     if root.exists() {
-        collect_files(root, root, &mut entries)?;
+        for file in guarded_tree_files(root)? {
+            let relative_path = file
+                .relative_path
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let bytes = std::fs::read(&file.resolved_path)
+                .map_err(|e| format!("Failed to read resource {:?}: {e}", file.resolved_path))?;
+            entries.push((relative_path, bytes));
+        }
     }
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
@@ -220,40 +238,6 @@ fn hash_tree_present(root: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn collect_files(
-    root: &Path,
-    dir: &Path,
-    entries: &mut Vec<(String, Vec<u8>)>,
-) -> Result<(), String> {
-    let mut children = std::fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read resource directory {dir:?}: {e}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("Failed to read resource entry: {e}"))?;
-    children.sort_by_key(|entry| entry.path());
-
-    for child in children {
-        let path = child.path();
-        let file_type = child
-            .file_type()
-            .map_err(|e| format!("Failed to inspect resource {path:?}: {e}"))?;
-        if file_type.is_dir() {
-            collect_files(root, &path, entries)?;
-        } else if file_type.is_file() {
-            let relative_path = path
-                .strip_prefix(root)
-                .map_err(|e| format!("Failed to relativize resource {path:?}: {e}"))?
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/");
-            let bytes = std::fs::read(&path)
-                .map_err(|e| format!("Failed to read resource {path:?}: {e}"))?;
-            entries.push((relative_path, bytes));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +246,20 @@ mod tests {
     fn write(path: &Path, content: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_hash_rejects_symlink_escape() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("pack");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(temp.path().join("secret"), "outside").unwrap();
+        std::os::unix::fs::symlink("../secret", root.join("secret")).unwrap();
+
+        assert!(content_hash(&root)
+            .unwrap_err()
+            .contains("escapes its root"));
     }
 
     #[test]

@@ -61,6 +61,8 @@ impl RawImportedServer {
             // Values entered through Settings land in the keychain, which is a
             // declaration on its own.
             secrets: Vec::new(),
+            cwd: None,
+            agent_plugin_runtime: None,
         }
     }
 }

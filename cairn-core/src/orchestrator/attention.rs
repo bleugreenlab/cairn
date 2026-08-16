@@ -114,7 +114,7 @@ pub struct PrStateContent {
 /// One attention event delivered to a watcher.
 ///
 /// `issue_id` is the internal id used by `watch` to filter subscriptions;
-/// `issue_uri` is the rendered `cairn://p/PROJ/N` form returned to callers.
+/// `issue_uri` is the rendered `cairn://p/proj/N` form returned to callers.
 /// `attention` and `status` are the projection at the time of the emit so the
 /// long-poll response is self-contained (the watcher does not need to re-read).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -422,7 +422,7 @@ async fn pending_permission_uri(
 ///
 /// A blocked node is either a gated agent **job** (resolve to its gated-artifact
 /// URI) or a blocked **action_run** — notably a `pr` node awaiting merge/close,
-/// whose detail URI is the bare node `cairn://p/PROJ/N/EXEC/pr` (no artifact
+/// whose detail URI is the bare node `cairn://p/proj/N/EXEC/pr` (no artifact
 /// name: the PR *is* the node's content). Picks the most-recently-created
 /// blocked owner across both tables, addressing by `(executions.seq,
 /// uri_segment)` — the same key the node-tree emits and the read resolver
@@ -927,15 +927,15 @@ mod tests {
     #[test]
     fn fact_keys_distinguish_distinct_facts() {
         let q = AttentionFact::Question {
-            detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
+            detail_uri: "cairn://p/cairn/1/1/planner/questions/q-1".into(),
             content: QuestionContent { questions: vec![] },
         };
         let other = AttentionFact::Question {
-            detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-2".into(),
+            detail_uri: "cairn://p/cairn/1/1/planner/questions/q-2".into(),
             content: QuestionContent { questions: vec![] },
         };
         let idle = AttentionFact::AgentIdleWithWork {
-            detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
+            detail_uri: "cairn://p/cairn/1/1/planner/questions/q-1".into(),
         };
         assert_ne!(q.key(), other.key());
         assert_ne!(q.key(), idle.key());
@@ -945,7 +945,7 @@ mod tests {
     fn event_renders_resolved_with_terminal_status() {
         let event = AttentionEvent {
             issue_id: "i-1".into(),
-            issue_uri: "cairn://p/CAIRN/1".into(),
+            issue_uri: "cairn://p/cairn/1".into(),
             fact: AttentionFact::Resolved {
                 final_status: IssueStatus::Merged,
             },
@@ -958,7 +958,7 @@ mod tests {
         assert_eq!(json["status"], "resolved");
         assert_eq!(json["issue_status"], "merged");
         assert_eq!(json["updated_at"], 42);
-        assert_eq!(json["issue_uri"], "cairn://p/CAIRN/1");
+        assert_eq!(json["issue_uri"], "cairn://p/cairn/1");
         assert_eq!(json["fact"]["kind"], "resolved");
     }
 
@@ -966,9 +966,9 @@ mod tests {
     fn event_renders_actionable_with_detail_uri_and_fact_block() {
         let event = AttentionEvent {
             issue_id: "i-1".into(),
-            issue_uri: "cairn://p/CAIRN/1".into(),
+            issue_uri: "cairn://p/cairn/1".into(),
             fact: AttentionFact::Question {
-                detail_uri: "cairn://p/CAIRN/1/1/planner/questions/q-1".into(),
+                detail_uri: "cairn://p/cairn/1/1/planner/questions/q-1".into(),
                 content: QuestionContent { questions: vec![] },
             },
             attention: IssueAttention::NeedsInput,
@@ -981,7 +981,7 @@ mod tests {
         assert_eq!(json["attention"], "needs_input");
         assert_eq!(
             json["detail_uri"],
-            "cairn://p/CAIRN/1/1/planner/questions/q-1"
+            "cairn://p/cairn/1/1/planner/questions/q-1"
         );
         assert_eq!(json["fact"]["kind"], "question");
     }
@@ -990,15 +990,15 @@ mod tests {
     fn external_message_reply_watch_json_includes_inline_body() {
         let event = AttentionEvent {
             issue_id: "issue-1".to_string(),
-            issue_uri: "cairn://p/CAIRN/1209".to_string(),
+            issue_uri: "cairn://p/cairn/1209".to_string(),
             attention: IssueAttention::None,
             status: IssueStatus::Active,
             updated_at: 1700000001,
             fact: AttentionFact::ExternalMessageReply {
-                detail_uri: "cairn://p/CAIRN/1209/messages".to_string(),
+                detail_uri: "cairn://p/cairn/1209/messages".to_string(),
                 message_id: "msg-1".to_string(),
                 content: ExternalMessageReplyContent {
-                    sender: "cairn://p/CAIRN/1209/1/builder".to_string(),
+                    sender: "cairn://p/cairn/1209/1/builder".to_string(),
                     body: "done".to_string(),
                 },
             },
@@ -1008,12 +1008,12 @@ mod tests {
         let json = event_to_watch_json(&event);
         assert_eq!(json["status"], "actionable");
         assert_eq!(json["attention"], "none");
-        assert_eq!(json["detail_uri"], "cairn://p/CAIRN/1209/messages");
+        assert_eq!(json["detail_uri"], "cairn://p/cairn/1209/messages");
         assert_eq!(json["fact"]["kind"], "external_message_reply");
         assert_eq!(json["fact"]["message_id"], "msg-1");
         assert_eq!(
             json["fact"]["content"]["sender"],
-            "cairn://p/CAIRN/1209/1/builder"
+            "cairn://p/cairn/1209/1/builder"
         );
         assert_eq!(json["fact"]["content"]["body"], "done");
     }

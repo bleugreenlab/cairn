@@ -36,10 +36,13 @@ pub(crate) const PACKS_CONTRACT: ResourceContract =
         }],
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
-        // Read-only. Installing a pack from a URL (CAIRN-3773) is not built yet,
-        // and an affordance block IS the contract an agent acts on — advertising
-        // a mutation that always errors would send every reader down it.
-        mutations: NO_MUTATIONS,
+        mutations: &[MutationSpec {
+            mode: ChangeMode::Create,
+            required: &[PACK_PATH],
+            optional: &[],
+            label: "import and install a local Agent Plugin directory",
+            example: "write({changes:[{target:\"cairn://packs\",mode:\"create\",payload:{path:\"/path/to/plugin\"}}]})",
+        }],
     };
 
 pub(crate) const PACK_CONTRACT: ResourceContract =
@@ -55,8 +58,8 @@ pub(crate) const PACK_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Patch,
                 required: &[PACK_ACTION],
-                optional: &[],
-                label: "install, update, or restore pack",
+                optional: &[PACK_PATH, PACK_ITEM_KIND, PACK_ITEM_ID],
+                label: "install, update, restore, or export pack",
                 example: "write({changes:[{target:\"cairn://packs/ID\",mode:\"patch\",payload:{action:\"install\"}}]})",
             },
             MutationSpec {
@@ -81,7 +84,7 @@ pub(crate) const SKILLS_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Create,
             required: &[SKILL_NAME, DESCRIPTION, SKILL_PROMPT],
-            optional: &[],
+            optional: &[SKILL_ALLOWED_TOOLS, SKILL_SOURCE_ISSUE],
             label: "create skill",
             example: "write({changes:[{target:\"cairn://skills\",mode:\"create\",payload:{name:\"...\",description:\"...\",prompt:\"...\"}}]})",
         }],
@@ -100,7 +103,15 @@ pub(crate) const SKILL_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Patch,
                 required: &[],
-                optional: &[SKILL_NAME, DESCRIPTION, SKILL_PROMPT],
+                optional: &[
+                    SKILL_NAME,
+                    DESCRIPTION,
+                    SKILL_PROMPT,
+                    SKILL_APPEND_TO_PROMPT,
+                    SKILL_REPLACE_SECTION,
+                    SKILL_ALLOWED_TOOLS,
+                    SKILL_SOURCE_ISSUE,
+                ],
                 label: "patch skill",
                 example: "write({changes:[{target:\"cairn://skills/ID\",mode:\"patch\",payload:{description:\"...\"}}]})",
             },
@@ -126,7 +137,7 @@ pub(crate) const PROJECT_SKILLS_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Create,
             required: &[SKILL_NAME, DESCRIPTION, SKILL_PROMPT],
-            optional: &[],
+            optional: &[SKILL_ALLOWED_TOOLS, SKILL_SOURCE_ISSUE],
             label: "create skill",
             example: "write({changes:[{target:\"cairn://p/PROJECT/skills\",mode:\"create\",payload:{name:\"...\",description:\"...\",prompt:\"...\"}}]})",
         }],
@@ -145,7 +156,15 @@ pub(crate) const PROJECT_SKILL_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Patch,
                 required: &[],
-                optional: &[SKILL_NAME, DESCRIPTION, SKILL_PROMPT],
+                optional: &[
+                    SKILL_NAME,
+                    DESCRIPTION,
+                    SKILL_PROMPT,
+                    SKILL_APPEND_TO_PROMPT,
+                    SKILL_REPLACE_SECTION,
+                    SKILL_ALLOWED_TOOLS,
+                    SKILL_SOURCE_ISSUE,
+                ],
                 label: "patch skill",
                 example: "write({changes:[{target:\"cairn://p/PROJECT/skills/ID\",mode:\"patch\",payload:{description:\"...\"}}]})",
             },

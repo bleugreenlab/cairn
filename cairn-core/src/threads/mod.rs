@@ -45,7 +45,7 @@ pub(crate) async fn resolve_parent_thread_uri_conn(
             "SELECT t.id, t.project_id, t.name
              FROM threads t
              JOIN projects p ON p.id = t.project_id
-             WHERE p.key = ?1
+             WHERE LOWER(p.key) = ?1
                AND ((?2 IS NOT NULL AND t.name = ?2)
                     OR (?3 IS NOT NULL
                         AND t.migrated_from_number = ?3
@@ -220,6 +220,50 @@ pub(crate) async fn inherited_thread_id_conn(
     }
 }
 
+/// The thread ROW a project-scoped thread name addresses, or `None` when the
+/// project holds no thread of that name.
+///
+/// The thread's id is its durable identity: sessions are replaced and compacted
+/// beneath it and its name can change, while this row persists. Anything that
+/// must outlive a session — a reading position, most of all — keys on this
+/// rather than on the session job or on the name.
+pub(crate) async fn thread_id_by_name_conn(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    name: &str,
+) -> crate::storage::DbResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT id FROM threads WHERE project_id = ?1 AND name = ?2 LIMIT 1",
+            cairn_db::turso::params![project_id, name],
+        )
+        .await?;
+    rows.next()
+        .await?
+        .map(|row| row.get::<String>(0))
+        .transpose()
+        .map_err(Into::into)
+}
+
+/// [`thread_id_by_name_conn`] for a caller holding a routed handle rather than a
+/// connection, addressed by project KEY the way a URI spells it.
+pub(crate) async fn thread_id_by_name(
+    db: &crate::storage::LocalDb,
+    project_key: &str,
+    name: &str,
+) -> crate::storage::DbResult<Option<String>> {
+    db.query_text(
+        "SELECT t.id FROM threads t
+         JOIN projects p ON t.project_id = p.id
+         WHERE p.key = ?1 AND t.name = ?2 LIMIT 1",
+        (
+            cairn_common::uri::canonical_project(project_key),
+            name.to_string(),
+        ),
+    )
+    .await
+}
+
 /// The one answer to "which job runs this thread's session", addressed the way
 /// a URI addresses a thread.
 pub(crate) async fn session_job_id_by_name_conn(
@@ -344,10 +388,9 @@ pub(crate) async fn ensure_thread_session_conn(
             cairn_db::turso::params![thread_id],
         )
         .await?;
-    let row = rows
-        .next()
-        .await?
-        .ok_or_else(|| crate::storage::DbError::Row(format!("thread not found: {thread_id}")))?;
+    let row = rows.next().await?.ok_or_else(|| {
+        crate::storage::DbError::Internal(format!("thread not found: {thread_id}"))
+    })?;
     let project_id = row.get::<String>(0)?;
     let stored_definition = row.get::<Option<String>>(1)?;
     let status = crate::models::ThreadStatus::parse(&row.get::<String>(2)?)
@@ -386,7 +429,7 @@ pub(crate) async fn ensure_thread_session_conn(
         .await?;
         job_id
     } else if !status.is_active() {
-        return Err(crate::storage::DbError::Row(closed_thread_refusal(
+        return Err(crate::storage::DbError::Internal(closed_thread_refusal(
             thread_id,
         )));
     } else {
@@ -475,13 +518,37 @@ pub(crate) async fn job_owner(db: &LocalDb, job_id: &str) -> JobOwner {
     let Ok(Some((execution_id, issue_id, thread_id))) = row else {
         return JobOwner::Unknown;
     };
+    classify_owner(
+        execution_id.as_deref(),
+        issue_id.as_deref(),
+        thread_id.as_deref(),
+    )
+}
+
+/// [`job_owner`] for a caller that already holds the row, so asking the same
+/// question costs no second read. Both answer through [`classify_owner`]; there
+/// is one notion of what a thread is.
+pub(crate) fn owner_of_job(job: &crate::db_records::DbJob) -> JobOwner {
+    classify_owner(
+        job.execution_id.as_deref(),
+        job.issue_id.as_deref(),
+        job.thread_id.as_deref(),
+    )
+}
+
+/// The ownership predicate itself.
+///
+/// `thread_id` is the owner; `execution_id` is machinery, and the two are not
+/// mutually exclusive. A thread's session job acquires an execution the moment
+/// it takes a turn or delegates — a passive host carrying its agent snapshot and
+/// its delegated packets. Reading that as issue ownership silently demoted a
+/// thread, taking its rolling compaction and its commit refusal with it.
+fn classify_owner(
+    execution_id: Option<&str>,
+    issue_id: Option<&str>,
+    thread_id: Option<&str>,
+) -> JobOwner {
     let issue_owned = execution_id.is_some() || issue_id.is_some();
-    // `thread_id` is the owner; `execution_id` is machinery, and the two are not
-    // mutually exclusive. Delegation books its packets in an execution snapshot,
-    // so the first task a thread spawns stamps a synthetic `execution_id` onto
-    // the thread's own session job (`ensure_task_execution_context`). Reading
-    // that as issue ownership silently demoted a thread the moment it delegated,
-    // taking its rolling compaction and its commit refusal with it.
     match (thread_id.is_some(), issue_owned) {
         (true, _) => JobOwner::Thread,
         (false, true) => JobOwner::Issue,
@@ -565,7 +632,7 @@ mod tests {
         let db = crate::storage::migrated_test_db(name).await;
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p','default','P','PRJ','/tmp/p',1,1);
+               VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('i-issue','p',1,'An ordinary issue','active','none',1,1);
              INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
@@ -644,7 +711,7 @@ mod tests {
 
         let session = db
             .read(|conn| {
-                Box::pin(async move { session_job_id_by_name_conn(conn, "PRJ", "topic").await })
+                Box::pin(async move { session_job_id_by_name_conn(conn, "prj", "topic").await })
             })
             .await
             .unwrap();

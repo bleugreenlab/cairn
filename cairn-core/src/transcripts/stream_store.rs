@@ -567,7 +567,8 @@ async fn record_read_tokens_if_applicable(conn: &Connection, event: &EventInsert
     }
 
     if let Some((true, expected)) = matched {
-        let segments = crate::runs::read_tokens::read_segment_tokens(&body, &expected);
+        let meter = crate::token_meters::meter_for_run_conn(conn, &event.run_id).await?;
+        let segments = crate::runs::read_tokens::read_segment_tokens(&body, &expected, meter);
         let total: i64 = segments.iter().map(|seg| seg.tokens).sum();
         let json = serde_json::to_string(&segments).unwrap_or_default();
         conn.execute(
@@ -1669,7 +1670,7 @@ mod tests {
                 conn.execute(
                     format!(
                         "INSERT INTO projects(id, {project_scope_column}, name, key, repo_path, created_at, updated_at)
-                         VALUES ('project-1', 'default', 'Project', 'PROJ', '/tmp/project', ?1, ?2)
+                         VALUES ('project-1', 'default', 'Project', 'proj', '/tmp/project', ?1, ?2)
                          ON CONFLICT(id) DO NOTHING"
                     ),
                     params![now, now],

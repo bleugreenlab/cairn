@@ -17,7 +17,7 @@ use serde::Deserialize;
 use crate::mcp::types::McpCallbackRequest;
 use crate::orchestrator::Orchestrator;
 
-use super::{error_segment, view, Produced};
+use super::{duplicate_segment, error_segment, view, Produced};
 
 type ReadCursorState = Mutex<HashMap<String, usize>>;
 
@@ -55,6 +55,14 @@ pub(crate) async fn handle_read_batch(
         }
     }
 
+    if let Some(run_id) = request.run_id.as_deref() {
+        for segment in &segments {
+            if segment.meta.kind == SegmentKind::Error {
+                log::info!("read_error: run={} target={}", run_id, segment.meta.uri);
+            }
+        }
+    }
+
     // Per-target flail dedup: re-applied here because `read_batch` is kept out of
     // the outer `is_read_family` so the batch granularity does not collapse the
     // per-target `[duplicate call]` stub.
@@ -67,7 +75,9 @@ pub(crate) async fn handle_read_batch(
             // Browser reads are snapshots of an interactive surface; repeating the
             // same URI is an intentional poll/visual re-check, not flailing over
             // a static resource. Always return the fresh browser read result.
-            if is_browser_resource_target(&segment.meta.uri) {
+            if is_browser_resource_target(&segment.meta.uri)
+                || crate::dispatch::is_explicitly_paged_target(&segment.meta.uri)
+            {
                 continue;
             }
             // A `?wait` long-poll is an intentional repeated read of the same
@@ -92,7 +102,7 @@ pub(crate) async fn handle_read_batch(
                     distinct_dupes,
                 );
                 let uri = segment.meta.uri.clone();
-                *segment = error_segment(uri, stub);
+                *segment = duplicate_segment(uri, stub);
             }
         }
     }
@@ -148,10 +158,15 @@ pub(crate) async fn handle_read_batch(
     // whose result the agent will not see.
     crate::mcp::handlers::durable_images::promote_read_images(orch, request, &mut segments).await;
 
+    let meter = request
+        .run_id
+        .as_deref()
+        .map(|run_id| crate::token_meters::meter_for_process(&orch.process_state, run_id))
+        .unwrap_or(&crate::token_meters::CLAUDE_TOKEN_METER);
     let envelope = if payload.include_bodies {
-        view::assemble_with_bodies(segments)
+        view::assemble_with_bodies(segments, meter)
     } else {
-        view::assemble(segments)
+        view::assemble(segments, meter)
     };
     serde_json::to_string(&envelope)
         .unwrap_or_else(|error| format!("Failed to serialize read batch: {error}"))
@@ -624,6 +639,7 @@ fn split_line_scope(target: &str, include_limit: bool) -> (String, Option<i64>, 
 mod tests {
     use super::*;
     use cairn_common::read::{Affordance, NaturalUnit, ReadBatchEnvelope, SegmentKind};
+    use cairn_common::token_meter::TokenMeter;
 
     fn file_segment(uri: &str, lines: usize) -> ReadSegment {
         let body: String = (1..=lines)
@@ -637,10 +653,10 @@ mod tests {
 
     #[test]
     fn assemble_orders_targets_under_headers() {
-        let envelope = view::assemble(vec![
-            file_segment("file:a.rs", 2),
-            file_segment("file:b.rs", 2),
-        ]);
+        let envelope = view::assemble(
+            vec![file_segment("file:a.rs", 2), file_segment("file:b.rs", 2)],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         let a = envelope.text.find("=== file:a.rs").unwrap();
         let b = envelope.text.find("=== file:b.rs").unwrap();
         assert!(a < b);
@@ -655,8 +671,11 @@ mod tests {
         for i in 0..5 {
             segments.push(file_segment(&format!("file:small{i}.rs"), 3));
         }
-        let envelope = view::assemble(segments);
-        assert!(envelope.text.len() <= view::READ_BATCH_CHAR_BUDGET);
+        let envelope = view::assemble(segments, &crate::token_meters::O200K_TOKEN_METER);
+        assert!(
+            crate::token_meters::O200K_TOKEN_METER.count(&envelope.text)
+                <= view::READ_BATCH_TOKEN_BUDGET
+        );
         for i in 0..5 {
             assert!(envelope.text.contains(&format!("=== file:small{i}.rs")));
         }
@@ -676,7 +695,7 @@ mod tests {
         let mut b = file_segment("cairn://p/X/2", 2);
         b.meta.kind = SegmentKind::Resource;
         b.affordance = Some(affordance.clone());
-        let envelope = view::assemble(vec![a, b]);
+        let envelope = view::assemble(vec![a, b], &crate::token_meters::O200K_TOKEN_METER);
         // The identical affordance appears exactly once, at the very end.
         assert_eq!(envelope.text.matches("--- actions ---").count(), 1);
         assert!(envelope.text.trim_end().ends_with("--- actions ---"));
@@ -684,11 +703,14 @@ mod tests {
 
     #[test]
     fn assemble_surfaces_error_segment_in_place() {
-        let envelope = view::assemble(vec![
-            file_segment("file:a.rs", 2),
-            error_segment("file:bad.rs", "Failed to read file: nope"),
-        ]);
-        assert!(envelope.text.contains("=== file:bad.rs ==="));
+        let envelope = view::assemble(
+            vec![
+                file_segment("file:a.rs", 2),
+                error_segment("file:bad.rs", "Failed to read file: nope"),
+            ],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
+        assert!(envelope.text.contains("=== file:bad.rs [error] ==="));
         assert!(envelope.text.contains("Failed to read file: nope"));
     }
 
@@ -817,6 +839,7 @@ mod tests {
         assert!(bodies[1].contains("char_offset="));
         assert_eq!(structured.segments[2].kind, SegmentKind::Error);
         assert_eq!(structured.segments[2].uri, "file:missing.rs");
+        assert!(structured.text.contains("=== file:missing.rs [error] ==="));
         assert!(bodies[2].contains("Invalid file target"), "{}", bodies[2]);
         assert!(bodies[2].contains("does not exist"), "{}", bodies[2]);
         for body in bodies {
@@ -834,6 +857,47 @@ mod tests {
         assert!(plain_json.get("bodies").is_none());
         let plain: ReadBatchEnvelope = serde_json::from_str(&plain_raw).unwrap();
         assert!(plain.bodies.is_none());
+    }
+
+    #[tokio::test]
+    async fn explicit_windows_bypass_dedup_while_unwindowed_repeats_are_duplicates() {
+        let orch = seeded_orch().await;
+        orch.process_state.processes.lock().unwrap().register(
+            "run-paging-dedup".to_string(),
+            crate::agent_process::process::RunHandle::test_handle(Some("session"), Some("job")),
+        );
+        orch.process_state
+            .set_current_turn_id("run-paging-dedup", Some("turn"));
+        let worktree = tempfile::tempdir().unwrap();
+        std::fs::write(worktree.path().join("big.rs"), "a\nb\nc\nd\ne\nf").unwrap();
+        let cursors = Mutex::new(HashMap::new());
+
+        let request = |path: &str| McpCallbackRequest {
+            thread_id: None,
+            cwd: worktree.path().display().to_string(),
+            run_id: Some("run-paging-dedup".to_string()),
+            tool: "read_batch".to_string(),
+            payload: serde_json::json!({"paths":[path], "include_bodies":true}),
+            tool_use_id: None,
+        };
+
+        for _ in 0..2 {
+            let raw =
+                handle_read_batch(&orch, &request("file:big.rs?offset=2&limit=3"), &cursors).await;
+            let envelope: ReadBatchEnvelope = serde_json::from_str(&raw).unwrap();
+            assert_eq!(envelope.segments[0].kind, SegmentKind::File);
+            assert!(envelope.bodies.unwrap()[0].contains("continue: file:big.rs?offset=5"));
+            assert!(!envelope.text.contains("[duplicate]"));
+        }
+
+        let first = handle_read_batch(&orch, &request("file:big.rs"), &cursors).await;
+        let first: ReadBatchEnvelope = serde_json::from_str(&first).unwrap();
+        assert_eq!(first.segments[0].kind, SegmentKind::File);
+        let second = handle_read_batch(&orch, &request("file:big.rs"), &cursors).await;
+        let second: ReadBatchEnvelope = serde_json::from_str(&second).unwrap();
+        assert_eq!(second.segments[0].kind, SegmentKind::Duplicate);
+        assert!(second.text.contains("=== file:big.rs [duplicate] ==="));
+        assert!(second.bodies.unwrap()[0].contains("[duplicate call]"));
     }
 
     async fn seeded_orch() -> Orchestrator {
@@ -893,7 +957,7 @@ mod tests {
         exec(
             orch,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-rb', 'default', 'RB', 'RB', '/tmp/repo', 1, 1)",
+             VALUES ('proj-rb', 'default', 'RB', 'rb', '/tmp/repo', 1, 1)",
         )
         .await;
     }
@@ -980,9 +1044,14 @@ mod tests {
         let CairnResource::ProjectImage { reference, .. } = reference else {
             panic!("a minted image URI parses as a stored image: {target}");
         };
-        let stored = crate::images::fetch_image_by_reference(&orch.db.local, "proj-rb", &reference)
-            .await
-            .unwrap();
+        let stored = crate::images::fetch_image_by_reference(
+            &orch.db.local,
+            "proj-rb",
+            "READBATCH",
+            &reference,
+        )
+        .await
+        .unwrap();
         assert_eq!(stored.bytes, bytes);
     }
 
@@ -999,7 +1068,7 @@ mod tests {
         assert!(envelope.text.contains("# builder [◐]"), "{}", envelope.text);
         assert!(envelope.text.contains("## Resources"), "{}", envelope.text);
         assert!(
-            envelope.text.contains("cairn://p/RB/1/1/builder/chat"),
+            envelope.text.contains("cairn://p/rb/1/1/builder/chat"),
             "{}",
             envelope.text
         );
@@ -1671,9 +1740,9 @@ mod tests {
         seed_project_terminal(&orch).await;
 
         for path in [
-            "cairn://p/RB/terminal/ci",
-            "cairn://p/RB/terminal/ci?limit=50",
-            "cairn://p/RB/terminal/ci?offset=-20",
+            "cairn://p/rb/terminal/ci",
+            "cairn://p/rb/terminal/ci?limit=50",
+            "cairn://p/rb/terminal/ci?offset=-20",
         ] {
             let text = read_batch_text(&orch, serde_json::json!([path])).await;
             assert!(!text.contains("Invalid terminal URI"), "{path}: {text}");
@@ -1729,7 +1798,7 @@ omega-24')",
         seed_project_terminal_with_buffer(&orch).await;
         let envelope = read_batch_envelope(
             &orch,
-            serde_json::json!(["cairn://p/RB/terminal/logs?grep=gamma"]),
+            serde_json::json!(["cairn://p/rb/terminal/logs?grep=gamma"]),
         )
         .await;
         let seg = &envelope.segments[0];
@@ -1763,7 +1832,7 @@ omega-24')",
         // Grep that matches a buffer line still carries the banner.
         let grep = read_batch_text(
             &orch,
-            serde_json::json!(["cairn://p/RB/terminal/logs?grep=sigma"]),
+            serde_json::json!(["cairn://p/rb/terminal/logs?grep=sigma"]),
         )
         .await;
         assert!(
@@ -1776,7 +1845,7 @@ omega-24')",
         // (`exited`) yields zero buffer matches, yet the banner is still shown.
         let envelope = read_batch_envelope(
             &orch,
-            serde_json::json!(["cairn://p/RB/terminal/logs?grep=exited"]),
+            serde_json::json!(["cairn://p/rb/terminal/logs?grep=exited"]),
         )
         .await;
         assert_eq!(

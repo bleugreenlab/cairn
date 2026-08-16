@@ -1,18 +1,16 @@
-//! The OpenRouter [`WireAdapter`]: the first and today the only adapter behind
-//! the neutral HTTP turn loop. It owns every OpenRouter wire concern — the
-//! chat-completions DTOs and streaming reader (`wire`, `http`), transcript↔
-//! `ChatMessage` mapping (`conversation`), context trimming (`context`), the
-//! provider-routing object, the api key, and the backend identity — and converts
-//! a streamed `ChatResponse` into the neutral [`Generation`] at `post_generation`,
-//! normalizing tool names in place so the stored/replayed history references the
-//! dispatched verb rather than an alias.
+//! The OpenRouter [`WireAdapter`] behind the neutral HTTP turn loop. It owns
+//! every OpenRouter wire concern — the chat-completions DTOs and streaming
+//! reader (`wire`, `http`), transcript↔`ChatMessage` mapping (`conversation`),
+//! context trimming (`context`), the provider-routing object, the api key, and
+//! the backend identity. Turning a streamed `ChatResponse` into the neutral
+//! [`Generation`] is shared with every other OpenAI-compatible provider and
+//! lives in `openai_compat::generation`.
 
 use super::http::{build_provider_object, post_chat_completion};
 use super::{openrouter_api_key, OPENROUTER_BACKEND_KEY, OPENROUTER_BACKEND_NAME};
-use crate::backends::http_loop::{
-    render_tool_result, repair, Connection, Generation, TurnToolCall, WireAdapter,
-};
-use crate::backends::openai_compat::wire::{ChatContent, ChatMessage, ChatResponse};
+use crate::backends::http_loop::{render_tool_result, Connection, Generation, WireAdapter};
+use crate::backends::openai_compat::generation::into_generation;
+use crate::backends::openai_compat::wire::ChatMessage;
 use crate::backends::openai_compat::{context, conversation};
 use crate::backends::SessionConfig;
 use crate::dispatch::DispatchOutput;
@@ -113,7 +111,7 @@ impl WireAdapter for OpenRouterAdapter {
             &self.provider,
             cancel,
         )?;
-        into_generation(response)
+        into_generation(response, OPENROUTER_BACKEND_NAME)
     }
 
     fn render_tool_result_message(
@@ -123,71 +121,4 @@ impl WireAdapter for OpenRouterAdapter {
     ) -> ChatMessage {
         ChatMessage::tool(tool_call_id.to_string(), render_tool_result(output))
     }
-}
-
-/// Convert a streamed OpenRouter `ChatResponse` into the neutral `Generation`,
-/// canonicalizing tool names in place BEFORE anything is stored, pushed into the
-/// conversation, or executed, so execution, the stored transcript, and any
-/// replay/resume all reference the dispatched verb. Otherwise a successful call
-/// replays under an invalid name like `Write_File` or `mcp__cairn__run` and
-/// reinforces it in the model-facing history.
-fn into_generation(response: ChatResponse) -> Result<Generation<ChatMessage>, String> {
-    let ChatResponse {
-        id,
-        model,
-        choices,
-        usage,
-        streamed_text,
-        finish_reason,
-    } = response;
-    let Some(choice) = choices.into_iter().next() else {
-        return Err("OpenRouter response did not include choices".to_string());
-    };
-    let mut assistant_message = choice.message;
-    if let Some(calls) = assistant_message.tool_calls.as_mut() {
-        for call in calls.iter_mut() {
-            if let Some(verb) = repair::normalize_tool_name(&call.function.name) {
-                if verb != call.function.name {
-                    log::warn!(
-                        "OpenRouter normalized tool name {:?} -> {:?}",
-                        call.function.name,
-                        verb
-                    );
-                    call.function.name = verb.to_string();
-                }
-            }
-        }
-    }
-    let assistant_text = assistant_message
-        .content
-        .as_ref()
-        .and_then(ChatContent::as_text)
-        .unwrap_or_default()
-        .to_string();
-    let tool_calls = assistant_message
-        .tool_calls
-        .as_ref()
-        .map(|calls| {
-            calls
-                .iter()
-                .map(|call| TurnToolCall {
-                    id: call.id.clone(),
-                    name: call.function.name.clone(),
-                    arguments: call.function.arguments.clone(),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let reasoning_details = assistant_message.reasoning_details.clone();
-    Ok(Generation {
-        assistant_message,
-        assistant_text,
-        tool_calls,
-        reasoning_details,
-        usage,
-        finish_reason,
-        generation_id: id,
-        response_model: model,
-        streamed_text,
-    })
 }

@@ -89,6 +89,7 @@ async fn create_detects_and_persists_repo_default_branch() {
         &FixedClock(1_700_000_000),
         create_input("proj-dev", "Dev", "DEV", &repo_path.to_string_lossy()),
         None,
+        None,
     )
     .await
     .unwrap();

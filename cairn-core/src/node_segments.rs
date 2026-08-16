@@ -72,7 +72,7 @@ async fn existing_segments(
 /// Allocate a top-level node segment for an execution, deduped across **both**
 /// `jobs.uri_segment` and `action_runs.uri_segment`. Agent nodes (jobs) and
 /// action nodes (action_runs, e.g. a `pr` node) share one URI namespace under
-/// `cairn://p/PROJ/N/EXEC/<segment>`, so a same-named agent and action can't
+/// `cairn://p/proj/N/EXEC/<segment>`, so a same-named agent and action can't
 /// both claim `pr` — the second gets `pr-2`. Used by both job creation and
 /// action_run creation so the namespace stays single-owner.
 pub async fn allocate_top_level_segment(

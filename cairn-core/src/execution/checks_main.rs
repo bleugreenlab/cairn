@@ -236,10 +236,16 @@ async fn run(
         crate::jj::reconcile_tracked_bookmark(&jj, &store, default_branch)
             .map_err(|error| format!("main-attestation bookmark reconcile failed: {error}"))?;
     }
-    let repository = if crate::jj::is_jj_dir(&store) {
-        store
-    } else {
-        repo_root.clone()
+    let repository = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = repo_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("main-attestation coordinate repository task failed: {error}"))??
     };
     let commit = cairn_vcs::resolve_coordinate(&repository, default_branch)
         .await
@@ -407,6 +413,11 @@ async fn main_health_issue(
             backend_override: None,
             label_ids: None,
         },
+        crate::issues::crud::installation_machine_authorship(
+            orch.anon_device_manager.device_id(),
+            orch.services.clock.now(),
+        )
+        .map_err(|error| error.to_string())?,
     )
     .await
     .map_err(|error| error.to_string())?;
@@ -588,14 +599,14 @@ mod tests {
     #[test]
     fn compile_failure_names_the_carrier_and_surgical_repair_shape() {
         let (report, _) = main_health_report(
-            "CAIRN-3549",
+            "cairn-3549",
             "main-head",
             &ReviewTreeGateResult::CheckFailed {
                 name: "rust-tests".into(),
                 detail: "error[E0599]: test target cannot compile".into(),
             },
         );
-        assert!(report.contains("CAIRN-3549"));
+        assert!(report.contains("cairn-3549"));
         assert!(report.contains("E0599"));
         assert!(report.contains("surgical child issue"));
         assert!(report.contains("do not add ride-along changes"));

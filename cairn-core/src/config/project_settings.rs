@@ -4,6 +4,9 @@
 //! These files can be version-controlled with the project.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::io::Write;
+use std::sync::{Mutex, OnceLock};
 
 pub use super::contextual_packages::{
     ContextualPackageKind, ContextualPackageRef, ContextualPackagesConfig,
@@ -57,7 +60,15 @@ pub struct ProjectSettingsFile {
     pub references: Option<Vec<ProjectReference>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialization: Option<MaterializationSettings>,
-    /// Project-level override for active backend
+    /// Project-level overrides of which backend serves each tier by default,
+    /// merged tier by tier over the workspace bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tier_defaults: Option<HashMap<String, String>>,
+    /// Legacy project-level global default provider. It said "every tier in this
+    /// project runs on this backend", so it loads as exactly that before any
+    /// `tierDefaults` entry refines it. Read-only: nothing writes this key, but
+    /// a project config is version-controlled by its own repository, so a value
+    /// already committed there is preserved rather than silently deleted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) active_backend: Option<String>,
     /// Project-level preset overrides (deep-merged with workspace)
@@ -72,6 +83,11 @@ pub struct ProjectSettingsFile {
 }
 
 impl ProjectSettingsFile {
+    /// The legacy global default provider this project config still carries, if any.
+    pub(crate) fn legacy_active_backend(&self) -> Option<&str> {
+        self.active_backend.as_deref()
+    }
+
     /// Get the populate config for executor materializations.
     /// Returns the configured PopulateConfig, or empty (skip-all) by default.
     pub fn populate_config(&self) -> PopulateConfig {
@@ -107,6 +123,8 @@ struct LegacyProjectSettingsFile {
     materialization: Option<MaterializationSettings>,
     // Preset fields — must be present so they survive the legacy parse path
     #[serde(default)]
+    tier_defaults: Option<HashMap<String, String>>,
+    #[serde(default)]
     active_backend: Option<String>,
     #[serde(default)]
     backends: Option<HashMap<String, HashMap<String, Preset>>>,
@@ -131,30 +149,102 @@ pub(crate) fn get_project_config_path(project_path: &Path) -> PathBuf {
     project_path.join(".cairn").join("config.yaml")
 }
 
-/// Load project settings from file. Returns defaults if file doesn't exist.
-/// Automatically migrates legacy config files (removes ciCommands and persistent field).
-pub fn load_project_settings(project_path: &Path) -> ProjectSettingsFile {
-    match load_project_settings_file(project_path) {
-        Ok((file, needs_migration)) => {
-            if needs_migration {
-                log::info!(
-                    "Migrating project config at {:?} (removing deprecated fields)",
-                    project_path
-                );
-                // `save_project_settings` commits the rewrite (scoped to
-                // `config.yaml`) so the migration does not float as dirt.
-                if let Err(e) = save_project_settings(project_path, &file) {
-                    log::warn!("Failed to migrate project settings: {}", e);
-                }
-            }
-            file
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectConfigMigration {
+    Current,
+    Legacy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectConfigError {
+    Missing {
+        path: PathBuf,
+    },
+    Read {
+        path: PathBuf,
+        source: String,
+    },
+    InvalidUtf8 {
+        path: PathBuf,
+        source: String,
+    },
+    Parse {
+        path: PathBuf,
+        source: String,
+    },
+    InvalidRoot {
+        path: PathBuf,
+    },
+    Mutation {
+        path: PathBuf,
+        source: String,
+    },
+    Render {
+        path: PathBuf,
+        source: String,
+    },
+    DestructiveChange {
+        path: PathBuf,
+        before_lines: usize,
+        after_lines: usize,
+        before_bytes: usize,
+        after_bytes: usize,
+    },
+    Persist {
+        path: PathBuf,
+        source: String,
+    },
+    Commit {
+        path: PathBuf,
+        source: String,
+    },
+}
+
+impl fmt::Display for ProjectConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing { path } => write!(f, "project config is missing at {}", path.display()),
+            Self::Read { path, source } => write!(f, "failed to read project config at {}: {source}", path.display()),
+            Self::InvalidUtf8 { path, source } => write!(f, "project config at {} is not valid UTF-8: {source}", path.display()),
+            Self::Parse { path, source } => write!(f, "failed to parse project config at {}: {source}", path.display()),
+            Self::InvalidRoot { path } => write!(f, "project config root at {} must be a YAML mapping", path.display()),
+            Self::Mutation { path, source } => write!(f, "project config mutation failed at {}: {source}", path.display()),
+            Self::Render { path, source } => write!(f, "failed to render project config at {}: {source}", path.display()),
+            Self::DestructiveChange { path, before_lines, after_lines, before_bytes, after_bytes } => write!(f, "refusing destructive project config rewrite at {} (non-comment lines {before_lines} -> {after_lines}, bytes {before_bytes} -> {after_bytes})", path.display()),
+            Self::Persist { path, source } => write!(f, "failed to persist project config at {}: {source}", path.display()),
+            Self::Commit { path, source } => write!(f, "failed to commit project config at {}: {source}", path.display()),
         }
+    }
+}
+
+impl std::error::Error for ProjectConfigError {}
+
+/// Strictly load the project configuration without writing or migrating it.
+pub fn load_project_settings_strict(
+    project_path: &Path,
+) -> Result<(ProjectSettingsFile, ProjectConfigMigration), ProjectConfigError> {
+    let path = get_project_config_path(project_path);
+    let bytes = std::fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ProjectConfigError::Missing { path: path.clone() }
+        } else {
+            ProjectConfigError::Read {
+                path: path.clone(),
+                source: error.to_string(),
+            }
+        }
+    })?;
+    parse_project_settings_bytes(&path, &bytes)
+}
+
+/// Tolerant, read-only projection. Missing or invalid configuration becomes the
+/// default, but is never migrated or otherwise written as a side effect.
+pub fn load_project_settings_read_only(project_path: &Path) -> ProjectSettingsFile {
+    match load_project_settings_strict(project_path) {
+        Ok((file, _)) => file,
+        Err(ProjectConfigError::Missing { .. }) => ProjectSettingsFile::default(),
         Err(e) => {
-            log::debug!(
-                "Using default project settings for {:?}: {}",
-                project_path,
-                e
-            );
+            log::error!("Using default read-only project settings: {e}");
             ProjectSettingsFile::default()
         }
     }
@@ -180,15 +270,51 @@ pub fn resolve_default_branch(
 /// Load the raw project settings file.
 /// Returns (settings, needs_migration) where needs_migration is true if legacy fields were found.
 fn load_project_settings_file(project_path: &Path) -> Result<(ProjectSettingsFile, bool), String> {
-    let path = get_project_config_path(project_path);
-
-    if !path.exists() {
-        return Ok((ProjectSettingsFile::default(), false));
+    match load_project_settings_strict(project_path) {
+        Ok((settings, migration)) => Ok((settings, migration == ProjectConfigMigration::Legacy)),
+        Err(ProjectConfigError::Missing { .. }) => Ok((ProjectSettingsFile::default(), false)),
+        Err(error) => Err(error.to_string()),
     }
+}
 
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read project config file: {}", e))?;
-    parse_project_settings(&content)
+fn parse_project_settings_bytes(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(ProjectSettingsFile, ProjectConfigMigration), ProjectConfigError> {
+    let content = std::str::from_utf8(bytes).map_err(|error| ProjectConfigError::InvalidUtf8 {
+        path: path.to_path_buf(),
+        source: error.to_string(),
+    })?;
+    let root = serde_yaml::from_str::<serde_yaml::Value>(content).map_err(|error| {
+        ProjectConfigError::Parse {
+            path: path.to_path_buf(),
+            source: error.to_string(),
+        }
+    })?;
+    // A null root is the file Cairn itself generates: the default template is
+    // comment-only, which YAML parses as null. Only a genuinely wrong root
+    // (sequence, scalar) is invalid.
+    if !matches!(
+        root,
+        serde_yaml::Value::Mapping(_) | serde_yaml::Value::Null
+    ) {
+        return Err(ProjectConfigError::InvalidRoot {
+            path: path.to_path_buf(),
+        });
+    }
+    let (settings, legacy) =
+        parse_project_settings(content).map_err(|source| ProjectConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok((
+        settings,
+        if legacy {
+            ProjectConfigMigration::Legacy
+        } else {
+            ProjectConfigMigration::Current
+        },
+    ))
 }
 
 /// Parse `.cairn/config.yaml` CONTENT into settings, independent of where those
@@ -245,6 +371,7 @@ pub(crate) fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFi
         default_branch: legacy.default_branch,
         references: legacy.references,
         materialization: legacy.materialization,
+        tier_defaults: legacy.tier_defaults,
         active_backend: legacy.active_backend,
         backends: legacy.backends,
         mcp_servers: legacy.mcp_servers,
@@ -261,7 +388,7 @@ pub(crate) fn parse_project_settings(content: &str) -> Result<(ProjectSettingsFi
 /// Load the project's terminal commands.
 ///
 /// Reads `[project_path]/.cairn/config.yaml` directly without the migration
-/// rewrite that `load_project_settings` performs, so it is safe on the hot
+/// rewrite that `load_project_settings_read_only` performs, so it is safe on the hot
 /// logical-fence policy-build path. Returns an empty list when absent or invalid.
 pub(crate) fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::TerminalCommand> {
     load_project_settings_file(project_path)
@@ -272,7 +399,7 @@ pub(crate) fn load_terminal_commands(project_path: &Path) -> Vec<crate::models::
 /// Load the project's canonical executor setup commands without rewriting config.
 ///
 /// Build-slot submission uses this against the live primary checkout. Unlike
-/// [`load_project_settings`], errors remain visible so an unreadable or invalid
+/// [`load_project_settings_read_only`], errors remain visible so an unreadable or invalid
 /// setup policy fails as infrastructure before any command reaches an executor.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ExecutionProjectPolicy {
@@ -296,7 +423,7 @@ pub fn load_setup_commands(project_path: &Path) -> Result<Vec<String>, String> {
 /// Load just the `checks` contract from a project's `.cairn/config.yaml`.
 ///
 /// Reads the file directly without the migration rewrite (and its scoped git
-/// commit) that `load_project_settings` performs, mirroring
+/// commit) that `load_project_settings_read_only` performs, mirroring
 /// [`load_terminal_commands`]. The synchronous `when:write` check runner calls
 /// this against the project's LIVE main checkout on every sealed commit, so it
 /// must stay side-effect free — a migration commit fired from inside an agent
@@ -352,6 +479,7 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "defaultBranch",
     "references",
     "worktree",
+    "tierDefaults",
     "activeBackend",
     "backends",
     "mcpServers",
@@ -361,70 +489,321 @@ const MANAGED_TOP_LEVEL_KEYS: &[&str] = &[
     "copyFiles",
 ];
 
-/// Save project settings to file.
+static PROJECT_SETTINGS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Mutate project settings as one process-wide, fail-closed transaction.
 ///
-/// When `config.yaml` already exists and parses cleanly, the write is a
-/// diff-scoped merge that rewrites only the subtrees whose value changed,
-/// preserving every comment and unknown key (see [`super::yaml_edit`]). A fresh
-/// file, or a document the merge declines, falls back to a full serialization
-/// with the header comment. The commit is pushed best-effort: a project's config
-/// lives on its shared branch, and a diverged local main breaks issue PR merges.
+/// Existing non-empty documents are always updated through the preserving YAML
+/// merge. A missing or empty file may be serialized from scratch. The rendered
+/// bytes are canonically reparsed and atomically replaced before a scoped commit
+/// is attempted.
+pub fn mutate_project_settings<T>(
+    project_path: &Path,
+    mutate: impl FnOnce(&mut ProjectSettingsFile) -> Result<T, String>,
+) -> Result<T, ProjectConfigError> {
+    let result = mutate_project_settings_inner(project_path, mutate);
+    if let Err(error) = &result {
+        log::error!("{error}");
+    }
+    result
+}
+
+fn mutate_project_settings_inner<T>(
+    project_path: &Path,
+    mutate: impl FnOnce(&mut ProjectSettingsFile) -> Result<T, String>,
+) -> Result<T, ProjectConfigError> {
+    let lock = PROJECT_SETTINGS_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = get_project_config_path(project_path);
+    let index_already_tracked = project_config_is_tracked(&path);
+    let staged_index_entry = staged_project_config_entry(&path);
+    let original = match std::fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(ProjectConfigError::Read {
+                path,
+                source: error.to_string(),
+            })
+        }
+    };
+    let existing_nonempty = original
+        .as_deref()
+        .is_some_and(|bytes| !bytes.iter().all(u8::is_ascii_whitespace));
+    let (mut settings, migration) = if existing_nonempty {
+        parse_project_settings_bytes(&path, original.as_deref().unwrap())?
+    } else {
+        (
+            ProjectSettingsFile::default(),
+            ProjectConfigMigration::Current,
+        )
+    };
+    let before = serde_yaml::to_value(&settings).map_err(|error| ProjectConfigError::Render {
+        path: path.clone(),
+        source: error.to_string(),
+    })?;
+    let value = mutate(&mut settings).map_err(|source| ProjectConfigError::Mutation {
+        path: path.clone(),
+        source,
+    })?;
+    let after = serde_yaml::to_value(&settings).map_err(|error| ProjectConfigError::Render {
+        path: path.clone(),
+        source: error.to_string(),
+    })?;
+
+    if before == after && migration == ProjectConfigMigration::Current {
+        return Ok(value);
+    }
+
+    let rendered = render_settings_yaml(&path, original.as_deref(), existing_nonempty, &settings)?;
+    parse_project_settings_bytes(&path, rendered.as_bytes())?;
+    if original.as_deref() == Some(rendered.as_bytes()) {
+        return Ok(value);
+    }
+    if let Some(original) = original.as_deref() {
+        guard_destructive_change(&path, original, rendered.as_bytes())?;
+    }
+
+    let parent = path.parent().expect("project config always has a parent");
+    std::fs::create_dir_all(parent).map_err(|error| ProjectConfigError::Persist {
+        path: path.clone(),
+        source: format!("failed to create config directory: {error}"),
+    })?;
+    let mut temporary =
+        tempfile::NamedTempFile::new_in(parent).map_err(|error| ProjectConfigError::Persist {
+            path: path.clone(),
+            source: format!("failed to create temporary file: {error}"),
+        })?;
+    temporary
+        .write_all(rendered.as_bytes())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| ProjectConfigError::Persist {
+            path: path.clone(),
+            source: format!("failed to write and sync temporary file: {error}"),
+        })?;
+    temporary
+        .persist(&path)
+        .map_err(|error| ProjectConfigError::Persist {
+            path: path.clone(),
+            source: format!("failed to atomically replace config: {}", error.error),
+        })?;
+
+    if let Err(source) = super::commit_config_path_required(&path, "cairn: update project config") {
+        rollback_project_config(&path, original.as_deref(), index_already_tracked).map_err(
+            |rollback| ProjectConfigError::Commit {
+                path: path.clone(),
+                source: format!("{source}; rollback also failed: {rollback}"),
+            },
+        )?;
+        return Err(ProjectConfigError::Commit { path, source });
+    }
+    if let Some(entry) = staged_index_entry {
+        restore_project_config_index(&path, &entry).map_err(|source| {
+            ProjectConfigError::Commit {
+                path: path.clone(),
+                source: format!(
+                    "config committed but prior staged state could not be restored: {source}"
+                ),
+            }
+        })?;
+    }
+    Ok(value)
+}
+
+#[derive(Debug)]
+struct StagedIndexEntry {
+    mode: String,
+    object: String,
+    root: PathBuf,
+    relative: PathBuf,
+}
+
+fn staged_project_config_entry(path: &Path) -> Option<StagedIndexEntry> {
+    let root = super::git_work_tree_root(path.parent()?)?;
+    let relative = path.strip_prefix(&root).ok()?.to_path_buf();
+    let output = crate::env::git()
+        .args(["ls-files", "--stage", "--"])
+        .arg(&relative)
+        .current_dir(&root)
+        .output()
+        .ok()?;
+    let line = std::str::from_utf8(&output.stdout).ok()?.lines().next()?;
+    let mut fields = line.split_whitespace();
+    let mode = fields.next()?.to_string();
+    let object = fields.next()?.to_string();
+    let head_object = crate::env::git()
+        .arg("rev-parse")
+        .arg(format!("HEAD:{}", relative.to_string_lossy()))
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    if head_object.as_deref() == Some(object.as_str()) {
+        return None;
+    }
+    Some(StagedIndexEntry {
+        mode,
+        object,
+        root,
+        relative,
+    })
+}
+
+fn restore_project_config_index(_path: &Path, entry: &StagedIndexEntry) -> Result<(), String> {
+    let cache_info = format!(
+        "{},{},{}",
+        entry.mode,
+        entry.object,
+        entry.relative.to_string_lossy()
+    );
+    let output = crate::env::git()
+        .args(["update-index", "--cacheinfo", &cache_info])
+        .current_dir(&entry.root)
+        .output()
+        .map_err(|error| format!("failed to restore staged config entry: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn project_config_is_tracked(path: &Path) -> bool {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return false;
+    };
+    crate::env::git()
+        .args(["ls-files", "--error-unmatch", "--"])
+        .arg(name)
+        .current_dir(parent)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+fn rollback_project_config(
+    path: &Path,
+    original: Option<&[u8]>,
+    index_already_tracked: bool,
+) -> Result<(), String> {
+    match original {
+        Some(bytes) => std::fs::write(path, bytes)
+            .map_err(|error| format!("failed to restore original bytes: {error}"))?,
+        None => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("failed to remove newly created config: {error}")),
+        },
+    }
+    if index_already_tracked {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "config has no parent".to_string())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "config has no file name".to_string())?;
+    let output = crate::env::git()
+        .args(["reset", "--"])
+        .arg(name)
+        .current_dir(parent)
+        .output()
+        .map_err(|error| format!("failed to restore Git index: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to restore Git index: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Test helper for exercising complete typed replacements through the transaction.
+/// It still receives all strict loading, merge, guard, and persistence guarantees.
+#[cfg(test)]
 pub fn save_project_settings(
     project_path: &Path,
     settings: &ProjectSettingsFile,
 ) -> Result<(), String> {
-    let path = get_project_config_path(project_path);
-
-    // Ensure .cairn directory exists
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create .cairn directory: {}", e))?;
-    }
-
-    let content = render_settings_yaml(&path, settings)?;
-
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write project config file: {}", e))?;
-    super::commit_and_maybe_push(
-        std::slice::from_ref(&path),
-        "cairn: update project config",
-        Some(project_path),
-    );
-    Ok(())
+    mutate_project_settings(project_path, |current| {
+        *current = settings.clone();
+        Ok(())
+    })
+    .map_err(|error| error.to_string())
 }
 
-/// The YAML text to write for `settings`.
-///
-/// Prefers a comment-preserving merge into the existing file; falls back to a
-/// full serialization (with the header comment) for a fresh or unmergeable file.
-/// A semantically no-op save returns the on-disk bytes verbatim, so git stages
-/// nothing and no commit is produced.
-fn render_settings_yaml(path: &Path, settings: &ProjectSettingsFile) -> Result<String, String> {
-    let target_value = serde_yaml::to_value(settings)
-        .map_err(|e| format!("Failed to serialize project settings: {}", e))?;
+fn render_settings_yaml(
+    path: &Path,
+    original: Option<&[u8]>,
+    existing_nonempty: bool,
+    settings: &ProjectSettingsFile,
+) -> Result<String, ProjectConfigError> {
+    let target_value =
+        serde_yaml::to_value(settings).map_err(|error| ProjectConfigError::Render {
+            path: path.to_path_buf(),
+            source: error.to_string(),
+        })?;
     let target_mapping = match &target_value {
         serde_yaml::Value::Mapping(m) => m,
-        _ => return Err("project settings did not serialize to a mapping".to_string()),
+        _ => {
+            return Err(ProjectConfigError::Render {
+                path: path.to_path_buf(),
+                source: "project settings did not serialize to a mapping".to_string(),
+            })
+        }
     };
 
-    if let Ok(original) = std::fs::read_to_string(path) {
-        if !original.trim().is_empty() {
-            match super::yaml_edit::merge_into_yaml(
-                &original,
-                target_mapping,
-                MANAGED_TOP_LEVEL_KEYS,
-            ) {
-                Ok(merged) => return Ok(merged),
-                Err(e) => {
-                    log::debug!("Comment-preserving YAML merge fell back to full rewrite: {e}")
-                }
-            }
-        }
+    if existing_nonempty {
+        let original = std::str::from_utf8(original.expect("nonempty content must exist"))
+            .map_err(|error| ProjectConfigError::InvalidUtf8 {
+                path: path.to_path_buf(),
+                source: error.to_string(),
+            })?;
+        return super::yaml_edit::merge_into_yaml(original, target_mapping, MANAGED_TOP_LEVEL_KEYS)
+            .map_err(|error| ProjectConfigError::Render {
+                path: path.to_path_buf(),
+                source: format!("comment-preserving merge refused the existing document: {error}"),
+            });
     }
 
-    let yaml = serde_yaml::to_string(settings)
-        .map_err(|e| format!("Failed to serialize project settings: {}", e))?;
+    let yaml = serde_yaml::to_string(settings).map_err(|error| ProjectConfigError::Render {
+        path: path.to_path_buf(),
+        source: error.to_string(),
+    })?;
     Ok(format!("# Cairn Project Configuration\n{}", yaml))
+}
+
+fn guard_destructive_change(
+    path: &Path,
+    before: &[u8],
+    after: &[u8],
+) -> Result<(), ProjectConfigError> {
+    fn non_comment_lines(bytes: &[u8]) -> usize {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with('#')
+            })
+            .count()
+    }
+    let before_lines = non_comment_lines(before);
+    let after_lines = non_comment_lines(after);
+    let removes_half_lines = before_lines >= 20 && after_lines.saturating_mul(2) <= before_lines;
+    let removes_half_bytes = before.len() >= 1024 && after.len().saturating_mul(2) <= before.len();
+    if removes_half_lines || removes_half_bytes {
+        return Err(ProjectConfigError::DestructiveChange {
+            path: path.to_path_buf(),
+            before_lines,
+            after_lines,
+            before_bytes: before.len(),
+            after_bytes: after.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Create a default project config file with commented template
@@ -492,6 +871,146 @@ pub(crate) fn create_default_project_config(project_path: &Path) -> Result<(), S
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn strict_loader_distinguishes_missing_invalid_utf8_parse_and_root() {
+        let temp = TempDir::new().unwrap();
+        let path = get_project_config_path(temp.path());
+        assert!(matches!(
+            load_project_settings_strict(temp.path()),
+            Err(ProjectConfigError::Missing { .. })
+        ));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, [0xff]).unwrap();
+        assert!(matches!(
+            load_project_settings_strict(temp.path()),
+            Err(ProjectConfigError::InvalidUtf8 { .. })
+        ));
+        std::fs::write(&path, "checks: [").unwrap();
+        assert!(matches!(
+            load_project_settings_strict(temp.path()),
+            Err(ProjectConfigError::Parse { .. })
+        ));
+        std::fs::write(&path, "- list\n").unwrap();
+        assert!(matches!(
+            load_project_settings_strict(temp.path()),
+            Err(ProjectConfigError::InvalidRoot { .. })
+        ));
+        std::fs::write(&path, "just a scalar\n").unwrap();
+        assert!(matches!(
+            load_project_settings_strict(temp.path()),
+            Err(ProjectConfigError::InvalidRoot { .. })
+        ));
+        // A comment-only document parses as a null root and is valid: it is
+        // exactly what create_default_project_config generates.
+        std::fs::write(&path, "# only comments\n\n# more comments\n").unwrap();
+        let (settings, migration) = load_project_settings_strict(temp.path()).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&settings).unwrap(),
+            serde_yaml::to_string(&ProjectSettingsFile::default()).unwrap()
+        );
+        assert_eq!(migration, ProjectConfigMigration::Current);
+    }
+
+    #[test]
+    fn generated_template_loads_as_defaults_and_yields_execution_policy() {
+        let temp = TempDir::new().unwrap();
+        create_default_project_config(temp.path()).unwrap();
+
+        let (settings, migration) = load_project_settings_strict(temp.path()).unwrap();
+        assert_eq!(
+            serde_yaml::to_string(&settings).unwrap(),
+            serde_yaml::to_string(&ProjectSettingsFile::default()).unwrap()
+        );
+        assert_eq!(migration, ProjectConfigMigration::Current);
+
+        let policy = load_execution_project_policy(temp.path()).unwrap();
+        assert_eq!(policy, ExecutionProjectPolicy::default());
+    }
+
+    #[test]
+    fn saving_onto_generated_template_preserves_comments_and_appends_keys() {
+        let temp = TempDir::new().unwrap();
+        create_default_project_config(temp.path()).unwrap();
+        let config_path = get_project_config_path(temp.path());
+        let template = std::fs::read_to_string(&config_path).unwrap();
+
+        let settings = ProjectSettingsFile {
+            default_branch: Some("develop".to_string()),
+            setup_commands: Some(vec!["bun install".to_string()]),
+            ..Default::default()
+        };
+        save_project_settings(temp.path(), &settings).unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            written.starts_with(&template),
+            "comment template must survive"
+        );
+        let (reloaded, _) = load_project_settings_strict(temp.path()).unwrap();
+        assert_eq!(reloaded.default_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            reloaded.setup_commands,
+            Some(vec!["bun install".to_string()])
+        );
+    }
+
+    #[test]
+    fn transactional_mutation_refuses_malformed_and_preserves_unknown_content() {
+        let temp = TempDir::new().unwrap();
+        let path = get_project_config_path(temp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "checks: [").unwrap();
+        let error = mutate_project_settings(temp.path(), |settings| {
+            settings.default_branch = Some("next".into());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(error, ProjectConfigError::Parse { .. }));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "checks: [");
+
+        let original = "# keep me\nfutureKey:\n  nested: true\ndefaultBranch: main\n";
+        std::fs::write(&path, original).unwrap();
+        mutate_project_settings(temp.path(), |settings| {
+            settings.default_branch = Some("next".into());
+            Ok(())
+        })
+        .unwrap();
+        let rendered = std::fs::read_to_string(&path).unwrap();
+        assert!(rendered.contains("# keep me"));
+        assert!(rendered.contains("futureKey:\n  nested: true"));
+        assert!(rendered.contains("defaultBranch: next"));
+    }
+
+    #[test]
+    fn transactional_mutation_creates_noops_and_guards_large_deletions() {
+        let temp = TempDir::new().unwrap();
+        let path = get_project_config_path(temp.path());
+        mutate_project_settings(temp.path(), |settings| {
+            settings.default_branch = Some("main".into());
+            Ok(())
+        })
+        .unwrap();
+        let created = std::fs::read(&path).unwrap();
+        mutate_project_settings(temp.path(), |_| Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), created);
+
+        let before = (0..30)
+            .map(|index| format!("unknown{index}: {}\n", "x".repeat(40)))
+            .collect::<String>()
+            + "defaultBranch: main\n";
+        std::fs::write(&path, &before).unwrap();
+        let error = guard_destructive_change(&path, before.as_bytes(), b"defaultBranch: main\n")
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProjectConfigError::DestructiveChange {
+                before_lines: 31,
+                after_lines: 1,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn removed_executor_keys_are_accepted_and_dropped_on_rewrite() {
@@ -712,7 +1231,7 @@ checks:
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, legacy_content).unwrap();
 
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
         let frontend = loaded
             .checks
             .as_ref()
@@ -721,17 +1240,18 @@ checks:
         assert_eq!(frontend.command, "vitest run");
         assert_eq!(frontend.policy, CheckPolicy::Gate);
 
-        let migrated_content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(migrated_content.contains("checks:"));
-        assert!(migrated_content.contains("frontend:"));
-        assert!(!migrated_content.contains("ciCommands"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            legacy_content,
+            "tolerant reads must not migrate configuration"
+        );
     }
 
     #[test]
     fn load_checks_reads_without_migrating() {
         let temp = TempDir::new().unwrap();
         let project_path = temp.path();
-        // A legacy config (ciCommands) that `load_project_settings` would rewrite
+        // A legacy config (ciCommands) that `load_project_settings_read_only` would rewrite
         // and commit. `load_checks` must read the checks WITHOUT that side effect.
         let legacy =
             "ciCommands:\n  - npm test\nchecks:\n  frontend:\n    command: vitest run\n    when: write\n";
@@ -848,8 +1368,9 @@ copyFiles:
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, legacy_content).unwrap();
 
-        // Load should trigger migration and strip copyFiles
-        let loaded = load_project_settings(project_path);
+        // Migration runs only through the transaction boundary.
+        let loaded =
+            mutate_project_settings(project_path, |settings| Ok(settings.clone())).unwrap();
         assert_eq!(loaded.setup_commands, Some(vec!["npm install".to_string()]));
 
         // Verify file was migrated (no copyFiles)
@@ -870,7 +1391,7 @@ copyFiles:
 
         save_project_settings(project_path, &settings).unwrap();
 
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
         assert_eq!(loaded.setup_commands, settings.setup_commands);
         assert_eq!(loaded.default_branch, settings.default_branch);
     }
@@ -997,7 +1518,7 @@ copyFiles:
 
         save_project_settings(project_path, &settings).unwrap();
 
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
         let config = loaded.populate_config();
         assert_eq!(config.copy, vec![".env", ".env.*"]);
         assert_eq!(config.symlink, vec!["target/"]);
@@ -1067,7 +1588,7 @@ materialization:
         // Try to create default - should not overwrite
         create_default_project_config(project_path).unwrap();
 
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
         assert_eq!(loaded.setup_commands, Some(vec!["custom".to_string()]));
     }
 
@@ -1175,7 +1696,7 @@ defaultBranch: main
         std::fs::write(&config_path, legacy_content).unwrap();
 
         // Load should trigger migration
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
 
         // Verify deprecated fields are gone
         assert_eq!(loaded.setup_commands, Some(vec!["npm install".to_string()]));
@@ -1186,10 +1707,11 @@ defaultBranch: main
         assert_eq!(cmds[0].name, "Dev Server");
         assert_eq!(cmds[0].command, "npm run dev");
 
-        // Verify file was migrated (no ciCommands or persistent)
-        let migrated_content = std::fs::read_to_string(&config_path).unwrap();
-        assert!(!migrated_content.contains("ciCommands"));
-        assert!(!migrated_content.contains("persistent"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            legacy_content,
+            "read-only loading must not migrate legacy configuration"
+        );
     }
 
     #[test]
@@ -1213,10 +1735,10 @@ backends:
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, content).unwrap();
 
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
 
         // Preset fields must survive the legacy parse path
-        assert_eq!(loaded.active_backend.as_deref(), Some("codex"));
+        assert_eq!(loaded.legacy_active_backend(), Some("codex"));
         assert!(loaded.backends.is_some());
         let backends = loaded.backends.unwrap();
         assert!(backends.contains_key("codex"));
@@ -1245,10 +1767,8 @@ terminalCommands:
         assert_eq!(loaded[0].name, "Dev");
         assert_eq!(loaded[0].command, "bun dev:instance --seed empty");
 
-        load_project_settings(project_path);
-        let rewritten = std::fs::read_to_string(config_path).unwrap();
-        assert!(!rewritten.contains("write:"));
-        assert!(!rewritten.contains(".aws"));
+        load_project_settings_read_only(project_path);
+        assert_eq!(std::fs::read_to_string(config_path).unwrap(), content);
     }
 
     #[test]
@@ -1277,20 +1797,18 @@ activeBackend: codex
         std::fs::write(&config_path, content).unwrap();
 
         // Load triggers migration (rewrites file without ciCommands)
-        let loaded = load_project_settings(project_path);
+        let loaded = load_project_settings_read_only(project_path);
 
         // Preset fields must survive the migration rewrite
-        assert_eq!(loaded.active_backend.as_deref(), Some("codex"));
+        assert_eq!(loaded.legacy_active_backend(), Some("codex"));
         // Legacy seedIgnored is parsed but results in empty populate config
         assert!(loaded.populate_config().is_empty());
 
-        // Verify rewritten file still has preset fields
-        let rewritten = std::fs::read_to_string(&config_path).unwrap();
-        assert!(rewritten.contains("activeBackend"));
-        assert!(rewritten.contains("codex"));
-        // seedIgnored is skip_serializing, so it's dropped on migration rewrite
-        assert!(!rewritten.contains("seedIgnored"));
-        assert!(!rewritten.contains("ciCommands"));
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            content,
+            "legacy configuration remains byte-for-byte unchanged on read"
+        );
     }
 
     fn init_git_repo(path: &Path) {
@@ -1389,9 +1907,10 @@ activeBackend: codex
         .unwrap();
         commit_all(project_path, "seed legacy config");
 
-        // Loading migrates the file (drops ciCommands) and commits the rewrite
-        // through `save_project_settings`, which is the scoped commit funnel.
-        let loaded = load_project_settings(project_path);
+        // A transaction migrates the file (drops ciCommands) and commits the
+        // rewrite; the tolerant read-only path above remains side-effect free.
+        let loaded =
+            mutate_project_settings(project_path, |settings| Ok(settings.clone())).unwrap();
         assert_eq!(loaded.setup_commands, Some(vec!["npm install".to_string()]));
 
         let migrated = std::fs::read_to_string(&config_path).unwrap();
@@ -1403,6 +1922,55 @@ activeBackend: codex
         assert_eq!(
             git_head_subject(project_path),
             "cairn: update project config"
+        );
+    }
+
+    #[test]
+    fn transaction_restores_preexisting_staged_config_entry_after_commit() {
+        let temp = TempDir::new().unwrap();
+        let project_path = temp.path();
+        init_git_repo(project_path);
+        let config_path = get_project_config_path(project_path);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "defaultBranch: main\n").unwrap();
+        commit_all(project_path, "seed config");
+
+        std::fs::write(&config_path, "defaultBranch: staged\n").unwrap();
+        assert!(crate::env::git()
+            .args(["add", "--", ".cairn/config.yaml"])
+            .current_dir(project_path)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(&config_path, "defaultBranch: worktree\n").unwrap();
+
+        mutate_project_settings(project_path, |settings| {
+            settings.default_branch = Some("app".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let staged = crate::env::git()
+            .args(["show", ":.cairn/config.yaml"])
+            .current_dir(project_path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&staged.stdout),
+            "defaultBranch: staged\n"
+        );
+        let committed = crate::env::git()
+            .args(["show", "HEAD:.cairn/config.yaml"])
+            .current_dir(project_path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&committed.stdout),
+            "defaultBranch: app\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(config_path).unwrap(),
+            "defaultBranch: app\n"
         );
     }
 }

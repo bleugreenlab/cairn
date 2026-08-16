@@ -34,7 +34,7 @@ use crate::transcripts::stream_store::{
 };
 use cairn_common::ids;
 use cairn_db::turso::params;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, Write};
 use std::process::Command;
 use std::sync::{
@@ -48,9 +48,108 @@ use uuid::Uuid;
 use super::{AgentBackend, BackendFailure, DiscoveredModel, ResolvedTools, SessionConfig};
 
 const CLAUDE_BACKEND_NAME: &str = "Claude";
+/// Refusal shown when a Claude session has no credential Cairn owns. Naming the
+/// remedy matters: the machine may well have a signed-in Claude CLI, and the
+/// point is that Cairn deliberately will not use it.
+const NO_CLAUDE_CREDENTIAL: &str = "No Claude account is available for this session. \
+     Sign in to a Claude account, or add an Anthropic API key, in Settings → Providers. \
+     Cairn only runs sessions on accounts it manages, never on the Claude CLI login \
+     that happens to be active outside it.";
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 512;
 const CLAUDE_TURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_TURN_WATCHDOG_POLL: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone)]
+struct ClaudeLaunchContract {
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+fn sanitize_mcp_diagnostic(line: &str) -> String {
+    let policy = crate::security::sanitize::RedactionPolicy::default();
+    let mut sanitizer = crate::security::sanitize::Sanitizer::structural(&policy);
+    sanitizer.text(line).chars().take(500).collect()
+}
+
+fn build_claude_launch_contract(
+    args: Vec<String>,
+    run_id: &str,
+    mcp_secret: &str,
+    user: &crate::identity::UserIdentity,
+    api_key: Option<&str>,
+) -> Result<ClaudeLaunchContract, String> {
+    let mut env = HashMap::from([
+        ("CAIRN_RUN_ID".to_string(), run_id.to_string()),
+        ("CAIRN_MCP_SECRET".to_string(), mcp_secret.to_string()),
+        ("ENABLE_TOOL_SEARCH".to_string(), "false".to_string()),
+        ("CLAUDE_CODE_ENABLE_TASKS".to_string(), "false".to_string()),
+        ("MCP_TOOL_TIMEOUT".to_string(), "604800000".to_string()),
+        ("GIT_AUTHOR_NAME".to_string(), user.name.clone()),
+        ("GIT_AUTHOR_EMAIL".to_string(), user.email.clone()),
+        ("GIT_COMMITTER_NAME".to_string(), user.name.clone()),
+        ("GIT_COMMITTER_EMAIL".to_string(), user.email.clone()),
+    ]);
+    match &user.claude_auth {
+        Some(crate::identity::ClaudeAuth::ApiKey(_)) => {
+            env.insert(
+                "ANTHROPIC_API_KEY".to_string(),
+                api_key
+                    .ok_or_else(|| "Claude API-key launch is missing its brokered key".to_string())?
+                    .to_string(),
+            );
+        }
+        Some(crate::identity::ClaudeAuth::ConfigDir(path)) => {
+            env.insert(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                path.to_string_lossy().into_owned(),
+            );
+        }
+        None => return Err(NO_CLAUDE_CREDENTIAL.to_string()),
+    }
+    Ok(ClaudeLaunchContract { args, env })
+}
+
+fn validate_claude_init(
+    data: &serde_json::Value,
+    stderr_diagnostics: &[String],
+) -> Result<(), String> {
+    let tools = data
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    if crate::agent_process::toolkits::CORE_VERBS
+        .iter()
+        .all(|required| tools.contains(required))
+    {
+        return Ok(());
+    }
+
+    let server_status = data
+        .get("mcp_servers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|server| server.get("name").and_then(serde_json::Value::as_str) == Some("cairn"))
+        .map(|server| {
+            server
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown")
+        })
+        .collect::<Vec<_>>();
+    let diagnostics = if stderr_diagnostics.is_empty() {
+        "Claude reported no MCP startup diagnostics".to_string()
+    } else {
+        stderr_diagnostics.join(" | ")
+    };
+    Err(format!(
+        "Claude started without the required Cairn MCP tools (cairn server status: {}). MCP startup diagnostics: {diagnostics}",
+        if server_status.is_empty() { "not reported".to_string() } else { server_status.join(", ") }
+    ))
+}
 
 /// Bounds a provider turn that has started but emits no further protocol
 /// progress. Tool calls are excluded: their host-owned execution has its own
@@ -721,6 +820,7 @@ fn classify_stderr_failure(line: &str) -> Option<BackendFailure> {
 struct StderrWatch {
     join: thread::JoinHandle<()>,
     failure: Arc<Mutex<Option<BackendFailure>>>,
+    mcp_diagnostics: Arc<Mutex<Vec<String>>>,
 }
 
 impl StderrWatch {
@@ -729,6 +829,8 @@ impl StderrWatch {
     fn spawn(stderr: Box<dyn BufRead + Send>) -> Self {
         let failure = Arc::new(Mutex::new(None));
         let thread_failure = failure.clone();
+        let mcp_diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let thread_mcp_diagnostics = mcp_diagnostics.clone();
         let join = thread::spawn(move || {
             log::debug!("stderr_thread: started");
             for line in stderr.lines().map_while(Result::ok) {
@@ -738,18 +840,40 @@ impl StderrWatch {
                         slot.get_or_insert(classified);
                     }
                 }
+                if line.to_ascii_lowercase().contains("mcp") {
+                    let sanitized = sanitize_mcp_diagnostic(&line);
+                    if let Ok(mut diagnostics) = thread_mcp_diagnostics.lock() {
+                        if diagnostics.len() < 5 {
+                            diagnostics.push(sanitized.chars().take(500).collect());
+                        }
+                    }
+                }
             }
             log::debug!("stderr_thread: ended");
         });
-        Self { join, failure }
+        Self {
+            join,
+            failure,
+            mcp_diagnostics,
+        }
     }
 
     /// Join the drain, then report whatever it classified.
     fn settle(self) -> Option<BackendFailure> {
+        self.settle_with_diagnostics().0
+    }
+
+    fn settle_with_diagnostics(self) -> (Option<BackendFailure>, Vec<String>) {
         if self.join.join().is_err() {
             log::warn!("stderr_thread panicked; treating its diagnosis as absent");
         }
-        self.failure.lock().ok().and_then(|slot| *slot)
+        let failure = self.failure.lock().ok().and_then(|slot| *slot);
+        let diagnostics = self
+            .mcp_diagnostics
+            .lock()
+            .map(|diagnostics| diagnostics.clone())
+            .unwrap_or_default();
+        (failure, diagnostics)
     }
 }
 
@@ -1273,35 +1397,6 @@ impl AgentBackend for ClaudeBackend {
             .map_err(|e| format!("Failed to get MCP auth secret: {}", e))?;
         log::info!("Using MCP auth secret for run {}", config.run_id);
 
-        // Build spawn config and spawn using ProcessSpawner service
-        let mut spawn_config = SpawnConfig::new(&claude_path)
-            .args(&claude_args)
-            .cwd(&config.working_dir)
-            .env("CAIRN_RUN_ID", &config.run_id)
-            .env("CAIRN_MCP_SECRET", &mcp_secret)
-            .env("ENABLE_TOOL_SEARCH", "false")
-            // Disable Claude Code's native Task* tools (TaskCreate/TaskUpdate/TaskList).
-            // Cairn's task tracking surface is `cairn:~/todos` via the `write` verb;
-            // the native tools are not exposed and their idle reminder fires on a
-            // wall-clock cadence regardless, burning tokens on polite acknowledgements.
-            // Removing the tools removes the reminder at the source.
-            .env("CLAUDE_CODE_ENABLE_TASKS", "false")
-            // Raise the Claude CLI's MCP tool-call timeout far above any legal
-            // Cairn callback. The host owns execution: `run` items are capped
-            // per-item (≤600s, returning partial output on expiry) and blocking
-            // `write` appends to a node's tasks/questions collection await a
-            // sub-agent task or user answer with no host-side deadline. cairn-cmd
-            // sizes its HTTP callback ceiling just under this (see
-            // `UNBOUNDED_CALLBACK_TIMEOUT` in cairn-cmd). The CLI default (~120s,
-            // observed) would abandon the call above cairn-cmd and leave the
-            // agent with no output while the host keeps running. 7 days is an
-            // effective "never" while still bounding a truly wedged socket;
-            // promote-to-terminal means nothing should ever actually run this
-            // long attached. (`MCP_TIMEOUT` governs server *startup*, a separate
-            // concern, and is left at its default.)
-            .env("MCP_TOOL_TIMEOUT", "604800000")
-            .stdin(true);
-
         // Inject user identity into Claude process environment
         // Prefer pre-resolved identity from SessionConfig (includes project overrides)
         let identity = config
@@ -1318,59 +1413,63 @@ impl AgentBackend for ClaudeBackend {
             _ => None,
         });
 
-        if let Some(user) = identity {
-            spawn_config = spawn_config
-                .env("GIT_AUTHOR_NAME", &user.name)
-                .env("GIT_AUTHOR_EMAIL", &user.email)
-                .env("GIT_COMMITTER_NAME", &user.name)
-                .env("GIT_COMMITTER_EMAIL", &user.email);
-
-            // Forward Claude auth token for remote/headless sessions.
-            //
-            // The CLI reads its credential from this environment, so the
-            // plaintext is unavoidable; what the broker adds is that the value
-            // is a registered scrub target before it is injected, and that the
-            // injection appears in the lease inventory. A `ConfigDir` is a path
-            // rather than a credential and deliberately does not go through it —
-            // registering an ordinary path is the over-registration failure the
-            // broker exists to avoid.
-            let backend_account = user.email.as_str();
-            const ANTHROPIC_PROVIDER: &str = "anthropic";
-            match &user.claude_auth {
-                Some(crate::identity::ClaudeAuth::OAuthToken(token)) => {
-                    let leased = crate::security::broker::backend::agent_credential(
-                        ANTHROPIC_PROVIDER,
-                        backend_account,
-                        crate::security::broker::backend::CLAUDE_ROLE,
-                        token,
-                    )?;
-                    log::info!("Setting CLAUDE_CODE_OAUTH_TOKEN (len={})", leased.len());
-                    spawn_config = spawn_config.env("CLAUDE_CODE_OAUTH_TOKEN", &leased);
-                }
-                Some(crate::identity::ClaudeAuth::ApiKey(key)) => {
-                    let leased = crate::security::broker::backend::agent_credential(
-                        ANTHROPIC_PROVIDER,
-                        backend_account,
-                        crate::security::broker::backend::CLAUDE_ROLE,
-                        key,
-                    )?;
-                    log::info!("Setting ANTHROPIC_API_KEY (len={})", leased.len());
-                    spawn_config = spawn_config.env("ANTHROPIC_API_KEY", &leased);
-                }
-                Some(crate::identity::ClaudeAuth::ConfigDir(path)) => {
-                    crate::identity::claude_profile::provision_profile(path)?;
-                    spawn_config =
-                        spawn_config.env("CLAUDE_CONFIG_DIR", path.to_string_lossy().as_ref());
-                }
-                None => {} // No configured Claude authentication
+        // Fail closed. A session that spawns without an explicit credential
+        // runs on whatever account is signed in at the user level: invisible to
+        // usage routing, unattributable, and impossible to switch away from
+        // when it runs out. Refusing to start says so; starting anyway looks
+        // like it worked and quietly spends someone else's subscription.
+        let user = identity.ok_or_else(|| NO_CLAUDE_CREDENTIAL.to_string())?;
+        // Forward Claude auth for remote/headless sessions.
+        //
+        // The CLI reads its credential from this environment, so the plaintext
+        // is unavoidable; what the broker adds is that the value is a
+        // registered scrub target before it is injected, and that the injection
+        // appears in the lease inventory. A `ConfigDir` is a path rather than a
+        // credential and deliberately does not go through it — registering an
+        // ordinary path is the over-registration failure the broker exists to
+        // avoid.
+        let backend_account = user.email.as_str();
+        const ANTHROPIC_PROVIDER: &str = "anthropic";
+        let brokered_api_key = match &user.claude_auth {
+            Some(crate::identity::ClaudeAuth::ApiKey(key)) => {
+                let leased = crate::security::broker::backend::agent_credential(
+                    ANTHROPIC_PROVIDER,
+                    backend_account,
+                    crate::security::broker::backend::CLAUDE_ROLE,
+                    key,
+                )?;
+                log::info!("Setting ANTHROPIC_API_KEY (len={})", leased.len());
+                Some(leased)
             }
+            Some(crate::identity::ClaudeAuth::ConfigDir(path)) => {
+                crate::identity::claude_profile::provision_profile(path)?;
+                None
+            }
+            None => return Err(NO_CLAUDE_CREDENTIAL.to_string()),
+        };
 
-            log::info!(
-                "Injected user identity into session: {} <{}>",
-                user.name,
-                user.email
-            );
+        // Keep the final process boundary inspectable: the exact argument vector
+        // and environment used by the real spawn are assembled together.
+        let launch = build_claude_launch_contract(
+            claude_args,
+            &config.run_id,
+            &mcp_secret,
+            &user,
+            brokered_api_key.as_deref(),
+        )?;
+        let mut spawn_config = SpawnConfig::new(&claude_path)
+            .args(&launch.args)
+            .cwd(&config.working_dir)
+            .stdin(true);
+        for (key, value) in &launch.env {
+            spawn_config = spawn_config.env(key, value);
         }
+
+        log::info!(
+            "Injected user identity into session: {} <{}>",
+            user.name,
+            user.email
+        );
 
         // A resume hands the CLI its own persisted conversation to replay, and a
         // single content block the API rejects there kills the session for good:
@@ -1703,7 +1802,7 @@ impl ClaudeBackend {
         session_id: Option<String>,
         confirm_backend_id_after_init: bool,
         stdout: Box<dyn std::io::BufRead + Send>,
-        stderr_watch: Option<StderrWatch>,
+        mut stderr_watch: Option<StderrWatch>,
         run_db: Arc<LocalDb>,
     ) {
         log::debug!("reader_thread: started");
@@ -1943,6 +2042,36 @@ impl ClaudeBackend {
                         }
                     }
 
+                    if let ClaudeEvent::System { subtype, data, .. } = &event {
+                        if subtype == "init" {
+                            if validate_claude_init(data, &[]).is_err() {
+                                // Close the child first so both output pipes reach
+                                // EOF, then join stderr. Snapshotting the parallel
+                                // drain here would race the actionable MCP error.
+                                orch.process_state.stop_and_remove(run_id);
+                                let diagnostics = stderr_watch
+                                    .take()
+                                    .map(StderrWatch::settle_with_diagnostics)
+                                    .map(|(_, diagnostics)| diagnostics)
+                                    .unwrap_or_default();
+                                let error = validate_claude_init(data, &diagnostics)
+                                    .expect_err("missing Cairn tools remains invalid");
+                                log::error!(
+                                    "Rejecting Claude launch without Cairn MCP tools for run {}: {}",
+                                    &run_id[..run_id.len().min(8)],
+                                    error
+                                );
+                                insert_error_event(orch, run_id, session_id.as_deref(), &error);
+                                crate::orchestrator::lifecycle::finalize_run(
+                                    orch,
+                                    run_id,
+                                    RunStatus::Crashed,
+                                );
+                                break;
+                            }
+                        }
+                    }
+
                     if !backend_id_confirmed {
                         if let ClaudeEvent::System {
                             subtype,
@@ -2053,7 +2182,7 @@ impl ClaudeBackend {
                                 let blocked_until = rate_limit_info
                                     .resets_at
                                     .or(rate_limit_info.overage_resets_at);
-                                if let Err(error) = orch.mark_account_blocked(
+                                if let Err(error) = orch.record_account_health(
                                     &target.account_id,
                                     snapshot.windows,
                                     blocked_until,
@@ -2901,7 +3030,8 @@ impl ClaudeBackend {
 
                 if saw_blocking_rate_limit {
                     if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
-                        if let Some((replacement_id, _)) = orch.select_claude_identity(
+                        if let Some((replacement_id, _)) = orch.select_routed_identity(
+                            crate::identity::RoutedProvider::Claude,
                             target.project_id.as_deref(),
                             None,
                             Some(&target.account_id),
@@ -3022,6 +3152,155 @@ impl ClaudeBackend {
 }
 
 #[cfg(test)]
+mod launch_contract_tests {
+    use super::{build_claude_launch_contract, sanitize_mcp_diagnostic, validate_claude_init};
+    use crate::agent_process::args::{build_claude_args, ClaudeArgsConfig};
+    use crate::backends::SessionStart;
+    use crate::identity::{ClaudeAuth, UserIdentity};
+
+    const MCP_CONFIG: &str =
+        r#"{"mcpServers":{"cairn":{"command":"cairn-cmd","args":["mcp-serve"]}}}"#;
+
+    fn identity(auth: ClaudeAuth) -> UserIdentity {
+        UserIdentity {
+            user_id: "user-1".to_string(),
+            email: "agent@example.com".to_string(),
+            name: "Cairn Agent".to_string(),
+            claude_auth: Some(auth),
+            codex_auth: None,
+            github_token: None,
+        }
+    }
+
+    fn args() -> Vec<String> {
+        build_claude_args(&ClaudeArgsConfig {
+            mcp_config: MCP_CONFIG.to_string(),
+            skip_permissions: false,
+            model: None,
+            session_start: SessionStart::New {
+                session_id: "session-1".to_string(),
+            },
+            prompt: "test".to_string(),
+            effort: None,
+            allowed_tools: crate::agent_process::toolkits::CORE_VERBS
+                .iter()
+                .map(|verb| verb.to_string())
+                .collect(),
+            disallowed_tools: vec![],
+            system_prompt_file: None,
+            settings_path: None,
+            bidirectional: false,
+            json_schema: None,
+        })
+    }
+
+    fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|argument| argument == flag)
+            .and_then(|index| args.get(index + 1))
+            .map(String::as_str)
+    }
+
+    #[test]
+    fn profile_launch_keeps_inline_mcp_and_uses_only_managed_auth() {
+        let profile = std::path::PathBuf::from("/managed/claude/profile");
+        let launch = build_claude_launch_contract(
+            args(),
+            "run-1",
+            "mcp-secret",
+            &identity(ClaudeAuth::ConfigDir(profile.clone())),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(flag_value(&launch.args, "--mcp-config"), Some(MCP_CONFIG));
+        assert!(launch.args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert_eq!(
+            launch.env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            profile.to_str()
+        );
+        assert!(!launch.env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(!launch.env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert_eq!(
+            launch.env.get("CAIRN_MCP_SECRET").map(String::as_str),
+            Some("mcp-secret")
+        );
+        assert_eq!(
+            launch.env.get("CAIRN_RUN_ID").map(String::as_str),
+            Some("run-1")
+        );
+    }
+
+    #[test]
+    fn api_key_launch_retains_the_same_strict_inline_mcp_contract() {
+        let launch = build_claude_launch_contract(
+            args(),
+            "run-1",
+            "mcp-secret",
+            &identity(ClaudeAuth::ApiKey("stored-key".to_string())),
+            Some("brokered-key"),
+        )
+        .unwrap();
+        assert_eq!(flag_value(&launch.args, "--mcp-config"), Some(MCP_CONFIG));
+        assert!(launch.args.iter().any(|arg| arg == "--strict-mcp-config"));
+        assert_eq!(
+            launch.env.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("brokered-key")
+        );
+        assert!(!launch.env.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn init_with_cairn_tools_succeeds() {
+        let init = serde_json::json!({
+            "tools": ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"],
+            "mcp_servers": [{"name": "cairn", "status": "connected"}]
+        });
+        assert!(validate_claude_init(&init, &[]).is_ok());
+    }
+
+    #[test]
+    fn init_with_connected_server_but_incomplete_inventory_fails_clearly() {
+        for tools in [
+            serde_json::json!([]),
+            serde_json::json!(["Read", "mcp__unrelated__search"]),
+            serde_json::json!(["mcp__cairn__read"]),
+            serde_json::json!(["mcp__cairn__read", "mcp__cairn__write"]),
+        ] {
+            let error = validate_claude_init(
+                &serde_json::json!({
+                    "tools": tools,
+                    "mcp_servers": [{"name": "cairn", "status": "connected"}]
+                }),
+                &[],
+            )
+            .unwrap_err();
+            assert!(error.contains("without the required Cairn MCP tools"));
+            assert!(error.contains("connected"));
+        }
+    }
+
+    #[test]
+    fn sanitized_mcp_stderr_is_surfaced_in_init_failure() {
+        // This value is deliberately NOT registered. Profile-scoped Claude can
+        // print credentials Cairn never held, so exact-value scrubbing is not
+        // sufficient at this untrusted stderr boundary.
+        let secret = "unregistered-profile-token-4Qf8Jv2Kp9";
+        let diagnostic = sanitize_mcp_diagnostic(&format!(
+            "MCP server cairn failed with authorization: Bearer {secret}"
+        ));
+        assert!(!diagnostic.contains(secret));
+        let error = validate_claude_init(
+            &serde_json::json!({"tools": [], "mcp_servers": []}),
+            &[diagnostic],
+        )
+        .unwrap_err();
+        assert!(error.contains("MCP server cairn failed"));
+        assert!(!error.contains(secret));
+    }
+}
+
+#[cfg(test)]
 mod stderr_failure_tests {
     use super::{classify_stderr_failure, BackendFailure, StderrWatch};
 
@@ -3068,7 +3347,7 @@ mod stderr_failure_tests {
             .expect("classify_eof dispatch present");
         assert!(
             settle < classify,
-            "reader_thread: the stderr drain must settle before classify_eof (CAIRN-3104)"
+            "reader_thread: the stderr drain must settle before classify_eof (cairn-3104)"
         );
     }
 
@@ -3331,7 +3610,7 @@ mod flush_pending_tests {
     /// counter hand the same number to two events and skip the next.
     fn streamed_tool_turn_fixture() -> String {
         [
-            r#"{"type":"system","subtype":"init","session_id":"session-1","cwd":"/tmp","model":"claude-opus-4","tools":[]}"#,
+            r#"{"type":"system","subtype":"init","session_id":"session-1","cwd":"/tmp","model":"claude-opus-4","tools":["mcp__cairn__read","mcp__cairn__write","mcp__cairn__run"],"mcp_servers":[{"name":"cairn","status":"connected"}]}"#,
             r#"{"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"msg_01","role":"assistant","model":"claude-opus-4"}}}"#,
             r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
             r#"{"type":"stream_event","session_id":"session-1","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading the file."}}}"#,

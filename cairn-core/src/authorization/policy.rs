@@ -27,7 +27,7 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     "accounts",
     // Which models and providers agent work is routed to — where prompts,
     // code, and credentials actually go.
-    "activeBackend",
+    "tierDefaults",
     "backends",
     "tiers",
     "openrouterRouting",

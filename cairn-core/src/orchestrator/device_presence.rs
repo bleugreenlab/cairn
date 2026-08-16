@@ -170,12 +170,12 @@ mod tests {
     #[tokio::test]
     async fn upsert_then_read_roundtrips() {
         let db = team_db().await;
-        upsert_presence(&db, "devA", "mac (macos)", &["PROJ".into()]).await;
+        upsert_presence(&db, "devA", "mac (macos)", &["proj".into()]).await;
         let rows = list_device_presence(&db).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].device_id, "devA");
         assert_eq!(rows[0].device_name, "mac (macos)");
-        assert_eq!(rows[0].project_keys, vec!["PROJ".to_string()]);
+        assert_eq!(rows[0].project_keys, vec!["proj".to_string()]);
         assert!(rows[0].last_seen > 0);
     }
 
@@ -183,11 +183,11 @@ mod tests {
     async fn upsert_is_idempotent_on_device_id() {
         let db = team_db().await;
         upsert_presence(&db, "devA", "old-name", &[]).await;
-        upsert_presence(&db, "devA", "new-name", &["P".into()]).await;
+        upsert_presence(&db, "devA", "new-name", &["p".into()]).await;
         let rows = list_device_presence(&db).await;
         assert_eq!(rows.len(), 1, "one row per device_id");
         assert_eq!(rows[0].device_name, "new-name");
-        assert_eq!(rows[0].project_keys, vec!["P".to_string()]);
+        assert_eq!(rows[0].project_keys, vec!["p".to_string()]);
     }
 
     #[tokio::test]

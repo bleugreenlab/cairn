@@ -9,9 +9,19 @@ const SOURCE_KIND_USER: &str = "user";
 pub(super) const SOURCE_KIND_PROCESS: &str = "process";
 const SOURCE_KIND_RESOURCE: &str = "resource";
 pub(super) const SOURCE_KIND_CONDITION: &str = "condition";
+/// The workspace Posts corpus. A row on this kind carries no `source_ref`: it is
+/// the elective feed watch, and which posts actually reach it is decided at
+/// delivery by jurisdiction, not by the row (`posts::post_feed_recipients`).
+pub(super) const SOURCE_KIND_POST: &str = "post";
 pub(super) const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub(super) const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 pub(super) const FACT_KIND_MESSAGE: &str = "message";
+/// A post was created. Reaches the Posts feed subscribers a post's scope admits.
+pub(crate) const FACT_KIND_NEW_POST: &str = "new_post";
+/// A comment was added to a post. Reaches the post author's current home.
+pub(crate) const FACT_KIND_POST_COMMENT: &str = "post_comment";
+/// A post or comment named a canonical destination. Reaches that destination.
+pub(crate) const FACT_KIND_POST_MENTION: &str = "post_mention";
 pub(crate) const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
 pub(crate) const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";
 /// A node's project check lanes reaching a state nothing will move further.
@@ -70,12 +80,27 @@ pub(super) fn derived_child_subscription(job_id: &str, issue_uri: &str) -> WakeS
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WakeSource {
-    Issue { reference: String },
-    Peer { reference: Option<String> },
+    Issue {
+        reference: String,
+    },
+    Peer {
+        reference: Option<String>,
+    },
     User,
-    Process { reference: String },
-    Resource { reference: String },
-    Condition { reference: String },
+    Process {
+        reference: String,
+    },
+    Resource {
+        reference: String,
+    },
+    Condition {
+        reference: String,
+    },
+    /// The Posts corpus. `None` is the standing feed watch; a reference names
+    /// one post, which is how a post-sourced fact addresses its subject.
+    Post {
+        reference: Option<String>,
+    },
 }
 
 impl WakeSource {
@@ -87,6 +112,7 @@ impl WakeSource {
             Self::Process { .. } => SOURCE_KIND_PROCESS,
             Self::Resource { .. } => SOURCE_KIND_RESOURCE,
             Self::Condition { .. } => SOURCE_KIND_CONDITION,
+            Self::Post { .. } => SOURCE_KIND_POST,
         }
     }
 
@@ -96,7 +122,7 @@ impl WakeSource {
             | Self::Process { reference }
             | Self::Resource { reference }
             | Self::Condition { reference } => Some(reference.as_str()),
-            Self::Peer { reference } => reference.as_deref(),
+            Self::Peer { reference } | Self::Post { reference } => reference.as_deref(),
             Self::User => None,
         }
     }
@@ -104,7 +130,11 @@ impl WakeSource {
     pub(crate) fn from_parts(kind: &str, reference: Option<&str>) -> Result<Self, String> {
         match kind {
             SOURCE_KIND_ISSUE => Ok(Self::Issue { reference: required_ref(kind, reference)? }),
-            SOURCE_KIND_PEER => Ok(Self::Peer { reference: reference.filter(|value| !value.is_empty()).map(ToString::to_string) }),
+            SOURCE_KIND_PEER => Ok(Self::Peer {
+                reference: reference
+                    .filter(|value| !value.is_empty())
+                    .map(cairn_common::uri::canonicalize_uri_identity),
+            }),
             SOURCE_KIND_USER => {
                 if reference.is_some() {
                     return Err("wake source kind 'user' must not include ref".to_string());
@@ -114,17 +144,35 @@ impl WakeSource {
             SOURCE_KIND_PROCESS => Ok(Self::Process { reference: required_ref(kind, reference)? }),
             SOURCE_KIND_RESOURCE => Ok(Self::Resource { reference: required_ref(kind, reference)? }),
             SOURCE_KIND_CONDITION => Ok(Self::Condition { reference: required_ref(kind, reference)? }),
+            SOURCE_KIND_POST => Ok(Self::Post {
+                reference: reference
+                    .filter(|value| !value.is_empty())
+                    .map(cairn_common::uri::canonicalize_uri_identity),
+            }),
             _ => Err(format!(
-                "unknown wake source kind '{kind}' (expected issue, peer, user, process, resource, or condition)"
+                "unknown wake source kind '{kind}' (expected issue, peer, user, process, resource, condition, or post)"
             )),
         }
     }
 }
 
+/// Whether a row of this kind with no `source_ref` is a **standing watch** over
+/// every reference of the kind, rather than an under-specified scope.
+///
+/// Two kinds say yes, for the same reason: their unscoped row is the only form
+/// the subscription has. A ref-less `peer` row watches every peer, and a
+/// ref-less `post` row watches the whole Posts corpus — so a fact carrying a
+/// concrete reference (a peer's URI, a post's URI) still has to find them.
+/// Every other kind requires a ref at subscribe time, so a NULL there would be a
+/// row that cannot match anything.
+pub(super) fn unscoped_row_is_a_standing_watch(kind: &str) -> bool {
+    matches!(kind, SOURCE_KIND_PEER | SOURCE_KIND_POST)
+}
+
 fn required_ref(kind: &str, reference: Option<&str>) -> Result<String, String> {
     reference
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .map(cairn_common::uri::canonicalize_uri_identity)
         .ok_or_else(|| format!("wake source kind '{kind}' requires ref"))
 }
 
@@ -157,6 +205,8 @@ pub enum WakeDelivery {
     /// Deliver one known subscriber job if its best matching subscription accepts.
     Targeted {
         subscriber_job_id: String,
+        #[serde(default)]
+        sender_name: Option<String>,
         message: String,
     },
     /// Deliver every job whose wake subscriptions match the event source/fact.

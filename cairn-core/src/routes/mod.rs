@@ -8,8 +8,8 @@ mod predicate;
 mod references;
 
 pub use definition::{
-    parse_definition, ArgumentBinding, DedupeWindow, NodePosition, RouteDefinition, RouteEdge,
-    RouteNode, RouteNodeConfig, RouteSink,
+    parse_definition, ArgumentBinding, ChannelDestination, DedupeWindow, NodePosition,
+    RouteDefinition, RouteEdge, RouteNode, RouteNodeConfig, RouteSink,
 };
 pub use dispatcher::{
     dispatch, record_channel_outcome, test_definition, ChannelSubmission, RouteContext,
@@ -28,6 +28,20 @@ use std::collections::BTreeMap;
 
 tokio::task_local! {
     static ROUTE_PROVENANCE: String;
+}
+
+/// Snapshot the local installation identity at an autonomous fact boundary.
+///
+/// Producers call this when the fact is decided; sinks must never reconstruct
+/// provenance later from mutable fact fields or ambient identity.
+pub(crate) fn installation_machine_origin(
+    orch: &crate::orchestrator::Orchestrator,
+) -> Result<crate::issues::crud::IssueAuthorship, String> {
+    crate::issues::crud::installation_machine_authorship(
+        orch.anon_device_manager.device_id(),
+        orch.services.clock.now(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) async fn with_provenance<T>(
@@ -49,6 +63,12 @@ pub struct RouteFact {
     pub source: String,
     pub identity: String,
     pub fields: BTreeMap<String, serde_json::Value>,
+    /// Immutable decision-time identity captured by the producer. This remains
+    /// outside matchable fields so response transforms cannot rewrite who acted.
+    /// It is skipped from route journals and outbound channel records because
+    /// the full appearance snapshot is storage-internal provenance.
+    #[serde(skip)]
+    pub origin: Option<crate::issues::crud::IssueAuthorship>,
     /// What this fact says, in the producer's own words. Identity is a key and
     /// `fields` can hold a serialized envelope, so neither is readable on its
     /// own; the producer knows what the fact meant and renders it here for the

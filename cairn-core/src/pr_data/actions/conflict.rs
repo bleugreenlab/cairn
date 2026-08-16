@@ -185,11 +185,11 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         };
-        let int = "agent/CAIRN-1940-coordinator-0";
+        let int = "agent/cairn-1940-coordinator-0";
         jj_cfg(&store, &["bookmark", "create", "-r", "main", int]);
 
-        let overlap = "agent/CAIRN-1-builder-0";
-        let clean = "agent/CAIRN-2-builder-0";
+        let overlap = "agent/cairn-1-builder-0";
+        let clean = "agent/cairn-2-builder-0";
         let ws_o = wts.path().join("o");
         let ws_c = wts.path().join("c");
         crate::jj::add_workspace(&jj, &store, &ws_o, overlap, int, None).unwrap();
@@ -309,8 +309,8 @@ mod tests {
             "- 27e4383e (\"merged\"): f.txt, g.rs\n- deadbeef"
         );
 
-        let recovery = conflict_recovery_hint("agent/CAIRN-1-builder-0", Some("main"));
-        assert!(recovery.contains("agent/CAIRN-1-builder-0"));
+        let recovery = conflict_recovery_hint("agent/cairn-1-builder-0", Some("main"));
+        assert!(recovery.contains("agent/cairn-1-builder-0"));
         assert!(recovery.contains("`main`"));
         assert!(recovery.contains("resolve-at-base"));
         // An unknown target falls back to a generic placeholder, never panics.

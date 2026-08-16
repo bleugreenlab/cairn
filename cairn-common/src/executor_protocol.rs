@@ -26,6 +26,191 @@ where
     Ok(accepted)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandProcessHealth {
+    pub tracked_live_count: usize,
+    pub reaped_stale_count: usize,
+    pub unverified_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_age_ms: Option<u64>,
+}
+
+/// Durable ownership of one transient command batch in a cell.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandBatchOwnership {
+    #[serde(default)]
+    pub executor_id: String,
+    #[serde(default)]
+    pub cell_id: String,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub attempt_id: String,
+    #[serde(default)]
+    pub batch_launch_nonce: String,
+    #[serde(default)]
+    pub launched_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<CommandItemOwnership>,
+}
+
+/// One requested batch item and every physical launch attempted for it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandItemOwnership {
+    #[serde(default)]
+    pub item_index: usize,
+    #[serde(default)]
+    pub stream_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<CommandAttemptOwnership>,
+}
+
+/// Persisted lifecycle of one launch attempt, including sandbox retries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandAttemptOwnership {
+    #[serde(default)]
+    pub attempt_index: usize,
+    #[serde(default)]
+    pub state: CommandAttemptLaunchState,
+    #[serde(default)]
+    pub launch_nonce: String,
+    #[serde(default)]
+    pub launched_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub processes: Vec<CommandPhysicalProcessIdentity>,
+}
+
+/// Launch intent is durable before spawn; running is published only after the
+/// leader's complete physical identity has been recorded.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandAttemptLaunchState {
+    #[default]
+    LaunchIntent,
+    Running,
+    Reaping,
+}
+
+/// PID-reuse-fenced identity of one observed member of an owned command tree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandPhysicalProcessIdentity {
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_group_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u32>,
+    pub start_token: String,
+    pub launch_nonce: String,
+    #[serde(default)]
+    pub observed_at_unix_ms: u64,
+    #[serde(default)]
+    pub parent: CommandProcessParentEvidence,
+}
+
+/// Evidence by which a physical identity was attached to the batch. Parent
+/// identities carry their own kernel start token so a recycled PPID cannot
+/// confer ownership.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CommandProcessParentEvidence {
+    #[default]
+    Leader,
+    Descendant {
+        parent_pid: u32,
+        parent_start_token: String,
+    },
+    ProcessGroup {
+        process_group_id: u32,
+        leader_pid: u32,
+        leader_start_token: String,
+    },
+    Session {
+        session_id: u32,
+        leader_pid: u32,
+        leader_start_token: String,
+    },
+}
+
+/// Durable proof that a resident process group belongs to one executor launch.
+///
+/// PIDs are recyclable, so cleanup matches the kernel start token before
+/// signalling the recorded group. The nonce identifies the durable launch
+/// generation in diagnostics and prevents records from being conflated.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessOwnership {
+    pub pid: u32,
+    pub process_group_id: u32,
+    pub launch_nonce: String,
+    pub start_token: String,
+    pub launched_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementTieBreak {
+    pub candidates: Vec<String>,
+    pub deciding_reason: String,
+}
+
+pub const fn interactive_cpu_reserve(logical_cores: usize) -> u32 {
+    let total = admission_concurrency_budget(logical_cores);
+    if total < 4 {
+        1
+    } else {
+        let proportional = total.saturating_add(7) / 8;
+        if proportional < 2 {
+            2
+        } else {
+            proportional
+        }
+    }
+}
+
+/// Admission capacity for one executor role. Colocated executors preserve
+/// foreground headroom; dedicated executors expose the whole machine.
+pub const fn executor_cpu_budget(logical_cores: usize, colocated: bool) -> u32 {
+    let total = admission_concurrency_budget(logical_cores);
+    if colocated {
+        let bulk = total.saturating_sub(interactive_cpu_reserve(logical_cores));
+        if bulk < 1 {
+            1
+        } else {
+            bulk
+        }
+    } else {
+        total
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxCapabilityEvidence {
+    /// Whether Cairn attached a policy to this executor process.
+    pub cairn_sandboxed_marker: bool,
+    /// A live behavioral measurement, not an inference from the marker.
+    pub nested_sandbox_write_available: bool,
+    pub nested_sandbox_write_detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "config")]
+pub enum ResidencyRuntimeConfig {
+    Install(ExecutorConfig),
+    NotRequired,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentionEstimate {
@@ -483,7 +668,43 @@ pub struct LearnedResourceEstimate {
 /// stdout. An older executor emits the value unredacted; the runner scrubs again
 /// on ingestion, so the pairing is safe in both directions, and the bump exists
 /// because the wire content itself changed, not because a field did.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 46;
+///
+/// Bumped to 47 for CAIRN-3934: runtime configuration is now part of each cell
+/// submission and residency request, so an executor installs it atomically
+/// before dispatching work after a restart or connection-generation change.
+///
+/// Bumped to 48 for CAIRN-3954: cell-root migration decides whether two roots
+/// are two roots by asking the filesystem rather than by comparing path text,
+/// so a case-insensitive filesystem no longer reports the destination back to
+/// itself as a competing inventory. No wire field moved; the bump is how the
+/// fix reaches the machines it is for, since an executor at 47 on macOS or
+/// Windows cannot provision a formerly-uppercase project at all.
+///
+/// Bumped to 49 for CAIRN-4065: a batch and a resident process now carry the
+/// Cairn-owned JavaScript packages they need, and the executor installs them
+/// above the checkout. The fields are additive and defaulted, so an executor at
+/// 48 would decode the message and simply not install anything -- and the only
+/// symptom would be bun reporting `@cairn/sdk` as a missing project dependency,
+/// which is precisely the misleading failure this change exists to remove.
+/// Refusing that peer at the handshake states the incompatibility where it can
+/// be read, rather than deferring it to an import error blamed on the project.
+///
+/// Bumped to 50 for CAIRN-4081: runtime concurrency policy is now a downward
+/// override of the executor's finite, role-aware advertised capacity. Older
+/// executors subtract the colocated reserve again and can interpret the legacy
+/// unlimited value as billions of units, so mixed peers must not silently agree
+/// on the same policy response with incompatible admission semantics.
+///
+/// Bumped to 56 for the combined wire boundaries below.
+///
+/// CAIRN-4166 adds the dependency-catalog execution contract. CAIRN-4162
+/// materializes a build cell only to a commit the current operation pinned and
+/// repairs an adopted cell that cannot be reconciled instead of latching its slot.
+///
+/// Placement decisions carry deterministic tie-break evidence, suspended process
+/// items and unavailable callback context use explicit backend control flow, and
+/// ordinary command batches persist distinct physical PID/start-token ownership.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 56;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -763,11 +984,19 @@ pub struct ExecutorSelector {
     /// and stands alone as "anywhere that can build this".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_toolchains: Vec<String>,
+    /// On macOS, require proof that the executor parent can apply a nested
+    /// Seatbelt profile and write inside its explicit allowance. Other
+    /// platforms are unaffected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub requires_macos_nested_sandbox_write: bool,
 }
 
 impl ExecutorSelector {
     pub fn is_empty(&self) -> bool {
-        self.name.is_none() && self.os.is_none() && self.required_toolchains.is_empty()
+        self.name.is_none()
+            && self.os.is_none()
+            && self.required_toolchains.is_empty()
+            && !self.requires_macos_nested_sandbox_write
     }
 
     /// Reject a selector that asks for nothing, or for two contradictory things.
@@ -780,7 +1009,7 @@ impl ExecutorSelector {
         }
         if self.is_empty() {
             return Err(
-                "an executor selector must state at least one of name, os, or requiredToolchains"
+                "an executor selector must state at least one of name, os, requiredToolchains, or requiresMacosNestedSandboxWrite"
                     .into(),
             );
         }
@@ -808,6 +1037,9 @@ impl ExecutorSelector {
                 "toolchains {}",
                 self.required_toolchains.join(", ")
             ));
+        }
+        if self.requires_macos_nested_sandbox_write {
+            parts.push("measured macOS nested Seatbelt write capability".into());
         }
         if parts.is_empty() {
             "any executor".to_string()
@@ -932,6 +1164,10 @@ pub struct ExecutorCapabilities {
     pub os: String,
     pub arch: String,
     pub logical_cores: usize,
+    /// Effective machine-wide CPU admission capacity after role-specific reserves.
+    /// Older executors omit it, in which case peers fall back to logical cores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_capacity: Option<u32>,
     #[serde(default)]
     pub toolchains: Vec<String>,
     #[serde(default)]
@@ -940,6 +1176,8 @@ pub struct ExecutorCapabilities {
     pub disk_budget_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_budget_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxCapabilityEvidence>,
     /// The evidence behind `toolchains`, absent from an executor built before
     /// probes were reported.
     ///
@@ -956,7 +1194,10 @@ pub struct ExecutorCapabilities {
 impl ExecutorCapabilities {
     /// The machine-wide concurrency budget this executor admits against.
     pub const fn admission_concurrency_budget(&self) -> u32 {
-        admission_concurrency_budget(self.logical_cores)
+        match self.concurrency_capacity {
+            Some(capacity) => capacity,
+            None => admission_concurrency_budget(self.logical_cores),
+        }
     }
 }
 
@@ -1528,6 +1769,9 @@ pub struct CellExecutionMeta {
     pub toolchain_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_environment_hash: Option<String>,
+    /// Sandbox marker state and measured kernel capability at execution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxCapabilityEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1693,6 +1937,9 @@ pub enum CellUnavailableReason {
     Provisioning,
     Checkout,
     Spawn,
+    /// The runner could not authenticate or reconstruct the originating run
+    /// context required to execute this cell.
+    RunnerContext,
     Preparation,
     /// The slot could not be made fit for this batch, so the executor retired
     /// it. Distinct from `Preparation` because of what it licenses rather than
@@ -1934,6 +2181,18 @@ pub struct ResidentProcessSpec {
     /// directory and exposes that root through `CAIRN_RUNTIME_ASSETS`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_assets: Vec<ResidentRuntimeAsset>,
+    /// Runner-provided JavaScript packages, addressed relative to the
+    /// `node_modules` root they install into (e.g. `@cairn/sdk/package.json`).
+    ///
+    /// Distinct from `runtime_assets` in destination rather than in kind:
+    /// assets land in lease-owned scratch and are reached through
+    /// `CAIRN_RUNTIME_ASSETS`, while packages install in the Cairn-owned
+    /// directory ABOVE the checkout, where a bare-specifier import resolves
+    /// them from anywhere inside it. Same contract as
+    /// `ProcessBatch::runtime_packages`, so a REPL and an inline run item
+    /// resolve a Cairn package the same way.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_packages: Vec<ResidentRuntimeAsset>,
     #[serde(default)]
     pub io: ResidentProcessIoMode,
 }
@@ -2015,6 +2274,10 @@ pub enum ResidentProcessStatus {
             alias = "process_group_id"
         )]
         process_group_id: Option<u32>,
+        /// Exact physical launch identity. Older persisted cells omit this and
+        /// are never eligible for restart-time signalling.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ownership: Option<ResidentProcessOwnership>,
     },
     Exited {
         #[serde(alias = "finished_at_unix_ms")]
@@ -2127,13 +2390,18 @@ pub struct CellOccupancy {
     /// as work rather than invisible behind the substrate that hosts it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<ActiveCellRequest>,
+    /// Durable physical ownership for the transient command batch. A legacy
+    /// `command` without this record is diagnostic-only: it is not authority to
+    /// signal anything found in the checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_ownership: Option<CommandBatchOwnership>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub processes: std::collections::BTreeMap<String, ResidentProcess>,
 }
 
 impl CellOccupancy {
     pub fn is_empty(&self) -> bool {
-        self.command.is_none() && self.processes.is_empty()
+        self.command.is_none() && self.command_ownership.is_none() && self.processes.is_empty()
     }
 
     pub fn live_processes(&self) -> impl Iterator<Item = (&String, &ResidentProcess)> {
@@ -2153,16 +2421,15 @@ impl CellOccupancy {
             source: ResourceReservationSource::Declared,
         };
         for (_, process) in self.live_processes() {
-            let Some(reservation) = process.reservation.as_ref() else {
-                continue;
-            };
+            let fallback = ResourceReservation::default();
+            let reservation = process.reservation.as_ref().unwrap_or(&fallback);
             total.memory_bytes = total.memory_bytes.saturating_add(reservation.memory_bytes);
             total.disk_growth_bytes = total
                 .disk_growth_bytes
                 .saturating_add(reservation.disk_growth_bytes);
             total.concurrency_units = total
                 .concurrency_units
-                .saturating_add(reservation.concurrency_units);
+                .saturating_add(reservation.concurrency_units.max(1));
         }
         total
     }
@@ -2695,6 +2962,8 @@ pub struct QueueClassHealth {
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionHealth {
     pub concurrency_capacity: Option<u32>,
+    #[serde(default)]
+    pub interactive_reserve: u32,
     pub memory_capacity_bytes: Option<u64>,
     pub disk_growth_capacity_bytes: Option<u64>,
     pub active_reservation: ResourceReservation,
@@ -3439,6 +3708,23 @@ pub struct ExecutorSubstrateReport {
     pub applied_policy: ExecutorRuntimePolicy,
     #[serde(default)]
     pub drain_mode: bool,
+    /// Physical process ownership reconciled against durable resident records.
+    #[serde(default)]
+    pub resident_processes: ResidentProcessHealth,
+    /// Physical ownership of transient command batches. Kept separate from
+    /// resident generations and restartability by design.
+    #[serde(default)]
+    pub command_processes: CommandProcessHealth,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResidentProcessHealth {
+    pub tracked_live_count: usize,
+    pub reaped_stale_count: usize,
+    pub unverified_stale_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_stale_age_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3483,6 +3769,10 @@ pub struct ExecutorHealthSnapshot {
     pub applied_policy: ExecutorRuntimePolicy,
     #[serde(default)]
     pub drain_mode: bool,
+    #[serde(default)]
+    pub resident_processes: ResidentProcessHealth,
+    #[serde(default)]
+    pub command_processes: CommandProcessHealth,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_skew: Option<BuildSkew>,
 }
@@ -3657,6 +3947,8 @@ pub struct PlacementSelection {
     pub executor_id: String,
     pub colocated: bool,
     pub reason: PlacementReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tie_break: Option<PlacementTieBreak>,
     /// The three placement inputs as they read for this machine, each with the
     /// instant it was measured. A gap stays a named gap here; it never becomes
     /// a zero.
@@ -4951,6 +5243,19 @@ pub struct ProcessBatch {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timeout_bases: Vec<Option<DurationEstimate>>,
     pub items: Vec<ProcessBatchItem>,
+    /// Runner-provided JavaScript packages this batch needs, addressed relative
+    /// to the `node_modules` root they install into (e.g.
+    /// `@cairn/sdk/package.json`).
+    ///
+    /// The executor installs these in the Cairn-owned directory ABOVE the
+    /// checkout, never inside it, so a batch without `commit_msg` cannot lose
+    /// them to checkout restoration and the project's own `node_modules` still
+    /// wins resolution. See `cairn_common::runtime` for why placement rather
+    /// than a resolver hook is the mechanism. Empty for batches that run no
+    /// JavaScript, so unrelated shell, Python, and MATLAB batches carry no
+    /// runtime bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_packages: Vec<ResidentRuntimeAsset>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_context_id: Option<String>,
     /// Run this batch inside a cell an existing residency already holds, rather
@@ -5111,9 +5416,6 @@ pub enum ExecutorMessage {
         expected: u32,
         received: u32,
     },
-    Configure {
-        config: ExecutorConfig,
-    },
     RuntimePolicyRequest {
         correlation_id: String,
         policy: ExecutorRuntimePolicy,
@@ -5131,6 +5433,7 @@ pub enum ExecutorMessage {
         result: Result<bool, String>,
     },
     Submit {
+        config: ExecutorConfig,
         request: CellRequest,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         batch: Option<ProcessBatch>,
@@ -5153,6 +5456,7 @@ pub enum ExecutorMessage {
     },
     ResidencyRequest {
         correlation_id: String,
+        config: ResidencyRuntimeConfig,
         operation: ResidencyOperation,
     },
     ResidencyResponse {
@@ -5383,16 +5687,6 @@ mod tests {
                 expected: 1,
                 received: 2,
             },
-            ExecutorMessage::Configure {
-                config: ExecutorConfig {
-                    project_id: "p".into(),
-                    project_key: "p".into(),
-                    default_timeout_seconds: 30,
-                    setup_commands: vec!["bun install".into()],
-                    populate: Default::default(),
-                    population_source_root: None,
-                },
-            },
             ExecutorMessage::ResidentProcessEvent {
                 event: ResidentProcessEvent {
                     holder: sample_holder(),
@@ -5435,6 +5729,14 @@ mod tests {
                 },
             },
             ExecutorMessage::Submit {
+                config: ExecutorConfig {
+                    project_id: "p".into(),
+                    project_key: "p".into(),
+                    default_timeout_seconds: 30,
+                    setup_commands: vec![],
+                    populate: Default::default(),
+                    population_source_root: None,
+                },
                 request: request.clone(),
                 batch: None,
             },
@@ -5450,6 +5752,14 @@ mod tests {
             ExecutorMessage::CancelJob { job_id: "j".into() },
             ExecutorMessage::ResidencyRequest {
                 correlation_id: "lease-request".into(),
+                config: ResidencyRuntimeConfig::Install(ExecutorConfig {
+                    project_id: "p".into(),
+                    project_key: "p".into(),
+                    default_timeout_seconds: 30,
+                    setup_commands: vec![],
+                    populate: Default::default(),
+                    population_source_root: None,
+                }),
                 operation: ResidencyOperation::Acquire {
                     request: sample_acquire_request(),
                 },
@@ -5580,6 +5890,7 @@ mod tests {
         };
         let occupancy = CellOccupancy {
             command: Some(command),
+            command_ownership: None,
             processes: std::collections::BTreeMap::from([(
                 "shell".to_string(),
                 ResidentProcess {
@@ -5591,6 +5902,7 @@ mod tests {
                     status: ResidentProcessStatus::Running {
                         started_at_unix_ms: 7,
                         process_group_id: Some(41),
+                        ownership: None,
                     },
                     reservation: None,
                 },
@@ -5749,11 +6061,13 @@ mod tests {
         };
         let mut occupancy = CellOccupancy {
             command: None,
+            command_ownership: None,
             processes: std::collections::BTreeMap::from([(
                 "server".to_string(),
                 process(ResidentProcessStatus::Running {
                     started_at_unix_ms: 1,
                     process_group_id: None,
+                    ownership: None,
                 }),
             )]),
         };
@@ -5927,6 +6241,12 @@ mod tests {
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
                 reason: PlacementReason::PredictedEarliestVerdict,
+                tie_break: Some(PlacementTieBreak {
+                    candidates: vec!["bglab-ub".into(), "bbs".into()],
+                    deciding_reason:
+                        "least recently selected among candidates equal on every earlier placement key"
+                            .into(),
+                }),
                 readings: PlacementReadings {
                     cpu: Measurement::measured(
                         10,
@@ -5980,6 +6300,15 @@ mod tests {
             }],
         };
         let encoded = serde_json::to_string(&decision).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            wire.pointer("/outcome/tieBreak"),
+            Some(&serde_json::json!({
+                "candidates": ["bglab-ub", "bbs"],
+                "decidingReason":
+                    "least recently selected among candidates equal on every earlier placement key"
+            }))
+        );
         let decoded: PlacementDecision = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, decision);
         assert!(decoded.mentions_executor("executor-7b21ce"));
@@ -6086,10 +6415,12 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 logical_cores: 8,
+                concurrency_capacity: None,
                 toolchains: vec!["rust".into()],
                 projects_served: vec!["p".into()],
                 disk_budget_bytes: Some(10),
                 memory_budget_bytes: None,
+                sandbox: None,
                 toolchain_detection: None,
             },
             current_load: 1,
@@ -6269,10 +6600,12 @@ mod tests {
         });
         let decoded: ExecutorCapabilities = serde_json::from_value(older).unwrap();
         assert_eq!(decoded.toolchain_detection, None);
+        assert_eq!(decoded.sandbox, None);
 
         // And an executor that probed and found nothing is a different fact,
         // which survives the same round trip.
         let probed = ExecutorCapabilities {
+            sandbox: None,
             toolchain_detection: Some(ToolchainDetection {
                 account: "mitch".into(),
                 home: "C:\\Users\\mitch".into(),
@@ -6293,11 +6626,16 @@ mod tests {
         let selector = ExecutorSelector {
             name: Some("bglab-ub".into()),
             required_toolchains: vec!["rust".into()],
+            requires_macos_nested_sandbox_write: true,
             ..ExecutorSelector::default()
         };
         assert_eq!(
             serde_json::to_value(&selector).unwrap(),
-            serde_json::json!({"name": "bglab-ub", "requiredToolchains": ["rust"]})
+            serde_json::json!({
+                "name": "bglab-ub",
+                "requiredToolchains": ["rust"],
+                "requiresMacosNestedSandboxWrite": true
+            })
         );
         for retired in ["executorId", "deviceId", "arch"] {
             let raw = serde_json::json!({ retired: "anything" });
@@ -6345,6 +6683,7 @@ mod tests {
             generation: 4,
             kind,
             spec: Some(ResidentProcessSpec {
+                runtime_packages: Vec::new(),
                 program: "bun".into(),
                 args: vec!["run".into(), "dev".into()],
                 cwd: "/cell".into(),
@@ -6374,6 +6713,7 @@ mod tests {
             status: ResidentProcessStatus::Running {
                 started_at_unix_ms: 1_785_185_750_222,
                 process_group_id: Some(62_961),
+                ownership: None,
             },
             reservation: Some(ResourceReservation {
                 memory_bytes: 1024,
@@ -6430,6 +6770,7 @@ mod tests {
             }),
             occupancy: CellOccupancy {
                 command: None,
+                command_ownership: None,
                 processes,
             },
             ..template.clone()
@@ -6470,6 +6811,7 @@ mod tests {
             }),
             occupancy: CellOccupancy {
                 command: None,
+                command_ownership: None,
                 processes,
             },
             ..template.clone()
@@ -6749,6 +7091,7 @@ mod tests {
             residency: Some(residency),
             occupancy: CellOccupancy {
                 command: Some(command.clone()),
+                command_ownership: None,
                 processes,
             },
         };
@@ -6870,6 +7213,7 @@ mod tests {
                 },
                 admission: AdmissionHealth {
                     concurrency_capacity: Some(8),
+                    interactive_reserve: 0,
                     memory_capacity_bytes: Some(22),
                     disk_growth_capacity_bytes: Some(23),
                     active_reservation: reservation.clone(),
@@ -6891,6 +7235,8 @@ mod tests {
                 connection_generation: 2,
                 applied_policy: ExecutorRuntimePolicy::default(),
                 drain_mode: true,
+                resident_processes: ResidentProcessHealth::default(),
+                command_processes: CommandProcessHealth::default(),
                 build_skew: Some(BuildSkew {
                     runner_build_id: "runner".into(),
                     executor_build_id: "executor".into(),
@@ -6984,6 +7330,7 @@ mod tests {
                         verdict_arch: None,
                         toolchain_fingerprint: None,
                         verdict_environment_hash: None,
+                        sandbox: None,
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -7199,6 +7546,7 @@ mod tests {
         let running = serde_json::to_value(ResidentProcessStatus::Running {
             started_at_unix_ms: 1_785_185_750_222,
             process_group_id: Some(62_961),
+            ownership: None,
         })
         .unwrap();
         assert_eq!(running["status"], "running");
@@ -7298,6 +7646,7 @@ mod tests {
             ResidentProcessStatus::Running {
                 started_at_unix_ms: 1_785_124_970_255,
                 process_group_id: Some(21_586),
+                ownership: None,
             }
         );
     }
@@ -8024,6 +8373,7 @@ mod tests {
                 verdict_arch: None,
                 toolchain_fingerprint: None,
                 verdict_environment_hash: None,
+                sandbox: None,
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),
@@ -8038,6 +8388,7 @@ mod tests {
     #[test]
     fn lifetime_pipe_runtime_shape_round_trips_with_stream_tags() {
         let process = ResidentProcessSpec {
+            runtime_packages: Vec::new(),
             program: "bun".into(),
             args: vec!["main.ts".into()],
             cwd: "package".into(),
@@ -8091,5 +8442,79 @@ mod tests {
         assert_eq!(meta.verdict_arch, None);
         assert_eq!(meta.toolchain_fingerprint, None);
         assert_eq!(meta.verdict_environment_hash, None);
+    }
+
+    #[test]
+    fn command_batch_ownership_round_trips_physical_and_parent_identity() {
+        let ownership = CommandBatchOwnership {
+            executor_id: "executor-1".into(),
+            cell_id: "cell-1".into(),
+            request_id: "request-1".into(),
+            attempt_id: "lease-attempt-1".into(),
+            batch_launch_nonce: "batch-nonce".into(),
+            launched_at_unix_ms: 10,
+            items: vec![CommandItemOwnership {
+                item_index: 2,
+                stream_id: "stderr".into(),
+                attempts: vec![CommandAttemptOwnership {
+                    attempt_index: 1,
+                    state: CommandAttemptLaunchState::Running,
+                    launch_nonce: "attempt-nonce".into(),
+                    launched_at_unix_ms: 11,
+                    identity_error: None,
+                    processes: vec![CommandPhysicalProcessIdentity {
+                        pid: 42,
+                        process_group_id: Some(42),
+                        session_id: Some(7),
+                        start_token: "kernel-start".into(),
+                        launch_nonce: "attempt-nonce".into(),
+                        observed_at_unix_ms: 12,
+                        parent: CommandProcessParentEvidence::Descendant {
+                            parent_pid: 41,
+                            parent_start_token: "parent-start".into(),
+                        },
+                    }],
+                }],
+            }],
+        };
+        let value = serde_json::to_value(&ownership).unwrap();
+        assert_eq!(value["items"][0]["attempts"][0]["state"], "running");
+        assert_eq!(
+            value["items"][0]["attempts"][0]["processes"][0]["parent"]["kind"],
+            "descendant"
+        );
+        assert_eq!(
+            serde_json::from_value::<CommandBatchOwnership>(value).unwrap(),
+            ownership
+        );
+    }
+
+    #[test]
+    fn legacy_command_occupancy_decodes_as_unverified_without_signal_authority() {
+        let occupancy: CellOccupancy = serde_json::from_value(serde_json::json!({
+            "command": {
+                "requestId": "request-1",
+                "attemptId": "attempt-1",
+                "command": "cargo test",
+                "commandClass": "cargoTest",
+                "priority": "reviewCheck",
+                "requestingJobId": null,
+                "queuedAtUnixMs": 0,
+                "startedAtUnixMs": 1
+            }
+        }))
+        .unwrap();
+        assert!(occupancy.command.is_some());
+        assert_eq!(occupancy.command_ownership, None);
+        assert!(!occupancy.is_empty());
+    }
+
+    #[test]
+    fn legacy_health_defaults_command_process_health_separately() {
+        let mut value = serde_json::to_value(ExecutorSubstrateReport::default()).unwrap();
+        value.as_object_mut().unwrap().remove("commandProcesses");
+        let report: ExecutorSubstrateReport = serde_json::from_value(value).unwrap();
+        assert_eq!(report.command_processes, CommandProcessHealth::default());
+        assert_eq!(report.resident_processes, ResidentProcessHealth::default());
     }
 }

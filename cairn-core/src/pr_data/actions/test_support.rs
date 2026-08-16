@@ -43,7 +43,7 @@ pub(super) async fn seed_merge_request(
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', ?1, 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', ?1, 'main', 1, 1)",
                     params![repo_path.as_str()],
                 )
                 .await?;
@@ -55,7 +55,7 @@ pub(super) async fn seed_merge_request(
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number, github_pr_url)
-                     VALUES ('mr-1', ?1, 'proj-1', 'issue-1', 'PR', 'agent/PROJ-2-child', ?2, 'merged', 1, 1, 7, 'https://example.com/pr/7')",
+                     VALUES ('mr-1', ?1, 'proj-1', 'issue-1', 'PR', 'agent/proj-2-child', ?2, 'merged', 1, 1, 7, 'https://example.com/pr/7')",
                     params![owner_id.as_str(), target_branch.as_str()],
                 )
                 .await?;
@@ -73,7 +73,7 @@ pub(super) async fn seed_local_open_merge_request(db: &LocalDb, owner_id: &str) 
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-local', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-local', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -85,7 +85,7 @@ pub(super) async fn seed_local_open_merge_request(db: &LocalDb, owner_id: &str) 
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, body, source_branch, target_branch, status, opened_at, updated_at)
-                     VALUES ('mr-local', ?1, 'proj-local', 'issue-local', 'Old title', 'Old body', 'agent/PROJ-2-builder', 'main', 'open', 1, 1)",
+                     VALUES ('mr-local', ?1, 'proj-local', 'issue-local', 'Old title', 'Old body', 'agent/proj-2-builder', 'main', 'open', 1, 1)",
                     params![owner_id.as_str()],
                 )
                 .await?;
@@ -122,7 +122,7 @@ pub(super) async fn seed_pr_node_merge_request_for_artifact_job(db: &LocalDb) {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-pr-node', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-pr-node', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -152,7 +152,7 @@ pub(super) async fn seed_pr_node_merge_request_for_artifact_job(db: &LocalDb) {
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, body, source_branch, target_branch, status, opened_at, updated_at)
-                     VALUES ('mr-pr-node', 'builder-job', 'proj-pr-node', 'issue-pr-node', 'Old title', 'Old body', 'agent/PROJ-3-builder', 'main', 'open', 1, 1)",
+                     VALUES ('mr-pr-node', 'builder-job', 'proj-pr-node', 'issue-pr-node', 'Old title', 'Old body', 'agent/proj-3-builder', 'main', 'open', 1, 1)",
                     (),
                 )
                 .await?;
@@ -174,7 +174,7 @@ pub(super) async fn seed_remote_open_merge_request(db: &LocalDb, owner_id: &str,
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-remote', 'default', 'Project', 'PROJ', ?1, 'main', 1, 1)",
+                     VALUES ('proj-remote', 'default', 'Project', 'proj', ?1, 'main', 1, 1)",
                     params![repo_path.as_str()],
                 )
                 .await?;
@@ -186,7 +186,7 @@ pub(super) async fn seed_remote_open_merge_request(db: &LocalDb, owner_id: &str,
                 .await?;
                 conn.execute(
                     "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, body, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number, github_pr_url)
-                     VALUES ('mr-remote', ?1, 'proj-remote', 'issue-remote', 'Old title', 'Old body', 'agent/PROJ-4-builder-0', 'main', 'open', 0, 1, 1, 2833, 'https://example.com/pr/2833')",
+                     VALUES ('mr-remote', ?1, 'proj-remote', 'issue-remote', 'Old title', 'Old body', 'agent/proj-4-builder-0', 'main', 'open', 0, 1, 1, 2833, 'https://example.com/pr/2833')",
                     params![owner_id.as_str()],
                 )
                 .await?;

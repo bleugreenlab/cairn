@@ -43,7 +43,11 @@ pub(super) async fn dispatch(
                 "user"
             };
             if let Some(value) = payload.get("subscribe") {
-                let filter = parse_wake_filter(index, item, value, "subscribe")?;
+                let filter = normalize_posts_filter(
+                    index,
+                    item,
+                    parse_wake_filter(index, item, value, "subscribe")?,
+                )?;
                 if filter.kind == "terminal" {
                     subscribe_terminal_wake(
                         orch, index, item, &job_id, &filter, created_by, dry_run, project, *number,
@@ -83,7 +87,11 @@ pub(super) async fn dispatch(
                     orch,
                     index,
                     item,
-                    parse_wake_filter(index, item, value, "mute")?,
+                    normalize_posts_filter(
+                        index,
+                        item,
+                        parse_wake_filter(index, item, value, "mute")?,
+                    )?,
                     project,
                     *number,
                     *exec_seq,
@@ -92,7 +100,13 @@ pub(super) async fn dispatch(
                 .await?;
                 let until = payload
                     .get("until")
-                    .map(|value| parse_wake_filter(index, item, value, "until"))
+                    .map(|value| {
+                        normalize_posts_filter(
+                            index,
+                            item,
+                            parse_wake_filter(index, item, value, "until")?,
+                        )
+                    })
                     .transpose()?;
                 let until = match until {
                     Some(filter) => Some(
@@ -152,7 +166,11 @@ pub(super) async fn dispatch(
                 orch,
                 index,
                 item,
-                parse_wake_filter(index, item, value, "unmute")?,
+                normalize_posts_filter(
+                    index,
+                    item,
+                    parse_wake_filter(index, item, value, "unmute")?,
+                )?,
                 project,
                 *number,
                 *exec_seq,
@@ -199,7 +217,11 @@ pub(super) async fn dispatch(
             let value = payload
                 .get("unsubscribe")
                 .ok_or_else(|| build_failure(index, item, "payload.unsubscribe is required"))?;
-            let filter = parse_wake_filter(index, item, value, "unsubscribe")?;
+            let filter = normalize_posts_filter(
+                index,
+                item,
+                parse_wake_filter(index, item, value, "unsubscribe")?,
+            )?;
             let created_by = if request.run_id.is_some() {
                 "agent"
             } else {
@@ -267,6 +289,35 @@ async fn normalize_checks_filter(
             .map_err(|error| build_failure(index, item, error))?;
     filter.kind = "condition".to_string();
     filter.reference = Some(target.uri);
+    Ok(filter)
+}
+
+/// Normalize the agent-facing `kind:"posts"` alias to the persisted `post`
+/// source kind, and refuse a `ref` on it.
+///
+/// The plural is what an agent writes — "watch posts" — while the wake schema
+/// stores the singular kind each post fact is carried on. Refusing a `ref` is
+/// not tidiness: a Posts subscription is a standing watch over the whole corpus
+/// whose reach is decided at delivery by the post's scope, so accepting a
+/// caller-supplied reference would either silently do nothing or invite a caller
+/// to name a destination the subscription does not govern. The subscribing job
+/// is always the node the URI addresses, never anything in the payload.
+pub(super) fn normalize_posts_filter(
+    index: usize,
+    item: &ChangeItem,
+    mut filter: WakeFilterPayload,
+) -> ResourceMutationResult<WakeFilterPayload> {
+    if !matches!(filter.kind.as_str(), "posts" | "post") {
+        return Ok(filter);
+    }
+    if filter.reference.is_some() {
+        return Err(build_failure(
+            index,
+            item,
+            "a posts wake watches the whole Posts corpus and does not accept ref",
+        ));
+    }
+    filter.kind = "post".to_string();
     Ok(filter)
 }
 

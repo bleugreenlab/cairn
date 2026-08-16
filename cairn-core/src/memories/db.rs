@@ -1315,12 +1315,12 @@ mod tests {
         db.write(|conn| {
             Box::pin(async move {
                 conn.execute(
-                    "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace) VALUES ('workspace', 'default', 'Workspace', 'WKS', '/tmp/ws', 1, 1, 1)",
+                    "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace) VALUES ('workspace', 'default', 'Workspace', 'wks', '/tmp/ws', 1, 1, 1)",
                     (),
                 )
                 .await?;
                 conn.execute(
-                    "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1)",
+                    "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'prj', '/tmp/prj', 1, 1)",
                     (),
                 )
                 .await?;
@@ -1815,7 +1815,7 @@ mod tests {
         assert_eq!(neighbors[0].memory.id, "prior");
         assert_eq!(
             neighbors[0].triage_issue_uri.as_deref(),
-            Some("cairn://p/PRJ/7")
+            Some("cairn://p/prj/7")
         );
         assert_eq!(
             neighbors[0].memory.promoted_commit_sha.as_deref(),
@@ -2044,7 +2044,7 @@ mod tests {
     #[tokio::test]
     async fn merged_batch_finalizes_a_defer_that_names_its_project_by_key() {
         let db = test_db().await;
-        merged_batch_with_project_defer(&db, "PRJ").await;
+        merged_batch_with_project_defer(&db, "prj").await;
 
         let resolved = resolve_triage_batch_on_merge(&db, "issue-merged")
             .await
@@ -2183,7 +2183,7 @@ mod tests {
         let db = test_db().await;
 
         assert_eq!(
-            project_id_for_reference(&db, "PRJ")
+            project_id_for_reference(&db, "prj")
                 .await
                 .unwrap()
                 .as_deref(),
@@ -2214,8 +2214,8 @@ mod tests {
     #[tokio::test]
     async fn project_key_by_id_resolves_workspace_key_dynamically() {
         let db = test_db().await;
-        assert_eq!(project_key_by_id(&db, "workspace").await.unwrap(), "WKS");
-        assert_eq!(project_key_by_id(&db, "project-1").await.unwrap(), "PRJ");
+        assert_eq!(project_key_by_id(&db, "workspace").await.unwrap(), "wks");
+        assert_eq!(project_key_by_id(&db, "project-1").await.unwrap(), "prj");
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use cairn_db::turso::params;
 /// in `head_turn_state`. `complete` is the idle shape both nudges observed;
 /// `running` is what the first launch leaves behind for the second to find.
 async fn seed_job(db: &LocalDb, head_turn_state: &str) {
-    let project_id = common::create_project(db, "RACE").await;
+    let project_id = common::create_project(db, "race").await;
     let head_turn_state = head_turn_state.to_string();
     db.write(|conn| {
         let project_id = project_id.clone();

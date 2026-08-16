@@ -33,11 +33,16 @@ pub struct UserIdentity {
 }
 
 /// Claude authentication method.
+///
+/// Subscription auth is a Cairn-managed profile and nothing else. Every
+/// claude-backend session runs against an explicit `CLAUDE_CONFIG_DIR`, so no
+/// session can land on whichever account happens to be signed in at the user
+/// level — that ambient account is invisible to usage routing and cannot be
+/// switched away from when it runs out. An API key stays a first-class
+/// alternative because it is a credential Cairn holds and can attribute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ClaudeAuth {
-    /// User's own OAuth token (Max subscriber using `claude setup-token`)
-    OAuthToken(String),
     /// API key (personal or org-provided)
     ApiKey(String),
     /// Cairn-managed Claude CLI profile directory.
@@ -48,7 +53,7 @@ impl ClaudeAuth {
     /// Get the raw token/key value.
     pub fn value(&self) -> &str {
         match self {
-            ClaudeAuth::OAuthToken(v) | ClaudeAuth::ApiKey(v) => v,
+            ClaudeAuth::ApiKey(v) => v,
             ClaudeAuth::ConfigDir(path) => path.to_str().unwrap_or_default(),
         }
     }
@@ -93,6 +98,11 @@ pub enum ApiProvider {
     /// OpenRouter APIs
     #[serde(rename = "openrouter", alias = "open_router")]
     OpenRouter,
+    /// OpenCode Zen APIs. One key spans the Zen surfaces; the Go subscription is
+    /// the one Cairn serves today, which is why the credential is named for the
+    /// account and the backend is named for the subscription.
+    #[serde(rename = "opencode", alias = "open_code")]
+    OpenCode,
     /// Ollama APIs
     #[serde(rename = "ollama")]
     Ollama,
@@ -108,6 +118,7 @@ impl ApiProvider {
             ApiProvider::OpenAI => "openai",
             ApiProvider::Google => "google",
             ApiProvider::OpenRouter => "openrouter",
+            ApiProvider::OpenCode => "opencode",
             ApiProvider::Ollama => "ollama",
             ApiProvider::GitHub => "github",
         }
@@ -120,6 +131,7 @@ impl ApiProvider {
             ApiProvider::OpenAI,
             ApiProvider::Google,
             ApiProvider::OpenRouter,
+            ApiProvider::OpenCode,
             ApiProvider::Ollama,
             ApiProvider::GitHub,
         ]
@@ -133,6 +145,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::OpenAI => write!(f, "OpenAI"),
             ApiProvider::Google => write!(f, "Google"),
             ApiProvider::OpenRouter => write!(f, "OpenRouter"),
+            ApiProvider::OpenCode => write!(f, "OpenCode"),
             ApiProvider::Ollama => write!(f, "Ollama"),
             ApiProvider::GitHub => write!(f, "GitHub"),
         }
@@ -145,8 +158,6 @@ impl std::fmt::Display for ApiProvider {
 pub enum AccountSource {
     /// User explicitly configured via settings UI
     Configured,
-    /// Auto-detected from installed CLI (not persisted)
-    LocalCli,
     /// Provided by cairn-server (future — team credentials)
     Server,
 }
@@ -164,9 +175,6 @@ pub enum ProviderAuth {
     /// Provider host URL. This is connection metadata, not a secret.
     #[serde(rename = "base_url")]
     BaseUrl { url: String },
-    /// Ambient CLI auth — no stored credential, uses locally installed CLI
-    #[serde(rename = "local_cli")]
-    LocalCli,
     /// Cairn-managed Claude CLI profile. Its path is derived from the account id.
     #[serde(rename = "claude_profile")]
     ClaudeProfile,
@@ -192,9 +200,7 @@ impl ProviderAuth {
     fn credential_value(&self) -> Option<&str> {
         match self {
             ProviderAuth::ApiKey { value } | ProviderAuth::OAuthToken { value } => Some(value),
-            ProviderAuth::BaseUrl { .. } | ProviderAuth::LocalCli | ProviderAuth::ClaudeProfile => {
-                None
-            }
+            ProviderAuth::BaseUrl { .. } | ProviderAuth::ClaudeProfile => None,
         }
     }
 
@@ -204,7 +210,6 @@ impl ProviderAuth {
             ProviderAuth::ApiKey { .. } => "api_key",
             ProviderAuth::OAuthToken { .. } => "oauth_token",
             ProviderAuth::BaseUrl { .. } => "base_url",
-            ProviderAuth::LocalCli => "local_cli",
             ProviderAuth::ClaudeProfile => "claude_profile",
         }
     }
@@ -219,6 +224,32 @@ pub struct ProviderAccountHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_until: Option<i64>,
     pub captured_at: i64,
+}
+
+impl ProviderAccountHealth {
+    /// Whether the provider has told Cairn this account cannot run yet.
+    fn is_blocked(&self, now: i64) -> bool {
+        self.blocked_until.is_some_and(|until| until > now)
+    }
+
+    /// The tightest remaining headroom this snapshot still speaks for at `now`,
+    /// or `None` when it says nothing measurable.
+    ///
+    /// A window whose reset time has passed has rolled over since it was
+    /// measured, so its number is history rather than evidence of exhaustion.
+    /// Without that, one measured-empty five-hour window would strand an
+    /// account out of rotation until somebody re-probed it by hand — snapshots
+    /// arrive on sign-in, on a manual refresh, and from live session events,
+    /// none of which fire for an account nothing is routing sessions to.
+    fn live_headroom(&self, now: i64) -> Option<f64> {
+        let tightest = self
+            .windows
+            .iter()
+            .filter(|window| window.resets_at.is_none_or(|resets_at| resets_at > now))
+            .map(|window| window.remaining_percent)
+            .fold(f64::INFINITY, f64::min);
+        tightest.is_finite().then_some(tightest)
+    }
 }
 
 /// A named credential for an API provider.
@@ -254,21 +285,23 @@ impl ProviderAccount {
             (ApiProvider::OpenAI, ProviderAuth::ApiKey { .. }) => vec!["codex", "native"],
             (ApiProvider::Google, ProviderAuth::ApiKey { .. }) => vec!["native"],
             (ApiProvider::OpenRouter, ProviderAuth::ApiKey { .. }) => vec!["openrouter"],
+            (ApiProvider::OpenCode, ProviderAuth::ApiKey { .. }) => vec!["opencode-go"],
             (ApiProvider::Ollama, ProviderAuth::BaseUrl { .. }) => vec!["ollama"],
             (ApiProvider::GitHub, ProviderAuth::ApiKey { .. }) => vec![],
             // OAuth is CLI-specific
-            (ApiProvider::Anthropic, ProviderAuth::OAuthToken { .. }) => vec!["claude"],
             (ApiProvider::OpenAI, ProviderAuth::OAuthToken { .. }) => vec!["codex"],
             (ApiProvider::Google, ProviderAuth::OAuthToken { .. }) => vec![],
             (ApiProvider::OpenRouter, ProviderAuth::OAuthToken { .. }) => vec![],
+            // OpenCode Zen issues API keys from its console; there is no OAuth.
+            (ApiProvider::OpenCode, ProviderAuth::OAuthToken { .. }) => vec![],
             (ApiProvider::GitHub, ProviderAuth::OAuthToken { .. }) => vec![],
-            // Local CLI is CLI-specific
-            (ApiProvider::Anthropic, ProviderAuth::LocalCli) => vec!["claude"],
+            // A Cairn-managed profile is the only subscription credential the
+            // Claude backend accepts. A pasted `claude setup-token` value
+            // (`OAuthToken`) authenticates a session Cairn can neither route by
+            // remaining usage nor sign out of, so it is not a usable Anthropic
+            // credential; stored ones are retired when the store loads.
+            (ApiProvider::Anthropic, ProviderAuth::OAuthToken { .. }) => vec![],
             (ApiProvider::Anthropic, ProviderAuth::ClaudeProfile) => vec!["claude"],
-            // Codex/ChatGPT OAuth refresh tokens are single-use. Cairn must own
-            // and refresh its Codex credential explicitly instead of falling back
-            // to ambient CLI state that can be mutated by other processes.
-            (ApiProvider::OpenAI, ProviderAuth::LocalCli) => vec![],
             _ => vec![],
         }
     }
@@ -286,6 +319,76 @@ pub struct GitIdentity {
     pub(crate) sort_order: i32,
 }
 
+/// An Anthropic login that the profiles-only model no longer accepts, kept
+/// until the user has been told why it disappeared.
+///
+/// Dropping a credential the user deliberately added is not something to do
+/// silently: the account simply vanishing from settings reads as a bug, and the
+/// only recovery — signing in again as a managed profile — is not guessable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetiredLogin {
+    pub(crate) label: String,
+    /// The auth shape it used to have (`local_cli` or `oauth_token`).
+    pub(crate) auth_type: String,
+    pub(crate) retired_at: i64,
+}
+
+/// Headroom assumed for a managed account Cairn has no usage snapshot for.
+/// Full, so an account that just signed in competes normally instead of
+/// being sorted below every account with a measured window.
+const UNKNOWN_HEADROOM: f64 = 100.0;
+
+/// A provider whose subscription logins Cairn routes sessions across by
+/// remaining usage.
+///
+/// Subscriptions are inventory — interchangeable token faucets picked by
+/// headroom — so what identifies one here is the provider plus the credential
+/// shape that carries a metered window. An API key bills per token and has no
+/// window to route around, so it is never a routing candidate; it remains the
+/// deliberate fallback a caller reaches for when no subscription is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutedProvider {
+    Claude,
+    Codex,
+}
+
+impl RoutedProvider {
+    /// The routed provider a backend draws its subscription credential from,
+    /// or `None` for a backend Cairn does not hold subscriptions for.
+    pub fn for_backend(backend: &str) -> Option<Self> {
+        match backend {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            _ => None,
+        }
+    }
+
+    fn api_provider(self) -> ApiProvider {
+        match self {
+            Self::Claude => ApiProvider::Anthropic,
+            Self::Codex => ApiProvider::OpenAI,
+        }
+    }
+
+    pub fn backend(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    /// Whether this credential is the metered subscription shape for the
+    /// provider: a Cairn-managed Claude profile, or a ChatGPT OAuth login whose
+    /// `auth.json` Cairn owns and refreshes.
+    fn routes(self, auth: &ProviderAuth) -> bool {
+        match self {
+            Self::Claude => matches!(auth, ProviderAuth::ClaudeProfile),
+            Self::Codex => matches!(auth, ProviderAuth::OAuthToken { .. }),
+        }
+    }
+}
+
 /// The full identity store — multi-account model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -298,6 +401,17 @@ pub struct IdentityStore {
     /// Per-project account overrides, keyed by project ID.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub(crate) project_overrides: std::collections::HashMap<String, AccountOverrides>,
+    /// Anthropic logins dropped by the profiles-only migration, pending the
+    /// user acknowledging them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) retired_logins: Vec<RetiredLogin>,
+    /// The configuration root this store was loaded from, and therefore the one
+    /// its managed Claude profiles live under. Not content, so not persisted —
+    /// but carried, because a store that cannot say where it lives cannot
+    /// resolve a profile path, and inferring one is how sign-in and session
+    /// resolution came to disagree.
+    #[serde(skip)]
+    pub(crate) config_dir: std::path::PathBuf,
 }
 
 impl IdentityStore {
@@ -312,7 +426,6 @@ impl IdentityStore {
         if let Some(auth) = &identity.claude_auth {
             let provider_auth = match auth {
                 ClaudeAuth::ApiKey(v) => ProviderAuth::ApiKey { value: v.clone() },
-                ClaudeAuth::OAuthToken(v) => ProviderAuth::OAuthToken { value: v.clone() },
                 ClaudeAuth::ConfigDir(_) => ProviderAuth::ClaudeProfile,
             };
             accounts.push(ProviderAccount {
@@ -380,6 +493,10 @@ impl IdentityStore {
                 sort_order: 0,
             }],
             project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            // A server-provided identity carries credentials, not a local
+            // configuration root; it never resolves a managed profile.
+            config_dir: std::path::PathBuf::new(),
         }
     }
 
@@ -436,37 +553,52 @@ impl IdentityStore {
             .find(|a| a.compatible_backends().contains(&backend))
     }
 
-    pub(crate) fn claude_account_is_available(&self, account_id: &str, now: i64) -> bool {
+    /// Whether a session's pinned subscription account can still run.
+    ///
+    /// An account with no snapshot reads as available: health is captured after
+    /// the fact, so its absence is ignorance, not exhaustion.
+    pub(crate) fn routed_account_is_available(
+        &self,
+        provider: RoutedProvider,
+        account_id: &str,
+        now: i64,
+    ) -> bool {
         self.accounts.iter().any(|account| {
             account.id == account_id
-                && matches!(account.auth, ProviderAuth::ClaudeProfile)
-                && account.health.as_ref().is_some_and(|health| {
-                    !health.blocked_until.is_some_and(|until| until > now)
-                        && !health.windows.is_empty()
+                && provider.routes(&account.auth)
+                && account.health.as_ref().is_none_or(|health| {
+                    !health.is_blocked(now)
                         && health
-                            .windows
-                            .iter()
-                            .all(|window| window.remaining_percent > 0.0)
+                            .live_headroom(now)
+                            .is_none_or(|headroom| headroom > 0.0)
                 })
         })
     }
 
-    /// Select an available managed Claude account by tightest-window headroom.
+    /// Select an available subscription account by tightest-window headroom.
     /// Assignments since each account's snapshot break equal-headroom bursts.
-    pub(crate) fn select_claude_account(
+    ///
+    /// An account Cairn has no usage snapshot for is a candidate at full
+    /// headroom rather than a skipped one. Snapshots only ever arrive after a
+    /// probe or a rate-limit event, so demanding one would make a login that
+    /// just completed permanently unselectable and push every session onto
+    /// whatever else happened to resolve.
+    pub(crate) fn select_routed_account(
         &self,
+        provider: RoutedProvider,
         project_id: Option<&str>,
         override_id: Option<&str>,
         excluded_id: Option<&str>,
         assignments: &[(String, i64)],
         now: i64,
     ) -> Option<&ProviderAccount> {
-        let accounts = self.accounts_for_provider(ApiProvider::Anthropic, project_id);
+        let backend = provider.backend();
+        let accounts = self.accounts_for_provider(provider.api_provider(), project_id);
         if let Some(id) = override_id {
             return accounts.into_iter().find(|account| {
                 account.id == id
                     && excluded_id != Some(account.id.as_str())
-                    && account.compatible_backends().contains(&"claude")
+                    && account.compatible_backends().contains(&backend)
             });
         }
 
@@ -474,29 +606,28 @@ impl IdentityStore {
             .into_iter()
             .filter(|account| {
                 excluded_id != Some(account.id.as_str())
-                    && matches!(account.auth, ProviderAuth::ClaudeProfile)
-                    && account.compatible_backends().contains(&"claude")
+                    && provider.routes(&account.auth)
+                    && account.compatible_backends().contains(&backend)
             })
             .filter_map(|account| {
-                let health = account.health.as_ref()?;
-                if health.blocked_until.is_some_and(|until| until > now)
-                    || health.windows.is_empty()
-                {
-                    return None;
-                }
-                let headroom = health
-                    .windows
-                    .iter()
-                    .map(|window| window.remaining_percent)
-                    .fold(f64::INFINITY, f64::min);
-                if !headroom.is_finite() || headroom <= 0.0 {
-                    return None;
-                }
+                let (headroom, since) = match account.health.as_ref() {
+                    Some(health) => {
+                        if health.is_blocked(now) {
+                            return None;
+                        }
+                        match health.live_headroom(now) {
+                            // A snapshot with no window still standing says
+                            // nothing about headroom, the same as no snapshot.
+                            None => (UNKNOWN_HEADROOM, health.captured_at),
+                            Some(tightest) if tightest <= 0.0 => return None,
+                            Some(tightest) => (tightest, health.captured_at),
+                        }
+                    }
+                    None => (UNKNOWN_HEADROOM, account.created_at),
+                };
                 let burst = assignments
                     .iter()
-                    .filter(|(id, created_at)| {
-                        id == &account.id && *created_at >= health.captured_at
-                    })
+                    .filter(|(id, created_at)| id == &account.id && *created_at >= since)
                     .count();
                 Some((account, headroom, burst))
             })
@@ -511,15 +642,22 @@ impl IdentityStore {
             .map(|(account, _, _)| account)
     }
 
-    pub(crate) fn resolve_with_anthropic_account(
+    /// Resolve the runtime identity with one provider's account pinned,
+    /// leaving the project's other overrides (git identity, the other
+    /// provider's pin) in force.
+    pub(crate) fn resolve_with_routed_account(
         &self,
+        provider: RoutedProvider,
         project_id: Option<&str>,
         account_id: &str,
     ) -> UserIdentity {
         let mut overrides = project_id
             .and_then(|id| self.project_overrides.get(id).cloned())
             .unwrap_or_default();
-        overrides.anthropic_account_id = Some(account_id.to_string());
+        match provider {
+            RoutedProvider::Claude => overrides.anthropic_account_id = Some(account_id.to_string()),
+            RoutedProvider::Codex => overrides.openai_account_id = Some(account_id.to_string()),
+        }
         self.resolve(project_id, Some(&overrides))
     }
 
@@ -582,11 +720,24 @@ impl IdentityStore {
             )
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(ClaudeAuth::ApiKey(value.clone())),
-                ProviderAuth::OAuthToken { value } => Some(ClaudeAuth::OAuthToken(value.clone())),
+                // Without a configuration root there is no honest profile path,
+                // and a guessed one points a session at an empty directory that
+                // the CLI reports as signed out. Resolving to nothing instead
+                // makes the backend refuse the session and say so.
+                ProviderAuth::ClaudeProfile if self.config_dir.as_os_str().is_empty() => {
+                    log::error!(
+                        "Claude profile {} cannot be resolved: identity store has no config dir",
+                        a.id
+                    );
+                    None
+                }
                 ProviderAuth::ClaudeProfile => Some(ClaudeAuth::ConfigDir(
-                    crate::identity::claude_profile::profile_dir(&a.id),
+                    crate::identity::claude_profile::profile_dir_in(&self.config_dir, &a.id),
                 )),
-                ProviderAuth::BaseUrl { .. } | ProviderAuth::LocalCli => None, // Not Claude auth
+                // A retired setup token is not Claude auth, and neither is a
+                // host URL. `best_account_for` already filters on
+                // `compatible_backends`, so neither reaches here.
+                ProviderAuth::OAuthToken { .. } | ProviderAuth::BaseUrl { .. } => None,
             });
 
         // Resolve Codex auth from best OpenAI account
@@ -595,9 +746,7 @@ impl IdentityStore {
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(CodexAuth::ApiKey(value.clone())),
                 ProviderAuth::OAuthToken { value } => Some(CodexAuth::OAuthToken(value.clone())),
-                ProviderAuth::BaseUrl { .. }
-                | ProviderAuth::LocalCli
-                | ProviderAuth::ClaudeProfile => None,
+                ProviderAuth::BaseUrl { .. } | ProviderAuth::ClaudeProfile => None,
             });
 
         // Resolve GitHub token
@@ -646,13 +795,6 @@ impl IdentityStore {
             codex_auth,
             github_token,
         }
-    }
-
-    /// Check if any Anthropic account has local CLI auth.
-    pub(crate) fn has_local_cli(&self, provider: ApiProvider) -> bool {
-        self.accounts
-            .iter()
-            .any(|a| a.api_provider == provider && matches!(a.auth, ProviderAuth::LocalCli))
     }
 }
 
@@ -823,6 +965,8 @@ mod tests {
                 sort_order: 0,
             }],
             project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            config_dir: std::path::PathBuf::from("/test-config-root"),
         }
     }
 
@@ -853,17 +997,16 @@ mod tests {
         store.accounts = vec![
             healthy_claude_account("busy", 20.0, 100),
             healthy_claude_account("free", 80.0, 100),
-            test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile),
         ];
         let selected = store
-            .select_claude_account(None, None, None, &[], 200)
+            .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
             .unwrap();
         assert_eq!(selected.id, "free");
 
         store.accounts[1].health.as_mut().unwrap().blocked_until = Some(300);
         assert_eq!(
             store
-                .select_claude_account(None, None, None, &[], 200)
+                .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
                 .unwrap()
                 .id,
             "busy"
@@ -880,7 +1023,7 @@ mod tests {
         let assignments = vec![("first".to_string(), 101)];
         assert_eq!(
             store
-                .select_claude_account(None, None, None, &assignments, 200)
+                .select_routed_account(RoutedProvider::Claude, None, None, None, &assignments, 200)
                 .unwrap()
                 .id,
             "second"
@@ -895,7 +1038,14 @@ mod tests {
         store.accounts = vec![explicit, healthy_claude_account("healthy", 90.0, 100)];
         assert_eq!(
             store
-                .select_claude_account(None, Some("explicit"), None, &[], 200)
+                .select_routed_account(
+                    RoutedProvider::Claude,
+                    None,
+                    Some("explicit"),
+                    None,
+                    &[],
+                    200
+                )
                 .unwrap()
                 .id,
             "explicit"
@@ -915,15 +1065,287 @@ mod tests {
     }
 
     #[test]
-    fn compatible_backends_anthropic_oauth() {
-        let account = test_account(ApiProvider::Anthropic, oauth_auth("oauth-token"));
-        assert_eq!(account.compatible_backends(), vec!["claude"]);
+    fn a_managed_profile_resolves_under_the_stores_own_root() {
+        // Sign-in writes the profile under the orchestrator's config dir. When
+        // resolution rebuilt that path from the environment instead, every
+        // Cairn running on a non-default root (each dev instance) spawned its
+        // sessions against an empty directory and the CLI answered "Not logged
+        // in", while the usage probe read the same empty directory.
+        let mut store = test_store();
+        let mut account = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        account.id = "acc_profile".to_string();
+        store.accounts.push(account);
+
+        match store.resolve(None, None).claude_auth {
+            Some(ClaudeAuth::ConfigDir(path)) => assert_eq!(
+                path,
+                std::path::Path::new("/test-config-root/claude-profiles/acc_profile")
+            ),
+            other => panic!("expected a managed profile directory, got {other:?}"),
+        }
     }
 
     #[test]
-    fn compatible_backends_anthropic_local_cli() {
-        let account = test_account(ApiProvider::Anthropic, ProviderAuth::LocalCli);
-        assert_eq!(account.compatible_backends(), vec!["claude"]);
+    fn a_store_with_no_root_resolves_no_profile_rather_than_guessing_one() {
+        let mut store = test_store();
+        store.config_dir = std::path::PathBuf::new();
+        store.accounts.push(test_account(
+            ApiProvider::Anthropic,
+            ProviderAuth::ClaudeProfile,
+        ));
+
+        // Fails closed: the backend refuses a session with no credential, which
+        // is honest, where a relative guess would point at some other profile.
+        assert!(store.resolve(None, None).claude_auth.is_none());
+    }
+
+    #[test]
+    fn a_profile_with_no_snapshot_yet_is_selectable() {
+        // The acceptance case for a fresh sign-in: a profile connected moments
+        // ago has no usage snapshot, and must still be able to run a session.
+        let mut store = test_store();
+        let mut fresh = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        fresh.id = "fresh".to_string();
+        store.accounts = vec![healthy_claude_account("measured", 40.0, 100), fresh];
+
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "fresh",
+            "an unmeasured profile competes at full headroom"
+        );
+        assert!(store.routed_account_is_available(RoutedProvider::Claude, "fresh", 200));
+    }
+
+    #[test]
+    fn a_snapshot_with_no_windows_reads_as_unknown_not_exhausted() {
+        let mut store = test_store();
+        let mut blank = healthy_claude_account("blank", 90.0, 100);
+        blank.health.as_mut().unwrap().windows.clear();
+        store.accounts = vec![blank];
+
+        assert!(store
+            .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
+            .is_some());
+        assert!(store.routed_account_is_available(RoutedProvider::Claude, "blank", 200));
+    }
+
+    #[test]
+    fn a_blocked_profile_is_unavailable_however_stale_its_snapshot() {
+        let mut store = test_store();
+        let mut blocked = healthy_claude_account("blocked", 90.0, 100);
+        blocked.health.as_mut().unwrap().blocked_until = Some(300);
+        store.accounts = vec![blocked];
+
+        assert!(store
+            .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
+            .is_none());
+        assert!(!store.routed_account_is_available(RoutedProvider::Claude, "blocked", 200));
+    }
+
+    /// A subscription account measured empty is out of rotation only while
+    /// that window stands. Once its reset time passes the number is history,
+    /// not exhaustion — otherwise nothing would ever route to the account
+    /// again, because every source of a fresh snapshot (sign-in, a manual
+    /// refresh, a live session event) needs the account to be in use.
+    #[test]
+    fn an_exhausted_window_stops_excluding_once_it_has_reset() {
+        let mut store = test_store();
+        let mut spent = healthy_claude_account("spent", 0.0, 100);
+        spent.health.as_mut().unwrap().windows[0].resets_at = Some(500);
+        store.accounts = vec![spent];
+
+        assert!(
+            store
+                .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
+                .is_none(),
+            "an empty window still standing excludes the account"
+        );
+        assert!(!store.routed_account_is_available(RoutedProvider::Claude, "spent", 200));
+
+        assert!(
+            store
+                .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 600)
+                .is_some(),
+            "after the window resets the account competes at unknown headroom again"
+        );
+        assert!(store.routed_account_is_available(RoutedProvider::Claude, "spent", 600));
+    }
+
+    // === Codex subscription routing ===
+
+    fn codex_account(id: &str, remaining: Option<f64>, captured_at: i64) -> ProviderAccount {
+        let mut account = test_account(ApiProvider::OpenAI, oauth_auth(&format!("{id}-auth-json")));
+        account.id = id.to_string();
+        account.health = remaining.map(|remaining| ProviderAccountHealth {
+            windows: vec![crate::models::ProviderUsageWindow {
+                id: "primary".to_string(),
+                label: "5-hour window".to_string(),
+                scope: crate::models::ProviderUsageScope::Session,
+                scope_target: None,
+                used_percent: 100.0 - remaining,
+                remaining_percent: remaining,
+                resets_at: None,
+                reset_at_text: None,
+                window_duration_mins: Some(300),
+            }],
+            blocked_until: None,
+            captured_at,
+        });
+        account
+    }
+
+    #[test]
+    fn codex_selection_prefers_headroom_and_skips_blocked() {
+        let mut store = test_store();
+        store.accounts = vec![
+            codex_account("busy", Some(15.0), 100),
+            codex_account("free", Some(70.0), 100),
+        ];
+
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Codex, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "free"
+        );
+
+        store.accounts[1].health.as_mut().unwrap().blocked_until = Some(300);
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Codex, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "busy",
+            "a rate-limited account is passed over while its block stands"
+        );
+        assert!(!store.routed_account_is_available(RoutedProvider::Codex, "free", 200));
+        assert!(
+            store.routed_account_is_available(RoutedProvider::Codex, "free", 400),
+            "the block lifts on its own once it expires"
+        );
+    }
+
+    #[test]
+    fn a_fresh_codex_account_is_selectable_before_any_usage_snapshot() {
+        // The acceptance case for a sign-in: the account connected moments ago
+        // has no snapshot, and must still be able to run a session.
+        let mut store = test_store();
+        store.accounts = vec![
+            codex_account("measured", Some(40.0), 100),
+            codex_account("fresh", None, 100),
+        ];
+
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Codex, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "fresh",
+            "an unmeasured account competes at full headroom"
+        );
+        assert!(store.routed_account_is_available(RoutedProvider::Codex, "fresh", 200));
+    }
+
+    #[test]
+    fn an_exhausted_codex_account_is_passed_over() {
+        let mut store = test_store();
+        store.accounts = vec![
+            codex_account("spent", Some(0.0), 100),
+            codex_account("left", Some(5.0), 100),
+        ];
+
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Codex, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "left"
+        );
+        assert!(!store.routed_account_is_available(RoutedProvider::Codex, "spent", 200));
+    }
+
+    /// An OpenAI API key bills per token, so it has no window to route around
+    /// and is never a routing candidate — it stays the deliberate fallback a
+    /// session reaches for when no subscription is available.
+    #[test]
+    fn an_openai_api_key_is_not_routed_by_usage() {
+        let mut store = test_store();
+        let mut key = test_account(ApiProvider::OpenAI, api_key_auth("sk-test"));
+        key.id = "key".to_string();
+        store.accounts = vec![key];
+
+        assert!(store
+            .select_routed_account(RoutedProvider::Codex, None, None, None, &[], 200)
+            .is_none());
+        assert!(!store.routed_account_is_available(RoutedProvider::Codex, "key", 200));
+    }
+
+    /// Selection stays inside its own provider: a Codex session must never
+    /// resolve onto an Anthropic profile, nor the reverse.
+    #[test]
+    fn routing_never_crosses_providers() {
+        let mut store = test_store();
+        let mut profile = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        profile.id = "claude".to_string();
+        store.accounts = vec![profile, codex_account("codex", Some(50.0), 100)];
+
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Codex, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "codex"
+        );
+        assert_eq!(
+            store
+                .select_routed_account(RoutedProvider::Claude, None, None, None, &[], 200)
+                .unwrap()
+                .id,
+            "claude"
+        );
+    }
+
+    /// Resolving onto a chosen Codex account pins that account's credential and
+    /// leaves the other provider's resolution alone.
+    #[test]
+    fn resolving_a_codex_account_pins_only_that_provider() {
+        let mut store = test_store();
+        let mut profile = test_account(ApiProvider::Anthropic, ProviderAuth::ClaudeProfile);
+        profile.id = "claude".to_string();
+        let mut first = codex_account("first", Some(50.0), 100);
+        first.sort_order = 0;
+        let mut second = codex_account("second", Some(90.0), 100);
+        second.sort_order = 1;
+        store.accounts = vec![profile, first, second];
+
+        let identity = store.resolve_with_routed_account(RoutedProvider::Codex, None, "second");
+
+        assert!(
+            matches!(identity.codex_auth, Some(CodexAuth::OAuthToken(ref json)) if json == "second-auth-json"),
+            "got {:?}",
+            identity.codex_auth
+        );
+        assert!(
+            matches!(identity.claude_auth, Some(ClaudeAuth::ConfigDir(_))),
+            "the Anthropic side still resolves normally"
+        );
+    }
+
+    #[test]
+    fn anthropic_setup_tokens_are_not_usable_credentials() {
+        // `claude setup-token` output authenticates a session Cairn cannot
+        // route by usage or sign out of, so it buys nothing the profile model
+        // does not already own.
+        let account = test_account(ApiProvider::Anthropic, oauth_auth("oauth-token"));
+        assert!(account.compatible_backends().is_empty());
+
+        let mut store = test_store();
+        store.accounts.push(account);
+        assert!(store.resolve(None, None).claude_auth.is_none());
     }
 
     #[test]
@@ -995,17 +1417,6 @@ mod tests {
             Some(ClaudeAuth::ApiKey(key)) => assert_eq!(key, "secondary-key"),
             other => panic!("Expected secondary key, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn resolve_local_cli_yields_no_auth() {
-        let mut store = test_store();
-        store
-            .accounts
-            .push(test_account(ApiProvider::Anthropic, ProviderAuth::LocalCli));
-        let identity = store.resolve(None, None);
-        // LocalCli doesn't produce a stored auth value
-        assert!(identity.claude_auth.is_none());
     }
 
     #[test]
@@ -1133,12 +1544,6 @@ mod tests {
     fn compatible_backends_openai_oauth() {
         let account = test_account(ApiProvider::OpenAI, oauth_auth("chatgpt-oauth"));
         assert_eq!(account.compatible_backends(), vec!["codex"]);
-    }
-
-    #[test]
-    fn compatible_backends_openai_local_cli() {
-        let account = test_account(ApiProvider::OpenAI, ProviderAuth::LocalCli);
-        assert!(account.compatible_backends().is_empty());
     }
 
     #[test]
@@ -1302,26 +1707,12 @@ mod tests {
             accounts: vec![],
             git_identities: vec![],
             project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            config_dir: std::path::PathBuf::new(),
         };
         let identity = store.resolve(None, None);
         assert_eq!(identity.name, "");
         assert_eq!(identity.email, "");
-    }
-
-    #[test]
-    fn has_local_cli_true_when_present() {
-        let mut store = test_store();
-        store
-            .accounts
-            .push(test_account(ApiProvider::Anthropic, ProviderAuth::LocalCli));
-        assert!(store.has_local_cli(ApiProvider::Anthropic));
-        assert!(!store.has_local_cli(ApiProvider::OpenAI));
-    }
-
-    #[test]
-    fn has_local_cli_false_when_absent() {
-        let store = test_store();
-        assert!(!store.has_local_cli(ApiProvider::Anthropic));
     }
 
     #[test]
@@ -1346,6 +1737,8 @@ mod tests {
                 },
             ],
             project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            config_dir: std::path::PathBuf::new(),
         };
         let default = store.default_git_identity().unwrap();
         assert_eq!(default.id, "gi_low");
@@ -1359,15 +1752,13 @@ mod tests {
         let oauth = oauth_auth("oauth-val");
         assert_eq!(oauth.credential_value(), Some("oauth-val"));
 
-        let local = ProviderAuth::LocalCli;
-        assert_eq!(local.credential_value(), None);
+        assert_eq!(ProviderAuth::ClaudeProfile.credential_value(), None);
     }
 
     #[test]
     fn provider_auth_type_labels() {
         assert_eq!(api_key_auth("x").auth_type_label(), "api_key");
         assert_eq!(oauth_auth("x").auth_type_label(), "oauth_token");
-        assert_eq!(ProviderAuth::LocalCli.auth_type_label(), "local_cli");
         assert_eq!(
             ProviderAuth::ClaudeProfile.auth_type_label(),
             "claude_profile"
@@ -1399,6 +1790,7 @@ mod tests {
                 ApiProvider::OpenAI,
                 ApiProvider::Google,
                 ApiProvider::OpenRouter,
+                ApiProvider::OpenCode,
                 ApiProvider::Ollama,
                 ApiProvider::GitHub,
             ]
@@ -1413,6 +1805,10 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ApiProvider>(r#""anthropic""#).unwrap(),
             ApiProvider::Anthropic
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiProvider>(r#""opencode""#).unwrap(),
+            ApiProvider::OpenCode
         );
         assert_eq!(
             serde_json::from_str::<ApiProvider>(r#""openai""#).unwrap(),
@@ -1475,11 +1871,6 @@ mod tests {
         let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.credential_value(), Some("tok"));
 
-        let local = ProviderAuth::LocalCli;
-        let json = serde_json::to_string(&local).unwrap();
-        let parsed: ProviderAuth = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.credential_value(), None);
-
         let base_url = ProviderAuth::BaseUrl {
             url: "http://localhost:11434".to_string(),
         };
@@ -1505,11 +1896,7 @@ mod tests {
 
     #[test]
     fn account_source_serde_roundtrip() {
-        for source in [
-            AccountSource::Configured,
-            AccountSource::LocalCli,
-            AccountSource::Server,
-        ] {
+        for source in [AccountSource::Configured, AccountSource::Server] {
             let json = serde_json::to_string(&source).unwrap();
             let parsed: AccountSource = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, source);
@@ -1538,21 +1925,6 @@ mod tests {
         match &anthropic[0].auth {
             ProviderAuth::ApiKey { value } => assert_eq!(value, "sk-ant-test"),
             other => panic!("expected ApiKey, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn from_user_identity_claude_oauth_creates_anthropic_account() {
-        let identity = UserIdentity {
-            claude_auth: Some(ClaudeAuth::OAuthToken("oauth-tok".to_string())),
-            ..test_user_identity()
-        };
-        let store = IdentityStore::from_user_identity(&identity);
-        let anthropic = store.accounts_for_provider(ApiProvider::Anthropic, None);
-        assert_eq!(anthropic.len(), 1);
-        match &anthropic[0].auth {
-            ProviderAuth::OAuthToken { value } => assert_eq!(value, "oauth-tok"),
-            other => panic!("expected OAuthToken, got {:?}", other),
         }
     }
 

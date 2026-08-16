@@ -3,7 +3,7 @@
 use crate::identity::local;
 use crate::identity::{
     AccountInfo, AccountOverrides, AccountSource, ApiProvider, GitIdentity, IdentityStore,
-    ProviderAccount, ProviderAuth, UserIdentity,
+    ProviderAccount, ProviderAuth, RoutedProvider, UserIdentity,
 };
 
 use super::Orchestrator;
@@ -40,12 +40,23 @@ impl Orchestrator {
     }
 
     /// Save the full identity store to disk and update in-memory state.
-    pub(crate) fn save_identity_store(&self, store: IdentityStore) -> Result<(), String> {
+    ///
+    /// Persistence only, and deliberately so. Model discovery is a consequence
+    /// of *credentials* changing, not of the store being written, so the few
+    /// paths that change credentials ask for a catalog refresh themselves.
+    /// Everything else that writes this file — a git identity rename, a
+    /// reorder, a rate-limit block recorded from the Claude stream reader —
+    /// leaves the catalog alone. Discovery must also never run inline here:
+    /// this is reached from async invoke tasks, and the discovery clients own
+    /// tokio runtimes that panic when dropped inside one.
+    pub(crate) fn save_identity_store(&self, mut store: IdentityStore) -> Result<(), String> {
         local::save_identity_store(&self.config_dir, &store)?;
+        // Stamp where it now lives, so the in-memory copy resolves profile
+        // paths against the same root it was just written to.
+        store.config_dir = self.config_dir.clone();
         if let Ok(mut guard) = self.identity_store.lock() {
             *guard = Some(store);
         }
-        self.refresh_model_catalog();
         Ok(())
     }
 
@@ -62,9 +73,11 @@ impl Orchestrator {
         })
     }
 
-    /// Select a managed Claude account and resolve the runtime identity to it.
-    pub(crate) fn select_claude_identity(
+    /// Select a subscription account for a provider by remaining usage and
+    /// resolve the runtime identity to it.
+    pub(crate) fn select_routed_identity(
         &self,
+        provider: RoutedProvider,
         project_id: Option<&str>,
         override_id: Option<&str>,
         excluded_account_id: Option<&str>,
@@ -75,7 +88,8 @@ impl Orchestrator {
         })
         .unwrap_or_default();
         let store = self.get_identity_store()?;
-        let account = store.select_claude_account(
+        let account = store.select_routed_account(
+            provider,
             project_id,
             override_id,
             excluded_account_id,
@@ -83,19 +97,20 @@ impl Orchestrator {
             chrono::Utc::now().timestamp(),
         )?;
         let account_id = account.id.clone();
-        let identity = store.resolve_with_anthropic_account(project_id, &account_id);
+        let identity = store.resolve_with_routed_account(provider, project_id, &account_id);
         Some((account_id, identity))
     }
 
-    pub(crate) fn resolve_available_claude_account(
+    pub(crate) fn resolve_available_routed_account(
         &self,
+        provider: RoutedProvider,
         project_id: Option<&str>,
         account_id: &str,
     ) -> Option<UserIdentity> {
         let store = self.get_identity_store()?;
         store
-            .claude_account_is_available(account_id, chrono::Utc::now().timestamp())
-            .then(|| store.resolve_with_anthropic_account(project_id, account_id))
+            .routed_account_is_available(provider, account_id, chrono::Utc::now().timestamp())
+            .then(|| store.resolve_with_routed_account(provider, project_id, account_id))
     }
 
     /// Resolve only the git author/committer identity for a project.
@@ -121,19 +136,15 @@ impl Orchestrator {
 
     /// List accounts visible in a scope. Global scope returns shared accounts only;
     /// project scope returns shared accounts plus accounts private to that project.
+    ///
+    /// Every account here is one Cairn holds a credential for. An installed CLI
+    /// that happens to be signed in is not an account: it cannot be routed by
+    /// usage, ordered against the others, or signed out of from here.
     pub fn list_accounts(&self, project_id: Option<&str>) -> Vec<AccountInfo> {
-        let mut store = match self.get_identity_store() {
+        let store = match self.get_identity_store() {
             Some(s) => s,
             None => return vec![],
         };
-
-        // Merge ephemeral local CLI accounts as shared accounts.
-        let local_accounts = local::detect_local_accounts();
-        for local_acc in &local_accounts {
-            if !store.has_local_cli(local_acc.api_provider) {
-                store.accounts.push(local_acc.clone());
-            }
-        }
 
         store
             .accounts
@@ -155,7 +166,7 @@ impl Orchestrator {
     ) -> Result<AccountInfo, String> {
         let mut store = self
             .get_identity_store()
-            .unwrap_or_else(local::identity_store_from_git_config);
+            .unwrap_or_else(|| local::identity_store_from_git_config(&self.config_dir));
 
         let now = chrono::Utc::now().timestamp();
         let max_sort = store
@@ -186,60 +197,51 @@ impl Orchestrator {
         self.save_identity_store(store)?;
 
         self.emit_config_changed();
+        self.spawn_model_catalog_refresh();
         Ok(info)
     }
 
-    /// Replace or create the single Cairn-owned OpenAI OAuth account for Codex.
+    /// Store a completed ChatGPT OAuth login as a Cairn-owned Codex account.
     ///
-    /// Codex refresh tokens are single-use, so reconnecting must not leave stale
-    /// OAuth profiles ahead of the newly issued token. The OAuth account is
-    /// promoted to OpenAI priority 0 and legacy OpenAI Local CLI entries are
-    /// removed from the persisted store.
+    /// Codex refresh tokens are single-use, so Cairn must hold exactly one
+    /// credential per ChatGPT account and replace it in place when that account
+    /// signs in again — a second profile for the same subscription would hold a
+    /// refresh token the provider has already retired, and whichever session
+    /// reached it first would knock the other out. That invariant is per
+    /// account, not global: logins carrying different ChatGPT account ids are
+    /// separate faucets, so they all persist and sessions route across them by
+    /// remaining usage.
+    ///
+    /// The match is on the ChatGPT account id the credential carries rather than
+    /// on its bytes, which every token refresh rewrites.
     pub fn upsert_codex_oauth_account(
         &self,
         label: String,
         auth_json: String,
         project_id: Option<String>,
     ) -> Result<AccountInfo, String> {
+        let identity = crate::backends::codex::codex_account_identity(&auth_json)?;
         let mut store = self
             .get_identity_store()
-            .unwrap_or_else(local::identity_store_from_git_config);
+            .unwrap_or_else(|| local::identity_store_from_git_config(&self.config_dir));
 
         let now = chrono::Utc::now().timestamp();
         let target_id = store
             .accounts
             .iter()
-            .filter(|account| {
+            .find(|account| {
                 account.api_provider == ApiProvider::OpenAI
                     && account.source == AccountSource::Configured
                     && account.project_id == project_id
-                    && matches!(&account.auth, ProviderAuth::OAuthToken { .. })
+                    && matches!(&account.auth, ProviderAuth::OAuthToken { value }
+                    if crate::backends::codex::codex_account_identity(value)
+                        .is_ok_and(|existing| {
+                            existing.chatgpt_account_id == identity.chatgpt_account_id
+                        }))
             })
-            .min_by_key(|account| account.sort_order)
             .map(|account| account.id.clone());
 
-        store.accounts.retain(|account| {
-            if account.api_provider != ApiProvider::OpenAI {
-                return true;
-            }
-            if account.project_id != project_id {
-                return true;
-            }
-            if account.source == AccountSource::LocalCli {
-                return false;
-            }
-            if matches!(&account.auth, ProviderAuth::OAuthToken { .. }) {
-                return target_id.as_deref() == Some(account.id.as_str());
-            }
-            true
-        });
-
-        for account in store.accounts.iter_mut().filter(|account| {
-            account.api_provider == ApiProvider::OpenAI && account.project_id == project_id
-        }) {
-            account.sort_order += 1;
-        }
-
+        let label = identity.email.clone().unwrap_or(label);
         let info = if let Some(target_id) = target_id {
             let account = store
                 .accounts
@@ -248,11 +250,20 @@ impl Orchestrator {
                 .ok_or_else(|| "Codex OAuth account disappeared during upsert".to_string())?;
             account.label = label;
             account.auth = ProviderAuth::OAuthToken { value: auth_json };
-            account.project_id = project_id.clone();
-            account.sort_order = 0;
+            account.email = identity.email;
+            account.plan = identity.plan;
             account.last_used_at = Some(now);
             AccountInfo::from(&*account)
         } else {
+            let max_sort = store
+                .accounts
+                .iter()
+                .filter(|account| {
+                    account.api_provider == ApiProvider::OpenAI && account.project_id == project_id
+                })
+                .map(|account| account.sort_order)
+                .max()
+                .unwrap_or(-1);
             let account = ProviderAccount {
                 id: format!("acc_{}", uuid::Uuid::new_v4()),
                 label,
@@ -260,11 +271,11 @@ impl Orchestrator {
                 source: AccountSource::Configured,
                 auth: ProviderAuth::OAuthToken { value: auth_json },
                 project_id,
-                sort_order: 0,
+                sort_order: max_sort + 1,
                 created_at: now,
                 last_used_at: Some(now),
-                email: None,
-                plan: None,
+                email: identity.email,
+                plan: identity.plan,
                 health: None,
             };
             let info = AccountInfo::from(&account);
@@ -274,6 +285,7 @@ impl Orchestrator {
 
         self.save_identity_store(store)?;
         self.emit_config_changed();
+        self.spawn_model_catalog_refresh();
         Ok(info)
     }
 
@@ -301,8 +313,13 @@ impl Orchestrator {
         Ok(info)
     }
 
-    /// Mark a provider account unavailable from an authoritative blocking event.
-    pub(crate) fn mark_account_blocked(
+    /// Record what Cairn last knew about an account's remaining subscription
+    /// usage. This is the only writer of account health, from both of its
+    /// sources: a usage probe (no block) and a blocking rate-limit event.
+    ///
+    /// Returns the account's display label, for the message a caller reporting
+    /// a block writes into the session.
+    pub(crate) fn record_account_health(
         &self,
         id: &str,
         windows: Vec<crate::models::ProviderUsageWindow>,
@@ -326,6 +343,52 @@ impl Orchestrator {
         self.save_identity_store(store)?;
         self.emit_config_changed();
         Ok(label)
+    }
+
+    /// Probe a subscription account's remaining usage and record it.
+    ///
+    /// Detached, because the probe drives a provider CLI and the caller — a
+    /// sign-in that just completed — must not wait on it. Nothing depends on it
+    /// finishing: an account with no snapshot is routable at full headroom, and
+    /// this replaces that assumption with a measurement.
+    pub fn capture_account_usage(&self, provider: RoutedProvider, account_id: String) {
+        let orch = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("provider-usage-capture".to_string())
+            .spawn(move || {
+                let snapshot = match provider {
+                    RoutedProvider::Claude => {
+                        crate::backends::collect_claude_usage_snapshot(&orch, Some(&account_id))
+                    }
+                    RoutedProvider::Codex => crate::backends::codex::collect_codex_usage_snapshot(
+                        &orch,
+                        Some(&account_id),
+                    ),
+                };
+                if snapshot.windows.is_empty() {
+                    log::debug!(
+                        "No {} usage windows reported for account {account_id}",
+                        provider.backend()
+                    );
+                    return;
+                }
+                // The panel reads per (backend, account), so the measurement
+                // that arms routing also fills that account's usage card.
+                orch.store_provider_account_usage_snapshot(
+                    Some(account_id.clone()),
+                    snapshot.clone(),
+                );
+                if let Err(error) = orch.record_account_health(&account_id, snapshot.windows, None)
+                {
+                    log::warn!(
+                        "Failed to record {} usage for {account_id}: {error}",
+                        provider.backend()
+                    );
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("Failed to start provider usage capture: {error}");
+        }
     }
 
     /// Update an existing account's label.
@@ -389,30 +452,17 @@ impl Orchestrator {
 
         self.save_identity_store(store)?;
         self.emit_config_changed();
+        self.spawn_model_catalog_refresh();
         Ok(())
     }
 
     /// Reorder accounts within a provider.
-    ///
-    /// If reorder includes a Local CLI account that isn't persisted yet,
-    /// it gets promoted into the store so its sort_order is remembered.
     pub fn reorder_accounts(
         &self,
         api_provider: ApiProvider,
         ordered_ids: &[String],
     ) -> Result<(), String> {
         let mut store = self.get_identity_store().ok_or("No identity store")?;
-
-        // Promote any ephemeral Local CLI accounts into the store if referenced
-        let local_accounts = local::detect_local_accounts();
-        for id in ordered_ids {
-            let in_store = store.accounts.iter().any(|a| a.id == *id);
-            if !in_store {
-                if let Some(local_acc) = local_accounts.iter().find(|a| a.id == *id) {
-                    store.accounts.push(local_acc.clone());
-                }
-            }
-        }
 
         for (idx, id) in ordered_ids.iter().enumerate() {
             if let Some(account) = store
@@ -424,6 +474,27 @@ impl Orchestrator {
             }
         }
 
+        self.save_identity_store(store)?;
+        self.emit_config_changed();
+        Ok(())
+    }
+
+    // === Retired logins ===
+
+    /// Anthropic logins the profiles-only migration dropped, still unread.
+    pub fn list_retired_logins(&self) -> Vec<crate::identity::RetiredLogin> {
+        self.get_identity_store()
+            .map(|store| store.retired_logins)
+            .unwrap_or_default()
+    }
+
+    /// Acknowledge the retired logins, so settings stops reporting them.
+    pub fn dismiss_retired_logins(&self) -> Result<(), String> {
+        let mut store = self.get_identity_store().ok_or("No identity store")?;
+        if store.retired_logins.is_empty() {
+            return Ok(());
+        }
+        store.retired_logins.clear();
         self.save_identity_store(store)?;
         self.emit_config_changed();
         Ok(())
@@ -447,7 +518,7 @@ impl Orchestrator {
     ) -> Result<GitIdentity, String> {
         let mut store = self
             .get_identity_store()
-            .unwrap_or_else(local::identity_store_from_git_config);
+            .unwrap_or_else(|| local::identity_store_from_git_config(&self.config_dir));
 
         let max_sort = store
             .git_identities
@@ -550,7 +621,7 @@ impl Orchestrator {
     ) -> Result<(), String> {
         let mut store = self
             .get_identity_store()
-            .unwrap_or_else(local::identity_store_from_git_config);
+            .unwrap_or_else(|| local::identity_store_from_git_config(&self.config_dir));
 
         match overrides {
             Some(o) => {
@@ -573,5 +644,212 @@ impl Orchestrator {
             "config-changed",
             serde_json::json!({"entity_type": "identity"}),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    async fn test_orchestrator() -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let db = LocalDb::open(root.join("orch.db")).await.unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// Persisting the identity store must not discover models inline.
+    ///
+    /// This is served from an async invoke task, and provider discovery builds
+    /// `reqwest::blocking` clients that each own a tokio runtime — dropping one
+    /// inside a runtime panics the task, which is how saving an OpenCode Go key
+    /// failed with a 500. The multi-thread flavor reproduces that context, and
+    /// an untouched catalog is the evidence no discovery ran: a refresh records
+    /// an entry per known backend even when every one of them fails.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_the_identity_store_does_not_discover_models() {
+        let orch = test_orchestrator().await;
+
+        orch.save_identity_store(local::identity_store_from_git_config(&orch.config_dir))
+            .expect("saving the identity store should succeed");
+
+        assert!(
+            orch.get_model_catalog().is_empty(),
+            "saving the identity store ran provider discovery inline; it must be spawned off the async task"
+        );
+    }
+
+    /// A store persisted through the orchestrator resolves its managed profiles
+    /// under the same root it was written to, rather than an inferred one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saving_stamps_the_config_root_onto_the_in_memory_store() {
+        let orch = test_orchestrator().await;
+
+        orch.save_identity_store(local::identity_store_from_git_config(&orch.config_dir))
+            .expect("saving the identity store should succeed");
+
+        let stored = orch.get_identity_store().expect("store is held in memory");
+        assert_eq!(stored.config_dir, orch.config_dir);
+    }
+
+    /// A Codex `auth.json` shaped like the one the app-server writes: the
+    /// ChatGPT account id rides in the access token's claims, the label and
+    /// plan in the id token's.
+    fn codex_auth_json(chatgpt_account_id: &str, email: &str, refresh_token: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let jwt = |payload: serde_json::Value| {
+            format!(
+                "header.{}.signature",
+                URL_SAFE_NO_PAD.encode(payload.to_string())
+            )
+        };
+        let id_token = jwt(serde_json::json!({
+            "email": email,
+            "https://api.openai.com/auth": { "chatgpt_plan_type": "pro" },
+        }));
+        let access_token = jwt(serde_json::json!({
+            "https://api.openai.com/auth": { "chatgpt_account_id": chatgpt_account_id },
+        }));
+        serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+            },
+        })
+        .to_string()
+    }
+
+    /// The OpenAI subscription credentials the store currently holds. A store
+    /// that was never written holds none, which is what a refused login leaves.
+    fn openai_oauth_accounts(orch: &Orchestrator) -> Vec<ProviderAccount> {
+        orch.get_identity_store()
+            .map(|store| store.accounts)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|account| {
+                account.api_provider == ApiProvider::OpenAI
+                    && matches!(account.auth, ProviderAuth::OAuthToken { .. })
+            })
+            .collect()
+    }
+
+    /// Subscriptions are inventory: signing in to a second ChatGPT account adds
+    /// a faucet rather than replacing the first one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_chatgpt_login_does_not_evict_the_first() {
+        let orch = test_orchestrator().await;
+
+        let first = orch
+            .upsert_codex_oauth_account(
+                "Codex OAuth".to_string(),
+                codex_auth_json("acct-one", "one@example.com", "refresh-one"),
+                None,
+            )
+            .expect("first account stored");
+        let second = orch
+            .upsert_codex_oauth_account(
+                "Codex OAuth".to_string(),
+                codex_auth_json("acct-two", "two@example.com", "refresh-two"),
+                None,
+            )
+            .expect("second account stored");
+
+        assert_ne!(first.id, second.id);
+        let accounts = openai_oauth_accounts(&orch);
+        assert_eq!(accounts.len(), 2, "both subscriptions persist");
+        assert_eq!(
+            accounts
+                .iter()
+                .filter_map(|account| account.email.clone())
+                .collect::<Vec<_>>(),
+            vec!["one@example.com".to_string(), "two@example.com".to_string()],
+            "each account keeps its own identity"
+        );
+        assert_ne!(
+            accounts[0].sort_order, accounts[1].sort_order,
+            "the newcomer takes its own priority slot"
+        );
+    }
+
+    /// Reconnecting a subscription replaces that account's credential in place.
+    /// A ChatGPT refresh token is single-use, so a duplicate profile would hold
+    /// one the provider has already retired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnecting_a_chatgpt_account_replaces_its_credential_in_place() {
+        let orch = test_orchestrator().await;
+
+        orch.upsert_codex_oauth_account(
+            "Codex OAuth".to_string(),
+            codex_auth_json("acct-other", "other@example.com", "refresh-other"),
+            None,
+        )
+        .expect("unrelated account stored");
+        let first = orch
+            .upsert_codex_oauth_account(
+                "Codex OAuth".to_string(),
+                codex_auth_json("acct-one", "one@example.com", "refresh-one"),
+                None,
+            )
+            .expect("account stored");
+
+        let reconnected_json = codex_auth_json("acct-one", "renamed@example.com", "refresh-two");
+        let reconnected = orch
+            .upsert_codex_oauth_account("Codex OAuth".to_string(), reconnected_json.clone(), None)
+            .expect("account reconnected");
+
+        assert_eq!(
+            reconnected.id, first.id,
+            "the same ChatGPT account keeps its Cairn account"
+        );
+        let accounts = openai_oauth_accounts(&orch);
+        assert_eq!(accounts.len(), 2, "reconnecting adds nothing");
+        let stored = accounts
+            .iter()
+            .find(|account| account.id == first.id)
+            .expect("the reconnected account is still stored");
+        match &stored.auth {
+            ProviderAuth::OAuthToken { value } => assert_eq!(
+                value, &reconnected_json,
+                "the newly issued credential replaced the retired one"
+            ),
+            other => panic!("expected an OAuth credential, got {other:?}"),
+        }
+        assert_eq!(stored.email.as_deref(), Some("renamed@example.com"));
+        assert_eq!(stored.plan.as_deref(), Some("pro"));
+        assert!(
+            accounts
+                .iter()
+                .any(|account| account.email.as_deref() == Some("other@example.com")),
+            "the other subscription is untouched"
+        );
+    }
+
+    /// An `auth.json` with no ChatGPT account id cannot be keyed, and storing it
+    /// anyway would make the next reconnect duplicate rather than replace.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credential_without_a_chatgpt_account_id_is_refused() {
+        let orch = test_orchestrator().await;
+
+        let stored = orch.upsert_codex_oauth_account(
+            "Codex OAuth".to_string(),
+            serde_json::json!({ "auth_mode": "chatgpt", "tokens": {} }).to_string(),
+            None,
+        );
+
+        assert!(stored.is_err());
+        assert!(openai_oauth_accounts(&orch).is_empty());
     }
 }

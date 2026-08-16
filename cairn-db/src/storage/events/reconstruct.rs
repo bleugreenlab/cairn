@@ -48,7 +48,26 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use cairn_common::read::ReadSegment;
+use cairn_common::token_meter::{Cut, TokenMeter};
 use serde_json::Value;
+
+struct LegacyCharMeter;
+impl TokenMeter for LegacyCharMeter {
+    fn count(&self, text: &str) -> u32 {
+        text.len().try_into().unwrap_or(u32::MAX)
+    }
+    fn cut(&self, text: &str, budget: u32) -> Cut {
+        let mut byte_offset = (budget as usize).min(text.len());
+        while !text.is_char_boundary(byte_offset) {
+            byte_offset -= 1;
+        }
+        Cut {
+            byte_offset,
+            tokens: byte_offset as u32,
+        }
+    }
+}
+static LEGACY_CHAR_METER: LegacyCharMeter = LegacyCharMeter;
 use sha2::{Digest, Sha256};
 
 use super::encoding::{
@@ -964,7 +983,7 @@ pub fn reconstruct_read(commit_hex: &str, paths: &[String], store: Option<&Objec
         .iter()
         .map(|target| build_archived_segment(commit_hex, target, store, renderer))
         .collect();
-    crate::storage::render::assemble(segments).text
+    crate::storage::render::assemble_legacy_chars(segments, &LEGACY_CHAR_METER).text
 }
 
 /// Render one archived file target's standalone section text — the exact bytes it
@@ -979,7 +998,7 @@ pub fn render_archived_file_section(
 ) -> String {
     let renderer = crate::storage::render::archived_file_renderer();
     let seg = build_archived_segment(commit_hex, target, store, renderer);
-    crate::storage::render::render_section_text(seg)
+    crate::storage::render::render_section_text(seg, &LEGACY_CHAR_METER)
 }
 
 /// The NUL-delimited placeholder a hybrid-read skeleton carries in place of an

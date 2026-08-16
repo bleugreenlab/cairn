@@ -59,6 +59,9 @@ impl ChangeMode {
 pub enum ResourceKind {
     Project,
     ProjectIssues,
+    Posts,
+    Post,
+    ProjectPosts,
     ProjectCheckResults,
     ProjectCheckObservation,
     ProjectImages,
@@ -101,6 +104,7 @@ pub enum ResourceKind {
     TaskArtifact,
     TaskMessages,
     JobTodos,
+    HomeFeed,
     NodeTasks,
     NodeCalls,
     NodeWakes,
@@ -117,6 +121,7 @@ pub enum ResourceKind {
     DevDb,
     DevPid,
     Logs,
+    ChannelsConversations,
     Executors,
     Executor,
     ExecutorAction,
@@ -182,6 +187,9 @@ impl ResourceKind {
     pub(crate) const ALL: &'static [ResourceKind] = &[
         ResourceKind::Project,
         ResourceKind::ProjectIssues,
+        ResourceKind::Posts,
+        ResourceKind::Post,
+        ResourceKind::ProjectPosts,
         ResourceKind::ProjectCheckResults,
         ResourceKind::ProjectCheckObservation,
         ResourceKind::ProjectImages,
@@ -224,6 +232,7 @@ impl ResourceKind {
         ResourceKind::TaskArtifact,
         ResourceKind::TaskMessages,
         ResourceKind::JobTodos,
+        ResourceKind::HomeFeed,
         ResourceKind::NodeTasks,
         ResourceKind::NodeCalls,
         ResourceKind::NodeWakes,
@@ -240,6 +249,7 @@ impl ResourceKind {
         ResourceKind::DevDb,
         ResourceKind::DevPid,
         ResourceKind::Logs,
+        ResourceKind::ChannelsConversations,
         ResourceKind::Executors,
         ResourceKind::Executor,
         ResourceKind::ExecutorAction,
@@ -321,6 +331,26 @@ impl ResourceKind {
     }
 
     /// Resolve a [`Self::slug`] back to its kind. `None` for an unknown slug.
+    /// True for the kinds whose accepted payload keys come from the addressed
+    /// artifact's JSON Schema at write time rather than from this table, so the
+    /// contract gate cannot enumerate them.
+    ///
+    /// These are not unchecked: the artifact handler closes them against the
+    /// resolved schema in `reject_undeclared_artifact_keys`. This is the same
+    /// seam the read side carves when it routes artifact kinds to
+    /// `artifact_affordance_block` instead of the contract-static block.
+    ///
+    /// Openness cannot be inferred from an empty key list: artifact `create`
+    /// enumerates nothing and is open, artifact `patch` enumerates eight keys
+    /// and is *still* open, and `delete` mutations across the table enumerate
+    /// nothing while being genuinely closed. It has to be declared by kind.
+    pub fn payload_keys_are_schema_resolved(self) -> bool {
+        matches!(
+            self,
+            ResourceKind::NodeArtifact | ResourceKind::TaskArtifact
+        )
+    }
+
     pub fn from_slug(slug: &str) -> Option<ResourceKind> {
         ResourceKind::ALL
             .iter()
@@ -335,6 +365,7 @@ pub enum KeyType {
     Str,
     Bool,
     Int,
+    Float,
     Array,
     Object,
     Any,
@@ -346,6 +377,7 @@ impl KeyType {
             KeyType::Str => "str",
             KeyType::Bool => "bool",
             KeyType::Int => "int",
+            KeyType::Float => "float",
             KeyType::Array => "array",
             KeyType::Object => "object",
             KeyType::Any => "any JSON value",
@@ -429,6 +461,43 @@ pub struct MutationSpec {
     pub label: &'static str,
     /// One-line, ready-to-copy `write` call.
     pub example: &'static str,
+}
+
+impl MutationSpec {
+    /// ``required `a(str)`; optional `b(bool)` `` — the accepted-key list shared
+    /// by the read-side affordance block and the write-side unknown-key
+    /// rejection, so what a resource advertises and what it enforces cannot
+    /// drift. `None` when the mutation enumerates no keys at all.
+    pub fn accepted_keys_display(&self) -> Option<String> {
+        fn keys(specs: &[KeySpec]) -> String {
+            specs
+                .iter()
+                .map(|k| format!("`{}`", k.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !self.required.is_empty() {
+            parts.push(format!("required {}", keys(self.required)));
+        }
+        if !self.optional.is_empty() {
+            parts.push(format!("optional {}", keys(self.optional)));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("; "))
+        }
+    }
+
+    /// True when `key` is the canonical name or a declared alias of any key this
+    /// mutation accepts.
+    pub fn accepts_key(&self, key: &str) -> bool {
+        self.required
+            .iter()
+            .chain(self.optional.iter())
+            .any(|spec| spec.key == key || spec.aliases.contains(&key))
+    }
 }
 
 /// One read-side query projection (`?key=values`).

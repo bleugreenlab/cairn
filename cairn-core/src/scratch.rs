@@ -393,15 +393,15 @@ mod tests {
     #[test]
     fn a_scratch_path_carries_no_opaque_segment() {
         let job_id = format!("test-{}", uuid::Uuid::new_v4());
-        let name = node_scratch_name(&job_id, "cairn://p/CAIRN/2695/1/builder");
+        let name = node_scratch_name(&job_id, "cairn://p/cairn/2695/1/builder");
         let path = scratch_root().join(&name);
-        assert_eq!(name, "CAIRN.2695.1.builder");
+        assert_eq!(name, "cairn.2695.1.builder");
         // Every segment below the user's home is one Cairn chose and a person
         // can read: no platform temp root, and so no per-user hash.
         let rendered = path.to_string_lossy().into_owned();
         assert!(!rendered.contains("/var/folders/"), "{rendered}");
         assert!(
-            rendered.ends_with("/scratch/CAIRN.2695.1.builder"),
+            rendered.ends_with("/scratch/cairn.2695.1.builder"),
             "{rendered}"
         );
     }
@@ -410,10 +410,10 @@ mod tests {
     fn node_uri_produces_a_readable_registered_name() {
         let job_id = format!("test-{}", uuid::Uuid::new_v4());
         let dir =
-            ensure_job_scratch_dir(&job_id, Some("cairn://p/CAIRN/2695/1/builder/task/review"));
+            ensure_job_scratch_dir(&job_id, Some("cairn://p/cairn/2695/1/builder/task/review"));
         assert_eq!(
             dir.file_name().and_then(|name| name.to_str()),
-            Some("CAIRN.2695.1.builder.task.review")
+            Some("cairn.2695.1.builder.task.review")
         );
         assert_eq!(job_scratch_dir(&job_id), dir);
         remove_job_scratch_dir(&job_id);
@@ -430,7 +430,7 @@ mod tests {
         let unnamed = ensure_job_scratch_dir(&job_id, None);
         std::fs::write(unnamed.join("report.pdf"), b"fixture").unwrap();
 
-        let named = ensure_job_scratch_dir(&job_id, Some("cairn://p/CAIRN/2695/1/builder"));
+        let named = ensure_job_scratch_dir(&job_id, Some("cairn://p/cairn/2695/1/builder"));
 
         assert_ne!(named, unnamed);
         assert!(!unnamed.exists());
@@ -440,13 +440,13 @@ mod tests {
 
     #[test]
     fn uri_structure_remains_visible_and_stable_without_a_hash() {
-        let top_level = "cairn://p/CAIRN/2695/1/builder-task-review";
-        let task = "cairn://p/CAIRN/2695/1/builder/task/review";
+        let top_level = "cairn://p/cairn/2695/1/builder-task-review";
+        let task = "cairn://p/cairn/2695/1/builder/task/review";
 
         let top_level_name = node_scratch_name("job-top", top_level);
         let task_name = node_scratch_name("job-task", task);
-        assert_eq!(top_level_name, "CAIRN.2695.1.builder-task-review");
-        assert_eq!(task_name, "CAIRN.2695.1.builder.task.review");
+        assert_eq!(top_level_name, "cairn.2695.1.builder-task-review");
+        assert_eq!(task_name, "cairn.2695.1.builder.task.review");
         assert_ne!(top_level_name, task_name);
         assert_eq!(node_scratch_name("another-job", top_level), top_level_name);
         assert_eq!(node_scratch_name("another-job", task), task_name);
@@ -454,8 +454,8 @@ mod tests {
 
     #[test]
     fn unsafe_uri_bytes_are_encoded_into_one_path_component() {
-        let name = node_scratch_name("job-abc", "cairn://p/CAIRN/1/1/a b/%2F._2F");
-        assert_eq!(name, "CAIRN.1.1.a_20b._252F_2E_5F2F");
+        let name = node_scratch_name("job-abc", "cairn://p/cairn/1/1/a b/%2F._2F");
+        assert_eq!(name, "cairn.1.1.a_20b._252F_2E_5F2F");
         assert_eq!(std::path::Path::new(&name).components().count(), 1);
         assert_ne!(encode_component("a/b"), encode_component("a.b"));
         assert_ne!(encode_component("_2F"), encode_component("/"));
@@ -469,7 +469,7 @@ mod tests {
         for rejected in ["", ".", "..", "../elsewhere", "a/b", ".jobs"] {
             assert!(!is_job_dir_name(rejected), "must reject {rejected:?}");
         }
-        assert!(is_job_dir_name("CAIRN.2695.1.builder"));
+        assert!(is_job_dir_name("cairn.2695.1.builder"));
         // A URI tail that would encode to a rejected name falls back rather than
         // registering a name the lookup would later refuse.
         assert_eq!(node_scratch_name("job-abc", "cairn://p/"), "job-abc");

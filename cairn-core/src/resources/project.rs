@@ -719,8 +719,9 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
     }
 
     output.push_str("## References\n\n");
-    let config =
-        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let config = crate::config::project_settings::load_project_settings_read_only(
+        std::path::Path::new(&repo_path),
+    );
     let references = config.references.clone().unwrap_or_default();
     let statuses = crate::references::list_reference_status(&orch.config_dir, &references);
     if statuses.is_empty() {
@@ -944,8 +945,9 @@ pub(super) async fn read_project_references(orch: &Orchestrator, project_key: &s
         },
         _ => return format!("Project '{}' not found", project_key),
     };
-    let config =
-        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let config = crate::config::project_settings::load_project_settings_read_only(
+        std::path::Path::new(&repo_path),
+    );
     let references = config.references.clone().unwrap_or_default();
     let statuses = crate::references::list_reference_status(&orch.config_dir, &references);
 
@@ -995,8 +997,9 @@ pub(super) async fn read_project_reference(
         },
         _ => return format!("Project '{}' not found", project_key),
     };
-    let config =
-        crate::config::project_settings::load_project_settings(std::path::Path::new(&repo_path));
+    let config = crate::config::project_settings::load_project_settings_read_only(
+        std::path::Path::new(&repo_path),
+    );
     let references = config.references.clone().unwrap_or_default();
     let Some(reference) = references.iter().find(|reference| reference.name == name) else {
         return format!("Project reference '{}' not found in {}", name, lookup);
@@ -1035,7 +1038,7 @@ pub(super) async fn read_project_settings(orch: &Orchestrator, project_key: &str
         };
 
     let repo = std::path::Path::new(&repo_path);
-    let config = crate::config::project_settings::load_project_settings(repo);
+    let config = crate::config::project_settings::load_project_settings_read_only(repo);
     let resolved_branch =
         crate::config::project_settings::resolve_default_branch(&config, default_branch.as_deref());
 

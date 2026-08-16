@@ -294,9 +294,13 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             false
         } else {
             match fence::resolve_run_fence(orch, request).await {
-                None => false,
-                Some((_, Fence::Allow)) => true,
-                Some((run_id, fence_mode @ (Fence::Ask | Fence::Deny))) => {
+                fence::RunFenceResolution::Ambient => false,
+                fence::RunFenceResolution::Unavailable(error) => return error,
+                fence::RunFenceResolution::Resolved(_, Fence::Allow) => true,
+                fence::RunFenceResolution::Resolved(
+                    run_id,
+                    fence_mode @ (Fence::Ask | Fence::Deny),
+                ) => {
                     let residence = std::path::Path::new(&request.cwd);
                     let mut any_escape = false;
                     for (index, item) in payload.changes.iter().enumerate() {
@@ -350,6 +354,20 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                         {
                             fence::FenceDecision::Allow => {}
                             fence::FenceDecision::Deny(msg) => {
+                                let IndexedFailure { failure, .. } =
+                                    *build_failure(index, item, msg);
+                                return serde_json::to_string(&empty_change_report(
+                                    Vec::new(),
+                                    vec![failure],
+                                    None,
+                                    false,
+                                    false,
+                                ))
+                                .unwrap_or_else(|e| {
+                                    format!("Failed to serialize change report: {e}")
+                                });
+                            }
+                            fence::FenceDecision::Unavailable(msg) => {
                                 let IndexedFailure { failure, .. } =
                                     *build_failure(index, item, msg);
                                 return serde_json::to_string(&empty_change_report(
@@ -425,10 +443,13 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         // to asking. Hard-denying here would make the boundary unreachable for
         // such a run even when it holds a standing grant, which is the opposite
         // of what a grant is for.
-        let fence_mode = crate::mcp::handlers::fence::resolve_run_fence(orch, request)
-            .await
-            .map(|(_, mode)| mode)
-            .unwrap_or(crate::models::Fence::Ask);
+        let fence_mode = match crate::mcp::handlers::fence::resolve_run_fence(orch, request).await {
+            crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, mode) => mode,
+            crate::mcp::handlers::fence::RunFenceResolution::Unavailable(error) => return error,
+            crate::mcp::handlers::fence::RunFenceResolution::Ambient => {
+                return "permission context unavailable: authority approval requires an authenticated run".to_string()
+            }
+        };
         for (index, authority_request) in authority_requests {
             let authority_request = match authority_request {
                 Ok(request) => request,
@@ -447,6 +468,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             {
                 AuthorityGate::Allow => {}
                 AuthorityGate::Deny(msg) => return deny(index, msg),
+                AuthorityGate::Unavailable(msg) => return deny(index, msg),
                 AuthorityGate::Suspended => {
                     return "Change suspended pending authority approval; resume will continue \
                         once it is answered."
@@ -486,8 +508,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))
         };
         match fence::resolve_run_fence(orch, request).await {
-            Some((_, Fence::Allow)) => {}
-            Some((run_id, fence_mode @ (Fence::Ask | Fence::Deny))) => {
+            fence::RunFenceResolution::Resolved(_, Fence::Allow) => {}
+            fence::RunFenceResolution::Resolved(run_id, fence_mode @ (Fence::Ask | Fence::Deny)) => {
                 match fence::raise_fence(
                     orch,
                     &run_id,
@@ -499,6 +521,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                 {
                     fence::FenceDecision::Allow => {}
                     fence::FenceDecision::Deny(msg) => return deny(msg),
+                    fence::FenceDecision::Unavailable(msg) => return deny(msg),
                     fence::FenceDecision::Suspended => {
                         return "Change suspended pending logical namespace approval; resume \
                             will continue once it is answered."
@@ -506,13 +529,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     }
                 }
             }
-            None => {
-                return deny(
-                    "Denied: creating a project or attaching a remote writes an explicit host \
-                     repository and requires an authenticated run for logical namespace adjudication."
-                        .to_string(),
-                );
-            }
+            fence::RunFenceResolution::Unavailable(error) => return error,
+            fence::RunFenceResolution::Ambient => return "permission context unavailable: creating a project or attaching a remote requires an authenticated run".to_string(),
         }
     }
 

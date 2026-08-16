@@ -1449,7 +1449,7 @@ mod tests {
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'brw', '/tmp/brw', 1, 1)",
                         (),
                     )
                     .await?;
@@ -1479,7 +1479,7 @@ mod tests {
         insert_browser(&orch.db.local, browser).await.unwrap();
 
         let resource = CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "main".to_string(),
         };
         let rendered = render_browser(&orch, &resource, BridgeFormat::Markdown).await;
@@ -1494,7 +1494,7 @@ mod tests {
     async fn render_browser_auto_creates_missing_slug() {
         let (orch, _dir) = orch_with_db().await;
         let resource = CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "fresh".to_string(),
         };
         let rendered = render_browser(&orch, &resource, BridgeFormat::Markdown).await;
@@ -1527,7 +1527,7 @@ mod tests {
 
     fn default_project_browser() -> CairnResource {
         CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "default".to_string(),
         }
     }
@@ -1592,7 +1592,7 @@ mod tests {
         let (orch, _dir) = orch_with_db().await;
         seed_browser(&orch, "tab-a", 99, true).await; // a more-recent OTHER tab
         let resource = CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "explicit".to_string(),
         };
         let (_scope, slug) = resolve_browser_target(&orch.db.local, &resource)
@@ -1779,7 +1779,7 @@ mod tests {
     #[test]
     fn format_network_body_tabulates_requests_and_errors() {
         let resource = CairnResource::ProjectBrowser {
-            project: "CAIRN".to_string(),
+            project: "cairn".to_string(),
             slug: "default".to_string(),
         };
         assert!(
@@ -1821,7 +1821,7 @@ mod tests {
             "{body}"
         );
         assert!(
-            body.contains("cairn://p/CAIRN/browser/default/network/realm-1"),
+            body.contains("cairn://p/cairn/browser/default/network/realm-1"),
             "{body}"
         );
         assert!(body.contains("| GET |"), "{body}");
@@ -2011,7 +2011,7 @@ mod tests {
     async fn screenshot_headless_returns_header_without_image() {
         let (orch, _dir) = orch_with_db().await;
         let resource = CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "main".to_string(),
         };
         let (header, image) = render_browser_screenshot(&orch, &resource).await;
@@ -2436,7 +2436,7 @@ mod tests {
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'brw', '/tmp/brw', 1, 1)",
                         (),
                     )
                     .await?;
@@ -2484,7 +2484,7 @@ mod tests {
             }
         });
         let resource = CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "main".to_string(),
         };
         let (header, image) = render_browser_screenshot(&orch, &resource).await;
@@ -2515,7 +2515,7 @@ mod tests {
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'brw', '/tmp/brw', 1, 1)",
                         (),
                     )
                     .await?;
@@ -2549,7 +2549,7 @@ mod tests {
             }
         });
         let resource = CairnResource::ProjectBrowser {
-            project: "BRW".to_string(),
+            project: "brw".to_string(),
             slug: "main".to_string(),
         };
         // If the gate wrongly waited the readiness budget (30s), this 5s bound trips.

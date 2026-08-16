@@ -280,6 +280,8 @@ async fn journal(actor: &AuthorityActor, request: &AuthorityRequest, decision: &
         run_id: actor.run_id.clone(),
         request_uri: actor.principal.node_uri.clone(),
         grant_id,
+        decision_actor: None,
+        appearance_snapshot: None,
         decided_at: now(),
     };
     if let Err(error) = store::append_event(&actor.db, event).await {
@@ -434,7 +436,7 @@ mod tests {
         let db = crate::storage::migrated_test_db(name).await;
         AuthorityActor {
             principal: AuthorityPrincipal {
-                node_uri: Some("cairn://p/CAIRN/1/1/builder".to_string()),
+                node_uri: Some("cairn://p/cairn/1/1/builder".to_string()),
                 run_id: Some("run-1".to_string()),
                 agent_id: Some("build".to_string()),
             },
@@ -480,7 +482,7 @@ mod tests {
             // An anchored grant is bound to the run it was minted for, so the
             // fixture has to mint as the run that will later ask.
             principal: AuthorityPrincipal {
-                node_uri: Some("cairn://p/CAIRN/1/1/builder".to_string()),
+                node_uri: Some("cairn://p/cairn/1/1/builder".to_string()),
                 run_id: Some("run-1".to_string()),
                 agent_id: Some("build".to_string()),
             },
@@ -526,7 +528,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, \
-                     updated_at) VALUES ('p','default','P','P','/tmp',1,1)",
+                     updated_at) VALUES ('p','default','P','p','/tmp',1,1)",
                     (),
                 )
                 .await?;

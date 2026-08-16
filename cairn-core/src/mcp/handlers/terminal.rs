@@ -2865,6 +2865,7 @@ async fn spawn_terminal_session(
                 // charge would tax the idle prompt at a compile's rate.
                 reservation: None,
                 process: ResidentProcessSpec {
+                    runtime_packages: Vec::new(),
                     program,
                     args,
                     cwd: String::new(),
@@ -3359,7 +3360,7 @@ mod terminal_finalize_tests {
         let db = crate::storage::migrated_test_db("term_thread_target.db").await;
         db.execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+             VALUES ('p-thr', 'default', 'Threads', 'thr', '/tmp/thr', 1, 1);
              INSERT INTO threads (id, project_id, name, created_at, updated_at)
              VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);",
         )
@@ -3369,7 +3370,7 @@ mod terminal_finalize_tests {
             .await
             .unwrap();
 
-        let resource = cairn_common::uri::parse_uri("cairn://p/THR/thread-ux/terminal/smoke")
+        let resource = cairn_common::uri::parse_uri("cairn://p/thr/thread-ux/terminal/smoke")
             .and_then(|resource| crate::resources::delegate_thread_descendant(resource).ok())
             .expect("a thread terminal path normalizes");
         assert!(matches!(resource, CairnResource::NodeTerminal { .. }));
@@ -3404,13 +3405,13 @@ mod terminal_finalize_tests {
         let db = crate::storage::migrated_test_db("term_thread_dormant.db").await;
         db.execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+             VALUES ('p-thr', 'default', 'Threads', 'thr', '/tmp/thr', 1, 1);
              INSERT INTO threads (id, project_id, name, created_at, updated_at)
              VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);",
         )
         .await
         .unwrap();
-        let resource = cairn_common::uri::parse_uri("cairn://p/THR/thread-ux/terminal/smoke")
+        let resource = cairn_common::uri::parse_uri("cairn://p/thr/thread-ux/terminal/smoke")
             .and_then(|resource| crate::resources::delegate_thread_descendant(resource).ok())
             .unwrap();
         let error = resolve_terminal_resource_target(&db, &resource)
@@ -3419,14 +3420,14 @@ mod terminal_finalize_tests {
             .expect("a thread with no session has no terminal target")
             .to_string();
         assert!(
-            error.contains("cairn://p/THR/thread-ux/terminal/smoke"),
+            error.contains("cairn://p/thr/thread-ux/terminal/smoke"),
             "the message names the terminal that was addressed: {error}"
         );
         assert!(
             error.contains("has no session yet"),
             "the message names the reason in the owner's terms: {error}"
         );
-        assert!(!error.contains("THR-0"), "{error}");
+        assert!(!error.contains("thr-0"), "{error}");
     }
 
     /// The UI's + menu resolves a terminal from the pane's JOB, and every owner
@@ -3446,7 +3447,7 @@ mod terminal_finalize_tests {
         let db = crate::storage::migrated_test_db("term_resource_for_job.db").await;
         db.execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+             VALUES ('p-thr', 'default', 'Threads', 'thr', '/tmp/thr', 1, 1);
              INSERT INTO threads (id, project_id, name, created_at, updated_at)
              VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);
              INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
@@ -3473,7 +3474,7 @@ mod terminal_finalize_tests {
             matches!(
                 &node,
                 CairnResource::NodeTerminal { project, number: 9, exec_seq: 2, node_id, slug }
-                    if project == "THR" && node_id == "builder" && slug == "smoke"
+                    if project == "thr" && node_id == "builder" && slug == "smoke"
             ),
             "{node:?}"
         );
@@ -3485,7 +3486,7 @@ mod terminal_finalize_tests {
             matches!(
                 &task,
                 CairnResource::TaskTerminal { project, number: 9, exec_seq: 2, node_id, task_name, slug }
-                    if project == "THR" && node_id == "builder" && task_name == "probe" && slug == "smoke"
+                    if project == "thr" && node_id == "builder" && task_name == "probe" && slug == "smoke"
             ),
             "{task:?}"
         );
@@ -3504,7 +3505,7 @@ mod terminal_finalize_tests {
             matches!(
                 &workflow,
                 CairnResource::NodeTerminal { project, number: 9, exec_seq: 2, node_id, slug }
-                    if project == "THR" && node_id == "ship" && slug == "smoke"
+                    if project == "thr" && node_id == "ship" && slug == "smoke"
             ),
             "a workflow is a node by its own segment, not a task under its parent: {workflow:?}"
         );
@@ -3516,7 +3517,7 @@ mod terminal_finalize_tests {
             matches!(
                 &thread,
                 CairnResource::NodeTerminal { project, number: 0, exec_seq: 0, node_id, slug }
-                    if project == "THR" && node_id == "thread-ux" && slug == "smoke"
+                    if project == "thr" && node_id == "thread-ux" && slug == "smoke"
             ),
             "{thread:?}"
         );
@@ -3524,7 +3525,7 @@ mod terminal_finalize_tests {
         // an agent read would address different things.
         assert_eq!(
             thread.to_uri(),
-            "cairn://p/THR/thread-ux/terminal/smoke",
+            "cairn://p/thr/thread-ux/terminal/smoke",
             "the UI path lands on the address the agent writes"
         );
         // And it resolves back to the session that owns it.
@@ -3547,7 +3548,7 @@ mod terminal_finalize_tests {
         let head = init_git_checkout(checkout.path());
         let owner_ref = CellOwnerRef {
             project_id: "p".into(),
-            project_key: Some("P".into()),
+            project_key: Some("p".into()),
             issue_number: Some(7),
             job_id: Some("job-7".into()),
             execution_seq: Some(2),
@@ -3590,7 +3591,7 @@ mod terminal_finalize_tests {
         db.execute_script(&format!(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
-            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','{}',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','{}',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',7,'I','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES('e','rec','i','p','running',1,2);
             INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, node_name, status, created_at, updated_at) VALUES('job-7','p','i','e','builder','builder','running',1,1);
@@ -3629,7 +3630,7 @@ mod terminal_finalize_tests {
             request.owner_ref,
             Some(CellOwnerRef {
                 project_id: "p".into(),
-                project_key: Some("P".into()),
+                project_key: Some("p".into()),
                 issue_number: Some(7),
                 job_id: Some("job-7".into()),
                 execution_seq: Some(2),
@@ -3655,7 +3656,7 @@ mod terminal_finalize_tests {
         db.execute_script(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
-            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp/p',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',7,'I','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES('e','rec','i','p','running',1,2);
             INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, node_name, status, created_at, updated_at) VALUES('job-7','p','i','e','builder','builder','running',1,1);
@@ -3723,7 +3724,78 @@ mod terminal_finalize_tests {
         let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
         let db_state = Arc::new(DbState::new(Arc::new(db), search));
         let services = Arc::new(TestServicesBuilder::new().build());
-        Orchestrator::builder(db_state, services, config_dir).build()
+        Orchestrator::builder(db_state, services, config_dir)
+            .jj_binary_path(test_jj_binary_path())
+            .build()
+    }
+
+    fn test_jj_binary_path() -> &'static str {
+        struct PinnedJj {
+            _temp: tempfile::TempDir,
+            path: String,
+        }
+
+        static PINNED: std::sync::OnceLock<PinnedJj> = std::sync::OnceLock::new();
+        &PINNED
+            .get_or_init(|| {
+                let source = test_jj_candidate().unwrap_or_else(|| {
+                    panic!(
+                        "jj-backed terminal tests require a host sidecar, CAIRN_JJ_BIN, or jj on PATH; run `bun run ensure-jj` or install jj"
+                    )
+                });
+                let mut source_file =
+                    std::fs::File::open(&source).expect("open jj executable snapshot");
+                let permissions = source_file
+                    .metadata()
+                    .expect("read jj executable metadata")
+                    .permissions();
+                let temp = tempdir().expect("create pinned jj directory");
+                let target = temp.path().join(source.file_name().unwrap_or_default());
+                let mut target_file =
+                    std::fs::File::create(&target).expect("create pinned jj executable");
+                std::io::copy(&mut source_file, &mut target_file)
+                    .expect("snapshot jj executable");
+                std::fs::set_permissions(&target, permissions)
+                    .expect("preserve jj executable permissions");
+                drop(target_file);
+                let probe = std::process::Command::new(&target)
+                    .arg("--version")
+                    .output()
+                    .expect("run pinned jj executable");
+                assert!(
+                    probe.status.success(),
+                    "pinned jj --version must succeed: {}",
+                    String::from_utf8_lossy(&probe.stderr)
+                );
+                PinnedJj {
+                    _temp: temp,
+                    path: target.to_string_lossy().into_owned(),
+                }
+            })
+            .path
+    }
+
+    fn test_jj_candidate() -> Option<std::path::PathBuf> {
+        let triple = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", "aarch64") => "aarch64-apple-darwin",
+            ("macos", "x86_64") => "x86_64-apple-darwin",
+            ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+            ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+            ("windows", "aarch64") => "aarch64-pc-windows-msvc",
+            ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+            _ => return None,
+        };
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let bundled = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../binaries")
+            .join(format!("jj-{triple}{suffix}"));
+        bundled.is_file().then_some(bundled).or_else(|| {
+            std::env::var("CAIRN_JJ_BIN")
+                .ok()
+                .map(std::path::PathBuf::from)
+                .filter(|path| path.is_file())
+                .or_else(|| cairn_common::toolchain_path::locate_program("jj"))
+        })
     }
 
     fn test_orchestrator_with_emitter(db: LocalDb) -> (Orchestrator, Arc<CapturingEmitter>) {
@@ -3738,7 +3810,9 @@ mod terminal_finalize_tests {
                 .build(),
         );
         (
-            Orchestrator::builder(db_state, services, config_dir).build(),
+            Orchestrator::builder(db_state, services, config_dir)
+                .jj_binary_path(test_jj_binary_path())
+                .build(),
             emitter,
         )
     }
@@ -3747,7 +3821,7 @@ mod terminal_finalize_tests {
         db.execute_script(
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
-            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',7,'I','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES('e','rec','i','p','running',1,2);
             INSERT INTO jobs(id, project_id, issue_id, execution_id, uri_segment, status, created_at, updated_at) VALUES('j','p','i','e','builder','running',1,1);
@@ -3868,7 +3942,7 @@ mod terminal_finalize_tests {
     }
 
     fn node_uri() -> String {
-        cairn_common::uri::build_node_terminal_uri("P", 7, 2, "builder", "run-1")
+        cairn_common::uri::build_node_terminal_uri("p", 7, 2, "builder", "run-1")
     }
 
     #[derive(Clone, Copy)]
@@ -4338,6 +4412,7 @@ mod terminal_finalize_tests {
             residency: Some(residency),
             occupancy: cairn_common::executor_protocol::CellOccupancy {
                 command: None,
+                command_ownership: None,
                 processes: std::collections::BTreeMap::from([(
                     "main".into(),
                     ResidentProcess {
@@ -4454,6 +4529,7 @@ mod terminal_finalize_tests {
             while let Some(message) = receiver.recv().await {
                 let ExecutorMessage::ResidencyRequest {
                     correlation_id,
+                    config: _,
                     operation,
                 } = message
                 else {
@@ -4645,7 +4721,7 @@ mod terminal_finalize_tests {
         let session_id = spawn_terminal_session(
             &orch,
             CairnResource::NodeTerminal {
-                project: "P".into(),
+                project: "p".into(),
                 number: 7,
                 exec_seq: 2,
                 node_id: "builder".into(),
@@ -4686,7 +4762,7 @@ mod terminal_finalize_tests {
         let result = spawn_terminal_session(
             &orch,
             CairnResource::NodeTerminal {
-                project: "P".into(),
+                project: "p".into(),
                 number: 7,
                 exec_seq: 2,
                 node_id: "builder".into(),
@@ -4734,7 +4810,7 @@ mod terminal_finalize_tests {
         let result = spawn_terminal_session(
             &orch,
             CairnResource::NodeTerminal {
-                project: "P".into(),
+                project: "p".into(),
                 number: 7,
                 exec_seq: 2,
                 node_id: "builder".into(),
@@ -4766,6 +4842,7 @@ mod terminal_finalize_tests {
     async fn terminal_residency_gate_refreshes_the_checkout_to_the_tip() {
         let db = crate::storage::migrated_test_db("term_residency_refresh_ok.db").await;
         let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
         let (_target, fence) = test_terminal_target("fast");
         let (executor, _releases, ops, _) =
             attach_fake_terminal_executor(&orch, fence.clone(), FakeTerminalStart::ImmediateExit);
@@ -4826,7 +4903,7 @@ mod terminal_finalize_tests {
 
     fn node_terminal_resource(slug: &str) -> CairnResource {
         CairnResource::NodeTerminal {
-            project: "P".into(),
+            project: "p".into(),
             number: 7,
             exec_seq: 2,
             node_id: "builder".into(),
@@ -5364,7 +5441,7 @@ mod terminal_finalize_tests {
         ))
         .unwrap();
 
-        let uri = "cairn://p/P/terminal/watch";
+        let uri = "cairn://p/p/terminal/watch";
         let facts = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
         block_on(crate::orchestrator::wakes::subscribe_one_shot(
             &orch.db.local,
@@ -5402,7 +5479,7 @@ mod terminal_finalize_tests {
         block_on(seed(&orch.db.local));
         block_on(seed_live_turn(&orch.db.local));
 
-        let uri = "cairn://p/P/7/2/builder/terminal/missing";
+        let uri = "cairn://p/p/7/2/builder/terminal/missing";
         let facts = vec![crate::orchestrator::wakes::FACT_KIND_TERMINAL_EXIT.to_string()];
         block_on(crate::orchestrator::wakes::subscribe_one_shot(
             &orch.db.local,
@@ -5507,7 +5584,7 @@ mod terminal_finalize_tests {
         let orch = test_orchestrator(db);
         block_on(seed(&orch.db.local));
         let resource = CairnResource::TaskTerminal {
-            project: "P".to_string(),
+            project: "p".to_string(),
             number: 7,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -5521,7 +5598,7 @@ mod terminal_finalize_tests {
         assert!(block_on(ensure_terminal_slug_available(&orch.db.local, &target)).is_err());
 
         let parent_resource = CairnResource::NodeTerminal {
-            project: "P".to_string(),
+            project: "p".to_string(),
             number: 7,
             exec_seq: 2,
             node_id: "builder".to_string(),
@@ -5585,7 +5662,7 @@ mod terminal_finalize_tests {
     #[test]
     fn recovery_answers_an_executor_loss_once_and_then_leaves_the_terminal_stopped() {
         let pty_state = crate::services::PtyState::default();
-        let terminal = "cairn://p/CAIRN/1/1/builder/terminal/tests";
+        let terminal = "cairn://p/cairn/1/1/builder/terminal/tests";
 
         // An ordinary exit is a terminal that finished, not one to start again.
         assert!(!terminal_should_recover(&pty_state, false, terminal));
@@ -5602,7 +5679,7 @@ mod terminal_finalize_tests {
         assert!(terminal_should_recover(
             &pty_state,
             true,
-            "cairn://p/CAIRN/1/1/builder/terminal/dev"
+            "cairn://p/cairn/1/1/builder/terminal/dev"
         ));
     }
 

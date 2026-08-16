@@ -36,7 +36,7 @@ pub(crate) async fn resolve_stable_images(
     let text = text.into();
     let mut seen = std::collections::HashSet::new();
     let mut images = Vec::new();
-    for found in cairn_common::uri::scan_stored_images(&text) {
+    for found in cairn_common::uri::scan_markdown_stored_images(&text) {
         let uri = found.uri;
         if !seen.insert(uri.clone()) {
             continue;
@@ -60,10 +60,22 @@ pub(crate) async fn resolve_stable_images(
         {
             return Err("durable image authority no longer matches the current project".into());
         }
-        let image =
-            crate::images::fetch_image_by_reference(&owning_db, authorized_project_id, &reference)
-                .await
-                .map_err(|error| format!("failed to resolve durable image {uri}: {error}"))?;
+        let image = match crate::images::fetch_image_by_reference(
+            &owning_db,
+            authorized_project_id,
+            authorized_project_key,
+            &reference,
+        )
+        .await
+        {
+            Ok(image) => image,
+            Err(error) => {
+                log::warn!(
+                    "failed to resolve durable image {uri}; leaving reference as text: {error}"
+                );
+                continue;
+            }
+        };
         images.push(MessageImage {
             mime_type: image.mime_type.to_string(),
             bytes: image.bytes,
@@ -93,9 +105,8 @@ impl MessageContent {
         }
     }
 
-    /// Resolve every unique stable project-image URI in textual order. Missing
-    /// or corrupt durable resources are errors; native delivery never silently
-    /// degrades to text-only.
+    /// Resolve every unique Markdown image reference in textual order. Missing
+    /// or corrupt durable resources degrade to the unchanged textual reference.
     #[cfg(test)]
     pub(crate) fn resolve(
         text: impl Into<String>,
@@ -104,9 +115,11 @@ impl MessageContent {
         let text = text.into();
         let mut seen = std::collections::HashSet::new();
         let mut images = Vec::new();
-        for found in cairn_common::uri::scan_stored_images(&text) {
+        for found in cairn_common::uri::scan_markdown_stored_images(&text) {
             if seen.insert(found.uri.clone()) {
-                images.push(resolver.resolve(&found.uri)?);
+                if let Ok(image) = resolver.resolve(&found.uri) {
+                    images.push(image);
+                }
             }
         }
         Ok(Self { text, images })
@@ -374,7 +387,7 @@ mod tests {
 
     #[test]
     fn stable_uri_resolves_once_and_serializes_as_native_claude_image() {
-        let uri = format!("cairn://p/CAIRN/images/{}", "a".repeat(64));
+        let uri = format!("cairn://p/cairn/images/{}", "a".repeat(64));
         let content =
             MessageContent::resolve(format!("![one]({uri}) again {uri}"), &FixtureResolver)
                 .unwrap();
@@ -405,17 +418,33 @@ mod tests {
     }
 
     #[test]
-    fn stable_uri_resolution_is_fail_closed() {
+    fn missing_markdown_image_degrades_to_unchanged_text() {
         struct Missing;
         impl StableImageResolver for Missing {
             fn resolve(&self, uri: &str) -> Result<MessageImage, String> {
                 Err(format!("missing image: {uri}"))
             }
         }
-        let uri = format!("cairn://p/CAIRN/images/{}", "b".repeat(64));
-        assert!(MessageContent::resolve(uri, &Missing)
-            .unwrap_err()
-            .contains("missing image"));
+        let uri = format!("cairn://p/cairn/images/{}", "b".repeat(64));
+        let text = format!("![missing]({uri})");
+        let content = MessageContent::resolve(&text, &Missing).unwrap();
+        assert_eq!(content.text, text);
+        assert!(content.images.is_empty());
+    }
+
+    #[test]
+    fn bare_and_fenced_image_uris_are_not_resolved() {
+        struct Panics;
+        impl StableImageResolver for Panics {
+            fn resolve(&self, uri: &str) -> Result<MessageImage, String> {
+                panic!("prose URI was treated as an attachment: {uri}")
+            }
+        }
+        let uri = "cairn://p/cairn/3242/images/1";
+        let text = format!("Mention {uri} in prose.\n```\n{uri}\n```");
+        let content = MessageContent::resolve(&text, &Panics).unwrap();
+        assert_eq!(content.text, text);
+        assert!(content.images.is_empty());
     }
 
     #[test]

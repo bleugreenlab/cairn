@@ -131,7 +131,7 @@ pub(crate) const TASK_MESSAGES_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[CONTENT],
-            optional: &[],
+            optional: &[ESCALATE],
             label: "send direct message",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/task/NAME/messages\",mode:\"append\",payload:{content:\"...\"}}]})",
         }],
@@ -225,7 +225,10 @@ pub(crate) const TASK_ARTIFACT_CONTRACT: ResourceContract =
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/task/{task}/{name}",
         name: "Task artifact",
         description: "Sub-task output artifact. Write it via change to cairn:~/<name>; the payload is validated against the task's declared schema. Patch accepts either artifact-field merge payloads (for example {content}) or text replacement operations ({old_string,new_string,field?}); text replacement helper keys are operations and are not stored as artifact metadata.",
-        read_projections: NO_PROJECTIONS,
+        read_projections: &[ProjectionSpec {
+            key: "format",
+            values: "json (exact stored artifact data; absent = Markdown)",
+        }],
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[

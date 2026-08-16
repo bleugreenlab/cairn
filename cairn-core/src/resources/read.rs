@@ -16,6 +16,7 @@ use super::issue::{
 use super::labels::{read_label, read_labels};
 use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
+use super::node::parse_artifact_format;
 use super::node::{
     read_job_todos, read_node, read_node_artifact, read_node_calls, read_node_chat,
     read_node_chat_event, read_node_chat_raw, read_node_chat_turn, read_node_checks,
@@ -1096,7 +1097,13 @@ pub(crate) async fn produce_cairn_resource(
         }
     }
 
-    let affordance = {
+    let raw_artifact = matches!(
+        resource,
+        CairnResource::NodeArtifact { .. } | CairnResource::TaskArtifact { .. }
+    ) && find_query_value(&split.params, "format") == Some("json");
+    let affordance = if raw_artifact {
+        None
+    } else {
         // Node/task artifacts derive their affordance example from the schema the
         // addressed name actually validates against, so a copied example is a
         // valid write even for a custom schema (CAIRN #170). Fall back to the
@@ -1177,7 +1184,9 @@ pub(crate) async fn produce_cairn_resource(
                 Ok(id) => id,
                 Err(error) => return RenderedResource::line(error, affordance, None, None),
             };
-        return match crate::images::fetch_image_by_reference(&db, &project_id, reference).await {
+        return match crate::images::fetch_image_by_reference(&db, &project_id, project, reference)
+            .await
+        {
             Ok(image) => {
                 let mut rendered = RenderedResource::line(String::new(), affordance, None, None);
                 // The target IS this image's address, so the block carries it
@@ -1397,9 +1406,10 @@ pub(crate) async fn produce_cairn_resource(
         CairnResource::NodeChatRaw { .. } | CairnResource::TaskChatRaw { .. }
     ) && find_query_value(&split.params, "format")
         == Some("json");
+    let is_raw_line_resource = is_structured_raw_transcript || raw_artifact;
     let body_params = if renderer_owns_params || is_browser_resource {
         strip_params(&split.params, &["offset"])
-    } else if is_structured_raw_transcript {
+    } else if is_raw_line_resource {
         strip_params(&split.params, &["offset", "limit", "char_offset"])
     } else {
         strip_params(&split.params, &["offset", "limit"])
@@ -1410,7 +1420,7 @@ pub(crate) async fn produce_cairn_resource(
 
 {content}");
     }
-    if is_structured_raw_transcript {
+    if is_raw_line_resource {
         if let Some(char_offset) = view_char_offset {
             let line_offset = view_offset.unwrap_or(0).max(0) as usize;
             content = apply_line_char_offset(&content, line_offset, char_offset);
@@ -1452,6 +1462,18 @@ async fn render_resource_body(
         CairnResource::DevDb => produce_dev_db_sql_resource(&params, None).await.content,
         CairnResource::DevPid => produce_dev_pid_resource(&params, None).await.content,
         CairnResource::Logs => logs_resource_body(&cairn_common::paths::cairn_log_dir(), &params),
+        CairnResource::ChannelsConversations => {
+            let unsupported = params
+                .iter()
+                .find(|param| !matches!(param.key.as_str(), "provider" | "deliverability"));
+            match unsupported {
+                Some(param) => format!(
+                    "Unsupported query parameter '{}' for cairn://channels/conversations",
+                    param.key
+                ),
+                None => crate::resources::channels::render_conversations(orch, &params).await,
+            }
+        }
         // The fleet is machine-scoped, so both arms read the runner's cached
         // projection rather than any project's database. `captured_at` is taken
         // once so every age on the rendering is derived from one instant.
@@ -1579,6 +1601,22 @@ async fn render_resource_body(
         }
         CairnResource::ProjectIssues { project } => {
             read_project_issues(db, &project, &params).await
+        }
+        // The unaddressed corpus is the one posts surface narrowed by who is
+        // asking, because it is the one that answers "what is there" rather than
+        // "show me this". The two addressed surfaces below stay workspace-open:
+        // naming another project's posts collection, or a post by id, is a
+        // deliberate read and reaches across projects exactly as reading another
+        // project's issues does.
+        CairnResource::Posts => super::posts::read_corpus(orch, request, &params).await,
+        CairnResource::Post { id } => super::posts::read_post(&orch.db.local, id, &params).await,
+        CairnResource::ProjectPosts { project } => {
+            super::posts::read_posts(
+                &orch.db.local,
+                crate::storage::PostScope::Project(&project),
+                &params,
+            )
+            .await
         }
         CairnResource::ProjectThreads { project } => {
             if let Some(error) = reject_query_params("project threads", &params) {
@@ -1722,21 +1760,9 @@ async fn render_resource_body(
             exec_seq,
             node_id,
             name,
-        } => {
-            // `?diff=full` inlines the live PR patch on a `/pr` artifact; any
-            // other query param is unsupported here.
-            let unexpected: Vec<&str> = params
-                .iter()
-                .filter(|param| param.key != "diff")
-                .map(|param| param.key.as_str())
-                .collect();
-            if !unexpected.is_empty() {
-                format!(
-                    "Query parameters are not supported on node artifact resources: {}",
-                    unexpected.join(", ")
-                )
-            } else {
-                let diff_full = find_query_value(&params, "diff") == Some("full");
+        } => match parse_artifact_format(&params, true) {
+            Err(error) => error,
+            Ok((format, diff_full)) => {
                 read_node_artifact(
                     orch,
                     &project,
@@ -1744,11 +1770,12 @@ async fn render_resource_body(
                     exec_seq,
                     &node_id,
                     name.as_deref(),
+                    format,
                     diff_full,
                 )
                 .await
             }
-        }
+        },
         CairnResource::TaskChat {
             project,
             number,
@@ -1814,14 +1841,23 @@ async fn render_resource_body(
             exec_seq,
             node_id,
             task_name,
-            name: _,
-        } => {
-            if let Some(error) = reject_query_params("task artifact", &params) {
-                error
-            } else {
-                read_task_artifact(db, &project, number, exec_seq, &node_id, &task_name).await
+            name,
+        } => match parse_artifact_format(&params, false) {
+            Err(error) => error,
+            Ok((format, _)) => {
+                read_task_artifact(
+                    db,
+                    &project,
+                    number,
+                    exec_seq,
+                    &node_id,
+                    &task_name,
+                    name.as_deref(),
+                    format,
+                )
+                .await
             }
-        }
+        },
         CairnResource::JobTodos {
             project,
             number,
@@ -1842,6 +1878,24 @@ async fn render_resource_body(
                 )
                 .await
             }
+        }
+        CairnResource::HomeFeed {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+        } => {
+            super::feed::read_home_feed(
+                orch,
+                &project,
+                number,
+                exec_seq,
+                &node_id,
+                task_name.as_deref(),
+                &params,
+            )
+            .await
         }
         CairnResource::NodeTasks {
             project,
@@ -2570,6 +2624,39 @@ mod tests {
     use cairn_common::query::parse_query_params;
     use std::sync::Arc;
 
+    #[test]
+    fn raw_artifact_uses_shared_line_and_character_continuations() {
+        use cairn_common::read::{NaturalUnit, ReadSegment, SegmentKind, SegmentMeta};
+
+        let raw = format!(
+            "{{\"text\":\"{}é{}\"}}",
+            "x".repeat(2_500),
+            "y".repeat(2_500)
+        );
+        let mut meta = SegmentMeta::new(
+            "cairn://p/prj/1/1/node/arc?format=json",
+            SegmentKind::Resource,
+            NaturalUnit::Line,
+        );
+        meta.total_units = Some(1);
+        meta.shown_units = 1;
+        meta.offset = 0;
+        let first = crate::storage::render::render_segment(
+            ReadSegment::text(raw.clone(), meta),
+            500,
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
+        assert!(first.text.contains("format=json"), "{}", first.text);
+        assert!(first.text.contains("char_offset="), "{}", first.text);
+        assert!(!first.text.contains('\u{fffd}'));
+
+        let multiline = "first\nsecond\nthird";
+        let window = crate::storage::render::window_text_lines(multiline, Some(1), Some(1));
+        assert_eq!(window.body, "second");
+        assert_eq!(window.offset, 1);
+        assert_eq!(window.shown, 1);
+    }
+
     /// A degraded machine has to say which kind of nothing it is reporting, and
     /// it has to say it in words rather than in the daemon's reason code.
     #[test]
@@ -2971,6 +3058,7 @@ line2', X'0001020AFF', 2.5),
         let rendered = crate::storage::render::render_segment(
             cairn_common::read::ReadSegment::text(page.content, meta),
             10_000,
+            &crate::token_meters::O200K_TOKEN_METER,
         );
         assert!(!rendered.text.contains("continue:"));
     }
@@ -2996,6 +3084,7 @@ line2', X'0001020AFF', 2.5),
         crate::storage::render::render_segment(
             cairn_common::read::ReadSegment::text(rendered.content, meta),
             10_000,
+            &crate::token_meters::O200K_TOKEN_METER,
         )
         .text
     }
@@ -3245,7 +3334,7 @@ line2', X'0001020AFF', 2.5),
         local
             .execute_script(
                 "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('p-thr', 'default', 'Threads', 'THR', '/tmp/thr', 1, 1);
+                 VALUES ('p-thr', 'default', 'Threads', 'thr', '/tmp/thr', 1, 1);
                  INSERT INTO threads (id, project_id, name, created_at, updated_at)
                  VALUES ('t-ux', 'p-thr', 'thread-ux', 2, 2);",
             )
@@ -3254,10 +3343,11 @@ line2', X'0001020AFF', 2.5),
         let job_id = crate::threads::ensure_thread_session(&local, "t-ux")
             .await
             .unwrap();
+        let stored_arc = r#"{"current_intent":"The canonical arc — café","rulings":[{"slug":"quoted-ruling","text":"Say \"yes\"\nthen proceed","status":"accepted","rationale":"nested provenance stays exact","provenance":["cairn://p/thr/1",{"uri":"cairn://p/thr/2","note":"résumé"}]}]}"#;
         local
             .execute(
-                r#"INSERT INTO artifacts (id, job_id, artifact_type, output_name, data, created_at, updated_at) VALUES ('a-arc', ?1, 'document', 'arc', '{"content":"The canonical arc"}', 3, 3)"#,
-                (job_id.as_str(),),
+                "INSERT INTO artifacts (id, job_id, artifact_type, output_name, data, created_at, updated_at) VALUES ('a-arc', ?1, 'document', 'arc', ?2, 3, 3)",
+                (job_id.as_str(), stored_arc),
             )
             .await
             .unwrap();
@@ -3289,13 +3379,13 @@ line2', X'0001020AFF', 2.5),
 
         // (b) the tasks collection reads as a collection, not as "no artifact
         // 'tasks' found", and lists the spawned task.
-        let tasks = produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/tasks").await;
+        let tasks = produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/tasks").await;
         assert!(!tasks.content.contains("No artifact"), "{}", tasks.content);
         assert!(tasks.content.contains("probe"), "{}", tasks.content);
 
         // (c) the spawned task reads at a stable URI, with no 0/0 anywhere.
         let task =
-            produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/task/probe").await;
+            produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/task/probe").await;
         assert!(task.content.contains("probe"), "{}", task.content);
         for rendered in [&tasks, &task] {
             assert!(!rendered.content.contains("/0/0/"), "{}", rendered.content);
@@ -3303,17 +3393,23 @@ line2', X'0001020AFF', 2.5),
 
         // (d) the affordance block is the delegated kind's, so it advertises the
         // mutations that descendant actually accepts.
-        let arc = produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/arc").await;
-        assert_eq!(arc.content.trim(), "The canonical arc");
+        let arc = produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/arc").await;
+        assert!(arc.content.contains("The canonical arc — café"));
+        assert_ne!(arc.content, stored_arc);
         let block = arc.affordance.map(|a| a.block).unwrap_or_default();
-        assert!(
-            block.contains("artifact") || block.contains("Artifact"),
-            "a thread's arc must carry the artifact affordance, got: {block}"
-        );
+        assert!(block.contains("[append one ruling]"), "{block}");
+        assert!(block.contains("[patch one ruling by slug]"), "{block}");
+
+        let raw =
+            produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/arc?format=json")
+                .await;
+        assert_eq!(raw.content, stored_arc);
+        assert!(raw.affordance.is_none());
+        assert!(!raw.content.contains("## actions"));
 
         // A branch-shaped segment is refused with its reason rather than read as
         // an artifact of that name.
-        let diff = produce_cairn_resource(&orch, &request, "cairn://p/THR/thread-ux/diff").await;
+        let diff = produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/diff").await;
         assert!(diff.content.contains("no branch"), "{}", diff.content);
     }
 
@@ -3342,7 +3438,7 @@ line2', X'0001020AFF', 2.5),
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'brw', '/tmp/brw', 1, 1)",
                         (),
                     )
                     .await?;
@@ -3395,7 +3491,7 @@ line2', X'0001020AFF', 2.5),
             tool_use_id: None,
         };
         let rendered =
-            produce_cairn_resource(&orch, &request, "cairn://p/BRW/browser?interactive&limit=3")
+            produce_cairn_resource(&orch, &request, "cairn://p/brw/browser?interactive&limit=3")
                 .await;
         assert!(
             rendered.content.contains("Interactive elements"),

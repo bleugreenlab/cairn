@@ -212,7 +212,7 @@ mod tests {
             out.push_str(&format!(
                 "- [{}]({}) [{}] — {}\n",
                 agent.id,
-                agent_link(agent, Some("CAIRN")),
+                agent_link(agent, Some("cairn")),
                 scope_label(agent),
                 agent.name,
             ));
@@ -230,7 +230,7 @@ mod tests {
 
         let rendered = render_collection(&config_dir, Some(&project_dir));
         // Project version wins and links project-scoped.
-        assert!(rendered.contains("cairn://p/CAIRN/agents/shared"));
+        assert!(rendered.contains("cairn://p/cairn/agents/shared"));
         assert!(rendered.contains("[project] — Project Version"));
         assert!(!rendered.contains("Workspace Version"));
     }

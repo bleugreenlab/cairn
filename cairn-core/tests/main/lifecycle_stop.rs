@@ -5,7 +5,7 @@ use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
 
 async fn insert_project_job_run_turn(db: &LocalDb, turn_state: &str) {
-    let project_id = common::create_project(db, "STOP").await;
+    let project_id = common::create_project(db, "stop").await;
     let turn_state = turn_state.to_string();
     db.write(|conn| {
         let project_id = project_id.clone();
@@ -143,7 +143,7 @@ async fn insert_issue_job_run_turn(db: &LocalDb, project_id: &str) {
 #[tokio::test]
 async fn marking_issue_closed_stops_active_runs() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "CLOSE").await;
+    let project_id = common::create_project(&orch.db.local, "close").await;
     insert_issue_job_run_turn(&orch.db.local, &project_id).await;
 
     cairn_core::issues::status::update_status(
@@ -207,7 +207,7 @@ async fn insert_issue_with_job(db: &LocalDb, project_id: &str, job_status: &str)
 #[tokio::test]
 async fn live_work_includes_a_running_job() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "GATE").await;
+    let project_id = common::create_project(&orch.db.local, "gate").await;
     insert_issue_with_job(&orch.db.local, &project_id, "running").await;
 
     let live_work = cairn_core::issues::status::live_work_for_issue(&orch, "issue-1")
@@ -227,7 +227,7 @@ async fn live_work_includes_a_running_job() {
 #[tokio::test]
 async fn live_work_is_empty_when_jobs_are_complete() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "GATE").await;
+    let project_id = common::create_project(&orch.db.local, "gate").await;
     insert_issue_with_job(&orch.db.local, &project_id, "complete").await;
 
     let live_work = cairn_core::issues::status::live_work_for_issue(&orch, "issue-1")
@@ -309,6 +309,100 @@ async fn stop_session_cancels_pending_turn_missing_from_process_map() {
         )
         .await,
         Some("exited".to_string())
+    );
+}
+
+/// Recovery terminalization is a durable boundary, not merely process cleanup.
+/// Even if an unrelated panic poisoned the in-memory process registry, the
+/// predecessor must not remain live/open and block its recovery successor.
+#[tokio::test]
+async fn kill_session_finalizes_after_process_registry_poisoning() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+
+    std::thread::scope(|scope| {
+        let processes = &orch.process_state.processes;
+        let poisoner = scope.spawn(move || {
+            let _guard = processes.lock().unwrap();
+            panic!("poison process registry for regression coverage");
+        });
+        assert!(poisoner.join().is_err());
+    });
+
+    lifecycle::kill_session_with_reason(&orch, "run-1", "provider_silence_recovery").unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("crashed")
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT exit_reason FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("provider_silence_recovery")
+    );
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT state FROM turns WHERE id = ?1",
+            "turn-1"
+        )
+        .await
+        .as_deref(),
+        Some("interrupted")
+    );
+
+    let successor = cairn_core::internal::agent_process::process::RunHandle::new(
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
+        std::sync::Arc::new(std::sync::Mutex::new(None)),
+        Some("session-1".to_string()),
+        Some("job-1".to_string()),
+    );
+    orch.process_state
+        .processes
+        .lock()
+        .expect("terminalization must clear registry poison for the successor")
+        .register("run-2".to_string(), successor);
+    assert_eq!(orch.process_state.run_ids(), vec!["run-2".to_string()]);
+}
+
+#[tokio::test]
+async fn watchdog_arm_failure_crashes_run_and_does_not_complete_turn() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    insert_project_job_run_turn(&orch.db.local, "running").await;
+
+    lifecycle::kill_session_with_reason(&orch, "run-1", "watchdog_arm_failed").unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-1"
+        )
+        .await
+        .as_deref(),
+        Some("crashed")
+    );
+    assert_ne!(
+        common::scalar_text_by_id(
+            &orch.db.local,
+            "SELECT state FROM turns WHERE id = ?1",
+            "turn-1"
+        )
+        .await
+        .as_deref(),
+        Some("complete"),
+        "an unowned provider turn must never be published as successful"
     );
 }
 

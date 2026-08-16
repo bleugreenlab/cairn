@@ -76,7 +76,7 @@ async fn seed_branch_jobs(
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', ?1, 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', ?1, 'main', 1, 1)",
                     params![repo_path.as_str()],
                 )
                 .await?;

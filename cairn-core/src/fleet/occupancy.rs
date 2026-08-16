@@ -171,7 +171,7 @@ mod tests {
             attempt_id: "attempt".into(),
             owner: Some(CellOwnerRef {
                 project_id: "project".into(),
-                project_key: Some("CAIRN".into()),
+                project_key: Some("cairn".into()),
                 issue_number: Some(3414),
                 job_id: None,
                 execution_seq: None,
@@ -213,7 +213,7 @@ mod tests {
             forecast.relief_ms, 240_000,
             "relief is when the last occupant finishes, not the first"
         );
-        assert_eq!(forecast.blocking, "CAIRN-3414's rust-tests");
+        assert_eq!(forecast.blocking, "cairn-3414's rust-tests");
         assert_eq!(forecast.occupant_count, 2);
     }
 
@@ -302,6 +302,6 @@ mod tests {
 
         let mut unnumbered = occupant("bun run test", 0, Some(1));
         unnumbered.owner.as_mut().unwrap().issue_number = None;
-        assert_eq!(describe_occupant(&unnumbered), "CAIRN's bun run test");
+        assert_eq!(describe_occupant(&unnumbered), "cairn's bun run test");
     }
 }

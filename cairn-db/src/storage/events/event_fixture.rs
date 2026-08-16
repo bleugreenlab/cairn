@@ -302,7 +302,7 @@ pub fn render_targets(targets: &[(&str, &[u8])]) -> String {
                 .expect("produce archived file segment")
         })
         .collect();
-    crate::storage::render::assemble(segments).text
+    crate::storage::render::assemble(segments, &crate::storage::render::TestByteMeter).text
 }
 
 /// One section of a mixed read batch for the hybrid-archival fixtures: a `file:`
@@ -333,7 +333,7 @@ pub fn mixed_render_targets(sections: &[MixedSection]) -> String {
             ),
         })
         .collect();
-    crate::storage::render::assemble(segments).text
+    crate::storage::render::assemble(segments, &crate::storage::render::TestByteMeter).text
 }
 
 /// The archived hybrid-read stub stored in `data`: the heavy `toolResult` is

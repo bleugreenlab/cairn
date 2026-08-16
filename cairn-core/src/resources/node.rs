@@ -26,6 +26,93 @@ use cairn_common::uri::{
     build_task_checks_uri, build_task_permission_uri,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ArtifactFormat {
+    Markdown,
+    Json,
+}
+
+pub(super) fn parse_artifact_format(
+    params: &[QueryParam],
+    allow_diff: bool,
+) -> Result<(ArtifactFormat, bool), String> {
+    let unexpected: Vec<&str> = params
+        .iter()
+        .filter(|param| param.key != "format" && !(allow_diff && param.key == "diff"))
+        .map(|param| param.key.as_str())
+        .collect();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "Query parameters are not supported on artifact resources: {}",
+            unexpected.join(", ")
+        ));
+    }
+
+    let format = match params.iter().rev().find(|param| param.key == "format") {
+        None => ArtifactFormat::Markdown,
+        Some(param) if param.value == "json" => ArtifactFormat::Json,
+        Some(param) => {
+            return Err(format!(
+                "Unsupported artifact format '{}'; expected json",
+                param.value
+            ))
+        }
+    };
+    let diff = params.iter().rev().find(|param| param.key == "diff");
+    if let Some(param) = diff {
+        if param.value != "full" {
+            return Err(format!(
+                "Unsupported artifact diff '{}'; expected full",
+                param.value
+            ));
+        }
+        if format == ArtifactFormat::Json {
+            return Err(
+                "format=json cannot be combined with diff=full; diff is Markdown-only".to_string(),
+            );
+        }
+    }
+    Ok((format, diff.is_some()))
+}
+
+#[cfg(test)]
+mod artifact_format_tests {
+    use super::*;
+
+    fn param(key: &str, value: &str) -> QueryParam {
+        QueryParam {
+            key: key.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn artifact_format_defaults_and_rejects_invalid_combinations() {
+        assert_eq!(
+            parse_artifact_format(&[], true).unwrap(),
+            (ArtifactFormat::Markdown, false)
+        );
+        assert_eq!(
+            parse_artifact_format(&[param("format", "json")], false).unwrap(),
+            (ArtifactFormat::Json, false)
+        );
+        assert!(parse_artifact_format(&[param("format", "yaml")], true)
+            .unwrap_err()
+            .contains("expected json"));
+        assert!(parse_artifact_format(&[param("other", "x")], false)
+            .unwrap_err()
+            .contains("other"));
+        assert!(
+            parse_artifact_format(&[param("format", "json"), param("diff", "full")], true)
+                .unwrap_err()
+                .contains("Markdown-only")
+        );
+        assert!(parse_artifact_format(&[param("diff", "full")], false)
+            .unwrap_err()
+            .contains("diff"));
+    }
+}
+
 /// Resolve the job id a node- or task-scoped URI addresses, read-only.
 ///
 /// `task_name: None` resolves a node job; `Some` resolves a sub-agent task job.
@@ -92,19 +179,32 @@ pub(crate) async fn resolve_node_or_task_job_id(
                 let project_key = project_key.clone();
                 let name = name.clone();
                 Box::pin(async move {
-                    let mut rows = conn
+                    let canonical_key = cairn_common::uri::canonical_project(&project_key);
+                    let mut projects = conn
                         .query(
-                            "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 LIMIT 1",
-                            cairn_db::turso::params![cairn_common::uri::canonical_project(project_key), name.as_str()],
+                            "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
+                            cairn_db::turso::params![canonical_key.as_str()],
                         )
                         .await?;
-                    let thread_id = rows
+                    let project_id = projects
                         .next()
                         .await?
                         .map(|row| row.get::<String>(0))
                         .transpose()?
-                        .ok_or_else(|| crate::storage::DbError::Row(format!("Thread '{name}' not found")))?;
-                    drop(rows);
+                        .ok_or_else(|| {
+                            crate::storage::DbError::Internal(format!(
+                                "No project found with key '{canonical_key}'"
+                            ))
+                        })?;
+                    drop(projects);
+                    let thread_id =
+                        crate::threads::thread_id_by_name_conn(conn, &project_id, &name)
+                            .await?
+                            .ok_or_else(|| {
+                                crate::storage::DbError::Internal(format!(
+                                    "Thread '{name}' not found in {canonical_key}"
+                                ))
+                            })?;
                     crate::threads::ensure_thread_session_conn(conn, &thread_id, None).await
                 })
             })
@@ -702,6 +802,7 @@ struct NodeQuestionRow {
     questions_json: String,
     response: Option<String>,
     answered: bool,
+    resolution: Option<cairn_db::models::ResolutionReceipt>,
 }
 
 async fn load_node_questions(
@@ -712,7 +813,9 @@ async fn load_node_questions(
     if let Ok(mut rows) = conn
         .query(
             "
-            SELECT p.uri_segment, p.questions, p.response, p.answered_at
+            SELECT p.uri_segment, p.questions, p.response, p.answered_at,
+                   p.resolution_id, p.resolution_surface, p.resolution_provider,
+                   p.resolution_conversation, p.resolution_actor, p.created_at
             FROM prompts p
             JOIN runs r ON p.run_id = r.id
             WHERE r.job_id = ?1
@@ -738,6 +841,16 @@ async fn load_node_questions(
                 questions_json,
                 response,
                 answered: answered_at.is_some(),
+                resolution: row.opt_text(5).ok().flatten().map(|surface| {
+                    cairn_db::models::ResolutionReceipt {
+                        id: row.opt_text(4).ok().flatten(),
+                        surface,
+                        provider: row.opt_text(6).ok().flatten(),
+                        conversation: row.opt_text(7).ok().flatten(),
+                        actor: row.opt_text(8).ok().flatten(),
+                        resolved_at: answered_at.unwrap_or_else(|| row.i64(9).unwrap_or_default()),
+                    }
+                }),
             });
         }
     }
@@ -781,6 +894,9 @@ pub(super) async fn read_node_questions(
             ));
             if let Some(response) = question.response.as_deref().filter(|r| !r.is_empty()) {
                 output.push_str(&format!("  → {}\n", response));
+            }
+            if let Some(receipt) = &question.resolution {
+                output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
             }
         }
         output.push('\n');
@@ -854,6 +970,21 @@ struct NodePermissionRow {
     summary: String,
     status: String,
     response: Option<String>,
+    resolution: Option<cairn_db::models::ResolutionReceipt>,
+}
+
+fn format_resolution_receipt(receipt: &cairn_db::models::ResolutionReceipt) -> String {
+    let mut origin = receipt.surface.clone();
+    if let Some(provider) = receipt.provider.as_deref() {
+        origin.push_str(&format!(" via {provider}"));
+    }
+    if let Some(conversation) = receipt.conversation.as_deref() {
+        origin.push_str(&format!(" in {conversation}"));
+    }
+    if let Some(actor) = receipt.actor.as_deref() {
+        origin.push_str(&format!(" by {actor}"));
+    }
+    format!("Resolved {origin} at {}", receipt.resolved_at)
 }
 
 async fn load_node_permissions(
@@ -864,7 +995,10 @@ async fn load_node_permissions(
     if let Ok(mut rows) = conn
         .query(
             "
-            SELECT pr.uri_segment, pr.tool_name, pr.tool_input, pr.status, pr.response
+            SELECT pr.uri_segment, pr.tool_name, pr.tool_input, pr.status, pr.response,
+                   pr.resolution_id, pr.resolution_surface, pr.resolution_provider,
+                   pr.resolution_conversation, pr.resolution_actor,
+                   pr.responded_at, pr.created_at
             FROM permission_requests pr
             JOIN runs r ON pr.run_id = r.id
             WHERE COALESCE(pr.job_id, r.job_id) = ?1
@@ -901,6 +1035,20 @@ async fn load_node_permissions(
                 summary,
                 status,
                 response,
+                resolution: row.opt_text(6).ok().flatten().map(|surface| {
+                    cairn_db::models::ResolutionReceipt {
+                        id: row.opt_text(5).ok().flatten(),
+                        surface,
+                        provider: row.opt_text(7).ok().flatten(),
+                        conversation: row.opt_text(8).ok().flatten(),
+                        actor: row.opt_text(9).ok().flatten(),
+                        resolved_at: row
+                            .opt_i64(10)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(|| row.i64(11).unwrap_or_default()),
+                    }
+                }),
             });
         }
     }
@@ -948,6 +1096,9 @@ pub(super) async fn read_node_permissions(
             ));
             if request.status != "pending" {
                 output.push_str(&format!("  → {}\n", request.status));
+            }
+            if let Some(receipt) = &request.resolution {
+                output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
             }
         }
         output.push('\n');
@@ -1970,6 +2121,7 @@ fn render_gated_artifact_actions(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn read_node_artifact(
     orch: &crate::orchestrator::Orchestrator,
     project_key: &str,
@@ -1977,6 +2129,7 @@ pub(super) async fn read_node_artifact(
     exec_seq: i32,
     node_name: &str,
     artifact_name: Option<&str>,
+    format: ArtifactFormat,
     diff_full: bool,
 ) -> String {
     let routed_db = orch.db.for_project(project_key).await;
@@ -1995,12 +2148,17 @@ pub(super) async fn read_node_artifact(
         None => get_artifact_for_job(&conn, &job.id).await,
     };
     let body = match &artifact {
+        Some(a) if format == ArtifactFormat::Json => a.data.clone(),
         Some(a) => render_artifact_markdown(&a.data),
         None => format!(
             "No artifact found for node '{}' in issue {}/{}",
             node_name, project_key, number
         ),
     };
+
+    if format == ArtifactFormat::Json {
+        return body;
+    }
 
     // Address the artifact at its canonical, schema-named URI (e.g. `/plan`,
     // `/create-pr`). The stored schema name wins over whatever alias the caller
@@ -2316,6 +2474,7 @@ pub(super) async fn read_task_chat_turn(
     crate::transcripts::format_transcript_full(&event_rows)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn read_task_artifact(
     db: &LocalDb,
     project_key: &str,
@@ -2323,6 +2482,8 @@ pub(super) async fn read_task_artifact(
     exec_seq: i32,
     node_name: &str,
     task_name: &str,
+    artifact_name: Option<&str>,
+    format: ArtifactFormat,
 ) -> String {
     let (conn, _parent_job, task_job) =
         match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
@@ -2332,8 +2493,14 @@ pub(super) async fn read_task_artifact(
             Err(error) => return error,
         };
 
-    // Get artifact for this task
-    match get_direct_artifact_for_job(&conn, &task_job.id).await {
+    // Named task reads follow that artifact's version chain. The generic alias
+    // retains latest-overall behavior.
+    let artifact = match artifact_name {
+        Some(name) => get_named_artifact_for_job(&conn, &task_job.id, name).await,
+        None => get_direct_artifact_for_job(&conn, &task_job.id).await,
+    };
+    match artifact {
+        Some(artifact) if format == ArtifactFormat::Json => artifact.data,
         Some(artifact) => render_artifact_markdown(&artifact.data),
         None => format!(
             "No artifact found for task '{}' in node '{}' of issue {}/{}",
@@ -2527,7 +2694,7 @@ mod task_permission_tests {
     async fn seed(db: &LocalDb) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',2,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-parent','e','i','p','running','builder','Builder',1,1)",
@@ -2547,7 +2714,7 @@ mod task_permission_tests {
         let db = test_db().await;
         seed(&db).await;
 
-        let resolved = read_task_permission(&db, "PRJ", 2, 1, "builder", "review", "perm-1").await;
+        let resolved = read_task_permission(&db, "prj", 2, 1, "builder", "review", "perm-1").await;
         assert!(
             resolved.contains("Permission perm-1") && resolved.contains("cross the fence"),
             "task permission should resolve: {resolved}"
@@ -2558,7 +2725,7 @@ mod task_permission_tests {
         );
 
         // The pre-fix URI named the task's own segment as a top-level node.
-        let broken = read_node_permission(&db, "PRJ", 2, 1, "review", "perm-1").await;
+        let broken = read_node_permission(&db, "prj", 2, 1, "review", "perm-1").await;
         assert!(
             broken.contains("not found"),
             "flat sub-task node URI must not resolve: {broken}"
@@ -2588,7 +2755,7 @@ mod coordinated_child_wakes_tests {
     async fn seed(db: &LocalDb) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('parent','p',1,'Parent','active',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, parent_issue_id, created_at, updated_at) VALUES ('child','p',2,'Child','active','parent',2,2)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','parent','p','running',1,1)",
@@ -2605,14 +2772,14 @@ mod coordinated_child_wakes_tests {
         let db = test_db().await;
         seed(&db).await;
 
-        let rendered = read_node_wakes(&db, "PRJ", 1, 1, "coordinator").await;
+        let rendered = read_node_wakes(&db, "prj", 1, 1, "coordinator").await;
 
         assert!(
             rendered.contains("## Coordinated child issues"),
             "got: {rendered}"
         );
         assert!(
-            rendered.contains("`cairn://p/PRJ/2`"),
+            rendered.contains("`cairn://p/prj/2`"),
             "the coordinated child must be named: {rendered}"
         );
         assert!(
@@ -2634,7 +2801,7 @@ mod coordinated_child_wakes_tests {
         .await
         .unwrap();
 
-        let rendered = read_node_wakes(&db, "PRJ", 1, 1, "coordinator").await;
+        let rendered = read_node_wakes(&db, "prj", 1, 1, "coordinator").await;
 
         assert!(
             !rendered.contains("Coordinated child issues"),
@@ -2823,7 +2990,7 @@ mod wait_artifact_tests {
     async fn seed_call(db: &LocalDb, run_status: &str, artifact: Option<&str>) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',3,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-wf','e','i','p','running','flow','Flow',1,1)",
@@ -2853,7 +3020,7 @@ mod wait_artifact_tests {
         seed_call(&db, "exited", Some(r#"{"answer":"42"}"#)).await;
         // Terminal on the first check: returns immediately with the raw JSON the
         // harness parses (no markdown rendering, no affordance).
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, r#"{"answer":"42"}"#);
     }
 
@@ -2861,7 +3028,7 @@ mod wait_artifact_tests {
     async fn wait_returns_failed_sentinel_for_failed_call() {
         let (orch, db) = orch_with_db().await;
         seed_call(&db, "failed", None).await;
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, CALL_WAIT_FAILED);
     }
 
@@ -2869,7 +3036,7 @@ mod wait_artifact_tests {
     async fn wait_returns_failed_sentinel_when_terminal_without_artifact() {
         let (orch, db) = orch_with_db().await;
         seed_call(&db, "exited", None).await;
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, CALL_WAIT_FAILED);
     }
 
@@ -2882,7 +3049,7 @@ mod wait_artifact_tests {
         // the artifact — the exact loss that made fan-out's Blue return `null`.
         let (orch, db) = orch_with_db().await;
         seed_call(&db, "crashed", Some(r#"{"answer":"blue"}"#)).await;
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, r#"{"answer":"blue"}"#);
     }
 
@@ -2891,7 +3058,7 @@ mod wait_artifact_tests {
         // Same invariant on a `failed` terminal run: the written artifact wins.
         let (orch, db) = orch_with_db().await;
         seed_call(&db, "failed", Some(r#"{"answer":"red"}"#)).await;
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, r#"{"answer":"red"}"#);
     }
 
@@ -2901,7 +3068,7 @@ mod wait_artifact_tests {
         // the failure sentinel — the fix only changes the artifact-present case.
         let (orch, db) = orch_with_db().await;
         seed_call(&db, "crashed", None).await;
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, CALL_WAIT_FAILED);
     }
 
@@ -2929,7 +3096,7 @@ mod wait_artifact_tests {
         )
         .await
         .unwrap();
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 3, 1, "flow", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 3, 1, "flow", "c1").await;
         assert_eq!(body, CALL_WAIT_FAILED);
     }
 
@@ -2943,7 +3110,7 @@ mod wait_artifact_tests {
         let (_orch, db) = orch_with_db().await;
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',3,'T','active',1,1)",
             "INSERT INTO jobs (id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-call','i','p','running','c1','Call',1,1)",
             // Predecessor first (lower rowid), replacement second (higher rowid),
@@ -2967,7 +3134,7 @@ mod wait_artifact_tests {
         // node-addressable by its segment despite having a parent.
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',4,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-builder','e','i','p','running','builder','Builder',1,1)",
@@ -2978,7 +3145,7 @@ mod wait_artifact_tests {
         ] {
             db.execute(sql, ()).await.unwrap();
         }
-        let body = wait_for_task_artifact(&orch, &db, "PRJ", 4, 1, "wf", "c1").await;
+        let body = wait_for_task_artifact(&orch, &db, "prj", 4, 1, "wf", "c1").await;
         assert_eq!(body, r#"{"v":1}"#);
     }
 }
@@ -3061,15 +3228,15 @@ mod gated_artifact_tests {
     fn gated_artifact_continue_targets_node_messages_collection() {
         let output = render_gated_artifact_actions(
             "body",
-            "cairn://p/CAIRN/2160/1/planner/plan",
-            "CAIRN",
+            "cairn://p/cairn/2160/1/planner/plan",
+            "cairn",
             2160,
             1,
             "planner",
         );
 
-        assert!(output.contains("[continue](cairn://p/CAIRN/2160/1/planner/messages)"));
-        assert!(output.contains("target:\"cairn://p/CAIRN/2160/1/planner/messages\""));
-        assert!(!output.contains("target:\"cairn://p/CAIRN/2160/1/planner\""));
+        assert!(output.contains("[continue](cairn://p/cairn/2160/1/planner/messages)"));
+        assert!(output.contains("target:\"cairn://p/cairn/2160/1/planner/messages\""));
+        assert!(!output.contains("target:\"cairn://p/cairn/2160/1/planner\""));
     }
 }

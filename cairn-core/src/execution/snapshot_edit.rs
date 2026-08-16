@@ -42,7 +42,7 @@ pub async fn update_execution_agent(
     // Resolve-early against current presets. Composer output that already
     // carries a concrete selection is stored verbatim; otherwise resolve
     // once (loud).
-    let normalized_snapshot = if agent_snapshot.selection.is_some() {
+    let mut normalized_snapshot = if agent_snapshot.selection.is_some() {
         agent_snapshot.clone()
     } else {
         let presets = load_effective_presets(&orch.config_dir, project_path.as_deref());
@@ -71,6 +71,14 @@ pub async fn update_execution_agent(
             &presets,
         )?
     };
+
+    // This is the one door an agent snapshot is edited through, so it is the one
+    // place that can honestly say an edit happened. The stamp is what tells a
+    // long-lived host (a thread session) that this snapshot is now customized
+    // and must stop being re-resolved from its authored definition each turn.
+    // Set server-side from the edit itself, never from the incoming payload:
+    // `merge_agent_patch` strips the field so a caller cannot assert it.
+    normalized_snapshot.edited_at = Some(chrono::Utc::now().timestamp());
 
     // Detect a prompt edit before overwriting the agent. The system prompt is
     // fixed at session spawn, so a prompt change can't reach the live session

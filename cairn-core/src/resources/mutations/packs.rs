@@ -10,11 +10,13 @@
 //! to send.
 
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use crate::config::pack::{self, ContentHash, PackItem, PackItemKind};
 use crate::orchestrator::Orchestrator;
 use crate::services::{RealFileSystem, RealGitClient};
-use crate::workspace::bundle::{sync_one_pack, uninstall_pack};
+use crate::workspace::bundle::{sync_one_pack, sync_resolved_pack, uninstall_pack};
 
 /// What one pack mutation did, in the terms the catalog itself uses.
 ///
@@ -39,6 +41,297 @@ pub struct PackMutationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed_item: Option<PackItem>,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<String>,
+}
+
+fn commit_plugin_snapshot(
+    stage: tempfile::TempDir,
+    destination: &Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let parent = destination
+        .parent()
+        .ok_or("Managed snapshot has no parent")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let backup = parent.join("source.previous");
+    if backup.exists() {
+        return Err(format!(
+            "Cannot commit managed plugin snapshot while stale backup exists at {}",
+            backup.display()
+        ));
+    }
+    let had_snapshot = destination.exists();
+    if had_snapshot {
+        std::fs::rename(destination, &backup)
+            .map_err(|e| format!("Failed to preserve managed plugin snapshot: {e}"))?;
+    }
+    if let Err(error) = std::fs::rename(stage.keep(), destination) {
+        if had_snapshot {
+            let _ = std::fs::rename(&backup, destination);
+        }
+        return Err(format!("Failed to retain managed plugin snapshot: {error}"));
+    }
+    Ok(had_snapshot.then_some(backup))
+}
+
+fn rollback_plugin_snapshot(destination: &Path, backup: Option<&Path>) {
+    let _ = std::fs::remove_dir_all(destination);
+    if let Some(backup) = backup {
+        let _ = std::fs::rename(backup, destination);
+    }
+}
+
+struct PackMutationSnapshot {
+    _temp: tempfile::TempDir,
+    entries: Vec<(PathBuf, Option<(PathBuf, bool)>)>,
+}
+
+impl PackMutationSnapshot {
+    fn capture(
+        config_dir: &Path,
+        pack_id: &str,
+        old_lock: Option<&pack::PackLock>,
+        new_manifest: &pack::PackManifest,
+    ) -> Result<Self, String> {
+        let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let mut paths = BTreeSet::from([
+            pack::lock::lock_path(config_dir, pack_id),
+            pack::lock::mcp_path(config_dir, pack_id),
+        ]);
+        for item in old_lock
+            .into_iter()
+            .flat_map(|lock| lock.items.iter().map(pack::PackLockItem::manifest_item))
+            .chain(new_manifest.items())
+        {
+            if let Some(path) = item.path {
+                paths.insert(config_dir.join(path));
+            }
+        }
+
+        let mut entries = Vec::with_capacity(paths.len());
+        for (index, path) in paths.into_iter().enumerate() {
+            let backup = temp.path().join(index.to_string());
+            let saved = if path.is_dir() {
+                crate::services::guarded_copy_tree(&path, &backup)?;
+                Some((backup, true))
+            } else if path.is_file() {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| format!("Snapshot path has no parent: {path:?}"))?;
+                crate::services::guarded_copy_file(parent, &path, &backup)?;
+                Some((backup, false))
+            } else {
+                None
+            };
+            entries.push((path, saved));
+        }
+        Ok(Self {
+            _temp: temp,
+            entries,
+        })
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        for (path, saved) in &self.entries {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)
+                    .map_err(|e| format!("Failed to clear rollback path {path:?}: {e}"))?;
+            } else if path.exists() {
+                std::fs::remove_file(path)
+                    .map_err(|e| format!("Failed to clear rollback path {path:?}: {e}"))?;
+            }
+            if let Some((backup, is_dir)) = saved {
+                if *is_dir {
+                    crate::services::guarded_copy_tree(backup, path)?;
+                } else {
+                    let parent = backup.parent().expect("temporary backup has a parent");
+                    crate::services::guarded_copy_file(parent, backup, path)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn stage_plugin_snapshot(
+    config_dir: &Path,
+    original: &Path,
+) -> Result<(tempfile::TempDir, pack::agent_plugin::AgentPlugin), String> {
+    let canonical = original
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve plugin path {original:?}: {e}"))?;
+    let plugin = pack::agent_plugin::load(&canonical)?;
+    let packs = config_dir.join(pack::lock::PACKS_DIR);
+    std::fs::create_dir_all(&packs).map_err(|e| e.to_string())?;
+    let stage = tempfile::Builder::new()
+        .prefix(".plugin-snapshot-")
+        .tempdir_in(&packs)
+        .map_err(|e| e.to_string())?;
+    crate::services::guarded_copy_tree(&canonical, stage.path())?;
+
+    // Project the extension into the canonical flat source layout consumed by
+    // the existing synchronizer. The original portable tree remains intact.
+    for dir in ["agents", "recipes", "responses", "workflows"] {
+        let source = stage
+            .path()
+            .join(pack::agent_plugin::CAIRN_EXTENSION)
+            .join(dir);
+        if source.is_dir() {
+            crate::services::guarded_copy_tree(&source, &stage.path().join(dir))?;
+        }
+    }
+    if !plugin.mcp_servers.is_empty() {
+        let servers = plugin
+            .mcp_servers
+            .iter()
+            .map(|(name, server)| (name.clone(), server.config.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let text = serde_yaml::to_string(&serde_json::json!({"mcpServers": servers}))
+            .map_err(|e| e.to_string())?;
+        std::fs::write(stage.path().join(pack::manifest::PACK_MCP_FILE), text)
+            .map_err(|e| e.to_string())?;
+    }
+    let mut staged = pack::agent_plugin::load(stage.path())?;
+    staged.manifest.root = stage.path().to_path_buf();
+    Ok((stage, staged))
+}
+
+pub fn import_agent_plugin(orch: &Orchestrator, path: &Path) -> Result<PackMutationResult, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve plugin path {path:?}: {e}"))?;
+    let (stage, plugin) = stage_plugin_snapshot(&orch.config_dir, &canonical)?;
+    let id = plugin.manifest.id.clone();
+    if pack::lock::read_lock(&orch.config_dir, &id).is_some()
+        || source_dir(orch)
+            .ok()
+            .and_then(|root| pack::available_pack(&root, &id))
+            .is_some()
+    {
+        return Err(format!("Pack id `{id}` collides with an existing pack"));
+    }
+    let destination = pack::lock::pack_dir(&orch.config_dir, &id).join("source");
+    let transaction = PackMutationSnapshot::capture(&orch.config_dir, &id, None, &plugin.manifest)?;
+    let backup = commit_plugin_snapshot(stage, &destination)?;
+    let mut manifest = plugin.manifest.clone();
+    manifest.root = destination.clone();
+    let result = sync_resolved_pack(
+        &RealGitClient,
+        &RealFileSystem,
+        &orch.config_dir,
+        manifest,
+        pack::PackSource::local(canonical.to_string_lossy().into_owned()),
+    )
+    .map_err(|error| {
+        rollback_plugin_snapshot(&destination, backup.as_deref());
+        match transaction.restore() {
+            Ok(()) => error,
+            Err(rollback) => format!("{error}; rollback failed: {rollback}"),
+        }
+    })?;
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_dir_all(backup);
+    }
+    orch.emit_pack_registry_change();
+    Ok(PackMutationResult {
+        action: "import".into(),
+        pack_id: id.clone(),
+        changed_paths: result.changed_paths,
+        diagnostics: plugin.diagnostics,
+        summary: format!("Imported Agent Plugin '{id}'"),
+        ..Default::default()
+    })
+}
+
+fn update_local_plugin(
+    orch: &Orchestrator,
+    lock: &pack::PackLock,
+) -> Result<PackMutationResult, String> {
+    let original = lock
+        .source
+        .path
+        .as_deref()
+        .ok_or("Local plugin source has no provenance path")?;
+    let (stage, plugin) = stage_plugin_snapshot(&orch.config_dir, Path::new(original))?;
+    if plugin.manifest.id != lock.id {
+        return Err(format!(
+            "Updated plugin id `{}` does not match installed id `{}`",
+            plugin.manifest.id, lock.id
+        ));
+    }
+    let destination = pack::lock::pack_dir(&orch.config_dir, &lock.id).join("source");
+    let transaction =
+        PackMutationSnapshot::capture(&orch.config_dir, &lock.id, Some(lock), &plugin.manifest)?;
+    let backup = commit_plugin_snapshot(stage, &destination)?;
+    let mut manifest = plugin.manifest.clone();
+    manifest.root = destination.clone();
+    let result = sync_resolved_pack(
+        &RealGitClient,
+        &RealFileSystem,
+        &orch.config_dir,
+        manifest,
+        lock.source.clone(),
+    )
+    .map_err(|error| {
+        rollback_plugin_snapshot(&destination, backup.as_deref());
+        match transaction.restore() {
+            Ok(()) => error,
+            Err(rollback) => format!("{error}; rollback failed: {rollback}"),
+        }
+    })?;
+    if let Some(backup) = backup {
+        let _ = std::fs::remove_dir_all(backup);
+    }
+    orch.emit_pack_registry_change();
+    Ok(PackMutationResult {
+        action: "update".into(),
+        pack_id: lock.id.clone(),
+        changed_paths: result.changed_paths,
+        diagnostics: plugin.diagnostics,
+        summary: format!("Updated pack '{}'", lock.id),
+        ..Default::default()
+    })
+}
+
+pub fn export_agent_plugin(
+    orch: &Orchestrator,
+    pack_id: &str,
+    destination: &Path,
+) -> Result<PackMutationResult, String> {
+    let lock = pack::lock::read_lock(&orch.config_dir, pack_id)
+        .ok_or_else(|| format!("Pack `{pack_id}` is not installed"))?;
+    let manifest = pack::PackManifest {
+        id: lock.id.clone(),
+        name: lock.name.clone(),
+        version: lock.version.clone(),
+        description: lock.description.clone(),
+        author: lock.author.clone(),
+        homepage: lock.homepage.clone(),
+        license: None,
+        keywords: lock.keywords.clone(),
+        default: false,
+        retired: vec![],
+        format: pack::PackFormat::AgentPlugin,
+        notes: lock.notes.clone(),
+        root: orch.config_dir.clone(),
+    };
+    let items = lock
+        .items
+        .iter()
+        .map(pack::PackLockItem::manifest_item)
+        .collect::<Vec<_>>();
+    let servers = pack::mcp::parse_pack_mcp_file(&pack::lock::mcp_path(&orch.config_dir, pack_id))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, config)| (name, pack::agent_plugin::AgentPluginServer { config }))
+        .collect();
+    pack::agent_plugin::export(destination, &manifest, &items, &servers)?;
+    Ok(PackMutationResult {
+        action: "export".into(),
+        pack_id: pack_id.into(),
+        summary: format!("Exported pack '{pack_id}' to {}", destination.display()),
+        ..Default::default()
+    })
 }
 
 /// Replace one live local copy with the pack's currently shipped item.
@@ -95,7 +388,7 @@ pub fn reset_pack_item(
                 .path
                 .as_deref()
                 .ok_or_else(|| format!("{} `{item_id}` has no materialized path", kind.as_str()))?;
-            match pack::hash_item_path(kind, &orch.config_dir.join(path))? {
+            match pack::hash_item_path(kind, &orch.config_dir, &orch.config_dir.join(path))? {
                 ContentHash::Present(hash) => hash,
                 ContentHash::Missing => {
                     return Err(format!(
@@ -163,6 +456,13 @@ pub fn apply_pack_action(
     action: &str,
     pack_id: &str,
 ) -> Result<PackMutationResult, String> {
+    if action == "update" {
+        if let Some(lock) = pack::lock::read_lock(&orch.config_dir, pack_id) {
+            if lock.source.kind == pack::PackSourceKind::Local {
+                return update_local_plugin(orch, &lock);
+            }
+        }
+    }
     // Resolve what this action will sync FROM before touching any lock. A
     // restore records its intent by rewriting the pack lock, so a source that
     // could never have been synced from must be refused while that record is
@@ -374,7 +674,11 @@ pub(super) fn dispatch_pack_action(
 ) -> Result<PackMutationResult, String> {
     let action = super::payload_trimmed_non_empty_str(payload, "action", &[])
         .ok_or("payload.action is required (install | update | restore | reset-item)")?;
-    if action == "reset-item" {
+    if action == "export" {
+        let path = super::payload_trimmed_non_empty_str(payload, "path", &[])
+            .ok_or("payload.path is required for export")?;
+        export_agent_plugin(orch, pack_id, Path::new(path))
+    } else if action == "reset-item" {
         let kind = super::payload_trimmed_non_empty_str(payload, "kind", &[])
             .ok_or("payload.kind is required for reset-item")?;
         let item_id = super::payload_trimmed_non_empty_str(payload, "itemId", &[])
@@ -727,6 +1031,96 @@ mod tests {
 
     /// The catalog is the one model both surfaces read, so it has to carry
     /// every state a picker distinguishes on.
+    fn write_failure_plugin(root: &Path, agent: &str, command: &str) {
+        write(
+            &root.join("plugin.json"),
+            &format!(
+                r#"{{"$schema":"{}","name":"rollback-plugin","version":"1.0.0","extensions":{{"dev.cairn":{{"version":1}}}}}}"#,
+                pack::agent_plugin::PLUGIN_SCHEMA_URI
+            ),
+        );
+        write(&root.join("dev.cairn/responses/first.md"), agent);
+        write(
+            &root.join("dev.cairn/workflows/later/workflow.yaml"),
+            "name: later\n",
+        );
+        write(
+            &root.join("mcp.json"),
+            &format!(
+                r#"{{"$schema":"{}","mcpServers":{{"rollback":{{"type":"stdio","command":"{command}"}}}}}}"#,
+                pack::agent_plugin::MCP_SCHEMA_URI
+            ),
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_local_sync_restores_source_lock_items_and_mcp() {
+        let ws = workspace().await;
+        let plugin = ws._temp.path().join("plugin");
+        write_failure_plugin(&plugin, "first import\n", "old-command");
+
+        std::fs::remove_dir_all(ws.home.join("skills")).unwrap();
+        std::fs::write(ws.home.join("skills"), "blocks skill directory\n").unwrap();
+        import_agent_plugin(&ws.orch, &plugin).expect_err("later item must fail");
+        assert!(!ws.home.join("agents/first.md").exists());
+        assert!(pack::lock::read_lock(&ws.home, "rollback-plugin").is_none());
+        assert!(!pack::lock::mcp_path(&ws.home, "rollback-plugin").exists());
+        assert!(!pack::lock::pack_dir(&ws.home, "rollback-plugin")
+            .join("source")
+            .exists());
+
+        std::fs::remove_file(ws.home.join("skills")).unwrap();
+        std::fs::create_dir_all(ws.home.join("skills")).unwrap();
+        import_agent_plugin(&ws.orch, &plugin).unwrap();
+        let source = pack::lock::pack_dir(&ws.home, "rollback-plugin").join("source");
+        let lock_before =
+            std::fs::read(pack::lock::lock_path(&ws.home, "rollback-plugin")).unwrap();
+        let mcp_before = std::fs::read(pack::lock::mcp_path(&ws.home, "rollback-plugin")).unwrap();
+        let source_before = std::fs::read(source.join("plugin.json")).unwrap();
+        let installed_lock = pack::lock::read_lock(&ws.home, "rollback-plugin").unwrap();
+        let agent_path = installed_lock
+            .items
+            .iter()
+            .find(|item| item.kind == PackItemKind::Response)
+            .and_then(|item| item.path.as_deref())
+            .unwrap();
+        let agent_before = std::fs::read(ws.home.join(agent_path)).unwrap();
+        let skill_path = installed_lock
+            .items
+            .iter()
+            .find(|item| item.kind == PackItemKind::Workflow)
+            .and_then(|item| item.path.as_deref())
+            .unwrap();
+        write_failure_plugin(&plugin, "updated before failure\n", "new-command");
+        std::fs::remove_dir_all(ws.home.join(skill_path)).unwrap();
+        std::fs::write(ws.home.join(skill_path), "blocks replacement\n").unwrap();
+        let skill_before = std::fs::read(ws.home.join(skill_path)).unwrap();
+        let error = apply_pack_action(&ws.orch, "update", "rollback-plugin")
+            .expect_err("later item must fail");
+        assert!(!error.contains("rollback failed"), "{error}");
+
+        assert_eq!(
+            std::fs::read(pack::lock::lock_path(&ws.home, "rollback-plugin")).unwrap(),
+            lock_before
+        );
+        assert_eq!(
+            std::fs::read(pack::lock::mcp_path(&ws.home, "rollback-plugin")).unwrap(),
+            mcp_before
+        );
+        assert_eq!(
+            std::fs::read(source.join("plugin.json")).unwrap(),
+            source_before
+        );
+        assert_eq!(
+            std::fs::read(ws.home.join(agent_path)).unwrap(),
+            agent_before
+        );
+        assert_eq!(
+            std::fs::read(ws.home.join(skill_path)).unwrap(),
+            skill_before
+        );
+    }
+
     #[tokio::test]
     async fn the_catalog_reports_installed_available_default_source_and_readiness() {
         let ws = workspace().await;

@@ -35,7 +35,11 @@ pub use completion::{
     OutputFormat,
 };
 pub use emitter::EventEmitter;
-pub use fs::{FileSystem, RealFileSystem};
+pub use fs::{
+    guarded_copy_file, guarded_copy_tree, guarded_resolve_file, guarded_tree_files, FileSystem,
+    GuardedTreeFile, RealFileSystem, GUARDED_TREE_MAX_FILES, GUARDED_TREE_MAX_FILE_BYTES,
+    GUARDED_TREE_MAX_TOTAL_BYTES,
+};
 pub use git::{GitClient, GitOutput, RealGitClient};
 pub use http::{HttpClient, HttpConfig, HttpMethod, HttpResponse, RealHttpClient, RedirectTarget};
 pub use process::{

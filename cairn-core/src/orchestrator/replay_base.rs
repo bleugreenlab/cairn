@@ -401,7 +401,7 @@ mod tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-              VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1);
+              VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
               VALUES ('issue-1', 'proj-1', 1, 'Child', 'active', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, branch, base_branch, created_at, updated_at)

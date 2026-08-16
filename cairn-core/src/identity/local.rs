@@ -13,7 +13,7 @@ use std::path::Path;
 use super::crypto::{decrypt_credential, encrypt_credential, get_machine_id};
 use super::{
     AccountOverrides, AccountSource, ApiProvider, ClaudeAuth, CodexAuth, GitIdentity,
-    IdentityStore, ProviderAccount, ProviderAuth, UserIdentity,
+    IdentityStore, ProviderAccount, ProviderAuth, RetiredLogin, UserIdentity,
 };
 
 const IDENTITY_FILENAME: &str = "identity.yaml";
@@ -65,6 +65,8 @@ struct IdentityStoreFile {
     accounts: Vec<AccountFile>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     project_overrides: std::collections::HashMap<String, AccountOverrides>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_logins: Vec<RetiredLogin>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -83,7 +85,7 @@ struct AccountFile {
     id: String,
     label: String,
     api_provider: ApiProvider,
-    source: AccountSource,
+    source: SourceFile,
     auth: AuthFile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     project_id: Option<String>,
@@ -99,6 +101,23 @@ struct AccountFile {
     health: Option<super::ProviderAccountHealth>,
 }
 
+/// On-disk account provenance.
+///
+/// `local_cli` is a retired shape: ambient CLI accounts used to be written
+/// here. The runtime model has no such source any more, so those rows are
+/// dropped when the file loads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceFile {
+    Configured,
+    LocalCli,
+    Server,
+}
+
+/// On-disk credential shape.
+///
+/// `local_cli` is likewise retired and readable only so an existing file still
+/// parses; nothing writes it.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 enum AuthFile {
@@ -147,14 +166,26 @@ pub fn load_identity_store(config_dir: &Path) -> Result<Option<IdentityStore>, S
             // V2 format — parse directly
             let file: IdentityStoreFile = serde_yaml::from_str(&content)
                 .map_err(|e| format!("Failed to parse v2 identity file: {}", e))?;
-            let store = store_from_v2_file(file, &machine_id)?;
+            let (mut store, retired) = store_from_v2_file(file, &machine_id)?;
+            store.config_dir = config_dir.to_path_buf();
+            // Write the pruned store straight back. The retired logins are the
+            // only record that those accounts existed, and they have to outlive
+            // this process for the UI to explain the change even once.
+            if retired {
+                if let Err(e) = save_identity_store(config_dir, &store) {
+                    log::warn!("Failed to persist retired Anthropic logins: {e}");
+                } else {
+                    log::info!("Retired non-profile Anthropic logins from identity.yaml");
+                }
+            }
             Ok(Some(store))
         }
         None | Some(1) => {
             // V1 or unversioned — migrate
             let file: IdentityFileV1 = serde_yaml::from_str(&content)
                 .map_err(|e| format!("Failed to parse v1 identity file: {}", e))?;
-            let store = migrate_v1_to_store(file, &machine_id)?;
+            let mut store = migrate_v1_to_store(file, &machine_id)?;
+            store.config_dir = config_dir.to_path_buf();
 
             // Save as v2 for future loads
             if let Err(e) = save_identity_store(config_dir, &store) {
@@ -201,20 +232,17 @@ pub fn identity_exists(config_dir: &Path) -> bool {
     config_dir.join(IDENTITY_FILENAME).exists()
 }
 
-/// Return ephemeral ambient accounts.
-///
-/// Ambient CLI accounts are intentionally not synthesized: managed provider
-/// profiles are the canonical authentication path for agent sessions.
-pub fn detect_local_accounts() -> Vec<ProviderAccount> {
-    Vec::new()
-}
-
 /// Auto-populate a new identity store from git config (for first-run).
-pub(crate) fn identity_store_from_git_config() -> IdentityStore {
+///
+/// Takes the configuration root rather than inferring one: this store resolves
+/// managed profile paths, and it has to name the same directory the sign-in
+/// that creates them will use.
+pub(crate) fn identity_store_from_git_config(config_dir: &Path) -> IdentityStore {
     let name = git_config_value("user.name").unwrap_or_default();
     let email = git_config_value("user.email").unwrap_or_default();
 
     IdentityStore {
+        config_dir: config_dir.to_path_buf(),
         user_id: format!("local-{}", uuid::Uuid::new_v4()),
         accounts: vec![],
         git_identities: vec![GitIdentity {
@@ -225,6 +253,7 @@ pub(crate) fn identity_store_from_git_config() -> IdentityStore {
             sort_order: 0,
         }],
         project_overrides: Default::default(),
+        retired_logins: Vec::new(),
     }
 }
 
@@ -249,6 +278,8 @@ pub fn save_local_identity(config_dir: &Path, identity: &UserIdentity) -> Result
         accounts: vec![],
         git_identities: vec![],
         project_overrides: Default::default(),
+        retired_logins: Vec::new(),
+        config_dir: config_dir.to_path_buf(),
     });
 
     // Update git identity
@@ -271,7 +302,6 @@ pub fn save_local_identity(config_dir: &Path, identity: &UserIdentity) -> Result
         &mut store.accounts,
         ApiProvider::Anthropic,
         identity.claude_auth.as_ref().map(|a| match a {
-            ClaudeAuth::OAuthToken(v) => ProviderAuth::OAuthToken { value: v.clone() },
             ClaudeAuth::ApiKey(v) => ProviderAuth::ApiKey { value: v.clone() },
             ClaudeAuth::ConfigDir(_) => ProviderAuth::ClaudeProfile,
         }),
@@ -343,24 +373,26 @@ fn update_account_from_auth(
 
 fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<IdentityStore, String> {
     let mut accounts = Vec::new();
+    let mut retired_logins = Vec::new();
     let now = chrono::Utc::now().timestamp();
 
-    // Migrate Claude auth
-    if let Some(claude_file) = file.claude_auth {
-        let auth = match claude_file {
-            ClaudeAuthFile::OAuthToken { encrypted } => ProviderAuth::OAuthToken {
-                value: decrypt_credential(&encrypted, machine_id)?,
-            },
-            ClaudeAuthFile::ApiKey { encrypted } => ProviderAuth::ApiKey {
-                value: decrypt_credential(&encrypted, machine_id)?,
-            },
-        };
-        accounts.push(ProviderAccount {
+    // Migrate Claude auth. A v1 setup token is the oldest form of the shape
+    // this model dropped, so it retires here rather than migrating forward
+    // into an account nothing can use.
+    match file.claude_auth {
+        Some(ClaudeAuthFile::OAuthToken { .. }) => retired_logins.push(RetiredLogin {
+            label: "Anthropic".to_string(),
+            auth_type: "oauth_token".to_string(),
+            retired_at: now,
+        }),
+        Some(ClaudeAuthFile::ApiKey { encrypted }) => accounts.push(ProviderAccount {
             id: format!("acc_{}", uuid::Uuid::new_v4()),
             label: "Anthropic".to_string(),
             api_provider: ApiProvider::Anthropic,
             source: AccountSource::Configured,
-            auth,
+            auth: ProviderAuth::ApiKey {
+                value: decrypt_credential(&encrypted, machine_id)?,
+            },
             project_id: None,
             sort_order: 0,
             created_at: now,
@@ -368,7 +400,8 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             email: None,
             plan: None,
             health: None,
-        });
+        }),
+        None => {}
     }
 
     // Migrate Codex auth
@@ -427,13 +460,52 @@ fn migrate_v1_to_store(file: IdentityFileV1, machine_id: &str) -> Result<Identit
             sort_order: 0,
         }],
         project_overrides: Default::default(),
+        retired_logins,
+        // Stamped by `load_identity_store`, which is the only caller and the
+        // only place that knows which root this file came from.
+        config_dir: std::path::PathBuf::new(),
     })
 }
 
-fn store_from_v2_file(file: IdentityStoreFile, machine_id: &str) -> Result<IdentityStore, String> {
+/// Load a v2 file, dropping credential shapes the model no longer accepts.
+///
+/// Returns the store and whether anything was dropped, so the caller can write
+/// the pruned file back. Two shapes go: ambient CLI rows (any provider) and
+/// Anthropic setup tokens. Anthropic ones leave a `RetiredLogin` behind — the
+/// user chose that credential, and needs to be told it is gone and that signing
+/// in again creates a managed profile. OpenAI's ambient row was already
+/// unusable before this and leaves nothing.
+fn store_from_v2_file(
+    file: IdentityStoreFile,
+    machine_id: &str,
+) -> Result<(IdentityStore, bool), String> {
     let mut accounts = Vec::new();
+    let mut retired_logins = file.retired_logins;
+    let already_retired = retired_logins.len();
+    let mut dropped_openai_ambient = false;
+    let now = chrono::Utc::now().timestamp();
 
     for acc_file in file.accounts {
+        let is_anthropic = acc_file.api_provider == ApiProvider::Anthropic;
+        let retired_shape = match &acc_file.auth {
+            _ if acc_file.source == SourceFile::LocalCli => Some("local_cli"),
+            AuthFile::LocalCli => Some("local_cli"),
+            AuthFile::OAuthToken { .. } if is_anthropic => Some("oauth_token"),
+            _ => None,
+        };
+        if let Some(auth_type) = retired_shape {
+            if is_anthropic {
+                retired_logins.push(RetiredLogin {
+                    label: acc_file.label,
+                    auth_type: auth_type.to_string(),
+                    retired_at: now,
+                });
+            } else {
+                dropped_openai_ambient = true;
+            }
+            continue;
+        }
+
         let auth = match acc_file.auth {
             AuthFile::ApiKey { encrypted } => ProviderAuth::ApiKey {
                 value: decrypt_credential(&encrypted, machine_id)?,
@@ -442,19 +514,19 @@ fn store_from_v2_file(file: IdentityStoreFile, machine_id: &str) -> Result<Ident
                 value: decrypt_credential(&encrypted, machine_id)?,
             },
             AuthFile::BaseUrl { url } => ProviderAuth::BaseUrl { url },
-            AuthFile::LocalCli => ProviderAuth::LocalCli,
             AuthFile::ClaudeProfile => ProviderAuth::ClaudeProfile,
+            // Both retired shapes are handled above; a `local_cli` row never
+            // reaches here.
+            AuthFile::LocalCli => continue,
         };
-        if acc_file.api_provider == ApiProvider::OpenAI
-            && acc_file.source == AccountSource::LocalCli
-        {
-            continue;
-        }
         accounts.push(ProviderAccount {
             id: acc_file.id,
             label: acc_file.label,
             api_provider: acc_file.api_provider,
-            source: acc_file.source,
+            source: match acc_file.source {
+                SourceFile::Server => AccountSource::Server,
+                SourceFile::Configured | SourceFile::LocalCli => AccountSource::Configured,
+            },
             auth,
             project_id: acc_file.project_id,
             sort_order: acc_file.sort_order,
@@ -478,29 +550,25 @@ fn store_from_v2_file(file: IdentityStoreFile, machine_id: &str) -> Result<Ident
         })
         .collect();
 
-    Ok(IdentityStore {
-        user_id: file.user_id,
-        accounts,
-        git_identities,
-        project_overrides: file.project_overrides,
-    })
+    let migrated = dropped_openai_ambient || retired_logins.len() > already_retired;
+    Ok((
+        IdentityStore {
+            user_id: file.user_id,
+            accounts,
+            git_identities,
+            project_overrides: file.project_overrides,
+            retired_logins,
+            // Stamped by `load_identity_store`, which knows the root.
+            config_dir: std::path::PathBuf::new(),
+        },
+        migrated,
+    ))
 }
 
 fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityStoreFile, String> {
     let mut accounts = Vec::new();
 
     for account in &store.accounts {
-        if account.api_provider == ApiProvider::OpenAI && account.source == AccountSource::LocalCli
-        {
-            continue;
-        }
-
-        // Skip ephemeral LocalCli accounts that haven't been reordered by the user.
-        // If the user reordered them (sort_order != 1000), persist so the preference sticks.
-        if account.source == AccountSource::LocalCli && account.sort_order == 1000 {
-            continue;
-        }
-
         let auth = match &account.auth {
             ProviderAuth::ApiKey { value } => AuthFile::ApiKey {
                 encrypted: encrypt_credential(value, machine_id)?,
@@ -509,7 +577,6 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
                 encrypted: encrypt_credential(value, machine_id)?,
             },
             ProviderAuth::BaseUrl { url } => AuthFile::BaseUrl { url: url.clone() },
-            ProviderAuth::LocalCli => AuthFile::LocalCli,
             ProviderAuth::ClaudeProfile => AuthFile::ClaudeProfile,
         };
 
@@ -517,7 +584,10 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
             id: account.id.clone(),
             label: account.label.clone(),
             api_provider: account.api_provider,
-            source: account.source.clone(),
+            source: match account.source {
+                AccountSource::Configured => SourceFile::Configured,
+                AccountSource::Server => SourceFile::Server,
+            },
             auth,
             project_id: account.project_id.clone(),
             sort_order: account.sort_order,
@@ -547,6 +617,7 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
         git_identities,
         accounts,
         project_overrides: store.project_overrides.clone(),
+        retired_logins: store.retired_logins.clone(),
     })
 }
 
@@ -652,28 +723,6 @@ mod tests {
         )
     }
 
-    fn local_cli_account(
-        id: &str,
-        label: &str,
-        api_provider: ApiProvider,
-        sort_order: i32,
-    ) -> ProviderAccount {
-        ProviderAccount {
-            id: id.to_string(),
-            label: label.to_string(),
-            api_provider,
-            source: AccountSource::LocalCli,
-            auth: ProviderAuth::LocalCli,
-            project_id: None,
-            sort_order,
-            created_at: 0,
-            last_used_at: None,
-            email: None,
-            plan: None,
-            health: None,
-        }
-    }
-
     fn git_identity(
         id: &str,
         label: &str,
@@ -700,6 +749,8 @@ mod tests {
             accounts,
             git_identities,
             project_overrides: Default::default(),
+            retired_logins: Vec::new(),
+            config_dir: std::path::PathBuf::new(),
         }
     }
 
@@ -808,11 +859,11 @@ mod tests {
         let store = identity_store(
             "local-multi",
             vec![
-                oauth_account(
+                configured_account(
                     "acc_1",
                     "Personal",
                     ApiProvider::Anthropic,
-                    "oauth-token",
+                    ProviderAuth::ClaudeProfile,
                     0,
                     1000,
                     None,
@@ -885,40 +936,80 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_local_cli_accounts_not_persisted() {
+    fn legacy_anthropic_logins_are_retired_on_load_and_pruned_from_disk() {
+        // The acceptance case for an existing install: a store carrying an
+        // ambient CLI row and a setup token loads cleanly, keeps the accounts
+        // that are still credentials, and can explain the two that went.
         let dir = TempDir::new().unwrap();
+        let machine_id = get_machine_id();
+        let encrypted = encrypt_credential("sk-ant-setup-token", &machine_id).unwrap();
+        let content = format!(
+            r#"# Cairn Identity Store (v2)
+version: 2
+userId: test-user
+gitIdentities: []
+accounts:
+  - id: local_cli_anthropic
+    label: Claude Code
+    apiProvider: anthropic
+    source: local_cli
+    auth:
+      type: local_cli
+    sortOrder: 0
+    createdAt: 0
+  - id: acc_token
+    label: Max subscription
+    apiProvider: anthropic
+    source: configured
+    auth:
+      type: oauth_token
+      encrypted: {encrypted}
+    sortOrder: 1
+    createdAt: 0
+  - id: acc_profile
+    label: work@example.com
+    apiProvider: anthropic
+    source: configured
+    auth:
+      type: claude_profile
+    sortOrder: 2
+    createdAt: 0
+"#
+        );
+        std::fs::write(dir.path().join(IDENTITY_FILENAME), content).unwrap();
 
-        let store = identity_store(
-            "test",
+        let store = load_identity_store(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            store
+                .accounts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["acc_profile"]
+        );
+        assert_eq!(
+            store
+                .retired_logins
+                .iter()
+                .map(|r| (r.label.as_str(), r.auth_type.as_str()))
+                .collect::<Vec<_>>(),
             vec![
-                api_key_account(
-                    "acc_1",
-                    "Configured",
-                    ApiProvider::Anthropic,
-                    "key",
-                    0,
-                    0,
-                    None,
-                ),
-                local_cli_account(
-                    "local_cli_anthropic",
-                    "Local CLI",
-                    ApiProvider::Anthropic,
-                    1000,
-                ),
-            ],
-            vec![],
+                ("Claude Code", "local_cli"),
+                ("Max subscription", "oauth_token"),
+            ]
         );
 
-        let loaded = roundtrip_saved(
-            &dir,
-            |path| save_identity_store(path, &store),
-            load_identity_store,
-        );
-
-        // LocalCli accounts should not be persisted
-        assert_eq!(loaded.accounts.len(), 1);
-        assert_eq!(loaded.accounts[0].label, "Configured");
+        // The pruned store is written back, so the notice survives a restart
+        // and the dropped rows do not come back.
+        let reloaded = load_identity_store(dir.path()).unwrap().unwrap();
+        assert_eq!(reloaded.accounts.len(), 1);
+        assert_eq!(reloaded.retired_logins.len(), 2);
+        // The retired entries name the shapes they used to have, so look for
+        // the account fields specifically rather than the words.
+        let raw = std::fs::read_to_string(dir.path().join(IDENTITY_FILENAME)).unwrap();
+        assert!(!raw.contains("type: local_cli"), "got: {raw}");
+        assert!(!raw.contains("source: local_cli"), "got: {raw}");
+        assert!(!raw.contains("type: oauth_token"), "got: {raw}");
     }
 
     // === V1 migration tests ===
@@ -1074,14 +1165,14 @@ mod tests {
     }
 
     #[test]
-    fn test_oauth_token_roundtrip() {
+    fn test_claude_profile_roundtrip() {
         let dir = TempDir::new().unwrap();
 
         let identity = user_identity(
             "test",
             "test@test.com",
             "Test",
-            Some(ClaudeAuth::OAuthToken("oauth-token-xyz".to_string())),
+            Some(ClaudeAuth::ConfigDir("/tmp/ignored".into())),
             None,
             None,
         );
@@ -1092,10 +1183,9 @@ mod tests {
             load_local_identity,
         );
 
-        match loaded.claude_auth {
-            Some(ClaudeAuth::OAuthToken(token)) => assert_eq!(token, "oauth-token-xyz"),
-            other => panic!("Expected OAuthToken, got {:?}", other),
-        }
+        // The stored shape is the account, not the path: the profile directory
+        // is derived from the account id on resolve.
+        assert!(matches!(loaded.claude_auth, Some(ClaudeAuth::ConfigDir(_))));
     }
 
     #[test]
@@ -1187,47 +1277,41 @@ mod tests {
     }
 
     #[test]
-    fn test_v2_local_cli_with_custom_sort_order_is_persisted() {
-        // When user reorders a LocalCli account (sort_order != 1000),
-        // it should be persisted so the preference sticks.
+    fn a_loaded_store_knows_the_root_it_came_from() {
+        // Managed profiles live under this root, so a store that could not name
+        // it resolved sessions to a different directory than sign-in wrote.
         let dir = TempDir::new().unwrap();
+        let store = identity_store("test", vec![], vec![]);
+        save_identity_store(dir.path(), &store).unwrap();
 
-        let store = identity_store(
-            "test",
-            vec![
-                local_cli_account(
-                    "local_cli_anthropic",
-                    "Local CLI",
-                    ApiProvider::Anthropic,
-                    0,
-                ),
-                api_key_account(
-                    "acc_1",
-                    "API Key",
-                    ApiProvider::Anthropic,
-                    "sk-key",
-                    1,
-                    0,
-                    None,
-                ),
-            ],
-            vec![],
-        );
+        let loaded = load_identity_store(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.config_dir, dir.path());
+    }
+
+    #[test]
+    fn retired_logins_survive_a_save_until_they_are_acknowledged() {
+        let dir = TempDir::new().unwrap();
+        let mut store = identity_store("test", vec![], vec![]);
+        store.retired_logins.push(RetiredLogin {
+            label: "Max subscription".to_string(),
+            auth_type: "oauth_token".to_string(),
+            retired_at: 42,
+        });
 
         let loaded = roundtrip_saved(
             &dir,
             |path| save_identity_store(path, &store),
             load_identity_store,
         );
+        assert_eq!(loaded.retired_logins, store.retired_logins);
 
-        // Both accounts should be persisted since LocalCli has non-1000 sort_order
-        assert_eq!(loaded.accounts.len(), 2);
-        let local = loaded
-            .accounts
-            .iter()
-            .find(|a| a.source == AccountSource::LocalCli)
-            .expect("LocalCli account should be persisted");
-        assert_eq!(local.sort_order, 0);
+        store.retired_logins.clear();
+        let cleared = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
+        assert!(cleared.retired_logins.is_empty());
     }
 
     #[test]
@@ -1310,14 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn detect_local_accounts_does_not_include_openai_local_cli() {
-        let accounts = detect_local_accounts();
-        assert!(!accounts.iter().any(|a| {
-            a.api_provider == ApiProvider::OpenAI && a.source == AccountSource::LocalCli
-        }));
-    }
-
-    #[test]
     fn test_v2_openai_local_cli_accounts_are_ignored_on_load() {
         let dir = TempDir::new().unwrap();
         let content = r#"# Cairn Identity Store (v2)
@@ -1338,6 +1414,9 @@ accounts:
 
         let store = load_identity_store(dir.path()).unwrap().unwrap();
         assert!(store.accounts.is_empty());
+        // An ambient OpenAI row was never a usable credential, so it goes
+        // without a notice.
+        assert!(store.retired_logins.is_empty());
     }
 
     #[test]
@@ -1406,7 +1485,7 @@ gitIdentities: []
 accounts:
   - id: acc_1
     label: Test
-    apiProvider: anthropic
+    apiProvider: openai
     source: configured
     auth:
       type: o_auth_token

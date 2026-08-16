@@ -333,13 +333,13 @@ mod tests {
                 "issues": [
                     {
                         "id": "iss-1",
-                        "key": "PROJ-42",
+                        "key": "proj-42",
                         "title": "Fix login",
                         "description": "Login page crashes",
                     },
                     {
                         "id": "iss-2",
-                        "key": "PROJ-55",
+                        "key": "proj-55",
                         "title": "Update deps",
                         "description": null,
                     }
@@ -355,9 +355,9 @@ mod tests {
         }];
         let output = format_resolved_inputs(&inputs);
         assert!(output.contains("## Source Issues"));
-        assert!(output.contains("### PROJ-42 — Fix login"));
+        assert!(output.contains("### proj-42 — Fix login"));
         assert!(output.contains("Login page crashes"));
-        assert!(output.contains("### PROJ-55 — Update deps"));
+        assert!(output.contains("### proj-55 — Update deps"));
         assert!(output.contains("## Trigger Event"));
     }
 }

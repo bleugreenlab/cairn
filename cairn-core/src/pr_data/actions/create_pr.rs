@@ -266,7 +266,7 @@ mod tests {
             .expect_err("an unpublishable branch must not report a completed sync");
 
         assert!(
-            error.contains("Failed to publish") && error.contains("agent/PROJ-4-builder-0"),
+            error.contains("Failed to publish") && error.contains("agent/proj-4-builder-0"),
             "the failure must name the branch it could not publish: {error}"
         );
         assert!(

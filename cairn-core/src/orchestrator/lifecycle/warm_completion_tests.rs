@@ -1,6 +1,6 @@
 use super::{
-    finalize_run, stop_job, stop_session_internal, suspend_run_for_durable_wait,
-    transition_to_warm_state, InterruptFailurePolicy,
+    finalize_run, finalize_run_for_recovery, stop_job, stop_session_internal,
+    suspend_run_for_durable_wait, transition_to_warm_state, InterruptFailurePolicy,
 };
 use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
 use crate::db::DbState;
@@ -96,7 +96,7 @@ async fn test_db() -> LocalDb {
     db
 }
 
-fn test_orchestrator(db: LocalDb) -> Orchestrator {
+pub(super) fn test_orchestrator(db: LocalDb) -> Orchestrator {
     test_orchestrator_with_emitter(db, None).0
 }
 
@@ -125,7 +125,7 @@ fn test_orchestrator_with_emitter(
 
 /// Register a warm-able process so `transition_to_warm` succeeds. The stdin
 /// is an in-memory writer; the child slot is empty (no real process).
-fn register_warm_process(orch: &Orchestrator, run_id: &str, job_id: Option<&str>) {
+pub(super) fn register_warm_process(orch: &Orchestrator, run_id: &str, job_id: Option<&str>) {
     let mut processes = orch.process_state.processes.lock().unwrap();
     let child = Arc::new(Mutex::new(None));
     let stdin = Arc::new(Mutex::new(Some(wrap_plain_stdin(Box::new(
@@ -187,7 +187,7 @@ async fn seed_top_level_run(
             let attention = attention.clone();
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-attn','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-attn','w-attn','Project','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-attn','w-attn','Project','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-attn','p-attn',42,'Toast issue','active',?1,1,1)", (attention.as_str(),)).await?;
                 conn.execute("INSERT INTO jobs (id, issue_id, project_id, status, node_name, created_at, updated_at) VALUES (?1,'i-attn','p-attn','running','builder',1,1)", (job_id.as_str(),)).await?;
                 conn.execute("INSERT INTO runs (id, job_id, status, created_at, updated_at) VALUES (?1,?2,'live',1,1)", (run_id.as_str(), job_id.as_str())).await?;
@@ -301,7 +301,7 @@ async fn warm_transition_emits_completion_attention_for_top_level_run() {
     assert_eq!(completed.len(), 1);
     assert_eq!(
         completed[0].get("projectKey"),
-        Some(&Value::String("PRJ".into()))
+        Some(&Value::String("prj".into()))
     );
     assert_eq!(
         completed[0].get("issueNumber").and_then(Value::as_i64),
@@ -359,6 +359,44 @@ async fn later_finalize_does_not_duplicate_completed_attention() {
 }
 
 #[tokio::test]
+async fn recovery_finalization_preserves_an_already_complete_turn() {
+    let db = test_db().await;
+    seed_top_level_run(
+        &db,
+        "run-terminal-recovery",
+        "job-terminal-recovery",
+        "turn-terminal-recovery",
+        "none",
+    )
+    .await;
+    db.execute(
+        "UPDATE turns SET state = 'complete', ended_at = 2 WHERE id = 'turn-terminal-recovery'",
+        (),
+    )
+    .await
+    .unwrap();
+    let orch = test_orchestrator(db);
+
+    finalize_run_for_recovery(&orch, "run-terminal-recovery", RunStatus::Crashed)
+        .expect("run ownership should finalize without rewriting the terminal turn");
+
+    assert_eq!(
+        turn_state(&orch, "turn-terminal-recovery").await,
+        "complete"
+    );
+    assert_eq!(
+        scalar_text(
+            &orch,
+            "SELECT status FROM runs WHERE id = ?1",
+            "run-terminal-recovery"
+        )
+        .await
+        .as_deref(),
+        Some("crashed")
+    );
+}
+
+#[tokio::test]
 async fn clean_finalize_without_prior_warm_does_not_emit_completed_attention() {
     let db = test_db().await;
     seed_top_level_run(&db, "run-finalize", "job-finalize", "turn-finalize", "none").await;
@@ -407,7 +445,7 @@ async fn seed_suspended_parent_with_completed_child(db: &LocalDb, snapshot: Stri
             let snapshot = snapshot.clone();
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
                 conn.execute(
                     "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)",
@@ -485,7 +523,7 @@ async fn seed_suspended_parent_with_running_child(db: &LocalDb, snapshot: String
             let snapshot = snapshot.clone();
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-warm','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-warm','w-warm','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-warm','p-warm',1,'T','active','none',1,1)", ()).await?;
                 conn.execute(
                     "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-warm','recipe','i-warm','p-warm','running',1,1,?1)",
@@ -626,7 +664,7 @@ async fn seed_suspended_parent_with_completed_nodeless_child(db: &LocalDb, snaps
             let snapshot = snapshot.clone();
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-wf','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-wf','p-wf',1,'T','active','none',1,1)", ()).await?;
                 conn.execute(
                     "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-wf','recipe','i-wf','p-wf','running',1,1,?1)",
@@ -724,7 +762,7 @@ async fn fail_run_terminalizes_nodeless_workflow_child_and_resumes_parent() {
     db.write(|conn| {
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-wf','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-wf','p-wf',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-wf','recipe','i-wf','p-wf','running',1,1,?1)", (completed_nodeless_child_snapshot("running").as_str(),)).await?;
                 conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
@@ -768,7 +806,7 @@ async fn startup_heal_recovers_stuck_nodeless_child_and_resumes_parent() {
     db.write(|conn| {
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-wf','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-wf','w-wf','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-wf','p-wf',1,'T','waiting','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-wf','recipe','i-wf','p-wf','running',1,1,?1)", (completed_nodeless_child_snapshot("running").as_str(),)).await?;
                 conn.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, yield_reason, start_reason, created_at, updated_at) VALUES ('anchor','s-parent','j-parent',1,'yielded','dependency_wait','initial',1,1)", ()).await?;
@@ -821,7 +859,7 @@ async fn reduce_leaves_packetless_child_task_untouched() {
             let s = empty_snapshot.clone();
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-ct','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-ct','w-ct','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-ct','w-ct','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-ct','p-ct',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-ct','recipe','i-ct','p-ct','running',1,1,?1)", (s.as_str(),)).await?;
                 conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, created_at, updated_at) VALUES ('j-ct-parent','e-ct','i-ct','p-ct','running',1,1)", ()).await?;
@@ -878,7 +916,7 @@ async fn seed_runless_suspended_job(db: &LocalDb) {
     db.write(|conn| {
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-sj','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-sj','w-sj','P','PRJ','/tmp/prj',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-sj','w-sj','P','prj','/tmp/prj',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-sj','p-sj',7,'T','waiting','needs_input',1,1)", ()).await?;
                 // Yielded work turn + the pending successor it points at. Inserted
                 // before the job because `jobs.current_turn_id` references it.

@@ -16,6 +16,8 @@ static ADMISSION_STATES: OnceLock<Mutex<HashMap<&'static str, (&'static str, Str
     OnceLock::new();
 static IMESSAGE_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static TELEGRAM_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static DISCORD_ADMISSION_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+static DISCORD_SURFACE_WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
 static OPERATOR_PRESENCE_STATE: OnceLock<Mutex<OperatorPresenceState>> = OnceLock::new();
 static DESKTOP_ACTIVITY_STATE: OnceLock<Mutex<DesktopActivityState>> = OnceLock::new();
 static OPERATOR_PRESENCE_CHANGED: OnceLock<tokio::sync::Notify> = OnceLock::new();
@@ -31,6 +33,229 @@ struct AdmissionFailureReporter {
     last_error: Option<String>,
     last_reported_at: Option<Instant>,
     suppressed: u64,
+}
+
+pub fn wake_discord_surfaces() {
+    DISCORD_SURFACE_WAKE
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_one();
+}
+
+pub async fn ensure_discord_thread_surface(
+    orch: &crate::orchestrator::Orchestrator,
+    db: &crate::storage::LocalDb,
+    project_id: &str,
+    thread_name: &str,
+) -> Result<(), String> {
+    let config = crate::config::settings::load_settings(&orch.config_dir)
+        .channels
+        .discord;
+    if !config.enabled {
+        return Ok(());
+    }
+    let guild_id = config
+        .guild_id
+        .parse::<u64>()
+        .map_err(|_| "Discord guild ID must be an unsigned integer".to_string())?;
+    let project = crate::projects::crud::get_db(db, project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("Project not found after thread creation: {project_id}"))?;
+    let now = chrono::Utc::now().timestamp();
+    let category = discord_surfaces::ensure_surface(
+        db,
+        guild_id,
+        discord_surfaces::SurfaceKind::ProjectCategory,
+        &project.key,
+        None,
+        None,
+        now,
+    )
+    .await?;
+    let target = format!("cairn://p/{}/{}", project.key, thread_name);
+    discord_surfaces::ensure_surface(
+        db,
+        guild_id,
+        discord_surfaces::SurfaceKind::ThreadChannel,
+        &project.key,
+        Some(&target),
+        Some(category.id),
+        now,
+    )
+    .await?;
+    wake_discord_surfaces();
+    Ok(())
+}
+
+fn route_submission_provider(
+    submission: &crate::routes::ChannelSubmission,
+) -> Option<&'static str> {
+    submission
+        .destination
+        .as_ref()
+        .map(|address| address.provider().id())
+}
+
+pub async fn configured_conversations_json(
+    orch: &crate::orchestrator::Orchestrator,
+) -> serde_json::Value {
+    serde_json::to_value(crate::resources::channels::configured_conversations(orch).await)
+        .expect("conversation rows serialize")
+}
+
+async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
+    loop {
+        let config = crate::config::settings::load_settings(&orch.config_dir)
+            .channels
+            .discord;
+        if !config.enabled {
+            clear_admission_state("discord");
+            tokio::select! {
+                () = DISCORD_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+            }
+            continue;
+        }
+        let error = if config.guild_id.trim().is_empty() {
+            Some("Discord channel requires a guild ID".to_string())
+        } else if config.guild_id.parse::<u64>().is_err() {
+            Some("Discord guild ID must be an unsigned integer".to_string())
+        } else if config.allow_from.is_empty() {
+            Some("Discord channel requires at least one allowed user ID".to_string())
+        } else {
+            None
+        };
+        let allowed = config
+            .allow_from
+            .iter()
+            .map(|id| id.parse::<u64>())
+            .collect::<Result<Vec<_>, _>>();
+        let token = crate::security::broker::web_provider_key(
+            "channel/discord",
+            "BOT_TOKEN",
+            "connect the Discord channel",
+        );
+        let validation = error
+            .or_else(|| {
+                allowed
+                    .as_ref()
+                    .err()
+                    .map(|_| "Discord allowlist entries must be numeric user IDs".to_string())
+            })
+            .or_else(|| {
+                token
+                    .as_ref()
+                    .is_none()
+                    .then(|| "Discord channel token is missing from the keychain".to_string())
+            });
+        if let Some(error) = validation {
+            set_admission_state("discord", Some(("stopped", error)));
+            tokio::select! {
+                () = DISCORD_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {},
+            }
+            continue;
+        }
+        let provider = discord::DiscordProvider::new(
+            token.unwrap().expose().to_string(),
+            serenity::all::GuildId::new(
+                config
+                    .guild_id
+                    .parse::<u64>()
+                    .expect("validated Discord guild ID"),
+            ),
+            allowed.unwrap(),
+        );
+        runtime_slot()
+            .lock()
+            .expect("channel runtime lock poisoned")
+            .insert("discord", provider.clone());
+        clear_admission_state("discord");
+        set_router_blocker("discord", None);
+        let mut tasks = router::spawn(
+            orch.clone(),
+            provider.clone(),
+            "discord",
+            config.guild_id.clone(),
+            config.route.clone(),
+            config.inbound_capabilities,
+        );
+        let (mut gateway, shard_manager) = match provider.start().await {
+            Ok(gateway) => gateway,
+            Err(error) => {
+                set_admission_state("discord", Some(("stopped", error)));
+                runtime_slot()
+                    .lock()
+                    .expect("channel runtime lock poisoned")
+                    .remove("discord");
+                for task in tasks.drain(..) {
+                    task.abort();
+                }
+                tokio::time::sleep(ADMISSION_RETRY_INTERVAL).await;
+                continue;
+            }
+        };
+        let surface_orch = orch.clone();
+        let surface_provider: Arc<dyn discord::DiscordApi> = provider.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                let now = chrono::Utc::now().timestamp();
+                for db in surface_orch.db.all_dbs().await {
+                    let reconciler = discord_surfaces::DiscordSurfaceReconciler::with_binding_db(
+                        db,
+                        surface_orch.db.local.clone(),
+                        surface_provider.clone(),
+                    );
+                    if let Err(error) = reconciler.reconcile_due(now).await {
+                        log::warn!("Discord surface reconciliation failed: {error}");
+                    }
+                }
+                tokio::select! {
+                    () = DISCORD_SURFACE_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
+                    () = tokio::time::sleep(Duration::from_secs(30)) => {},
+                }
+            }
+        }));
+        let mut gateway_finished = false;
+        loop {
+            tokio::select! {
+                result = &mut gateway => {
+                    gateway_finished = true;
+                    if let Ok(Err(error)) = result {
+                        set_admission_state("discord", Some(("stopped", error)));
+                    }
+                    break;
+                }
+                () = DISCORD_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => break,
+                () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {
+                    let current = crate::config::settings::load_settings(&orch.config_dir).channels.discord;
+                    if current != config { break; }
+                }
+            }
+        }
+        if !gateway_finished {
+            shard_manager.shutdown_all().await;
+            let _ = gateway.await;
+        }
+        for task in tasks.drain(..) {
+            task.abort();
+        }
+        runtime_slot()
+            .lock()
+            .expect("channel runtime lock poisoned")
+            .remove("discord");
+        route_submission_slot()
+            .lock()
+            .expect("route submission slot poisoned")
+            .remove("discord");
+        set_router_blocker("discord", None);
+    }
+}
+
+pub fn retry_discord_admission() {
+    DISCORD_ADMISSION_WAKE
+        .get_or_init(tokio::sync::Notify::new)
+        .notify_waiters();
 }
 
 pub fn retry_telegram_admission() {
@@ -57,8 +282,13 @@ pub fn submit_route(
     if senders.is_empty() {
         return Err(Box::new(submission));
     }
+
+    let directed_provider = route_submission_provider(&submission);
     let mut delivered = false;
     for (provider, sender) in senders {
+        if directed_provider.is_some_and(|directed| directed != provider) {
+            continue;
+        }
         if sender.send(submission.clone()).is_ok() {
             delivered = true;
         } else {
@@ -399,6 +629,7 @@ pub struct ChannelRuntimeStatus {
     pub unsolicited_inbound: Vec<ChannelInboundSummary>,
     pub presence_mode: OperatorPresenceMode,
     pub operator_presence: OperatorPresence,
+    pub last_send_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -480,6 +711,9 @@ pub async fn runtime_status(
             received_at: record.received_at,
         })
         .collect();
+    let last_send_error = ledger::latest_send_error(&orch.db.local, provider_id)
+        .await
+        .unwrap_or_default();
     ChannelRuntimeStatus {
         provider: provider_id,
         state,
@@ -491,7 +725,34 @@ pub async fn runtime_status(
         unsolicited_inbound,
         presence_mode,
         operator_presence,
+        last_send_error,
     }
+}
+
+const TELEGRAM_OWN_ID_GUIDANCE: &str =
+    "This is the bot's own ID; use your Telegram user ID — message @userinfobot to get it";
+
+fn telegram_bot_id(token: &str) -> Option<&str> {
+    let (prefix, _) = token.trim().split_once(':')?;
+    (!prefix.is_empty() && prefix.bytes().all(|byte| byte.is_ascii_digit())).then_some(prefix)
+}
+
+pub fn telegram_identity_error(
+    chat_id: &str,
+    allow_from: &[String],
+    token: &str,
+) -> Option<String> {
+    let bot_id = telegram_bot_id(token)?;
+    (chat_id.trim() == bot_id || allow_from.iter().any(|id| id.trim() == bot_id))
+        .then(|| TELEGRAM_OWN_ID_GUIDANCE.to_string())
+}
+
+pub(crate) fn telegram_identity_error_for_brokered_token(
+    chat_id: &str,
+    allow_from: &[String],
+    token: &crate::security::broker::BrokeredSecret,
+) -> Option<String> {
+    telegram_identity_error(chat_id, allow_from, token.expose())
 }
 
 const RECEIPT_RECENCY_SECONDS: i64 = 5 * 60;
@@ -512,15 +773,26 @@ fn feed_state(liveness: Option<ChannelLiveness>, now: i64) -> &'static str {
     }
 }
 
+pub mod address;
+pub mod bindings;
+pub mod commands;
+pub mod discord;
+pub mod discord_surfaces;
 pub mod imessage;
 pub mod ledger;
 pub mod router;
 pub mod telegram;
 
+pub use address::{
+    conversation_capabilities, ConversationAddress, ConversationAddressError,
+    ConversationCapabilities, ConversationDestination, ConversationProvider,
+};
+
 /// Starts the configured external channel service on runner hosts.
 pub fn spawn_configured(orch: crate::orchestrator::Orchestrator) {
     crate::routes::spawn_attention_routes(orch.clone());
     tokio::spawn(supervise_telegram(orch.clone()));
+    tokio::spawn(supervise_discord(orch.clone()));
     tokio::spawn(async move {
         loop {
             let config = crate::config::settings::load_settings(&orch.config_dir)
@@ -691,6 +963,7 @@ async fn spawn_imessage(
         "imessage",
         config.to.clone(),
         config.route.clone(),
+        config.inbound_capabilities,
     ));
 
     loop {
@@ -740,7 +1013,11 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             .iter()
             .map(|id| id.parse::<u64>())
             .collect::<Result<Vec<_>, _>>();
-        let token = crate::config::secrets::get_secret("channel/telegram", "BOT_TOKEN");
+        let token = crate::security::broker::web_provider_key(
+            "channel/telegram",
+            "BOT_TOKEN",
+            "connect the Telegram channel",
+        );
         let validation = error
             .or_else(|| {
                 allowed
@@ -751,9 +1028,15 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             .or_else(|| {
                 token
                     .as_ref()
-                    .filter(|value| !value.trim().is_empty())
                     .is_none()
                     .then(|| "Telegram channel token is missing from the keychain".to_string())
+            })
+            .or_else(|| {
+                telegram_identity_error(
+                    &config.chat_id,
+                    &config.allow_from,
+                    token.as_ref()?.expose(),
+                )
             });
         if let Some(error) = validation {
             set_admission_state("telegram", Some(("stopped", error)));
@@ -768,7 +1051,7 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             .parse::<i64>()
             .expect("validated Telegram chat ID");
         let provider = telegram::TelegramProvider::new(
-            token.unwrap(),
+            token.unwrap().expose().to_string(),
             teloxide::types::ChatId(chat_id),
             allowed.unwrap(),
         );
@@ -784,6 +1067,7 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             "telegram",
             config.chat_id.clone(),
             config.route.clone(),
+            config.inbound_capabilities,
         );
         let mut polling = provider.start();
         let mut polling_finished = false;
@@ -876,6 +1160,7 @@ pub struct SentIds {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum InboundEvent {
     Selection {
+        conversation: String,
         bound_guid: String,
         sender: String,
         option_id: String,
@@ -883,16 +1168,25 @@ pub enum InboundEvent {
         selected: bool,
     },
     Selections {
+        conversation: String,
         bound_guid: String,
         sender: String,
         changes: Vec<PollSelectionChange>,
     },
     Reply {
+        conversation: String,
         bound_guid: String,
         sender: String,
         text: String,
     },
     Bare {
+        conversation: String,
+        sender: String,
+        text: String,
+    },
+    /// Recording-only input from a sender rejected at the provider boundary.
+    Rejected {
+        conversation: String,
         sender: String,
         text: String,
     },
@@ -1014,6 +1308,42 @@ mod tests {
         assert_eq!(
             select_inferred_presence(Some(OperatorPresence::Away), OperatorPresence::Present),
             OperatorPresence::Away
+        );
+    }
+
+    #[test]
+    fn directed_route_selects_only_its_addressed_provider() {
+        use crate::routes::{ChannelSubmission, RouteFact};
+
+        let submission = ChannelSubmission {
+            route_id: "route-test".into(),
+            scope_key: "workspace".into(),
+            project_id: None,
+            fact: RouteFact {
+                source: "attention".into(),
+                identity: "directed".into(),
+                fields: Default::default(),
+                origin: None,
+                summary: None,
+                route_provenance: None,
+            },
+            transforms_json: None,
+            created_at: 1,
+            binding_ref: "route:route-test:directed".into(),
+            text: "notify".into(),
+            context: "[Cairn]".into(),
+            job_id: None,
+            initiated_by: None,
+            destination: Some("discord:1/2".parse().unwrap()),
+        };
+        assert_eq!(route_submission_provider(&submission), Some("discord"));
+        let providers = ["imessage", "telegram", "discord"];
+        assert_eq!(
+            providers
+                .into_iter()
+                .filter(|provider| route_submission_provider(&submission) == Some(*provider))
+                .collect::<Vec<_>>(),
+            ["discord"]
         );
     }
 
@@ -1336,5 +1666,19 @@ mod tests {
             render_text_floor(&free_text),
             "What should change?\n\nReply to this message with your answer."
         );
+    }
+
+    #[test]
+    fn rejects_the_telegram_bots_own_id_as_a_recipient_or_sender() {
+        let token = "123456789:secret";
+        assert_eq!(
+            telegram_identity_error("123456789", &["42".into()], token).as_deref(),
+            Some(TELEGRAM_OWN_ID_GUIDANCE)
+        );
+        assert_eq!(
+            telegram_identity_error("42", &["123456789".into()], token).as_deref(),
+            Some(TELEGRAM_OWN_ID_GUIDANCE)
+        );
+        assert_eq!(telegram_identity_error("42", &["7".into()], token), None);
     }
 }

@@ -232,7 +232,7 @@ mod tests {
             out.push_str(&format!(
                 "- [{}]({}) [{}] — {}\n",
                 recipe.recipe.id,
-                recipe_link(recipe, Some("CAIRN")),
+                recipe_link(recipe, Some("cairn")),
                 scope_label(recipe),
                 recipe.recipe.name,
             ));
@@ -262,7 +262,7 @@ mod tests {
 
         let rendered = render_collection(&config_dir, Some(&project_dir));
         // Project version wins and links project-scoped.
-        assert!(rendered.contains("cairn://p/CAIRN/recipes/shared"));
+        assert!(rendered.contains("cairn://p/cairn/recipes/shared"));
         assert!(rendered.contains("[project] — Project Version"));
         assert!(!rendered.contains("Workspace Version"));
     }
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(not_found("nope", None), "Recipe not found: nope");
         assert_eq!(
             not_found("nope", Some("cairn")),
-            "Recipe not found in project CAIRN: nope"
+            "Recipe not found in project cairn: nope"
         );
     }
 }

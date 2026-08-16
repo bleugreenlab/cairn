@@ -476,6 +476,7 @@ mod tests {
                 verdict_arch: None,
                 toolchain_fingerprint: None,
                 verdict_environment_hash: None,
+                sandbox: None,
             },
             mutation_delta: None,
             sandbox_denials: vec![],

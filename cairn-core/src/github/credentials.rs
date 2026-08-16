@@ -11,6 +11,54 @@
 use super::crypto;
 use crate::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    OnceLock,
+};
+use tokio::sync::{Mutex, Notify};
+
+static RELAY_OPERATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static RELAY_REPAIR_NOTIFY: OnceLock<Notify> = OnceLock::new();
+static RELAY_REPAIR_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes relay polling and key rotation for the lifetime of this process.
+pub fn relay_operation_lock() -> &'static Mutex<()> {
+    RELAY_OPERATION_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+pub fn relay_repair_generation() -> u64 {
+    RELAY_REPAIR_GENERATION.load(Ordering::Acquire)
+}
+
+pub async fn relay_repair_notified() {
+    RELAY_REPAIR_NOTIFY
+        .get_or_init(Notify::new)
+        .notified()
+        .await;
+}
+
+pub fn notify_relay_repaired() {
+    RELAY_REPAIR_GENERATION.fetch_add(1, Ordering::AcqRel);
+    // There is one relay poller. `notify_one` retains a permit when repair lands
+    // between its generation check and registration of the next waiter.
+    RELAY_REPAIR_NOTIFY.get_or_init(Notify::new).notify_one();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repair_notification_is_retained_for_a_late_poller_waiter() {
+        notify_relay_repaired();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            relay_repair_notified(),
+        )
+        .await
+        .expect("repair notification should retain a permit");
+    }
+}
 
 /// GitHub credentials stored in DB.
 #[derive(Debug, Clone, Default)]
@@ -26,6 +74,17 @@ pub struct GitHubCredentials {
     pub last_event_sync: Option<String>,
     pub relay_public_key: Option<String>,
     pub relay_private_key_encrypted: Option<String>,
+    pub relay_key_rotated_at: Option<String>,
+    pub relay_pending_public_key: Option<String>,
+    pub relay_pending_private_key_encrypted: Option<String>,
+    pub relay_health_state: Option<String>,
+    pub relay_health_reason: Option<String>,
+    pub relay_first_failure_at: Option<String>,
+    pub relay_last_failure_at: Option<String>,
+    pub relay_consecutive_failures: Option<i64>,
+    pub relay_failing_event_id: Option<String>,
+    pub relay_failing_event_at: Option<String>,
+    pub relay_last_successful_delivery_at: Option<String>,
 }
 
 /// Get GitHub credentials from DB.
@@ -36,7 +95,13 @@ pub async fn get_github_credentials(db: &LocalDb) -> Result<GitHubCredentials, S
                 .query(
                     "SELECT app_id, app_name, app_slug, private_key, webhook_secret,
                             installation_id, relay_channel_id, relay_secret, last_event_sync,
-                            relay_public_key, relay_private_key_encrypted
+                            relay_public_key, relay_private_key_encrypted,
+                            relay_health_state, relay_health_reason, relay_first_failure_at,
+                            relay_last_failure_at, relay_consecutive_failures,
+                            relay_failing_event_id, relay_failing_event_at,
+                            relay_last_successful_delivery_at,
+                            relay_pending_public_key, relay_pending_private_key_encrypted,
+                            relay_key_rotated_at
                      FROM github_app
                      WHERE id = 'default'",
                     (),
@@ -59,6 +124,17 @@ pub async fn get_github_credentials(db: &LocalDb) -> Result<GitHubCredentials, S
                 last_event_sync: row.opt_text(8)?,
                 relay_public_key: row.opt_text(9)?,
                 relay_private_key_encrypted: row.opt_text(10)?,
+                relay_health_state: row.opt_text(11)?,
+                relay_health_reason: row.opt_text(12)?,
+                relay_first_failure_at: row.opt_text(13)?,
+                relay_last_failure_at: row.opt_text(14)?,
+                relay_consecutive_failures: row.opt_i64(15)?,
+                relay_failing_event_id: row.opt_text(16)?,
+                relay_failing_event_at: row.opt_text(17)?,
+                relay_last_successful_delivery_at: row.opt_text(18)?,
+                relay_pending_public_key: row.opt_text(19)?,
+                relay_pending_private_key_encrypted: row.opt_text(20)?,
+                relay_key_rotated_at: row.opt_text(21)?,
             })
         })
     })
@@ -162,9 +238,15 @@ where
                 "INSERT INTO github_app (
                     id, app_id, app_name, app_slug, private_key, webhook_secret,
                     installation_id, relay_channel_id, relay_secret, last_event_sync,
-                    created_at, updated_at, relay_public_key, relay_private_key_encrypted
+                    created_at, updated_at, relay_public_key, relay_private_key_encrypted,
+                    relay_health_state, relay_health_reason, relay_first_failure_at,
+                    relay_last_failure_at, relay_consecutive_failures, relay_failing_event_id,
+                    relay_failing_event_at, relay_last_successful_delivery_at,
+                    relay_pending_public_key, relay_pending_private_key_encrypted,
+                    relay_key_rotated_at
                  )
-                 VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12)
+                 VALUES ('default', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?11, ?12,
+                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                  ON CONFLICT(id) DO UPDATE SET
                     app_id = excluded.app_id,
                     app_name = excluded.app_name,
@@ -177,7 +259,18 @@ where
                     last_event_sync = excluded.last_event_sync,
                     updated_at = excluded.updated_at,
                     relay_public_key = excluded.relay_public_key,
-                    relay_private_key_encrypted = excluded.relay_private_key_encrypted",
+                    relay_private_key_encrypted = excluded.relay_private_key_encrypted,
+                    relay_health_state = excluded.relay_health_state,
+                    relay_health_reason = excluded.relay_health_reason,
+                    relay_first_failure_at = excluded.relay_first_failure_at,
+                    relay_last_failure_at = excluded.relay_last_failure_at,
+                    relay_consecutive_failures = excluded.relay_consecutive_failures,
+                    relay_failing_event_id = excluded.relay_failing_event_id,
+                    relay_failing_event_at = excluded.relay_failing_event_at,
+                    relay_last_successful_delivery_at = excluded.relay_last_successful_delivery_at,
+                    relay_pending_public_key = excluded.relay_pending_public_key,
+                    relay_pending_private_key_encrypted = excluded.relay_pending_private_key_encrypted,
+                    relay_key_rotated_at = excluded.relay_key_rotated_at",
                 params![
                     creds.app_id,
                     creds.app_name,
@@ -191,6 +284,17 @@ where
                     now,
                     creds.relay_public_key,
                     creds.relay_private_key_encrypted,
+                    creds.relay_health_state,
+                    creds.relay_health_reason,
+                    creds.relay_first_failure_at,
+                    creds.relay_last_failure_at,
+                    creds.relay_consecutive_failures,
+                    creds.relay_failing_event_id,
+                    creds.relay_failing_event_at,
+                    creds.relay_last_successful_delivery_at,
+                    creds.relay_pending_public_key,
+                    creds.relay_pending_private_key_encrypted,
+                    creds.relay_key_rotated_at,
                 ],
             )
             .await?;

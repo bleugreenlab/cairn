@@ -34,6 +34,22 @@ impl Orchestrator {
 
     /// Update settings with partial input.
     pub fn update_settings(&self, input: UpdateSettings) -> Result<Settings, String> {
+        if let (Some(channels), Some(token)) = (
+            input.channels.as_ref(),
+            crate::security::broker::web_provider_key(
+                "channel/telegram",
+                "BOT_TOKEN",
+                "validate Telegram channel settings",
+            ),
+        ) {
+            if let Some(error) = crate::channels::telegram_identity_error_for_brokered_token(
+                &channels.telegram.chat_id,
+                &channels.telegram.allow_from,
+                &token,
+            ) {
+                return Err(error);
+            }
+        }
         let current = settings::update_settings(&self.config_dir, input)?;
 
         // Emit config-changed event

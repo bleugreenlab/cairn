@@ -17,15 +17,11 @@ pub struct ClaudeAuthStatus {
     pub subscription_type: Option<String>,
 }
 
-/// Resolve a managed profile from the standard Cairn configuration root.
-pub fn profile_dir(account_id: &str) -> PathBuf {
-    let root = std::env::var_os("CAIRN_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|dir| dir.join(".cairn")))
-        .unwrap_or_else(|| PathBuf::from(".cairn"));
-    profile_dir_in(&root, account_id)
-}
-
+/// A managed profile lives under the configuration root that owns the identity
+/// store it belongs to. There is deliberately no variant that infers the root:
+/// sign-in, sign-out and session resolution all have to name the same
+/// directory, and an inferred one silently disagreed with the real one
+/// whenever Cairn ran with a non-default config dir.
 pub fn profile_dir_in(config_dir: &Path, account_id: &str) -> PathBuf {
     config_dir.join(PROFILES_DIR).join(account_id)
 }

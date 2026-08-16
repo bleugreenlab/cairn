@@ -263,6 +263,21 @@ mod tests {
     }
 
     #[test]
+    fn catches_json_string_escaped_form_at_every_split_point() {
+        let secret = "SYNTH-Q7\"m2Zx9\\line\n-RedTeam";
+        let snapshot = snapshot_with(&[secret]);
+        let encoded = serde_json::to_string(secret).unwrap();
+        let escaped = &encoded[1..encoded.len() - 1];
+        let full = format!("json={escaped};");
+        for split in 0..=full.len() {
+            let (left, right) = full.split_at(split);
+            let out = drive(&[left.as_bytes(), right.as_bytes()], snapshot.clone());
+            assert_eq!(out, "json=[REDACTED];", "split {split}: {out}");
+            assert!(!out.contains(escaped), "leaked at split {split}: {out}");
+        }
+    }
+
+    #[test]
     fn terminal_flush_releases_a_trailing_secret_redacted() {
         let snapshot = snapshot_with(&[SECRET]);
         let mut scrubber = StreamingScrubber::with_snapshot(snapshot);

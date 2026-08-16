@@ -405,7 +405,7 @@ mod tests {
         exec(
             &db,
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PROJ', '/tmp/proj', 1, 1)",
+             VALUES ('proj', 'default', 'Project', 'proj', '/tmp/proj', 1, 1)",
         )
         .await;
         exec(
@@ -454,7 +454,7 @@ mod tests {
         exec(
             &db,
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj', 'default', 'Project', 'PROJ', '/tmp/proj', 1, 1)",
+             VALUES ('proj', 'default', 'Project', 'proj', '/tmp/proj', 1, 1)",
         )
         .await;
         exec(
@@ -486,7 +486,7 @@ mod tests {
             resolve_session_owner_uri_async(&db, "sess-job")
                 .await
                 .unwrap(),
-            Some("cairn://p/PROJ/7/2/builder".to_string())
+            Some("cairn://p/proj/7/2/builder".to_string())
         );
     }
 
@@ -614,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn summary_upsert_keyed_by_node_uri_round_trips() {
         let db = migrated_db().await;
-        let uri = "cairn://p/PROJ/7/2/builder";
+        let uri = "cairn://p/proj/7/2/builder";
         let bytes = crate::embeddings::vector::to_bytes(&[0.1_f32, 0.2, 0.3]);
         upsert_resource_embedding_async(&db, uri, &bytes, "cohere-test", 3)
             .await

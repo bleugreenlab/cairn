@@ -99,22 +99,23 @@ pub async fn migrate_contextual_disables(
         return Ok(0);
     }
 
-    let mut settings = crate::config::project_settings::load_project_settings(project_path);
-    let policy = settings.contextual_packages.get_or_insert_default();
-    for row in &contextual {
-        let kind = match row.entity_type.as_str() {
-            "skill" => crate::config::contextual_packages::ContextualPackageKind::Skill,
-            "recipe" => crate::config::contextual_packages::ContextualPackageKind::Recipe,
-            "agent" => crate::config::contextual_packages::ContextualPackageKind::Agent,
-            _ => unreachable!(),
-        };
-        policy.disable(crate::config::contextual_packages::ContextualPackageRef {
-            kind,
-            id: row.config_key.clone(),
-        });
-    }
-    policy.normalize()?;
-    crate::config::project_settings::save_project_settings(project_path, &settings)?;
+    crate::config::project_settings::mutate_project_settings(project_path, |settings| {
+        let policy = settings.contextual_packages.get_or_insert_default();
+        for row in &contextual {
+            let kind = match row.entity_type.as_str() {
+                "skill" => crate::config::contextual_packages::ContextualPackageKind::Skill,
+                "recipe" => crate::config::contextual_packages::ContextualPackageKind::Recipe,
+                "agent" => crate::config::contextual_packages::ContextualPackageKind::Agent,
+                _ => unreachable!(),
+            };
+            policy.disable(crate::config::contextual_packages::ContextualPackageRef {
+                kind,
+                id: row.config_key.clone(),
+            });
+        }
+        policy.normalize()
+    })
+    .map_err(|error| error.to_string())?;
 
     for row in &contextual {
         enable_config(db, project_id, &row.entity_type, &row.config_key).await?;
@@ -233,7 +234,8 @@ mod tests {
             0
         );
 
-        let settings = crate::config::project_settings::load_project_settings(project.path());
+        let settings =
+            crate::config::project_settings::load_project_settings_read_only(project.path());
         let disabled = settings.contextual_packages.unwrap().disabled;
         assert_eq!(disabled.len(), 2);
         let remaining = list_disabled_configs(&db, "p").await.unwrap();

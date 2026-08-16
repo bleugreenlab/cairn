@@ -114,7 +114,7 @@ async fn insert_condition_evaluation(
 #[tokio::test]
 async fn action_runs_list_by_issue_and_execution_in_created_order() {
     let (_temp, db) = common::migrated_db().await;
-    let project_id = common::create_project(&db, "AR").await;
+    let project_id = common::create_project(&db, "ar").await;
     insert_issue(&db, &project_id, "issue-1", 1).await;
     insert_issue(&db, &project_id, "issue-2", 2).await;
     insert_execution(&db, "exec-1", &project_id, Some("issue-1")).await;
@@ -175,7 +175,7 @@ async fn action_runs_list_by_issue_and_execution_in_created_order() {
 #[tokio::test]
 async fn get_action_run_maps_optional_fields_and_reports_missing_id() {
     let (_temp, db) = common::migrated_db().await;
-    let project_id = common::create_project(&db, "ARG").await;
+    let project_id = common::create_project(&db, "arg").await;
     insert_issue(&db, &project_id, "issue-1", 1).await;
     insert_execution(&db, "exec-1", &project_id, Some("issue-1")).await;
     insert_action_run(
@@ -205,7 +205,7 @@ async fn get_action_run_maps_optional_fields_and_reports_missing_id() {
 #[tokio::test]
 async fn condition_evaluations_list_by_issue_execution_join() {
     let (_temp, db) = common::migrated_db().await;
-    let project_id = common::create_project(&db, "CE").await;
+    let project_id = common::create_project(&db, "ce").await;
     insert_issue(&db, &project_id, "issue-1", 1).await;
     insert_issue(&db, &project_id, "issue-2", 2).await;
     insert_execution(&db, "exec-1", &project_id, Some("issue-1")).await;

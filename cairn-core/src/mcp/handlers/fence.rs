@@ -32,24 +32,34 @@ use crate::orchestrator::Orchestrator;
 
 use super::permission::{await_permission_decision, resolve_fence_policy, PermissionWait};
 
-/// Resolve the canonical run and its fence policy for a verb request, looking
-/// the run up exclusively by its authenticated id. Returns `None` when the
-/// request has no resolvable run identity.
+/// Typed result of resolving the fence attached to a request. Ambient means no
+/// authenticated identity was supplied; unavailable means one was supplied but
+/// its context or policy could not be recovered.
+pub(crate) enum RunFenceResolution {
+    Ambient,
+    Resolved(String, Fence),
+    Unavailable(String),
+}
+
 pub(crate) async fn resolve_run_fence(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
-) -> Option<(String, Fence)> {
-    let run_id = match request.run_id.clone() {
-        Some(id) => id,
-        None => {
-            super::run_context::lookup_run(&orch.db.local, request)
-                .await
-                .ok()?
-                .run_id
-        }
+) -> RunFenceResolution {
+    let Some(run_id) = request.run_id.clone().filter(|id| !id.is_empty()) else {
+        return RunFenceResolution::Ambient;
     };
-    let fence = resolve_fence_policy(orch, Some(&run_id)).await?;
-    Some((run_id, fence))
+    if let Err(error) = super::run_context::lookup_run_routed(&orch.db, request).await {
+        return RunFenceResolution::Unavailable(format!(
+            "permission context unavailable: authenticated run is missing or expired ({error})"
+        ));
+    }
+    match resolve_fence_policy(orch, Some(&run_id)).await {
+        Some(fence) => RunFenceResolution::Resolved(run_id, fence),
+        None => RunFenceResolution::Unavailable(
+            "permission context unavailable: authenticated run has no resolvable fence policy"
+                .to_string(),
+        ),
+    }
 }
 
 /// What kind of boundary crossing was detected.
@@ -237,6 +247,9 @@ pub enum FenceDecision {
     /// The run durably suspended; the verb handler returns a suspend marker and
     /// the run re-drives the verb on resume.
     Suspended,
+    /// The prompt boundary could not establish an answerable request. Execution
+    /// remains closed, but this is infrastructure failure rather than denial.
+    Unavailable(String),
 }
 
 /// Adjudicate a detected crossing under the agent's escape policy.
@@ -322,6 +335,7 @@ pub async fn raise_fence(
                     }
                 }
                 PermissionWait::Suspended => FenceDecision::Suspended,
+                PermissionWait::Unavailable(error) => FenceDecision::Unavailable(error),
             }
         }
     }

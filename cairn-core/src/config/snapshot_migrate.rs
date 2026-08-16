@@ -31,10 +31,19 @@ pub fn load(json: &str) -> Result<ExecutionSnapshot, String> {
 /// into the atomic `selection` + `extras` representation, once.
 ///
 /// Recovers exactly what the runtime used to recompute: the backend prefers the
-/// stored `resolved_backend`, else derives from the model, else the frozen
-/// active backend; extras are recovered from the frozen preset matrix when
-/// present. Clears the legacy fields and the frozen presets afterward so the
-/// atomic field is the single representation going forward.
+/// stored `resolved_backend`, else derives from the model, else asks the frozen
+/// preset matrix which backend served THIS agent's authored tier; extras come
+/// from that same frozen resolution. Clears the legacy fields and the frozen
+/// presets afterward so the atomic field is the single representation going
+/// forward.
+///
+/// The last-resort backend is a per-agent question, not a config-global one. The
+/// legacy shape's single `activeBackend` was only ever the right answer because
+/// every tier resolved through it; rehydrating the frozen matrix (see
+/// `PresetsConfig::from(&SnapshotPresets)`) restates that as a per-tier default,
+/// and resolving the agent's own tier against it gives the same answer wherever
+/// the old fallback was correct and a better one where the tier was pinned
+/// elsewhere.
 fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
     let frozen = snapshot.presets.as_ref().map(PresetsConfig::from);
     for packet in &mut snapshot.delegated_packets {
@@ -57,27 +66,36 @@ fn migrate_on_read(snapshot: &mut ExecutionSnapshot) {
         agent.sandbox = None;
         agent.on_escape = None;
 
+        // What the frozen matrix says this agent's authored tier resolved to.
+        // Computed once and consulted by both the backend fallback and extras.
+        let frozen_resolution = frozen.as_ref().and_then(|presets| {
+            resolve_selection_with_provenance(
+                agent.tier.as_ref().map(Model::as_str),
+                agent.backend_preference.as_deref(),
+                None,
+                presets,
+            )
+            .ok()
+        });
+
         if agent.selection.is_none() {
             if let Some(model) = agent.model.clone() {
                 let backend = agent
                     .resolved_backend
                     .clone()
                     .or_else(|| backends::backend_for_model(model.as_str()).map(str::to_string))
-                    .or_else(|| frozen.as_ref().map(|p| p.active_backend.clone()))
+                    .or_else(|| {
+                        frozen_resolution
+                            .as_ref()
+                            .map(|resolved| resolved.selection.backend.clone())
+                    })
                     .unwrap_or_else(|| "claude".to_string());
                 agent.selection = Some(ModelSelection { backend, model });
             }
         }
         if agent.extras.is_none() {
-            if let Some(presets) = frozen.as_ref() {
-                if let Ok(resolved) = resolve_selection_with_provenance(
-                    agent.tier.as_ref().map(Model::as_str),
-                    agent.backend_preference.as_deref(),
-                    None,
-                    presets,
-                ) {
-                    agent.extras = Some(resolved.extras);
-                }
+            if let Some(resolved) = frozen_resolution {
+                agent.extras = Some(resolved.extras);
             }
         }
         agent.model = None;

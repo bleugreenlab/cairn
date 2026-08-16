@@ -169,7 +169,7 @@ async fn insert_webhook_event(db: &LocalDb, pr_number: i64, processed_at: i64) -
 #[tokio::test]
 async fn summaries_for_action_runs_preserve_action_run_id() {
     let (_temp, db) = common::migrated_db().await;
-    let project = common::create_project(&db, "PRS").await;
+    let project = common::create_project(&db, "prs").await;
     let execution = create_execution(&db, &project).await;
     let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
     let action_run = create_action_run(&db, &project, &execution, &job).await;
@@ -197,7 +197,7 @@ async fn summaries_for_action_runs_preserve_action_run_id() {
 #[tokio::test]
 async fn get_by_action_run_id_accepts_action_run_or_job_id() {
     let (_temp, db) = common::migrated_db().await;
-    let project = common::create_project(&db, "PRD").await;
+    let project = common::create_project(&db, "prd").await;
     let execution = create_execution(&db, &project).await;
     let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
     let action_run = create_action_run(&db, &project, &execution, &job).await;
@@ -230,7 +230,7 @@ async fn get_by_action_run_id_accepts_action_run_or_job_id() {
 #[tokio::test]
 async fn webhook_events_can_load_by_number_or_job() {
     let (_temp, db) = common::migrated_db().await;
-    let project = common::create_project(&db, "PRW").await;
+    let project = common::create_project(&db, "prw").await;
     let execution = create_execution(&db, &project).await;
     let job = create_job(&db, &project, None, Some(&execution), Some("feature")).await;
     create_merge_request(

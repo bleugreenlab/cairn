@@ -60,12 +60,54 @@ pub(crate) fn post_chat_completion(
             "{} chat completion returned HTTP {}: {}",
             endpoint.provider_name,
             status.as_u16(),
-            text
+            upstream_error_detail(&text)
         )));
     }
     response
         .json()
         .map_err(|error| CompletionError::InvalidResponse(error.to_string()))
+}
+
+/// The sentence a provider wrote inside a JSON error body.
+///
+/// Providers on this path nest the message the same way — `{"error":
+/// {"message": ...}}`, with or without a sibling `type` — so a refusal reaches
+/// the transcript as the explanation the provider gave ("No payment method",
+/// "only available hosted in China and requires explicit opt in") instead of a
+/// wall of JSON the reader has to decode. Anything that is not JSON, or that
+/// carries no message, passes through untouched: an unrecognized body is still
+/// evidence, and dropping it would leave the failure unexplained.
+pub(crate) fn upstream_error_detail(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            let error = parsed.get("error").unwrap_or(&parsed);
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| body.to_string())
+}
+
+/// Inject the OpenAI-native structured-output constraint into a chat-completions
+/// request body. `response_format` json_schema with `strict` demands
+/// conformance; Cairn's server-side validation of the stored artifact is the
+/// backstop if a provider honors it loosely. A no-op when the run carries no
+/// output schema, leaving schema-less sessions bit-for-bit unchanged.
+pub(crate) fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
+    let Some(schema) = schema else {
+        return;
+    };
+    body["response_format"] = serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": "cairn_output",
+            "strict": true,
+            "schema": schema,
+        }
+    });
 }
 
 impl Endpoint {
@@ -127,7 +169,7 @@ pub(crate) fn post_chat_completion_streaming(
             "{} chat completion returned HTTP {}: {}",
             endpoint.provider_name,
             status.as_u16(),
-            text
+            upstream_error_detail(&text)
         ));
     }
 
@@ -266,4 +308,52 @@ fn open_stream_state<'a>(
         )?);
     }
     Ok(state.as_mut().expect("stream state just initialized"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_output_schema, upstream_error_detail};
+    use serde_json::json;
+
+    #[test]
+    fn a_json_error_body_reaches_the_reader_as_the_providers_own_sentence() {
+        assert_eq!(
+            upstream_error_detail(
+                r#"{"type":"error","error":{"type":"CreditsError","message":"No payment method."}}"#
+            ),
+            "No payment method."
+        );
+        // The OpenAI shape, with no sibling `type`, resolves identically.
+        assert_eq!(
+            upstream_error_detail(r#"{"error":{"message":"model not found"}}"#),
+            "model not found"
+        );
+    }
+
+    #[test]
+    fn an_unrecognized_body_is_preserved_rather_than_swallowed() {
+        assert_eq!(
+            upstream_error_detail("<html>502</html>"),
+            "<html>502</html>"
+        );
+        assert_eq!(upstream_error_detail(r#"{"error":{}}"#), r#"{"error":{}}"#);
+        assert_eq!(upstream_error_detail(""), "");
+    }
+
+    #[test]
+    fn no_schema_leaves_the_body_unconstrained() {
+        let mut body = json!({ "model": "m" });
+        apply_output_schema(&mut body, None);
+        assert!(body.get("response_format").is_none());
+    }
+
+    #[test]
+    fn a_schema_becomes_a_strict_response_format() {
+        let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+        let mut body = json!({ "model": "m" });
+        apply_output_schema(&mut body, Some(&schema));
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
 }

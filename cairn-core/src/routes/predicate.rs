@@ -257,12 +257,12 @@ mod tests {
     #[test]
     fn predicates_are_or_of_ands_and_support_prefix_and_presence() {
         let clauses: Vec<BTreeMap<String, Value>> = serde_yaml::from_str(
-            "- { fact: attention, status: [failed], presence: away }\n- { fact: thread_stream, detailUriPrefix: 'cairn://p/CAIRN/', presence: away }"
+            "- { fact: attention, status: [failed], presence: away }\n- { fact: thread_stream, detailUriPrefix: 'cairn://p/cairn/', presence: away }"
         ).unwrap();
         let fields = BTreeMap::from([
             (
                 "detailUri".into(),
-                Value::String("cairn://p/CAIRN/1".into()),
+                Value::String("cairn://p/cairn/1".into()),
             ),
             ("status".into(), Value::String("active".into())),
         ]);

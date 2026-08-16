@@ -395,6 +395,19 @@ pub fn project_store_dir(config_dir: &Path, repo_path: &Path) -> PathBuf {
         .join(format!("{base}-{:016x}", hasher.finish()))
 }
 
+/// The repository every coordinate resolves against: the Cairn-managed store,
+/// created on first use. There is no second answer — the user's checkout is
+/// never a jj repo, so falling back to it only produces a raw jj error.
+pub fn coordinate_repository(
+    jj: &JjEnv,
+    config_dir: &Path,
+    project_repo: &Path,
+) -> Result<PathBuf, String> {
+    let store_dir = project_store_dir(config_dir, project_repo);
+    ensure_store_initialized(jj, &store_dir, project_repo)?;
+    Ok(store_dir)
+}
+
 /// Create the shared per-project jj store if absent: a Cairn-managed jj repo
 /// whose git backend is the project's existing `.git`. The user's checkout is
 /// never touched and sealed commits land in the project's object database.

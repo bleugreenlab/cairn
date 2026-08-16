@@ -319,7 +319,17 @@ mod tests {
     fn a_report_outside_the_window_is_not_attributed_to_an_old_abort() {
         let dir = tempfile::tempdir().unwrap();
         let mut exit = AbnormalExit::new(74402, "aborted".to_string());
-        write_report(dir.path(), "cairn-runner-2026-08-01-153834.ips", 74402);
+        let report = write_report(dir.path(), "cairn-runner-2026-08-01-153834.ips", 74402);
+        exit.at_unix_ms = report
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            .try_into()
+            .unwrap();
         assert!(crash_report_in(dir.path(), &exit).is_some());
 
         exit.at_unix_ms -= CRASH_REPORT_WINDOW_MS + 60_000;

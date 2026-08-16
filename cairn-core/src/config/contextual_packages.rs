@@ -115,7 +115,7 @@ pub(crate) fn load_contextual_packages(
     project_path: Option<&std::path::Path>,
 ) -> ContextualPackagesConfig {
     let mut config: ContextualPackagesConfig = project_path
-        .map(super::project_settings::load_project_settings)
+        .map(super::project_settings::load_project_settings_read_only)
         .and_then(|settings| settings.contextual_packages)
         .unwrap_or_default();
     // Scoped to the PERSONAL workspace's install locks. A team workspace twin

@@ -452,7 +452,7 @@ async fn fixture() -> Fixture {
     let repository = temp.path().join("runner-repository");
     let base = init_repo(&repository);
     let db = Arc::new(db);
-    let project_id = common::insert_project_with_repo(&db, "CAS", &repository).await;
+    let project_id = common::insert_project_with_repo(&db, "cas", &repository).await;
     let repository_id = "acceptance-repository".to_owned();
     let orch = common::orchestrator(&temp, db);
     let executor_home = temp.path().join("isolated-executor-home");

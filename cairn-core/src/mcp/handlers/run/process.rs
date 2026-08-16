@@ -394,55 +394,64 @@ pub(crate) async fn run_one(
         // now lives in `fence::raise_fence`, which both this site and the
         // executor-relayed one in `fleet/mod.rs` reach, rather than here where
         // only one of them would get it.
-        if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
-            let crossing = match &denial {
-                sandbox::SandboxDenial::Path { path, .. } => {
-                    fence::Crossing::shell_path(path.as_path(), &path.display().to_string())
-                }
-                sandbox::SandboxDenial::Command => fence::Crossing::shell_command(
-                    format!("command blocked by the executor sandbox: {header}"),
-                    shell_command.as_deref().unwrap_or(&program),
-                ),
-            };
-            match fence::raise_fence(orch, &run_id, fence_mode, request, crossing).await {
-                fence::FenceDecision::Allow => {
-                    match execute_process(
-                        orch,
-                        cwd,
-                        tool_use_id,
-                        run_context,
-                        &program,
-                        &args,
-                        timeout_ms,
-                        shell_command.as_deref(),
-                        stdin.as_deref(),
-                        false,
-                    )
-                    .await
-                    {
-                        Ok(e) => exec = e,
-                        Err(e) => {
-                            return ItemOutcome::failed(
-                                header,
-                                format!("Failed to spawn command: {e}"),
-                            )
+        match fence::resolve_run_fence(orch, request).await {
+            fence::RunFenceResolution::Resolved(run_id, fence_mode) => {
+                let crossing = match &denial {
+                    sandbox::SandboxDenial::Path { path, .. } => {
+                        fence::Crossing::shell_path(path.as_path(), &path.display().to_string())
+                    }
+                    sandbox::SandboxDenial::Command => fence::Crossing::shell_command(
+                        format!("command blocked by the executor sandbox: {header}"),
+                        shell_command.as_deref().unwrap_or(&program),
+                    ),
+                };
+                match fence::raise_fence(orch, &run_id, fence_mode, request, crossing).await {
+                    fence::FenceDecision::Allow => {
+                        match execute_process(
+                            orch,
+                            cwd,
+                            tool_use_id,
+                            run_context,
+                            &program,
+                            &args,
+                            timeout_ms,
+                            shell_command.as_deref(),
+                            stdin.as_deref(),
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(e) => exec = e,
+                            Err(e) => {
+                                return ItemOutcome::failed(
+                                    header,
+                                    format!("Failed to spawn command: {e}"),
+                                )
+                            }
+                        }
+                    }
+                    fence::FenceDecision::Deny(msg) => return ItemOutcome::failed(header, msg),
+                    fence::FenceDecision::Unavailable(msg) => {
+                        return ItemOutcome::failed(header, msg)
+                    }
+                    fence::FenceDecision::Suspended => {
+                        return ItemOutcome {
+                            header,
+                            body: "Run suspended pending worktree fence approval; resume will \
+                               continue once it is answered."
+                                .to_string(),
+                            succeeded: false,
+                            suspended: true,
+                            images: Vec::new(),
+                            tracked_modifications: None,
                         }
                     }
                 }
-                fence::FenceDecision::Deny(msg) => return ItemOutcome::failed(header, msg),
-                fence::FenceDecision::Suspended => {
-                    return ItemOutcome {
-                        header,
-                        body: "Run suspended pending worktree fence approval; resume will \
-                               continue once it is answered."
-                            .to_string(),
-                        succeeded: false,
-                        suspended: true,
-                        images: Vec::new(),
-                        tracked_modifications: None,
-                    }
-                }
             }
+            fence::RunFenceResolution::Unavailable(error) => {
+                return ItemOutcome::failed(header, error);
+            }
+            fence::RunFenceResolution::Ambient => {}
         }
     }
 
@@ -822,6 +831,17 @@ pub(crate) async fn build_agent_spawn_config(
     // writable set (`services::sandbox::default_writable_extra`) and created at
     // host startup (`env::ensure_uv_cache_dir`).
     let uv_cache_dir = crate::env::uv_cache_dir().to_string_lossy().into_owned();
+    // A host-spawned bun gets the same runner-provided SDK a placed batch gets,
+    // installed in the Cairn-owned directory above the checkout. Best-effort on
+    // purpose: most bun invocations never import a Cairn package, so a failure
+    // here must not take one of those down. The cost is that an invocation that
+    // does import one fails with the runtime's ordinary missing-module error,
+    // with this log line as the only record of why the package was absent.
+    if program == "bun" {
+        if let Err(error) = crate::runtime::install_sdk_for_checkout(std::path::Path::new(cwd)) {
+            log::warn!("could not install the Cairn runtime SDK for {cwd}: {error}");
+        }
+    }
     let mut spawn_config = SpawnConfig::new(program);
     for arg in args {
         spawn_config = spawn_config.arg(arg);

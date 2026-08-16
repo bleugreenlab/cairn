@@ -54,7 +54,7 @@ async fn seed_run(db: &LocalDb, started_at: Option<i64>, created_at: i64, status
         Box::pin(async move {
             for sql in [
                 "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('proj-1', 'default', 'Test Project', 'FENCE', '/tmp/test-repo', 1, 1)",
+                 VALUES ('proj-1', 'default', 'Test Project', 'fence', '/tmp/test-repo', 1, 1)",
                 "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
                  VALUES ('issue-1', 'proj-1', 1, 'fenced issue', 'active', 1, 1)",
                 "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -92,7 +92,7 @@ fn commenting_write(run_id: &str) -> McpCallbackRequest {
         tool: "write".to_string(),
         payload: serde_json::json!({
             "changes": [{
-                "target": "cairn://p/FENCE/1",
+                "target": "cairn://p/fence/1",
                 "mode": "append",
                 "payload": { "content": COMMENT },
             }]

@@ -89,7 +89,7 @@ async fn a_thread_child_establishes_and_reaches_its_thread_session() {
         &db,
         CHILD_URI,
         None,
-        "cairn://p/P/2/1/builder/questions",
+        "cairn://p/p/2/1/builder/questions",
         Wake::Wake,
         crate::orchestrator::attention_push::Boundary::Event,
         "question:q1",
@@ -156,7 +156,7 @@ async fn a_closed_thread_stops_coordinating_its_children_without_silencing_them(
         &db,
         CHILD_URI,
         None,
-        "cairn://p/P/2/1/builder/questions",
+        "cairn://p/p/2/1/builder/questions",
         Wake::Wake,
         crate::orchestrator::attention_push::Boundary::Event,
         "question:q1",
@@ -219,7 +219,7 @@ async fn a_targeted_wake_to_a_closed_thread_is_dropped_and_spends_nothing() {
         &db,
         &job_id,
         "process",
-        Some("cairn://p/P/general/terminal/build"),
+        Some("cairn://p/p/general/terminal/build"),
         None,
         "agent",
     )
@@ -236,7 +236,7 @@ async fn a_targeted_wake_to_a_closed_thread_is_dropped_and_spends_nothing() {
     );
     let exit_wake = || WakeEvent {
         source: WakeSource::Process {
-            reference: "cairn://p/P/general/terminal/build".into(),
+            reference: "cairn://p/p/general/terminal/build".into(),
         },
         fact_kind: "exit".into(),
         detail_uri: None,
@@ -382,7 +382,7 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
         "artifacts": ["arc"],
         "triggers": [{
             "fact": "attention",
-            "detailUri": "cairn://p/P/3",
+            "detailUri": "cairn://p/p/3",
             "status": ["merged", "closed", "failed"]
         }]
     })
@@ -536,9 +536,9 @@ async fn seed_second_job(db: &LocalDb) {
         .unwrap();
 }
 
-/// The child-attention fixture's child issue: `cairn://p/P/2`, parented to the
+/// The child-attention fixture's child issue: `cairn://p/p/2`, parented to the
 /// fixture issue `i` that `seed_job` puts jobs on.
-const CHILD_URI: &str = "cairn://p/P/2";
+const CHILD_URI: &str = "cairn://p/p/2";
 
 async fn seed_child_issue(db: &LocalDb) {
     db.execute(
@@ -631,8 +631,8 @@ async fn seed_queueable_node(db: &LocalDb) -> QueueableNodeFixture {
     QueueableNodeFixture {
         job_id: "j",
         run_id: "r",
-        issue_uri: "cairn://p/P/1",
-        terminal_uri: "cairn://p/P/1/1/builder/terminal/run-1",
+        issue_uri: "cairn://p/p/1",
+        terminal_uri: "cairn://p/p/1/1/builder/terminal/run-1",
     }
 }
 
@@ -756,7 +756,7 @@ async fn queueable_node_fixture_can_drive_issue_wakes_without_tribal_setup() {
 fn terminal_exit_message_carries_slug_code_runtime_uri_and_tail() {
     let msg = format_terminal_exit_message(
         "run-1",
-        "cairn://p/P/1/1/builder/terminal/run-1",
+        "cairn://p/p/1/1/builder/terminal/run-1",
         Some(2),
         Some(125),
         Some("error: boom"),
@@ -765,7 +765,7 @@ fn terminal_exit_message_carries_slug_code_runtime_uri_and_tail() {
     assert!(msg.contains("exit code 2"), "{msg}");
     assert!(msg.contains("2m05s"), "{msg}");
     assert!(
-        msg.contains("cairn://p/P/1/1/builder/terminal/run-1"),
+        msg.contains("cairn://p/p/1/1/builder/terminal/run-1"),
         "{msg}"
     );
     assert!(msg.contains("error: boom"), "{msg}");
@@ -805,7 +805,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
     let db = migrated_db().await;
     seed_job(&db).await;
     let orch = test_orchestrator(db);
-    let uri = "cairn://p/P/1/1/builder/checks";
+    let uri = "cairn://p/p/1/1/builder/checks";
     subscribe_one_shot(
         &orch.db.local,
         "j",
@@ -846,7 +846,7 @@ async fn checks_settled_wake_fires_once_for_its_own_node_then_is_consumed() {
     let other = route_checks_settled(
         &orch,
         "builder",
-        "cairn://p/P/9/1/builder/checks",
+        "cairn://p/p/9/1/builder/checks",
         &snapshot,
     )
     .await
@@ -967,7 +967,7 @@ fn checks_settled_message_carries_verdict_tally_lanes_and_gaps() {
         statuses,
         terminal_reason: Some("issue merged before submission".to_string()),
     };
-    let uri = "cairn://p/P/1/1/builder/checks";
+    let uri = "cairn://p/p/1/1/builder/checks";
     let message = format_checks_settled_message("builder", uri, &snapshot);
 
     assert!(message.contains("[Checks settled]"));
@@ -989,7 +989,7 @@ async fn terminal_exit_wake_fires_once_then_is_consumed() {
     let orch = test_orchestrator(db);
     // The subscription is keyed on the canonical URI, matching what the route
     // side emits.
-    let uri = "cairn://p/P/1/1/builder/terminal/run-1";
+    let uri = "cairn://p/p/1/1/builder/terminal/run-1";
     subscribe_one_shot(
         &orch.db.local,
         "j",
@@ -1005,7 +1005,7 @@ async fn terminal_exit_wake_fires_once_then_is_consumed() {
     let other = route_terminal_exit_async(
         &orch,
         "run-1",
-        "cairn://p/P/9/1/builder/terminal/run-1",
+        "cairn://p/p/9/1/builder/terminal/run-1",
         Some(0),
         Some(3),
         None,
@@ -1053,14 +1053,14 @@ async fn terminal_exit_wake_fires_once_then_is_consumed() {
 fn terminal_output_message_carries_slug_phrase_uri_and_excerpt() {
     let msg = format_terminal_output_message(
         "dev",
-        "cairn://p/P/1/1/builder/terminal/dev",
+        "cairn://p/p/1/1/builder/terminal/dev",
         "ready",
         Some("VITE ready in 412 ms"),
     );
     assert!(msg.contains("dev"), "{msg}");
     assert!(msg.contains("ready"), "{msg}");
     assert!(
-        msg.contains("cairn://p/P/1/1/builder/terminal/dev"),
+        msg.contains("cairn://p/p/1/1/builder/terminal/dev"),
         "{msg}"
     );
     assert!(msg.contains("VITE ready in 412 ms"), "{msg}");
@@ -1171,7 +1171,7 @@ async fn terminal_output_subscription_also_wakes_on_exit() {
 async fn terminal_output_watchers_persist_for_session_hydration() {
     let db = migrated_db().await;
     seed_job(&db).await;
-    let uri = "cairn://p/P/1/1/builder/terminal/dev";
+    let uri = "cairn://p/p/1/1/builder/terminal/dev";
     subscribe_terminal_output_one_shot(&db, "j", uri, "ready", "agent")
         .await
         .unwrap();
@@ -1198,7 +1198,7 @@ async fn terminal_output_watchers_persist_for_session_hydration() {
     assert!(other_slug.is_empty());
 
     // A different terminal URI shares nothing.
-    let other = list_terminal_output_watchers(&db, "cairn://p/P/1/1/builder/terminal/other")
+    let other = list_terminal_output_watchers(&db, "cairn://p/p/1/1/builder/terminal/other")
         .await
         .unwrap();
     assert!(other.is_empty());
@@ -1206,8 +1206,8 @@ async fn terminal_output_watchers_persist_for_session_hydration() {
 
 #[test]
 fn child_attention_message_with_detail_reads_detail_once() {
-    let issue_uri = "cairn://p/P/2";
-    let detail_uri = "cairn://p/P/2/1/builder/permissions/perm-2";
+    let issue_uri = "cairn://p/p/2";
+    let detail_uri = "cairn://p/p/2/1/builder/permissions/perm-2";
     let message = child_attention_message(
         issue_uri,
         "needs_approval",
@@ -1217,7 +1217,7 @@ fn child_attention_message_with_detail_reads_detail_once() {
 
     assert_eq!(
             message,
-            "[Child update] needs_approval/agent_idle_with_work. Read cairn://p/P/2/1/builder/permissions/perm-2."
+            "[Child update] needs_approval/agent_idle_with_work. Read cairn://p/p/2/1/builder/permissions/perm-2."
         );
     assert_eq!(message.matches(issue_uri).count(), 1);
     assert_eq!(message.matches(detail_uri).count(), 1);
@@ -1225,12 +1225,12 @@ fn child_attention_message_with_detail_reads_detail_once() {
 
 #[test]
 fn child_attention_message_without_detail_reads_issue_once() {
-    let issue_uri = "cairn://p/P/2";
+    let issue_uri = "cairn://p/p/2";
     let message = child_attention_message(issue_uri, "needs_input", "question", None);
 
     assert_eq!(
         message,
-        "[Child update] needs_input/question. Read cairn://p/P/2."
+        "[Child update] needs_input/question. Read cairn://p/p/2."
     );
     assert_eq!(message.matches(issue_uri).count(), 1);
 }
@@ -1247,7 +1247,7 @@ async fn scoped_fact_kinds_match_granularly() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         Some(&kinds),
         "agent",
     )
@@ -1257,7 +1257,7 @@ async fn scoped_fact_kinds_match_granularly() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         Some(&kinds),
         None,
         None,
@@ -1266,13 +1266,13 @@ async fn scoped_fact_kinds_match_granularly() {
     .await
     .unwrap();
     assert!(
-        matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "pr_state_change")
+        matching_subscription(&db, "j", "issue", Some("cairn://p/p/2"), "pr_state_change")
             .await
             .unwrap()
             .is_some()
     );
     assert!(
-        matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "question")
+        matching_subscription(&db, "j", "issue", Some("cairn://p/p/2"), "question")
             .await
             .unwrap()
             .is_none()
@@ -1335,14 +1335,14 @@ async fn narrow_mute_downgrades_only_the_facts_it_names() {
 async fn narrow_active_overrides_broad_muted_scope() {
     let db = migrated_db().await;
     seed_job(&db).await;
-    subscribe(&db, "j", "issue", Some("cairn://p/P/2"), None, "agent")
+    subscribe(&db, "j", "issue", Some("cairn://p/p/2"), None, "agent")
         .await
         .unwrap();
     mute(
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         None,
         None,
         None,
@@ -1355,21 +1355,21 @@ async fn narrow_active_overrides_broad_muted_scope() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         Some(&kinds),
         "agent",
     )
     .await
     .unwrap();
 
-    let question = matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "question")
+    let question = matching_subscription(&db, "j", "issue", Some("cairn://p/p/2"), "question")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(question.state, WakeSubscriptionState::Active);
     assert_eq!(question.fact_kinds.as_ref().unwrap(), &kinds);
 
-    let pr = matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "pr_state_change")
+    let pr = matching_subscription(&db, "j", "issue", Some("cairn://p/p/2"), "pr_state_change")
         .await
         .unwrap()
         .unwrap();
@@ -1385,7 +1385,7 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         None,
         None,
         None,
@@ -1402,10 +1402,10 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
         &orch,
         WakeEvent {
             source: WakeSource::Issue {
-                reference: "cairn://p/P/2".to_string(),
+                reference: "cairn://p/p/2".to_string(),
             },
             fact_kind: "pr_state_change".to_string(),
-            detail_uri: Some("cairn://p/P/2/1/pr".to_string()),
+            detail_uri: Some("cairn://p/p/2/1/pr".to_string()),
             delivery: WakeDelivery::Broadcast {
                 message: "routine PR update".to_string(),
             },
@@ -1428,12 +1428,13 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
         &orch,
         WakeEvent {
             source: WakeSource::Issue {
-                reference: "cairn://p/P/2".to_string(),
+                reference: "cairn://p/p/2".to_string(),
             },
             fact_kind: "question".to_string(),
-            detail_uri: Some("cairn://p/P/2/1/questions/q".to_string()),
+            detail_uri: Some("cairn://p/p/2/1/questions/q".to_string()),
             delivery: WakeDelivery::Targeted {
                 subscriber_job_id: sub.job_id.clone(),
+                sender_name: None,
                 message: "needs answer".to_string(),
             },
             urgency: DeliveryUrgency::Interrupt,
@@ -1456,7 +1457,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
         WakeEvent {
             source: WakeSource::User,
             fact_kind: FACT_KIND_MESSAGE.to_string(),
-            detail_uri: Some("cairn://p/P/1/1/builder".to_string()),
+            detail_uri: Some("cairn://p/p/1/1/builder".to_string()),
             delivery: WakeDelivery::MessageDigest {
                 subscriber_job_id: "j".to_string(),
                 content: "passive note".to_string(),
@@ -1483,7 +1484,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
         WakeEvent {
             source: WakeSource::User,
             fact_kind: FACT_KIND_MESSAGE.to_string(),
-            detail_uri: Some("cairn://p/P/1/1/builder".to_string()),
+            detail_uri: Some("cairn://p/p/1/1/builder".to_string()),
             delivery: WakeDelivery::MessageDigest {
                 subscriber_job_id: "j".to_string(),
                 content: "dropped note".to_string(),
@@ -1911,7 +1912,7 @@ async fn review_fact_aliases_match_legacy_child_subscription_kinds() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         Some(&legacy),
         "agent",
     )
@@ -1919,7 +1920,7 @@ async fn review_fact_aliases_match_legacy_child_subscription_kinds() {
     .unwrap();
 
     assert!(
-        matching_subscription(&db, "j", "issue", Some("cairn://p/P/2"), "review")
+        matching_subscription(&db, "j", "issue", Some("cairn://p/p/2"), "review")
             .await
             .unwrap()
             .is_some()
@@ -1954,7 +1955,7 @@ async fn mute_creates_a_scoped_subscription() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/99"),
+        Some("cairn://p/p/99"),
         None,
         None,
         None,
@@ -1964,7 +1965,7 @@ async fn mute_creates_a_scoped_subscription() {
     .unwrap();
     assert_eq!(sub.state, WakeSubscriptionState::Muted);
     assert_eq!(sub.source_kind, "issue");
-    assert_eq!(sub.source_ref.as_deref(), Some("cairn://p/P/99"));
+    assert_eq!(sub.source_ref.as_deref(), Some("cairn://p/p/99"));
     assert_eq!(list_subscriptions_for_job(&db, "j").await.unwrap().len(), 1);
 }
 
@@ -1995,7 +1996,7 @@ async fn default_job_subscriptions_cover_user_and_any_peer() {
         .unwrap()
         .unwrap();
     assert_eq!(user.state, WakeSubscriptionState::Active);
-    let peer = matching_subscription(&db, "j", "peer", Some("cairn://p/P/1/1/planner"), "message")
+    let peer = matching_subscription(&db, "j", "peer", Some("cairn://p/p/1/1/planner"), "message")
         .await
         .unwrap()
         .unwrap();
@@ -2015,7 +2016,7 @@ async fn specific_peer_subscription_overrides_broad_default() {
         &db,
         "j",
         "peer",
-        Some("cairn://p/P/1/1/planner"),
+        Some("cairn://p/p/1/1/planner"),
         None,
         "system",
     )
@@ -2025,7 +2026,7 @@ async fn specific_peer_subscription_overrides_broad_default() {
         &db,
         "j",
         "peer",
-        Some("cairn://p/P/1/1/planner"),
+        Some("cairn://p/p/1/1/planner"),
         None,
         None,
         None,
@@ -2035,21 +2036,21 @@ async fn specific_peer_subscription_overrides_broad_default() {
     .unwrap();
 
     let specific =
-        matching_subscription(&db, "j", "peer", Some("cairn://p/P/1/1/planner"), "message")
+        matching_subscription(&db, "j", "peer", Some("cairn://p/p/1/1/planner"), "message")
             .await
             .unwrap()
             .unwrap();
     assert_eq!(specific.state, WakeSubscriptionState::Muted);
     assert_eq!(
         specific.source_ref.as_deref(),
-        Some("cairn://p/P/1/1/planner")
+        Some("cairn://p/p/1/1/planner")
     );
 
     let other = matching_subscription(
         &db,
         "j",
         "peer",
-        Some("cairn://p/P/1/1/reviewer"),
+        Some("cairn://p/p/1/1/reviewer"),
         "message",
     )
     .await
@@ -2064,10 +2065,10 @@ async fn source_matching_returns_best_subscription_for_every_subscriber() {
     let db = migrated_db().await;
     seed_job(&db).await;
     seed_second_job(&db).await;
-    subscribe(&db, "j", "issue", Some("cairn://p/P/2"), None, "agent")
+    subscribe(&db, "j", "issue", Some("cairn://p/p/2"), None, "agent")
         .await
         .unwrap();
-    subscribe(&db, "j2", "issue", Some("cairn://p/P/2"), None, "agent")
+    subscribe(&db, "j2", "issue", Some("cairn://p/p/2"), None, "agent")
         .await
         .unwrap();
     let routine = vec!["pr_state_change".to_string()];
@@ -2075,7 +2076,7 @@ async fn source_matching_returns_best_subscription_for_every_subscriber() {
         &db,
         "j2",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         Some(&routine),
         None,
         None,
@@ -2085,7 +2086,7 @@ async fn source_matching_returns_best_subscription_for_every_subscriber() {
     .unwrap();
 
     let matches =
-        matching_subscriptions_for_source(&db, "issue", Some("cairn://p/P/2"), "pr_state_change")
+        matching_subscriptions_for_source(&db, "issue", Some("cairn://p/p/2"), "pr_state_change")
             .await
             .unwrap();
     assert_eq!(matches.len(), 2);
@@ -2103,7 +2104,7 @@ async fn digest_render_names_lifted_scope_and_live_wake() {
         subscription_id: Some("s".to_string()),
         job_id: "j".to_string(),
         source_kind: "issue".to_string(),
-        source_ref: Some("cairn://p/P/2".to_string()),
+        source_ref: Some("cairn://p/p/2".to_string()),
         fact_kind: Some("pr_state_change".to_string()),
         occurrences: 3,
         latest_detail_uri: Some("latest".to_string()),
@@ -2113,7 +2114,7 @@ async fn digest_render_names_lifted_scope_and_live_wake() {
         delivered_at: None,
     };
     let rendered = SuppressedWake::render_digest_with_context(&[notice], Some(&WakeSource::User));
-    assert!(rendered.contains("lifting wake snooze on issue cairn://p/P/2"));
+    assert!(rendered.contains("lifting wake snooze on issue cairn://p/p/2"));
     assert!(rendered.contains("woken by: user"));
     assert!(rendered.contains("pr_state_change ×3"));
 }
@@ -2128,7 +2129,7 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
             &db,
             "j",
             "issue",
-            Some("cairn://p/P/2"),
+            Some("cairn://p/p/2"),
             "review",
             Wake::Wake
         )
@@ -2140,7 +2141,7 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
         &db,
         "j",
         "issue",
-        Some("cairn://p/P/2"),
+        Some("cairn://p/p/2"),
         None,
         None,
         None,
@@ -2154,7 +2155,7 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
             &db,
             "j",
             "issue",
-            Some("cairn://p/P/2"),
+            Some("cairn://p/p/2"),
             "review",
             Wake::Wake
         )
@@ -2168,7 +2169,7 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
             &db,
             "j",
             "issue",
-            Some("cairn://p/P/2"),
+            Some("cairn://p/p/2"),
             "review",
             Wake::Interrupt
         )
@@ -2182,7 +2183,7 @@ async fn mute_downgrade_lowers_wake_for_muted_source_only() {
             &db,
             "j",
             "issue",
-            Some("cairn://p/P/2"),
+            Some("cairn://p/p/2"),
             "review",
             Wake::Passive
         )

@@ -95,7 +95,7 @@ mod capacity_retry_tests {
     async fn seed_job(db: &LocalDb) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO jobs (id, project_id, status, current_session_id, created_at, updated_at) VALUES ('j','p','running','s',1,1)",
             "INSERT INTO sessions (id, job_id, backend, status, created_at, updated_at) VALUES ('s','j','codex','open',1,1)",
         ] {
@@ -1264,7 +1264,7 @@ mod followup_start_reason_tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('p','w','P','PRJ','/tmp/prj',1,1)",
+                     VALUES ('p','w','P','prj','/tmp/prj',1,1)",
                     (),
                 )
                 .await?;

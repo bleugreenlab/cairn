@@ -567,7 +567,7 @@ mod tests {
         write_skill_md(&d, "---\nname: testing\ndescription: Test\n---\n\nPrompt.");
         std::fs::write(
             d.join(".meta.json"),
-            r#"{"created_by":"Reviewer","source_issue":"CAIRN-949"}"#,
+            r#"{"created_by":"Reviewer","source_issue":"cairn-949"}"#,
         )
         .unwrap();
 
@@ -575,7 +575,7 @@ mod tests {
             ConfigResult::Ok(s) => {
                 let m = s.meta.unwrap();
                 assert_eq!(m.created_by, Some("Reviewer".to_string()));
-                assert_eq!(m.source_issue, Some("CAIRN-949".to_string()));
+                assert_eq!(m.source_issue, Some("cairn-949".to_string()));
             }
             ConfigResult::Err { error, .. } => panic!("{}", error),
         }
@@ -637,7 +637,7 @@ mod tests {
             None,
             Some(SkillMetaUpdate {
                 updated_by: Some("test".into()),
-                source_issue: Some("CAIRN-999".into()),
+                source_issue: Some("cairn-999".into()),
                 ..Default::default()
             }),
         )
@@ -649,7 +649,7 @@ mod tests {
             loaded.allowed_tools,
             Some(vec!["Read".into(), "Grep".into()])
         );
-        assert!(loaded.meta.unwrap().source_issue == Some("CAIRN-999".into()));
+        assert!(loaded.meta.unwrap().source_issue == Some("cairn-999".into()));
     }
 
     #[test]

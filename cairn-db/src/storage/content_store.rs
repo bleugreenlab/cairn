@@ -22,7 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
-use crate::storage::local_db::DbHandle;
+use crate::storage::local_db::{ConnectionGate, DbHandle, TrackedConnection};
 use crate::storage::LocalDb;
 use crate::storage::TeamId;
 use crate::turso::Value;
@@ -62,18 +62,29 @@ pub trait ContentStore: Send + Sync {
 /// Private-database content store backed by the durable `cas_cache` table.
 pub(crate) struct PrivateContentStore {
     database: Arc<DbHandle>,
+    gate: Arc<ConnectionGate>,
 }
 
 impl PrivateContentStore {
-    pub(super) fn new(database: Arc<DbHandle>) -> Self {
-        Self { database }
+    pub(super) fn new(database: Arc<DbHandle>, gate: Arc<ConnectionGate>) -> Self {
+        Self { database, gate }
     }
 
-    async fn connect(&self) -> Result<turso::Connection, String> {
-        match self.database.as_ref() {
-            DbHandle::Local(db) => db.connect().map_err(|error| error.to_string()),
-            DbHandle::Synced(db) => db.connect().await.map_err(|error| error.to_string()),
-        }
+    /// A connection for one content-store statement.
+    ///
+    /// This is the only connection in the process that does not come from
+    /// `LocalDb` — it reaches `DbHandle` directly — which makes it the one path
+    /// that would silently defeat the quiesce if it were left out. The
+    /// statements below run in autocommit, and an autocommit statement is an
+    /// MVCC transaction like any other, so it registers with the
+    /// [`ConnectionGate`] exactly as a pooled connection does.
+    async fn connect(&self) -> Result<TrackedConnection, String> {
+        let slot = self.gate.admit("content-store").await;
+        let conn = match self.database.as_ref() {
+            DbHandle::Local(db) => db.connect().map_err(|error| error.to_string())?,
+            DbHandle::Synced(db) => db.connect().await.map_err(|error| error.to_string())?,
+        };
+        Ok(TrackedConnection::new(conn, slot))
     }
 }
 

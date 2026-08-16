@@ -2,9 +2,9 @@
 //!
 //! The transcript list renders read rows as a per-target token count instead of
 //! shipping the full read body to the frontend. Counts are computed here with
-//! tiktoken-rs's `o200k_base` BPE. That is an *approximation* of Claude's
-//! tokenizer — Claude's tokenizer is not public — so counts are surfaced in the
-//! UI as `~N tok`, never as an exact figure.
+//! the meter selected for the run's backend and model. Counts remain surfaced in
+//! the UI as `~N tok` because every local tokenizer is an approximation of the
+//! provider's request framing.
 //!
 //! Section parsing mirrors the frontend grammar in
 //! `src/components/toolFormatters/read.tsx` (`parseReadSections`,
@@ -13,25 +13,14 @@
 //! covering the whole body. Segments come out in input order because the batch
 //! assembler composes targets in input order.
 
+use cairn_common::token_meter::TokenMeter;
 use regex::Regex;
 use std::sync::OnceLock;
-use tiktoken_rs::{o200k_base, CoreBPE};
 
 /// Per-target token count for one section of a composed read result. The type
 /// lives in `models::run` (serialized onto `Event.read_segments`); this module
 /// owns the token-counting logic that produces it.
 pub use crate::models::ReadSegmentTokens;
-
-fn bpe() -> &'static CoreBPE {
-    static BPE: OnceLock<CoreBPE> = OnceLock::new();
-    BPE.get_or_init(|| o200k_base().expect("o200k_base BPE initializes"))
-}
-
-/// Approximate token count of `text` using the `o200k_base` BPE. Ordinary
-/// encoding (no special-token handling) so arbitrary file content never errors.
-fn count_tokens(text: &str) -> usize {
-    bpe().encode_ordinary(text).len()
-}
 
 /// True when `name` denotes the unified `read` tool, matching the frontend's
 /// `normalizeToolName` (strip an `mcp__<server>__` prefix, case-insensitive).
@@ -219,12 +208,13 @@ fn extract_output(result: &str) -> String {
 pub(crate) fn read_segment_tokens(
     result_body: &str,
     expected: &[String],
+    meter: &dyn TokenMeter,
 ) -> Vec<ReadSegmentTokens> {
     let output = extract_output(result_body);
     let whole = || {
         vec![ReadSegmentTokens {
             target: expected.first().cloned().unwrap_or_default(),
-            tokens: count_tokens(&output) as i64,
+            tokens: i64::from(meter.count(&output)),
             image_uri: stored_image_uri(&output),
         }]
     };
@@ -253,7 +243,7 @@ pub(crate) fn read_segment_tokens(
             };
             ReadSegmentTokens {
                 target,
-                tokens: count_tokens(&body) as i64,
+                tokens: i64::from(meter.count(&body)),
                 image_uri: stored_image_uri(&body),
             }
         })
@@ -276,7 +266,11 @@ mod tests {
     #[test]
     fn multi_section_batch_yields_one_segment_per_target_in_order() {
         let body = "=== file:a.rs ===\nline one\nline two\n=== file:b.rs ===\nbeta";
-        let segs = read_segment_tokens(body, &["file:a.rs".into(), "file:b.rs".into()]);
+        let segs = read_segment_tokens(
+            body,
+            &["file:a.rs".into(), "file:b.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].target, "file:a.rs");
         assert_eq!(segs[1].target, "file:b.rs");
@@ -287,7 +281,11 @@ mod tests {
     #[test]
     fn single_no_header_read_yields_one_segment_with_input_target() {
         let body = "just some file content\nwith two lines";
-        let segs = read_segment_tokens(body, &["file:only.rs".into()]);
+        let segs = read_segment_tokens(
+            body,
+            &["file:only.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].target, "file:only.rs");
         assert!(segs[0].tokens > 0);
@@ -301,6 +299,7 @@ mod tests {
         let segs = read_segment_tokens(
             "=== cairn:~/issues?limit=3 [3 of 3 issues] ===\nissue body here",
             &["cairn://p/RB/issues?limit=3".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
         );
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].target, "cairn://p/RB/issues?limit=3");
@@ -316,6 +315,7 @@ mod tests {
         let segs = read_segment_tokens(
             body,
             &["file:a.rs".into(), "cairn://p/RB/issues?limit=2".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
         );
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].target, "file:a.rs");
@@ -325,17 +325,25 @@ mod tests {
 
     #[test]
     fn header_suffixes_are_stripped_from_target() {
-        let grep = read_segment_tokens("=== file:a.rs [3 matches] ===\nhit", &["file:a.rs".into()]);
+        let grep = read_segment_tokens(
+            "=== file:a.rs [3 matches] ===\nhit",
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(grep[0].target, "file:a.rs");
 
         let lines = read_segment_tokens(
             "=== file:a.rs [lines 1\u{2013}20 of 99] ===\nbody",
             &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
         );
         assert_eq!(lines[0].target, "file:a.rs");
 
-        let trunc =
-            read_segment_tokens("=== file:a.rs [truncated] ===\nbody", &["file:a.rs".into()]);
+        let trunc = read_segment_tokens(
+            "=== file:a.rs [truncated] ===\nbody",
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(trunc[0].target, "file:a.rs");
     }
 
@@ -344,17 +352,29 @@ mod tests {
         // A single read is unframed; a bare `=== file:… ===` line in its content
         // must not be treated as a frame and mis-split the body.
         let body = "intro line\n=== file:other.rs ===\nmore content";
-        let segs = read_segment_tokens(body, &["file:a.rs".into()]);
+        let segs = read_segment_tokens(
+            body,
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].target, "file:a.rs");
-        let whole = read_segment_tokens("intro line\nmore content", &["file:a.rs".into()]);
+        let whole = read_segment_tokens(
+            "intro line\nmore content",
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         // The count covers the whole body, internal pseudo-header included.
         assert!(segs[0].tokens >= whole[0].tokens);
     }
 
     #[test]
     fn empty_body_yields_zero_token_segment() {
-        let segs = read_segment_tokens("", &["file:a.rs".into()]);
+        let segs = read_segment_tokens(
+            "",
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].target, "file:a.rs");
         assert_eq!(segs[0].tokens, 0);
@@ -362,7 +382,11 @@ mod tests {
 
     #[test]
     fn no_expected_targets_still_splits_on_headers() {
-        let segs = read_segment_tokens("=== file:a.rs ===\nbody\n=== file:b.rs ===\nmore", &[]);
+        let segs = read_segment_tokens(
+            "=== file:a.rs ===\nbody\n=== file:b.rs ===\nmore",
+            &[],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 2);
     }
 
@@ -371,13 +395,17 @@ mod tests {
         // The file content contains a `=== x ===` line that is not an input path;
         // with expected targets it must stay inside the section, not split it.
         let body = "=== file:a.rs ===\nprefix\n=== not a target ===\nsuffix";
-        let segs = read_segment_tokens(body, &["file:a.rs".into()]);
+        let segs = read_segment_tokens(
+            body,
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].target, "file:a.rs");
     }
 
     const STORED: &str =
-        "cairn://p/CAIRN/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        "cairn://p/cairn/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
     fn image_reference_is_lifted_onto_the_segment_that_read_it() {
@@ -385,7 +413,11 @@ mod tests {
         // the row through the segment metadata or the image is invisible again.
         let body =
             format!("=== file:a.rs ===\nfn a() {{}}\n=== file:plot.png ===\n![plot.png]({STORED})");
-        let segs = read_segment_tokens(&body, &["file:a.rs".into(), "file:plot.png".into()]);
+        let segs = read_segment_tokens(
+            &body,
+            &["file:a.rs".into(), "file:plot.png".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].image_uri, None);
         assert_eq!(segs[1].image_uri.as_deref(), Some(STORED));
@@ -393,7 +425,11 @@ mod tests {
 
     #[test]
     fn unframed_single_image_read_carries_its_reference() {
-        let segs = read_segment_tokens(&format!("![fig.png]({STORED})"), &["file:fig.png".into()]);
+        let segs = read_segment_tokens(
+            &format!("![fig.png]({STORED})"),
+            &["file:fig.png".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].image_uri.as_deref(), Some(STORED));
     }
@@ -404,15 +440,27 @@ mod tests {
         // claim it read an image; only the anchored stable-URI shape counts.
         let body =
             "=== file:README.md ===\n![logo](docs/logo.png)\n![remote](https://example.com/x.png)";
-        let segs = read_segment_tokens(body, &["file:README.md".into()]);
+        let segs = read_segment_tokens(
+            body,
+            &["file:README.md".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(segs[0].image_uri, None);
     }
 
     #[test]
     fn trailing_batch_truncated_marker_is_dropped() {
         let body = "=== file:a.rs ===\nbody\n--- batch truncated: too big ---";
-        let with = read_segment_tokens(body, &["file:a.rs".into()]);
-        let without = read_segment_tokens("=== file:a.rs ===\nbody", &["file:a.rs".into()]);
+        let with = read_segment_tokens(
+            body,
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
+        let without = read_segment_tokens(
+            "=== file:a.rs ===\nbody",
+            &["file:a.rs".into()],
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
         assert_eq!(with[0].tokens, without[0].tokens);
     }
 }

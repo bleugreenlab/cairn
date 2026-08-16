@@ -328,7 +328,7 @@ impl OrchestratorBuilder {
         let fleet = Arc::new(crate::fleet::Fleet::with_residency_route_path(
             self.config_dir.join("build-slot-residency-routes.json"),
         ));
-        Orchestrator {
+        let orchestrator = Orchestrator {
             db: self.db,
             services: self.services,
             process_state: self.process_state,
@@ -376,6 +376,10 @@ impl OrchestratorBuilder {
             mcp_gateway: Arc::new(OnceLock::new()),
             model_catalog: self.model_catalog,
             provider_usage_snapshots: self.provider_usage_snapshots,
+            sidebar_active_issues: Arc::new(std::sync::RwLock::new(None)),
+            sidebar_active_issues_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            sidebar_active_issues_rebuild: Arc::new(TokioMutex::new(())),
+            sidebar_active_issues_rebuild_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             context_token_snapshots: self.context_token_snapshots,
             team_attention_sender: self.team_attention_sender,
             team_attention_push_dedupe: Arc::new(TokioMutex::new(HashMap::new())),
@@ -393,8 +397,30 @@ impl OrchestratorBuilder {
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
             main_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             write_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            node_check_status_cache: Arc::new(
+                crate::execution::checks_status::NodeCheckStatusCache::default(),
+            ),
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let mut pulls = crate::storage::subscribe_team_pull_applied();
+            let snapshot = Arc::downgrade(&orchestrator.sidebar_active_issues);
+            let generation = Arc::downgrade(&orchestrator.sidebar_active_issues_generation);
+            handle.spawn(async move {
+                while pulls.recv().await.is_ok() {
+                    let (Some(snapshot), Some(generation)) =
+                        (snapshot.upgrade(), generation.upgrade())
+                    else {
+                        break;
+                    };
+                    generation.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    if let Ok(mut snapshot) = snapshot.write() {
+                        *snapshot = None;
+                    };
+                }
+            });
         }
+        orchestrator
     }
 }
 
@@ -804,6 +830,25 @@ struct AttachedUi {
     current: Option<(u64, u32)>,
 }
 
+#[derive(Clone, Debug)]
+pub enum CloudObjectGrantMintError {
+    InvalidRequest,
+    StaleExecution,
+    Unavailable(String),
+}
+
+impl std::fmt::Display for CloudObjectGrantMintError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest => formatter.write_str("cloud object grant request is malformed"),
+            Self::StaleExecution => {
+                formatter.write_str("cloud object grant execution authorization is stale")
+            }
+            Self::Unavailable(error) => formatter.write_str(error),
+        }
+    }
+}
+
 /// Central runtime state for agent orchestration.
 ///
 /// Created once at startup by each host (Tauri app, cairn-server).
@@ -930,6 +975,8 @@ pub struct Orchestrator {
         Arc<Mutex<HashMap<String, crate::execution::checks_main::MainCheckRun>>>,
     /// Job ids with a synchronous when:write batch in flight. Runtime-only.
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
+    /// Exact settled node-check projection, generation-fenced and single-flight.
+    pub(crate) node_check_status_cache: Arc<crate::execution::checks_status::NodeCheckStatusCache>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -1039,6 +1086,15 @@ pub struct Orchestrator {
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     /// Latest usage snapshots keyed by backend and requested account.
     pub provider_usage_snapshots: ProviderUsageSnapshots,
+    /// Published Nav-equivalent active issue projection. Mutations invalidate it;
+    /// the next tray/sidebar read rebuilds it with bounded per-database queries.
+    pub sidebar_active_issues:
+        Arc<std::sync::RwLock<Option<Vec<crate::models::SidebarActiveIssue>>>>,
+    sidebar_active_issues_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// Single-flight gate for cold snapshot rebuilds. Readers recheck the cache
+    /// after acquiring it so one query pass serves an entire concurrent burst.
+    pub sidebar_active_issues_rebuild: Arc<TokioMutex<()>>,
+    sidebar_active_issues_rebuild_count: Arc<std::sync::atomic::AtomicU64>,
     /// Latest normalized context-token snapshots keyed by durable session id.
     context_token_snapshots: Arc<RwLock<HashMap<String, ContextTokenState>>>,
 
@@ -1153,6 +1209,43 @@ impl Drop for JobLaunchClaim {
 }
 
 impl Orchestrator {
+    pub fn invalidate_sidebar_active_issues(&self) {
+        self.sidebar_active_issues_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if let Ok(mut snapshot) = self.sidebar_active_issues.write() {
+            *snapshot = None;
+        }
+    }
+
+    pub fn sidebar_active_issues_generation(&self) -> u64 {
+        self.sidebar_active_issues_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn begin_sidebar_active_issues_rebuild(&self) {
+        self.sidebar_active_issues_rebuild_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn sidebar_active_issues_rebuild_count(&self) -> u64 {
+        self.sidebar_active_issues_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn publish_sidebar_active_issues(
+        &self,
+        generation: u64,
+        issues: Vec<crate::models::SidebarActiveIssue>,
+    ) -> Result<(), String> {
+        let mut snapshot = self
+            .sidebar_active_issues
+            .write()
+            .map_err(|error| error.to_string())?;
+        if self.sidebar_active_issues_generation() == generation {
+            *snapshot = Some(issues);
+        }
+        Ok(())
+    }
     pub fn substrate_health_snapshot(
         &self,
     ) -> cairn_common::executor_protocol::SubstrateHealthSnapshot {
@@ -1669,27 +1762,38 @@ impl Orchestrator {
         &self,
         request: &cairn_common::executor_protocol::CloudObjectGrantRequest,
         base_commit: &str,
-    ) -> Result<cairn_common::executor_protocol::CloudObjectGrant, String> {
+    ) -> Result<cairn_common::executor_protocol::CloudObjectGrant, CloudObjectGrantMintError> {
+        if !crate::orchestrator::object_plane::ObjectPlaneState::valid_cloud_grant_shape(request) {
+            return Err(CloudObjectGrantMintError::InvalidRequest);
+        }
         if !self
             .object_plane
             .authorizes_cloud_grant(request, base_commit)
         {
-            return Err(
-                "Cloud object grant is not authorized for this execution generation".into(),
-            );
+            return Err(CloudObjectGrantMintError::StaleExecution);
         }
         let team_id = self
             .db
             .team_id_for_project(&request.coordinate.repository.project_id)
-            .await?
-            .ok_or_else(|| "Cloud object grants require a connected team project".to_string())?;
+            .await
+            .map_err(CloudObjectGrantMintError::Unavailable)?
+            .ok_or_else(|| {
+                CloudObjectGrantMintError::Unavailable(
+                    "Cloud object grants require a connected team project".into(),
+                )
+            })?;
         let device_jwt = crate::account::read_device_jwt(&self.db.local)
-            .await?
-            .ok_or_else(|| "Cloud object grants require a connected runner account".to_string())?;
+            .await
+            .map_err(CloudObjectGrantMintError::Unavailable)?
+            .ok_or_else(|| {
+                CloudObjectGrantMintError::Unavailable(
+                    "Cloud object grants require a connected runner account".into(),
+                )
+            })?;
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CloudObjectGrantMintError::Unavailable(error.to_string()))?;
         crate::account::mint_cloud_object_grant(
             &client,
             &device_jwt,
@@ -1700,6 +1804,7 @@ impl Orchestrator {
             &self.api_config,
         )
         .await
+        .map_err(CloudObjectGrantMintError::Unavailable)
     }
 
     /// The shared `/embed` gateway client.
@@ -1760,6 +1865,7 @@ impl Orchestrator {
         if let Ok(mut jobs) = self.recent_turn_end_check_requests.lock() {
             jobs.remove(job_id);
         }
+        self.invalidate_node_check_status(job_id, "check-submission");
         Some(cancel)
     }
 
@@ -1768,6 +1874,7 @@ impl Orchestrator {
         if let Ok(mut map) = self.turn_end_checks_in_flight.lock() {
             map.remove(job_id);
         }
+        self.invalidate_node_check_status(job_id, "check-settlement");
     }
 
     /// Whether a turn-end check run is currently in flight for a job — the signal
@@ -1783,6 +1890,7 @@ impl Orchestrator {
         if let Ok(mut jobs) = self.write_checks_in_flight.lock() {
             *jobs.entry(job_id.to_string()).or_default() += 1;
         }
+        self.invalidate_node_check_status(job_id, "head-tree-or-write-check-submission");
     }
 
     pub(crate) fn end_write_checks(&self, job_id: &str) {
@@ -1794,6 +1902,7 @@ impl Orchestrator {
                 }
             }
         }
+        self.invalidate_node_check_status(job_id, "write-check-settlement-or-result");
     }
 
     pub(crate) fn write_checks_in_flight(&self, job_id: &str) -> bool {
@@ -1854,6 +1963,18 @@ impl Orchestrator {
                 cancel.cancel();
             }
         }
+        self.invalidate_node_check_status(job_id, "cancellation");
+    }
+
+    /// Advance the complete correctness generation for a job's settled check
+    /// projection. Call only after the corresponding state transition commits.
+    pub(crate) fn invalidate_node_check_status(&self, job_id: &str, reason: &'static str) {
+        self.node_check_status_cache.invalidate(job_id, reason);
+    }
+
+    pub(crate) fn invalidate_project_check_results(&self, project_id: &str) {
+        self.node_check_status_cache
+            .invalidate_project_results(project_id);
     }
 
     /// Token provider for the `/embed` gateway: prefers the connected account's
@@ -1988,7 +2109,14 @@ impl Orchestrator {
         provider: std::sync::Arc<dyn crate::channels::ChannelProvider>,
         config: crate::models::IMessageChannelConfig,
     ) {
-        crate::channels::router::spawn(self.clone(), provider, "imessage", config.to, config.route);
+        crate::channels::router::spawn(
+            self.clone(),
+            provider,
+            "imessage",
+            config.to,
+            config.route,
+            config.inbound_capabilities,
+        );
     }
 
     /// Re-dispatch workflow runs that were in flight when the process died
@@ -2591,6 +2719,19 @@ impl Orchestrator {
             interval.tick().await;
             loop {
                 interval.tick().await;
+                for db in orch.db.all_dbs().await {
+                    if let Err(error) = crate::runs::watchdog_reconciler::reconcile_watchdog_leases(
+                        &db,
+                        crate::runs::watchdog_reconciler::ReconcileScope::Periodic,
+                        chrono::Utc::now().timestamp(),
+                        crate::runs::watchdog_reconciler::DEFAULT_HEARTBEAT_GRACE_SECS,
+                        &orch,
+                    )
+                    .await
+                    {
+                        log::error!("Codex watchdog periodic reconciliation failed: {error}");
+                    }
+                }
                 let orch = orch.clone();
                 // Off the async worker: the eviction lookup and kills block on
                 // DB round-trips, so keep the runtime responsive.
@@ -2641,7 +2782,7 @@ impl Orchestrator {
             };
             // Prefer the richer source. A coarse live snapshot (Claude
             // `rate_limit_event`, a single status window) must not overwrite a
-            // richer manual-probe snapshot (`claude_usage_tui` / `codex_rate_limits`,
+            // richer canonical snapshot (`claude_usage_oauth` / `codex_rate_limits`,
             // the canonical 5-hour + weekly windows) already cached, or the panel
             // would flip shape mid-run. Equal-or-greater rank still updates, so
             // Codex's rich live events and every manual refresh flow through.
@@ -2740,10 +2881,9 @@ impl Orchestrator {
             ));
         }
 
-        if matches!(
-            backend.to_ascii_lowercase().as_str(),
-            "codex" | "openrouter" | "ollama"
-        ) {
+        // Claude answered above; every other provider sources the window from
+        // its discovered catalog rather than a table in Cairn.
+        if crate::backends::KNOWN_BACKENDS.contains(&backend.to_ascii_lowercase().as_str()) {
             return model.and_then(|model| {
                 self.model_catalog
                     .read()
@@ -2794,10 +2934,22 @@ impl Orchestrator {
         entry
     }
 
+    /// Rediscover every provider's models, then tell clients the catalog moved.
+    ///
+    /// The announcement belongs here rather than at any one entry point. A full
+    /// refresh runs on several schedules — an immediate startup pass, a gated
+    /// startup pass, and the account paths that change credentials — and every
+    /// one of them leaves clients holding a catalog they fetched before
+    /// discovery finished. A scoped single-backend refresh deliberately stays
+    /// silent: it hands the new entry straight back to the caller that asked.
     fn refresh_model_catalog(&self) {
-        for backend_name in ["claude", "codex", "openrouter", "ollama"] {
+        for backend_name in crate::backends::KNOWN_BACKENDS {
             self.refresh_provider_model_catalog_blocking(backend_name);
         }
+        let _ = self.services.emitter.emit(
+            "config-changed",
+            serde_json::json!({"entity_type": "model_catalog"}),
+        );
     }
 
     pub async fn run_model_catalog_refresh(&self) {
@@ -2813,10 +2965,7 @@ impl Orchestrator {
         backend: &str,
     ) -> Result<ProviderModelCatalog, String> {
         let backend = backend.to_ascii_lowercase();
-        if !matches!(
-            backend.as_str(),
-            "claude" | "codex" | "openrouter" | "ollama"
-        ) {
+        if !crate::backends::KNOWN_BACKENDS.contains(&backend.as_str()) {
             return Err(format!("Unsupported backend: {backend}"));
         }
         let orch = self.clone();
@@ -2826,6 +2975,13 @@ impl Orchestrator {
             .map_err(|e| format!("model catalog refresh task failed: {e}"))
     }
 
+    /// Rediscover every provider's models on a dedicated thread.
+    ///
+    /// Discovery builds `reqwest::blocking` clients, and each of those owns a
+    /// tokio runtime that panics when dropped inside an async context, so the
+    /// refresh may never run on a runtime thread. That is also why callers
+    /// cannot await a fresh catalog — they learn it landed from the completion
+    /// event [`Self::refresh_model_catalog`] emits.
     pub fn spawn_model_catalog_refresh(&self) {
         let orch = self.clone();
         std::thread::spawn(move || {
@@ -2900,10 +3056,12 @@ mod tests {
                     os: "windows".into(),
                     arch: "x86_64".into(),
                     logical_cores: 16,
+                    concurrency_capacity: None,
                     toolchains: Vec::new(),
                     projects_served: Vec::new(),
                     disk_budget_bytes: None,
                     memory_budget_bytes: None,
+                    sandbox: None,
                     toolchain_detection: None,
                 },
                 current_load: 0,
@@ -2957,6 +3115,8 @@ mod tests {
             connection_generation: 1,
             applied_policy: ExecutorRuntimePolicy::default(),
             drain_mode: false,
+            resident_processes: Default::default(),
+            command_processes: Default::default(),
             build_skew: None,
         }
     }

@@ -1,5 +1,204 @@
+macro_rules! private_codex_watchdog_ledger {
+    () => {
+        Migration::new(
+            "0188",
+            "codex_watchdog_ledger",
+            include_str!("../../../../turso_migrations/0188_codex_watchdog_ledger.sql"),
+        )
+    };
+}
+
+macro_rules! private_posts {
+    () => {
+        Migration::new(
+            "0194",
+            "posts",
+            include_str!("../../../../turso_migrations/0194_posts.sql"),
+        )
+    };
+}
+
+macro_rules! private_canonical_project_routes {
+    () => {
+        Migration::new(
+            "0193",
+            "canonical_project_routes",
+            include_str!("../../../../turso_migrations/0193_canonical_project_routes.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_canonical_project_keys {
+    () => {
+        Migration::new(
+            "0191",
+            "canonical_project_keys",
+            include_str!("../../../../turso_migrations/0191_canonical_project_keys.sql"),
+        )
+    };
+}
+
+macro_rules! private_canonical_discord_surface_project_keys {
+    () => {
+        Migration::new(
+            "0192",
+            "canonical_discord_surface_project_keys",
+            include_str!(
+                "../../../../turso_migrations/0192_canonical_discord_surface_project_keys.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! private_canonicalize_channel_permission_answers {
+    () => {
+        Migration::new(
+            "0190",
+            "canonicalize_channel_permission_answers",
+            include_str!(
+                "../../../../turso_migrations/0190_canonicalize_channel_permission_answers.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! private_github_relay_key_rotation_time {
+    () => {
+        Migration::new(
+            "0189",
+            "github_relay_key_rotation_time",
+            include_str!("../../../../turso_migrations/0189_github_relay_key_rotation_time.sql"),
+        )
+    };
+}
+
+macro_rules! private_repair_prompts_column_order_parity {
+    () => {
+        Migration::rebuild_fk_off(
+            "0186",
+            "repair_prompts_column_order_parity",
+            include_str!(
+                "../../../../turso_migrations/0186_repair_prompts_column_order_parity.sql"
+            ),
+            &[RebuildCheck::Conserved("prompts")],
+        )
+    };
+}
+
+macro_rules! private_ask_resolution_provenance {
+    () => {
+        Migration::new(
+            "0184",
+            "ask_resolution_provenance",
+            include_str!("../../../../turso_migrations/0184_ask_resolution_provenance.sql"),
+        )
+    };
+}
+
+macro_rules! private_repair_attention_pushes_index_parity {
+    () => {
+        Migration::new(
+            "0185",
+            "repair_attention_pushes_index_parity",
+            include_str!(
+                "../../../../turso_migrations/0185_repair_attention_pushes_index_parity.sql"
+            ),
+        )
+    };
+}
+
+macro_rules! shared_tail_issue_authorship {
+    () => {
+        Migration::new(
+            "0187",
+            "issue_authorship",
+            include_str!("../../../../turso_migrations/0187_issue_authorship.sql"),
+        )
+    };
+}
+
+macro_rules! private_channel_ask_resolution {
+    () => {
+        Migration::new(
+            "0182",
+            "channel_ask_resolution",
+            include_str!("../../../../turso_migrations/0182_channel_ask_resolution.sql"),
+        )
+    };
+}
+
+macro_rules! private_channel_conversation_binding {
+    () => {
+        Migration::new(
+            "0181",
+            "channel_conversation_binding",
+            include_str!("../../../../turso_migrations/0181_channel_conversation_binding.sql"),
+        )
+    };
+}
+
+macro_rules! private_discord_surface {
+    () => {
+        Migration::new(
+            "0180",
+            "discord_surface",
+            include_str!("../../../../turso_migrations/0180_discord_surface.sql"),
+        )
+    };
+}
+
+macro_rules! private_channel_inbound_rejection_reason {
+    () => {
+        Migration::new(
+            "0176",
+            "channel_inbound_rejection_reason",
+            include_str!("../../../../turso_migrations/0176_channel_inbound_rejection_reason.sql"),
+        )
+    };
+}
+
+macro_rules! private_github_relay_pending_key {
+    () => {
+        Migration::new(
+            "0179",
+            "github_relay_pending_key",
+            include_str!("../../../../turso_migrations/0179_github_relay_pending_key.sql"),
+        )
+    };
+}
+
+macro_rules! private_github_relay_delivery_health {
+    () => {
+        Migration::new(
+            "0178",
+            "github_relay_delivery_health",
+            include_str!("../../../../turso_migrations/0178_github_relay_delivery_health.sql"),
+        )
+    };
+}
+
 use super::migration::RebuildCheck;
 use super::Migration;
+
+macro_rules! shared_tail_tool_analytics_hourly {
+    () => {
+        Migration::new(
+            "0177",
+            "tool_analytics_hourly",
+            include_str!("../../../../turso_migrations/0177_tool_analytics_hourly.sql"),
+        )
+    };
+}
+
+macro_rules! private_canonicalize_uri_identity_columns {
+    () => {
+        Migration::new(
+            "0175",
+            "canonicalize_uri_identity_columns",
+            include_str!("../../../../turso_migrations/0175_canonicalize_uri_identity_columns.sql"),
+        )
+    };
+}
 
 macro_rules! shared_tail_lowercase_project_keys {
     () => {
@@ -111,6 +310,16 @@ macro_rules! private_authority_grants {
 /// quarantine that withholds an affected record from serving. Private-only: the
 /// inventory maps exactly which records carry a credential, and syncing that map
 /// would send a disclosure hint further than the disclosure.
+macro_rules! private_authority_attribution {
+    () => {
+        Migration::new(
+            "0183",
+            "authority_attribution",
+            include_str!("../../../../turso_migrations/0183_authority_attribution.sql"),
+        )
+    };
+}
+
 macro_rules! private_disclosure_remediation {
     () => {
         Migration::new(
@@ -949,6 +1158,9 @@ macro_rules! team_lineage {
             shared_tail_turn_end_check_attempts!(),
             shared_tail_check_result_cache_row_family!(),
             shared_tail_lowercase_project_keys!(),
+            shared_tail_tool_analytics_hourly!(),
+            shared_tail_issue_authorship!(),
+            shared_tail_canonical_project_keys!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1225,6 +1437,26 @@ macro_rules! private_lineage {
             private_disclosure_remediation!(),
             shared_tail_lowercase_project_keys!(),
             private_lowercase_project_routes!(),
+            private_canonicalize_uri_identity_columns!(),
+            private_channel_inbound_rejection_reason!(),
+            shared_tail_tool_analytics_hourly!(),
+            private_github_relay_delivery_health!(),
+            private_github_relay_pending_key!(),
+            private_discord_surface!(),
+            private_channel_conversation_binding!(),
+            private_channel_ask_resolution!(),
+            private_authority_attribution!(),
+            private_ask_resolution_provenance!(),
+            private_repair_attention_pushes_index_parity!(),
+            private_repair_prompts_column_order_parity!(),
+            shared_tail_issue_authorship!(),
+            private_codex_watchdog_ledger!(),
+            private_github_relay_key_rotation_time!(),
+            private_canonicalize_channel_permission_answers!(),
+            shared_tail_canonical_project_keys!(),
+            private_canonical_discord_surface_project_keys!(),
+            private_canonical_project_routes!(),
+            private_posts!(),
         ]
     };
 }
@@ -1747,6 +1979,11 @@ pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
         "elastic_executor_inventory",
         include_str!("../../../../turso_migrations_team/0006_elastic_executor_inventory.sql"),
     ),
+    Migration::new(
+        "0007",
+        "ask_resolution_provenance",
+        include_str!("../../../../turso_migrations_team/0007_ask_resolution_provenance.sql"),
+    ),
 ];
 
 // ── Table scope: the single source of truth (CAIRN-2210) ────────────────────
@@ -1886,6 +2123,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "disclosure_incidents",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    (
+        "discord_surface",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
     ("doc_references", TableScope::ProjectScoped),
     ("event_read_tokens", TableScope::ProjectScoped),
     ("event_vibes", TableScope::ProjectScoped),
@@ -1940,6 +2181,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("todos", TableScope::ProjectScoped),
     ("token_rollup", TableScope::ProjectScoped),
     ("token_rollup_runs", TableScope::ProjectScoped),
+    ("tool_analytics_hourly", TableScope::ProjectScoped),
     ("tool_invocation_runs", TableScope::ProjectScoped),
     ("tool_invocations", TableScope::ProjectScoped),
     ("turn_end_check_attempts", TableScope::ProjectScoped),
@@ -2087,16 +2329,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "route_firings",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
-    // This install's own build identity and the frozen rebuild notices derived
-    // from it: operator-install facts about one machine, not project data.
-    (
-        "app_boot_state",
-        TableScope::Private(PrivateReason::RunnerTransient),
-    ),
-    (
-        "build_change_notifications",
-        TableScope::Private(PrivateReason::RunnerTransient),
-    ),
     (
         "route_fact_samples",
         TableScope::Private(PrivateReason::RunnerTransient),
@@ -2118,11 +2350,15 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
-        "channel_thread_follow",
+        "channel_conversation_binding",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
-        "channel_thread_focus",
+        "channel_ask_resolution",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "channel_ask_action",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // A terminal child makes parent turns compactable; the mark sits in this
@@ -2130,6 +2366,18 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // that owns the thread's agent session.
     (
         "thread_compaction_marks",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // A Codex watchdog lease is ownership held by one runner boot, and the
+    // lifecycle rows are that runner's evidence of what it armed and expired.
+    // Both are keyed by the boot that wrote them, so they mean nothing on
+    // another host.
+    (
+        "codex_watchdog_leases",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "codex_watchdog_lifecycle",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // ── Private: rebuildable / refetchable caches ────────────────────────────
@@ -2154,6 +2402,27 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
     // ── Private: deferred-shared (lean is shared, move tracked by an owner) ───
+    (
+        "posts",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-4106",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
+    (
+        "post_comments",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-4106",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
+    (
+        "feed_cursors",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-4106",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
     // resource_embeddings: remotely computed (expensive to regenerate); lean is
     // compute-once-per-team. Sharing needs routing the embed worker + a mechanism
     // choice (sync rows vs the 2188 store), so it is deferred, not anonymous.
@@ -2504,6 +2773,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["run_id"],
     },
     RekeyTableManifest {
+        table: "tool_analytics_hourly",
+        id_columns: &["id", "project_id", "run_id", "session_id"],
+    },
+    RekeyTableManifest {
         table: "tool_invocation_runs",
         id_columns: &["run_id"],
     },
@@ -2555,6 +2828,130 @@ mod tests {
         let mut expected = scoped.clone();
         expected.insert("execution_history");
         assert_eq!(manifest, expected);
+    }
+
+    async fn db_before_canonical_project_key_repairs(name: &str) -> LocalDb {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.keep().join(name)).await.unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| !matches!(migration.version, "0191" | "0192" | "0193"))
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db
+    }
+
+    async fn insert_project_for_key_repair(db: &LocalDb, id: &str, key: &str) {
+        db.execute(
+            "INSERT INTO projects (
+                id, workspace_id, name, key, repo_path, repository_id,
+                created_at, updated_at, is_workspace
+             ) VALUES (?1, 'default', ?2, ?3, ?4, ?1, 1, 1, 0)",
+            (id, id, key, format!("/repos/{id}")),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn canonical_project_key_repairs_are_total_across_private_surfaces() {
+        let db = db_before_canonical_project_key_repairs("canonical-project-key.db").await;
+        insert_project_for_key_repair(&db, "project-1", "LCLTW").await;
+        db.execute(
+            "INSERT INTO teams(id, name, sync_url, replica_path, created_at)
+             VALUES ('teamABC123', 'Team', 'http://sync', '/tmp/team.db', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO project_routes(project_key, team_id, local_repo_path, created_at)
+             VALUES ('LCLTW', 'teamABC123', '/repos/project-1', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO discord_surface (
+                guild_id, surface_kind, project_key, updated_at
+             ) VALUES ('1', 'project_category', 'LCLTW', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+        MigrationRunner::new(vec![
+            shared_tail_canonical_project_keys!(),
+            private_canonical_discord_surface_project_keys!(),
+            private_canonical_project_routes!(),
+        ])
+        .run(&db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_text(&db, "SELECT key FROM projects WHERE id = 'project-1'")
+                .await
+                .unwrap(),
+            "lcltw"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT project_key FROM project_routes WHERE team_id = 'teamABC123'"
+            )
+            .await
+            .unwrap(),
+            "lcltw"
+        );
+        assert_eq!(
+            query_text(
+                &db,
+                "SELECT project_key FROM discord_surface WHERE guild_id = '1'"
+            )
+            .await
+            .unwrap(),
+            "lcltw"
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_project_key_collision_refuses_without_partial_repair() {
+        let db = db_before_canonical_project_key_repairs("project-key-collision.db").await;
+        insert_project_for_key_repair(&db, "lower", "foo").await;
+        insert_project_for_key_repair(&db, "upper", "FOO").await;
+
+        let error = MigrationRunner::new(vec![shared_tail_canonical_project_keys!()])
+            .run(&db)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("two or more projects' keys differ only by letter case"));
+        assert!(error.contains("SELECT id, key, name, repo_path FROM projects"));
+        assert!(error.contains(db.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            query_text(&db, "SELECT key FROM projects WHERE id = 'lower'")
+                .await
+                .unwrap(),
+            "foo"
+        );
+        assert_eq!(
+            query_text(&db, "SELECT key FROM projects WHERE id = 'upper'")
+                .await
+                .unwrap(),
+            "FOO"
+        );
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT version FROM cairn_schema_migrations WHERE version = '0191'",
+                (),
+            )
+            .await
+            .unwrap(),
+            None
+        );
     }
 
     async fn migrated_db() -> DbResult<LocalDb> {
@@ -2741,13 +3138,211 @@ mod tests {
                 "0169_route_fact_samples".to_string(),
                 "0170_build_change_ride_alongs".to_string(),
                 "0171_check_result_cache_row_family".to_string(),
-                "0173_lowercase_project_keys".to_string(),
                 "0172_disclosure_remediation".to_string(),
                 "0173_lowercase_project_keys".to_string(),
                 "0174_lowercase_project_routes".to_string(),
+                "0175_canonicalize_uri_identity_columns".to_string(),
+                "0176_channel_inbound_rejection_reason".to_string(),
+                "0177_tool_analytics_hourly".to_string(),
+                "0178_github_relay_delivery_health".to_string(),
+                "0179_github_relay_pending_key".to_string(),
+                "0180_discord_surface".to_string(),
+                "0181_channel_conversation_binding".to_string(),
+                "0182_channel_ask_resolution".to_string(),
+                "0183_authority_attribution".to_string(),
+                "0184_ask_resolution_provenance".to_string(),
+                "0185_repair_attention_pushes_index_parity".to_string(),
+                "0186_repair_prompts_column_order_parity".to_string(),
+                "0187_issue_authorship".to_string(),
+                "0188_codex_watchdog_ledger".to_string(),
+                "0189_github_relay_key_rotation_time".to_string(),
+                "0190_canonicalize_channel_permission_answers".to_string(),
+                "0191_canonical_project_keys".to_string(),
+                "0192_canonical_discord_surface_project_keys".to_string(),
+                "0193_canonical_project_routes".to_string(),
+                "0194_posts".to_string(),
             ]
         );
         Ok(db)
+    }
+
+    #[tokio::test]
+    async fn canonicalizes_only_known_historical_permission_answers() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("permission-answers.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != "0190")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+
+        for (index, answer) in [
+            "1",
+            "yes",
+            "y",
+            "approve",
+            "allow",
+            " Approve ",
+            "2",
+            "no",
+            "n",
+            "deny",
+            "denied",
+            " Deny ",
+            "unknown",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.execute(
+                "INSERT INTO channel_ask_resolution
+                 (binding_ref, action_ref, kind, answer, winner_provider, winner_conversation,
+                  resolved_at, resolution_id, winner_surface, winner_actor)
+                 VALUES (?1, ?1, 'permission', ?2, 'telegram', 'telegram:1', 1, ?1,
+                         'channel_reply', 'operator')",
+                (format!("permission-{index:02}"), answer.to_string()),
+            )
+            .await
+            .unwrap();
+        }
+        db.execute(
+            "INSERT INTO channel_ask_resolution
+             (binding_ref, action_ref, kind, answer, winner_provider, winner_conversation,
+              resolved_at, resolution_id, winner_surface, winner_actor)
+             VALUES ('question', 'question', 'question', 'Approve', 'telegram', 'telegram:1', 1,
+                     'question', 'channel_reply', 'operator')",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let migration = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == "0190")
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            MigrationRunner::new(migration).run(&db).await.unwrap(),
+            vec!["0190_canonicalize_channel_permission_answers".to_string()]
+        );
+
+        let answers = db
+            .query_all(
+                "SELECT answer FROM channel_ask_resolution
+                 WHERE kind = 'permission' ORDER BY binding_ref",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            answers,
+            [
+                "allow", "allow", "allow", "allow", "allow", "allow", "deny", "deny", "deny",
+                "deny", "deny", "deny", "unknown",
+            ]
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT answer FROM channel_ask_resolution WHERE binding_ref = 'question'",
+                (),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap(),
+            "Approve"
+        );
+    }
+
+    #[tokio::test]
+    async fn authority_attribution_columns_and_indexes_are_private_and_registered() {
+        let db = migrated_db().await.unwrap();
+        for table in ["authority_grants", "authorization_events"] {
+            let columns = db
+                .query_all(format!("PRAGMA table_info({table})"), (), |row| row.text(1))
+                .await
+                .unwrap();
+            assert!(columns.contains(&"actor_principal_json".to_string()));
+            assert!(columns.contains(&"appearance_snapshot_json".to_string()));
+        }
+        for sql in [
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_authority_grants_actor'",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_authorization_events_actor'",
+        ] {
+            assert_eq!(query_i64(&db, sql).await.unwrap(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_authorship_is_shared_paired_storage_without_backfill() {
+        let db = migrated_db().await.unwrap();
+        let columns = db
+            .query_all("PRAGMA table_info(issues)", (), |row| row.text(1))
+            .await
+            .unwrap();
+        assert!(columns.contains(&"author_principal_json".to_string()));
+        assert!(columns.contains(&"appearance_snapshot_json".to_string()));
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_issues_author_principal'")
+                .await
+                .unwrap(),
+            1
+        );
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('authorship-ws','Authorship',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+             VALUES('authorship-project','authorship-ws','Authorship','AUTHOR','/tmp/authorship',1,1);
+             INSERT INTO issues(id,project_id,number,title,created_at,updated_at)
+             VALUES('legacy-issue','authorship-project',1,'Legacy',1,1);",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM issues WHERE id='legacy-issue' AND author_principal_json IS NULL AND appearance_snapshot_json IS NULL")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(db
+            .execute(
+                "UPDATE issues SET author_principal_json='{}' WHERE id='legacy-issue'",
+                (),
+            )
+            .await
+            .is_err());
+        db.execute(
+            "INSERT INTO issues(
+                id, project_id, number, title, created_at, updated_at,
+                author_principal_json, appearance_snapshot_json
+             ) VALUES('authored-issue','authorship-project',2,'Authored',1,1,'principal','appearance')",
+            (),
+        )
+        .await
+        .unwrap();
+        for update in [
+            "UPDATE issues SET author_principal_json='changed', appearance_snapshot_json='changed' WHERE id='authored-issue'",
+            "UPDATE issues SET author_principal_json=NULL, appearance_snapshot_json=NULL WHERE id='authored-issue'",
+            "UPDATE issues SET author_principal_json='fabricated', appearance_snapshot_json='fabricated' WHERE id='legacy-issue'",
+        ] {
+            assert!(db.execute(update, ()).await.is_err());
+        }
+        db.execute(
+            "UPDATE issues SET title='Still authored' WHERE id='authored-issue'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let (_team_temp, team_db) = migrated_team_db().await;
+        let team_columns = team_db
+            .query_all("PRAGMA table_info(issues)", (), |row| row.text(1))
+            .await
+            .unwrap();
+        assert!(team_columns.contains(&"author_principal_json".to_string()));
+        assert!(team_columns.contains(&"appearance_snapshot_json".to_string()));
     }
 
     #[tokio::test]
@@ -4771,6 +5366,7 @@ mod tests {
                 // credentials and grant consumption remain private.
                 "0005_executor_registry".to_string(),
                 "0006_elastic_executor_inventory".to_string(),
+                "0007_ask_resolution_provenance".to_string(),
                 // Shared-tail migrations land in the team lineage after the team
                 // head, preserving one shared SQL source for project-scoped tables.
                 "0084_archival_pack_hash".to_string(),
@@ -4827,6 +5423,10 @@ mod tests {
                 "0167_inherit_thread_id_for_child_jobs".to_string(),
                 "0168_turn_end_check_attempts".to_string(),
                 "0171_check_result_cache_row_family".to_string(),
+                "0173_lowercase_project_keys".to_string(),
+                "0177_tool_analytics_hourly".to_string(),
+                "0187_issue_authorship".to_string(),
+                "0191_canonical_project_keys".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.
@@ -4848,6 +5448,22 @@ mod tests {
             .unwrap(),
             0
         );
+        for (table, sql) in [
+            (
+                "authority_grants",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='authority_grants'",
+            ),
+            (
+                "authorization_events",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='authorization_events'",
+            ),
+        ] {
+            assert_eq!(
+                query_i64(&db, sql).await.unwrap(),
+                0,
+                "private authority journal table {table} must not enter the team lineage",
+            );
+        }
         // Re-running is idempotent (tracked in cairn_schema_migrations).
         let again = MigrationRunner::new(TEAM_MIGRATIONS.to_vec())
             .run(&db)
@@ -4980,8 +5596,14 @@ mod tests {
         // private routing registry from 0082 vs the team-only FK root), so it is
         // excluded from classification and handled explicitly, exactly as the
         // DDL loops above skip it.
-        const SCHEMA_INFRA: &[&str] = &["__turso_internal_mvcc_meta", "cairn_schema_migrations"];
-        let is_classifiable = |name: &str| !SCHEMA_INFRA.contains(&name) && name != "teams";
+        const SCHEMA_INFRA: &[&str] = &[
+            "__turso_internal_mvcc_meta",
+            "cairn_schema_migrations",
+            "sqlite_sequence",
+        ];
+        let is_schema_infra =
+            |name: &str| SCHEMA_INFRA.contains(&name) || name.starts_with("__turso_internal_seq_");
+        let is_classifiable = |name: &str| !is_schema_infra(name) && name != "teams";
 
         let mut scope_map: std::collections::BTreeMap<&'static str, TableScope> =
             std::collections::BTreeMap::new();
@@ -5029,7 +5651,7 @@ mod tests {
         let actual_team: std::collections::BTreeSet<&str> = team_tables
             .keys()
             .map(String::as_str)
-            .filter(|name| !SCHEMA_INFRA.contains(name))
+            .filter(|name| !is_schema_infra(name))
             .collect();
         assert_eq!(
             expected_team, actual_team,
@@ -5073,5 +5695,39 @@ mod tests {
                 let _ = target;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn posts_schema_persists_posts_comments_and_feed_cursors() {
+        let db = migrated_db().await.unwrap();
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES ('posts-workspace', 'Posts', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('posts-project', 'posts-workspace', 'Posts', 'POSTS', '/tmp/posts', 1, 1);
+             INSERT INTO posts(project_id, title, content, author_principal_json, appearance_snapshot_json)
+             VALUES ('posts-project', 'Hello', 'Durable post', '{}', '{}');
+             INSERT INTO post_comments(post_id, content, author_principal_json, appearance_snapshot_json)
+             VALUES (1, 'First reply', '{}', '{}');
+             INSERT INTO feed_cursors(home_kind, home_id, acknowledged_post_id, last_issued_nonce, last_issued_through)
+             VALUES ('node', 'node-1', 1, 'nonce-1', 1);",
+        ).await.unwrap();
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM posts").await.unwrap(),
+            1
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM post_comments")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM feed_cursors")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM search_outbox WHERE source_table IN ('posts', 'post_comments')").await.unwrap(), 2);
     }
 }

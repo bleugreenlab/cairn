@@ -1288,9 +1288,15 @@ pub async fn handle_read_file(orch: &Orchestrator, request: &McpCallbackRequest)
 
     match produce_file_segment(orch, request, &payload).await {
         Produced::Segment(segment) => {
+            let meter = request
+                .run_id
+                .as_deref()
+                .map(|run_id| crate::token_meters::meter_for_process(&orch.process_state, run_id))
+                .unwrap_or(&crate::token_meters::CLAUDE_TOKEN_METER);
             crate::mcp::handlers::read::view::render_segment(
                 segment,
-                crate::mcp::handlers::read::view::READ_BATCH_CHAR_BUDGET,
+                crate::mcp::handlers::read::view::READ_BATCH_TOKEN_BUDGET,
+                meter,
             )
             .text
         }
@@ -1352,28 +1358,37 @@ pub(crate) async fn produce_file_segment(
             && crate::mcp::file_targets::path_within_any(&full, &orch.sandbox_deny_read())
         {
             use crate::mcp::handlers::fence;
-            if let Some((run_id, fence_mode)) = fence::resolve_run_fence(orch, request).await {
-                match fence::raise_fence(
-                    orch,
-                    &run_id,
-                    fence_mode,
-                    request,
-                    fence::Crossing::read_denied(&full),
-                )
-                .await
-                {
-                    fence::FenceDecision::Allow => {}
-                    fence::FenceDecision::Deny(msg) => {
-                        return Produced::Segment(error_segment(uri, msg))
-                    }
-                    fence::FenceDecision::Suspended => {
-                        return Produced::Suspended(
-                            "Read suspended pending logical namespace approval; resume will \
+            match fence::resolve_run_fence(orch, request).await {
+                fence::RunFenceResolution::Resolved(run_id, fence_mode) => {
+                    match fence::raise_fence(
+                        orch,
+                        &run_id,
+                        fence_mode,
+                        request,
+                        fence::Crossing::read_denied(&full),
+                    )
+                    .await
+                    {
+                        fence::FenceDecision::Allow => {}
+                        fence::FenceDecision::Deny(msg) => {
+                            return Produced::Segment(error_segment(uri, msg))
+                        }
+                        fence::FenceDecision::Unavailable(msg) => {
+                            return Produced::Segment(error_segment(uri, msg))
+                        }
+                        fence::FenceDecision::Suspended => {
+                            return Produced::Suspended(
+                                "Read suspended pending logical namespace approval; resume will \
                              continue once it is answered."
-                                .to_string(),
-                        );
+                                    .to_string(),
+                            );
+                        }
                     }
                 }
+                fence::RunFenceResolution::Unavailable(error) => {
+                    return Produced::Segment(error_segment(uri, error));
+                }
+                fence::RunFenceResolution::Ambient => {}
             }
         }
     }
@@ -2552,14 +2567,14 @@ mod tests {
         assert_eq!(branch.as_deref(), Some("main"));
 
         let (projection, _, _, _, _, branch) =
-            project("grep=needle&branch=agent/CAIRN-1-builder-0").unwrap();
+            project("grep=needle&branch=agent/cairn-1-builder-0").unwrap();
         assert!(matches!(projection, ReadProjection::Grep(_)));
-        assert_eq!(branch.as_deref(), Some("agent/CAIRN-1-builder-0"));
+        assert_eq!(branch.as_deref(), Some("agent/cairn-1-builder-0"));
 
         let (projection, _, _, _, _, branch) =
-            project("glob=**/*.rs&branch=cairn://p/CAIRN/1/1/builder").unwrap();
+            project("glob=**/*.rs&branch=cairn://p/cairn/1/1/builder").unwrap();
         assert!(matches!(projection, ReadProjection::Glob { .. }));
-        assert_eq!(branch.as_deref(), Some("cairn://p/CAIRN/1/1/builder"));
+        assert_eq!(branch.as_deref(), Some("cairn://p/cairn/1/1/builder"));
     }
 
     #[test]

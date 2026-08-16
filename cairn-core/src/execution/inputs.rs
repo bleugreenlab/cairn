@@ -1360,7 +1360,7 @@ mod tests {
 
         assert_eq!(
             rust.nodes.len(),
-            16,
+            18,
             "every declared workspace member becomes a node: {:?}",
             rust.nodes.keys().collect::<Vec<_>>()
         );

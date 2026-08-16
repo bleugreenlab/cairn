@@ -14,9 +14,9 @@ use crate::services::testing::TestServicesBuilder;
 use crate::storage::{LocalDb, RowExt, SearchIndex};
 use std::sync::Arc;
 
-const ISSUE_URI: &str = "cairn://p/PRJ/7";
+const ISSUE_URI: &str = "cairn://p/prj/7";
 const PLANBUILD_YAML: &str = include_str!("../../../../../packs/core/recipes/planbuild.yaml");
-const REVIEW_KEY: &str = "review:cairn://p/PRJ/7";
+const REVIEW_KEY: &str = "review:cairn://p/prj/7";
 
 async fn test_db() -> LocalDb {
     crate::storage::migrated_test_db("review-push.db").await
@@ -98,7 +98,7 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
     crate::jj::ensure_project_store(&jj, &store, backing.path()).unwrap();
     let workspaces = tempfile::tempdir().unwrap();
     let workspace = workspaces.path().join("builder");
-    let branch = "agent/CAIRN-3604-builder-0";
+    let branch = "agent/cairn-3604-builder-0";
     crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
     std::fs::write(workspace.join("agent-only.rs"), "wave path\n").unwrap();
     crate::jj::seal(&jj, &workspace, "agent branch", None).unwrap();
@@ -437,7 +437,7 @@ fn test_orchestrator(db: LocalDb) -> Orchestrator {
     OrchestratorBuilder::new(db_state, services, config_dir).build()
 }
 
-/// Producing builder node `j-prod` (issue `i-rev` / `cairn://p/PRJ/7`, exec
+/// Producing builder node `j-prod` (issue `i-rev` / `cairn://p/prj/7`, exec
 /// seq 1) whose just-ended turn carries `start_reason`, a watcher job
 /// `j-watch`, and an active issue subscription for BOTH so the producing
 /// node's self-exclusion is exercised.
@@ -446,7 +446,7 @@ async fn seed(db: &LocalDb, start_reason: &str) {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p-rev','w','Project','PRJ','/tmp/repo',1,1);
+              VALUES('p-rev','w','Project','prj','/tmp/repo',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('i-rev','p-rev',7,'Rev','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -616,7 +616,7 @@ async fn work_idle_with_open_pr_pushes_review() {
     assert_eq!(watcher[0].key, REVIEW_KEY);
     assert!(watcher[0]
         .content_ref
-        .starts_with("cairn://p/PRJ/7/1/builder"));
+        .starts_with("cairn://p/prj/7/1/builder"));
     assert!(pending(&orch, "j-prod").await.is_empty());
 }
 
@@ -793,7 +793,7 @@ async fn pr_open_with_quiescent_producer_pushes_one_review() {
     assert_eq!(watcher[0].key, REVIEW_KEY);
     assert!(watcher[0]
         .content_ref
-        .starts_with("cairn://p/PRJ/7/1/builder"));
+        .starts_with("cairn://p/prj/7/1/builder"));
     assert!(pending(&orch, "j-prod").await.is_empty());
 }
 
@@ -1287,7 +1287,7 @@ async fn seed_branch_sharers(db: &LocalDb) {
         "
         INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-          VALUES('p-rev','w','Project','PRJ','/tmp/repo',1,1);
+          VALUES('p-rev','w','Project','prj','/tmp/repo',1,1);
         INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
           VALUES('i-rev','p-rev',7,'Rev','active','active','none',1,1);
         INSERT INTO jobs(id, project_id, issue_id, status, node_name, branch, created_at, updated_at)

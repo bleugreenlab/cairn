@@ -24,7 +24,18 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Filesystem context carried only by an installed Agent Plugin MCP server.
+///
+/// This is deliberately excluded from serde: plugin roots are installation
+/// state, not authored MCP configuration, and must not become a way for native
+/// or user entries to opt into plugin placeholder semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentPluginRuntime {
+    pub root: PathBuf,
+    pub data: PathBuf,
+}
 
 /// Configuration for a single external MCP server.
 ///
@@ -47,6 +58,9 @@ pub struct McpServerConfig {
     /// Stdio: environment variables for the spawned process.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Stdio: working directory for the spawned process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Remote (`http`/`sse`): server URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
@@ -85,6 +99,9 @@ pub struct McpServerConfig {
     /// `security::broker` for the full reasoning.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub secrets: Vec<String>,
+    /// Installation-only Agent Plugin launch context.
+    #[serde(skip)]
+    pub agent_plugin_runtime: Option<AgentPluginRuntime>,
 }
 
 /// Non-secret OAuth configuration persisted in `settings.yaml`. The interactive
@@ -120,7 +137,9 @@ pub const MCP_CONFIG_FINGERPRINT_ALGORITHM: &str = "sha256";
 /// the clear if the server echoes it", and a standing grant must not carry a
 /// server across that change silently. Bumping re-prompts on the next
 /// reconfigure, which is the intended cost.
-pub const MCP_CONFIG_FINGERPRINT_ENCODING_VERSION: u32 = 2;
+/// v3 added stdio `cwd`, which changes where a server executes and therefore
+/// belongs to the authority identity just like its command and arguments.
+pub const MCP_CONFIG_FINGERPRINT_ENCODING_VERSION: u32 = 3;
 
 /// Domain separator. Keeps these digests from colliding with any other
 /// sha256-over-config in the system, now or later.
@@ -230,17 +249,20 @@ pub fn fingerprint_mcp_config(
                 command,
                 args,
                 env,
+                cwd,
                 url,
                 headers,
                 enabled,
                 oauth,
                 secrets,
+                agent_plugin_runtime: _,
             } = config;
             encoder.field("config", "present");
             encoder.field("transport", transport);
             encoder.field("command", command.as_deref().unwrap_or(""));
             encoder.sequence("args", args);
             encoder.map("env", env);
+            encoder.field("cwd", cwd.as_deref().unwrap_or(""));
             encoder.field("url", url.as_deref().unwrap_or(""));
             encoder.map("headers", headers);
             encoder.field("enabled", if *enabled { "true" } else { "false" });
@@ -288,12 +310,20 @@ impl McpServerConfig {
     /// exactly the parallel resolution chain that left the settings-save
     /// connection test registering nothing.
     pub(crate) fn expand_vars(&self, resolve: &dyn Fn(&str) -> String) -> McpServerConfig {
+        // Agent Plugin portable fields use only PLUGIN_ROOT / PLUGIN_DATA and
+        // are expanded by the gateway after the managed data directory exists.
+        // Sending them through Cairn's credential broker would erase them as
+        // unknown native `${VAR}` references.
+        if self.agent_plugin_runtime.is_some() {
+            return self.clone();
+        }
         let map = |s: &str| expand_with(s, resolve);
         McpServerConfig {
             transport: self.transport.clone(),
             command: self.command.as_deref().map(&map),
             args: self.args.iter().map(|a| map(a)).collect(),
             env: self.env.iter().map(|(k, v)| (k.clone(), map(v))).collect(),
+            cwd: self.cwd.as_deref().map(&map),
             url: self.url.as_deref().map(&map),
             headers: self
                 .headers
@@ -307,6 +337,7 @@ impl McpServerConfig {
             // The declaration names variables, not values, so it survives
             // expansion unchanged.
             secrets: self.secrets.clone(),
+            agent_plugin_runtime: None,
         }
     }
 
@@ -377,6 +408,9 @@ impl McpServerConfig {
         }
         for value in self.env.values() {
             scan(value);
+        }
+        if let Some(cwd) = &self.cwd {
+            scan(cwd);
         }
         if let Some(url) = &self.url {
             scan(url);
@@ -510,7 +544,7 @@ pub(crate) fn resolve_mcp_servers(
 
     if let Some(project_path) = project_path {
         if let Some(project_servers) =
-            super::project_settings::load_project_settings(project_path).mcp_servers
+            super::project_settings::load_project_settings_read_only(project_path).mcp_servers
         {
             for (name, cfg) in project_servers {
                 servers.insert(name, cfg);
@@ -598,7 +632,7 @@ pub fn workspace_mcp_entries(config_dir: &Path) -> BTreeMap<String, WorkspaceMcp
 /// This is the unfiltered registry the management UI edits, so disabled entries
 /// are included and can be toggled back on.
 pub fn load_project_mcp_servers(project_path: &Path) -> HashMap<String, McpServerConfig> {
-    super::project_settings::load_project_settings(project_path)
+    super::project_settings::load_project_settings_read_only(project_path)
         .mcp_servers
         .unwrap_or_default()
 }
@@ -1064,6 +1098,8 @@ args: ["@playwright/mcp@latest"]
             enabled: true,
             oauth: None,
             secrets: Vec::new(),
+            cwd: None,
+            agent_plugin_runtime: None,
         };
         let e = cfg.expand_vars(&|var| match var {
             "BIN" => "server".to_string(),
@@ -1088,6 +1124,7 @@ args: ["@playwright/mcp@latest"]
             command: Some("${BIN}".to_string()),
             args: vec!["--flag".to_string(), "${ARG_TOKEN}".to_string()],
             env: HashMap::from([("E".to_string(), "${ENV_TOKEN}".to_string())]),
+            cwd: Some("${WORK_DIR}".to_string()),
             url: Some("https://${HOST}/mcp".to_string()),
             headers: HashMap::from([(
                 "Authorization".to_string(),
@@ -1096,6 +1133,7 @@ args: ["@playwright/mcp@latest"]
             enabled: true,
             oauth: None,
             secrets: Vec::new(),
+            agent_plugin_runtime: None,
         };
         let vars = cfg.referenced_vars();
         assert!(vars.contains("BIN"));
@@ -1105,7 +1143,8 @@ args: ["@playwright/mcp@latest"]
         assert!(vars.contains("HDR_TOKEN"));
         // A plain field with no reference contributes nothing.
         assert!(!vars.contains("flag"));
-        assert_eq!(vars.len(), 5);
+        assert!(vars.contains("WORK_DIR"));
+        assert_eq!(vars.len(), 6);
     }
 
     fn axon_config() -> McpServerConfig {
@@ -1119,6 +1158,8 @@ args: ["@playwright/mcp@latest"]
             enabled: true,
             oauth: None,
             secrets: Vec::new(),
+            cwd: None,
+            agent_plugin_runtime: None,
         }
     }
 
@@ -1325,7 +1366,7 @@ args: ["@playwright/mcp@latest"]
         assert!(raw.contains("npm install"));
         assert!(raw.contains("axon"));
         // The surviving config must still parse cleanly into ProjectSettingsFile.
-        let loaded = super::super::project_settings::load_project_settings(proj.path());
+        let loaded = super::super::project_settings::load_project_settings_read_only(proj.path());
         assert_eq!(loaded.default_branch.as_deref(), Some("develop"));
         assert!(loaded.mcp_servers.unwrap().contains_key("axon"));
     }
@@ -1368,6 +1409,8 @@ mod fingerprint_tests {
             enabled: true,
             oauth: None,
             secrets: Vec::new(),
+            cwd: None,
+            agent_plugin_runtime: None,
         }
     }
 
@@ -1492,6 +1535,8 @@ mod fingerprint_secret_tests {
             enabled: true,
             oauth: None,
             secrets: Vec::new(),
+            cwd: None,
+            agent_plugin_runtime: None,
         }
     }
 

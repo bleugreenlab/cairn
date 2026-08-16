@@ -64,18 +64,18 @@ async fn prepare_terminal_repository(
             .success());
     }
     let base_commit = common::head_sha(repo_path);
-    let branch = "agent/TXW-1-builder-0";
+    let branch = "agent/txw-1-builder-0";
     let worktree = repo_path.parent().unwrap().join("agent-worktree");
     common::provision_jj_workspace(config_dir, repo_path, &worktree, branch);
     let repo_path = repo_path.to_string_lossy().to_string();
     db.execute(
-        "UPDATE projects SET repo_path = ?1 WHERE key = 'TXW'",
+        "UPDATE projects SET repo_path = ?1 WHERE key = 'txw'",
         params![repo_path.as_str()],
     )
     .await
     .unwrap();
     db.execute(
-        "UPDATE jobs SET branch = 'agent/TXW-1-builder-0', base_commit = ?1 WHERE id = 'job-1'",
+        "UPDATE jobs SET branch = 'agent/txw-1-builder-0', base_commit = ?1 WHERE id = 'job-1'",
         params![base_commit.as_str()],
     )
     .await
@@ -132,7 +132,7 @@ async fn wait_for_output_wake_consumed(db: &LocalDb, job_id: &str, phrase: &str)
 }
 
 async fn seed_node(db: &LocalDb) {
-    let project_id = common::create_project(db, "TXW").await;
+    let project_id = common::create_project(db, "txw").await;
     db.write(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {
@@ -240,7 +240,7 @@ async fn subscribe_running_terminal_creates_one_shot_process_subscription() {
     let out = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/wakes",
+            "target": "cairn://p/txw/1/1/builder/wakes",
             "mode": "append",
             "payload": {"subscribe": {"kind": "terminal", "ref": "cairn:~/terminal/run-1", "on": "exit"}}
         }]),
@@ -278,7 +278,7 @@ async fn same_slug_terminal_in_another_job_does_not_cross_wake() {
     change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/wakes",
+            "target": "cairn://p/txw/1/1/builder/wakes",
             "mode": "append",
             "payload": {"subscribe": {"kind": "terminal", "ref": "run-1", "on": "exit"}}
         }]),
@@ -300,7 +300,7 @@ async fn same_slug_terminal_in_another_job_does_not_cross_wake() {
     let other = wakes::route_terminal_exit_async(
         &orch,
         "run-1",
-        "cairn://p/TXW/9/1/builder/terminal/run-1",
+        "cairn://p/txw/9/1/builder/terminal/run-1",
         Some(0),
         Some(1),
         None,
@@ -341,7 +341,7 @@ async fn subscribe_already_exited_terminal_fires_and_consumes() {
     let out = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/wakes",
+            "target": "cairn://p/txw/1/1/builder/wakes",
             "mode": "append",
             "payload": {"subscribe": {"kind": "terminal", "ref": "run-1", "on": "exit"}}
         }]),
@@ -366,7 +366,7 @@ async fn subscribe_already_exited_terminal_fires_and_consumes() {
 async fn output_phrase_subscription_is_woken_by_exit_before_phrase() {
     let (_t, db, orch) = resource_orchestrator_fixture().await;
     seed_node(&db).await;
-    let uri = "cairn://p/TXW/1/1/builder/terminal/run-1";
+    let uri = "cairn://p/txw/1/1/builder/terminal/run-1";
     // An agent waiting for a phrase subscribes an output one-shot.
     wakes::subscribe_terminal_output_one_shot(&db, "job-1", uri, "ready", "agent")
         .await
@@ -404,7 +404,7 @@ async fn subscribe_unknown_terminal_errors_with_existing_slugs() {
     let out = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/wakes",
+            "target": "cairn://p/txw/1/1/builder/wakes",
             "mode": "append",
             "payload": {"subscribe": {"kind": "terminal", "ref": "nope", "on": "exit"}}
         }]),
@@ -433,7 +433,7 @@ async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
     let out = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/wait-exit",
+            "target": "cairn://p/txw/1/1/builder/terminal/wait-exit",
             "mode": "create",
             "payload": {"command": "sleep 30", "wake": "exit"}
         }]),
@@ -442,7 +442,7 @@ async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
     .await;
     assert!(out.contains("subscribed to exit"), "{out}");
     assert!(
-        out.contains("cairn://p/TXW/1/1/builder/terminal/wait-exit"),
+        out.contains("cairn://p/txw/1/1/builder/terminal/wait-exit"),
         "{out}"
     );
     assert!(out.contains("end your turn"), "{out}");
@@ -457,7 +457,7 @@ async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
     assert!(term.one_shot);
     assert_eq!(
         term.source_ref.as_deref(),
-        Some("cairn://p/TXW/1/1/builder/terminal/wait-exit")
+        Some("cairn://p/txw/1/1/builder/terminal/wait-exit")
     );
     assert_eq!(
         term.fact_kinds.as_deref(),
@@ -467,7 +467,7 @@ async fn create_terminal_with_exit_wake_subscribes_to_canonical_uri() {
     let _ = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/wait-exit",
+            "target": "cairn://p/txw/1/1/builder/terminal/wait-exit",
             "mode": "delete"
         }]),
     )
@@ -484,7 +484,7 @@ async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
     let out = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/wait-ready",
+            "target": "cairn://p/txw/1/1/builder/terminal/wait-ready",
             "mode": "create",
             "payload": {"command": "sleep 1; echo x y z | tr -d ' '; sleep 30", "wake": "xyz"}
         }]),
@@ -502,7 +502,7 @@ async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
         .expect("output wake row exists before phrase routes");
     assert_eq!(
         term.source_ref.as_deref(),
-        Some("cairn://p/TXW/1/1/builder/terminal/wait-ready")
+        Some("cairn://p/txw/1/1/builder/terminal/wait-ready")
     );
     let fact_kinds = term.fact_kinds.as_deref().expect("terminal fact kinds");
     assert!(fact_kinds.contains(&"terminal_output".to_string()));
@@ -513,7 +513,7 @@ async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
         job_id: "job-1".to_string(),
         phrase: "xyz".to_string(),
         carry: String::new(),
-        terminal_uri: "cairn://p/TXW/1/1/builder/terminal/wait-ready".to_string(),
+        terminal_uri: "cairn://p/txw/1/1/builder/terminal/wait-ready".to_string(),
     }]));
     wakes::scan_and_route_terminal_output(&orch, &watchers, "xyz\n");
     wait_for_output_wake_consumed(&db, "job-1", "xyz").await;
@@ -521,7 +521,7 @@ async fn create_terminal_with_output_wake_routes_when_phrase_prints() {
     let _ = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/wait-ready",
+            "target": "cairn://p/txw/1/1/builder/terminal/wait-ready",
             "mode": "delete"
         }]),
     )
@@ -539,7 +539,7 @@ async fn output_wake_fires_when_process_exits_before_phrase() {
     let out = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/wait-ready",
+            "target": "cairn://p/txw/1/1/builder/terminal/wait-ready",
             "mode": "create",
             "payload": {"command": "echo starting; exit 3", "wake": "neverphrase"}
         }]),
@@ -629,7 +629,7 @@ async fn a_terminal_that_echoes_a_registered_credential_records_it_redacted() {
     change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/leaky",
+            "target": "cairn://p/txw/1/1/builder/terminal/leaky",
             "mode": "create",
             "payload": {"command": format!("printf '%s\\n' 'token={CREDENTIAL}'")}
         }]),
@@ -691,7 +691,7 @@ async fn agent_command_terminal_exits_with_the_commands_own_status() {
     let out = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/tests",
+            "target": "cairn://p/txw/1/1/builder/terminal/tests",
             "mode": "create",
             "payload": {"command": "sh -c 'exit 7'"}
         }]),
@@ -735,7 +735,7 @@ async fn interactive_terminal_outlives_the_command_it_was_created_with() {
     change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/agent",
+            "target": "cairn://p/txw/1/1/builder/terminal/agent",
             "mode": "create",
             "payload": {"command": "true"}
         }]),
@@ -770,7 +770,7 @@ async fn bare_terminal_exits_when_its_shell_exits() {
     change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/bare",
+            "target": "cairn://p/txw/1/1/builder/terminal/bare",
             "mode": "append",
             "payload": {"content": "exit"}
         }]),
@@ -793,7 +793,7 @@ async fn command_terminal_finalizes_when_its_process_dies_first() {
     change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/long",
+            "target": "cairn://p/txw/1/1/builder/terminal/long",
             "mode": "create",
             "payload": {"command": "sleep 300"}
         }]),
@@ -806,7 +806,7 @@ async fn command_terminal_finalizes_when_its_process_dies_first() {
     change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/long",
+            "target": "cairn://p/txw/1/1/builder/terminal/long",
             "mode": "delete"
         }]),
     )
@@ -825,7 +825,7 @@ async fn create_terminal_rejects_invalid_wake_before_spawning() {
     let empty = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/bad-empty",
+            "target": "cairn://p/txw/1/1/builder/terminal/bad-empty",
             "mode": "create",
             "payload": {"command": "sleep 30", "wake": ""}
         }]),
@@ -838,7 +838,7 @@ async fn create_terminal_rejects_invalid_wake_before_spawning() {
     let non_string = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/1/1/builder/terminal/bad-type",
+            "target": "cairn://p/txw/1/1/builder/terminal/bad-type",
             "mode": "create",
             "payload": {"command": "sleep 30", "wake": {"on": "exit"}}
         }]),
@@ -862,7 +862,7 @@ async fn project_terminal_create_wake_subscribes_calling_job() {
     let out = change_resource_as_run(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/terminal/project-wait",
+            "target": "cairn://p/txw/terminal/project-wait",
             "mode": "create",
             "payload": {"command": "sleep 30", "wake": "exit"}
         }]),
@@ -880,13 +880,13 @@ async fn project_terminal_create_wake_subscribes_calling_job() {
         .expect("project terminal exit subscription");
     assert_eq!(
         term.source_ref.as_deref(),
-        Some("cairn://p/TXW/terminal/project-wait")
+        Some("cairn://p/txw/terminal/project-wait")
     );
 
     let _ = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/terminal/project-wait",
+            "target": "cairn://p/txw/terminal/project-wait",
             "mode": "delete"
         }]),
     )
@@ -903,7 +903,7 @@ async fn project_terminal_wake_requires_agent_caller_before_spawning() {
     let out = change_resource(
         &orch,
         json!([{
-            "target": "cairn://p/TXW/terminal/no-agent",
+            "target": "cairn://p/txw/terminal/no-agent",
             "mode": "create",
             "payload": {"command": "sleep 30", "wake": "exit"}
         }]),

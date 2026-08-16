@@ -11,7 +11,7 @@ pub const JOB_COLUMNS: &str = "id, execution_id, recipe_node_id, parent_job_id,
     branch, base_commit, current_session_id, resume_session_id, status, agent_config_id,
     issue_id, project_id, task_description, created_at, updated_at, completed_at,
     parent_tool_use_id, task_index, started_at, model, node_name, base_branch,
-    current_turn_id, uri_segment, pack_anchor";
+    current_turn_id, uri_segment, pack_anchor, thread_id";
 
 #[derive(Debug, Clone)]
 pub struct DbJob {
@@ -76,6 +76,7 @@ pub struct DbJob {
     pub base_branch: Option<String>,
     pub current_turn_id: Option<String>,
     pub uri_segment: Option<String>,
+    pub thread_id: Option<String>,
 }
 
 pub fn db_job_from_row(row: &turso::Row) -> DbResult<DbJob> {
@@ -105,6 +106,7 @@ pub fn db_job_from_row(row: &turso::Row) -> DbResult<DbJob> {
         current_turn_id: row.opt_text(22)?,
         uri_segment: row.opt_text(23)?,
         pack_anchor: row.opt_text(24)?,
+        thread_id: row.opt_text(25)?,
     })
 }
 

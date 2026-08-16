@@ -26,7 +26,7 @@
 
 #![allow(dead_code)]
 
-use cairn_common::uri::parse_uri;
+use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::params;
 use uuid::Uuid;
 
@@ -43,6 +43,146 @@ pub enum Wake {
     Wake,
     /// Breaks the running turn now.
     Interrupt,
+}
+
+/// Build the durable wake-card payload from the owning database. Question and
+/// permission push keys carry their canonical ask URI, which remains precise
+/// even though `content_ref` intentionally points at the issue-level context.
+/// Looking up receipts here preserves an answer that races with delivery after
+/// the push was selected but before its carrying event was rendered.
+pub async fn push_event_content_json_with_resolutions(
+    db: &LocalDb,
+    pushes: &[Push],
+    resolved: &str,
+) -> DbResult<String> {
+    let mut resolutions = std::collections::HashMap::new();
+    for push in pushes {
+        let Some((kind, ask_ref)) = push.key.split_once(':') else {
+            continue;
+        };
+        if !matches!(kind, "question" | "permission") {
+            continue;
+        }
+        if let Some(receipt) = resolution_receipt_for_ask(db, ask_ref).await? {
+            resolutions.insert(ask_ref.to_string(), receipt);
+        }
+    }
+
+    let mut value: serde_json::Value = serde_json::from_str(
+        &pushes_to_briefing_json_with_resolutions(pushes, &resolutions),
+    )
+    .unwrap_or_else(|_| serde_json::json!({ "active": [], "catchup": [] }));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "resolved".into(),
+            serde_json::Value::String(resolved.into()),
+        );
+    }
+    Ok(value.to_string())
+}
+
+async fn resolution_receipt_for_ask(
+    db: &LocalDb,
+    ask_ref: &str,
+) -> DbResult<Option<cairn_db::models::ResolutionReceipt>> {
+    let Some(resource) = parse_uri(ask_ref) else {
+        return Ok(None);
+    };
+    let (table, project, number, exec_seq, node, task, segment) = match resource {
+        CairnResource::NodeQuestion {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            segment,
+        } => ("prompts", project, number, exec_seq, node_id, None, segment),
+        CairnResource::NodePermission {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            segment,
+        } => (
+            "permission_requests",
+            project,
+            number,
+            exec_seq,
+            node_id,
+            None,
+            segment,
+        ),
+        CairnResource::TaskPermission {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            task_name,
+            segment,
+        } => (
+            "permission_requests",
+            project,
+            number,
+            exec_seq,
+            node_id,
+            Some(task_name),
+            segment,
+        ),
+        _ => return Ok(None),
+    };
+    db.read(|conn| {
+        Box::pin(async move {
+            let target_node = task.as_deref().unwrap_or(&node);
+            let parent_node = task.as_ref().map(|_| node.as_str());
+            let sql = format!(
+                "SELECT a.resolution_id, a.resolution_surface, a.resolution_provider, \
+                    a.resolution_conversation, a.resolution_actor, \
+                    COALESCE(a.{resolved_column}, a.created_at) \
+             FROM {table} a \
+             JOIN runs r ON r.id=a.run_id \
+             JOIN jobs j ON j.id=COALESCE(a.job_id, r.job_id) \
+             JOIN executions e ON e.id=j.execution_id \
+             JOIN issues i ON i.id=COALESCE(j.issue_id, r.issue_id) \
+             JOIN projects p ON p.id=i.project_id \
+             LEFT JOIN jobs parent ON parent.id=j.parent_job_id \
+             WHERE p.key=?1 AND i.number=?2 AND e.seq=?3 \
+               AND j.uri_segment=?4 AND a.uri_segment=?5 \
+               AND (?6 IS NULL OR parent.uri_segment=?6) LIMIT 1",
+                resolved_column = if table == "prompts" {
+                    "answered_at"
+                } else {
+                    "responded_at"
+                },
+            );
+            let mut rows = conn
+                .query(
+                    &sql,
+                    params![
+                        project,
+                        number as i64,
+                        exec_seq as i64,
+                        target_node,
+                        segment,
+                        parent_node
+                    ],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let Some(surface) = row.opt_text(1)? else {
+                return Ok(None);
+            };
+            Ok(Some(cairn_db::models::ResolutionReceipt {
+                id: row.opt_text(0)?,
+                surface,
+                provider: row.opt_text(2)?,
+                conversation: row.opt_text(3)?,
+                actor: row.opt_text(4)?,
+                resolved_at: row.i64(5)?,
+            }))
+        })
+    })
+    .await
 }
 
 impl Wake {
@@ -166,11 +306,24 @@ pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
         "tasks" => ("tasks", "Tasks need attention"),
         "turn-checks" => ("checks", "Turn-end check results"),
         "build-change" => ("system", "Cairn was rebuilt"),
+        "post" => ("post", "New post"),
+        "post-comment" => ("post", "New comment on your post"),
+        "post-mention" => ("post", "A post referenced you"),
         other => (other, "Attention update"),
     }
 }
 
 pub fn pushes_to_briefing_json(pushes: &[Push]) -> String {
+    pushes_to_briefing_json_with_resolutions(pushes, &std::collections::HashMap::new())
+}
+
+/// Structured wake projection for completed asks. Pending pushes continue to
+/// use the receipt-free shape; callers that have observed completion attach the
+/// canonical persisted receipt by referent URI.
+pub fn pushes_to_briefing_json_with_resolutions(
+    pushes: &[Push],
+    resolutions: &std::collections::HashMap<String, cairn_db::models::ResolutionReceipt>,
+) -> String {
     let mut active = Vec::new();
     let mut catchup = Vec::new();
     for push in pushes {
@@ -180,11 +333,15 @@ pub fn pushes_to_briefing_json(pushes: &[Push]) -> String {
             .map(|(p, _)| p)
             .unwrap_or(&push.key);
         let (kind, headline) = push_kind_headline(prefix);
-        let item = serde_json::json!({
+        let mut item = serde_json::json!({
             "kind": kind,
             "headline": headline,
             "uri": push.content_ref,
         });
+        let ask_ref = push.key.split_once(':').map(|(_, value)| value);
+        if let Some(resolution) = ask_ref.and_then(|reference| resolutions.get(reference)) {
+            item["resolution"] = serde_json::to_value(resolution).unwrap_or_default();
+        }
         if push.wake == Wake::Passive {
             catchup.push(item);
         } else {
@@ -234,7 +391,7 @@ pub fn render_pushes(pushes: &[Push]) -> Option<String> {
 /// their nudge decision off the effective wake via [`Wake::wakes_idle`].
 pub async fn has_push_identity(db: &LocalDb, recipient: &str, key: &str) -> DbResult<bool> {
     let recipient = recipient.to_string();
-    let key = key.to_string();
+    let key = cairn_common::uri::canonicalize_uri_identity(key);
     db.read(|conn| {
         let recipient = recipient.clone();
         let key = key.clone();
@@ -293,7 +450,14 @@ async fn source_mute_downgrade(
     let (source_kind, fact_kind) = match prefix {
         "review" | "question" | "permission" | "resolved" => ("issue", prefix),
         "turn-checks" => ("condition", "checks_settled"),
-        _ => return Ok(requested),
+        // A post push's suffix is the post's URI, which a ref-less Posts
+        // subscription matches as a standing watch, so a muted Posts watcher's
+        // wake is downgraded here into the same ride-along every other muted
+        // source produces.
+        _ => match crate::orchestrator::wakes::post_push_source(prefix) {
+            Some(source) => source,
+            None => return Ok(requested),
+        },
     };
     crate::orchestrator::wakes::mute_downgrade(
         db,
@@ -329,8 +493,8 @@ pub async fn push_with_fingerprint(
     // skips nudging a downgraded recipient.
     let wake = source_mute_downgrade(db, recipient, key, wake).await?;
     let recipient = recipient.to_string();
-    let content_ref = content_ref.to_string();
-    let key = key.to_string();
+    let content_ref = cairn_common::uri::canonicalize_uri_identity(content_ref);
+    let key = cairn_common::uri::canonicalize_uri_identity(key);
     let fingerprint = fingerprint.map(|s| s.to_string());
     let now = now_ts();
     let id = db
@@ -807,7 +971,7 @@ pub async fn lazy_resolve_live(db: &LocalDb, push: &Push) -> DbResult<bool> {
     let Some(parsed) = parse_uri(&push.content_ref) else {
         return Ok(true); // unparseable ref -> don't silently drop
     };
-    let project = parsed.project().map(str::to_uppercase);
+    let project = parsed.project().map(cairn_common::uri::canonical_project);
     let number = parsed.issue_number();
     let (Some(project_key), Some(number)) = (project, number) else {
         return Ok(true);
@@ -969,15 +1133,44 @@ async fn issue_is_terminal(conn: &cairn_db::turso::Connection, issue_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_ask_briefing_keeps_canonical_receipt_provenance() {
+        let push = sample_push(
+            "question:cairn://p/proj/2/1/planner/questions/q-1",
+            "cairn://p/proj/2",
+        );
+        let receipt = cairn_db::models::ResolutionReceipt {
+            id: Some("receipt-1".into()),
+            surface: "channel_reply".into(),
+            provider: Some("telegram".into()),
+            conversation: Some("telegram:chat-42".into()),
+            actor: Some("telegram:chat-42:user-7".into()),
+            resolved_at: 1_786_590_456,
+        };
+        let resolutions = std::collections::HashMap::from([(
+            "cairn://p/proj/2/1/planner/questions/q-1".to_string(),
+            receipt,
+        )]);
+        let briefing: serde_json::Value = serde_json::from_str(
+            &pushes_to_briefing_json_with_resolutions(&[push], &resolutions),
+        )
+        .unwrap();
+        let resolution = &briefing["active"][0]["resolution"];
+        assert_eq!(resolution["provider"], "telegram");
+        assert_eq!(resolution["conversation"], "telegram:chat-42");
+        assert_eq!(resolution["actor"], "telegram:chat-42:user-7");
+        assert_eq!(resolution["resolvedAt"], 1_786_590_456_i64);
+    }
     use crate::storage::LocalDb;
 
-    const ISSUE_URI: &str = "cairn://p/PROJ/2";
+    const ISSUE_URI: &str = "cairn://p/proj/2";
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("attention-push.db").await
     }
 
-    /// Seed a project, an issue (`issue-1` / `cairn://p/PROJ/2`), a watcher job
+    /// Seed a project, an issue (`issue-1` / `cairn://p/proj/2`), a watcher job
     /// (the recipient), a child job, and a run for that issue so the FK and the
     /// referent-table resolution queries have rows to work against.
     async fn seed(db: &LocalDb) {
@@ -985,13 +1178,15 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('issue-1','p',2,'Child','active','active','none',1,1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('exec-1','default','issue-1','p','running',1,1);
             INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
               VALUES('watcher','p','issue-1','running','sess',1,1);
-            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-              VALUES('child-job','p','issue-1','running','sess2',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, execution_id, node_name, uri_segment, status, current_session_id, created_at, updated_at)
+              VALUES('child-job','p','issue-1','exec-1','planner','planner','running','sess2',1,1);
             INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
               VALUES('run-1','p','child-job','issue-1',1,1);
             ",
@@ -1013,6 +1208,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn production_payload_resolves_question_receipt_from_push_key() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute("INSERT INTO prompts(id, run_id, job_id, questions, response, uri_segment, created_at, answered_at, resolution_id, resolution_surface, resolution_provider, resolution_conversation, resolution_actor) VALUES('prompt-1','run-1','child-job','[]','yes','q-1',10,1786590456000,'receipt-q','channel_reply','telegram','telegram:chat-42','telegram:user-7')", ()).await.unwrap();
+        let push = sample_push(
+            "question:cairn://p/proj/2/1/planner/questions/q-1",
+            ISSUE_URI,
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            &push_event_content_json_with_resolutions(&db, &[push], "answer")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let receipt = &payload["active"][0]["resolution"];
+        assert_eq!(receipt["provider"], "telegram");
+        assert_eq!(receipt["conversation"], "telegram:chat-42");
+        assert_eq!(receipt["actor"], "telegram:user-7");
+        assert_eq!(receipt["resolvedAt"], 1_786_590_456_000_i64);
+    }
+
+    #[tokio::test]
+    async fn production_payload_resolves_permission_receipt_from_push_key() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute("INSERT INTO permission_requests(id, run_id, job_id, tool_use_id, tool_name, tool_input, status, response, uri_segment, created_at, responded_at, resolution_id, resolution_surface, resolution_provider, resolution_conversation, resolution_actor) VALUES('permission-1','run-1','child-job','tool-1','Bash','{}','approved','once','perm-1',10,1786590456000,'receipt-p','channel_reply','discord','discord:guild/channel','discord:user-9')", ()).await.unwrap();
+        let push = sample_push(
+            "permission:cairn://p/proj/2/1/planner/permissions/perm-1",
+            ISSUE_URI,
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            &push_event_content_json_with_resolutions(&db, &[push], "approved")
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let receipt = &payload["active"][0]["resolution"];
+        assert_eq!(receipt["surface"], "channel_reply");
+        assert_eq!(receipt["provider"], "discord");
+        assert_eq!(receipt["conversation"], "discord:guild/channel");
+        assert_eq!(receipt["actor"], "discord:user-9");
+        assert_eq!(receipt["resolvedAt"], 1_786_590_456_000_i64);
+    }
     async fn delivered_event(db: &LocalDb, id: &str) -> Option<String> {
         let id = id.to_string();
         db.read(|conn| {
@@ -1039,7 +1278,7 @@ mod tests {
     async fn muted_turn_checks_push_is_created_passively() {
         let db = migrated_db().await;
         seed(&db).await;
-        let checks_uri = "cairn://p/PROJ/2/1/builder/checks";
+        let checks_uri = "cairn://p/proj/2/1/builder/checks";
         crate::orchestrator::wakes::mute(
             &db,
             "watcher",
@@ -1078,10 +1317,10 @@ mod tests {
         let (id, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/builder",
+            "cairn://p/proj/2/1/builder",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1092,7 +1331,7 @@ mod tests {
         assert_eq!(pending[0].recipient, "watcher");
         assert_eq!(pending[0].wake, Wake::Wake);
         assert_eq!(pending[0].boundary, Boundary::Event);
-        assert_eq!(pending[0].key, "review:cairn://p/PROJ/2");
+        assert_eq!(pending[0].key, "review:cairn://p/proj/2");
         assert!(pending[0].delivered_event_id.is_none());
     }
 
@@ -1106,7 +1345,7 @@ mod tests {
             "ref-1",
             Wake::Passive,
             Boundary::Turn,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1116,7 +1355,7 @@ mod tests {
             "ref-2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1139,7 +1378,7 @@ mod tests {
         let (id1, w1) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/builder",
+            "cairn://p/proj/2/1/builder",
             Wake::Wake,
             Boundary::Event,
             "direct:msg-1",
@@ -1149,7 +1388,7 @@ mod tests {
         let (id2, w2) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/builder",
+            "cairn://p/proj/2/1/builder",
             Wake::Wake,
             Boundary::Event,
             "direct:msg-2",
@@ -1175,7 +1414,7 @@ mod tests {
             "ref-1",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1194,7 +1433,7 @@ mod tests {
             "ref-2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1426,7 +1665,7 @@ mod tests {
     async fn lazy_resolve_review_lives_with_open_pr_skips_when_merged() {
         let db = migrated_db().await;
         seed(&db).await;
-        let p = sample_push("review:cairn://p/PROJ/2", "cairn://p/PROJ/2/1/builder");
+        let p = sample_push("review:cairn://p/proj/2", "cairn://p/proj/2/1/builder");
 
         // No merge_request row -> nothing open -> resolved.
         assert!(!lazy_resolve_live(&db, &p).await.unwrap());
@@ -1451,7 +1690,7 @@ mod tests {
         let db = migrated_db().await;
         seed(&db).await;
         let p = sample_push(
-            "question:cairn://p/PROJ/2/1/planner/questions/q-1",
+            "question:cairn://p/proj/2/1/planner/questions/q-1",
             ISSUE_URI,
         );
 
@@ -1477,7 +1716,7 @@ mod tests {
         let db = migrated_db().await;
         seed(&db).await;
         let p = sample_push(
-            "permission:cairn://p/PROJ/2/1/builder/permissions/perm-1",
+            "permission:cairn://p/proj/2/1/builder/permissions/perm-1",
             ISSUE_URI,
         );
 
@@ -1502,7 +1741,7 @@ mod tests {
         let db = migrated_db().await;
         seed(&db).await;
         let p = sample_push(
-            "question:cairn://p/PROJ/2/1/planner/questions/q-1",
+            "question:cairn://p/proj/2/1/planner/questions/q-1",
             ISSUE_URI,
         );
         db.execute_script(
@@ -1527,7 +1766,7 @@ mod tests {
         let db = migrated_db().await;
         seed(&db).await;
         // A plan-review push: content_ref is a /plan node URI, no merge_request.
-        let p = sample_push("review:cairn://p/PROJ/2", "cairn://p/PROJ/2/1/planner/plan");
+        let p = sample_push("review:cairn://p/proj/2", "cairn://p/proj/2/1/planner/plan");
         // No PR and no artifact yet -> dead.
         assert!(!lazy_resolve_live(&db, &p).await.unwrap());
 
@@ -1556,7 +1795,7 @@ mod tests {
         // AUTO-confirmed on write (CAIRN-1219), and the PR has not opened yet
         // (no merge_requests row). Before the fix this window read DEAD, silently
         // dropping the idle coordinator's review wake. It must read LIVE.
-        let p = sample_push("review:cairn://p/PROJ/2", "cairn://p/PROJ/2/1/builder");
+        let p = sample_push("review:cairn://p/proj/2", "cairn://p/proj/2/1/builder");
         // No artifact and no PR -> dead.
         assert!(!lazy_resolve_live(&db, &p).await.unwrap());
 
@@ -1578,7 +1817,7 @@ mod tests {
         // Guards against over-widening arm 3: once a merge_requests row exists,
         // arm 1 is authoritative. A merged PR is a dead review even though the
         // confirmed create-pr artifact that opened it still exists.
-        let p = sample_push("review:cairn://p/PROJ/2", "cairn://p/PROJ/2/1/builder");
+        let p = sample_push("review:cairn://p/proj/2", "cairn://p/proj/2/1/builder");
         db.execute_script(
             "INSERT INTO artifacts
                (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
@@ -1606,9 +1845,9 @@ mod tests {
         let db = migrated_db().await;
         seed(&db).await;
         for key in [
-            "catchup:cairn://p/PROJ/2/1/child",
-            "direct:cairn://p/PROJ/2",
-            "resolved:cairn://p/PROJ/2",
+            "catchup:cairn://p/proj/2/1/child",
+            "direct:cairn://p/proj/2",
+            "resolved:cairn://p/proj/2",
             "weird",
         ] {
             let p = sample_push(key, ISSUE_URI);
@@ -1640,10 +1879,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1652,10 +1891,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/child",
+            "cairn://p/proj/2/1/child",
             Wake::Passive,
             Boundary::Event,
-            "catchup:cairn://p/PROJ/2/1/child",
+            "catchup:cairn://p/proj/2/1/child",
         )
         .await
         .unwrap();
@@ -1663,7 +1902,7 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Turn,
             "review:turn",
@@ -1675,10 +1914,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "question:cairn://p/PROJ/2",
+            "question:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1692,8 +1931,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "catchup:cairn://p/PROJ/2/1/child",
-                "review:cairn://p/PROJ/2"
+                "catchup:cairn://p/proj/2/1/child",
+                "review:cairn://p/proj/2"
             ]
         );
         // Rendered into non-empty reminder lines for the agent.
@@ -1710,10 +1949,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/child",
+            "cairn://p/proj/2/1/child",
             Wake::Passive,
             Boundary::Event,
-            "catchup:cairn://p/PROJ/2/1/child",
+            "catchup:cairn://p/proj/2/1/child",
         )
         .await
         .unwrap();
@@ -1721,10 +1960,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1732,7 +1971,7 @@ mod tests {
         let live = list_pending_live(&db, "watcher").await.unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].wake, Wake::Passive);
-        assert_eq!(live[0].key, "catchup:cairn://p/PROJ/2/1/child");
+        assert_eq!(live[0].key, "catchup:cairn://p/proj/2/1/child");
     }
 
     #[tokio::test]
@@ -1743,10 +1982,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/child",
+            "cairn://p/proj/2/1/child",
             Wake::Passive,
             Boundary::Event,
-            "catchup:cairn://p/PROJ/2/1/child",
+            "catchup:cairn://p/proj/2/1/child",
         )
         .await
         .unwrap();
@@ -1757,10 +1996,10 @@ mod tests {
         push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Turn,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1780,7 +2019,7 @@ mod tests {
         let (id, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Passive,
             Boundary::Event,
             "direct:msg-1",
@@ -1837,10 +2076,10 @@ mod tests {
         let (id, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1882,10 +2121,10 @@ mod tests {
         let (id, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1922,10 +2161,10 @@ mod tests {
         let (id, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -2012,7 +2251,7 @@ mod tests {
         let (id, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/child/chat?offset=0",
+            "cairn://p/proj/2/1/child/chat?offset=0",
             Wake::Passive,
             Boundary::Event,
             "catchup:child-job",
@@ -2039,7 +2278,7 @@ mod tests {
         let (cid, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/child/chat?offset=0",
+            "cairn://p/proj/2/1/child/chat?offset=0",
             Wake::Passive,
             Boundary::Event,
             "catchup:child-job",
@@ -2061,7 +2300,7 @@ mod tests {
         let (cid2, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2/1/child/chat?offset=3",
+            "cairn://p/proj/2/1/child/chat?offset=3",
             Wake::Passive,
             Boundary::Event,
             "catchup:child-job",
@@ -2080,10 +2319,10 @@ mod tests {
         let (rid, _) = push(
             &db,
             "watcher",
-            "cairn://p/PROJ/2",
+            "cairn://p/proj/2",
             Wake::Wake,
             Boundary::Event,
-            "review:cairn://p/PROJ/2",
+            "review:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -2092,6 +2331,48 @@ mod tests {
             read_cursor(&db, "watcher", "child-job").await.unwrap(),
             Some(10),
             "a non-catchup push must not touch the read cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_case_uri_key_round_trips_through_store_and_match() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        let (first_id, _) = push_with_fingerprint(
+            &db,
+            "watcher",
+            "cairn://p/CaIrN/42/1/Builder/artifact",
+            Wake::Wake,
+            Boundary::Event,
+            "review:cairn://p/CaIrN/42",
+            Some("same-fact"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            latest_push_fingerprint(&db, "watcher", "review:cairn://p/cairn/42")
+                .await
+                .unwrap(),
+            Some(Some("same-fact".to_string()))
+        );
+
+        let (second_id, _) = push(
+            &db,
+            "watcher",
+            "cairn://p/cairn/42/1/Builder/create-pr",
+            Wake::Wake,
+            Boundary::Event,
+            "review:cairn://p/cairn/42",
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_id, second_id, "the canonical key supersedes in place");
+        let pending = list_pending(&db, "watcher").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, "review:cairn://p/cairn/42");
+        assert_eq!(
+            pending[0].content_ref,
+            "cairn://p/cairn/42/1/Builder/create-pr"
         );
     }
 }

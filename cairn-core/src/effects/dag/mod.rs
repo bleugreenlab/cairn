@@ -308,7 +308,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
-                     VALUES ('proj', 'default', 'Proj', 'PROJ', '/tmp/proj', 0, 0)",
+                     VALUES ('proj', 'default', 'Proj', 'proj', '/tmp/proj', 0, 0)",
                     (),
                 )
                 .await?;

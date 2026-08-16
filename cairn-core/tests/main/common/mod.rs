@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use cairn_common::executor_protocol::{
     ExecutorAdvertisement, ExecutorCapabilities, ExecutorIdentity, ExecutorMessage,
-    ObjectChannelCredential,
+    ObjectChannelCredential, ResidencyRuntimeConfig,
 };
 use cairn_core::internal::db::DbState;
 use cairn_core::internal::jj::{self, JjEnv};
@@ -291,10 +291,12 @@ fn attach_executor(
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
                 logical_cores: 1,
+                concurrency_capacity: None,
                 toolchains: Vec::new(),
                 projects_served: projects_served.as_ref().clone(),
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
+                sandbox: None,
                 toolchain_detection: None,
             },
             current_load: 0,
@@ -316,8 +318,12 @@ fn attach_executor(
     tokio::spawn(async move {
         while let Some(message) = rx.recv().await {
             match message {
-                ExecutorMessage::Configure { config } => executor_pool.configure(config),
-                ExecutorMessage::Submit { request, batch } => {
+                ExecutorMessage::Submit {
+                    config,
+                    request,
+                    batch,
+                } => {
+                    executor_pool.configure(config);
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     let projects_served = projects_served.clone();
@@ -361,10 +367,12 @@ fn attach_executor(
                                         os: std::env::consts::OS.into(),
                                         arch: std::env::consts::ARCH.into(),
                                         logical_cores: 1,
+                                        concurrency_capacity: None,
                                         toolchains: Vec::new(),
                                         projects_served: projects_served.as_ref().clone(),
                                         disk_budget_bytes: None,
                                         memory_budget_bytes: None,
+                                        sandbox: None,
                                         toolchain_detection: None,
                                     },
                                     current_load: 0,
@@ -384,8 +392,12 @@ fn attach_executor(
                 }
                 ExecutorMessage::ResidencyRequest {
                     correlation_id,
+                    config,
                     operation,
                 } => {
+                    if let ResidencyRuntimeConfig::Install(config) = config {
+                        executor_pool.configure(config);
+                    }
                     let executor_pool = executor_pool.clone();
                     let core_pool = core_pool.clone();
                     tokio::spawn(async move {
@@ -476,15 +488,54 @@ pub async fn read_resource(orch: &Orchestrator, uri: impl AsRef<str>) -> String 
 }
 
 pub async fn change_resource(orch: &Orchestrator, changes: Value) -> String {
+    change_resource_as_run(orch, changes, None).await
+}
+
+pub async fn change_resource_as_run(
+    orch: &Orchestrator,
+    changes: Value,
+    run_id: Option<&str>,
+) -> String {
     let request = McpCallbackRequest {
         thread_id: None,
         cwd: String::new(),
-        run_id: None,
+        run_id: run_id.map(str::to_string),
         tool: "write".to_string(),
         payload: json!({ "changes": changes }),
         tool_use_id: None,
     };
     handle_write(orch, &request).await
+}
+
+pub async fn seed_authenticated_thread_run(
+    db: &LocalDb,
+    project_id: &str,
+    thread_name: &str,
+    run_id: &str,
+) {
+    let thread_id = format!("thread-{run_id}");
+    let job_id = format!("job-{run_id}");
+    db.execute(
+        "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'active', 'none', 1, 1)",
+        params![thread_id.as_str(), project_id, thread_name],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO jobs(id, project_id, thread_id, node_name, status, uri_segment, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'Thread', 'running', 'thread', 1, 1)",
+        params![job_id.as_str(), project_id, thread_id.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'live', 1, 1)",
+        params![run_id, project_id, job_id.as_str()],
+    )
+    .await
+    .unwrap();
 }
 
 pub async fn test_orchestrator() -> (tempfile::TempDir, Orchestrator) {

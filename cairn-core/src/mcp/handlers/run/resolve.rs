@@ -286,8 +286,10 @@ fn resolve_repl_send(item: &RunItem, slug: &str) -> (String, Result<RunSpec, Str
 /// (`bun -e <code>`); python delegates to [`resolve_python_spec`], which routes
 /// through `uv run -` (code on stdin) when uv resolves and falls back to
 /// `python3 -c <code>` otherwise. No shell (so no quoting), no temp file (no
-/// lifecycle). Because `execute_process` injects the callback env, inline
-/// TypeScript gets zero-config `@cairn/sdk` from the worktree `node_modules`.
+/// lifecycle). Because `execute_process` injects the callback env and the
+/// runner ships the SDK with any batch that runs JavaScript, inline TypeScript
+/// can import `@cairn/sdk` in any project -- see `cairn_common::runtime` for
+/// where those packages install and why a project's own copy still wins.
 fn resolve_code_spec(item: &RunItem) -> (String, Result<RunSpec, String>) {
     let code = item.code.as_deref().unwrap_or_default();
     let header = item_header(item, &first_line_header(code));

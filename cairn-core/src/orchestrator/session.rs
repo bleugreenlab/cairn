@@ -1872,7 +1872,7 @@ pub fn start_agent_session(
             // project references. Both read from the same loaded project config.
             if let Some(ref project_path) = project_path_for_prompt {
                 let proj_config =
-                    crate::config::project_settings::load_project_settings(project_path);
+                    crate::config::project_settings::load_project_settings_read_only(project_path);
 
                 if let Some(ref checks) = proj_config.checks {
                     if let Some(section) = build_project_checks_section(checks) {
@@ -2035,12 +2035,16 @@ pub fn start_agent_session(
         )
     };
 
-    // Resolve identity: an explicit server identity always wins. Managed Claude
-    // sessions otherwise retain their durable account pin while it is available;
-    // project overrides win selection outright, and an unavailable pin is replaced.
+    // Resolve identity: an explicit server identity always wins. A session on a
+    // subscription provider (Claude, Codex) otherwise retains its durable
+    // account pin while it is available; project overrides win selection
+    // outright, and an unavailable pin is replaced by the account with the most
+    // remaining usage.
+    let routed_provider =
+        crate::identity::RoutedProvider::for_backend(&backend.name().to_ascii_lowercase());
     let resolved_identity = if let Some(identity) = identity_override {
         Some(identity)
-    } else if backend.name() == "Claude" {
+    } else if let Some(provider) = routed_provider {
         let session_id = match &session_start {
             SessionStart::New { session_id }
             | SessionStart::Resume { session_id, .. }
@@ -2054,16 +2058,30 @@ pub fn start_agent_session(
         let project_override = session_project_id.as_ref().and_then(|project_id| {
             orch.get_identity_store()
                 .and_then(|store| store.project_overrides.get(project_id).cloned())
-                .and_then(|overrides| overrides.anthropic_account_id)
+                .and_then(|overrides| match provider {
+                    crate::identity::RoutedProvider::Claude => overrides.anthropic_account_id,
+                    crate::identity::RoutedProvider::Codex => overrides.openai_account_id,
+                })
         });
         let selected = if let Some(override_id) = project_override.as_deref() {
-            orch.select_claude_identity(session_project_id.as_deref(), Some(override_id), None)
+            orch.select_routed_identity(
+                provider,
+                session_project_id.as_deref(),
+                Some(override_id),
+                None,
+            )
         } else if let Some(account_id) = session.account_id.as_deref() {
-            orch.resolve_available_claude_account(session_project_id.as_deref(), account_id)
-                .map(|identity| (account_id.to_string(), identity))
-                .or_else(|| orch.select_claude_identity(session_project_id.as_deref(), None, None))
+            orch.resolve_available_routed_account(
+                provider,
+                session_project_id.as_deref(),
+                account_id,
+            )
+            .map(|identity| (account_id.to_string(), identity))
+            .or_else(|| {
+                orch.select_routed_identity(provider, session_project_id.as_deref(), None, None)
+            })
         } else {
-            orch.select_claude_identity(session_project_id.as_deref(), None, None)
+            orch.select_routed_identity(provider, session_project_id.as_deref(), None, None)
         };
 
         if let Some((account_id, identity)) = selected {
@@ -2080,23 +2098,35 @@ pub fn start_agent_session(
             }
             Some(identity)
         } else {
-            // Unknown/blocked managed profiles must never silently fall through
-            // to the first profile (or the ambient Keychain). Preserve legacy
-            // non-profile auth only when no managed profile exists.
-            let has_managed_profiles = orch.get_identity_store().is_some_and(|store| {
-                store.accounts.iter().any(|account| {
-                    account.api_provider == crate::identity::ApiProvider::Anthropic
-                        && matches!(account.auth, crate::identity::ProviderAuth::ClaudeProfile)
+            // No subscription account is available. The only other credential
+            // Cairn owns for this provider is an API key, which the user added
+            // deliberately, so fall to that and to nothing else: plain
+            // resolution here used to hand back an identity with no provider
+            // auth at all, and the backend then spawned on the user-level
+            // login. Leaving the auth field unset is what makes the spawn
+            // refuse.
+            orch.resolve_identity_for_project(session_project_id.as_deref(), None)
+                .map(|mut identity| {
+                    match provider {
+                        crate::identity::RoutedProvider::Claude => {
+                            if !matches!(
+                                identity.claude_auth,
+                                Some(crate::identity::ClaudeAuth::ApiKey(_))
+                            ) {
+                                identity.claude_auth = None;
+                            }
+                        }
+                        crate::identity::RoutedProvider::Codex => {
+                            if !matches!(
+                                identity.codex_auth,
+                                Some(crate::identity::CodexAuth::ApiKey(_))
+                            ) {
+                                identity.codex_auth = None;
+                            }
+                        }
+                    }
+                    identity
                 })
-            });
-            let mut identity =
-                orch.resolve_identity_for_project(session_project_id.as_deref(), None);
-            if has_managed_profiles {
-                if let Some(identity) = identity.as_mut() {
-                    identity.claude_auth = None;
-                }
-            }
-            identity
         }
     } else {
         let project_overrides = session_project_id.as_ref().and_then(|pid| {
@@ -2249,11 +2279,11 @@ mod tests {
     #[test]
     fn orientation_block_states_run_coordinates() {
         let block = build_orientation_block(
-            "cairn://p/CAIRN/1288/1/builder",
-            Some("CAIRN"),
+            "cairn://p/cairn/1288/1/builder",
+            Some("cairn"),
             Some("/repos/cairn"),
             Some("main"),
-            Some("/home/tester/.cairn/scratch/CAIRN.1288.1.builder"),
+            Some("/home/tester/.cairn/scratch/cairn.1288.1.builder"),
             Some("claude-opus-4"),
             false,
         );
@@ -2265,10 +2295,10 @@ mod tests {
         // The block names the environment the agent's commands run in. It never
         // names the CLI process's own directory, which no agent surface reaches.
         assert!(block.contains("Working directory: the checkout your commands"));
-        assert!(!block.contains("/work/CAIRN-1288-builder-0"));
-        assert!(block.contains("cairn://p/CAIRN/1288/1/builder"));
+        assert!(!block.contains("/work/cairn-1288-builder-0"));
+        assert!(block.contains("cairn://p/cairn/1288/1/builder"));
         assert!(block.contains("cairn:~/"));
-        assert!(block.contains("Project: `CAIRN`"));
+        assert!(block.contains("Project: `cairn`"));
         // The project's own checkout is a distinct, read-only surface.
         assert!(block.contains("Repository:"));
         assert!(block.contains("read-only for agents"));
@@ -2281,7 +2311,7 @@ mod tests {
         // see belongs to the run's environment, not to the CLI process, so
         // advertising an absolute path here could only be wrong.
         assert!(block.contains("Scratch: `$TMPDIR`"));
-        assert!(!block.contains("/home/tester/.cairn/scratch/CAIRN.1288.1.builder"));
+        assert!(!block.contains("/home/tester/.cairn/scratch/cairn.1288.1.builder"));
         // An authenticated virtual-residence run carries no ambient framing.
         assert!(!block.contains("## Capability tier"));
     }
@@ -2289,8 +2319,8 @@ mod tests {
     #[test]
     fn orientation_block_never_makes_cwd_repository_identity() {
         let block = build_orientation_block(
-            "cairn://p/CAIRN/1/1/manager",
-            Some("CAIRN"),
+            "cairn://p/cairn/1/1/manager",
+            Some("cairn"),
             Some("/repos/cairn"),
             Some("main"),
             Some("/tmp/job-residence"),
@@ -2310,8 +2340,8 @@ mod tests {
     #[test]
     fn orientation_block_carries_no_substrate_vocabulary() {
         let block = build_orientation_block(
-            "cairn://p/CAIRN/1/1/manager",
-            Some("CAIRN"),
+            "cairn://p/cairn/1/1/manager",
+            Some("cairn"),
             Some("/repos/cairn"),
             Some("main"),
             Some("/tmp/job-residence"),
@@ -2329,7 +2359,7 @@ mod tests {
             INSERT INTO workspaces(id, name, created_at, updated_at)
              VALUES('w', 'Workspace', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES('proj', 'w', 'Project', 'CAIRN', '/repos/cairn', 'main', 1, 1);
+             VALUES('proj', 'w', 'Project', 'cairn', '/repos/cairn', 'main', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
              VALUES('parent', 'proj', 1, 'Parent', 'active', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, parent_issue_id, created_at, updated_at)
@@ -2337,7 +2367,7 @@ mod tests {
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
              VALUES('exec-child', 'recipe', 'child', 'proj', 'running', 1, 1);
             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, base_branch, created_at, updated_at)
-             VALUES('job-child', 'exec-child', 'child', 'proj', 'running', 'builder', 'builder', 'agent/CAIRN-1-coordinator-0', 1, 1);
+             VALUES('job-child', 'exec-child', 'child', 'proj', 'running', 'builder', 'builder', 'agent/cairn-1-coordinator-0', 1, 1);
             INSERT INTO runs(id, issue_id, project_id, job_id, status, created_at, updated_at)
              VALUES('run-child', 'child', 'proj', 'job-child', 'running', 1, 1);
             ",
@@ -2350,7 +2380,7 @@ mod tests {
 
         assert_eq!(
             context.effective_base_branch.as_deref(),
-            Some("agent/CAIRN-1-coordinator-0")
+            Some("agent/cairn-1-coordinator-0")
         );
         assert_ne!(context.effective_base_branch.as_deref(), Some("main"));
     }
@@ -2358,7 +2388,7 @@ mod tests {
     #[test]
     fn orientation_block_omits_missing_optionals() {
         let block =
-            build_orientation_block("cairn://p/P/1/1/node", None, None, None, None, None, false);
+            build_orientation_block("cairn://p/p/1/1/node", None, None, None, None, None, false);
         assert!(block.contains("Working directory:"));
         assert!(!block.contains("Project:"));
         // The trailing guidance mentions repository commands; only the labelled
@@ -2570,7 +2600,7 @@ mod tests {
         let db = Arc::new(migrated_db().await);
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p','default','P','PROJ','/tmp/p',1,1);
+               VALUES('p','default','P','proj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
                VALUES('i','p',7,'An issue','active','active','none',1,1);
              INSERT INTO executions(id, issue_id, project_id, recipe_id, status, started_at, seq)
@@ -2872,7 +2902,7 @@ mod tests {
         let agent = "<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>";
         let dynamic = "\n\nORIENTATION\n</agent_role>";
         let segs = assemble_prompt_segments(
-            "CAIRN",
+            "cairn",
             Some("ws doctrine"),
             Some("proj doctrine"),
             Some(agent),
@@ -2892,7 +2922,7 @@ mod tests {
         let full: String = segs.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
             full,
-            "CAIRN\n\n## Workspace Instructions\n\nws doctrine\n\n## Project Instructions\n\nproj doctrine\n\n<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>"
+            "cairn\n\n## Workspace Instructions\n\nws doctrine\n\n## Project Instructions\n\nproj doctrine\n\n<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>"
         );
         assert_eq!(
             segs.iter()
@@ -2915,7 +2945,7 @@ mod tests {
     #[test]
     fn assemble_prompt_segments_omits_absent_pieces() {
         let segs = assemble_prompt_segments(
-            "CAIRN",
+            "cairn",
             None,
             None,
             Some("<agent_role>\nx\n</agent_role>"),
@@ -2924,7 +2954,7 @@ mod tests {
         let kinds: Vec<&str> = segs.iter().map(|s| s.kind).collect();
         assert_eq!(kinds, vec![SEGMENT_KIND_CAIRN, SEGMENT_KIND_AGENT]);
         let full: String = segs.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(full, "CAIRN\n\n<agent_role>\nx\n</agent_role>");
+        assert_eq!(full, "cairn\n\n<agent_role>\nx\n</agent_role>");
     }
 
     /// Codex derives its two payloads by slicing the same assembled segments, so
@@ -2935,7 +2965,7 @@ mod tests {
         let agent = "<agent_role>\nbuilder body\n\nORIENTATION\n</agent_role>";
         let dynamic = "\n\nORIENTATION\n</agent_role>";
         let segs = assemble_prompt_segments(
-            "CAIRN",
+            "cairn",
             Some("ws doctrine"),
             Some("proj doctrine"),
             Some(agent),
@@ -2946,7 +2976,7 @@ mod tests {
         // Base = cairn + workspace + project; developer = agent + dynamic.
         assert_eq!(
             base,
-            "CAIRN\n\n## Workspace Instructions\n\nws doctrine\n\n## Project Instructions\n\nproj doctrine"
+            "cairn\n\n## Workspace Instructions\n\nws doctrine\n\n## Project Instructions\n\nproj doctrine"
         );
         assert_eq!(
             developer,
@@ -2959,11 +2989,11 @@ mod tests {
     /// With no agent content there is nothing to send as developer instructions.
     #[test]
     fn developer_instructions_absent_without_agent_segment() {
-        let segs = assemble_prompt_segments("CAIRN", Some("ws"), None, None, None);
+        let segs = assemble_prompt_segments("cairn", Some("ws"), None, None, None);
         assert!(developer_instructions_from_segments(&segs).is_none());
         assert_eq!(
             base_instructions_from_segments(&segs),
-            "CAIRN\n\n## Workspace Instructions\n\nws"
+            "cairn\n\n## Workspace Instructions\n\nws"
         );
     }
 
@@ -2974,7 +3004,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
             VALUES('i', 'p', 1, 'Issue', 'backlog', 'backlog', 'none', 1, 1);
             INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
@@ -3060,7 +3090,7 @@ mod tests {
             Box::pin(async move {
                 recent_messages_for_run(
                     conn,
-                    "PROJ",
+                    "proj",
                     Some(&issue_key),
                     exclude_job_id.as_deref(),
                     cursor,
@@ -3084,7 +3114,7 @@ mod tests {
             &db,
             "m1",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-child"),
             "system",
             "salvage-frozen finished successfully",
@@ -3095,7 +3125,7 @@ mod tests {
         // First injection: empty cursor surfaces the message.
         let cursor0 = read_cursor(&db, "sess").await;
         assert!(cursor0.is_none());
-        let first = fetch_recent(&db, "PROJ/1", Some("j"), cursor0).await;
+        let first = fetch_recent(&db, "proj/1", Some("j"), cursor0).await;
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].content, "salvage-frozen finished successfully");
 
@@ -3106,7 +3136,7 @@ mod tests {
         assert_eq!(cursor1, Some(max_rowid));
 
         // Second injection on the same session: the message is deduped.
-        let second = fetch_recent(&db, "PROJ/1", Some("j"), cursor1).await;
+        let second = fetch_recent(&db, "proj/1", Some("j"), cursor1).await;
         assert!(
             second.is_empty(),
             "already-injected message must not re-surface"
@@ -3117,14 +3147,14 @@ mod tests {
             &db,
             "m2",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-child"),
             "system",
             "new notice",
             2000,
         )
         .await;
-        let third = fetch_recent(&db, "PROJ/1", Some("j"), cursor1).await;
+        let third = fetch_recent(&db, "proj/1", Some("j"), cursor1).await;
         assert_eq!(third.len(), 1);
         assert_eq!(third[0].content, "new notice");
     }
@@ -3142,14 +3172,14 @@ mod tests {
             &db,
             "ffff",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-child"),
             "system",
             "first",
             1000,
         )
         .await;
-        let first = fetch_recent(&db, "PROJ/1", Some("j"), None).await;
+        let first = fetch_recent(&db, "proj/1", Some("j"), None).await;
         advance(&db, "sess", first.iter().map(|m| m.rowid).max().unwrap()).await;
         let cursor = read_cursor(&db, "sess").await;
 
@@ -3159,14 +3189,14 @@ mod tests {
             &db,
             "0000",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-child"),
             "system",
             "same-second later",
             1000,
         )
         .await;
-        let next = fetch_recent(&db, "PROJ/1", Some("j"), cursor).await;
+        let next = fetch_recent(&db, "proj/1", Some("j"), cursor).await;
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].content, "same-second later");
     }
@@ -3179,7 +3209,7 @@ mod tests {
             &db,
             "lifecycle",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-peer"),
             "system",
             "builder finished successfully",
@@ -3190,7 +3220,7 @@ mod tests {
             &db,
             "agent-message",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-peer"),
             "builder",
             "I need the parent to review this output",
@@ -3229,7 +3259,7 @@ mod tests {
             &db,
             "self-lifecycle",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-self"),
             "system",
             "builder finished successfully",
@@ -3240,7 +3270,7 @@ mod tests {
             &db,
             "other-lifecycle",
             "issue",
-            "PROJ/1",
+            "proj/1",
             Some("run-other"),
             "system",
             "planner finished successfully",
@@ -3248,7 +3278,7 @@ mod tests {
         )
         .await;
 
-        let recent = fetch_recent(&db, "PROJ/1", Some("j"), None).await;
+        let recent = fetch_recent(&db, "proj/1", Some("j"), None).await;
 
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].content, "planner finished successfully");

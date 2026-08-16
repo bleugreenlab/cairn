@@ -221,8 +221,8 @@ mod tests {
         let json = serde_json::json!({
             "changes": [
                 {"target": "file:src/lib.rs", "mode": "create", "payload": {"content": "fn main() {}"}},
-                {"target": "cairn://p/CAIRN/1", "mode": "patch", "payload": {"title": "Updated"}},
-                {"target": "cairn://p/CAIRN/messages", "mode": "append", "payload": {"content": "hello"}}
+                {"target": "cairn://p/cairn/1", "mode": "patch", "payload": {"title": "Updated"}},
+                {"target": "cairn://p/cairn/messages", "mode": "append", "payload": {"content": "hello"}}
             ],
             "commit_msg": "test commit"
         });

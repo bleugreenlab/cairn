@@ -290,7 +290,7 @@ async fn completed_at(db: &LocalDb, job_id: &str) -> Option<i64> {
 #[tokio::test]
 async fn cascade_failure_linear_chain() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCFL").await;
+    let project_id = common::create_project(&ctx.db, "tcfl").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-1", None, &snapshot).await;
     insert_job(
@@ -334,7 +334,7 @@ async fn interrupt_does_not_cascade_to_downstream() {
     // interrupt is a resumable pause — downstream stay pending so that continuing
     // the job and approving its plan can still start them.
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TINT").await;
+    let project_id = common::create_project(&ctx.db, "tint").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
     insert_execution_with_snapshot(&ctx.db, "exec-interrupt-1", None, &snapshot).await;
     insert_job(
@@ -382,7 +382,7 @@ async fn interrupt_does_not_cascade_to_downstream() {
 #[tokio::test]
 async fn cascade_failure_fan_out() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCFO").await;
+    let project_id = common::create_project(&ctx.db, "tcfo").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-a", "node-c")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-2", None, &snapshot).await;
     insert_job(
@@ -422,7 +422,7 @@ async fn cascade_failure_fan_out() {
 #[tokio::test]
 async fn cascade_failure_fan_in_only_affects_downstream_of_failed_job() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCFI").await;
+    let project_id = common::create_project(&ctx.db, "tcfi").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-c"), ("2", "node-b", "node-c")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-3", None, &snapshot).await;
     insert_job(
@@ -465,7 +465,7 @@ async fn cascade_failure_fan_in_only_affects_downstream_of_failed_job() {
 #[tokio::test]
 async fn cascade_failure_skips_running_downstream() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCSR").await;
+    let project_id = common::create_project(&ctx.db, "tcsr").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-4", None, &snapshot).await;
     insert_job(
@@ -502,7 +502,7 @@ async fn cascade_failure_leaf_job_no_downstream() {
     // recomputes through its execution sweep; this exercises the minimal case —
     // a job seeded at the source node with no downstream job to fail.
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCSJ").await;
+    let project_id = common::create_project(&ctx.db, "tcsj").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
     insert_execution_with_snapshot(&ctx.db, "exec-leaf", None, &snapshot).await;
     insert_job(
@@ -523,7 +523,7 @@ async fn cascade_failure_leaf_job_no_downstream() {
 #[tokio::test]
 async fn cascade_failure_recomputes_execution_and_issue() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCRE").await;
+    let project_id = common::create_project(&ctx.db, "tcre").await;
     insert_issue(&ctx.db, "issue-cascade", &project_id).await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-5", Some("issue-cascade"), &snapshot)
@@ -559,7 +559,7 @@ async fn cascade_failure_recomputes_execution_and_issue() {
 #[tokio::test]
 async fn cascade_failure_sets_completed_at_on_downstream_jobs() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCCA").await;
+    let project_id = common::create_project(&ctx.db, "tcca").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-ca", None, &snapshot).await;
     insert_job(
@@ -589,7 +589,7 @@ async fn cascade_failure_sets_completed_at_on_downstream_jobs() {
 #[tokio::test]
 async fn cascade_failure_emits_core_db_change_events() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCDE").await;
+    let project_id = common::create_project(&ctx.db, "tcde").await;
     let snapshot = build_snapshot(vec![("1", "node-a", "node-b"), ("2", "node-b", "node-c")]);
     insert_execution_with_snapshot(&ctx.db, "exec-cascade-ev", None, &snapshot).await;
     insert_job(
@@ -637,7 +637,7 @@ async fn cascade_failure_emits_core_db_change_events() {
 #[tokio::test]
 async fn cascade_failure_diamond_pattern() {
     let ctx = transition_context().await;
-    let project_id = common::create_project(&ctx.db, "TCDP").await;
+    let project_id = common::create_project(&ctx.db, "tcdp").await;
     let snapshot = build_snapshot(vec![
         ("1", "node-a", "node-b"),
         ("2", "node-a", "node-c"),

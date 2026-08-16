@@ -8,6 +8,10 @@ use super::append_payload;
 use crate::mcp::handlers::{comments_artifacts, issues};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
+use cairn_common::identity::{
+    Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+    VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+};
 use cairn_common::uri::CairnResource;
 
 pub(super) async fn dispatch(
@@ -74,6 +78,57 @@ pub(super) async fn dispatch(
                     None => format!("Would create issue in project {project}: {title}"),
                 }
             } else {
+                let (run, _) =
+                    crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                let live_run_id = request.run_id.as_deref().ok_or_else(|| {
+                    build_failure(
+                        index,
+                        item,
+                        "Authenticated agent request is missing its run ID",
+                    )
+                })?;
+                if run.run_id != live_run_id {
+                    return Err(build_failure(
+                        index,
+                        item,
+                        "Authenticated agent run does not match the resolved live run",
+                    ));
+                }
+                let node =
+                    crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                let author = PrincipalRef::Agent {
+                    node: node.clone(),
+                    run_id: Some(live_run_id.to_string()),
+                };
+                let now = orch.services.clock.now();
+                let verification = VerificationRecord::new(
+                    VerificationMethod::NodeSession,
+                    VerificationStatus::Verified,
+                    None,
+                    None,
+                    Some(live_run_id.to_string()),
+                    None,
+                    VerificationStrength::new("session-bound")
+                        .map_err(|error| build_failure(index, item, error.to_string()))?,
+                    now,
+                )
+                .map_err(|error| build_failure(index, item, error.to_string()))?;
+                let evidence = AppearanceEvidence::new(
+                    AppearanceTransport::ResourcePatch,
+                    Address::Resource { node },
+                    verification,
+                    now,
+                    None,
+                )
+                .map_err(|error| build_failure(index, item, error.to_string()))?;
+                let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None)
+                    .map_err(|error| build_failure(index, item, error.to_string()))?;
+                let authorship = crate::issues::crud::IssueAuthorship::new(author, appearance)
+                    .map_err(|error| build_failure(index, item, error.to_string()))?;
                 let description = match payload_str(payload, "description", &[]) {
                     Some(description) => Some(
                         crate::durable_content::normalize_text(orch, request, project, description)
@@ -96,6 +151,7 @@ pub(super) async fn dispatch(
                     // node"). Without this the child has no owner to route its
                     // questions, reviews, and messages back to.
                     request.run_id.clone(),
+                    authorship,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
@@ -144,13 +200,6 @@ pub(super) async fn dispatch(
             },
             ChangeMode::Delete,
         ) => {
-            if item.payload.is_some() {
-                return Err(build_failure(
-                    index,
-                    item,
-                    "mode=delete does not accept payload",
-                ));
-            }
             if dry_run {
                 format!("Would delete comment {comment_seq} on issue {project}/{number}")
             } else {
@@ -300,13 +349,6 @@ pub(super) async fn dispatch(
             }
         }
         (CairnResource::Issue { project, number }, ChangeMode::Delete) => {
-            if item.payload.is_some() {
-                return Err(build_failure(
-                    index,
-                    item,
-                    "mode=delete does not accept payload",
-                ));
-            }
             // Resolve against the owning DB (CAIRN-2181): a team project's issue
             // row lives in its team replica, so the lookup must route there or a
             // team-project delete would falsely report "not found".
@@ -493,11 +535,13 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',2,1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',2,1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('parent','p',1,'Parent','active','active','none',1,1);
-            INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at)
-              VALUES('coordinator','p','parent','running','sess',1,1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('exec','recipe','parent','p','running',1,1);
+            INSERT INTO jobs(id, execution_id, project_id, issue_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+              VALUES('coordinator','exec','p','parent','Coordinator','running','sess','coordinator',1,1);
             INSERT INTO runs(id, project_id, job_id, issue_id, status, created_at, updated_at)
               VALUES('run-coordinator','p','coordinator','parent','live',1,1);
             ",
@@ -507,11 +551,11 @@ mod tests {
         let orch = test_orchestrator(db);
 
         let item = ChangeItem {
-            target: "cairn://p/PROJ/issues".to_string(),
+            target: "cairn://p/proj/issues".to_string(),
             mode: ChangeMode::Append,
             payload: Some(serde_json::json!({
                 "title": "Spawned child",
-                "parent": "cairn://p/PROJ/1",
+                "parent": "cairn://p/proj/1",
             })),
         };
         let request = McpCallbackRequest {
@@ -530,7 +574,7 @@ mod tests {
             &item,
             false,
             &CairnResource::ProjectIssues {
-                project: "PROJ".to_string(),
+                project: "proj".to_string(),
             },
             &mut applied_data,
         )
@@ -565,9 +609,13 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, next_issue_number, created_at, updated_at)
-               VALUES('p','w','Project','PROJ','/tmp/repo',1,1,1);
+               VALUES('p','w','Project','proj','/tmp/repo',1,1,1);
              INSERT INTO threads(id, project_id, name, status, attention, migrated_from_number, created_at, updated_at)
-               VALUES('thread','p','general','active','none',3404,1,1);",
+               VALUES('thread','p','general','active','none',3404,1,1);
+             INSERT INTO jobs(id, project_id, thread_id, node_name, status, uri_segment, created_at, updated_at)
+               VALUES('thread-session','p','thread','Thread','running','thread',1,1);
+             INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at)
+               VALUES('run-thread-session','p','thread-session','live',1,1);",
         )
         .await
         .unwrap();
@@ -575,18 +623,18 @@ mod tests {
         let request = McpCallbackRequest {
             thread_id: None,
             cwd: "/tmp/repo".to_string(),
-            run_id: None,
+            run_id: Some("run-thread-session".to_string()),
             tool: "write".to_string(),
             payload: serde_json::Value::Null,
             tool_use_id: None,
         };
 
         for (title, parent) in [
-            ("Name child", "cairn://p/PROJ/general"),
-            ("Alias child", "cairn://p/PROJ/3404"),
+            ("Name child", "cairn://p/proj/general"),
+            ("Alias child", "cairn://p/proj/3404"),
         ] {
             let item = ChangeItem {
-                target: "cairn://p/PROJ/issues".to_string(),
+                target: "cairn://p/proj/issues".to_string(),
                 mode: ChangeMode::Append,
                 payload: Some(serde_json::json!({"title": title, "parent": parent})),
             };
@@ -598,7 +646,7 @@ mod tests {
                 &item,
                 false,
                 &CairnResource::ProjectIssues {
-                    project: "PROJ".to_string(),
+                    project: "proj".to_string(),
                 },
                 &mut applied_data,
             )

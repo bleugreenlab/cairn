@@ -336,6 +336,11 @@ async fn spawn_triage_for_scope_inner(
             None,
             None,
             None,
+            crate::issues::crud::installation_machine_authorship(
+                orch.anon_device_manager.device_id(),
+                orch.services.clock.now(),
+            )
+            .map_err(|error| error.to_string())?,
         )
         .await?;
 
@@ -597,12 +602,12 @@ mod tests {
                 let project_path = project_dir.to_string_lossy().to_string();
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace) VALUES ('workspace', 'default', 'Workspace', 'WKS', ?1, 1, 1, 1)",
+                        "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace) VALUES ('workspace', 'default', 'Workspace', 'wks', ?1, 1, 1, 1)",
                         params![workspace_path.as_str()],
                     )
                     .await?;
                     conn.execute(
-                        "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'PRJ', ?1, 1, 1)",
+                        "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'prj', ?1, 1, 1)",
                         params![project_path.as_str()],
                     )
                     .await?;
@@ -681,7 +686,7 @@ mod tests {
             .local
             .execute(
                 "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
-                 VALUES (?1, ?1, ?2, ?1, ?3, ?4, ?5, 'job-main', ?6, 'cairn://p/CAIRN/42/1/builder/chat/turn/2', ?6, ?6)",
+                 VALUES (?1, ?1, ?2, ?1, ?3, ?4, ?5, 'job-main', ?6, 'cairn://p/cairn/42/1/builder/chat/turn/2', ?6, ?6)",
                 params![id, project_id, status, scope, scope_value, created_at],
             )
             .await
@@ -748,7 +753,7 @@ mod tests {
             triage_decision: None,
             deferred_scope: None,
             deferred_scope_value: None,
-            provenance_uri: Some("cairn://p/CAIRN/1/1/builder/chat/turn/2".to_string()),
+            provenance_uri: Some("cairn://p/cairn/1/1/builder/chat/turn/2".to_string()),
             created_at: 1,
             updated_at: 1,
         }
@@ -980,7 +985,7 @@ mod tests {
             scope: "project".to_string(),
             scope_value: "00ace0d0-24a5-4700-83ba-cc719c63f43c".to_string(),
             project_id: "00ace0d0-24a5-4700-83ba-cc719c63f43c".to_string(),
-            project_key: "CAIRN".to_string(),
+            project_key: "cairn".to_string(),
             project_name: "Cairn".to_string(),
         };
 
@@ -996,7 +1001,7 @@ mod tests {
             scope: "role".to_string(),
             scope_value: "builder".to_string(),
             project_id: "workspace".to_string(),
-            project_key: "WKS".to_string(),
+            project_key: "wks".to_string(),
             project_name: "Workspace".to_string(),
         };
 
@@ -1036,19 +1041,19 @@ mod tests {
     fn neighbor_format_includes_resolution_issue_commit_and_reason() {
         let mut neighbor = MemoryTriageNeighbor {
             memory: memory("prior", "project-1", "old"),
-            uri: "cairn://p/CAIRN/1/1/builder/memories/1".to_string(),
+            uri: "cairn://p/cairn/1/1/builder/memories/1".to_string(),
             similarity: 0.91,
-            triage_issue_uri: Some("cairn://p/CAIRN/7".to_string()),
+            triage_issue_uri: Some("cairn://p/cairn/7".to_string()),
         };
         neighbor.memory.status = MemoryStatus::Promoted;
         neighbor.memory.promoted_commit_sha = Some("abc123".to_string());
         neighbor.memory.reason = Some("generalized into AGENTS".to_string());
 
         let formatted = format_neighbor(&neighbor);
-        assert!(formatted.starts_with("   - cairn://p/CAIRN/1/1/builder/memories/1 (0.91)"));
+        assert!(formatted.starts_with("   - cairn://p/cairn/1/1/builder/memories/1 (0.91)"));
         assert!(!formatted.contains("prior"));
         assert!(!formatted.contains("via"));
-        assert!(!formatted.contains("cairn://p/CAIRN/7"));
+        assert!(!formatted.contains("cairn://p/cairn/7"));
         assert!(formatted.contains("commit `abc123`"));
         assert!(formatted.contains("generalized into AGENTS"));
     }
@@ -1066,7 +1071,7 @@ mod tests {
             scope: "role".to_string(),
             scope_value: "builder".to_string(),
             project_id: "project-1".to_string(),
-            project_key: "PRJ".to_string(),
+            project_key: "prj".to_string(),
             project_name: "Project".to_string(),
         };
 
@@ -1107,7 +1112,7 @@ mod tests {
             scope: "project".to_string(),
             scope_value: "project-1".to_string(),
             project_id: "project-1".to_string(),
-            project_key: "PRJ".to_string(),
+            project_key: "prj".to_string(),
             project_name: "Project".to_string(),
         };
 
@@ -1115,7 +1120,7 @@ mod tests {
             super::seed_description(&test.orch, &test.orch.db.local, &target, &[memory]).await;
 
         assert!(description
-            .contains("- [durable behavior note](cairn://p/PRJ/42/1/builder/memories/4)"));
+            .contains("- [durable behavior note](cairn://p/prj/42/1/builder/memories/4)"));
         assert!(!description.contains("```text"));
         assert!(!description.contains("content:"));
         assert!(!description.contains("none above threshold"));
@@ -1153,7 +1158,7 @@ mod tests {
             .local
             .execute(
                 "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
-                 VALUES (?1, ?1, 'project-1', ?1, ?2, ?3, ?4, ?5, ?6, 'cairn://p/CAIRN/42/1/builder/chat/turn/2', ?7, ?7)",
+                 VALUES (?1, ?1, 'project-1', ?1, ?2, ?3, ?4, ?5, ?6, 'cairn://p/cairn/42/1/builder/chat/turn/2', ?7, ?7)",
                 params![id, status, scope, scope_value, job_id, node_seq, created_at],
             )
             .await
@@ -2166,7 +2171,7 @@ mod tests {
             crate::models::MemoryTriageDecision::Defer,
             "belongs to the project pool",
             Some(crate::models::MemoryScope::Project),
-            "PRJ".into(),
+            "prj".into(),
         )
         .await
         .unwrap();
@@ -2250,7 +2255,7 @@ mod tests {
     ) {
         let execution_id = format!("{team_id}~00000000-0000-4000-8000-100000000003");
         db.execute(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'TP', ?2, 1, 1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'tp', ?2, 1, 1)",
             params![project_id, repo_path],
         )
         .await
@@ -2279,7 +2284,7 @@ mod tests {
             let seq = (idx as i64) + 1;
             db.execute(
                 "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
-                 VALUES (?1, ?1, ?2, 'a durable team fact', ?3, ?4, ?5, ?6, ?7, 'cairn://p/TP/7/1/builder/chat/turn/2', ?7, ?7)",
+                 VALUES (?1, ?1, ?2, 'a durable team fact', ?3, ?4, ?5, ?6, ?7, 'cairn://p/tp/7/1/builder/chat/turn/2', ?7, ?7)",
                 params![mid.as_str(), project_id, status, scope, scope_value, job_id, seq],
             )
             .await
@@ -2364,7 +2369,7 @@ mod tests {
         // replica rather than the private DB.
         test.orch
             .db
-            .set_route("TP", Some(team_id.to_string()))
+            .set_route("tp", Some(team_id.to_string()))
             .await;
 
         let spawned = crate::memories::commands::confirm_and_spawn_drafts_for_merged_issue(
@@ -2431,7 +2436,7 @@ mod tests {
             .await;
         test.orch
             .db
-            .set_route("TP", Some(team_id.to_string()))
+            .set_route("tp", Some(team_id.to_string()))
             .await;
 
         super::reconcile_memory_triage(test.orch.clone())
@@ -2477,7 +2482,7 @@ mod tests {
             .await;
         test.orch
             .db
-            .set_route("TP", Some(team_id.to_string()))
+            .set_route("tp", Some(team_id.to_string()))
             .await;
 
         let spawned = super::reconcile_pending_triage(&test.orch).await.unwrap();

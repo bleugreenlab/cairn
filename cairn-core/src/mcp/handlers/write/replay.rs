@@ -336,7 +336,7 @@ mod tests {
         })
     }
 
-    const HOME_URI: &str = "cairn://p/CAIRN/3264/1/builder";
+    const HOME_URI: &str = "cairn://p/cairn/3264/1/builder";
 
     /// The transcript and delivery use different spellings for home-relative
     /// targets. Canonicalization must make them one identity without discarding
@@ -353,7 +353,7 @@ mod tests {
         });
         let as_the_host_received_it = json!({
             "changes": [file_edit(), {
-                "target": "cairn://p/CAIRN/3264/1/builder/todos",
+                "target": "cairn://p/cairn/3264/1/builder/todos",
                 "mode": "patch",
                 "payload": { "updates": [] }
             }],
@@ -397,14 +397,14 @@ mod tests {
     fn resource_only_batches_have_distinct_identities() {
         let payload = json!({
             "changes": [{
-                "target": "cairn://p/CAIRN/3264",
+                "target": "cairn://p/cairn/3264",
                 "mode": "append",
                 "payload": { "content": "a comment" }
             }]
         });
         let other = json!({
             "changes": [{
-                "target": "cairn://p/CAIRN/3264",
+                "target": "cairn://p/cairn/3264",
                 "mode": "append",
                 "payload": { "content": "a different comment" }
             }]

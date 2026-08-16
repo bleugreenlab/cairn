@@ -100,18 +100,18 @@ async fn recipe_create_rejects_malformed_yaml() {
 
 #[tokio::test]
 async fn recipe_project_scope_roundtrip_and_guard() {
-    let (temp, _db, orch, repo) = project_resource_fixture("PROJ").await;
+    let (temp, _db, orch, repo) = project_resource_fixture("proj").await;
 
     let created = change(
         &orch,
-        json!([{ "target": "cairn://p/PROJ/recipes", "mode": "create", "payload": { "content": RECIPE_YAML } }]),
+        json!([{ "target": "cairn://p/proj/recipes", "mode": "create", "payload": { "content": RECIPE_YAML } }]),
     )
     .await;
     assert!(created.contains("\"applied\""), "create: {created}");
     let file = repo.join(".cairn/recipes/deploy-flow.yaml");
     assert!(file.exists(), "project recipe file should exist");
 
-    let item = read(&orch, "cairn://p/PROJ/recipes/deploy-flow").await;
+    let item = read(&orch, "cairn://p/proj/recipes/deploy-flow").await;
     assert!(item.contains("[project]"), "read: {item}");
 
     // A workspace-only recipe must not resolve behind an explicit project URI.
@@ -122,11 +122,11 @@ async fn recipe_project_scope_roundtrip_and_guard() {
     .await;
     let guarded = change(
         &orch,
-        json!([{ "target": "cairn://p/PROJ/recipes/ws-only", "mode": "delete" }]),
+        json!([{ "target": "cairn://p/proj/recipes/ws-only", "mode": "delete" }]),
     )
     .await;
     assert!(
-        guarded.contains("not found in project PROJ"),
+        guarded.contains("not found in project proj"),
         "guarded: {guarded}"
     );
     assert!(
@@ -205,7 +205,7 @@ async fn agent_create_rejects_missing_tools() {
 
 #[tokio::test]
 async fn agent_project_scope_does_not_bleed_into_workspace() {
-    let (temp, _db, orch, _repo) = project_resource_fixture("PROJ").await;
+    let (temp, _db, orch, _repo) = project_resource_fixture("proj").await;
     let cfg = config_dir(&temp);
 
     change(
@@ -218,19 +218,19 @@ async fn agent_project_scope_does_not_bleed_into_workspace() {
     )
     .await;
 
-    let read_proj = read(&orch, "cairn://p/PROJ/agents/shared").await;
+    let read_proj = read(&orch, "cairn://p/proj/agents/shared").await;
     assert!(
-        read_proj.contains("not found in project PROJ"),
+        read_proj.contains("not found in project proj"),
         "read_proj: {read_proj}"
     );
 
     let patched = change(
         &orch,
-        json!([{ "target": "cairn://p/PROJ/agents/shared", "mode": "patch", "payload": { "description": "hijacked" } }]),
+        json!([{ "target": "cairn://p/proj/agents/shared", "mode": "patch", "payload": { "description": "hijacked" } }]),
     )
     .await;
     assert!(
-        patched.contains("not found in project PROJ"),
+        patched.contains("not found in project proj"),
         "patched: {patched}"
     );
     let body = std::fs::read_to_string(cfg.join("agents/shared.md")).unwrap();
@@ -239,12 +239,12 @@ async fn agent_project_scope_does_not_bleed_into_workspace() {
 
 #[tokio::test]
 async fn agent_project_scope_create_read_roundtrip() {
-    let (_temp, _db, orch, repo) = project_resource_fixture("PROJ").await;
+    let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
 
     let created = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/agents",
+            "target": "cairn://p/proj/agents",
             "mode": "create",
             "payload": { "name": "Builder Helper", "description": "proj", "prompt": "p", "tools": ["Read"] }
         }]),
@@ -256,7 +256,7 @@ async fn agent_project_scope_create_read_roundtrip() {
         "project agent file"
     );
 
-    let item = read(&orch, "cairn://p/PROJ/agents/builder-helper").await;
+    let item = read(&orch, "cairn://p/proj/agents/builder-helper").await;
     assert!(item.contains("[project]"), "read: {item}");
 }
 
@@ -319,12 +319,12 @@ async fn action_create_rejects_missing_command() {
 
 #[tokio::test]
 async fn action_project_scope_roundtrip_and_guard() {
-    let (_temp, db, orch, _repo) = project_resource_fixture("PROJ").await;
+    let (_temp, db, orch, _repo) = project_resource_fixture("proj").await;
 
     let created = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/actions",
+            "target": "cairn://p/proj/actions",
             "mode": "create",
             "payload": { "name": "Proj Action", "commandTemplate": "echo {{msg:string}}" }
         }]),
@@ -335,7 +335,7 @@ async fn action_project_scope_roundtrip_and_guard() {
         .await
         .expect("action id");
 
-    let item = read(&orch, &format!("cairn://p/PROJ/actions/{id}")).await;
+    let item = read(&orch, &format!("cairn://p/proj/actions/{id}")).await;
     assert!(item.contains("[project]"), "read: {item}");
 
     // A workspace action must not resolve behind an explicit project URI.
@@ -347,9 +347,9 @@ async fn action_project_scope_roundtrip_and_guard() {
     let ws_id = action_id_by_name(&db, "WS Action")
         .await
         .expect("ws action id");
-    let guarded = read(&orch, &format!("cairn://p/PROJ/actions/{ws_id}")).await;
+    let guarded = read(&orch, &format!("cairn://p/proj/actions/{ws_id}")).await;
     assert!(
-        guarded.contains("not found in project PROJ"),
+        guarded.contains("not found in project proj"),
         "guarded: {guarded}"
     );
 }

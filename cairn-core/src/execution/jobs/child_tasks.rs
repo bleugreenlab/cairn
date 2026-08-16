@@ -30,6 +30,7 @@ pub fn create_child_task(
     ))?;
     let project_id = parent_job.project_id.clone();
     let issue_id = parent_job.issue_id.clone();
+    let thread_id = parent_job.thread_id.clone();
     let execution_id = parent_job.execution_id.clone();
 
     let project_path = run_db(load_project_path(orch.db.clone(), project_id.clone()))?;
@@ -97,19 +98,14 @@ pub fn create_child_task(
     let now = chrono::Utc::now().timestamp() as i32;
 
     let presets = load_effective_presets(&config_dir, project_path.as_deref());
-    let inherited_backend = parent_job
-        .model
-        .as_ref()
-        .and_then(|model| crate::backends::backend_for_model(model.as_str()));
     let authored_tier = input
         .tier
         .as_deref()
         .or(agent_config.tier.as_ref().map(Model::as_str));
-    let authored_backend = input
-        .backend_preference
-        .as_deref()
-        .or(agent_config.backend_preference.as_deref())
-        .or(inherited_backend);
+    let authored_backend = spawned_task_backend(
+        input.backend_preference.as_deref(),
+        agent_config.backend_preference.as_deref(),
+    );
     // Resolve-early: carry the concrete atomic selection + extras into the child
     // AgentConfig so the child session never re-resolves a tier.
     let (selection, extras) = resolve_runtime_selection(authored_tier, authored_backend, &presets)?;
@@ -164,6 +160,7 @@ pub fn create_child_task(
             "insert",
             &job_id,
             issue_id.as_deref(),
+            thread_id.as_deref(),
             execution_id.as_deref(),
             Some(&input.parent_job_id),
             None,

@@ -1,8 +1,6 @@
 //! First-class thread resource mutations.
 
-use super::super::{
-    build_failure, payload_non_empty_str, ResourceMutationFailure, ResourceMutationResult,
-};
+use super::super::{build_failure, payload_non_empty_str, ResourceMutationResult};
 use super::append_payload;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
@@ -32,25 +30,9 @@ async fn thread_by_name(
         .ok_or_else(|| format!("Thread '{name}' not found"))
 }
 
-/// A thread has exactly one identifier, so a payload still naming a `title` is
-/// REFUSED rather than quietly ignored. Silently discarding it would leave a
-/// caller believing a title landed and no way to learn the field retired — the
-/// second source returning by another door.
-fn refuse_retired_title(index: usize, item: &ChangeItem) -> Result<(), ResourceMutationFailure> {
-    let names_title = item
-        .payload
-        .as_ref()
-        .and_then(|payload| payload.as_object())
-        .is_some_and(|payload| payload.contains_key("title"));
-    if names_title {
-        return Err(build_failure(
-            index,
-            item,
-            "threads have one identifier: `name`. `title` has retired; put the topic in `name`",
-        ));
-    }
-    Ok(())
-}
+// A thread has exactly one identifier: `name`. A payload still naming the
+// retired `title` is refused by the contract gate, whose rejection enumerates
+// the accepted keys and so points at `name` — no local check needed.
 
 pub(super) async fn dispatch(
     orch: &Orchestrator,
@@ -66,7 +48,6 @@ pub(super) async fn dispatch(
             let name = payload_non_empty_str(payload, "name", &[])
                 .ok_or_else(|| build_failure(index, item, "payload.name is required"))?;
             validate_thread_name(name).map_err(|e| build_failure(index, item, e))?;
-            refuse_retired_title(index, item)?;
             let jurisdiction = payload
                 .get("jurisdiction")
                 .and_then(|v| v.as_str())
@@ -94,6 +75,14 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|e| build_failure(index, item, e.to_string()))?;
+                crate::channels::ensure_discord_thread_surface(
+                    orch,
+                    &db,
+                    &thread.project_id,
+                    &thread.name,
+                )
+                .await
+                .map_err(|e| build_failure(index, item, e))?;
                 if let Some(content) = content.filter(|value| !value.trim().is_empty()) {
                     crate::mcp::handlers::messages::append_thread_message(
                         orch, request, project, &thread.id, &content,
@@ -155,7 +144,6 @@ pub(super) async fn dispatch(
                         .ok_or_else(|| {
                             build_failure(index, item, "mode=patch requires an object payload")
                         })?;
-                    refuse_retired_title(index, item)?;
                     if let Some(new_name) = payload.get("name").and_then(|v| v.as_str()) {
                         validate_thread_name(new_name)
                             .map_err(|e| build_failure(index, item, e))?;

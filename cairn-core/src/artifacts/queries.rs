@@ -252,7 +252,7 @@ mod latest_recency_tests {
     async fn seed_job(db: &LocalDb) {
         db.execute_script(
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
-             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
              INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at) VALUES ('i','p',1,'T','active','none',1,1);
              INSERT INTO jobs (id,issue_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('j','i','p','running','b','b',1,1);",
         )
@@ -411,7 +411,7 @@ mod latest_recency_tests {
         let db = crate::storage::migrated_test_db("artifacts-for-thread.db").await;
         db.execute_script(
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
-             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
              INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('th','p','roadmap','active','none',1,1);
              INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('other','p','neighbour','active','none',1,1);
              INSERT INTO jobs (id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('session','th','p','idle','thread','thread',1,1);

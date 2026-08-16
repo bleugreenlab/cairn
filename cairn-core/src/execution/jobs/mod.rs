@@ -13,7 +13,7 @@
 use crate::agent_process::stream::TranscriptEvent;
 use crate::config::presets::{
     load_effective_presets, resolve_agent_snapshot, resolve_runtime_selection,
-    LaunchSelectionOverride,
+    spawned_task_backend, LaunchSelectionOverride,
 };
 use crate::config::{self, agents as config_agents, ConfigResult};
 use crate::db_records::{db_job_from_row, DbJob, DbRecipeEdge, DbRecipeNode, JOB_COLUMNS};
@@ -64,7 +64,7 @@ pub(crate) use inputs::{
     resolve_ctx_self_schemas_conn, resolve_ctx_self_schemas_with_snapshot,
     resolve_instruction_prompt_conn,
 };
-pub(crate) use lifecycle::continue_automatic_retry;
+pub(crate) use lifecycle::{continue_automatic_retry, continue_job_launch_locked_for_watchdog};
 // The branch-mode coordinate decision. Production reaches it only through
 // `prepare_job`; the delegation edge's regression imports it to run the mode it
 // emits all the way to the commit a delegated task starts from.
@@ -79,9 +79,17 @@ pub use lifecycle::{
 };
 #[cfg(test)]
 pub(crate) use lifecycle::{select_job_coordinate, CoordinateRequest, ParentCoordinate};
+pub(crate) use persistence::load_job_conn;
 pub(crate) use slash_commands::resolve_skill_slash_command;
 pub(crate) use snapshots::queued_user_transcript_event;
-pub use snapshots::store_tool_result_event_with_turn;
+// Delegation reaches the host-execution invariant here: a job that arrives at
+// delegation with no execution gets one carrying its OWN agent, not an empty
+// agents map.
+pub(crate) use snapshots::{ensure_host_agent_snapshot, SnapshotFreshness};
+// The agent-snapshot editor establishes a session job's host through this before
+// the job's first turn, so a thread is configurable before it has ever run.
+pub use snapshots::ensure_job_agent_snapshot;
+pub use snapshots::{store_tool_result_event_with_resolution, store_tool_result_event_with_turn};
 // Exercised end-to-end by the `synthetic_continuation_event` integration test,
 // which pins the stored event type that keeps a Cairn-synthesized resume out of
 // every user-attributed surface (CAIRN-3175).
@@ -260,6 +268,36 @@ where
             crate::storage::panic_message(&*payload)
         )
     })?
+}
+
+/// [`run_db`] for a future that BORROWS its inputs.
+///
+/// The scoped thread keeps the borrow alive across the join, which a `'static`
+/// spawn cannot, so a synchronous caller holding `&Orchestrator` can drive async
+/// database work without cloning the world. The thread itself is there for the
+/// same reason as in [`run_db`]: a fresh current-thread runtime must not be
+/// built inside an existing one.
+fn run_db_borrowed<T>(future: impl Future<Output = Result<T, String>> + Send) -> Result<T, String>
+where
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Failed to start database runtime: {}", e))?
+                    .block_on(future)
+            })
+            .join()
+            .map_err(|payload| {
+                format!(
+                    "Database task panicked: {}",
+                    crate::storage::panic_message(&*payload)
+                )
+            })?
+    })
 }
 
 fn db_error(context: &str, error: DbError) -> String {

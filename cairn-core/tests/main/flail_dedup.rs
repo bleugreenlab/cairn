@@ -223,7 +223,7 @@ async fn dispatch_never_dedups_read_resource_terminal_poll() {
         cwd: "/tmp".to_string(),
         run_id: Some("run-1".to_string()),
         tool: "read_resource".to_string(),
-        payload: serde_json::json!({ "uri": "cairn://p/CAIRN/42/1/builder/terminal/dev-server" }),
+        payload: serde_json::json!({ "uri": "cairn://p/cairn/42/1/builder/terminal/dev-server" }),
         tool_use_id: None,
     };
 

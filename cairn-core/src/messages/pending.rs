@@ -147,7 +147,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention,
                                created_at, updated_at)
               VALUES('i','p',1,'Issue','active','active','none',1,1);
@@ -160,10 +160,10 @@ mod tests {
         attention_push::push(
             &db,
             "job-1",
-            "cairn://p/PROJ/1/1/builder/checks",
+            "cairn://p/proj/1/1/builder/checks",
             attention_push::Wake::Wake,
             attention_push::Boundary::Event,
-            "turn-checks:cairn://p/PROJ/1/1/builder/checks",
+            "turn-checks:cairn://p/proj/1/1/builder/checks",
         )
         .await
         .unwrap();

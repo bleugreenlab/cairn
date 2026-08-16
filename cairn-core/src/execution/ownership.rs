@@ -14,6 +14,8 @@
 //! owner ever proceeds), NOT from a conditional UPDATE — an embedded-replica CAS
 //! is local-first and would let two machines both "win" locally.
 
+use cairn_common::uri::canonical_project;
+
 use crate::storage::{LocalDb, RowExt};
 
 /// Read `executions.runner_device_id` for one execution. `None` when the
@@ -139,9 +141,12 @@ pub async fn device_has_clone(db: &LocalDb, device_id: &str, project_key: &str) 
         .ok()
         .flatten();
     match keys_json {
-        Some(json) => serde_json::from_str::<Vec<String>>(&json)
-            .map(|keys| keys.iter().any(|k| k == project_key))
-            .unwrap_or(false),
+        Some(json) => {
+            let project_key = canonical_project(project_key);
+            serde_json::from_str::<Vec<String>>(&json)
+                .map(|keys| keys.iter().any(|key| canonical_project(key) == project_key))
+                .unwrap_or(false)
+        }
         None => false,
     }
 }
@@ -152,17 +157,30 @@ pub async fn device_has_clone(db: &LocalDb, device_id: &str, project_key: &str) 
 /// (which is derived from it and can lag). Used to validate a reassignment TO this
 /// machine, which — unlike execution creation — the launch flow does not gate.
 pub async fn local_has_clone(private_db: &LocalDb, project_key: &str) -> bool {
-    let project_key = project_key.to_string();
+    let project_key = canonical_project(project_key);
     private_db
-        .query_text(
-            "SELECT local_repo_path FROM project_routes \
-             WHERE project_key = ?1 AND local_repo_path IS NOT NULL",
-            (project_key,),
-        )
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT project_key FROM project_routes \
+                         WHERE local_repo_path IS NOT NULL",
+                        (),
+                    )
+                    .await?;
+                while let Some(row) = rows.next().await? {
+                    if row
+                        .opt_text(0)?
+                        .is_some_and(|key| canonical_project(key) == project_key)
+                    {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })
+        })
         .await
-        .ok()
-        .flatten()
-        .is_some()
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -241,10 +259,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(device_has_clone(&db, "devA", "PROJ").await);
+        assert!(device_has_clone(&db, "devA", "proj").await);
+        assert!(
+            device_has_clone(&db, "devA", "proj").await,
+            "historical presence keys survive a project canonical-form change"
+        );
         assert!(!device_has_clone(&db, "devA", "OTHER").await);
         assert!(
-            !device_has_clone(&db, "devB", "PROJ").await,
+            !device_has_clone(&db, "devB", "proj").await,
             "no presence row"
         );
     }
@@ -253,7 +275,7 @@ mod tests {
     async fn device_has_clone_false_without_table() {
         // A private DB has no device_presence table; must fail closed, not panic.
         let db = db().await;
-        assert!(!device_has_clone(&db, "devA", "PROJ").await);
+        assert!(!device_has_clone(&db, "devA", "proj").await);
     }
 
     #[tokio::test]
@@ -262,7 +284,7 @@ mod tests {
         // team_id is a nullable FK; leave it NULL to avoid seeding the registry.
         db.execute(
             "INSERT INTO project_routes (project_key, local_repo_path, created_at) \
-             VALUES ('CLONED', '/tmp/x', 0)",
+             VALUES ('CLONED', '/tmp/x', 0), ('Ä', '/tmp/unicode', 0)",
             (),
         )
         .await
@@ -275,6 +297,11 @@ mod tests {
         .await
         .unwrap();
         assert!(local_has_clone(&db, "CLONED").await);
+        assert!(
+            local_has_clone(&db, "cloned").await,
+            "historical route keys survive a project canonical-form change"
+        );
+        assert!(local_has_clone(&db, "ä").await);
         assert!(
             !local_has_clone(&db, "UNCLONED").await,
             "route without a clone"

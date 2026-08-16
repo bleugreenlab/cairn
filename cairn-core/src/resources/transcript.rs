@@ -1965,7 +1965,7 @@ mod tests {
 
         let window = crate::storage::render::window_text_lines(&jsonl, None, Some(1));
         let mut meta = SegmentMeta::new(
-            "cairn://p/CAIRN/2703/1/builder/chat/raw?format=json&limit=1",
+            "cairn://p/cairn/2703/1/builder/chat/raw?format=json&limit=1",
             SegmentKind::Resource,
             NaturalUnit::Line,
         );
@@ -1973,13 +1973,16 @@ mod tests {
         meta.shown_units = window.shown;
         meta.offset = window.offset;
         meta.limit = Some(1);
-        let rendered =
-            crate::storage::render::render_segment(ReadSegment::text(window.body, meta), 10_000);
+        let rendered = crate::storage::render::render_segment(
+            ReadSegment::text(window.body, meta),
+            10_000,
+            &crate::token_meters::O200K_TOKEN_METER,
+        );
 
         assert!(rendered.text.contains("\"turnId\":\"turn-1\""));
         assert!(!rendered.text.contains("\"turnId\":\"turn-2\""));
         assert!(rendered.text.contains(
-            "continue: cairn://p/CAIRN/2703/1/builder/chat/raw?format=json&offset=1&limit=1"
+            "continue: cairn://p/cairn/2703/1/builder/chat/raw?format=json&offset=1&limit=1"
         ));
     }
 
@@ -2245,7 +2248,7 @@ mod tests {
     fn digest_meta() -> DigestMeta<'static> {
         DigestMeta {
             label: "builder",
-            project: "CAIRN",
+            project: "cairn",
             coordinate: DigestCoordinate::Issue {
                 number: 1666,
                 exec_seq: 1,
@@ -2288,15 +2291,15 @@ mod tests {
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
         let out = format_transcript_digest(
             &events,
-            "cairn://p/CAIRN/1666/1/builder/chat",
+            "cairn://p/cairn/1666/1/builder/chat",
             &digest_meta(),
             &turns,
             false,
             None,
             None,
         );
-        assert!(out.contains("# builder — CAIRN-1666/1 · 1 run · 1 turn · 3 events · complete"));
-        assert!(out.contains("raw stream: cairn://p/CAIRN/1666/1/builder/chat/raw"));
+        assert!(out.contains("# builder — cairn/1666/1 · 1 run · 1 turn · 3 events · complete"));
+        assert!(out.contains("raw stream: cairn://p/cairn/1666/1/builder/chat/raw"));
         assert!(out.contains("## Turn 1 · "));
         assert!(out.contains("**Assistant:** Working on it"));
         assert!(out.contains("· read src/lib.rs [50 lines]"));
@@ -2319,7 +2322,7 @@ mod tests {
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
         let out = format_transcript_digest(
             &events,
-            "cairn://p/CAIRN/1666/1/builder/chat",
+            "cairn://p/cairn/1666/1/builder/chat",
             &digest_meta(),
             &turns,
             false,
@@ -2391,7 +2394,7 @@ mod tests {
         ]);
         let out = format_transcript_digest(
             &events,
-            "cairn://p/CAIRN/1666/1/builder/chat",
+            "cairn://p/cairn/1666/1/builder/chat",
             &digest_meta(),
             &turns,
             false,
@@ -2455,7 +2458,7 @@ mod tests {
             std::collections::HashMap::from([("t1".to_string(), 1i32), ("t2".to_string(), 2i32)]);
         let out = format_transcript_digest(
             &events,
-            "cairn://p/CAIRN/1666/1/builder/chat",
+            "cairn://p/cairn/1666/1/builder/chat",
             &digest_meta(),
             &turns,
             true,
@@ -2581,7 +2584,7 @@ mod tests {
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
         let out = format_transcript_digest(
             &events,
-            "cairn://p/CAIRN/1666/1/builder/chat",
+            "cairn://p/cairn/1666/1/builder/chat",
             &digest_meta(),
             &turns,
             false,
@@ -2589,7 +2592,7 @@ mod tests {
             None,
         );
         assert!(out.contains("**User:**"));
-        assert!(out.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
+        assert!(out.contains("→ cairn://p/cairn/1666/1/builder/chat/turn/1]"));
     }
 
     #[test]
@@ -2616,7 +2619,7 @@ mod tests {
         for unabridged in [false, true] {
             let out = format_transcript_digest_with(
                 &events,
-                "cairn://p/CAIRN/1666/1/builder/chat",
+                "cairn://p/cairn/1666/1/builder/chat",
                 &digest_meta(),
                 &turns,
                 &DigestOptions {
@@ -2673,7 +2676,7 @@ mod tests {
 
         let ride_along = format_transcript_digest_with(
             &events,
-            "cairn://p/CAIRN/3405/1/builder/chat",
+            "cairn://p/cairn/3405/1/builder/chat",
             &digest_meta(),
             &turns,
             &DigestOptions {
@@ -2706,7 +2709,7 @@ mod tests {
         // returns — under an honest speaker, never as **User:**.
         let reseed = format_transcript_digest_with(
             &events,
-            "cairn://p/CAIRN/3405/1/builder/chat",
+            "cairn://p/cairn/3405/1/builder/chat",
             &digest_meta(),
             &turns,
             &DigestOptions {
@@ -2757,7 +2760,7 @@ mod tests {
         for unabridged in [false, true] {
             let out = format_transcript_digest_with(
                 &events,
-                "cairn://p/CAIRN/1666/1/builder/chat",
+                "cairn://p/cairn/1666/1/builder/chat",
                 &digest_meta(),
                 &turns,
                 &DigestOptions {
@@ -2872,7 +2875,7 @@ mod tests {
             serde_json::json!({ "content": big }),
         )];
         let turns = std::collections::HashMap::from([("t1".to_string(), 1i32)]);
-        let base = "cairn://p/CAIRN/1666/1/builder/chat";
+        let base = "cairn://p/cairn/1666/1/builder/chat";
 
         // Default: truncated with a turn-link trailer; the tail is dropped.
         let truncated = format_transcript_digest_with(
@@ -2882,7 +2885,7 @@ mod tests {
             &turns,
             &digest_opts(false, false, false),
         );
-        assert!(truncated.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
+        assert!(truncated.contains("→ cairn://p/cairn/1666/1/builder/chat/turn/1]"));
         assert!(!truncated.contains("user instruction line 300"));
 
         // messages=full: the whole message renders, no truncation trailer.
@@ -2895,7 +2898,7 @@ mod tests {
         );
         assert!(full.contains("user instruction line 1 that must survive a reseed"));
         assert!(full.contains("user instruction line 300 that must survive a reseed"));
-        assert!(!full.contains("→ cairn://p/CAIRN/1666/1/builder/chat/turn/1]"));
+        assert!(!full.contains("→ cairn://p/cairn/1666/1/builder/chat/turn/1]"));
     }
 
     #[test]

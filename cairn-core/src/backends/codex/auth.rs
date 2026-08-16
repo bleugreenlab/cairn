@@ -87,6 +87,13 @@ impl CodexAuthState {
         self.tokens.chatgpt_account_id.clone()
     }
 
+    /// The Cairn account this session's credential came from, for attributing
+    /// what the app-server reports (usage, rate-limit blocks) to the right
+    /// subscription.
+    pub(super) fn cairn_account_id(&self) -> Option<String> {
+        self.account_id.clone()
+    }
+
     fn refresh_token(&self) -> Option<String> {
         self.tokens.refresh_token.clone()
     }
@@ -441,15 +448,53 @@ fn parse_codex_oauth_tokens(auth_json: &str) -> Result<CodexOAuthTokens, String>
     })
 }
 
-/// Extract `chatgpt_account_id` from a Codex access token JWT without signature verification.
-fn extract_chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
+/// Decode a JWT payload without verifying its signature.
+///
+/// These tokens were just issued to Cairn by the OAuth endpoint over TLS and
+/// are read only to label and key the account they belong to; the provider
+/// verifies them for every call that actually spends them.
+fn jwt_payload(jwt: &str) -> Option<Value> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
     let payload_b64 = jwt.split('.').nth(1)?;
     let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
-    let payload: Value = serde_json::from_slice(&payload_bytes).ok()?;
-    json_string(payload.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id"))
+    serde_json::from_slice(&payload_bytes).ok()
+}
+
+/// Extract `chatgpt_account_id` from a Codex access token JWT without signature verification.
+fn extract_chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
+    json_string(jwt_payload(jwt)?.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id"))
+}
+
+/// Which ChatGPT subscription a Codex `auth.json` belongs to.
+///
+/// The account id is the durable key. It is minted by OpenAI, survives every
+/// token refresh, and is what distinguishes reconnecting an existing
+/// subscription — which must replace that account's single-use credential in
+/// place — from adding a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexAccountIdentity {
+    pub chatgpt_account_id: String,
+    pub email: Option<String>,
+    pub plan: Option<String>,
+}
+
+/// Read the ChatGPT identity out of a Codex `auth.json`.
+pub fn codex_account_identity(auth_json: &str) -> Result<CodexAccountIdentity, String> {
+    let tokens = parse_codex_oauth_tokens(auth_json)?;
+    let chatgpt_account_id = tokens
+        .chatgpt_account_id
+        .ok_or_else(|| "Missing ChatGPT account id in Codex auth tokens".to_string())?;
+    let claims = jwt_payload(&tokens.id_token).unwrap_or(Value::Null);
+    let email = json_string(claims.get("email"))
+        .or_else(|| json_string(claims.pointer("/https:~1~1api.openai.com~1profile/email")));
+    let plan = json_string(claims.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"));
+    Ok(CodexAccountIdentity {
+        chatgpt_account_id,
+        email,
+        plan,
+    })
 }
 
 fn token_chatgpt_account_id(
@@ -468,6 +513,51 @@ mod tests {
 
     fn unsigned_jwt(payload: &str) -> String {
         format!("header.{}.signature", URL_SAFE_NO_PAD.encode(payload))
+    }
+
+    #[test]
+    fn account_identity_reads_id_token_claims() {
+        let access_token =
+            unsigned_jwt(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-123"}}"#);
+        let id_token = unsigned_jwt(
+            r#"{"email":"pilot@example.com","https://api.openai.com/auth":{"chatgpt_plan_type":"pro"}}"#,
+        );
+        let auth_json = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": id_token,
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+            }
+        });
+
+        let identity = codex_account_identity(&auth_json.to_string()).expect("identity parsed");
+
+        assert_eq!(identity.chatgpt_account_id, "acct-123");
+        assert_eq!(identity.email.as_deref(), Some("pilot@example.com"));
+        assert_eq!(identity.plan.as_deref(), Some("pro"));
+    }
+
+    /// An id token that carries no profile claims still yields the account id,
+    /// because that is what keys the account; the label just stays generic.
+    #[test]
+    fn account_identity_without_profile_claims_still_has_an_account_id() {
+        let access_token = unsigned_jwt(r#"{"sub":"user"}"#);
+        let auth_json = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "not-a-jwt",
+                "access_token": access_token,
+                "refresh_token": "refresh-token",
+                "account_id": "acct-fallback"
+            }
+        });
+
+        let identity = codex_account_identity(&auth_json.to_string()).expect("identity parsed");
+
+        assert_eq!(identity.chatgpt_account_id, "acct-fallback");
+        assert!(identity.email.is_none());
+        assert!(identity.plan.is_none());
     }
 
     #[test]

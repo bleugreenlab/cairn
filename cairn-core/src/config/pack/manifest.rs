@@ -44,6 +44,8 @@ pub const CLAUDE_MCP_FILE: &str = ".mcp.json";
 pub enum PackFormat {
     /// `cairn-pack.yaml` at the root.
     Cairn,
+    /// Agent Plugins 1.0.0 `plugin.json` at the root.
+    AgentPlugin,
     /// `.claude-plugin/plugin.json` at the root.
     ClaudeCode,
     /// A bare `SKILL.md` at the root — one skill, no manifest.

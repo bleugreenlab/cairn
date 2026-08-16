@@ -41,6 +41,7 @@ pub enum SegmentKind {
     Resource,
     Image,
     Error,
+    Duplicate,
 }
 
 /// A base64-encoded image block, surfaced as a separate `CallToolResult` content

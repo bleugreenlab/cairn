@@ -149,11 +149,11 @@ mod tests {
         Memory {
             id: id.to_string(),
             name: None,
-            project_id: Some("CAIRN".to_string()),
+            project_id: Some("cairn".to_string()),
             content: content.to_string(),
             status: MemoryStatus::Claimed,
             scope: MemoryScope::Project,
-            scope_value: "CAIRN".to_string(),
+            scope_value: "cairn".to_string(),
             job_id: Some("job-1".to_string()),
             node_seq: Some(1),
             promoted_commit_sha: None,
@@ -161,7 +161,7 @@ mod tests {
             triage_decision: Some(decision),
             deferred_scope: None,
             deferred_scope_value: None,
-            provenance_uri: Some(format!("cairn://p/CAIRN/1/1/node/memories/{id}")),
+            provenance_uri: Some(format!("cairn://p/cairn/1/1/node/memories/{id}")),
             created_at: 1,
             updated_at: 2,
         }
@@ -184,15 +184,15 @@ mod tests {
             ),
         ];
 
-        let first = render_triage_ledger("Triage role memories", "project", "CAIRN", &memories);
-        let second = render_triage_ledger("Triage role memories", "project", "CAIRN", &memories);
+        let first = render_triage_ledger("Triage role memories", "project", "cairn", &memories);
+        let second = render_triage_ledger("Triage role memories", "project", "cairn", &memories);
 
         assert_eq!(first, second);
         assert!(first.contains("# Memory triage ledger"));
-        assert!(first.contains("Scope: `project=CAIRN`"));
+        assert!(first.contains("Scope: `project=cairn`"));
         assert!(first.contains("Decisions: 0 promote, 2 discard, 0 defer, 0 pending"));
         assert!(first.contains("### Discard (2)"));
-        assert!(first.contains("- `mem-1` from `project`=`CAIRN`; provenance `cairn://p/CAIRN/1/1/node/memories/mem-1`"));
+        assert!(first.contains("- `mem-1` from `project`=`cairn`; provenance `cairn://p/cairn/1/1/node/memories/mem-1`"));
         assert!(!first.contains("Already covered by the existing role prompt."));
         assert!(!first.contains("Agents should use bun, not npm."));
     }
@@ -209,10 +209,10 @@ mod tests {
         deferred.deferred_scope_value = Some("workspace".to_string());
 
         let rendered =
-            render_triage_ledger("Triage deferred memories", "project", "CAIRN", &[deferred]);
+            render_triage_ledger("Triage deferred memories", "project", "cairn", &[deferred]);
 
         assert!(rendered.contains("### Defer (1)"));
-        assert!(rendered.contains("- `mem-3` from `project`=`CAIRN`; provenance `cairn://p/CAIRN/1/1/node/memories/mem-3`; deferred to `workspace`=`workspace`"));
+        assert!(rendered.contains("- `mem-3` from `project`=`cairn`; provenance `cairn://p/cairn/1/1/node/memories/mem-3`; deferred to `workspace`=`workspace`"));
         assert!(!rendered.contains("Belongs to the workspace-wide pool"));
     }
 
@@ -222,7 +222,7 @@ mod tests {
         let rendered = render_triage_ledger(
             "Triage fenced memory",
             "project",
-            "CAIRN",
+            "cairn",
             &[memory(
                 "mem-fence",
                 MemoryTriageDecision::Discard,
@@ -263,9 +263,9 @@ mod tests {
         assert!(rendered.contains("Scope: `role=Integrator`"));
         assert!(rendered.contains("Decisions: 1 promote, 1 discard, 0 defer, 0 pending"));
         assert!(rendered.contains("### Promote (1)"));
-        assert!(rendered.contains("- `mem-4` from `project`=`CAIRN`; provenance `cairn://p/CAIRN/1/1/node/memories/mem-4`; canon commit `abc123`"));
+        assert!(rendered.contains("- `mem-4` from `project`=`cairn`; provenance `cairn://p/cairn/1/1/node/memories/mem-4`; canon commit `abc123`"));
         assert!(rendered.contains("### Discard (1)"));
-        assert!(rendered.contains("- `mem-5` from `project`=`CAIRN`; provenance `cairn://p/CAIRN/1/1/node/memories/mem-5`"));
+        assert!(rendered.contains("- `mem-5` from `project`=`cairn`; provenance `cairn://p/cairn/1/1/node/memories/mem-5`"));
         assert!(!rendered.contains("… [truncated]"));
         assert!(rendered.len() < 1_000);
     }

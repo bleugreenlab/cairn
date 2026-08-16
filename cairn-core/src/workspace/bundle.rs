@@ -14,7 +14,7 @@ use crate::config::pack::{
     self, lock as pack_lock, ContentHash, PackItemKind, PackLock, PackLockItem, PackManifest,
     PackSource,
 };
-use crate::services::{FileSystem, GitClient};
+use crate::services::{guarded_copy_file, guarded_copy_tree, FileSystem, GitClient};
 
 #[cfg(test)]
 const DEFAULT_BRANCH: &str = "main";
@@ -28,6 +28,33 @@ const PACK_COMMIT_PREFIX: &str = "Sync pack resources: ";
 
 fn is_pack_authored_subject(subject: &str) -> bool {
     BUNDLE_COMMIT_SUBJECTS.contains(&subject) || subject.starts_with(PACK_COMMIT_PREFIX)
+}
+
+/// Sync an already resolved source through the canonical pack ownership machinery.
+pub fn sync_resolved_pack(
+    git: &dyn GitClient,
+    fs: &dyn FileSystem,
+    config_dir: &Path,
+    manifest: PackManifest,
+    source: PackSource,
+) -> Result<PackSyncResult, String> {
+    fs.create_dir_all(config_dir)?;
+    ensure_workspace_content_dirs(fs, config_dir)?;
+    pack_lock::clear_uninstall(fs, config_dir, &manifest.id)?;
+    let hash = pack::content_hash(&manifest.root)?;
+    let lock = pack_lock::read_lock(config_dir, &manifest.id);
+    apply_plans(
+        git,
+        fs,
+        config_dir,
+        vec![PackPlan {
+            manifest,
+            lock,
+            hash,
+            action: PackAction::Sync,
+            source,
+        }],
+    )
 }
 
 /// Explicitly replace every currently shipped item in one bundled pack and
@@ -107,6 +134,7 @@ struct PackPlan {
     lock: Option<PackLock>,
     hash: String,
     action: PackAction,
+    source: PackSource,
 }
 
 impl PackPlan {
@@ -165,6 +193,7 @@ pub fn sync_one_pack(
         fs,
         config_dir,
         vec![PackPlan {
+            source: PackSource::bundled(manifest.format),
             manifest,
             lock,
             hash,
@@ -237,7 +266,7 @@ fn apply_plans(
             PackLock::new(
                 &plan.manifest,
                 plan.hash.clone(),
-                PackSource::bundled(plan.manifest.format),
+                plan.source.clone(),
                 plan.manifest.items(),
             )
         });
@@ -253,6 +282,7 @@ fn apply_plans(
             config_dir,
             &plan.manifest,
             &plan.hash,
+            &plan.source,
             &mut lock,
             &mut outcome,
         )?;
@@ -293,11 +323,13 @@ fn plan_packs(
             } else {
                 PackAction::Skip
             };
+            let source = PackSource::bundled(manifest.format);
             Ok(PackPlan {
                 manifest,
                 lock,
                 hash,
                 action,
+                source,
             })
         })
         .collect()
@@ -377,6 +409,7 @@ fn sync_pack(
     config_dir: &Path,
     manifest: &PackManifest,
     pack_hash: &str,
+    source: &PackSource,
     lock: &mut PackLock,
     outcome: &mut SyncOutcome,
 ) -> Result<(), String> {
@@ -471,7 +504,7 @@ fn sync_pack(
     lock.keywords = manifest.keywords.clone();
     lock.notes = manifest.notes.clone();
     lock.content_hash = pack_hash.to_string();
-    lock.source = PackSource::bundled(manifest.format);
+    lock.source = source.clone();
     lock.sort_items();
     // Content always lands before the baseline that claims it.
     pack_lock::write_lock(fs, config_dir, lock)?;
@@ -489,7 +522,7 @@ fn source_item_hash(
     let Some(path) = &item.path else {
         return Ok(None);
     };
-    match pack::hash_item_path(item.kind, &manifest.root.join(path))? {
+    match pack::hash_item_path(item.kind, &manifest.root, &manifest.root.join(path))? {
         ContentHash::Missing => Ok(None),
         ContentHash::Present(hash) => Ok(Some(hash)),
     }
@@ -514,7 +547,7 @@ fn current_item_hash_with_mcp(
             .path
             .as_ref()
             .ok_or_else(|| "File-backed pack item has no path".to_string())?;
-        return pack::hash_item_path(item.kind, &config_dir.join(path));
+        return pack::hash_item_path(item.kind, config_dir, &config_dir.join(path));
     }
     let owned;
     let servers = if let Some(servers) = cached_mcp {
@@ -575,9 +608,9 @@ fn materialize_item(
         if fs.exists(&destination) {
             fs.remove_dir_all(&destination)?;
         }
-        fs.copy_dir_recursive(&source, &destination)
+        guarded_copy_tree(&source, &destination)
     } else {
-        fs.copy_file(&source, &destination)
+        guarded_copy_file(&manifest.root, &source, &destination)
     }
 }
 

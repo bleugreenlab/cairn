@@ -42,7 +42,14 @@ pub(crate) async fn insert_attention_push_events(
     // store the carrying event as an `attention:briefing` whose content is the
     // structured `{active, catchup}` card payload plus the `resolved` markdown the
     // agent received (for the detail modal), not a raw `system:message` line.
-    let summary = crate::orchestrator::attention_push::push_event_content_json(pushes, resolved);
+    let summary = crate::orchestrator::attention_push::push_event_content_json_with_resolutions(
+        &db, pushes, resolved,
+    )
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("Failed to resolve attention push receipts: {}", error);
+        crate::orchestrator::attention_push::push_event_content_json(pushes, resolved)
+    });
     let push_ids: Vec<String> = pushes.iter().map(|p| p.id.clone()).collect();
     let transcript_event = TranscriptEvent {
         event_type: "attention:briefing".to_string(),
@@ -572,7 +579,7 @@ mod tests {
         db.write(|conn| {
             let run_id = run_id.clone();
             Box::pin(async move {
-                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj-1', 'default', 'Project', 'PROJ', '/tmp/repo', 1, 1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj-1', 'default', 'Project', 'proj', '/tmp/repo', 1, 1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('issue-1', 'proj-1', 42, 'Issue', 'active', 1, 1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at) VALUES ('job-1', 'exec-1', 'builder', 'issue-1', 'proj-1', 'builder', 'builder', 'running', 1, 1)", ()).await?;
@@ -655,7 +662,7 @@ mod tests {
         let notice = SideChannelNotice {
             id: "notice-1".to_string(),
             parent_job_id: "job-1".to_string(),
-            child_uri: "cairn://p/PROJ/42/1/child".to_string(),
+            child_uri: "cairn://p/proj/42/1/child".to_string(),
             content: "child says hi".to_string(),
             origin: SideChannelOrigin::UserChild,
             created_at: 1,
@@ -676,7 +683,7 @@ mod tests {
         let push = Push {
             id: "push-1".to_string(),
             recipient: "job-1".to_string(),
-            content_ref: "cairn://p/PROJ/42".to_string(),
+            content_ref: "cairn://p/proj/42".to_string(),
             wake: Wake::Passive,
             boundary: Boundary::Event,
             key: "k".to_string(),
@@ -699,7 +706,7 @@ mod tests {
         let notice = SideChannelNotice {
             id: "notice-sync-1".to_string(),
             parent_job_id: "job-1".to_string(),
-            child_uri: "cairn://p/PROJ/42/1/child".to_string(),
+            child_uri: "cairn://p/proj/42/1/child".to_string(),
             content: "resume-time notice".to_string(),
             origin: SideChannelOrigin::UserChild,
             created_at: 1,

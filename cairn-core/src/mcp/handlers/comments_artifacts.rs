@@ -1626,14 +1626,14 @@ mod tests {
             "working": "A then B",
             "rulings": [{
                 "text": "No budget kills", "status": "accepted",
-                "rationale": "Budgets degrade quality", "provenance": ["cairn://p/CAIRN/3404"]
+                "rationale": "Budgets degrade quality", "provenance": ["cairn://p/cairn/3404"]
             }]
         });
         let patched = apply_arc_ruling_patch(
             base,
             &json!({"ruling": {
                 "text": "No budget kills", "status": "rejected",
-                "rationale": "A distinct later ruling", "provenance": ["cairn://p/CAIRN/3700"]
+                "rationale": "A distinct later ruling", "provenance": ["cairn://p/cairn/3700"]
             }}),
         )
         .unwrap();
@@ -1647,8 +1647,8 @@ mod tests {
     #[test]
     fn arc_ruling_patch_updates_only_the_addressed_ruling() {
         let base = json!({"current_intent": "Direction", "rulings": [
-            {"slug": "keep", "text": "Keep", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
-            {"slug": "replace", "text": "Replace", "status": "accepted", "rationale": "old", "provenance": ["cairn://p/P/2"]}
+            {"slug": "keep", "text": "Keep", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/1"]},
+            {"slug": "replace", "text": "Replace", "status": "accepted", "rationale": "old", "provenance": ["cairn://p/p/2"]}
         ]});
         let patched = apply_arc_ruling_patch(
             base,
@@ -1670,7 +1670,7 @@ mod tests {
         let patched = apply_arc_ruling_patch(
             json!({"current_intent": "Direction", "rulings": []}),
             &json!({"ruling": {
-                "text": "X", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/P/1"]
+                "text": "X", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/p/1"]
             }, "working": "Now composed"}),
         )
         .unwrap();
@@ -1680,7 +1680,7 @@ mod tests {
         let error = apply_arc_ruling_patch(
             patched,
             &json!({"ruling": {
-                "text": "Z", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/P/1"]
+                "text": "Z", "status": "accepted", "rationale": "Y", "provenance": ["cairn://p/p/1"]
             }, "rulings": []}),
         )
         .unwrap_err();
@@ -1690,19 +1690,19 @@ mod tests {
     #[test]
     fn whole_array_replacement_preserves_exact_matches_and_rejects_duplicates() {
         let base = json!({"current_intent": "Direction", "rulings": [
-            {"slug": "one", "text": "One", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
-            {"slug": "two", "text": "Two", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/2"]}
+            {"slug": "one", "text": "One", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/1"]},
+            {"slug": "two", "text": "Two", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/2"]}
         ]});
         let patched = apply_arc_field_patch(base.clone(), &json!({"rulings": [
-            {"text": "Two", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/2"]},
-            {"text": "One", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/1"]}
+            {"text": "Two", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/p/2"]},
+            {"text": "One", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/p/1"]}
         ]})).unwrap();
         assert_eq!(patched["rulings"][0]["slug"], "two");
         assert_eq!(patched["rulings"][1]["slug"], "one");
 
         let error = apply_arc_field_patch(base, &json!({"rulings": [
-            {"slug": "same", "text": "New one", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
-            {"slug": "same", "text": "New two", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/2"]}
+            {"slug": "same", "text": "New one", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/1"]},
+            {"slug": "same", "text": "New two", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/2"]}
         ]})).unwrap_err();
         assert!(error.contains("appears more than once"), "{error}");
     }
@@ -1710,12 +1710,12 @@ mod tests {
     #[test]
     fn whole_array_reorder_plus_edit_requires_explicit_slugs() {
         let base = json!({"current_intent": "Direction", "rulings": [
-            {"slug": "a", "text": "A", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/1"]},
-            {"slug": "b", "text": "B", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/P/2"]}
+            {"slug": "a", "text": "A", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/1"]},
+            {"slug": "b", "text": "B", "status": "accepted", "rationale": "why", "provenance": ["cairn://p/p/2"]}
         ]});
         let error = apply_arc_field_patch(base, &json!({"rulings": [
-            {"text": "B revised", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/2"]},
-            {"text": "A revised", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/P/1"]}
+            {"text": "B revised", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/p/2"]},
+            {"text": "A revised", "status": "accepted", "rationale": "new", "provenance": ["cairn://p/p/1"]}
         ]})).unwrap_err();
         assert!(
             error.contains("include its stable `slug` explicitly"),
@@ -2263,7 +2263,7 @@ mod capture_tests {
             let contract = contract.clone();
             Box::pin(async move {
                 conn.execute("INSERT OR IGNORE INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)", ()).await?;
-                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)", ()).await?;
                 conn.execute(

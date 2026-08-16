@@ -40,7 +40,7 @@ struct Fixture {
 /// turn and a single job-owned fence `permission_requests` row stored with
 /// `turn_id = NULL` (the warm-reuse race signature).
 async fn insert_fixture(db: &LocalDb, opts: &Fixture) {
-    let project_id = common::create_project(db, "TRS").await;
+    let project_id = common::create_project(db, "trs").await;
     let job_id_for_run: Option<&str> = if opts.job_owned { Some("job-1") } else { None };
     let job_has_current_turn = opts.job_has_current_turn;
     db.write(|conn| {

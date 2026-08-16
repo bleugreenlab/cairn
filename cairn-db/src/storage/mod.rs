@@ -1,9 +1,11 @@
 mod blocking;
 mod error;
 mod executor_desktop_automation;
+mod feed;
 mod local_db;
 mod migration;
 mod migrations;
+mod posts;
 mod response_invocations;
 mod route_fact_samples;
 mod route_firings;
@@ -28,8 +30,10 @@ pub use executor_desktop_automation::{
     delete_executor_desktop_automation, get_executor_desktop_automation,
     upsert_executor_desktop_automation, ExecutorDesktopAutomation,
 };
+pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
 pub use local_db::{
-    db_set_paths, db_set_size, install_crypto_provider, move_db_set, LocalDb, RetryConfig,
+    db_set_paths, db_set_size, install_crypto_provider, move_db_set, CheckpointReport, DrainReport,
+    LocalDb, RetryConfig, TrackedConnection,
 };
 pub use migration::{
     repair_index_entry_drift, run_integrity_sweep, IntegritySweepOutcome, Migration,
@@ -39,6 +43,7 @@ pub use migrations::{
     Lineage, PrivateReason, RekeyTableManifest, ScopeTarget, TableScope, PROJECT_REKEY_MANIFEST,
     TABLE_SCOPES, TEAM_MIGRATIONS, TURSO_MIGRATIONS,
 };
+pub use posts::PostScope;
 pub use response_invocations::{
     count_response_invocations, get_response_invocation, insert_response_invocation,
     list_response_invocations, NewResponseInvocation, ResponseInvocationRecord,

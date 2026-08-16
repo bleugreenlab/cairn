@@ -23,6 +23,23 @@ pub fn build_reachable_pack(git_dir: &Path, tip: &str) -> Result<ExecutionPack, 
         .ok_or_else(|| format!("reachable pack for {tip} unexpectedly contained no objects"))
 }
 
+/// Create pack output next to the repository's object database. Git may finalize
+/// a named pack with a hard link, so process-global temporary storage can fail
+/// with `EXDEV` when it is mounted on another filesystem.
+pub(crate) fn pack_scratch_dir(repository: &Path) -> Result<tempfile::TempDir, String> {
+    let common_dir = run_git(repository, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = Path::new(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir.to_path_buf()
+    } else {
+        repository.join(common_dir)
+    };
+    tempfile::Builder::new()
+        .prefix(".cairn-pack-")
+        .tempdir_in(&common_dir)
+        .map_err(|e| format!("creating same-filesystem pack scratch dir: {e}"))
+}
+
 /// Build all objects reachable from `tip` but not from the already-covered `base`.
 /// Unlike archival ranges, this deliberately does not exclude the default branch:
 /// the base pack plus this range must reconstruct the complete tip in isolation.
@@ -95,7 +112,7 @@ fn build_pack_from_rev_list(
         return Ok(None);
     }
 
-    let scratch = tempfile::tempdir().map_err(|e| format!("creating pack scratch dir: {e}"))?;
+    let scratch = pack_scratch_dir(git_dir)?;
     let base = scratch.path().join("range");
     let hash = pack_objects(git_dir, &base, &oids)?;
 
@@ -180,6 +197,50 @@ mod tests {
 
     use super::*;
     use crate::testutil::{commit_all, git, init_repo, write_file};
+
+    fn assert_named_pack_uses_common_directory(
+        repository: &Path,
+        common_directory: &Path,
+        tip: &str,
+    ) {
+        let scratch = pack_scratch_dir(repository).unwrap();
+        assert_eq!(
+            scratch.path().parent().unwrap().canonicalize().unwrap(),
+            common_directory.canonicalize().unwrap()
+        );
+
+        let (pack, index) = build_reachable_pack(repository, tip).unwrap();
+        assert!(!pack.is_empty());
+        assert!(!index.is_empty());
+    }
+
+    #[test]
+    fn named_pack_scratch_uses_common_directory_for_all_repository_forms() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        write_file(&repo, "base.txt", b"base");
+        let tip = commit_all(&repo, "base");
+
+        assert_named_pack_uses_common_directory(&repo, &repo.join(".git"), &tip);
+
+        let linked = dir.path().join("linked");
+        let linked_arg = linked.to_string_lossy();
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "linked", &linked_arg],
+        );
+        assert_named_pack_uses_common_directory(&linked, &repo.join(".git"), &tip);
+
+        let bare = dir.path().join("bare.git");
+        let bare_arg = bare.to_string_lossy();
+        git(
+            dir.path(),
+            &["clone", "-q", "--bare", &repo.to_string_lossy(), &bare_arg],
+        );
+        assert_named_pack_uses_common_directory(&bare, &bare, &tip);
+    }
 
     fn range_oids(repo: &Path, tip: &str, anchor: &str, default_ref: &str) -> BTreeSet<String> {
         run_git(

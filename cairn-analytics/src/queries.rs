@@ -1256,14 +1256,23 @@ pub(crate) async fn economics_granular_live(
 
 // --- Tier B: tool-invocation rollup (backfill + read queries) ---
 
-/// Joins `tool_invocations` to runs/jobs so scope filtering matches Tier A.
+/// Dashboard ranges are UTC-hour aligned before crossing the API boundary, so
+/// filtering the stored hour floor preserves the selected half-open window.
+const TOOL_ANALYTICS_SCOPE_RANGE: &str = "(?1 IS NULL OR ta.project_id = ?1)
+        AND (?2 IS NULL OR ta.bucket_start >= ?2)
+        AND (?3 IS NULL OR ta.bucket_start < ?3)";
+
 const TOOL_JOIN: &str = "FROM tool_invocations ti
         LEFT JOIN runs r ON r.id = ti.run_id
         LEFT JOIN jobs j ON j.id = r.job_id";
-
 const TOOL_SCOPE_RANGE: &str = "(?1 IS NULL OR COALESCE(r.project_id, j.project_id) = ?1)
         AND (?2 IS NULL OR ti.ts >= ?2)
         AND (?3 IS NULL OR ti.ts < ?3)";
+
+fn tool_range_is_hour_aligned(range: &TimeRange) -> bool {
+    range.start.is_none_or(|ts| ts.rem_euclid(3600) == 0)
+        && range.end.is_none_or(|ts| ts.rem_euclid(3600) == 0)
+}
 
 /// Run an idempotent incremental backfill of the tool-invocation rollup.
 ///
@@ -1368,10 +1377,13 @@ async fn upsert_run_invocations(
             let mut count = 0u64;
             for row in &rows {
                 conn.execute(
-                    "INSERT OR REPLACE INTO tool_invocations
+                    "INSERT INTO tool_invocations
                         (id, event_id, tool_use_id, run_id, ts, verb, tool_name,
                          target_scheme, target_kind, target_path, is_error, result_ts)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(id) DO UPDATE SET
+                       is_error = excluded.is_error,
+                       result_ts = excluded.result_ts",
                     params![
                         row.id(),
                         row.event_id.as_str(),
@@ -1420,15 +1432,28 @@ pub(crate) async fn target_shapes(
     scope: &Scope,
     range: &TimeRange,
 ) -> DbResult<Vec<ShapeCount>> {
+    if !tool_range_is_hour_aligned(range) {
+        let sql = format!("SELECT ti.verb, ti.target_scheme, ti.target_kind, COUNT(*), SUM(ti.is_error) {TOOL_JOIN} WHERE {TOOL_SCOPE_RANGE} GROUP BY ti.verb, ti.target_scheme, ti.target_kind ORDER BY COUNT(*) DESC");
+        return db
+            .query_all(sql, scope_range_params(scope, range), |row| {
+                Ok(ShapeCount {
+                    verb: row.text(0)?,
+                    scheme: row.text(1)?,
+                    kind: row.text(2)?,
+                    count: row.i64(3)?,
+                    error_count: row.opt_i64(4)?.unwrap_or(0),
+                })
+            })
+            .await;
+    }
     let sql = format!(
-        "SELECT ti.verb, ti.target_scheme, ti.target_kind,
-                COUNT(*) AS c, SUM(ti.is_error) AS errors
-        {join}
+        "SELECT ta.verb, ta.target_scheme, ta.target_kind,
+                SUM(ta.invocation_count) AS c, SUM(ta.error_count) AS errors
+        FROM tool_analytics_hourly ta
         WHERE {filter}
-        GROUP BY ti.verb, ti.target_scheme, ti.target_kind
+        GROUP BY ta.verb, ta.target_scheme, ta.target_kind
         ORDER BY c DESC",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(ShapeCount {
@@ -1447,16 +1472,28 @@ pub(crate) async fn top_targets(
     scope: &Scope,
     range: &TimeRange,
 ) -> DbResult<Vec<TopTargetRow>> {
+    if !tool_range_is_hour_aligned(range) {
+        let sql = format!("SELECT ti.target_path, ti.target_scheme, COUNT(*), SUM(ti.is_error) {TOOL_JOIN} WHERE {TOOL_SCOPE_RANGE} AND ti.target_path IS NOT NULL GROUP BY ti.target_path, ti.target_scheme ORDER BY COUNT(*) DESC LIMIT 25");
+        return db
+            .query_all(sql, scope_range_params(scope, range), |row| {
+                Ok(TopTargetRow {
+                    target: row.text(0)?,
+                    scheme: row.text(1)?,
+                    count: row.i64(2)?,
+                    error_count: row.opt_i64(3)?.unwrap_or(0),
+                })
+            })
+            .await;
+    }
     let sql = format!(
-        "SELECT ti.target_path, ti.target_scheme,
-                COUNT(*) AS c, SUM(ti.is_error) AS errors
-        {join}
-        WHERE {filter} AND ti.target_path IS NOT NULL
-        GROUP BY ti.target_path, ti.target_scheme
+        "SELECT ta.target_path, ta.target_scheme,
+                SUM(ta.invocation_count) AS c, SUM(ta.error_count) AS errors
+        FROM tool_analytics_hourly ta
+        WHERE {filter} AND ta.target_path IS NOT NULL
+        GROUP BY ta.target_path, ta.target_scheme
         ORDER BY c DESC
         LIMIT 25",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(TopTargetRow {
@@ -1482,15 +1519,28 @@ pub(crate) async fn tool_calls_per_session(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<ToolSessionBucketRow>> {
+    if !tool_range_is_hour_aligned(range) {
+        let bucket_expr = bucket.bucket_expr("session_ts");
+        let sql = format!("WITH session_calls AS (SELECT r.session_id, COUNT(*) calls, MIN(ti.ts) session_ts {TOOL_JOIN} WHERE r.session_id IS NOT NULL AND {TOOL_SCOPE_RANGE} GROUP BY r.session_id) SELECT {bucket_expr}, AVG(calls), COUNT(*) FROM session_calls GROUP BY 1 ORDER BY 1");
+        return db
+            .query_all(sql, scope_range_params(scope, range), |row| {
+                Ok(ToolSessionBucketRow {
+                    bucket_start: row.i64(0)?,
+                    avg_calls: row.opt_f64(1)?.unwrap_or(0.0),
+                    session_count: row.i64(2)?,
+                })
+            })
+            .await;
+    }
     let bucket_expr = bucket.bucket_expr("session_ts");
     let sql = format!(
         "WITH session_calls AS (
-            SELECT r.session_id AS session_id,
-                   COUNT(*) AS calls,
-                   MIN(ti.ts) AS session_ts
-            {join}
-            WHERE r.session_id IS NOT NULL AND {filter}
-            GROUP BY r.session_id
+            SELECT ta.session_id AS session_id,
+                   SUM(ta.invocation_count) AS calls,
+                   MIN(ta.bucket_start) AS session_ts
+            FROM tool_analytics_hourly ta
+            WHERE ta.session_id IS NOT NULL AND {filter}
+            GROUP BY ta.session_id
         )
         SELECT {bucket_expr} AS bucket_start,
                AVG(calls) AS avg_calls,
@@ -1498,8 +1548,7 @@ pub(crate) async fn tool_calls_per_session(
         FROM session_calls
         GROUP BY bucket_start
         ORDER BY bucket_start",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(ToolSessionBucketRow {
@@ -1524,15 +1573,27 @@ pub(crate) async fn tool_mix(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<ToolMixRow>> {
-    let bucket_expr = bucket.bucket_expr("ti.ts");
+    if !tool_range_is_hour_aligned(range) {
+        let bucket_expr = bucket.bucket_expr("ti.ts");
+        let sql = format!("SELECT {bucket_expr}, ti.verb, COUNT(*) {TOOL_JOIN} WHERE {TOOL_SCOPE_RANGE} GROUP BY 1, ti.verb ORDER BY 1");
+        return db
+            .query_all(sql, scope_range_params(scope, range), |row| {
+                Ok(ToolMixRow {
+                    bucket_start: row.i64(0)?,
+                    verb: row.text(1)?,
+                    count: row.i64(2)?,
+                })
+            })
+            .await;
+    }
+    let bucket_expr = bucket.bucket_expr("ta.bucket_start");
     let sql = format!(
-        "SELECT {bucket_expr} AS bucket_start, ti.verb, COUNT(*) AS c
-        {join}
+        "SELECT {bucket_expr} AS bucket_start, ta.verb, SUM(ta.invocation_count) AS c
+        FROM tool_analytics_hourly ta
         WHERE {filter}
-        GROUP BY bucket_start, ti.verb
+        GROUP BY bucket_start, ta.verb
         ORDER BY bucket_start",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(ToolMixRow {
@@ -1578,15 +1639,11 @@ pub(crate) async fn time_composition(
               AND (?2 IS NULL OR r.started_at >= ?2)
               AND (?3 IS NULL OR r.started_at < ?3)
         ),
-        raw_tool_by_run AS (
+        tool_by_run AS (
             SELECT cr.run_id AS run_id,
-                   SUM(CASE
-                       WHEN ti.result_ts IS NOT NULL AND ti.result_ts >= ti.ts
-                           THEN ti.result_ts - ti.ts
-                       ELSE 0
-                   END) AS raw_tool_s
+                   SUM(ta.duration_sum_s) AS raw_tool_s
             FROM completed_runs cr
-            LEFT JOIN tool_invocations ti ON ti.run_id = cr.run_id
+            LEFT JOIN tool_analytics_hourly ta ON ta.run_id = cr.run_id
             GROUP BY cr.run_id
         ),
         run_parts AS (
@@ -1595,7 +1652,7 @@ pub(crate) async fn time_composition(
                    cr.wall_s,
                    MIN(cr.wall_s, COALESCE(rtbr.raw_tool_s, 0)) AS tool_s
             FROM completed_runs cr
-            LEFT JOIN raw_tool_by_run rtbr ON rtbr.run_id = cr.run_id
+            LEFT JOIN tool_by_run rtbr ON rtbr.run_id = cr.run_id
         )
         SELECT {bucket_expr} AS bucket_start,
                SUM(wall_s) AS wall_s,
@@ -1633,20 +1690,32 @@ pub(crate) async fn tool_time_mix(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<ToolTimeMixRow>> {
-    let bucket_expr = bucket.bucket_expr("ti.ts");
+    if !tool_range_is_hour_aligned(range) {
+        let bucket_expr = bucket.bucket_expr("ti.ts");
+        let sql = format!("SELECT {bucket_expr}, ti.verb, SUM(ti.result_ts-ti.ts), COUNT(*) {TOOL_JOIN} WHERE {TOOL_SCOPE_RANGE} AND ti.result_ts IS NOT NULL AND ti.result_ts >= ti.ts GROUP BY 1, ti.verb ORDER BY 1");
+        return db
+            .query_all(sql, scope_range_params(scope, range), |row| {
+                Ok(ToolTimeMixRow {
+                    bucket_start: row.i64(0)?,
+                    verb: row.text(1)?,
+                    seconds: row.opt_i64(2)?.unwrap_or(0),
+                    count: row.i64(3)?,
+                })
+            })
+            .await;
+    }
+    let bucket_expr = bucket.bucket_expr("ta.bucket_start");
     let sql = format!(
         "SELECT {bucket_expr} AS bucket_start,
-                ti.verb,
-                SUM(ti.result_ts - ti.ts) AS seconds,
-                COUNT(*) AS c
-        {join}
+                ta.verb,
+                SUM(ta.duration_sum_s) AS seconds,
+                SUM(ta.duration_count) AS c
+        FROM tool_analytics_hourly ta
         WHERE {filter}
-          AND ti.result_ts IS NOT NULL
-          AND ti.result_ts >= ti.ts
-        GROUP BY bucket_start, ti.verb
+          AND ta.duration_count > 0
+        GROUP BY bucket_start, ta.verb
         ORDER BY bucket_start",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(ToolTimeMixRow {
@@ -1679,25 +1748,43 @@ pub(crate) async fn command_durations(
     range: &TimeRange,
     limit: i64,
 ) -> DbResult<Vec<CommandDurationQueryRow>> {
+    if !tool_range_is_hour_aligned(range) {
+        let sql = format!("SELECT ti.verb, ti.target_scheme, ti.target_kind, MIN(ti.target_path), COUNT(*), SUM(ti.result_ts-ti.ts), CAST(SUM(ti.result_ts-ti.ts) AS REAL)/COUNT(*), MAX(ti.result_ts-ti.ts), SUM(ti.is_error) {TOOL_JOIN} WHERE {TOOL_SCOPE_RANGE} AND ti.result_ts IS NOT NULL AND ti.result_ts >= ti.ts GROUP BY ti.verb, ti.target_scheme, ti.target_kind ORDER BY 6 DESC, 5 DESC LIMIT ?4");
+        let mut params = scope_range_params(scope, range);
+        params.push(Value::Integer(limit.max(1)));
+        return db
+            .query_all(sql, params, |row| {
+                Ok(CommandDurationQueryRow {
+                    verb: row.text(0)?,
+                    scheme: row.text(1)?,
+                    kind: row.text(2)?,
+                    target: row.opt_text(3)?,
+                    count: row.i64(4)?,
+                    total_s: row.opt_i64(5)?.unwrap_or(0),
+                    avg_s: row.opt_f64(6)?.unwrap_or(0.0),
+                    max_s: row.opt_i64(7)?.unwrap_or(0),
+                    error_count: row.opt_i64(8)?.unwrap_or(0),
+                })
+            })
+            .await;
+    }
     let sql = format!(
-        "SELECT ti.verb,
-                ti.target_scheme,
-                ti.target_kind,
-                MIN(ti.target_path) AS representative_target,
-                COUNT(*) AS c,
-                SUM(ti.result_ts - ti.ts) AS total_s,
-                CAST(SUM(ti.result_ts - ti.ts) AS REAL) / COUNT(*) AS avg_s,
-                MAX(ti.result_ts - ti.ts) AS max_s,
-                SUM(ti.is_error) AS errors
-        {join}
+        "SELECT ta.verb,
+                ta.target_scheme,
+                ta.target_kind,
+                MIN(ta.target_path) AS representative_target,
+                SUM(ta.duration_count) AS c,
+                SUM(ta.duration_sum_s) AS total_s,
+                CAST(SUM(ta.duration_sum_s) AS REAL) / SUM(ta.duration_count) AS avg_s,
+                MAX(ta.max_duration_s) AS max_s,
+                SUM(ta.duration_error_count) AS errors
+        FROM tool_analytics_hourly ta
         WHERE {filter}
-          AND ti.result_ts IS NOT NULL
-          AND ti.result_ts >= ti.ts
-        GROUP BY ti.verb, ti.target_scheme, ti.target_kind
+          AND ta.duration_count > 0
+        GROUP BY ta.verb, ta.target_scheme, ta.target_kind
         ORDER BY total_s DESC, c DESC
         LIMIT ?4",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     let mut params = scope_range_params(scope, range);
     params.push(Value::Integer(limit.max(1)));
@@ -1943,9 +2030,7 @@ pub(crate) async fn cost_by_project(
     .await
 }
 
-/// Tool-call volume and error count for one time bucket. The `tool_invocations`
-/// table is at full `ts` resolution, so `bucket_expr("ti.ts")` serves every
-/// granularity (including hourly) directly -- no `_live` sibling needed.
+/// Tool-call volume and error count from the maintained hourly summary.
 #[derive(Debug, Clone)]
 pub(crate) struct ToolErrorBucketRow {
     pub bucket_start: i64,
@@ -1959,17 +2044,29 @@ pub(crate) async fn tool_error_rate(
     range: &TimeRange,
     bucket: Bucket,
 ) -> DbResult<Vec<ToolErrorBucketRow>> {
-    let bucket_expr = bucket.bucket_expr("ti.ts");
+    if !tool_range_is_hour_aligned(range) {
+        let bucket_expr = bucket.bucket_expr("ti.ts");
+        let sql = format!("SELECT {bucket_expr}, COUNT(*), SUM(ti.is_error) {TOOL_JOIN} WHERE {TOOL_SCOPE_RANGE} GROUP BY 1 ORDER BY 1");
+        return db
+            .query_all(sql, scope_range_params(scope, range), |row| {
+                Ok(ToolErrorBucketRow {
+                    bucket_start: row.i64(0)?,
+                    total: row.i64(1)?,
+                    errors: row.opt_i64(2)?.unwrap_or(0),
+                })
+            })
+            .await;
+    }
+    let bucket_expr = bucket.bucket_expr("ta.bucket_start");
     let sql = format!(
         "SELECT {bucket_expr} AS bucket_start,
-                COUNT(*) AS total,
-                SUM(ti.is_error) AS errors
-        {join}
+                SUM(ta.invocation_count) AS total,
+                SUM(ta.error_count) AS errors
+        FROM tool_analytics_hourly ta
         WHERE {filter}
         GROUP BY bucket_start
         ORDER BY bucket_start",
-        join = TOOL_JOIN,
-        filter = TOOL_SCOPE_RANGE,
+        filter = TOOL_ANALYTICS_SCOPE_RANGE,
     );
     db.query_all(sql, scope_range_params(scope, range), |row| {
         Ok(ToolErrorBucketRow {

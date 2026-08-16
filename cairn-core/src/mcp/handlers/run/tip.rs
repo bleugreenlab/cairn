@@ -12,7 +12,7 @@ use super::types::RunItem;
 const PYTHON_TIP: &str = "tip: inline code runs natively — pass {code, interpreter:\"python\"} instead of python3 -c; no shell quoting, and PEP 723 `# /// script` deps resolve through uv.";
 
 /// One-line nudge for a wrapped bun/node one-liner.
-const TS_TIP: &str = "tip: inline code runs natively — pass {code, interpreter:\"typescript\"} instead of bun -e; no shell quoting, and the worktree node_modules + @cairn/sdk import zero-config.";
+const TS_TIP: &str = "tip: inline code runs natively — pass {code, interpreter:\"typescript\"} instead of bun -e; no shell quoting, and the worktree node_modules + Cairn-provided @cairn/sdk import with no setup.";
 
 /// The one-line tip for the first shell `command` item in the batch that looks
 /// like a wrapped interpreter one-liner, or `None`. `code` and `target` items

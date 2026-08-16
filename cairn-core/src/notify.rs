@@ -51,8 +51,8 @@ pub(crate) fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
 /// Build a fully-scoped `jobs` db-change payload.
 ///
 /// LOAD-BEARING INVARIANT: any `jobs` db-change that carries `jobId` MUST also
-/// carry the complete scoping set (`issueId`/`executionId`/`parentJobId`/
-/// `parentToolUseId`/`projectId`). The frontend precisely-invalidates from these
+/// carry the complete scoping set (`issueId`/`threadId`/`executionId`/
+/// `parentJobId`/`parentToolUseId`/`projectId`). The frontend precisely-invalidates from these
 /// ids and has no cache-scan fallback to recover a missing one, so a payload
 /// with `jobId` but a missing `issueId` would silently skip the issue's
 /// job-list pane. Route every single-job change through this builder (it is
@@ -64,6 +64,7 @@ pub(crate) fn job_db_change_ids(
     action: &str,
     job_id: &str,
     issue_id: Option<&str>,
+    thread_id: Option<&str>,
     execution_id: Option<&str>,
     parent_job_id: Option<&str>,
     parent_tool_use_id: Option<&str>,
@@ -74,6 +75,7 @@ pub(crate) fn job_db_change_ids(
         "action": action,
         "jobId": job_id,
         "issueId": issue_id,
+        "threadId": thread_id,
         "executionId": execution_id,
         "parentJobId": parent_job_id,
         "parentToolUseId": parent_tool_use_id,
@@ -89,6 +91,7 @@ pub fn job_db_change(job: &models::Job, action: &str) -> Value {
         action,
         &job.id,
         job.issue_id.as_deref(),
+        job.thread_id.as_deref(),
         job.execution_id.as_deref(),
         job.parent_job_id.as_deref(),
         job.parent_tool_use_id.as_deref(),
@@ -110,7 +113,7 @@ pub(crate) async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &st
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT issue_id, execution_id, parent_job_id, parent_tool_use_id, project_id
+                        "SELECT issue_id, thread_id, execution_id, parent_job_id, parent_tool_use_id, project_id
                          FROM jobs WHERE id = ?1 LIMIT 1",
                         (job_id.as_str(),),
                     )
@@ -122,6 +125,7 @@ pub(crate) async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &st
                         row.opt_text(2)?,
                         row.opt_text(3)?,
                         row.opt_text(4)?,
+                        row.opt_text(5)?,
                     ))),
                     None => Ok(None),
                 }
@@ -129,17 +133,23 @@ pub(crate) async fn job_db_change_for_id(db: &LocalDb, job_id: &str, action: &st
         })
         .await;
     match scope {
-        Ok(Some((issue_id, execution_id, parent_job_id, parent_tool_use_id, Some(project_id)))) => {
-            job_db_change_ids(
-                action,
-                job_id,
-                issue_id.as_deref(),
-                execution_id.as_deref(),
-                parent_job_id.as_deref(),
-                parent_tool_use_id.as_deref(),
-                &project_id,
-            )
-        }
+        Ok(Some((
+            issue_id,
+            thread_id,
+            execution_id,
+            parent_job_id,
+            parent_tool_use_id,
+            Some(project_id),
+        ))) => job_db_change_ids(
+            action,
+            job_id,
+            issue_id.as_deref(),
+            thread_id.as_deref(),
+            execution_id.as_deref(),
+            parent_job_id.as_deref(),
+            parent_tool_use_id.as_deref(),
+            &project_id,
+        ),
         Ok(_) => json!({"table": "jobs", "action": action}),
         Err(error) => {
             log::warn!("Failed to load job scope for db-change {job_id}: {error}");
@@ -480,6 +490,7 @@ mod tests {
             dismissed_at: None,
             created_at: 1000,
             updated_at: 2000,
+            author: None,
             backend_override: None,
             merged_at: None,
             closed_at: None,
@@ -553,6 +564,7 @@ mod tests {
             "update",
             "job-1",
             Some("issue-1"),
+            Some("thread-1"),
             Some("exec-1"),
             Some("parent-1"),
             Some("tool-1"),
@@ -563,6 +575,7 @@ mod tests {
         assert_eq!(payload["action"], "update");
         assert_eq!(payload["jobId"], "job-1");
         assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["threadId"], "thread-1");
         assert_eq!(payload["executionId"], "exec-1");
         assert_eq!(payload["parentJobId"], "parent-1");
         assert_eq!(payload["parentToolUseId"], "tool-1");
@@ -573,12 +586,14 @@ mod tests {
 
     #[test]
     fn job_db_change_ids_serializes_absent_child_fields_as_null() {
-        let payload = job_db_change_ids("insert", "job-1", None, None, None, None, "project-1");
+        let payload =
+            job_db_change_ids("insert", "job-1", None, None, None, None, None, "project-1");
 
         // Keys are present and explicitly null (not omitted) so the frontend's
         // payloadString reads them as absent rather than choking.
         assert!(payload.get("issueId").is_some());
         assert!(payload["issueId"].is_null());
+        assert!(payload["threadId"].is_null());
         assert!(payload["executionId"].is_null());
         assert!(payload["parentJobId"].is_null());
         assert!(payload["parentToolUseId"].is_null());
@@ -594,6 +609,7 @@ mod tests {
         assert_eq!(payload["table"], "jobs");
         assert_eq!(payload["jobId"], "job-1");
         assert_eq!(payload["issueId"], "issue-1");
+        assert_eq!(payload["threadId"], "thread-1");
         assert_eq!(payload["executionId"], "exec-1");
         assert_eq!(payload["parentJobId"], "parent-1");
         assert_eq!(payload["parentToolUseId"], "tool-1");
@@ -687,6 +703,7 @@ mod tests {
             status: models::JobStatus::Running,
             agent_config_id: None,
             issue_id: Some("issue-1".into()),
+            thread_id: Some("thread-1".into()),
             project_id: "project-1".into(),
             task_description: None,
             model: None,

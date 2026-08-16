@@ -6,6 +6,7 @@ use crate::storage::{run_db_blocking, LocalDb};
 fn persist_system_direct(
     orch: &Orchestrator,
     recipient_run_id: &str,
+    sender_name: &str,
     message: &str,
     urgency: DeliveryUrgency,
 ) -> Result<String, String> {
@@ -23,7 +24,7 @@ fn persist_system_direct(
         &ChannelType::Direct,
         None,
         None,
-        "system",
+        sender_name,
         Some(recipient_run_id),
         message,
         Some(urgency),
@@ -96,6 +97,7 @@ pub(crate) async fn queue_passive_parent_push(
 pub(crate) fn queue_or_resume_parent(
     orch: &Orchestrator,
     parent_job_id: &str,
+    sender_name: Option<&str>,
     message: &str,
     urgency: DeliveryUrgency,
 ) {
@@ -123,7 +125,13 @@ pub(crate) fn queue_or_resume_parent(
     if let Some(recipient_run_id) =
         crate::messages::delivery::latest_run_for_job(&owning, parent_job_id)
     {
-        let message_id = match persist_system_direct(orch, &recipient_run_id, message, urgency) {
+        let message_id = match persist_system_direct(
+            orch,
+            &recipient_run_id,
+            sender_name.unwrap_or("system"),
+            message,
+            urgency,
+        ) {
             Ok(message_id) => {
                 // Ride the attention push queue (CAIRN-1900): create a `direct:`
                 // push so the nudge below has a drainable push and the raw
@@ -211,7 +219,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1)",
+                     VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1)",
                     (),
                 )
                 .await?;
@@ -248,7 +256,7 @@ mod tests {
         assert!(queue_passive_parent_push(
             &db,
             "child",
-            "cairn://p/PROJ/2/1/builder/checks",
+            "cairn://p/proj/2/1/builder/checks",
             "turn-checks-infrastructure:child",
             "state-a",
         )
@@ -257,7 +265,7 @@ mod tests {
         assert!(!queue_passive_parent_push(
             &db,
             "child",
-            "cairn://p/PROJ/2/1/builder/checks",
+            "cairn://p/proj/2/1/builder/checks",
             "turn-checks-infrastructure:child",
             "state-a",
         )
@@ -266,7 +274,7 @@ mod tests {
         assert!(queue_passive_parent_push(
             &db,
             "child",
-            "cairn://p/PROJ/2/1/builder/checks",
+            "cairn://p/proj/2/1/builder/checks",
             "turn-checks-infrastructure:child",
             "state-b",
         )
@@ -309,7 +317,7 @@ mod tests {
             queue_passive_parent_push(
                 &db,
                 "child",
-                "cairn://p/PROJ/2/1/builder/checks",
+                "cairn://p/proj/2/1/builder/checks",
                 "turn-checks-infrastructure:child",
                 "state-a",
             )

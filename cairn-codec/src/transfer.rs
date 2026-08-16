@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::packfile::ExecutionPack;
+use crate::packfile::{pack_scratch_dir, ExecutionPack};
 
 const PACK_FRAME_MAGIC: &[u8; 8] = b"CAIRNPK1";
 const PACK_FRAME_VERSION: u16 = 1;
@@ -429,7 +429,7 @@ fn canonical_object_sizes(
 }
 
 fn build_pack_from_oids(repository: &Path, object_ids: &str) -> Result<ExecutionPack, String> {
-    let scratch = tempfile::tempdir().map_err(|e| format!("creating pack scratch dir: {e}"))?;
+    let scratch = pack_scratch_dir(repository)?;
     let base = scratch.path().join("range");
     let mut child = Command::new("git")
         .current_dir(repository)

@@ -48,7 +48,7 @@ async fn ctx() -> Ctx {
     let config_dir = temp.path().join("config");
     let (db_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "CKL").await;
+    let project_id = common::create_project(&db, "ckl").await;
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db.clone(), search_index));
     let services = Arc::new(TestServicesBuilder::new().build());

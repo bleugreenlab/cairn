@@ -7,6 +7,14 @@ use super::types::*;
 // where the key name + type + example don't already make the value obvious; an
 // empty note renders as just `key(type)`.
 pub(crate) const CONTENT: KeySpec = KeySpec::new("content", KeyType::Str, "");
+/// Node/task direct messages only. A project or issue channel append ignores
+/// this key, so declaring it there would advertise a promise that surface does
+/// not keep.
+pub(crate) const ESCALATE: KeySpec = KeySpec::new(
+    "escalate",
+    KeyType::Bool,
+    "interrupt the recipient's active turn instead of queueing for its next one",
+);
 pub(crate) const PROGRESS_KIND: KeySpec = KeySpec::new("kind", KeyType::Str, "phase | log");
 pub(crate) const PROGRESS_TEXT: KeySpec = KeySpec::new(
     "text",
@@ -256,9 +264,43 @@ pub(crate) const SKILL_NAME: KeySpec = KeySpec::new("name", KeyType::Str, "");
 pub(crate) const PACK_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "install (materialize an available pack) | update (re-sync an installed one, preserving edits) | restore (bring back items you removed)",
+    "install | update | restore | export (requires path)",
+);
+pub(crate) const PACK_PATH: KeySpec =
+    KeySpec::new("path", KeyType::Str, "local Agent Plugin directory");
+pub(crate) const PACK_ITEM_KIND: KeySpec = KeySpec::new(
+    "kind",
+    KeyType::Str,
+    "required for reset-item: which kind of packed item to restore",
+);
+pub(crate) const PACK_ITEM_ID: KeySpec = KeySpec::new(
+    "itemId",
+    KeyType::Str,
+    "required for reset-item: the packed item to restore to its shipped form",
 );
 pub(crate) const SKILL_PROMPT: KeySpec = KeySpec::new("prompt", KeyType::Str, "SKILL.md body");
+pub(crate) const SKILL_ALLOWED_TOOLS: KeySpec = KeySpec::new(
+    "allowedTools",
+    KeyType::Array,
+    "tool names this skill is allowed to use; empty clears the restriction",
+);
+pub(crate) const SKILL_SOURCE_ISSUE: KeySpec = KeySpec::new(
+    "sourceIssue",
+    KeyType::Str,
+    "issue this skill came from; defaults to the writing run's issue",
+);
+pub(crate) const SKILL_APPEND_TO_PROMPT: KeySpec = KeySpec::with_aliases(
+    "appendToPrompt",
+    &["append_to_prompt"],
+    KeyType::Str,
+    "append to SKILL.md instead of replacing it",
+);
+pub(crate) const SKILL_REPLACE_SECTION: KeySpec = KeySpec::with_aliases(
+    "replaceSection",
+    &["replace_section"],
+    KeyType::Object,
+    "{heading, content} — replace one SKILL.md section in place",
+);
 pub(crate) const MEMORY_NAME: KeySpec = KeySpec::new(
     "name",
     KeyType::Str,
@@ -284,8 +326,9 @@ pub(crate) const MEMORY_REASON: KeySpec = KeySpec::new(
     KeyType::Str,
     "why this triage decision is correct",
 );
-pub(crate) const MEMORY_NEW_SCOPE: KeySpec = KeySpec::new(
+pub(crate) const MEMORY_NEW_SCOPE: KeySpec = KeySpec::with_aliases(
     "newScope",
+    &["new_scope"],
     KeyType::Object,
     "optional for defer: {scope,value} (project key or role name); re-pools as pending",
 );
@@ -322,6 +365,16 @@ pub(crate) const PERMISSION_DECISION: KeySpec =
     KeySpec::new("decision", KeyType::Str, "allow|deny");
 pub(crate) const PERMISSION_SCOPE: KeySpec =
     KeySpec::new("scope", KeyType::Str, "once|session (default once)");
+pub(crate) const PERMISSION_LIFETIME: KeySpec = KeySpec::new(
+    "lifetime",
+    KeyType::Str,
+    "how long an allow decision grants authority for, beyond this one answer",
+);
+pub(crate) const PERMISSION_EXPIRES_IN_SECONDS: KeySpec = KeySpec::new(
+    "expiresInSeconds",
+    KeyType::Int,
+    "explicit expiry for an allow decision, in seconds from now",
+);
 pub(crate) const ANSWERS: KeySpec = KeySpec::new(
     "answers",
     KeyType::Array,
@@ -388,6 +441,26 @@ pub(crate) const AGENT_DISALLOWED: KeySpec = KeySpec::with_aliases(
 );
 pub(crate) const AGENT_SKILLS: KeySpec =
     KeySpec::new("skills", KeyType::Array, "skill ids to inject");
+pub(crate) const AGENT_ICON: KeySpec =
+    KeySpec::new("icon", KeyType::Str, "icon name shown beside the agent");
+pub(crate) const AGENT_HOOKS: KeySpec = KeySpec::new(
+    "hooks",
+    KeyType::Any,
+    "lifecycle hook configuration, stored verbatim",
+);
+/// Superseded by `fence`, still read so existing agent definitions keep working.
+pub(crate) const AGENT_SANDBOX: KeySpec = KeySpec::new(
+    "sandbox",
+    KeyType::Str,
+    "legacy, use fence: workspace-write | read-only | danger-full-access",
+);
+/// Superseded by `fence`, still read so existing agent definitions keep working.
+pub(crate) const AGENT_ON_ESCAPE: KeySpec = KeySpec::with_aliases(
+    "onEscape",
+    &["on_escape"],
+    KeyType::Str,
+    "legacy, use fence: deny | ask | allow",
+);
 pub(crate) const ACTION_NAME: KeySpec = KeySpec::new("name", KeyType::Str, "");
 pub(crate) const ACTION_COMMAND: KeySpec = KeySpec::with_aliases(
     "commandTemplate",
@@ -433,6 +506,11 @@ pub(crate) const MCP_HEADERS: KeySpec = KeySpec::new(
 );
 pub(crate) const MCP_ENABLED: KeySpec =
     KeySpec::new("enabled", KeyType::Bool, "expose to agents (default true)");
+pub(crate) const MCP_OAUTH: KeySpec = KeySpec::new(
+    "oauth",
+    KeyType::Object,
+    "non-secret OAuth block only: {clientId?, scopes?}; tokens and client secrets live in the keychain and are never set here",
+);
 pub(crate) const MCP_SCOPE: KeySpec = KeySpec::new(
     "scope",
     KeyType::Str,
@@ -680,8 +758,11 @@ pub(crate) const TASK_MESSAGES_RELATED: &[RelatedSpec] = &[RelatedSpec {
 }];
 
 // --- workspace settings (cairn://settings patch) ---
-pub(crate) const SETTINGS_ACTIVE_BACKEND: KeySpec =
-    KeySpec::new("activeBackend", KeyType::Str, "claude|codex");
+pub(crate) const SETTINGS_TIER_DEFAULTS: KeySpec = KeySpec::new(
+    "tierDefaults",
+    KeyType::Object,
+    "tier -> default backend, e.g. {lg: claude, sm: codex}",
+);
 pub(crate) const SETTINGS_TIERS: KeySpec = KeySpec::new("tiers", KeyType::Array, "tier ordering");
 pub(crate) const SETTINGS_BACKENDS: KeySpec =
     KeySpec::new("backends", KeyType::Object, "backend -> tier -> preset map");
@@ -700,7 +781,7 @@ pub(crate) const SETTINGS_GIT_IDENTITIES: KeySpec = KeySpec::new(
 pub(crate) const SETTINGS_ACCOUNTS: KeySpec = KeySpec::new(
     "accounts",
     KeyType::Object,
-    "{add[{provider,label,authType,authValue?}], update[{id,label}], remove[ids], order{provider,ids}} (api_key|oauth_token|local_cli only; OAuth browser add stays UI-only)",
+    "{add[{provider,label,authType,authValue?}], update[{id,label}], remove[ids], order{provider,ids}} (api_key|oauth_token|base_url only; Claude sign-in stays UI-only)",
 );
 pub(crate) const SETTINGS_KEYBINDS: KeySpec = KeySpec::new(
     "keybinds",
@@ -711,6 +792,93 @@ pub(crate) const SETTINGS_BUILD_SERVICES: KeySpec = KeySpec::new(
     "buildServices",
     KeyType::Object,
     "{upsert[{name,config}], setEnabled[{name,enabled}], remove[names]}",
+);
+pub(crate) const SETTINGS_MAX_THINKING_TOKENS: KeySpec = KeySpec::new(
+    "maxThinkingTokens",
+    KeyType::Int,
+    "thinking budget per turn; null restores the backend default",
+);
+pub(crate) const SETTINGS_ORPHAN_CLEANUP_DAYS: KeySpec = KeySpec::new(
+    "orphanCleanupDays",
+    KeyType::Int,
+    "days before orphaned worktrees are swept",
+);
+pub(crate) const SETTINGS_REPO_TARGET_SWEEP_DAYS: KeySpec = KeySpec::new(
+    "repoTargetSweepDays",
+    KeyType::Int,
+    "days before stale build artifacts in project checkouts are swept; 0 disables",
+);
+pub(crate) const SETTINGS_BUG_REPORTS: KeySpec = KeySpec::new(
+    "bugReports",
+    KeyType::Bool,
+    "whether agents may file bug reports",
+);
+pub(crate) const SETTINGS_THINKING_DISPLAY_MODE: KeySpec = KeySpec::new(
+    "thinkingDisplayMode",
+    KeyType::Str,
+    "how thinking blocks render in transcripts",
+);
+pub(crate) const SETTINGS_TRANSCRIPT_TEXT_SIZE: KeySpec = KeySpec::new(
+    "transcriptTextSize",
+    KeyType::Str,
+    "base text scale for transcript markdown",
+);
+pub(crate) const SETTINGS_TRANSCRIPT_DENSITY: KeySpec = KeySpec::new(
+    "transcriptDensity",
+    KeyType::Str,
+    "vertical rhythm preset for transcript markdown",
+);
+pub(crate) const SETTINGS_LOG_LEVEL: KeySpec =
+    KeySpec::new("logLevel", KeyType::Str, "file-log verbosity");
+pub(crate) const SETTINGS_LOG_RETENTION_DAYS: KeySpec = KeySpec::new(
+    "logRetentionDays",
+    KeyType::Int,
+    "days of daily JSONL logs to retain",
+);
+pub(crate) const SETTINGS_MEMORY_TRIAGE_ENABLED: KeySpec = KeySpec::new(
+    "memoryTriageEnabled",
+    KeyType::Bool,
+    "whether memory-triage issues are created automatically",
+);
+pub(crate) const SETTINGS_MAX_OPEN_TRIAGE_ISSUES: KeySpec = KeySpec::new(
+    "maxOpenTriageIssuesPerScope",
+    KeyType::Int,
+    "cap on simultaneously open memory-triage issues for one exact scope",
+);
+pub(crate) const SETTINGS_PENDING_MEMORY_THRESHOLD: KeySpec = KeySpec::new(
+    "pendingMemoryThreshold",
+    KeyType::Int,
+    "pending memories in one scope that trigger a triage issue",
+);
+pub(crate) const SETTINGS_THREAD_COMPACT_THRESHOLD: KeySpec = KeySpec::new(
+    "threadCompactThreshold",
+    KeyType::Float,
+    "fraction of the context window at which a warm thread session rebuilds",
+);
+pub(crate) const SETTINGS_EXTERNAL_REPLIES: KeySpec = KeySpec::new(
+    "externalReplies",
+    KeyType::Str,
+    "policy for replies addressed to an external correspondent",
+);
+pub(crate) const SETTINGS_SUBSCRIPTION_FEES: KeySpec = KeySpec::new(
+    "subscriptionFees",
+    KeyType::Object,
+    "backend -> flat monthly fee in USD; replaces the whole map",
+);
+pub(crate) const SETTINGS_OPENROUTER_ROUTING: KeySpec = KeySpec::new(
+    "openrouterRouting",
+    KeyType::Object,
+    "OpenRouter provider-routing controls; replaces the whole object",
+);
+pub(crate) const SETTINGS_ROUTE_CALLS_VIA_OPENROUTER: KeySpec = KeySpec::new(
+    "routeCallsViaOpenRouter",
+    KeyType::Bool,
+    "route tier-based ephemeral calls through OpenRouter instead of the native backend",
+);
+pub(crate) const SETTINGS_CHANNELS: KeySpec = KeySpec::new(
+    "channels",
+    KeyType::Object,
+    "workspace external delivery policy; replaces the whole object",
 );
 
 // --- projects collection + project lifecycle ---
@@ -774,4 +942,20 @@ pub(crate) const PS_CHECKS: KeySpec = KeySpec::new(
     "checks",
     KeyType::Object,
     "{name: {full, select?{mode,command,targetsFrom?}, impact?[], parse?, policy?, when?, deterministic?}}; empty object clears all",
+);
+
+// --- posts ---
+pub(crate) const POST_CONTENT: KeySpec =
+    KeySpec::new("content", KeyType::Str, "non-empty Markdown");
+pub(crate) const POST_TITLE: KeySpec =
+    KeySpec::new("title", KeyType::Str, "optional non-empty title");
+pub(crate) const POST_SCOPE: KeySpec = KeySpec::new(
+    "scope",
+    KeyType::Str,
+    "project or the authenticated caller's own project key",
+);
+pub(crate) const FEED_ACK: KeySpec = KeySpec::new(
+    "ack",
+    KeyType::Str,
+    "the acknowledgement token this home's last feed read returned; a position cannot be named",
 );

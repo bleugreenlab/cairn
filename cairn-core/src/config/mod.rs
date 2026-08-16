@@ -76,6 +76,81 @@ pub fn get_config_dir() -> Result<PathBuf, String> {
     Ok(cairn_common::paths::cairn_home())
 }
 
+fn git_commit_paths_with_identity(
+    repo_root: &Path,
+    msg: &str,
+    paths: &[PathBuf],
+) -> Option<String> {
+    let mut command = crate::env::git();
+    command.args([
+        "-c",
+        "user.name=Cairn",
+        "-c",
+        "user.email=cairn@local.invalid",
+        "commit",
+        "--only",
+        "-m",
+        msg,
+        "--",
+    ]);
+    command.args(paths);
+    match command.current_dir(repo_root).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => {
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if !combined.contains("nothing to commit") {
+                log::warn!(
+                    "Failed to commit scoped config paths in {:?}: {}",
+                    repo_root,
+                    combined.trim()
+                );
+            }
+            return None;
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to commit scoped config paths in {:?}: {error}",
+                repo_root
+            );
+            return None;
+        }
+    }
+    let head = crate::env::git()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .ok()?;
+    head.status
+        .success()
+        .then(|| String::from_utf8_lossy(&head.stdout).trim().to_string())
+}
+
+/// Commit one project config path and require that its containing repository
+/// actually received a commit. Routine project-setting writes use this stricter
+/// boundary so a successful response cannot leave config bytes uncommitted.
+pub(crate) fn commit_config_path_required(path: &Path, msg: &str) -> Result<(), String> {
+    let Some(root) = path.parent().and_then(git_work_tree_root) else {
+        return Ok(());
+    };
+    let commits = commit_config_paths(&[path.to_path_buf()], msg);
+    if commits
+        .iter()
+        .any(|(committed_root, _)| *committed_root == root)
+    {
+        std::thread::spawn(move || push_workspace_repo_best_effort(&root));
+        Ok(())
+    } else {
+        Err(format!(
+            "failed to commit project config {} after writing it",
+            path.display()
+        ))
+    }
+}
+
 /// Get project repo path from project ID
 pub async fn get_project_path(db: &LocalDb, project_id: &str) -> Result<PathBuf, String> {
     let project_id = project_id.to_string();
@@ -223,11 +298,10 @@ fn git_commit_with_identity(repo_root: &Path, msg: &str) -> Option<String> {
 pub fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<(PathBuf, String)> {
     use std::collections::BTreeMap;
 
-    // Map each repo's work-tree root to a directory inside it that we can run
-    // `git commit` from. Staging happens per path (relative to its parent dir,
-    // sidestepping symlinked-temp-dir pathspec mismatches); the commit happens
-    // once per repo.
-    let mut repos: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
+    // Explicit commit pathspecs keep unrelated pre-staged user work out of the
+    // app-authored commit. New files need intent-to-add so a path-limited commit
+    // accepts them without staging their contents in the caller's index.
+    let mut repos: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
     for path in paths {
         let Some(parent) = path.parent() else {
             continue;
@@ -238,31 +312,32 @@ pub fn commit_config_paths(paths: &[PathBuf], msg: &str) -> Vec<(PathBuf, String
         let Some(root) = git_work_tree_root(parent) else {
             continue;
         };
-        let Some(name) = path.file_name() else {
+        let Ok(relative) = path.strip_prefix(&root) else {
             continue;
         };
-        match crate::env::git()
-            .arg("add")
-            .arg("--")
-            .arg(name)
-            .current_dir(parent)
+        let tracked = crate::env::git()
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(relative)
+            .current_dir(&root)
             .output()
-        {
-            Ok(out) if out.status.success() => {
-                repos.entry(root).or_insert_with(|| parent.to_path_buf());
+            .is_ok_and(|output| output.status.success());
+        if !tracked && path.exists() {
+            let staged = crate::env::git()
+                .args(["add", "--intent-to-add", "--"])
+                .arg(relative)
+                .current_dir(&root)
+                .output();
+            if !staged.is_ok_and(|output| output.status.success()) {
+                log::warn!("Failed to mark new config path {:?} intent-to-add", path);
+                continue;
             }
-            Ok(out) => log::warn!(
-                "Failed to stage config path {:?}: {}",
-                path,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(e) => log::warn!("Failed to stage config path {:?}: {e}", path),
         }
+        repos.entry(root).or_default().push(relative.to_path_buf());
     }
 
     let mut commits = Vec::new();
-    for (root, dir) in repos {
-        if let Some(sha) = git_commit_with_identity(&dir, msg) {
+    for (root, paths) in repos {
+        if let Some(sha) = git_commit_paths_with_identity(&root, msg, &paths) {
             commits.push((root, sha));
         }
     }
@@ -1144,9 +1219,15 @@ mod tests {
 
         let status = git_status(repo);
         assert!(
-            status.contains("unrelated.txt"),
-            "unrelated file should remain dirty: {status:?}"
+            status.contains("A  unrelated.txt"),
+            "unrelated file should remain staged: {status:?}"
         );
+        let committed_files = crate::env::git()
+            .args(["show", "--pretty=", "--name-only", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&committed_files.stdout).contains("unrelated.txt"));
         assert!(
             !status.contains("planner.md"),
             "planner.md should have been committed: {status:?}"
@@ -1332,8 +1413,15 @@ mod tests {
         let repo = temp.path();
         init_git_repo(repo);
         std::fs::write(repo.join("settings.yaml"), "a: 1\n").unwrap();
-        // Unrelated dirty state in the same repo must be left alone.
+        // Unrelated staged state in the same repo must be left out of the
+        // app-authored commit and remain staged for the user's next commit.
         std::fs::write(repo.join("unrelated.txt"), "dirty").unwrap();
+        assert!(crate::env::git()
+            .args(["add", "--", "unrelated.txt"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
 
         // push_root = None: commit only, no push attempted.
         commit_and_maybe_push(

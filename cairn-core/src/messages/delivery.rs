@@ -60,6 +60,7 @@ pub async fn append_thread_message(
             detail_uri: None,
             delivery: WakeDelivery::Targeted {
                 subscriber_job_id: job_id,
+                sender_name: Some(sender_name.to_string()),
                 message: content.to_string(),
             },
             urgency: DeliveryUrgency::Steer,
@@ -901,7 +902,7 @@ mod tests {
     async fn seed_thread_session_run(db: &LocalDb) {
         db.execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('proj-1','default','Test Project','PROJ','/tmp/test-repo',1,1);
+               VALUES ('proj-1','default','Test Project','proj','/tmp/test-repo',1,1);
              INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
                VALUES ('thread-1','proj-1','general','active','none',1,1);
              INSERT INTO jobs (id, thread_id, project_id, node_name, uri_segment, status, created_at, updated_at)
@@ -1017,7 +1018,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Test Project', 'PROJ', '/tmp/test-repo', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Test Project', 'proj', '/tmp/test-repo', 1, 1)",
                     (),
                 )
                 .await?;
@@ -1123,10 +1124,10 @@ mod tests {
         crate::orchestrator::attention_push::push(
             db,
             recipient,
-            "cairn://p/PROJ/42",
+            "cairn://p/proj/42",
             crate::orchestrator::attention_push::Wake::Wake,
             crate::orchestrator::attention_push::Boundary::Event,
-            "resolved:cairn://p/PROJ/42",
+            "resolved:cairn://p/proj/42",
         )
         .await
         .unwrap();
@@ -1238,10 +1239,10 @@ mod tests {
         crate::orchestrator::attention_push::push(
             &db,
             "job-1",
-            "cairn://p/PROJ/42",
+            "cairn://p/proj/42",
             crate::orchestrator::attention_push::Wake::Wake,
             crate::orchestrator::attention_push::Boundary::Event,
-            "review:cairn://p/PROJ/42",
+            "review:cairn://p/proj/42",
         )
         .await
         .unwrap();
@@ -1275,7 +1276,7 @@ mod tests {
         seed_side_channel_notice(
             &db,
             "job-1",
-            "cairn://p/P/9/1/child",
+            "cairn://p/p/9/1/child",
             "user pinged the child",
         )
         .await;

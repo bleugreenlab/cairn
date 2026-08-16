@@ -6,6 +6,7 @@
 
 pub(crate) mod context;
 pub(crate) mod conversation;
+pub(crate) mod generation;
 pub(crate) mod http;
 pub(crate) mod wire;
 

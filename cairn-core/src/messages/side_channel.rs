@@ -465,7 +465,7 @@ mod tests {
             let job_id = job_id.clone();
             Box::pin(async move {
                 conn.execute("INSERT OR IGNORE INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1)", ()).await?;
-                conn.execute("INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','P','/tmp',1,1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p','w','P','p','/tmp',1,1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i','p',1,'I','active','active','none',1,1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES(?1,'p','i','complete','s',1,1)", params![job_id.as_str()]).await?;
                 Ok(())
@@ -482,7 +482,7 @@ mod tests {
             let run_id = run_id.clone();
             let run_status = run_status.clone();
             Box::pin(async move {
-                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj-1', 'default', 'Project', 'PROJ', '/tmp/repo', 1, 1)", ()).await?;
+                conn.execute("INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj-1', 'default', 'Project', 'proj', '/tmp/repo', 1, 1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('issue-1', 'proj-1', 42, 'Issue', 'active', 1, 1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1)", ()).await?;
                 conn.execute("INSERT OR IGNORE INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, node_name, uri_segment, status, created_at, updated_at) VALUES (?1, 'exec-1', 'builder', 'issue-1', 'proj-1', ?1, ?1, 'running', 1, 1)", params![job_id.as_str()]).await?;
@@ -590,7 +590,7 @@ mod tests {
             assert_eq!(claimed.len(), 1);
             assert_eq!(
                 claimed[0].render(),
-                "[Side-channel] the user commented on this issue cairn://p/PROJ/42:\nplease consider this"
+                "[Side-channel] the user commented on this issue cairn://p/proj/42:\nplease consider this"
             );
             assert_eq!(claimed[0].channel_type(), "issue_comment");
         }
@@ -626,7 +626,7 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(
             claimed[0].render(),
-            "[Side-channel] an agent posted a message on this issue cairn://p/PROJ/42:\nmessage for siblings"
+            "[Side-channel] an agent posted a message on this issue cairn://p/proj/42:\nmessage for siblings"
         );
         assert_eq!(claimed[0].channel_type(), "issue_message");
     }
@@ -635,8 +635,8 @@ mod tests {
     async fn issue_message_notice_round_trips_origin_and_bare_content() {
         let db = migrated_db().await;
         seed_parent_job(&db, "job-a").await;
-        let issue_uri = "cairn://p/PROJ/42";
-        let rendered = "[Side-channel] the user posted a message on this issue cairn://p/PROJ/42:\nmessage body";
+        let issue_uri = "cairn://p/proj/42";
+        let rendered = "[Side-channel] the user posted a message on this issue cairn://p/proj/42:\nmessage body";
         let wake = crate::orchestrator::wakes::record_live_issue_message_side_channel_message(
             &db, "job-a", issue_uri, rendered,
         )
@@ -710,7 +710,7 @@ mod tests {
             assert_eq!(claimed.len(), 1);
             assert_eq!(
                 claimed[0].render(),
-                "[Side-channel] an agent commented on this issue cairn://p/PROJ/42:\nsibling update"
+                "[Side-channel] an agent commented on this issue cairn://p/proj/42:\nsibling update"
             );
         }
     }
@@ -719,9 +719,9 @@ mod tests {
     async fn issue_comment_notice_round_trips_origin_and_bare_content() {
         let db = migrated_db().await;
         seed_parent_job(&db, "job-a").await;
-        let issue_uri = "cairn://p/PROJ/42";
+        let issue_uri = "cairn://p/proj/42";
         let rendered =
-            "[Side-channel] the user commented on this issue cairn://p/PROJ/42:\ncomment body";
+            "[Side-channel] the user commented on this issue cairn://p/proj/42:\ncomment body";
         let wake = crate::orchestrator::wakes::record_live_comment_side_channel_message(
             &db, "job-a", issue_uri, rendered,
         )
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(notice.channel_type(), "issue_comment");
 
         let child =
-            insert_notice_for_test(&db, "job-child", "cairn://p/PROJ/42/1/child", "child body")
+            insert_notice_for_test(&db, "job-child", "cairn://p/proj/42/1/child", "child body")
                 .await;
         assert_eq!(child.origin, SideChannelOrigin::UserChild);
         assert_eq!(child.content, "child body");
@@ -750,9 +750,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn claim_pending_side_channel_marks_delivered_and_filters_by_parent_job() {
         let db = migrated_db().await;
-        let first = insert_notice_for_test(&db, "parent-a", "cairn://p/P/1/1/child", "one").await;
-        let second = insert_notice_for_test(&db, "parent-a", "cairn://p/P/2/1/child", "two").await;
-        insert_notice_for_test(&db, "parent-b", "cairn://p/P/3/1/child", "three").await;
+        let first = insert_notice_for_test(&db, "parent-a", "cairn://p/p/1/1/child", "one").await;
+        let second = insert_notice_for_test(&db, "parent-a", "cairn://p/p/2/1/child", "two").await;
+        insert_notice_for_test(&db, "parent-b", "cairn://p/p/3/1/child", "three").await;
 
         let claimed = claim_pending_side_channel_for_job_async(&db, "parent-a")
             .await
@@ -778,7 +778,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn peek_pending_side_channel_does_not_stamp_delivered() {
         let db = migrated_db().await;
-        insert_notice_for_test(&db, "parent-a", "cairn://p/P/1/1/child", "queued").await;
+        insert_notice_for_test(&db, "parent-a", "cairn://p/p/1/1/child", "queued").await;
 
         // Peek returns the pending notice without stamping it...
         let peeked = peek_pending_side_channel_for_job_async(&db, "parent-a")

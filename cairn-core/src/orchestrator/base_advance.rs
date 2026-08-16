@@ -74,6 +74,35 @@ pub(crate) async fn publish_managed_branch(
         .map_err(|error| format!("stale publication retry failed: {error}"))
 }
 
+/// Invalidate every cached GitHub verdict for a branch that moved locally but
+/// did not reach origin. The live artifact compares GitHub's head with the store
+/// and names both commits; this cache downgrade closes the window before anyone
+/// opens that artifact, so the desktop cannot continue presenting the old head's
+/// green mergeability as current.
+async fn mark_publication_unconfirmed(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp();
+    db.execute(
+        "UPDATE merge_requests
+         SET github_mergeable = 'UNKNOWN', github_fetched_at = NULL, updated_at = ?3
+         WHERE project_id = ?1 AND source_branch = ?2
+           AND status NOT IN ('merged', 'closed')
+           AND (github_state IS NULL OR lower(github_state) NOT IN ('merged', 'closed'))",
+        params![project_id, branch, now],
+    )
+    .await
+    .map_err(|error| format!("invalidate stale pull-request verdict for `{branch}`: {error}"))?;
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "merge_requests", "action": "update"}),
+    );
+    Ok(())
+}
+
 async fn release_reminted_claim_after_failure(
     db: &LocalDb,
     original_intent_id: &str,
@@ -2558,6 +2587,14 @@ async fn execute_reconcile_claim(
                     after.insert(branch.clone(), commit);
                 }
             }
+            if before.get(branch) != after.get(branch) {
+                if let Some(sibling) = siblings
+                    .iter()
+                    .find(|sibling| sibling.branch.as_deref() == Some(branch.as_str()))
+                {
+                    orch.invalidate_node_check_status(&sibling.id, "base-or-fork-point-advance");
+                }
+            }
             item_report
         };
 
@@ -2612,9 +2649,17 @@ async fn execute_reconcile_claim(
                 item_report
                     .rebased_clean
                     .retain(|candidate| candidate != branch);
+                let cache_diagnostic =
+                    mark_publication_unconfirmed(orch, db, &claim.project_id, branch)
+                        .await
+                        .err()
+                        .map(|cache_error| format!("; additionally, {cache_error}"))
+                        .unwrap_or_default();
                 item_report.failed.push(crate::jj::ReconcileFailure {
                     branch: branch.clone(),
-                    error: format!("origin push failed: {error}"),
+                    error: format!(
+                        "origin push failed: {error}. GitHub still holds the previous branch head; the pull-request artifact has been downgraded to UNKNOWN until publication recovers{cache_diagnostic}"
+                    ),
                 });
             }
         }
@@ -4163,8 +4208,8 @@ mod tests {
     /// store-wide list failed) disables the filter and proceeds with all.
     #[test]
     fn retain_present_siblings_drops_missing_and_honors_none() {
-        let live = "agent/CAIRN-1-builder-0".to_string();
-        let ghost = "agent/CAIRN-1-ghost-0".to_string();
+        let live = "agent/cairn-1-builder-0".to_string();
+        let ghost = "agent/cairn-1-ghost-0".to_string();
         let existing: std::collections::HashSet<String> = [live.clone()].into_iter().collect();
 
         let (retained, dropped) =
@@ -4446,6 +4491,78 @@ mod tests {
     const JOB_BASE: &str = "SELECT base_branch FROM jobs WHERE id = ?1";
     const MR_TARGET: &str = "SELECT target_branch FROM merge_requests WHERE id = ?1";
 
+    #[tokio::test]
+    async fn failed_publication_invalidates_the_open_pull_requests_cached_verdict() {
+        let db = Arc::new(migrated_db().await);
+        seed_base_advance_fixture(&db).await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-2', 'default', 'Other', 'other', '/other', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-other', 'proj-2', 1, 'Other', 'active', 1, 1);
+             INSERT INTO jobs (id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+               VALUES ('job-other', 'issue-other', 'proj-2', 'running', 'agent/clean', 'main', 1, 1);
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch,
+                status, github_state, github_mergeable, github_fetched_at, opened_at, updated_at)
+             VALUES
+               ('mr-open', 'job-clean', 'proj-1', 'issue-3', 'Open',
+                'agent/clean', 'main', 'open', 'OPEN', 'MERGEABLE', 100, 1, 1),
+               ('mr-github-resolved', 'job-overlap', 'proj-1', 'issue-2', 'Resolved remotely',
+                'agent/clean', 'main', 'open', 'MERGED', 'MERGEABLE', 100, 1, 1),
+               ('mr-other-project', 'job-other', 'proj-2', 'issue-other', 'Other project',
+                'agent/clean', 'main', 'open', 'OPEN', 'MERGEABLE', 100, 1, 1);",
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+
+        mark_publication_unconfirmed(&orch, &db, "proj-1", "agent/clean")
+            .await
+            .unwrap();
+
+        let open: (String, Option<i64>) = db
+            .query_one(
+                "SELECT github_mergeable, github_fetched_at FROM merge_requests WHERE id = 'mr-open'",
+                (),
+                |row| Ok((row.text(0)?, row.opt_i64(1)?)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open, ("UNKNOWN".to_string(), None));
+        for (id, reason) in [
+            (
+                "mr-github-resolved",
+                "GitHub-resolved pull requests are historical records",
+            ),
+            (
+                "mr-other-project",
+                "the same branch name in another project is unrelated",
+            ),
+        ] {
+            assert_eq!(
+                text_field(
+                    &db,
+                    "SELECT github_mergeable FROM merge_requests WHERE id = ?1",
+                    id,
+                )
+                .await
+                .as_deref(),
+                Some("MERGEABLE"),
+                "{reason} and must not be rewritten"
+            );
+        }
+    }
+
     /// A child issue's branch is cut from its parent's, and the parent's merge
     /// deletes that branch. Re-pointing is what keeps the child placeable
     /// afterwards, so it has to reach BOTH records that hold the dead name and
@@ -4531,7 +4648,7 @@ mod tests {
         db.execute_script(&format!(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-              VALUES ('proj-1', 'default', 'Project', 'PROJ', '{repo}', 'main', 1, 1);
+              VALUES ('proj-1', 'default', 'Project', 'proj', '{repo}', 'main', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
               VALUES ('issue-child', 'proj-1', 1, 'Child', 'active', 1, 1);
             INSERT INTO jobs (id, project_id, issue_id, status, branch, base_branch, created_at, updated_at)
@@ -4777,7 +4894,7 @@ mod tests {
         let incoming = IncomingIdentity {
             base_branch: "main".to_string(),
             pr_number: Some(2893),
-            issue: Some("CAIRN-3337".to_string()),
+            issue: Some("cairn-3337".to_string()),
         };
         record_conflict_session(&db, &claim.id, branch, &diagnostic, &incoming)
             .await
@@ -4796,7 +4913,7 @@ mod tests {
             "the stored fingerprint is the one the wake deduplicated on"
         );
         assert_eq!(session.incoming.pr_number, Some(2893));
-        assert_eq!(session.incoming.issue.as_deref(), Some("CAIRN-3337"));
+        assert_eq!(session.incoming.issue.as_deref(), Some("cairn-3337"));
 
         // The cross-file trap: a report naming only the conflicting path lets a
         // coordinated change land half-applied, so the clean-on-retry sibling
@@ -5144,7 +5261,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES ('proj-1', 'default', 'Project', 'PROJ', '/repo', 'main', 1, 1)",
+                     VALUES ('proj-1', 'default', 'Project', 'proj', '/repo', 'main', 1, 1)",
                     (),
                 )
                 .await?;
@@ -5528,7 +5645,7 @@ mod tests {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
         let orch = test_orchestrator(db, MockGitClient::new());
-        let branch = "agent/PROJ-integration";
+        let branch = "agent/proj-integration";
         let fingerprint = "aaa+bbb";
         let message = "ambiguous divergence";
         let recipients = ["run-job-overlap", "run-job-clean"];
@@ -5615,7 +5732,7 @@ mod tests {
                 branch, base_branch, created_at, updated_at)
              VALUES
                ('job-no-issue', NULL, 'node', NULL, 'proj-1', 'running',
-                'agent/PROJ-null-builder-0', 'integration', 1, 1);",
+                'agent/proj-null-builder-0', 'integration', 1, 1);",
         )
         .await
         .unwrap();
@@ -5634,7 +5751,7 @@ mod tests {
         let db = migrated_db().await;
         seed_base_advance_fixture(&db).await;
         db.execute_script(
-            "UPDATE jobs SET branch = 'agent/PROJ-2-builder-0' WHERE id = 'job-overlap';
+            "UPDATE jobs SET branch = 'agent/proj-2-builder-0' WHERE id = 'job-overlap';
              INSERT INTO job_terminals
                  (id, job_id, session_id, command, status, created_at, slug,
                   residency_holder, residency_incarnation_id, cell_epoch)
@@ -5645,7 +5762,7 @@ mod tests {
         .await
         .unwrap();
 
-        let leases = load_live_terminal_leases(&db, "proj-1", "agent/PROJ-2-builder-0")
+        let leases = load_live_terminal_leases(&db, "proj-1", "agent/proj-2-builder-0")
             .await
             .unwrap();
         assert_eq!(
@@ -5891,13 +6008,13 @@ mod tests {
     #[test]
     fn jj_conflict_note_carries_no_rebase_commands() {
         let issue = IssueInfo {
-            project_key: "PROJ".to_string(),
+            project_key: "proj".to_string(),
             number: 7,
         };
-        let note = build_jj_conflict_note("agent/CAIRN-1940-coordinator-0", Some(42), Some(&issue));
+        let note = build_jj_conflict_note("agent/cairn-1940-coordinator-0", Some(42), Some(&issue));
         assert!(note.contains("[Base branch update]"));
         assert!(note.contains("PR #42 merged"));
-        assert!(note.contains("cairn://p/PROJ/7"));
+        assert!(note.contains("cairn://p/proj/7"));
         // Stop-the-line: the note names the conflict as blocking, not optional.
         assert!(note.contains("BLOCKING"));
         // The rebase was ROLLED BACK, and saying so is what makes the note
@@ -5917,14 +6034,14 @@ mod tests {
     #[test]
     fn jj_clean_note_describes_clean_rebase_with_no_action() {
         let issue = IssueInfo {
-            project_key: "PROJ".to_string(),
+            project_key: "proj".to_string(),
             number: 7,
         };
-        let note = build_jj_clean_note("agent/CAIRN-1940-coordinator-0", Some(42), Some(&issue));
+        let note = build_jj_clean_note("agent/cairn-1940-coordinator-0", Some(42), Some(&issue));
         assert!(note.contains("[Base branch update]"));
-        assert!(note.contains("agent/CAIRN-1940-coordinator-0"));
+        assert!(note.contains("agent/cairn-1940-coordinator-0"));
         assert!(note.contains("PR #42 merged"));
-        assert!(note.contains("cairn://p/PROJ/7"));
+        assert!(note.contains("cairn://p/proj/7"));
         assert!(note.contains("cleanly"));
         assert!(note.contains("nothing to resolve"));
         // A clean rebase needs no manual git work.
@@ -5941,9 +6058,9 @@ mod tests {
         // live-bug case where reconcile previously found zero siblings because the
         // status filter excluded a `complete` job awaiting merge.
         db.execute_script(
-            "UPDATE jobs SET branch = 'agent/PROJ-4-builder-0' WHERE id = 'job-complete';
+            "UPDATE jobs SET branch = 'agent/proj-4-builder-0' WHERE id = 'job-complete';
              INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
-             VALUES ('mr-complete', 'job-complete', 'proj-1', 'issue-4', 'PR', 'agent/PROJ-4-builder-0', 'integration', 'open', 1, 1);",
+             VALUES ('mr-complete', 'job-complete', 'proj-1', 'issue-4', 'PR', 'agent/proj-4-builder-0', 'integration', 'open', 1, 1);",
         )
         .await
         .unwrap();
@@ -6150,11 +6267,11 @@ mod tests {
         let orch = test_orchestrator(db, MockGitClient::new());
         let siblings = vec![SiblingJob {
             id: "job-overlap".to_string(),
-            branch: Some("agent/PROJ-2-builder-0".to_string()),
+            branch: Some("agent/proj-2-builder-0".to_string()),
             base_commit: None,
         }];
         let failed = vec![crate::jj::ReconcileFailure {
-            branch: "agent/PROJ-2-builder-0".to_string(),
+            branch: "agent/proj-2-builder-0".to_string(),
             error: "jj bookmark rebase failed: exact stderr".to_string(),
         }];
 
@@ -6204,16 +6321,16 @@ mod tests {
         let siblings = vec![
             SiblingJob {
                 id: "job-overlap".to_string(),
-                branch: Some("agent/PROJ-2-builder-0".to_string()),
+                branch: Some("agent/proj-2-builder-0".to_string()),
                 base_commit: None,
             },
             SiblingJob {
                 id: "job-clean".to_string(),
-                branch: Some("agent/PROJ-3-builder-0".to_string()),
+                branch: Some("agent/proj-3-builder-0".to_string()),
                 base_commit: None,
             },
         ];
-        let conflicted = vec!["agent/PROJ-2-builder-0".to_string()];
+        let conflicted = vec!["agent/proj-2-builder-0".to_string()];
         let note = build_jj_conflict_note("integration", Some(42), None);
         // The cross-file trap this diagnostic exists for: the incoming change
         // conflicts on two files and ALSO carries a third that arrives cleanly.
@@ -6221,7 +6338,7 @@ mod tests {
         // and has no idea why (CAIRN-3337).
         let mut diagnostics: HashMap<String, crate::jj::ConflictDiagnostic> = HashMap::new();
         diagnostics.insert(
-            "agent/PROJ-2-builder-0".to_string(),
+            "agent/proj-2-builder-0".to_string(),
             crate::jj::ConflictDiagnostic {
                 base: Some("b".repeat(40)),
                 ours: Some("o".repeat(40)),
@@ -6432,17 +6549,17 @@ mod tests {
         let siblings = vec![
             SiblingJob {
                 id: "job-overlap".to_string(),
-                branch: Some("agent/PROJ-2-builder-0".to_string()),
+                branch: Some("agent/proj-2-builder-0".to_string()),
                 base_commit: None,
             },
             SiblingJob {
                 id: "job-clean".to_string(),
-                branch: Some("agent/PROJ-3-builder-0".to_string()),
+                branch: Some("agent/proj-3-builder-0".to_string()),
                 base_commit: None,
             },
         ];
         let ambiguous = vec![AmbiguousDivergence {
-            branch: "agent/PROJ-2-builder-0".to_string(),
+            branch: "agent/proj-2-builder-0".to_string(),
             change_id: "qpvuntsmxyzw".to_string(),
             twins: vec!["aaaa1111".to_string(), "bbbb2222".to_string()],
         }];
@@ -6529,10 +6646,10 @@ mod tests {
 
         let siblings = vec![SiblingJob {
             id: "job-clean".to_string(),
-            branch: Some("agent/PROJ-3-builder-0".to_string()),
+            branch: Some("agent/proj-3-builder-0".to_string()),
             base_commit: None,
         }];
-        let clean = vec!["agent/PROJ-3-builder-0".to_string()];
+        let clean = vec!["agent/proj-3-builder-0".to_string()];
         let note = build_jj_clean_note("integration", Some(42), None);
 
         notify_clean_siblings(
@@ -6752,7 +6869,7 @@ mod tests {
             &jj,
             &store,
             &wts.path().join("job"),
-            "agent/CAIRN-3192-builder-0",
+            "agent/cairn-3192-builder-0",
             "main",
             None,
         )
@@ -6771,7 +6888,7 @@ mod tests {
 
         assert!(branch_is_project_default(&db, "proj-1", "main").await);
         assert!(!branch_is_project_default(&db, "proj-1", "integration").await);
-        assert!(!branch_is_project_default(&db, "proj-1", "agent/CAIRN-1-builder-0").await);
+        assert!(!branch_is_project_default(&db, "proj-1", "agent/cairn-1-builder-0").await);
         assert!(
             !branch_is_project_default(&db, "no-such-project", "main").await,
             "an unreadable project must decline to reconcile rather than guess"

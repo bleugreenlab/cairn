@@ -89,7 +89,7 @@ async fn seed(db: &LocalDb) {
         let worker_id = worker_id.clone();
         Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','CSL','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','csl','/tmp/p',1,1)", ()).await?;
             conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
             conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('exec-1','recipe-1','i-1','p-1','running',1,1,?1)", (snapshot.as_str(),)).await?;
             conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-worker','exec-1',?1,'i-1','p-1','running','worker','worker',1,1)", (worker_id.as_str(),)).await?;
@@ -141,8 +141,8 @@ async fn ctx_self_living_doc_lifecycle_alongside_terminal_gate() {
     seed(&db).await;
     let orch = orchestrator(&temp, db.clone());
 
-    let scratch_uri = "cairn://p/CSL/1/1/worker/scratch";
-    let summary_uri = "cairn://p/CSL/1/1/worker/summary";
+    let scratch_uri = "cairn://p/csl/1/1/worker/scratch";
+    let summary_uri = "cairn://p/csl/1/1/worker/summary";
 
     // --- ctx-self living doc: create then patch repeatedly -----------------
     let r1 = common::change_resource(

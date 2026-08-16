@@ -1,7 +1,7 @@
 use crate::common;
 use std::sync::Arc;
 
-use crate::common::{change_resource as change, read_resource};
+use crate::common::{change_resource_as_run as change_as_run, read_resource};
 use cairn_common::uri::{build_issue_uri, build_project_issues_uri, build_project_uri};
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::{LocalDb, RowExt};
@@ -19,6 +19,7 @@ struct IssueProjectFixture {
 async fn issue_project_fixture(project_key: &str) -> IssueProjectFixture {
     let (temp, db, orch) = common::resource_orchestrator_fixture().await;
     let project_id = common::create_project(&db, project_key).await;
+    common::seed_authenticated_thread_run(&db, &project_id, "fixture", "run-issue-create").await;
     IssueProjectFixture {
         _temp: temp,
         db,
@@ -188,12 +189,12 @@ fn assert_not_contains_any(haystack: &str, unexpected: &[&str]) {
 
 #[tokio::test]
 async fn read_project_issues_uses_current_database_path() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     fixture.insert_issue(1, "First resource issue").await;
 
     let output = fixture.read_project_issues(None).await;
     assert!(output.contains("# Issues"));
-    assert!(output.contains("MCP-1"));
+    assert!(output.contains("mcp/1"));
     assert!(output.contains("First resource issue"));
 
     fixture.insert_issue(2, "Write after read").await;
@@ -207,7 +208,7 @@ async fn read_project_issues_uses_current_database_path() {
 
 #[tokio::test]
 async fn node_and_task_resources_resolve_by_stored_uri_segment() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     let issue_id = fixture
         .insert_issue_with_status_and_time(1, "Stored segment issue", "active", 1)
         .await;
@@ -255,25 +256,25 @@ async fn node_and_task_resources_resolve_by_stored_uri_segment() {
 
     assert!(read_resource(
         &fixture.orch,
-        "cairn://p/MCP/1/1/builder/artifact".to_string()
+        "cairn://p/mcp/1/1/builder/artifact".to_string()
     )
     .await
     .starts_with("node artifact"));
     assert!(read_resource(
         &fixture.orch,
-        "cairn://p/MCP/1/1/builder/task/explore/artifact".to_string()
+        "cairn://p/mcp/1/1/builder/task/explore/artifact".to_string()
     )
     .await
     .starts_with("task artifact"));
     assert!(read_resource(
         &fixture.orch,
-        "cairn://p/MCP/1/1/renamed-builder/artifact".to_string()
+        "cairn://p/mcp/1/1/renamed-builder/artifact".to_string()
     )
     .await
     .contains("Node 'renamed-builder' not found"));
     assert!(read_resource(
         &fixture.orch,
-        "cairn://p/MCP/1/1/builder/task/renamed-task/artifact".to_string()
+        "cairn://p/mcp/1/1/builder/task/renamed-task/artifact".to_string()
     )
     .await
     .contains("Task 'renamed-task' not found"));
@@ -281,7 +282,7 @@ async fn node_and_task_resources_resolve_by_stored_uri_segment() {
 
 #[tokio::test]
 async fn node_summary_surfaces_activity_and_latest_assistant_line() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     let issue_id = fixture
         .insert_issue_with_status_and_time(1, "Activity issue", "active", 1)
         .await;
@@ -343,7 +344,7 @@ async fn node_summary_surfaces_activity_and_latest_assistant_line() {
         .await
         .unwrap();
 
-    let summary = read_resource(&fixture.orch, "cairn://p/MCP/1/1/planner".to_string()).await;
+    let summary = read_resource(&fixture.orch, "cairn://p/mcp/1/1/planner".to_string()).await;
     assert_contains_all(
         &summary,
         &[
@@ -361,7 +362,7 @@ async fn node_summary_surfaces_activity_and_latest_assistant_line() {
 
 #[tokio::test]
 async fn project_root_is_overview_and_project_issues_is_collection() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     set_project_context(
         &fixture.db,
         &fixture.project_id,
@@ -388,7 +389,7 @@ async fn project_root_is_overview_and_project_issues_is_collection() {
         .insert_issue_with_status_and_time(6, "Newest activity", "active", 6)
         .await;
 
-    let project_root = read_resource(&fixture.orch, build_project_uri("MCP")).await;
+    let project_root = read_resource(&fixture.orch, build_project_uri("mcp")).await;
     let issue_collection = fixture.read_project_issues(None).await;
 
     assert_contains_all(
@@ -413,13 +414,13 @@ async fn project_root_is_overview_and_project_issues_is_collection() {
     );
     assert_not_contains_any(
         &project_root,
-        &["# Issues — MCP", "Oldest full listing only"],
+        &["# Issues — mcp", "Oldest full listing only"],
     );
 
     assert_contains_all(
         &issue_collection,
         &[
-            "# Issues — MCP",
+            "# Issues — mcp",
             "6 issue(s)",
             "Oldest full listing only",
             "Newest activity",
@@ -446,7 +447,7 @@ async fn project_root_is_overview_and_project_issues_is_collection() {
 
 #[tokio::test]
 async fn issue_read_renders_dependencies_and_possibly_related_issues() {
-    let fixture = issue_project_fixture("REL").await;
+    let fixture = issue_project_fixture("rel").await;
     let current_id = fixture
         .insert_issue_with_status_and_time(1, "Current work", "active", 3)
         .await;
@@ -456,7 +457,7 @@ async fn issue_read_renders_dependencies_and_possibly_related_issues() {
     let related_id = fixture
         .insert_issue_with_status_and_time(3, "Related work", "active", 1)
         .await;
-    insert_dependency(&fixture.db, &current_id, &build_issue_uri("REL", 2)).await;
+    insert_dependency(&fixture.db, &current_id, &build_issue_uri("rel", 2)).await;
     insert_file_change(
         &fixture.db,
         &fixture.project_id,
@@ -482,19 +483,22 @@ async fn issue_read_renders_dependencies_and_possibly_related_issues() {
     )
     .await;
 
-    let output = read_resource(&fixture.orch, build_issue_uri("REL", 1)).await;
+    let output = read_resource(&fixture.orch, build_issue_uri("rel", 1)).await;
 
     assert!(output.contains("## dependencies"));
-    assert!(output.contains("[REL-2](cairn://p/REL/2) [○] Active blocker"));
+    assert!(
+        output.contains("[rel-2](cairn://p/rel/2) [○] Active blocker"),
+        "{output}"
+    );
     assert!(output.contains("## possibly related"));
-    assert!(output.contains("[Related work](cairn://p/REL/3) — 1 file overlap"));
-    assert!(!output.contains("[Current work](cairn://p/REL/1) —"));
-    assert!(!output.contains("[Active blocker](cairn://p/REL/2) —"));
+    assert!(output.contains("[Related work](cairn://p/rel/3) — 1 file overlap"));
+    assert!(!output.contains("[Current work](cairn://p/rel/1) —"));
+    assert!(!output.contains("[Active blocker](cairn://p/rel/2) —"));
 }
 
 #[tokio::test]
 async fn project_issues_filters_by_status_and_dependency_readiness() {
-    let fixture = issue_project_fixture("FIL").await;
+    let fixture = issue_project_fixture("fil").await;
     let active_blocker_id = fixture
         .insert_issue_with_status_and_time(1, "Active blocker", "active", 1)
         .await;
@@ -510,8 +514,8 @@ async fn project_issues_filters_by_status_and_dependency_readiness() {
     fixture
         .insert_issue_with_status_and_time(5, "Waiting issue", "waiting", 5)
         .await;
-    insert_dependency(&fixture.db, &ready_id, &build_issue_uri("FIL", 2)).await;
-    insert_dependency(&fixture.db, &blocked_id, &build_issue_uri("FIL", 1)).await;
+    insert_dependency(&fixture.db, &ready_id, &build_issue_uri("fil", 2)).await;
+    insert_dependency(&fixture.db, &blocked_id, &build_issue_uri("fil", 1)).await;
 
     let ready_output = fixture.read_project_issues(Some("ready=true")).await;
     let blocked_output = fixture.read_project_issues(Some("ready=false")).await;
@@ -552,7 +556,7 @@ async fn project_issues_filters_by_status_and_dependency_readiness() {
 
 #[tokio::test]
 async fn project_issues_applies_limit_status_and_sort_filters() {
-    let fixture = issue_project_fixture("QRY").await;
+    let fixture = issue_project_fixture("qry").await;
     fixture
         .insert_issue_with_status_and_time(1, "Old backlog", "backlog", 1)
         .await;
@@ -602,7 +606,7 @@ async fn project_issues_applies_limit_status_and_sort_filters() {
 
 #[tokio::test]
 async fn project_issues_default_limit_caps_results() {
-    let fixture = issue_project_fixture("CAP").await;
+    let fixture = issue_project_fixture("cap").await;
     for number in 1..=25 {
         fixture
             .insert_issue_with_status_and_time(
@@ -676,9 +680,10 @@ async fn apply_change(
     mode: &str,
     payload: serde_json::Value,
 ) -> String {
-    change(
+    change_as_run(
         orch,
         json!([{ "target": target, "mode": mode, "payload": payload }]),
+        Some("run-issue-create"),
     )
     .await
 }
@@ -738,7 +743,7 @@ async fn gated_artifact_fixture(issue_title: &str) -> GatedArtifactFixture {
         orch,
         project_id,
         ..
-    } = issue_project_fixture("MCP").await;
+    } = issue_project_fixture("mcp").await;
     let issue_id =
         insert_issue_with_status_and_time(&db, &project_id, 1, issue_title, "active", 1).await;
     seed_gated_execution(&db, &project_id, &issue_id).await;
@@ -781,7 +786,7 @@ async fn artifact_text_replacement_patch_updates_latest_object_version() {
 
     let result = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/plan",
+        "cairn://p/mcp/1/1/planner/plan",
         "patch",
         json!({ "old_string": "stale", "new_string": "corrected" }),
     )
@@ -806,7 +811,7 @@ async fn artifact_text_replacement_patch_failure_does_not_store_version() {
 
     let missing = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/plan",
+        "cairn://p/mcp/1/1/planner/plan",
         "patch",
         json!({ "old_string": "absent", "new_string": "corrected" }),
     )
@@ -824,7 +829,7 @@ async fn artifact_text_replacement_patch_failure_does_not_store_version() {
 
     let ambiguous = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/plan",
+        "cairn://p/mcp/1/1/planner/plan",
         "patch",
         json!({ "old_string": "stale", "new_string": "corrected" }),
     )
@@ -851,7 +856,7 @@ async fn artifact_mixed_text_and_field_patch_rejects_without_new_version() {
 
     let result = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/plan",
+        "cairn://p/mcp/1/1/planner/plan",
         "patch",
         json!({ "old_string": "stale", "new_string": "corrected", "summary": "new summary" }),
     )
@@ -874,7 +879,7 @@ async fn artifact_field_merge_patch_preserves_unedited_fields() {
 
     let result = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/plan",
+        "cairn://p/mcp/1/1/planner/plan",
         "patch",
         json!({ "content": "fully revised content" }),
     )
@@ -893,17 +898,17 @@ async fn blocked_artifact_read_surfaces_resolution_actions() {
     let fixture = gated_artifact_fixture("Gated plan").await;
 
     // Blocked producing job: the read carries the gate-resolution affordance.
-    let blocked = read_resource(&fixture.orch, "cairn://p/MCP/1/1/planner/plan".to_string()).await;
+    let blocked = read_resource(&fixture.orch, "cairn://p/mcp/1/1/planner/plan".to_string()).await;
     assert!(blocked.contains("the plan body"));
     assert!(blocked.contains("## actions"));
     assert!(blocked.contains("confirmed:true"));
-    assert!(blocked.contains("cairn://p/MCP/1/1/planner/plan"));
+    assert!(blocked.contains("cairn://p/mcp/1/1/planner/plan"));
     assert!(blocked.contains("continue"));
     // The continue action targets the producing node's messages collection, not the artifact.
-    assert!(blocked.contains("target:\"cairn://p/MCP/1/1/planner/messages\""));
+    assert!(blocked.contains("target:\"cairn://p/mcp/1/1/planner/messages\""));
 
     // Non-blocked producing job: no resolution affordance, raw artifact only.
-    let done = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder/pr".to_string()).await;
+    let done = read_resource(&fixture.orch, "cairn://p/mcp/1/1/builder/pr".to_string()).await;
     assert!(done.starts_with("the pr body"), "done: {done}");
 }
 
@@ -913,7 +918,7 @@ async fn confirm_change_with_confirmed_false_is_rejected() {
 
     let result = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/plan",
+        "cairn://p/mcp/1/1/planner/plan",
         "patch",
         json!({ "confirmed": false }),
     )
@@ -932,7 +937,7 @@ async fn confirm_change_on_job_without_unconfirmed_artifact_is_rejected() {
     // the unconfirmed artifact, not the job's blocked state (CAIRN-1576).
     let result = apply_change(
         &fixture.orch,
-        "cairn://p/MCP/1/1/builder/pr",
+        "cairn://p/mcp/1/1/builder/pr",
         "patch",
         json!({ "confirmed": true }),
     )
@@ -954,23 +959,23 @@ async fn generic_artifact_alias_resolves_to_schema_named_uri() {
     // presented as a destination.
     let aliased = read_resource(
         &fixture.orch,
-        "cairn://p/MCP/1/1/planner/artifact".to_string(),
+        "cairn://p/mcp/1/1/planner/artifact".to_string(),
     )
     .await;
     assert!(aliased.contains("the plan body"));
     assert!(aliased.contains("## actions"));
-    assert!(aliased.contains("cairn://p/MCP/1/1/planner/plan"));
+    assert!(aliased.contains("cairn://p/mcp/1/1/planner/plan"));
     assert!(!aliased.contains("planner/artifact"));
 
     // The node summary lists the artifact at its schema-named URI too.
-    let summary = read_resource(&fixture.orch, "cairn://p/MCP/1/1/planner".to_string()).await;
-    assert!(summary.contains("Artifact: `cairn://p/MCP/1/1/planner/plan`"));
+    let summary = read_resource(&fixture.orch, "cairn://p/mcp/1/1/planner".to_string()).await;
+    assert!(summary.contains("Artifact: `cairn://p/mcp/1/1/planner/plan`"));
     assert!(!summary.contains("planner/artifact"));
 }
 
 #[tokio::test]
 async fn artifact_uri_prefers_output_name_over_artifact_type() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     let issue_id = fixture
         .insert_issue_with_status_and_time(1, "Inherited schema", "active", 1)
         .await;
@@ -1010,10 +1015,10 @@ async fn artifact_uri_prefers_output_name_over_artifact_type() {
 
     let aliased = read_resource(
         &fixture.orch,
-        "cairn://p/MCP/1/1/builder/artifact".to_string(),
+        "cairn://p/mcp/1/1/builder/artifact".to_string(),
     )
     .await;
-    assert!(aliased.contains("cairn://p/MCP/1/1/builder/create-pr"));
+    assert!(aliased.contains("cairn://p/mcp/1/1/builder/create-pr"));
     assert!(!aliased.contains("builder/artifact"));
     // The generic alias and the bare artifact_type are both absent as a target.
     assert!(!aliased.contains("builder/pr\""));
@@ -1072,35 +1077,35 @@ async fn seed_two_named_artifacts(fixture: &IssueProjectFixture, issue_id: &str)
 
 #[tokio::test]
 async fn node_summary_lists_every_named_artifact() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     let issue_id = fixture
         .insert_issue_with_status_and_time(1, "Multi-artifact node", "active", 1)
         .await;
     seed_two_named_artifacts(&fixture, &issue_id).await;
 
-    let summary = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder".to_string()).await;
+    let summary = read_resource(&fixture.orch, "cairn://p/mcp/1/1/builder".to_string()).await;
     // Both named chains surface at their canonical, schema-named URIs.
     assert!(summary.contains("- Artifacts:"), "unexpected: {summary}");
-    assert!(summary.contains("cairn://p/MCP/1/1/builder/plan"));
-    assert!(summary.contains("cairn://p/MCP/1/1/builder/notes"));
+    assert!(summary.contains("cairn://p/mcp/1/1/builder/plan"));
+    assert!(summary.contains("cairn://p/mcp/1/1/builder/notes"));
 }
 
 #[tokio::test]
 async fn named_read_returns_its_own_chain_latest() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
     let issue_id = fixture
         .insert_issue_with_status_and_time(1, "Multi-artifact read", "active", 1)
         .await;
     seed_two_named_artifacts(&fixture, &issue_id).await;
 
     // The `plan` read returns the plan chain's latest version (v2), never notes.
-    let plan = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder/plan".to_string()).await;
+    let plan = read_resource(&fixture.orch, "cairn://p/mcp/1/1/builder/plan".to_string()).await;
     assert!(plan.contains("plan two"), "unexpected: {plan}");
     assert!(!plan.contains("plan one"));
     assert!(!plan.contains("notes one"));
 
     // The `notes` read returns its own chain, independent of plan.
-    let notes = read_resource(&fixture.orch, "cairn://p/MCP/1/1/builder/notes".to_string()).await;
+    let notes = read_resource(&fixture.orch, "cairn://p/mcp/1/1/builder/notes".to_string()).await;
     assert!(notes.contains("notes one"), "unexpected: {notes}");
     assert!(!notes.contains("plan two"));
 }
@@ -1109,7 +1114,7 @@ async fn named_read_returns_its_own_chain_latest() {
 
 #[tokio::test]
 async fn issue_create_without_execution_creates_issue_only() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
 
     let result = apply_change(
         &fixture.orch,
@@ -1120,7 +1125,7 @@ async fn issue_create_without_execution_creates_issue_only() {
     .await;
 
     assert!(
-        result.contains("Created issue MCP-1"),
+        result.contains("Created issue mcp/1"),
         "unexpected: {result}"
     );
     assert_eq!(
@@ -1139,7 +1144,7 @@ async fn issue_create_without_execution_creates_issue_only() {
 
 #[tokio::test]
 async fn issue_create_result_carries_structured_issue_ref() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
 
     let result = apply_change(
         &fixture.orch,
@@ -1161,17 +1166,17 @@ async fn issue_create_result_carries_structured_issue_ref() {
     let data = applied[0]
         .get("data")
         .expect("applied[0].data present for issue create");
-    assert_eq!(data.get("projectKey").and_then(|v| v.as_str()), Some("MCP"));
+    assert_eq!(data.get("projectKey").and_then(|v| v.as_str()), Some("mcp"));
     assert_eq!(data.get("number").and_then(|v| v.as_i64()), Some(1));
     assert_eq!(
         data.get("uri").and_then(|v| v.as_str()),
-        Some(build_issue_uri("MCP", 1).as_str())
+        Some(build_issue_uri("mcp", 1).as_str())
     );
 }
 
 #[tokio::test]
 async fn issue_create_with_execution_creates_issue_then_surfaces_start_failure() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
 
     // No recipe config exists in the temp config dir, so the start fails — but
     // the issue must already be durable, and the failure must name the
@@ -1205,7 +1210,7 @@ async fn issue_create_with_execution_creates_issue_then_surfaces_start_failure()
 
 #[tokio::test]
 async fn issue_create_rejects_malformed_execution_before_creating() {
-    let fixture = issue_project_fixture("MCP").await;
+    let fixture = issue_project_fixture("mcp").await;
 
     // A non-object execution is rejected at parse time, before the issue row is
     // written — a malformed spec must not leave a half-created issue behind.

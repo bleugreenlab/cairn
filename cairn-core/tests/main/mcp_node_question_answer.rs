@@ -11,7 +11,7 @@ use cairn_db::turso::params;
 use serde_json::json;
 
 async fn insert_question_fixture(db: &LocalDb) {
-    let project_id = common::create_project(db, "TQA").await;
+    let project_id = common::create_project(db, "tqa").await;
     db.write(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {
@@ -90,7 +90,7 @@ async fn node_question_patch_answers_prompt_once() {
     insert_question_fixture(&db).await;
     let orch = orchestrator(&temp, db.clone());
 
-    let target = "cairn://p/TQA/1/1/builder/questions/q-1";
+    let target = "cairn://p/tqa/1/1/builder/questions/q-1";
     let result = handle_write(
         &orch,
         &change_request(json!({
@@ -132,7 +132,7 @@ async fn pending_question_read_shows_answer_action() {
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
-            payload: json!({"path": "cairn://p/TQA/1/1/builder/questions/q-1"}),
+            payload: json!({"path": "cairn://p/tqa/1/1/builder/questions/q-1"}),
             tool_use_id: None,
         },
     )

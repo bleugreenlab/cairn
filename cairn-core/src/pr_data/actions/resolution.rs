@@ -689,7 +689,7 @@ mod tests {
                    (id, job_id, source_kind, source_ref, fact_kinds_json, state,
                     created_by, created_at, updated_at, one_shot)
                  VALUES
-                   ('muted-child', 'parent-coordinator', 'issue', 'cairn://p/PROJ/3',
+                   ('muted-child', 'parent-coordinator', 'issue', 'cairn://p/proj/3',
                     '[\"resolved\"]', 'muted', 'agent', 2, 2, 0)",
                 (),
             )
@@ -728,7 +728,7 @@ mod tests {
                 "muted={muted}"
             );
             let rendered = render_push_resolved(&orch, &pushes[0]).await;
-            assert!(rendered.contains("PROJ-3 \"Issue\" merged"), "{rendered}");
+            assert!(rendered.contains("proj-3 \"Issue\" merged"), "{rendered}");
             assert!(
                 rendered.contains("PR #3023, by operator (UI)"),
                 "{rendered}"
@@ -755,7 +755,7 @@ mod tests {
             "builder-job",
             PrNodeResolution::Merge,
             Some(PrResolutionAttribution::agent(
-                "cairn://p/PRJ/1/1/thread".to_string(),
+                "cairn://p/prj/1/1/thread".to_string(),
             )),
         )
         .await
@@ -767,7 +767,7 @@ mod tests {
         assert_eq!(attribution.actor_kind, "agent");
         assert_eq!(
             attribution.actor_identity.as_deref(),
-            Some("cairn://p/PRJ/1/1/thread")
+            Some("cairn://p/prj/1/1/thread")
         );
         assert!(attribution.lane_snapshot.contains("executionStatus"));
 
@@ -1012,7 +1012,7 @@ mod tests {
                 Box::pin(async move {
                     conn.execute(
                         "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                         VALUES ('proj-t', 'default', 'P', 'PROJ', '/repo', 'main', 1, 1)",
+                         VALUES ('proj-t', 'default', 'P', 'proj', '/repo', 'main', 1, 1)",
                         (),
                     )
                     .await?;

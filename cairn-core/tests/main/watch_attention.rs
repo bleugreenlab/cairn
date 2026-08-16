@@ -17,7 +17,7 @@ use cairn_db::turso::params;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-const WATCH_URI: &str = "cairn://p/WATCH/1";
+const WATCH_URI: &str = "cairn://p/watch/1";
 
 async fn insert_issue(
     db: &LocalDb,
@@ -88,7 +88,7 @@ struct WatchFixture {
 async fn watch_fixture(attention: &str, updated_at: i64) -> WatchFixture {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, attention, updated_at).await;
     let orch = orchestrator(&temp, db.clone());
     WatchFixture {
@@ -142,7 +142,7 @@ async fn watch_returns_immediately_when_already_actionable() {
     let value = handle_watch_json(&fixture.orch, None).await;
     assert_eq!(value["status"], "actionable");
     assert_eq!(value["attention"], "needs_approval");
-    assert_eq!(value["issue_uri"], "cairn://p/WATCH/1");
+    assert_eq!(value["issue_uri"], "cairn://p/watch/1");
 }
 
 #[tokio::test]
@@ -198,7 +198,7 @@ async fn watch_returns_resolved_for_an_already_merged_issue() {
     let value = handle_watch_json(&fixture.orch, Some(100)).await;
     assert_eq!(value["status"], "resolved");
     assert_eq!(value["issue_status"], "merged");
-    assert_eq!(value["issue_uri"], "cairn://p/WATCH/1");
+    assert_eq!(value["issue_uri"], "cairn://p/watch/1");
 }
 
 #[tokio::test]
@@ -264,7 +264,7 @@ async fn typed_question_event_carries_inline_questions() {
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "none", 100).await;
     let orch = orchestrator(&temp, db.clone());
 
@@ -273,10 +273,10 @@ async fn typed_question_event_carries_inline_questions() {
 
     let event = AttentionEvent {
         issue_id: issue_id.clone(),
-        issue_uri: "cairn://p/WATCH/1".to_string(),
+        issue_uri: "cairn://p/watch/1".to_string(),
         route_provenance: None,
         fact: AttentionFact::Question {
-            detail_uri: "cairn://p/WATCH/1/1/planner/questions/q-1".to_string(),
+            detail_uri: "cairn://p/watch/1/1/planner/questions/q-1".to_string(),
             content: QuestionContent {
                 questions: vec![Question {
                     question: "Continue?".to_string(),
@@ -325,7 +325,7 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "needs_approval", 100).await;
     let orch = orchestrator(&temp, db.clone());
 
@@ -333,10 +333,10 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
 
     let artifact = AttentionEvent {
         issue_id: issue_id.clone(),
-        issue_uri: "cairn://p/WATCH/1".to_string(),
+        issue_uri: "cairn://p/watch/1".to_string(),
         route_provenance: None,
         fact: AttentionFact::ArtifactWritten {
-            detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
+            detail_uri: "cairn://p/watch/1/1/builder/pr".to_string(),
             content: ArtifactSummary {
                 output_name: "pr".to_string(),
                 version: 1,
@@ -352,10 +352,10 @@ async fn distinct_facts_for_same_issue_each_pass_through_dedupe() {
     };
     let idle = AttentionEvent {
         issue_id: issue_id.clone(),
-        issue_uri: "cairn://p/WATCH/1".to_string(),
+        issue_uri: "cairn://p/watch/1".to_string(),
         route_provenance: None,
         fact: AttentionFact::AgentIdleWithWork {
-            detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
+            detail_uri: "cairn://p/watch/1/1/builder/pr".to_string(),
         },
         attention: IssueAttention::NeedsApproval,
         status: IssueStatus::Active,
@@ -450,7 +450,7 @@ async fn wake_for_issue_emits_resolved_when_status_is_terminal() {
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "none", 100).await;
     set_status(&db, &issue_id, "merged", 200).await;
     let orch = orchestrator(&temp, db.clone());
@@ -474,7 +474,7 @@ async fn wake_for_issue_emits_idle_with_work_for_needs_approval() {
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "needs_approval", 200).await;
     let orch = orchestrator(&temp, db.clone());
 
@@ -496,7 +496,7 @@ async fn wake_for_issue_idle_with_work_points_at_pending_permission_segment() {
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     // seed_run_for_issue uses node_segment "planner", exec_seq 1.
     let (issue_id, run_id, job_id, node_segment, _seq) =
         seed_run_for_issue(&db, &project_id, 1, "needs_authorization").await;
@@ -530,7 +530,7 @@ async fn wake_for_issue_idle_with_work_points_at_pending_permission_segment() {
         AttentionFact::AgentIdleWithWork { detail_uri, .. } => {
             assert_eq!(
                 detail_uri,
-                format!("cairn://p/WATCH/1/1/{node_segment}/permissions/perm-1")
+                format!("cairn://p/watch/1/1/{node_segment}/permissions/perm-1")
             );
         }
         other => panic!("expected AgentIdleWithWork, got {:?}", other),
@@ -544,7 +544,7 @@ async fn wake_for_issue_is_silent_when_no_actionable_state() {
     // recomputes would generate spurious wakes.
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "none", 100).await;
     let orch = orchestrator(&temp, db.clone());
 
@@ -572,7 +572,7 @@ async fn ask_questions_handler_emits_typed_question_event() {
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let (issue_id, run_id, _job_id, _node, _seq) =
         seed_run_for_issue(&db, &project_id, 1, "none").await;
     let orch = orchestrator(&temp, db.clone());
@@ -650,10 +650,10 @@ async fn watch_returns_event_fact_in_response_json() {
     set_attention(&fixture.db, &fixture.issue_id, "needs_approval", 200).await;
     fixture.orch.emit_attention_event(AttentionEvent {
         issue_id: fixture.issue_id.clone(),
-        issue_uri: "cairn://p/WATCH/1".to_string(),
+        issue_uri: "cairn://p/watch/1".to_string(),
         route_provenance: None,
         fact: AttentionFact::ArtifactWritten {
-            detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
+            detail_uri: "cairn://p/watch/1/1/builder/pr".to_string(),
             content: ArtifactSummary {
                 output_name: "pr".to_string(),
                 version: 1,
@@ -676,7 +676,7 @@ async fn watch_returns_event_fact_in_response_json() {
     .await;
     assert_eq!(value["status"], "actionable");
     assert_eq!(value["attention"], "needs_approval");
-    assert_eq!(value["detail_uri"], "cairn://p/WATCH/1/1/builder/pr");
+    assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
     assert_eq!(value["fact"]["kind"], "artifact_written");
     assert_eq!(value["fact"]["content"]["title"], "Add typed events");
     assert_eq!(value["fact"]["content"]["version"], 1);
@@ -782,7 +782,7 @@ async fn wake_for_issue_emits_idle_with_work_for_open_pr_even_with_none_attentio
 
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "none", 100).await;
     seed_open_pr(&db, &project_id, &issue_id, 1, "builder", 150).await;
     let orch = orchestrator(&temp, db.clone());
@@ -796,7 +796,7 @@ async fn wake_for_issue_emits_idle_with_work_for_open_pr_even_with_none_attentio
     assert_eq!(event.updated_at, 150);
     match event.fact {
         AttentionFact::AgentIdleWithWork { detail_uri, .. } => {
-            assert_eq!(detail_uri, "cairn://p/WATCH/1/1/builder/pr");
+            assert_eq!(detail_uri, "cairn://p/watch/1/1/builder/pr");
         }
         other => panic!("expected AgentIdleWithWork, got {:?}", other),
     }
@@ -817,10 +817,10 @@ async fn watch_returns_on_idle_with_work_event_with_none_attention() {
 
     fixture.orch.emit_attention_event(AttentionEvent {
         issue_id: fixture.issue_id.clone(),
-        issue_uri: "cairn://p/WATCH/1".to_string(),
+        issue_uri: "cairn://p/watch/1".to_string(),
         route_provenance: None,
         fact: AttentionFact::AgentIdleWithWork {
-            detail_uri: "cairn://p/WATCH/1/1/builder/pr".to_string(),
+            detail_uri: "cairn://p/watch/1/1/builder/pr".to_string(),
         },
         attention: IssueAttention::None,
         status: IssueStatus::Active,
@@ -835,7 +835,7 @@ async fn watch_returns_on_idle_with_work_event_with_none_attention() {
     .await;
     assert_eq!(value["status"], "actionable");
     assert_eq!(value["attention"], "none");
-    assert_eq!(value["detail_uri"], "cairn://p/WATCH/1/1/builder/pr");
+    assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
     assert_eq!(value["fact"]["kind"], "agent_idle_with_work");
 }
 
@@ -846,7 +846,7 @@ async fn watch_catch_up_returns_for_open_pr_with_none_attention() {
     // updated after the cursor is actionable work even with attention `none`.
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "none", 100).await;
     seed_open_pr(&db, &project_id, &issue_id, 1, "builder", 250).await;
     let orch = orchestrator(&temp, db.clone());
@@ -854,7 +854,7 @@ async fn watch_catch_up_returns_for_open_pr_with_none_attention() {
     let value = handle_watch_json(&orch, Some(200)).await;
     assert_eq!(value["status"], "actionable");
     assert_eq!(value["attention"], "none");
-    assert_eq!(value["detail_uri"], "cairn://p/WATCH/1/1/builder/pr");
+    assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
     assert_eq!(value["fact"]["kind"], "agent_idle_with_work");
     assert_eq!(value["updated_at"], 250);
 }
@@ -865,7 +865,7 @@ async fn watch_catch_up_does_not_return_for_open_pr_at_or_before_cursor() {
     // must block rather than re-return it, or the driver would spin.
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "none", 100).await;
     seed_open_pr(&db, &project_id, &issue_id, 1, "builder", 200).await;
     let orch = orchestrator(&temp, db.clone());
@@ -916,7 +916,7 @@ async fn watch_live_open_pr_wake_carries_pr_updated_at_not_stale_issue_updated_a
     .await;
     assert_eq!(value["status"], "actionable");
     assert_eq!(value["attention"], "none");
-    assert_eq!(value["detail_uri"], "cairn://p/WATCH/1/1/builder/pr");
+    assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
     assert_eq!(value["updated_at"], 150);
 }
 
@@ -928,7 +928,7 @@ async fn watch_catch_up_resolves_pr_uri_for_pr_state_attention() {
     // issue URI.
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "WATCH").await;
+    let project_id = common::create_project(&db, "watch").await;
     let issue_id = insert_issue(&db, &project_id, 1, "needs_approval", 100).await;
     seed_open_pr(&db, &project_id, &issue_id, 1, "builder", 100).await;
     let orch = orchestrator(&temp, db.clone());
@@ -936,5 +936,5 @@ async fn watch_catch_up_resolves_pr_uri_for_pr_state_attention() {
     let value = handle_watch_json(&orch, None).await;
     assert_eq!(value["status"], "actionable");
     assert_eq!(value["attention"], "needs_approval");
-    assert_eq!(value["detail_uri"], "cairn://p/WATCH/1/1/builder/pr");
+    assert_eq!(value["detail_uri"], "cairn://p/watch/1/1/builder/pr");
 }

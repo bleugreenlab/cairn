@@ -81,6 +81,7 @@ pub(crate) async fn delete_issue(orch: &Orchestrator, issue_id: &str) -> Result<
         "db-change",
         crate::notify::issue_db_change(&issue, "delete"),
     );
+    orch.invalidate_sidebar_active_issues();
 
     log::info!("Deleted issue {}", issue_id);
     Ok(())

@@ -656,7 +656,14 @@ impl AuthorityLifetimeKind {
 pub struct AuthorityProvenance {
     /// What minted the grant, e.g. `"operator_prompt"`.
     pub issuer: String,
-    /// The operator who approved it, when one is identified.
+    /// Validated identity that made the decision. Historical grants omit it.
+    #[serde(default)]
+    pub decision_actor: Option<crate::identity::PrincipalRef>,
+    /// Immutable evidence for how the decision actor appeared at decision time.
+    #[serde(default)]
+    pub appearance_snapshot: Option<crate::identity::AppearanceSnapshot>,
+    /// Legacy, untyped approver label retained only for historical decoding.
+    #[serde(default)]
     pub approver: Option<String>,
     /// The permission request / proposal that prompted the approval.
     pub request_uri: Option<String>,

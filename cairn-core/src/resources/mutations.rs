@@ -202,11 +202,11 @@ mod tests {
         let ack = created_resource_ack(
             "skill",
             "rust-dev",
-            &cairn_common::uri::build_project_skill_uri("CAIRN", "rust-dev", &[]),
+            &cairn_common::uri::build_project_skill_uri("cairn", "rust-dev", &[]),
         );
         assert_eq!(
             ack,
-            "Created skill 'rust-dev' at cairn://p/CAIRN/skills/rust-dev"
+            "Created skill 'rust-dev' at cairn://p/cairn/skills/rust-dev"
         );
     }
 
@@ -217,9 +217,9 @@ mod tests {
     fn created_resource_ack_never_carries_a_filesystem_path() {
         for uri in [
             cairn_common::uri::build_skill_uri("local", &[]),
-            cairn_common::uri::build_project_recipe_uri("CAIRN", "coordinator"),
+            cairn_common::uri::build_project_recipe_uri("cairn", "coordinator"),
             cairn_common::uri::build_agent_uri("build"),
-            cairn_common::uri::build_project_agent_uri("CAIRN", "build"),
+            cairn_common::uri::build_project_agent_uri("cairn", "build"),
         ] {
             let ack = created_resource_ack("resource", "id", &uri);
             let address = ack

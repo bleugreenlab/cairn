@@ -796,7 +796,7 @@ mod tests {
         exec(
             &db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-1','default','Cairn','CAIRN','/tmp/repo',1,1)",
+             VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1)",
         )
         .await;
         exec(

@@ -48,7 +48,7 @@ pub(crate) const NODE_MESSAGES_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Append,
             required: &[CONTENT],
-            optional: &[],
+            optional: &[ESCALATE],
             label: "send direct message",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/EXEC/NODE/messages\",mode:\"append\",payload:{content:\"...\"}}]})",
         }],
@@ -167,10 +167,10 @@ pub(crate) const NODE_ARTIFACT_CONTRACT: ResourceContract =
         uri_template: "cairn://p/{project}/{number}/{exec}/{node}/{name}",
         name: "Node artifact",
         description: "Agent output artifact (plan, PR, etc.). Write it via change to cairn:~/<name>; the payload is validated against the node's declared schema. Patch accepts either artifact-field merge payloads (for example {content}) or text replacement operations ({old_string,new_string,field?}); text replacement helper keys are operations and are not stored as artifact metadata. A PR artifact reads back its live GitHub state and accepts merge/close/refresh actions.",
-        read_projections: &[ProjectionSpec {
-            key: "diff",
-            values: "full (inline the live PR patch text on a PR artifact)",
-        }],
+        read_projections: &[
+            ProjectionSpec { key: "format", values: "json (exact stored artifact data; absent = Markdown)" },
+            ProjectionSpec { key: "diff", values: "full (Markdown-only; inline the live PR patch text on a PR artifact)" },
+        ],
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
         mutations: &[

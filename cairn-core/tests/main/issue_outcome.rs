@@ -21,7 +21,7 @@ async fn seed_issue_with_pr(
     github_review: Option<&str>,
     checks_status: Option<&str>,
 ) -> String {
-    let project_id = common::create_project(db, "OUT").await;
+    let project_id = common::create_project(db, "out").await;
     let issue_id = uuid::Uuid::new_v4().to_string();
     let execution_id = uuid::Uuid::new_v4().to_string();
     let job_id = uuid::Uuid::new_v4().to_string();

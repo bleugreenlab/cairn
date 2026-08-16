@@ -380,7 +380,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-                     VALUES('proj','ws','p','PROJ','/tmp/p','main',1,1)",
+                     VALUES('proj','ws','P','proj','/tmp/p','main',1,1)",
                     (),
                 )
                 .await?;

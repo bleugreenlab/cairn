@@ -439,6 +439,7 @@ mod tests {
             status: "pending".to_string(),
             agent_config_id: None,
             issue_id: issue_id.map(str::to_string),
+            thread_id: None,
             project_id: "p-1".to_string(),
             task_description: None,
             created_at: 1,
@@ -462,13 +463,13 @@ mod tests {
         )
         .await
         .unwrap();
-        conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','CAIRN','/tmp/p',1,1)", ()).await.unwrap();
+        conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','cairn','/tmp/p',1,1)", ()).await.unwrap();
         conn.execute("INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES ('dep','p-1',1,'Dep',?1,?1,'none',1,1)", params![dep_status]).await.unwrap();
         conn.execute("INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES ('child','p-1',2,'Child','active','active','none',1,1)", ()).await.unwrap();
         crate::issues::relations::replace_dependencies(
             conn,
             "child",
-            &["cairn://p/CAIRN/1".to_string()],
+            &["cairn://p/cairn/1".to_string()],
             1,
         )
         .await

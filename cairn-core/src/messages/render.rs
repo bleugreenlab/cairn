@@ -14,27 +14,50 @@
 //! both node and task senders. Before CAIRN-1363 these sites echoed the bare
 //! `sender_name` as the reply-to, so recipients were pointed at the raw node
 //! URI even though `/messages` is the documented form.
+//!
+//! An external sender is the one case with no URI at all, and it gets its own
+//! hint rather than an address. CAIRN-4135: this arm used to name a literal
+//! `to: "external"` target, whose dispatcher was removed as unreachable code
+//! once the `to`-carrying message tool gave way to the `write` carrier. The
+//! instruction outlived the mechanism, so recipients followed an address that
+//! nothing implemented. A rendered hint may name only affordances that exist.
 
 use crate::models::Message;
 
+/// The sender name minted for a message from an external session: an MCP caller
+/// with no `run_id`, i.e. a CLI or driver session running outside any Cairn run.
+/// Such a session is not a node, has no URI, and therefore cannot be addressed
+/// as a reply target. Shared with the handler that mints it so the sending and
+/// rendering halves cannot drift apart.
+pub(crate) const EXTERNAL_SENDER: &str = "external";
+
+/// The reply affordance for an external session.
+///
+/// An external session has no inbox. It reads replies by polling the message
+/// stream of the container it wrote into, so "post a message in this
+/// conversation" is the whole of the affordance — there is no address. For an
+/// issue-scoped node, an ordinary issue-channel message is additionally what a
+/// `cairn watch` driver surfaces as its `external_message_reply` fact.
+const EXTERNAL_REPLY_HINT: &str = "(Sent by an external session outside Cairn, which has no address to reply to. It reads replies from the conversation it wrote into — post your reply as an ordinary message here; on an issue, a message in that issue's /messages collection is what an external `cairn watch` driver surfaces.)";
+
 /// The canonical reply-to URI for a direct message, or `None` when the sender
 /// is not addressable by URI (e.g. a project-level agent whose `sender_name`
-/// is a bare node name rather than a `cairn://` URI).
+/// is a bare node name rather than a `cairn://` URI, or an external session).
 fn reply_to_uri(sender_name: &str) -> Option<String> {
-    if sender_name == "external" {
-        return Some("external".to_string());
-    }
-
     sender_name
         .starts_with("cairn://")
         .then(|| format!("{sender_name}/messages"))
 }
 
 /// Render a direct message for its recipient: the `[Direct message from …]`
-/// header followed by the content, plus a reply-to hint pointing at the
-/// sender's canonical `/messages` collection when the sender is URI-addressable.
+/// header followed by the content, plus a reply hint — the sender's canonical
+/// `/messages` collection when the sender is URI-addressable, or the
+/// post-in-this-conversation affordance when the sender is an external session.
 pub(crate) fn render_direct_message(msg: &Message) -> String {
     let head = format!("[Direct message from {}] {}", msg.sender_name, msg.content);
+    if msg.sender_name == EXTERNAL_SENDER {
+        return format!("{head}\n{EXTERNAL_REPLY_HINT}");
+    }
     match reply_to_uri(&msg.sender_name) {
         Some(reply_to) => {
             format!("{head}\nTo reply, use the message tool with to: \"{reply_to}\"")
@@ -64,14 +87,14 @@ mod tests {
 
     #[test]
     fn node_sender_reply_to_targets_messages_collection() {
-        let uri = reply_to_uri("cairn://p/CAIRN/1361/1/builder").unwrap();
-        assert_eq!(uri, "cairn://p/CAIRN/1361/1/builder/messages");
+        let uri = reply_to_uri("cairn://p/cairn/1361/1/builder").unwrap();
+        assert_eq!(uri, "cairn://p/cairn/1361/1/builder/messages");
     }
 
     #[test]
     fn task_sender_reply_to_targets_task_messages_collection() {
-        let uri = reply_to_uri("cairn://p/CAIRN/1361/1/builder/task/explore").unwrap();
-        assert_eq!(uri, "cairn://p/CAIRN/1361/1/builder/task/explore/messages");
+        let uri = reply_to_uri("cairn://p/cairn/1361/1/builder/task/explore").unwrap();
+        assert_eq!(uri, "cairn://p/cairn/1361/1/builder/task/explore/messages");
     }
 
     #[test]
@@ -79,28 +102,31 @@ mod tests {
         assert!(reply_to_uri("builder").is_none());
     }
 
+    /// An external session has no URI, so it is not a reply-to address. The
+    /// retired special case returned the literal `external` here, which the
+    /// renderer then stamped as an instruction no dispatcher could satisfy.
     #[test]
-    fn external_sender_reply_to_targets_external_literal() {
-        assert_eq!(reply_to_uri("external"), Some("external".to_string()));
+    fn external_sender_is_not_uri_addressable() {
+        assert!(reply_to_uri(EXTERNAL_SENDER).is_none());
     }
 
     #[test]
     fn render_includes_header_content_and_messages_reply_to() {
-        let msg = direct_from("cairn://p/CAIRN/1361/1/builder", "ship it");
+        let msg = direct_from("cairn://p/cairn/1361/1/builder", "ship it");
         let rendered = render_direct_message(&msg);
         assert!(
-            rendered.contains("[Direct message from cairn://p/CAIRN/1361/1/builder] ship it"),
+            rendered.contains("[Direct message from cairn://p/cairn/1361/1/builder] ship it"),
             "header + content preserved: {rendered}"
         );
         assert!(
             rendered.contains(
-                "To reply, use the message tool with to: \"cairn://p/CAIRN/1361/1/builder/messages\""
+                "To reply, use the message tool with to: \"cairn://p/cairn/1361/1/builder/messages\""
             ),
             "reply-to points at /messages: {rendered}"
         );
         // The reply target must be the /messages collection, never the bare node URI.
         assert!(
-            !rendered.contains("to: \"cairn://p/CAIRN/1361/1/builder\""),
+            !rendered.contains("to: \"cairn://p/cairn/1361/1/builder\""),
             "reply-to must not be the bare node URI: {rendered}"
         );
     }
@@ -112,11 +138,25 @@ mod tests {
         assert_eq!(rendered, "[Direct message from planner] hello");
     }
 
+    /// The external arm must name only affordances that exist: posting an
+    /// ordinary message in this conversation. It must never mint an address,
+    /// because no dispatcher accepts one for an external sender.
     #[test]
-    fn render_external_sender_includes_documented_literal_reply_to() {
-        let msg = direct_from("external", "please summarize");
+    fn render_external_sender_hint_names_a_real_affordance() {
+        let msg = direct_from(EXTERNAL_SENDER, "please summarize");
         let rendered = render_direct_message(&msg);
         assert!(rendered.contains("[Direct message from external] please summarize"));
-        assert!(rendered.contains("To reply, use the message tool with to: \"external\""));
+        assert!(
+            rendered.contains("post your reply as an ordinary message here"),
+            "hint names the affordance that exists: {rendered}"
+        );
+        assert!(
+            !rendered.contains("to: \"external\""),
+            "must not name a target no dispatcher implements: {rendered}"
+        );
+        assert!(
+            !rendered.contains("message tool"),
+            "must not route the external arm through the retired to:-carrying tool: {rendered}"
+        );
     }
 }

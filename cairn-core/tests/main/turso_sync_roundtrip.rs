@@ -439,6 +439,7 @@ async fn open_team_seeds_team_root_so_first_create_routed_succeeds() {
         &RealClock,
         create_project_input("p-team", "TEAMP", &dir.path().join("t"), Some("team-1")),
         None,
+        None,
     )
     .await
     .expect("first create_routed into a team must not fail the FK");
@@ -525,6 +526,7 @@ async fn create_routed_writes_project_row_to_team_db_and_route_stub_to_private()
         &RealClock,
         create_project_input("p-team", "TEAMP", &dir.path().join("t"), Some("team-1")),
         None,
+        None,
     )
     .await
     .expect("create team-routed project");
@@ -547,7 +549,7 @@ async fn create_routed_writes_project_row_to_team_db_and_route_stub_to_private()
     assert_eq!(
         dbs.local
             .query_text(
-                "SELECT team_id FROM project_routes WHERE project_key = 'TEAMP'",
+                "SELECT team_id FROM project_routes WHERE project_key = 'teamp'",
                 (),
             )
             .await
@@ -560,11 +562,46 @@ async fn create_routed_writes_project_row_to_team_db_and_route_stub_to_private()
         "for_project resolves the normalized key to the team replica"
     );
 
+    let duplicate = crud::create_routed(
+        &dbs,
+        &RealClock,
+        create_project_input("p-duplicate", "teamp", &dir.path().join("duplicate"), None),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        duplicate.to_string(),
+        "a project with key 'teamp' already exists"
+    );
+    assert_eq!(
+        dbs.local
+            .query_text(
+                "SELECT team_id FROM project_routes WHERE project_key = 'teamp'",
+                (),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("team-1"),
+        "a cross-scope duplicate must not steal the existing global route"
+    );
+    assert!(
+        dbs.local
+            .query_opt_text("SELECT id FROM projects WHERE id = 'p-duplicate'", ())
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected cross-scope duplicate must not leave a project row"
+    );
+
     // Local create: row + NULL route stay private.
     let (_lp, local_target) = crud::create_routed(
         &dbs,
         &RealClock,
         create_project_input("p-local", "LOCALP", &dir.path().join("l"), None),
+        None,
         None,
     )
     .await
@@ -589,7 +626,7 @@ async fn create_routed_writes_project_row_to_team_db_and_route_stub_to_private()
         dbs.local
             .query_text(
                 "SELECT CAST(COUNT(*) AS TEXT) FROM project_routes \
-                 WHERE project_key = 'LOCALP' AND team_id IS NULL",
+                 WHERE project_key = 'localp' AND team_id IS NULL",
                 (),
             )
             .await
@@ -639,6 +676,7 @@ async fn create_routed_project_and_routed_write_sync_to_a_second_replica() {
         &dbs_a,
         &RealClock,
         create_project_input("p", "TEAMP", &dir.path().join("repo"), Some("team-1")),
+        None,
         None,
     )
     .await
@@ -725,6 +763,7 @@ async fn all_dbs_list_unions_local_and_team_projects() {
         &RealClock,
         create_project_input("p-local", "LOCALP", &dir.path().join("l"), None),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -732,6 +771,7 @@ async fn all_dbs_list_unions_local_and_team_projects() {
         &dbs,
         &RealClock,
         create_project_input("p-team", "TEAMP", &dir.path().join("t"), Some("team-1")),
+        None,
         None,
     )
     .await
@@ -798,6 +838,7 @@ async fn routed_lifecycle_mutations_hit_the_team_db_and_sync() {
             &dir.path().join("t"),
             Some("team-lifecycle"),
         ),
+        None,
         None,
     )
     .await
@@ -920,6 +961,7 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
         &RealClock,
         create_project_input("p-team", "TEAMP", &dir.path().join("repo"), Some("team-1")),
         None,
+        None,
     )
     .await
     .expect("create routed team project");
@@ -929,6 +971,10 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
     let request = external_request(&dir.path().join("repo"));
 
     // 1. CREATE through the routed handler — the regression the live bug hit.
+    let authorship =
+        cairn_core::issues::crud::installation_machine_authorship("test-installation", 1).unwrap();
+    let (expected_author_json, expected_appearance_json) =
+        cairn_core::issues::crud::encode_issue_authorship(&authorship).unwrap();
     let outcome = issues::create_issue_in_project(
         &orch,
         "TEAMP",
@@ -938,6 +984,7 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
         None,
         None,
         None,
+        authorship.clone(),
     )
     .await
     .expect("create issue must succeed (no `project not found`)");
@@ -1085,6 +1132,37 @@ async fn issue_content_handlers_route_writes_to_team_db_and_sync() {
     assert_eq!(
         team_b
             .query_text(
+                "SELECT author_principal_json FROM issues WHERE id = ?1",
+                (issue_id.clone(),),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(expected_author_json.as_str()),
+        "the exact non-null author principal syncs to the second replica"
+    );
+    assert_eq!(
+        team_b
+            .query_text(
+                "SELECT appearance_snapshot_json FROM issues WHERE id = ?1",
+                (issue_id.clone(),),
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(expected_appearance_json.as_str()),
+        "the exact paired appearance snapshot syncs to the second replica"
+    );
+    let replicated = issue_crud::get(&team_b, &issue_id)
+        .await
+        .expect("decode replicated issue authorship")
+        .expect("replicated issue exists");
+    assert_eq!(replicated.author, Some(authorship.author));
+    // The decision-time appearance is intentionally decoded only for validation;
+    // the Issue model exposes the principal while keeping the snapshot internal.
+    assert_eq!(
+        team_b
+            .query_text(
                 "SELECT CAST(COUNT(*) AS TEXT) FROM comments WHERE content = 'a routed comment'",
                 (),
             )
@@ -1228,6 +1306,7 @@ async fn routed_execution_writes_hit_the_team_db_and_sync() {
         &dbs_a,
         &RealClock,
         create_project_input(proj, "TEAMP", &dir.path().join("repo"), Some(team)),
+        None,
         None,
     )
     .await
@@ -1374,6 +1453,7 @@ async fn fail_closed_execution_routing_when_team_replica_not_open() {
         &dbs_a,
         &RealClock,
         create_project_input(proj, "TEAMP", &dir.path().join("repo"), Some(team)),
+        None,
         None,
     )
     .await
@@ -1546,6 +1626,7 @@ async fn routed_run_reads_resolve_to_team_replica_and_local_to_private() {
         &dbs_a,
         &RealClock,
         create_project_input(proj, "TEAMP", &dir.path().join("repo"), Some(team)),
+        None,
         None,
     )
     .await
@@ -1754,6 +1835,7 @@ async fn routed_permission_response_resolves_to_team_replica_and_local_to_privat
         &RealClock,
         create_project_input(proj, "TEAMP", &dir.path().join("repo"), Some(team)),
         None,
+        None,
     )
     .await
     .expect("create routed team project");
@@ -1761,21 +1843,47 @@ async fn routed_permission_response_resolves_to_team_replica_and_local_to_privat
     seed_execution_skeleton(&team_a, proj, exec, job, run).await;
     seed_team_run_turn_and_permission(&team_a, run, job, perm).await;
 
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+        VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+    };
     use cairn_core::internal::execution::routing;
     use cairn_core::internal::mcp::handlers::permission::{
-        resolve_permission_request, OperatorApproval, OperatorTransport, PermissionAnswer,
-        PermissionDecision, PermissionScope,
+        resolve_permission_request, OperatorApproval, PermissionAnswer, PermissionDecision,
+        PermissionScope,
     };
 
     /// The operator capability the desktop adapter would have resolved from its
-    /// authentication context. Built here so the test drives the same path a
-    /// real answer takes.
+    /// authentication context. Built here so the test drives the same typed path
+    /// as a real answer and can assert that attribution survives private routing.
     fn operator() -> OperatorApproval {
-        OperatorApproval::authenticated(
-            "user:test-operator",
-            OperatorTransport::AuthenticatedOperator,
+        let actor = PrincipalRef::Human {
+            issuer: "api".to_string(),
+            subject: "test-operator".to_string(),
+            organization: Some("test-org".to_string()),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::JwtOperator,
+            VerificationStatus::Verified,
+            Some("api".to_string()),
+            Some("test-operator".to_string()),
+            None,
+            None,
+            VerificationStrength::new("jwt").unwrap(),
+            1,
         )
-        .expect("a named operator is a valid approval")
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::AuthenticatedOperator,
+            Address::Invoke { origin: None },
+            verification,
+            1,
+            None,
+        )
+        .unwrap();
+        let appearance =
+            AppearanceSnapshot::new(actor.clone(), evidence, Vec::new(), None).unwrap();
+        OperatorApproval::authenticated(actor, appearance).expect("typed operator approval")
     }
 
     let orch = orchestrator_over(dbs_a.clone(), &dir.path().join("config"));
@@ -1964,6 +2072,7 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
         &RealClock,
         create_project_input(proj, "TEAMP", &dir.path().join("repo"), Some(team)),
         None,
+        None,
     )
     .await
     .expect("create routed team project");
@@ -2076,6 +2185,7 @@ async fn routed_question_flow_resolves_to_team_replica_and_local_to_private() {
         &dbs_a,
         &RealClock,
         create_project_input("p-local", "LOCALP", &dir.path().join("l"), None),
+        None,
         None,
     )
     .await

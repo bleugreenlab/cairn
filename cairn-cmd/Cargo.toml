@@ -33,4 +33,5 @@ base64 = "0.22"
 libc = "0.2"
 
 [dev-dependencies]
+rmcp = { version = "3", features = ["client"] }
 tempfile = "3"

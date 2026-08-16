@@ -39,9 +39,14 @@ async fn project_fixture(key: &str) -> (tempfile::TempDir, LocalDb, String) {
 }
 
 async fn create_issue_at(db: &LocalDb, project_id: &str, title: &str, now: i64) -> Issue {
-    crud::create(db, &FixedClock(now), create_issue_input(project_id, title))
-        .await
-        .unwrap()
+    crud::create(
+        db,
+        &FixedClock(now),
+        create_issue_input(project_id, title),
+        crud::installation_machine_authorship("test-installation", now).unwrap(),
+    )
+    .await
+    .unwrap()
 }
 
 async fn count_where(db: &LocalDb, sql: &'static str, id: &str) -> i64 {
@@ -373,17 +378,17 @@ async fn update_dependencies_replaces_and_hydrates_issue_models() {
             title: None,
             description: None,
             backend_override: None,
-            depends_on: Some(vec![format!("cairn://p/DEP/{}", blocker.number)]),
+            depends_on: Some(vec![format!("cairn://p/dep/{}", blocker.number)]),
             label_ids: None,
         },
     )
     .await
     .unwrap();
 
-    assert_eq!(updated.depends_on, vec!["cairn://p/DEP/1"]);
+    assert_eq!(updated.depends_on, vec!["cairn://p/dep/1"]);
     assert_eq!(updated.updated_at, 300);
     let loaded = crud::get(&db, &dependent.id).await.unwrap().unwrap();
-    assert_eq!(loaded.depends_on, vec!["cairn://p/DEP/1"]);
+    assert_eq!(loaded.depends_on, vec!["cairn://p/dep/1"]);
     let listed = crud::list(&db, &project_id).await.unwrap();
     assert_eq!(
         listed
@@ -391,7 +396,7 @@ async fn update_dependencies_replaces_and_hydrates_issue_models() {
             .find(|issue| issue.id == dependent.id)
             .unwrap()
             .depends_on,
-        vec!["cairn://p/DEP/1"]
+        vec!["cairn://p/dep/1"]
     );
 
     let cleared = crud::update(
@@ -432,7 +437,7 @@ async fn failed_dependency_update_keeps_existing_dependencies() {
             title: None,
             description: None,
             backend_override: None,
-            depends_on: Some(vec![format!("cairn://p/BAD/{}", blocker.number)]),
+            depends_on: Some(vec![format!("cairn://p/bad/{}", blocker.number)]),
             label_ids: None,
         },
     )
@@ -462,6 +467,6 @@ async fn failed_dependency_update_keeps_existing_dependencies() {
             .unwrap()
             .unwrap()
             .depends_on,
-        vec!["cairn://p/BAD/1"]
+        vec!["cairn://p/bad/1"]
     );
 }

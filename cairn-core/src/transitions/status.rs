@@ -239,7 +239,7 @@ mod tests {
             INSERT INTO workspaces (id, name, created_at, updated_at)
              VALUES ('workspace-1', 'Workspace', 1, 1);
             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('project-1', 'workspace-1', 'Project', 'PROJ', '/tmp/proj', 1, 1);
+             VALUES ('project-1', 'workspace-1', 'Project', 'proj', '/tmp/proj', 1, 1);
             INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at)
              VALUES ('issue-1', 'project-1', 1, 'Issue', 'active', 'active', 'none', 1, 1);
             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)

@@ -544,12 +544,12 @@ mod tests {
     #[test]
     fn instances_from_derives_key_home_and_port() {
         let root = Path::new("/home/u");
-        let reg = registry(&[("agent/CAIRN-1928-builder-0", 3)]);
+        let reg = registry(&[("agent/cairn-1928-builder-0", 3)]);
         let instances = instances_from(root, &reg);
         assert_eq!(instances.len(), 1);
         let inst = &instances[0];
         assert_eq!(inst.key, "agent-cairn-1928-builder-0");
-        assert_eq!(inst.branch, "agent/CAIRN-1928-builder-0");
+        assert_eq!(inst.branch, "agent/cairn-1928-builder-0");
         assert_eq!(inst.runner_port, paths::DEV_INSTANCE_RUNNER_PORT_BASE + 3); // 3849 + slot 3
         assert_eq!(
             inst.home,

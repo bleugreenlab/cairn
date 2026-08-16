@@ -155,6 +155,8 @@ pub(crate) fn format_search_results(
             SearchContentType::Artifact => "Artifact",
             SearchContentType::Event => "Transcript",
             SearchContentType::Message => "Message",
+            SearchContentType::Post => "Post",
+            SearchContentType::PostComment => "Post comment",
         };
         output.push_str(&format!(
             "{}. [{}] {}\n",
@@ -1351,7 +1353,7 @@ mod tests {
             result(
                 SearchContentType::Issue,
                 "Direct issue hit",
-                "cairn://p/PROJ/7",
+                "cairn://p/proj/7",
                 None,
                 1,
                 None,
@@ -1359,7 +1361,7 @@ mod tests {
             result(
                 SearchContentType::Event,
                 "builder",
-                "cairn://p/PROJ/12/1/builder/chat/turn/5",
+                "cairn://p/proj/12/1/builder/chat/turn/5",
                 Some((12, "Hotspot issue")),
                 4,
                 Some((4, 6)),
@@ -1367,14 +1369,14 @@ mod tests {
             result(
                 SearchContentType::Event,
                 "review",
-                "cairn://p/PROJ/12/1/builder/task/review/chat/turn/2",
+                "cairn://p/proj/12/1/builder/task/review/chat/turn/2",
                 Some((12, "Hotspot issue")),
                 1,
                 Some((2, 2)),
             ),
         ];
 
-        let output = format_search_results(&results, Some("PROJ"));
+        let output = format_search_results(&results, Some("proj"));
 
         assert!(output.starts_with("Found 3 result(s):"));
         // Documents keep their flat row; transcripts trail in their own section.
@@ -1384,10 +1386,10 @@ mod tests {
             .expect("transcript section")
             .1;
         // One heading for the issue, both of its stretches beneath it.
-        assert_eq!(transcripts.matches("PROJ-12 Hotspot issue").count(), 1);
+        assert_eq!(transcripts.matches("proj-12 Hotspot issue").count(), 1);
         assert!(transcripts.contains("2. builder \u{2014} 4 matches in turns 4\u{2013}6"));
         assert!(transcripts.contains("3. review \u{2014} turn 2"));
-        assert!(transcripts.contains("cairn://p/PROJ/12/1/builder/task/review/chat/turn/2"));
+        assert!(transcripts.contains("cairn://p/proj/12/1/builder/task/review/chat/turn/2"));
     }
 
     #[test]
@@ -1395,13 +1397,13 @@ mod tests {
         let results = vec![result(
             SearchContentType::Event,
             "general",
-            "cairn://p/PROJ/general/chat",
+            "cairn://p/proj/general/chat",
             None,
             1,
             None,
         )];
 
-        let output = format_search_results(&results, Some("PROJ"));
+        let output = format_search_results(&results, Some("proj"));
         assert!(output.contains("Project transcripts"));
         assert!(output.contains("1. general\n"), "got: {output}");
         assert!(!output.contains("1 matches"));

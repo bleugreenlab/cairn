@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn new_and_resume_use_identical_strict_mcp_policy() {
+    fn new_resume_and_fork_use_identical_strict_mcp_policy() {
         let mut new_config = base_config();
         new_config.mcp_config = r#"{"mcpServers":{"cairn":{"command":"cairn-cmd"}}}"#.to_string();
         new_config.allowed_tools = vec![
@@ -205,21 +205,26 @@ mod tests {
             backend_id: "claude-thread".to_string(),
             session_id: "cairn-uuid".to_string(),
         };
+        let mut fork_config = new_config.clone();
+        fork_config.session_start = SessionStart::Fork {
+            session_id: "cairn-fork".to_string(),
+            source_backend_id: "claude-thread".to_string(),
+        };
 
         let new_args = build_claude_args(&new_config);
         let resume_args = build_claude_args(&resume_config);
-        assert_eq!(
-            flag_value(&new_args, "--mcp-config"),
-            flag_value(&resume_args, "--mcp-config")
-        );
-        assert_eq!(
-            new_args.contains(&"--strict-mcp-config".to_string()),
-            resume_args.contains(&"--strict-mcp-config".to_string())
-        );
-        assert_eq!(
-            flag_value(&new_args, "--allowedTools"),
-            flag_value(&resume_args, "--allowedTools")
-        );
+        let fork_args = build_claude_args(&fork_config);
+        for candidate in [&resume_args, &fork_args] {
+            assert_eq!(
+                flag_value(&new_args, "--mcp-config"),
+                flag_value(candidate, "--mcp-config")
+            );
+            assert!(candidate.contains(&"--strict-mcp-config".to_string()));
+            assert_eq!(
+                flag_value(&new_args, "--allowedTools"),
+                flag_value(candidate, "--allowedTools")
+            );
+        }
     }
 
     #[test]

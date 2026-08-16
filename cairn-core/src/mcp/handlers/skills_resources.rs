@@ -567,7 +567,7 @@ mod tests {
             out.push_str(&format!(
                 "- [{}]({}) [{}] — {}\n",
                 skill.id,
-                skill_link(skill, Some("CAIRN"), &[]),
+                skill_link(skill, Some("cairn"), &[]),
                 scope_label(skill),
                 skill.description,
             ));
@@ -586,7 +586,7 @@ mod tests {
 
         let rendered = render_collection(&config_dir, Some(&project_dir));
         // Project version wins and links project-scoped.
-        assert!(rendered.contains("cairn://p/CAIRN/skills/shared"));
+        assert!(rendered.contains("cairn://p/cairn/skills/shared"));
         assert!(rendered.contains("[project] — Project Version"));
         assert!(!rendered.contains("Workspace Version"));
     }
@@ -618,9 +618,9 @@ mod tests {
         // Add a references dir and reload.
         std::fs::create_dir_all(skills.join("ui/references")).unwrap();
         let skill = write_skill(&skills, "ui", "UI work");
-        let rendered = render_skill(&skill, &SkillScopeUri::Project("CAIRN".to_string()));
-        assert!(rendered.contains("cairn://p/CAIRN/skills/ui/references"));
-        assert!(!rendered.contains("cairn://p/CAIRN/skills/ui/SKILL.md"));
+        let rendered = render_skill(&skill, &SkillScopeUri::Project("cairn".to_string()));
+        assert!(rendered.contains("cairn://p/cairn/skills/ui/references"));
+        assert!(!rendered.contains("cairn://p/cairn/skills/ui/SKILL.md"));
         assert!(rendered.contains("Body for ui."));
     }
 

@@ -23,14 +23,15 @@ use cairn_common::executor_protocol::{
 };
 
 use crate::config::build_services::{
-    builds_in_managed_root, default_sccache_service, BuildServiceConfig, ReadyProbe, Templates,
-    BUILD_SERVICE_UNFIT_ENV,
+    builds_in_managed_root, BuildServiceConfig, ReadyProbe, Templates,
 };
 use crate::config::settings;
 use crate::services::sandbox::{self, SandboxPolicy};
 use crate::services::{ChildProcess, ProcessSpawner, SpawnConfig};
 
 use super::Orchestrator;
+
+const BUILD_SERVICE_UNFIT_ENV: &str = "CAIRN_BUILD_SERVICE_UNFIT";
 
 /// Timeout for a TCP reachability probe. Short — this can gate fenced builds.
 const TCP_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -99,37 +100,6 @@ const CACHE_QUARANTINE_FILE_LIMIT: usize = 100_000;
 /// How much of a probe's stdout is read. The sccache report is roughly 1.5 KiB;
 /// this leaves generous headroom while keeping the read bounded.
 const PROBE_OUTPUT_BYTES: u64 = 16_384;
-
-/// The rustc-wrapper / CMake compiler launcher, compiled into the binary from
-/// its single source of truth `scripts/cache-wrapper.sh`. Installed to a stable
-/// host path at startup (see `install_cache_wrapper`) so the `RUSTC_WRAPPER` the
-/// default sccache service injects always resolves to one wrapper identity.
-const CACHE_WRAPPER: &str = include_str!("../../../../../scripts/cache-wrapper.sh");
-
-/// Install the embedded cache wrapper to `{cairn_home}/bin/cache-wrapper.sh`,
-/// executable, overwriting any prior copy so upgrades propagate on every startup.
-///
-/// This is the stable path the default sccache service injects as `RUSTC_WRAPPER`.
-/// Keeping it in one host location (rather than the repo-relative
-/// `scripts/cache-wrapper.sh`) means every worktree's cargo shares one wrapper
-/// identity, so cargo fingerprints never flip between a bare `cargo` in an agent
-/// shell and the `bun run` scripts. The wrapper degrades safely with no sccache
-/// on PATH (`exec "$@"`), so installing it is harmless even where the injected
-/// env is never used. Best-effort at the call site: a failure is logged, never
-/// fatal.
-fn install_cache_wrapper(cairn_home: &Path) -> std::io::Result<PathBuf> {
-    let bin_dir = cairn_home.join("bin");
-    std::fs::create_dir_all(&bin_dir)?;
-    let dest = bin_dir.join("cache-wrapper.sh");
-    std::fs::write(&dest, CACHE_WRAPPER)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))?;
-    }
-
-    Ok(dest)
-}
 
 fn reset_recovery_for_changed_config(
     state: &mut BuildServiceRuntimeDiagnostic,
@@ -219,15 +189,14 @@ fn may_launch_service(
     templates: &Templates,
     runner_is_confined: bool,
 ) -> bool {
-    !runner_is_confined || launches_via_unconfined_user_service(cfg, templates)
+    let _ = (cfg, templates);
+    !runner_is_confined
 }
 
 /// Build the spawn config for launching a service daemon. Pure (no spawning), so
 /// it can be asserted directly in tests.
 ///
-/// Generic configured services retain their declared service sandbox. The
-/// built-in machine-wide sccache daemon is the exception on macOS: it is submitted
-/// to launchd, which creates it outside the runner's inherited Seatbelt profile.
+/// Every configured service retains its declared service sandbox.
 fn build_service_spawn_config(
     cfg: &BuildServiceConfig,
     templates: &Templates,
@@ -271,72 +240,12 @@ fn build_service_spawn_config(
     for (k, v) in cfg.expanded_launch_env(templates) {
         config = config.env(&k, &v);
     }
-    if launches_via_unconfined_user_service(cfg, templates) {
-        // launchd does not inherit the runner's user PATH. Resolve the program
-        // while still in the runner so the submitted job executes the same
-        // binary whose availability made this service eligible for launch.
-        if !Path::new(&config.program).is_absolute() {
-            config.program = crate::env::find_binary(&config.program).ok()?;
-        }
-        Some(launchd_submit_config(config, &state_dir))
-    } else {
-        Some(config)
-    }
-}
-
-fn launches_via_unconfined_user_service(cfg: &BuildServiceConfig, templates: &Templates) -> bool {
-    let _ = templates;
-    cfg!(target_os = "macos") && cfg == &default_sccache_service()
-}
-
-/// Submit the foreground daemon to the per-user launchd domain. `launchctl` is
-/// only the request client; launchd becomes the daemon's parent, so a Seatbelt
-/// profile inherited by the runner cannot cross this boundary. Reconciliation
-/// boots out any loaded definition before submitting the current command, which
-/// both recovers a killed daemon and prevents an app or settings update from
-/// leaving stale launch arguments resident in launchd.
-fn launchd_submit_config(config: SpawnConfig, state_dir: &Path) -> SpawnConfig {
-    #[cfg(target_os = "macos")]
-    {
-        const LABEL: &str = "computer.cairn.sccache";
-        const SCRIPT: &str = r#"
-target=$1; label=$2; cwd=$3; shift 3
-if /bin/launchctl print "$target" >/dev/null 2>&1; then
-  /bin/launchctl bootout "$target" || exit $?
-fi
-exec /bin/launchctl submit -l "$label" -- /bin/sh -c 'cd "$1" && shift && exec "$@"' cairn-sccache-launch "$cwd" "$@"
-"#;
-        let uid = unsafe { libc::getuid() };
-        let target = format!("gui/{uid}/{LABEL}");
-        let mut env: Vec<_> = config.env.iter().collect();
-        env.sort_by_key(|(key, _)| *key);
-        let mut args = vec![
-            "-c".to_string(),
-            SCRIPT.to_string(),
-            "cairn-launchd-submit".to_string(),
-            target,
-            LABEL.to_string(),
-            state_dir.to_string_lossy().into_owned(),
-            "/usr/bin/env".to_string(),
-        ];
-        args.extend(env.into_iter().map(|(key, value)| format!("{key}={value}")));
-        args.push(config.program);
-        args.extend(config.args);
-        let mut launch = SpawnConfig::new("/bin/sh").args(args).sandbox(None);
-        launch.capture_stdout = true;
-        launch.capture_stderr = true;
-        launch
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_dir;
-        config
-    }
+    Some(config)
 }
 
 /// The env vars that name a process's temp directory. A daemon keeps the values
-/// it was launched with for its entire life, which is why a build service pins
-/// them explicitly instead of inheriting them (see `default_sccache_service`).
+/// it was launched with for its entire life, which is why a configured build
+/// service may pin them explicitly instead of inheriting them.
 const DAEMON_TEMP_ENV: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
 
 /// The distinct temp directories a service's launch env pins, in declaration
@@ -1424,7 +1333,7 @@ fn reconcile_launched_service_with_timeout(
     startup_timeout: Duration,
 ) -> Result<Option<Box<dyn ChildProcess>>, String> {
     let mut child = launch_service(spawner, cfg, templates, deny_read.clone())?;
-    let submitted_to_user_service = launches_via_unconfined_user_service(cfg, templates);
+    let submitted_to_user_service = false;
     let Some(probe) = cfg.ready.as_ref() else {
         return Ok(Some(child));
     };
@@ -2074,20 +1983,12 @@ impl Orchestrator {
             .collect()
     }
 
-    /// Startup entry point: install the embedded rustc wrapper, then bring every
-    /// enabled, installed build service to a healthy state via
+    /// Startup entry point: bring every enabled, installed user-configured build
+    /// service to a healthy state via
     /// [`Self::ensure_build_services_ready`]. Best-effort throughout — failures
     /// log and are never fatal, because the client wrapper falls back to a plain
     /// compiler when the daemon is unreachable.
     pub fn start_build_services(&self) {
-        // Install the embedded rustc wrapper to `{cairnHome}/bin` first, before
-        // any early return, so the `RUSTC_WRAPPER` the default sccache service
-        // injects always resolves — even on a host without a service sandbox,
-        // where clients run uncached but the wrapper must still exist to exec the
-        // compiler. Overwrite each startup so upgrades propagate.
-        if let Err(e) = install_cache_wrapper(&self.config_dir) {
-            log::warn!("failed to install cache wrapper: {e}");
-        }
         self.ensure_build_services_ready();
     }
 
@@ -2864,8 +2765,38 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::build_services::{default_sccache_service, BUILD_SERVICE_CLIENT_ENV};
     use crate::services::testing::{MockChildProcess, MockProcessSpawner};
+
+    const BUILD_SERVICE_CLIENT_ENV: &str = "CAIRN_BUILD_SERVICE_CLIENT";
+
+    fn default_sccache_service() -> BuildServiceConfig {
+        BuildServiceConfig {
+            enabled: true,
+            start: vec!["sccache".into()],
+            ready: Some(ReadyProbe {
+                tcp: Some("127.0.0.1:4227".into()),
+                command: None,
+                round_trip: Some(vec!["sccache".into(), "--show-stats".into()]),
+            }),
+            state_dir: Some("{home}/.cache/sccache-cairn".into()),
+            write: vec!["{worktrees}/**/target/**".into()],
+            env: HashMap::from([
+                ("SCCACHE_SERVER_PORT".into(), "4227".into()),
+                ("SCCACHE_DIR".into(), "{home}/.cache/sccache-cairn".into()),
+                (
+                    "RUSTC_WRAPPER".into(),
+                    "{cairnHome}/bin/cache-wrapper.sh".into(),
+                ),
+                (BUILD_SERVICE_CLIENT_ENV.into(), "1".into()),
+            ]),
+            launch_env: HashMap::from([
+                ("SCCACHE_START_SERVER".into(), "1".into()),
+                ("TMPDIR".into(), "{home}/.cache/sccache-cairn-tmp".into()),
+                ("TMP".into(), "{home}/.cache/sccache-cairn-tmp".into()),
+                ("TEMP".into(), "{home}/.cache/sccache-cairn-tmp".into()),
+            ]),
+        }
+    }
 
     fn templates() -> Templates {
         Templates {
@@ -2906,56 +2837,6 @@ mod tests {
     }
 
     #[test]
-    fn successful_launchd_submission_does_not_end_daemon_readiness_wait() {
-        assert!(
-            !launch_child_exit_ends_startup(true, true),
-            "launchctl exit 0 only means launchd accepted the job"
-        );
-        assert!(launch_child_exit_ends_startup(true, false));
-        assert!(
-            launch_child_exit_ends_startup(false, true),
-            "a foreground child's exit still means the daemon ended"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn accepted_launchd_job_is_not_double_submitted_before_readiness_deadline() {
-        let root = tempfile::tempdir().unwrap();
-        let cfg = default_sccache_service();
-        let mut spawner = MockProcessSpawner::new();
-        spawner
-            .expect_spawn()
-            .withf(|spawn| spawn.program == "/bin/sh")
-            .times(1)
-            .returning(|_| Ok(Box::new(MockChildProcess::failing(11, "", 0))));
-        // The machine-wide port may be occupied by the real supervised daemon
-        // while this test runs. Its health commands are allowed; a second
-        // launchctl submission is not.
-        spawner
-            .expect_spawn()
-            .withf(|spawn| spawn.program != "/bin/sh")
-            .returning(|_| Ok(Box::new(MockChildProcess::failing(12, "", 1))));
-        let control = FakeListenerControl::new(None, 0, PathBuf::new());
-
-        let error = reconcile_launched_service_with_timeout(
-            &spawner,
-            &control,
-            &cfg,
-            &templates_in(root.path()),
-            vec![],
-            false,
-            Duration::from_millis(20),
-        );
-        let error = match error {
-            Err(error) => error,
-            Ok(_) => panic!("an accepted job that never binds must fail with a deadline diagnosis"),
-        };
-
-        assert!(error.contains("launchd accepted the service"), "{error}");
-    }
-
-    #[test]
     fn recovery_exhaustion_survives_runtime_state_recreation() {
         let root = tempfile::tempdir().unwrap();
         let mut cfg = default_sccache_service();
@@ -2991,62 +2872,6 @@ mod tests {
         assert_eq!(runtime.consecutive_failures, 0);
         assert_eq!(runtime.lifecycle.as_deref(), Some("degraded"));
         assert!(runtime.current_failure.is_none());
-    }
-
-    #[test]
-    fn built_in_sccache_crosses_launchd_while_custom_services_keep_their_sandbox() {
-        let cfg = default_sccache_service();
-        let config = build_service_spawn_config(&cfg, &templates(), vec![]).unwrap();
-        if cfg!(target_os = "macos") {
-            assert_eq!(config.program, "/bin/sh");
-            assert!(config
-                .args
-                .iter()
-                .any(|arg| arg == "computer.cairn.sccache"));
-            assert!(config
-                .args
-                .iter()
-                .any(|arg| arg == "SCCACHE_START_SERVER=1"));
-            let submitted_program = config
-                .args
-                .iter()
-                .find(|arg| {
-                    Path::new(arg)
-                        .file_name()
-                        .is_some_and(|name| name == "sccache")
-                })
-                .expect("launchd submission must include the resolved sccache executable");
-            assert!(
-                Path::new(submitted_program).is_absolute(),
-                "launchd's restricted PATH cannot resolve a bare sccache program: {submitted_program}"
-            );
-            assert!(
-                config.sandbox.is_none(),
-                "the launchctl request must not itself add a worktree fence"
-            );
-        }
-
-        let mut custom_config = cfg;
-        custom_config
-            .env
-            .insert("CUSTOM_SERVICE".to_string(), "1".to_string());
-        let custom_spawn =
-            build_service_spawn_config(&custom_config, &templates(), vec![]).unwrap();
-        assert_eq!(custom_spawn.program, "sccache");
-        if sandbox::is_available() {
-            assert!(
-                custom_spawn.sandbox.is_some(),
-                "generic configured services must retain their declared sandbox"
-            );
-        }
-        assert!(
-            may_launch_service(&default_sccache_service(), &templates(), true),
-            "a confined runner must recover sccache through launchd"
-        );
-        assert!(
-            !may_launch_service(&custom_config, &templates(), true),
-            "a confined runner must not directly launch a generic service"
-        );
     }
 
     struct FakeListenerControl {
@@ -3149,8 +2974,8 @@ mod tests {
     #[test]
     fn a_build_inside_a_managed_root_is_pointed_at_the_daemon() {
         for build_dir in [
-            "/home/u/.cairn/worktrees/CAIRN-1/src-tauri",
-            "/home/u/.cairn/build-slots/CAIRN/slot-3",
+            "/home/u/.cairn/worktrees/cairn-1/src-tauri",
+            "/home/u/.cairn/build-slots/cairn/slot-3",
         ] {
             let env = client_env_for(
                 &sccache_services(),
@@ -3255,18 +3080,11 @@ mod tests {
         spawner
             .expect_spawn()
             .withf(|cfg| {
-                if cfg!(target_os = "macos") {
-                    cfg.program == "/bin/sh"
-                        && cfg.args.iter().any(|arg| arg == "computer.cairn.sccache")
-                        && cfg.args.iter().any(|arg| arg == "SCCACHE_START_SERVER=1")
-                        && cfg.args.iter().any(|arg| arg == "SCCACHE_SERVER_PORT=4227")
-                        && cfg.sandbox.is_none()
-                } else {
-                    cfg.program == "sccache"
-                        && cfg.args.is_empty()
-                        && cfg.env.get("SCCACHE_START_SERVER").map(String::as_str) == Some("1")
-                        && cfg.env.get("SCCACHE_SERVER_PORT").map(String::as_str) == Some("4227")
-                }
+                cfg.program == "sccache"
+                    && cfg.args.is_empty()
+                    && cfg.env.get("SCCACHE_START_SERVER").map(String::as_str) == Some("1")
+                    && cfg.env.get("SCCACHE_SERVER_PORT").map(String::as_str) == Some("4227")
+                    && cfg.sandbox.is_some()
             })
             .returning(|_| Ok(Box::new(MockChildProcess::with_stdout(7, vec![]))));
 
@@ -4501,26 +4319,6 @@ Max cache size                       50 GiB
         assert_eq!(disabled.agent_advisory(), None);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn install_cache_wrapper_writes_executable_wrapper() {
-        use std::os::unix::fs::PermissionsExt;
-        let temp = tempfile::tempdir().unwrap();
-        let dest = install_cache_wrapper(temp.path()).unwrap();
-        assert_eq!(dest, temp.path().join("bin").join("cache-wrapper.sh"));
-
-        let meta = std::fs::metadata(&dest).unwrap();
-        assert!(
-            meta.permissions().mode() & 0o111 != 0,
-            "installed wrapper must be executable"
-        );
-        // The embedded body is the real script (has its sccache guard), and a
-        // second install overwrites cleanly so upgrades propagate.
-        let body = std::fs::read_to_string(&dest).unwrap();
-        assert!(body.contains("command -v sccache"));
-        assert_eq!(install_cache_wrapper(temp.path()).unwrap(), dest);
-    }
-
     #[test]
     fn cache_hit_read_failure_is_unfit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4564,25 +4362,6 @@ Max cache size                       50 GiB
             "{reason}"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn adoption_environment_fingerprint_mismatch_is_positive_evidence() {
-        let cfg = default_sccache_service();
-        let templates = templates();
-        let control = FakeListenerControl::detached(41, PathBuf::from("/bin/sccache"))
-            .with_env("SCCACHE_DIR", "/wrong/cache");
-        let mismatch =
-            listener_environment_mismatch(&control, "127.0.0.1:4227", &cfg, &templates).unwrap();
-        assert!(mismatch.contains("pid 41"), "{mismatch}");
-        assert!(mismatch.contains("SCCACHE_DIR"), "{mismatch}");
-
-        let unreadable = FakeListenerControl::detached(42, PathBuf::from("/bin/sccache"))
-            .with_unreadable_environ();
-        assert!(
-            listener_environment_mismatch(&unreadable, "127.0.0.1:4227", &cfg, &templates)
-                .is_none()
-        );
     }
 
     #[test]

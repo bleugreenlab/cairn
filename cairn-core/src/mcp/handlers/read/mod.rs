@@ -41,9 +41,10 @@ pub fn file_at_commit(
 
 // The shared view/render layer moved down into `storage::render` so `storage`
 // carries no upward `crate::mcp` edge. Re-export it under the original `view`
-// name, and re-export `error_segment`, so every existing `super::view::…` /
-// `super::error_segment` consumer in `batch`/`file` compiles unchanged.
+// name, and re-export the non-content segment constructors, so every producer
+// and suppression path uses the same structured states.
 pub(crate) use crate::storage::render as view;
+pub(crate) use crate::storage::render::duplicate_segment;
 pub(crate) use crate::storage::render::error_segment;
 
 #[cfg(test)]

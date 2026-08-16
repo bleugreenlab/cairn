@@ -2,6 +2,29 @@ use super::*;
 use crate::contract::ResourceKind;
 use crate::query::QueryParam;
 
+#[test]
+fn uri_identity_canonicalization_preserves_non_project_segments() {
+    assert_eq!(
+        canonicalize_uri_identity("review:cairn://p/CAIRN/42/1/Builder?View=Raw"),
+        "review:cairn://p/cairn/42/1/Builder?View=Raw"
+    );
+    assert_eq!(canonicalize_uri_identity("direct:ABC"), "direct:ABC");
+}
+
+#[test]
+fn parses_and_roundtrips_channel_conversations() {
+    let resource = CairnResource::ChannelsConversations;
+    assert_eq!(
+        parse_uri("cairn://channels/conversations?provider=telegram&deliverability=ready"),
+        Some(resource.clone())
+    );
+    assert_eq!(resource.to_uri(), "cairn://channels/conversations");
+    assert_eq!(resource.kind(), ResourceKind::ChannelsConversations);
+    assert_eq!(resource.project(), None);
+    assert_eq!(resource.issue_number(), None);
+    assert_eq!(resource.to_route(), None);
+}
+
 /// The reserved thread coordinate renders at the thread's own address, and it
 /// reaches every node and task sub-resource because they all compose from
 /// `build_node_uri`.
@@ -147,6 +170,91 @@ fn symbol_uris_round_trip() {
     ] {
         assert_eq!(parse_uri(uri).unwrap().to_uri(), uri, "round-trip {uri}");
     }
+}
+
+#[test]
+fn parses_and_builds_posts_resources() {
+    let cases = [
+        ("cairn://posts", CairnResource::Posts),
+        ("cairn://posts/42", CairnResource::Post { id: 42 }),
+        (
+            "cairn://p/cairn/posts",
+            CairnResource::ProjectPosts {
+                project: "cairn".to_string(),
+            },
+        ),
+    ];
+    for (uri, resource) in cases {
+        assert_eq!(parse_uri(uri), Some(resource.clone()));
+        assert_eq!(resource.to_uri(), uri);
+    }
+    assert_eq!(parse_uri("cairn://posts/0"), None);
+    assert_eq!(parse_uri("cairn://posts/not-an-integer"), None);
+    assert_eq!(
+        parse_uri("cairn://p/cairn/posts"),
+        Some(CairnResource::ProjectPosts {
+            project: "cairn".to_string()
+        })
+    );
+}
+
+/// A feed is addressed exactly where the home it belongs to is: under a node,
+/// under a sub-agent task, and — as an opaque thread path the core resolves —
+/// under a thread.
+#[test]
+fn parses_and_builds_the_home_feed() {
+    let node = CairnResource::HomeFeed {
+        project: "cairn".to_string(),
+        number: 42,
+        exec_seq: 2,
+        node_id: "builder".to_string(),
+        task_name: None,
+    };
+    assert_eq!(
+        parse_uri("cairn://p/cairn/42/2/builder/feed"),
+        Some(node.clone())
+    );
+    assert_eq!(node.to_uri(), "cairn://p/cairn/42/2/builder/feed");
+    assert_eq!(node.kind(), ResourceKind::HomeFeed);
+
+    let task = CairnResource::HomeFeed {
+        project: "cairn".to_string(),
+        number: 42,
+        exec_seq: 2,
+        node_id: "builder".to_string(),
+        task_name: Some("probe".to_string()),
+    };
+    assert_eq!(
+        parse_uri("cairn://p/cairn/42/2/builder/task/probe/feed"),
+        Some(task.clone())
+    );
+    assert_eq!(
+        task.to_uri(),
+        "cairn://p/cairn/42/2/builder/task/probe/feed"
+    );
+
+    // Reserved, so a node artifact can never be named `feed`, and a thread's
+    // own feed renders at the thread address rather than a `0/0` coordinate.
+    assert!(is_reserved_node_segment("feed"));
+    assert_eq!(
+        parse_uri("cairn://p/cairn/design-review/feed"),
+        Some(CairnResource::Thread {
+            project: "cairn".into(),
+            name: "design-review".into(),
+            path: vec!["feed".to_string()],
+        })
+    );
+    assert_eq!(
+        CairnResource::HomeFeed {
+            project: "cairn".to_string(),
+            number: 0,
+            exec_seq: 0,
+            node_id: "design-review".to_string(),
+            task_name: None,
+        }
+        .to_uri(),
+        "cairn://p/cairn/design-review/feed"
+    );
 }
 
 #[test]

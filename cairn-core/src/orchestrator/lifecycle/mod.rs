@@ -22,6 +22,7 @@ mod common;
 mod finalize;
 mod review_push;
 mod stop;
+mod watchdog_recovery;
 
 pub(crate) use common::set_exit_reason;
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
@@ -33,7 +34,6 @@ pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
     rearm_review_checks_on_startup,
 };
-pub(crate) use stop::PROVIDER_SILENCE_RECOVERY_EXIT_REASON;
 #[cfg(test)]
 pub(crate) use stop::USER_STOP_TOOL_RESULT;
 pub use stop::{
@@ -42,6 +42,10 @@ pub use stop::{
     suspend_run_for_durable_wait, suspend_run_for_durable_wait_after_handoff,
     suspend_run_for_durable_wait_after_handoff_then, HostShutdownStops, ParkSlots,
     RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
+};
+pub(crate) use stop::{PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON};
+pub(crate) use watchdog_recovery::{
+    recover_provider_watchdog, ProviderWatchdogRecovery, ALREADY_TERMINAL_RECONCILED_REASON,
 };
 
 #[cfg(test)]
@@ -55,6 +59,8 @@ pub(crate) use stop::{stop_session_internal, InterruptFailurePolicy};
 
 #[cfg(test)]
 mod memory_review_tests;
+#[cfg(test)]
+mod watchdog_recovery_tests;
 
 /// CAIRN-3104: the decide-and-record half of the crashed-resume digest-reseed
 /// fallback, exercised against a migrated database. These cover what the pure

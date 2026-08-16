@@ -44,4 +44,12 @@ pub struct GitHubAppAuthorizationStatus {
 pub struct EventDeliveryStatus {
     pub configured: bool,
     pub last_event_sync: Option<String>,
+    pub health_state: String,
+    pub health_reason: Option<String>,
+    pub first_failure_at: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub consecutive_failures: i64,
+    pub failing_event_id: Option<String>,
+    pub failing_event_at: Option<String>,
+    pub last_successful_delivery_at: Option<String>,
 }

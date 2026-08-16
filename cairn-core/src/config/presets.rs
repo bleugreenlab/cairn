@@ -1,7 +1,7 @@
 //! Preset resolution — maps tier references to concrete runtime config.
 //!
 //! A **tier reference** is either:
-//! - Unqualified: `"md"` → resolved against the active backend
+//! - Unqualified: `"md"` → resolved against that tier's own default backend
 //! - Qualified: `"codex/lg"` → resolved against the named backend
 //!
 //! The central function is [`resolve_agent_snapshot`], which all AgentSnapshot
@@ -13,19 +13,46 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::config::agents::FileAgent;
-use crate::config::project_settings::load_project_settings;
+use crate::config::project_settings::load_project_settings_read_only;
 use crate::config::settings::load_settings;
 use crate::models::{
     AgentSnapshot, Model, ModelSelection, Preset, PresetOptionValue, RuntimeExtras, SnapshotPresets,
 };
 
 /// Effective presets config (workspace + project merged).
+///
+/// `tier_defaults` binds each tier to the backend that serves it by default —
+/// the whole point of tiers being interchangeable faucets is that `lg` can sit
+/// on the best available model while `sm` sits on the cheapest adequate one, so
+/// the default is per tier rather than one global provider toggle. A tier with
+/// no entry (a freshly added custom tier) falls to its first defined provider.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresetsConfig {
-    pub(crate) active_backend: String,
+    pub(crate) tier_defaults: HashMap<String, String>,
     pub(crate) tiers: Vec<String>,
     pub(crate) backends: HashMap<String, HashMap<String, Preset>>,
+}
+
+impl PresetsConfig {
+    /// The backend this tier defaults to, when one is configured.
+    pub(crate) fn tier_default(&self, tier: &str) -> Option<&str> {
+        self.tier_defaults.get(tier).map(String::as_str)
+    }
+}
+
+/// Expand a single backend name into a per-tier default for every named tier.
+///
+/// This is what a legacy global `activeBackend` MEANT — every tier resolved
+/// against that one provider — so it is also exactly how such a config migrates.
+pub(crate) fn tier_defaults_from_single_backend(
+    backend: &str,
+    tiers: &[String],
+) -> HashMap<String, String> {
+    tiers
+        .iter()
+        .map(|tier| (tier.clone(), backend.to_string()))
+        .collect()
 }
 
 /// Result of resolving a tier reference.
@@ -51,12 +78,30 @@ pub enum ResolutionSource {
     ExecutionOverride,
     /// The agent's authored backend preference chose the backend.
     AgentDefault,
-    /// A single-provider tier pinned the backend.
-    TierDefault,
-    /// The workspace/project active backend chose among a multi-provider tier.
-    ActiveBackend,
+    /// The tier is defined on exactly one backend, which therefore pinned itself.
+    SoleProvider,
+    /// The tier's own configured default backend chose among its providers.
+    TierDefaultBackend,
+    /// Nothing that named a backend named one this tier actually defines — an
+    /// override or preference pointing elsewhere, or a tier carrying no default
+    /// binding at all — so the tier's first defined provider was used.
+    FirstProvider,
     /// A concrete (non-tier) model carried its own backend.
     ExplicitModel,
+}
+
+/// The backend chosen to serve a tier, and the rung of the ladder that chose it.
+///
+/// The two travel together because provenance is only honest if it is read off
+/// the branch that actually decided. Deriving it afterwards from which inputs
+/// were merely PRESENT reports a cause that did not apply: an override is a
+/// documented no-op on a sole-provider tier, and a preference naming a backend
+/// the tier does not define is skipped — both would otherwise be reported as
+/// having decided the selection they were ignored for.
+#[derive(Debug, Clone)]
+struct TierBackendChoice {
+    backend: String,
+    source: ResolutionSource,
 }
 
 /// Resolution output: one atomic backend+model [`ModelSelection`], orthogonal
@@ -86,10 +131,15 @@ pub enum LaunchSelectionOverride {
 // snapshot) is rehydrated into a `PresetsConfig` so `migrate_on_read` can
 // recover `extras`. The write direction (freezing presets into a snapshot) is
 // gone — nothing produces a fresh `SnapshotPresets` anymore.
+//
+// The frozen shape predates per-tier defaults and carries one `activeBackend`.
+// Every tier of that snapshot resolved against it, so expanding it across the
+// frozen tier list reproduces the resolution the snapshot was written under —
+// not a rename, a restatement of the same fact in the current vocabulary.
 impl From<&SnapshotPresets> for PresetsConfig {
     fn from(value: &SnapshotPresets) -> Self {
         Self {
-            active_backend: value.active_backend.clone(),
+            tier_defaults: tier_defaults_from_single_backend(&value.active_backend, &value.tiers),
             tiers: value.tiers.clone(),
             backends: value.backends.clone(),
         }
@@ -204,16 +254,60 @@ fn default_openrouter_presets() -> HashMap<String, Preset> {
     map
 }
 
+/// Build default OpenCode Go backend presets.
+///
+/// Go prices models against one shared dollar budget, so the tiers are chosen by
+/// what each costs against it as much as by capability: `sm` is the cheap model
+/// with effectively unlimited headroom, `md` the workhorse on the larger monthly
+/// allowance, `lg` the strongest model with the smallest allowance. Efforts are
+/// each model's own published vocabulary rather than a common ladder — Go's
+/// models do not share one.
+///
+/// The two DeepSeek models are deliberately absent despite being the cheapest on
+/// offer: they are served only from China-hosted infrastructure behind an
+/// explicit per-workspace opt-in, so a default pointing at one fails for anyone
+/// who has not opted in.
+fn default_opencode_presets() -> HashMap<String, Preset> {
+    let mut map = HashMap::new();
+    map.insert(
+        "sm".to_string(),
+        Preset {
+            model: Model::new("mimo-v2.5"),
+            options: HashMap::new(),
+        },
+    );
+    map.insert(
+        "md".to_string(),
+        Preset {
+            model: Model::new("glm-5.2"),
+            options: reasoning_options(Some("high")),
+        },
+    );
+    map.insert(
+        "lg".to_string(),
+        Preset {
+            model: Model::new("kimi-k3"),
+            options: reasoning_options(Some("max")),
+        },
+    );
+    map
+}
+
 /// Build a default PresetsConfig.
 pub(crate) fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
     let mut backends = HashMap::new();
     backends.insert("claude".to_string(), default_claude_presets(max_thinking));
     backends.insert("codex".to_string(), default_codex_presets());
     backends.insert("openrouter".to_string(), default_openrouter_presets());
+    backends.insert(
+        crate::backends::opencode::OPENCODE_BACKEND_KEY.to_string(),
+        default_opencode_presets(),
+    );
 
+    let tiers: Vec<String> = DEFAULT_TIERS.iter().map(|s| s.to_string()).collect();
     PresetsConfig {
-        active_backend: "claude".to_string(),
-        tiers: DEFAULT_TIERS.iter().map(|s| s.to_string()).collect(),
+        tier_defaults: tier_defaults_from_single_backend("claude", &tiers),
+        tiers,
         backends,
     }
 }
@@ -237,9 +331,11 @@ pub(crate) fn is_tier_ref(s: &str, config: &PresetsConfig) -> bool {
 
 /// Ordered list of providers (backends) that define a preset for `tier`.
 ///
-/// Ordering is active-backend-first then alphabetical, so the first element is a
-/// deterministic "first defined provider" for the multi-provider fallbacks.
+/// Ordering puts THIS tier's default backend first, then the rest
+/// alphabetically, so the first element is a deterministic "first defined
+/// provider" for the multi-provider fallbacks.
 fn providers_for_tier(tier: &str, config: &PresetsConfig) -> Vec<String> {
+    let default_backend = config.tier_default(tier);
     let mut names: Vec<String> = config
         .backends
         .iter()
@@ -247,29 +343,28 @@ fn providers_for_tier(tier: &str, config: &PresetsConfig) -> Vec<String> {
         .map(|(name, _)| name.clone())
         .collect();
     names.sort_by(|a, b| {
-        if *a == config.active_backend {
-            return if *b == config.active_backend {
-                std::cmp::Ordering::Equal
-            } else {
-                std::cmp::Ordering::Less
-            };
+        let a_default = Some(a.as_str()) == default_backend;
+        let b_default = Some(b.as_str()) == default_backend;
+        match (a_default, b_default) {
+            (true, true) | (false, false) => a.cmp(b),
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
         }
-        if *b == config.active_backend {
-            return std::cmp::Ordering::Greater;
-        }
-        a.cmp(b)
     });
     names
 }
 
-/// Choose the backend that serves `tier`, applying the tier-resolution semantics:
+/// Choose the backend that serves `tier`, and report which rung chose it.
 ///
-/// - **Single-provider tier** (defined on exactly one backend): always pins to that
-///   backend; `override_backend`/`preferred_backend` are silent no-ops. Never errors.
-/// - **Multi-provider tier**: `override` → `preferred` → active, restricted to the
-///   providers the tier actually defines. An override/preference naming a backend the
-///   tier does NOT define falls to the agent's preferred backend if the tier defines
-///   it, else the tier's first defined provider.
+/// - **Single-provider tier** (defined on exactly one backend): pins to that
+///   backend; `override_backend`/`preferred_backend` are silent no-ops, and the
+///   source says `SoleProvider` rather than crediting an input that was ignored.
+/// - **Multi-provider tier**: one uniform ladder — `override` → `preferred` →
+///   the tier's own default → the tier's first defined provider. Every rung is
+///   skipped when it names a backend this tier does not define, so a stale
+///   override does not knock resolution off the ladder; it simply does not
+///   apply. Reaching the last rung is reported as `FirstProvider`, which is the
+///   state an unbound custom tier lands in.
 ///
 /// Returns `None` only when the tier is defined on no backend (a genuinely undefined
 /// tier name).
@@ -278,48 +373,51 @@ fn resolve_tier_backend(
     override_backend: Option<&str>,
     preferred_backend: Option<&str>,
     config: &PresetsConfig,
-) -> Option<String> {
+) -> Option<TierBackendChoice> {
     let providers = providers_for_tier(tier, config);
     let first = providers.first()?.clone();
 
-    // Single-provider tier: nothing to select; the override is a no-op.
+    // Single-provider tier: nothing to select; any override is a no-op.
     if providers.len() == 1 {
-        return Some(first);
+        return Some(TierBackendChoice {
+            backend: first,
+            source: ResolutionSource::SoleProvider,
+        });
     }
 
     let defines = |backend: &str| providers.iter().any(|p| p == backend);
+    let chose = |backend: &str, source: ResolutionSource| {
+        Some(TierBackendChoice {
+            backend: backend.to_string(),
+            source,
+        })
+    };
 
     if let Some(backend) = override_backend {
         if defines(backend) {
-            return Some(backend.to_string());
+            return chose(backend, ResolutionSource::ExecutionOverride);
         }
-        // Override names a backend the tier doesn't define: prefer the agent's
-        // preferred backend if the tier defines it, else the first defined provider.
-        if let Some(preferred) = preferred_backend {
-            if defines(preferred) {
-                return Some(preferred.to_string());
-            }
-        }
-        return Some(first);
     }
-
     if let Some(preferred) = preferred_backend {
         if defines(preferred) {
-            return Some(preferred.to_string());
+            return chose(preferred, ResolutionSource::AgentDefault);
         }
-        return Some(first);
     }
-
-    if defines(&config.active_backend) {
-        return Some(config.active_backend.clone());
+    if let Some(tier_default) = config.tier_default(tier) {
+        if defines(tier_default) {
+            return chose(tier_default, ResolutionSource::TierDefaultBackend);
+        }
     }
-    Some(first)
+    Some(TierBackendChoice {
+        backend: first,
+        source: ResolutionSource::FirstProvider,
+    })
 }
 
 /// Resolve a tier reference to a concrete preset.
 ///
-/// - `"md"` → resolved against the tier's providers (active backend among them, or
-///   its single provider when the tier is single-provider).
+/// - `"md"` → resolved against the tier's providers (its own default backend among
+///   them, or its single provider when the tier is single-provider).
 /// - `"codex/lg"` → the explicit backend acts as an override among the tier's providers.
 ///
 /// A tier defined on >=1 backend always resolves; `'Unknown tier'` is reachable only
@@ -327,18 +425,24 @@ fn resolve_tier_backend(
 pub fn resolve_preset(tier_ref: &str, config: &PresetsConfig) -> Result<ResolvedPreset, String> {
     let (explicit_backend, tier) = parse_tier_ref(tier_ref);
 
-    if let Some(backend_name) = resolve_tier_backend(tier, explicit_backend, None, config) {
-        if let Some(preset) = config.backends.get(&backend_name).and_then(|m| m.get(tier)) {
+    if let Some(choice) = resolve_tier_backend(tier, explicit_backend, None, config) {
+        if let Some(preset) = config
+            .backends
+            .get(&choice.backend)
+            .and_then(|m| m.get(tier))
+        {
             return Ok(ResolvedPreset {
                 model: preset.model.clone(),
                 extras: preset.to_extras(),
-                backend: backend_name,
+                backend: choice.backend,
             });
         }
     }
 
     // Genuinely-undefined tier name: preserve the explicit-backend error semantics.
-    let backend_name = explicit_backend.unwrap_or(&config.active_backend);
+    let backend_name = explicit_backend
+        .or_else(|| config.tier_default(tier))
+        .ok_or_else(|| format!("Unknown tier '{}'", tier))?;
     let backend_presets = config
         .backends
         .get(backend_name)
@@ -362,22 +466,18 @@ pub(crate) fn normalize_tier_selection(selection: &str, config: &PresetsConfig) 
         return selection.to_string();
     }
 
-    let backend_names = std::iter::once(config.active_backend.as_str()).chain(
-        config
-            .backends
-            .keys()
-            .map(String::as_str)
-            .filter(|name| *name != config.active_backend),
-    );
-
-    for backend_name in backend_names {
-        for known_tier in &config.tiers {
-            if config.backends[backend_name]
+    // Search tier by tier, each in its own provider order (its default backend
+    // first), so a legacy concrete model normalizes to the SHORTEST ref that
+    // still resolves back to it: unqualified when the match sits on that tier's
+    // default provider, qualified otherwise.
+    for known_tier in &config.tiers {
+        for backend_name in providers_for_tier(known_tier, config) {
+            if config.backends[&backend_name]
                 .get(known_tier)
                 .map(|preset| preset.model.as_str() == selection)
                 .unwrap_or(false)
             {
-                return if backend_name == config.active_backend {
+                return if Some(backend_name.as_str()) == config.tier_default(known_tier) {
                     known_tier.clone()
                 } else {
                     format!("{}/{}", backend_name, known_tier)
@@ -451,30 +551,24 @@ pub(crate) fn resolve_selection_with_provenance(
     let tier = authored.tier.as_str();
 
     if is_tier_ref(tier, config) {
-        let backend =
+        // Provenance comes from the choice itself, never from which inputs were
+        // present: an override the tier ignores must not be reported as having
+        // decided anything.
+        let choice =
             resolve_tier_backend(tier, authored.backend.as_deref(), preferred_backend, config)
                 .ok_or_else(|| format!("Unknown tier '{}'", tier))?;
         let preset = config
             .backends
-            .get(&backend)
+            .get(&choice.backend)
             .and_then(|m| m.get(tier))
-            .ok_or_else(|| format!("Unknown tier '{}' for backend '{}'", tier, backend))?;
-        let source = if override_backend.is_some() {
-            ResolutionSource::ExecutionOverride
-        } else if preferred_backend.is_some() {
-            ResolutionSource::AgentDefault
-        } else if providers_for_tier(tier, config).len() == 1 {
-            ResolutionSource::TierDefault
-        } else {
-            ResolutionSource::ActiveBackend
-        };
+            .ok_or_else(|| format!("Unknown tier '{}' for backend '{}'", tier, choice.backend))?;
         return Ok(ResolvedSelection {
             selection: ModelSelection {
-                backend,
+                backend: choice.backend,
                 model: preset.model.clone(),
             },
             extras: preset.to_extras(),
-            source,
+            source: choice.source,
         });
     }
 
@@ -506,21 +600,52 @@ pub(crate) fn resolve_selection_with_provenance(
     })
 }
 
+/// The backend a SPAWNED task authors, given the spawn payload's explicit
+/// preference and the agent file's own.
+///
+/// Deliberately short: there is no third rung. A task does not inherit the
+/// calling session's provider, because with per-tier defaults the tier IS the
+/// routing decision — `sm` means "the cheapest adequate faucet", and which
+/// provider that is belongs to the tier, not to whoever happened to call.
+/// Inheritance would defeat tier defaults at exactly the site that consumes
+/// unqualified tier refs most (fan-out tasks), pinning every child of an
+/// opus parent to Claude no matter what `sm` is configured to use.
+///
+/// Both spawn paths — MCP-hosted delegation and the child-task job builder —
+/// ask here, so the ladder cannot differ between them. It once did: one ranked
+/// the inherited provider above the agent file's preference and the other below
+/// it, so the same agent resolved differently depending on which door it came
+/// through.
+pub(crate) fn spawned_task_backend<'a>(
+    explicit: Option<&'a str>,
+    agent_file: Option<&'a str>,
+) -> Option<&'a str> {
+    explicit.or(agent_file)
+}
+
 /// Load effective presets config (workspace + optional project overrides merged).
 pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) -> PresetsConfig {
     let settings = load_settings(config_dir);
 
     let mut config = PresetsConfig {
-        active_backend: settings.active_backend.clone(),
+        tier_defaults: settings.tier_defaults.clone(),
         tiers: settings.tiers.clone(),
         backends: settings.backends.clone(),
     };
 
     // Merge project-level overrides
     if let Some(proj_path) = project_path {
-        let proj_settings = load_project_settings(proj_path);
-        if let Some(ab) = proj_settings.active_backend {
-            config.active_backend = ab;
+        let proj_settings = load_project_settings_read_only(proj_path);
+        // A project's legacy global `activeBackend` said "every tier here runs on
+        // this provider"; it lands as exactly that, and an explicit per-tier
+        // `tierDefaults` then overrides tier by tier.
+        if let Some(backend) = proj_settings.legacy_active_backend() {
+            config.tier_defaults = tier_defaults_from_single_backend(backend, &config.tiers);
+        }
+        if let Some(proj_tier_defaults) = proj_settings.tier_defaults.clone() {
+            for (tier, backend) in proj_tier_defaults {
+                config.tier_defaults.insert(tier, backend);
+            }
         }
         if let Some(proj_backends) = proj_settings.backends {
             for (backend_name, tier_overrides) in proj_backends {
@@ -537,8 +662,9 @@ pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) ->
 
 /// Enumerate the atomic backend+model selections offered for a launch composer.
 ///
-/// For each configured tier, in each backend that defines that tier (active-backend
-/// first via [`providers_for_tier`]), yields one `ModelSelection { backend, model }`.
+/// For each configured tier, in each backend that defines that tier (that tier's
+/// default backend first via [`providers_for_tier`]), yields one
+/// `ModelSelection { backend, model }`.
 /// Deduplicated by `(backend, model)` so a model shared across tiers appears once.
 /// This is the MVP option set: there is no canonical concrete-model registry beyond
 /// tiers, so the launch composer offers exactly the tier-resolved selections (the
@@ -617,6 +743,7 @@ pub fn resolve_agent_snapshot(
     let authored = normalize_authored_selection(eff_tier, eff_backend, config);
 
     Ok(AgentSnapshot {
+        edited_at: None,
         id: file_agent.id.clone(),
         name: file_agent.name.clone(),
         description: file_agent.description.clone(),
@@ -723,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn available_selections_dedup_and_active_first() {
+    fn available_selections_dedup_and_tier_default_first() {
         let config = test_config();
         let avail = available_selections(&config);
         // No duplicate (backend, model) pairs.
@@ -735,7 +862,7 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), len, "available_selections must be deduped");
-        // Active backend (claude) leads, since the first tier (sm) is multi-provider.
+        // sm's default backend (claude) leads, since sm is multi-provider.
         assert_eq!(avail.first().unwrap().backend, "claude");
     }
 
@@ -1005,11 +1132,11 @@ mod tests {
         );
     }
 
-    /// Config whose active backend is codex, with an extra single-provider tier
-    /// `big` defined only on claude.
+    /// Config whose tiers all default to codex, with an extra single-provider
+    /// tier `big` defined only on claude.
     fn single_provider_config() -> PresetsConfig {
         let mut config = default_presets_config(Some(31999));
-        config.active_backend = "codex".to_string();
+        config.tier_defaults = tier_defaults_from_single_backend("codex", &config.tiers);
         config.tiers.push("big".to_string());
         config.backends.get_mut("claude").unwrap().insert(
             "big".to_string(),
@@ -1022,8 +1149,8 @@ mod tests {
     }
 
     #[test]
-    fn single_provider_tier_pins_backend_ignoring_active() {
-        // active backend is codex, but 'big' is defined only on claude.
+    fn single_provider_tier_pins_backend_ignoring_other_tier_defaults() {
+        // Every other tier defaults to codex, but 'big' is defined only on claude.
         let config = single_provider_config();
         let resolved = resolve_preset("big", &config).unwrap();
         assert_eq!(resolved.backend, "claude");
@@ -1057,50 +1184,190 @@ mod tests {
         assert_eq!(selection.model.as_str(), "opus");
     }
 
+    /// Assert both halves of a choice: the backend AND the rung that chose it.
+    fn assert_chose(
+        tier: &str,
+        override_backend: Option<&str>,
+        preferred: Option<&str>,
+        config: &PresetsConfig,
+        expected_backend: &str,
+        expected_source: ResolutionSource,
+    ) {
+        let choice = resolve_tier_backend(tier, override_backend, preferred, config)
+            .unwrap_or_else(|| panic!("tier '{tier}' should resolve"));
+        assert_eq!(choice.backend, expected_backend, "backend for '{tier}'");
+        assert_eq!(choice.source, expected_source, "provenance for '{tier}'");
+    }
+
     #[test]
-    fn multi_provider_tier_override_preferred_active_priority() {
-        // active claude; sm/md/lg defined on both claude and codex.
+    fn multi_provider_tier_override_preferred_tier_default_priority() {
+        // every tier defaults to claude; sm/md/lg defined on both claude and codex.
         let config = test_config();
         // override wins among defined providers.
-        assert_eq!(
-            resolve_tier_backend("md", Some("codex"), Some("claude"), &config).unwrap(),
-            "codex"
+        assert_chose(
+            "md",
+            Some("codex"),
+            Some("claude"),
+            &config,
+            "codex",
+            ResolutionSource::ExecutionOverride,
         );
         // no override: preferred wins.
-        assert_eq!(
-            resolve_tier_backend("md", None, Some("codex"), &config).unwrap(),
-            "codex"
+        assert_chose(
+            "md",
+            None,
+            Some("codex"),
+            &config,
+            "codex",
+            ResolutionSource::AgentDefault,
         );
-        // neither: active backend.
-        assert_eq!(
-            resolve_tier_backend("md", None, None, &config).unwrap(),
-            "claude"
-        );
-    }
-
-    #[test]
-    fn multi_provider_nonmatching_override_falls_to_preferred_then_first() {
-        let config = test_config(); // active claude
-                                    // override not defined; preferred codex is defined → codex.
-        assert_eq!(
-            resolve_tier_backend("md", Some("ghost"), Some("codex"), &config).unwrap(),
-            "codex"
-        );
-        // override not defined; preferred not defined → first defined (active claude).
-        assert_eq!(
-            resolve_tier_backend("md", Some("ghost"), Some("phantom"), &config).unwrap(),
-            "claude"
-        );
-        // override not defined; no preferred → first defined (active claude).
-        assert_eq!(
-            resolve_tier_backend("md", Some("ghost"), None, &config).unwrap(),
-            "claude"
+        // neither: the tier's own default backend.
+        assert_chose(
+            "md",
+            None,
+            None,
+            &config,
+            "claude",
+            ResolutionSource::TierDefaultBackend,
         );
     }
 
     #[test]
-    fn multi_provider_first_defined_excludes_undefined_active() {
-        // active claude no longer defines 'md'; md stays multi-provider via codex + gemini.
+    fn each_tier_resolves_through_its_own_default_backend() {
+        // The point of the model: one ladder per tier, not one provider for all.
+        let mut config = test_config();
+        config
+            .tier_defaults
+            .insert("lg".to_string(), "claude".to_string());
+        config
+            .tier_defaults
+            .insert("md".to_string(), "codex".to_string());
+        config
+            .tier_defaults
+            .insert("sm".to_string(), "openrouter".to_string());
+
+        assert_eq!(resolve_preset("lg", &config).unwrap().backend, "claude");
+        assert_eq!(
+            resolve_preset("lg", &config).unwrap().model.as_str(),
+            "opus"
+        );
+        assert_eq!(resolve_preset("md", &config).unwrap().backend, "codex");
+        assert_eq!(
+            resolve_preset("md", &config).unwrap().model.as_str(),
+            Model::GPT_5_6_TERRA
+        );
+        assert_eq!(resolve_preset("sm", &config).unwrap().backend, "openrouter");
+        assert_eq!(
+            resolve_preset("sm", &config).unwrap().model.as_str(),
+            "openrouter/auto"
+        );
+    }
+
+    #[test]
+    fn a_tier_default_never_leaks_into_a_sibling_tier() {
+        // Pointing 'sm' at codex must leave 'md' and 'lg' exactly where they were.
+        let mut config = test_config();
+        config
+            .tier_defaults
+            .insert("sm".to_string(), "codex".to_string());
+
+        assert_eq!(resolve_preset("sm", &config).unwrap().backend, "codex");
+        assert_eq!(resolve_preset("md", &config).unwrap().backend, "claude");
+        assert_eq!(resolve_preset("lg", &config).unwrap().backend, "claude");
+    }
+
+    #[test]
+    fn qualified_refs_and_overrides_ignore_the_tier_default() {
+        // A qualified ref and an execution override outrank the tier's default.
+        let mut config = test_config();
+        config
+            .tier_defaults
+            .insert("lg".to_string(), "codex".to_string());
+
+        assert_eq!(
+            resolve_preset("claude/lg", &config).unwrap().backend,
+            "claude"
+        );
+        let (selection, _) =
+            resolve_runtime_selection(Some("lg"), Some("claude"), &config).unwrap();
+        assert_eq!(selection.backend, "claude");
+        assert_eq!(selection.model.as_str(), "opus");
+    }
+
+    #[test]
+    fn a_tier_without_a_default_falls_to_its_first_defined_provider() {
+        // A freshly added custom tier carries no binding yet; it must still resolve.
+        let mut config = test_config();
+        config.tiers.push("xl".to_string());
+        for backend in ["codex", "openrouter"] {
+            config.backends.get_mut(backend).unwrap().insert(
+                "xl".to_string(),
+                Preset {
+                    model: Model::new(format!("{backend}-xl")),
+                    options: HashMap::new(),
+                },
+            );
+        }
+        assert!(config.tier_default("xl").is_none());
+        // Alphabetically first among the tier's providers.
+        assert_eq!(resolve_preset("xl", &config).unwrap().backend, "codex");
+    }
+
+    #[test]
+    fn normalize_qualifies_a_model_that_is_not_on_its_tier_default() {
+        // 'sonnet' is claude/md. With md defaulting to codex, the shortest ref
+        // that still resolves back to sonnet is the qualified one.
+        let mut config = test_config();
+        assert_eq!(normalize_tier_selection("sonnet", &config), "md");
+        config
+            .tier_defaults
+            .insert("md".to_string(), "codex".to_string());
+        assert_eq!(normalize_tier_selection("sonnet", &config), "claude/md");
+        assert_eq!(
+            normalize_tier_selection(Model::GPT_5_6_TERRA, &config),
+            "md"
+        );
+    }
+
+    /// A rung naming a backend the tier does not define is SKIPPED, and the
+    /// ladder continues below it — it does not short-circuit to the last rung.
+    #[test]
+    fn a_nonmatching_rung_is_skipped_and_the_ladder_continues() {
+        let config = test_config(); // every tier defaults to claude
+
+        // override not defined; preferred codex is defined → codex, credited to
+        // the preference rather than to the override that was ignored.
+        assert_chose(
+            "md",
+            Some("ghost"),
+            Some("codex"),
+            &config,
+            "codex",
+            ResolutionSource::AgentDefault,
+        );
+        // neither defined → the tier's own default still gets its turn.
+        assert_chose(
+            "md",
+            Some("ghost"),
+            Some("phantom"),
+            &config,
+            "claude",
+            ResolutionSource::TierDefaultBackend,
+        );
+        assert_chose(
+            "md",
+            Some("ghost"),
+            None,
+            &config,
+            "claude",
+            ResolutionSource::TierDefaultBackend,
+        );
+    }
+
+    #[test]
+    fn multi_provider_first_defined_excludes_a_tier_default_that_does_not_define_it() {
+        // md's default (claude) no longer defines 'md'; md stays multi-provider
+        // via codex + gemini.
         let mut config = test_config();
         config.backends.get_mut("claude").unwrap().remove("md");
         let mut gem = HashMap::new();
@@ -1113,15 +1380,25 @@ mod tests {
         );
         config.backends.insert("gemini".to_string(), gem);
 
-        // No override/preference, active not among providers → first defined (codex, alpha).
-        assert_eq!(
-            resolve_tier_backend("md", None, None, &config).unwrap(),
-            "codex"
+        // No override/preference, the tier default not among providers → first
+        // defined (codex, alphabetically), and the source says so rather than
+        // crediting a tier default that could not apply.
+        assert_chose(
+            "md",
+            None,
+            None,
+            &config,
+            "codex",
+            ResolutionSource::FirstProvider,
         );
-        // Override names the (now non-defining) active backend → first defined.
-        assert_eq!(
-            resolve_tier_backend("md", Some("claude"), None, &config).unwrap(),
-            "codex"
+        // Override names the (now non-defining) default backend → first defined.
+        assert_chose(
+            "md",
+            Some("claude"),
+            None,
+            &config,
+            "codex",
+            ResolutionSource::FirstProvider,
         );
     }
 
@@ -1199,7 +1476,8 @@ mod tests {
                 case.preferred.as_deref(),
                 &case.config,
             )
-            .unwrap_or_else(|| panic!("{}: expected backend", case.name));
+            .unwrap_or_else(|| panic!("{}: expected backend", case.name))
+            .backend;
             assert_eq!(backend, case.expected.backend, "{}", case.name);
             let model = case
                 .config
@@ -1249,6 +1527,110 @@ mod tests {
     }
 
     #[test]
+    fn a_spawned_task_never_inherits_a_callers_provider() {
+        // Explicit payload preference wins, then the agent file's own. There is
+        // no third rung: with neither, the tier's default decides.
+        assert_eq!(
+            spawned_task_backend(Some("codex"), Some("claude")),
+            Some("codex")
+        );
+        assert_eq!(spawned_task_backend(None, Some("claude")), Some("claude"));
+        assert_eq!(spawned_task_backend(None, None), None);
+    }
+
+    #[test]
+    fn a_claude_parent_spawning_sm_lands_on_sms_own_default() {
+        // The acceptance case: lg defaults to claude, sm to another backend. A
+        // claude-backed parent spawning an unqualified `sm` task with no
+        // preference anywhere resolves through sm's default, not the caller's.
+        let mut config = test_config();
+        config
+            .tier_defaults
+            .insert("lg".to_string(), "claude".to_string());
+        config
+            .tier_defaults
+            .insert("sm".to_string(), "codex".to_string());
+
+        let resolved = resolve_selection_with_provenance(
+            Some("sm"),
+            None,
+            spawned_task_backend(None, None),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(resolved.selection.backend, "codex");
+        assert_eq!(resolved.selection.model.as_str(), Model::GPT_5_6_LUNA);
+        assert_eq!(resolved.source, ResolutionSource::TierDefaultBackend);
+
+        // An explicit preference still wins, unchanged.
+        let pinned = resolve_selection_with_provenance(
+            Some("sm"),
+            None,
+            spawned_task_backend(Some("claude"), None),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(pinned.selection.backend, "claude");
+        assert_eq!(pinned.source, ResolutionSource::AgentDefault);
+    }
+
+    /// Provenance must name the rung that ACTUALLY chose, not one whose input
+    /// merely arrived. Each case below is a state where an input was supplied
+    /// and then ignored, so crediting it would tell the operator a false cause.
+    #[test]
+    fn provenance_never_credits_an_input_the_resolver_ignored() {
+        // An override on a sole-provider tier is a documented no-op.
+        let single = single_provider_config();
+        let ignored_override =
+            resolve_selection_with_provenance(Some("big"), Some("codex"), None, &single).unwrap();
+        assert_eq!(ignored_override.selection.backend, "claude");
+        assert_eq!(
+            ignored_override.source,
+            ResolutionSource::SoleProvider,
+            "an override the tier ignores must not be reported as having decided"
+        );
+
+        // An agent preference naming a backend that does not define the tier is
+        // skipped; the tier's own default decides instead.
+        let config = test_config();
+        let invalid_preference =
+            resolve_selection_with_provenance(Some("md"), None, Some("ghost"), &config).unwrap();
+        assert_eq!(invalid_preference.selection.backend, "claude");
+        assert_eq!(
+            invalid_preference.source,
+            ResolutionSource::TierDefaultBackend,
+            "a preference the tier cannot honor must not be reported as AgentDefault"
+        );
+
+        // An unbound multi-provider tier has no default to credit.
+        let mut unbound = test_config();
+        unbound.tier_defaults.remove("md");
+        let fell_through =
+            resolve_selection_with_provenance(Some("md"), None, None, &unbound).unwrap();
+        assert_eq!(fell_through.selection.backend, "claude");
+        assert_eq!(
+            fell_through.source,
+            ResolutionSource::FirstProvider,
+            "a tier with no default binding must not claim one decided"
+        );
+    }
+
+    /// A rung that cannot be honored is skipped, not treated as the end of the
+    /// ladder: a stale override still lets the tier's own default decide.
+    #[test]
+    fn an_unhonorable_rung_is_skipped_rather_than_ending_the_ladder() {
+        let mut config = test_config();
+        config
+            .tier_defaults
+            .insert("md".to_string(), "codex".to_string());
+
+        let resolved =
+            resolve_selection_with_provenance(Some("md"), Some("ghost"), None, &config).unwrap();
+        assert_eq!(resolved.selection.backend, "codex");
+        assert_eq!(resolved.source, ResolutionSource::TierDefaultBackend);
+    }
+
+    #[test]
     fn provenance_reports_each_decision_level() {
         let config = test_config();
         // Execution override (override_backend supplied).
@@ -1265,20 +1647,32 @@ mod tests {
                 .source,
             ResolutionSource::AgentDefault
         );
-        // Active backend (multi-provider tier, neither override nor preference).
+        // The tier's own default backend (multi-provider tier, neither override
+        // nor preference).
         assert_eq!(
             resolve_selection_with_provenance(Some("md"), None, None, &config)
                 .unwrap()
                 .source,
-            ResolutionSource::ActiveBackend
+            ResolutionSource::TierDefaultBackend
         );
-        // Tier default (single-provider tier pins the backend).
+        // First provider: reached only when the tier ALSO has no usable default
+        // (see `provenance_never_credits_an_input_the_resolver_ignored`), since
+        // a skipped override still leaves the tier's own default its turn.
+        let mut unbound = test_config();
+        unbound.tier_defaults.remove("md");
+        assert_eq!(
+            resolve_selection_with_provenance(Some("md"), Some("ghost"), None, &unbound)
+                .unwrap()
+                .source,
+            ResolutionSource::FirstProvider
+        );
+        // Sole provider (the tier is defined on exactly one backend).
         let single = single_provider_config();
         assert_eq!(
             resolve_selection_with_provenance(Some("big"), None, None, &single)
                 .unwrap()
                 .source,
-            ResolutionSource::TierDefault
+            ResolutionSource::SoleProvider
         );
         // Explicit model (concrete model + explicit backend).
         assert_eq!(

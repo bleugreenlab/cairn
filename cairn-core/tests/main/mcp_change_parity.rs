@@ -25,7 +25,7 @@ use serde_json::json;
 fn sample_uri(contract: &ResourceContract) -> String {
     contract
         .uri_template
-        .replace("{anchor}", "cairn://p/MCP/1/1/builder/plan")
+        .replace("{anchor}", "cairn://p/mcp/1/1/builder/plan")
         .replace("{id}", "ann-1")
         .replace("{seq}", "1")
         .replace("{exec_seq}", "1")
@@ -70,6 +70,7 @@ fn payload_for(spec: &MutationSpec) -> serde_json::Value {
             KeyType::Str => json!("x"),
             KeyType::Bool => json!(true),
             KeyType::Int => json!(1),
+            KeyType::Float => json!(1.0),
             KeyType::Array => json!([]),
             KeyType::Object => json!({}),
             KeyType::Any => serde_json::Value::Null,

@@ -140,8 +140,9 @@ pub async fn pull_project_on_default_branch_push(
         .default_branch
         .as_deref()
         .unwrap_or(event_default_branch);
-    let config =
-        crate::config::project_settings::load_project_settings(Path::new(&project.repo_path));
+    let config = crate::config::project_settings::load_project_settings_read_only(Path::new(
+        &project.repo_path,
+    ));
     let default_branch =
         crate::config::project_settings::resolve_default_branch(&config, Some(stored_default));
 
@@ -256,7 +257,7 @@ mod tests {
             &CreateProject {
                 id: Some(id.to_string()),
                 name: id.to_string(),
-                key: cairn_common::uri::canonical_project(&id.chars().take(8).collect::<String>()),
+                key: cairn_common::uri::canonical_project(id.chars().take(8).collect::<String>()),
                 repo_path: repo_path.to_string(),
                 team_id: None,
             },

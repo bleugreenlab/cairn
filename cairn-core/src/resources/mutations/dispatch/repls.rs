@@ -76,13 +76,6 @@ pub(super) async fn dispatch(
             }
         }
         ChangeMode::Delete => {
-            if item.payload.is_some() {
-                return Err(build_failure(
-                    index,
-                    item,
-                    "mode=delete does not accept payload",
-                ));
-            }
             if dry_run {
                 format!("Would stop or discard REPL {slug}")
             } else {

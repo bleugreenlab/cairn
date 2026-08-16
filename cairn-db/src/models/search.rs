@@ -11,6 +11,28 @@ pub enum SearchContentType {
     Artifact,
     Event,
     Message,
+    Post,
+    #[serde(rename = "post_comment")]
+    PostComment,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchContentType;
+
+    #[test]
+    fn post_comment_content_type_uses_the_filter_vocabulary() {
+        let encoded = serde_json::to_string(&SearchContentType::PostComment).unwrap();
+        assert_eq!(encoded, "\"post_comment\"");
+        assert_eq!(
+            serde_json::from_str::<SearchContentType>(&encoded).unwrap(),
+            SearchContentType::PostComment
+        );
+        assert_eq!(
+            encoded.trim_matches('"').parse(),
+            Ok(SearchContentType::PostComment)
+        );
+    }
 }
 
 impl std::fmt::Display for SearchContentType {
@@ -21,6 +43,8 @@ impl std::fmt::Display for SearchContentType {
             SearchContentType::Artifact => write!(f, "artifact"),
             SearchContentType::Event => write!(f, "event"),
             SearchContentType::Message => write!(f, "message"),
+            SearchContentType::Post => write!(f, "post"),
+            SearchContentType::PostComment => write!(f, "post_comment"),
         }
     }
 }
@@ -35,6 +59,8 @@ impl std::str::FromStr for SearchContentType {
             "artifact" => Ok(SearchContentType::Artifact),
             "event" => Ok(SearchContentType::Event),
             "message" => Ok(SearchContentType::Message),
+            "post" => Ok(SearchContentType::Post),
+            "post_comment" => Ok(SearchContentType::PostComment),
             _ => Err(format!("Unknown content type: {}", s)),
         }
     }

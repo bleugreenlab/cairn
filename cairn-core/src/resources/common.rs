@@ -3,7 +3,7 @@
 use cairn_db::turso::params;
 
 use crate::mcp::types::McpCallbackRequest;
-use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use crate::storage::{DbError, DbResult, LocalDb, RowExt, TrackedConnection};
 use cairn_common::contract::{
     contract_for, ChangeMode, KeyType, MutationSpec, ResourceContract, ResourceKind,
 };
@@ -121,7 +121,20 @@ fn resolve_home_suffix(home_uri: &str, suffix: &str) -> String {
     format!("{}/{}", home_uri.trim_end_matches('/'), suffix)
 }
 
-pub(super) async fn connect_for_read(db: &LocalDb) -> Result<cairn_db::turso::Connection, String> {
+/// Open one read transaction for a resource render, on a connection of its own.
+///
+/// The transaction ends when the returned connection drops at the end of the
+/// read — nothing here issues a `ROLLBACK`, and it does not need to: the engine
+/// rolls an active MVCC transaction back when its connection is dropped,
+/// precisely so its entries cannot leak and block a checkpoint.
+///
+/// It is a [`TrackedConnection`], so the transaction counts toward the quiet
+/// instant `LocalDb`'s connection gate waits for. That matters more here than
+/// anywhere else in the codebase: these reads back the desktop UI's status
+/// polling, which is the bulk of the database traffic on an idle machine, and
+/// they are out of the pool. A quiesce that did not see them would drain to zero
+/// and still lose the checkpoint lock (CAIRN-4167).
+pub(super) async fn connect_for_read(db: &LocalDb) -> Result<TrackedConnection, String> {
     let conn = db
         .connect()
         .await
@@ -391,26 +404,14 @@ fn push_mutation_actions(action_lines: &mut Vec<String>, contract: &ResourceCont
 }
 
 /// One-line payload guidance for an action: required/optional keys + example.
+///
+/// The key list comes from `MutationSpec::accepted_keys_display`, the same
+/// formatter the write gate's unknown-key rejection uses, so what a resource
+/// advertises here is exactly what it enforces there.
 fn action_summary(spec: &MutationSpec) -> String {
-    fn keys(specs: &[cairn_common::contract::KeySpec]) -> String {
-        specs
-            .iter()
-            .map(|k| format!("`{}`", k.display()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-    let mut parts: Vec<String> = Vec::new();
-    if !spec.required.is_empty() {
-        parts.push(format!("required {}", keys(spec.required)));
-    }
-    if !spec.optional.is_empty() {
-        parts.push(format!("optional {}", keys(spec.optional)));
-    }
-    let head = if parts.is_empty() {
-        "no payload".to_string()
-    } else {
-        parts.join("; ")
-    };
+    let head = spec
+        .accepted_keys_display()
+        .unwrap_or_else(|| "no payload".to_string());
     format!("{}. e.g. {}", head, spec.example)
 }
 
@@ -503,8 +504,11 @@ pub(super) fn artifact_affordance_with_schema(
     sections.push_str(&format!(
         "- [{create_label}]({example_uri}): {head}. e.g. {create_example}\n"
     ));
-    // The patch action is schema-agnostic (field merge / text replacement /
-    // confirm / PR ops), so its contract example stands as written.
+    if addressed_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
+        sections.push_str("- [append one ruling](cairn:~/arc): required `ruling(object)` with text, status, rationale, and canonical provenance; Cairn mints its stable slug. This does not resend or replace any other ruling. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling:{text:\"...\",status:\"accepted\",rationale:\"...\",provenance:[\"cairn://p/PROJECT/NUMBER\"]}}}]})\n");
+        sections.push_str("- [patch one ruling by slug](cairn:~/arc): required `ruling_slug(str)`, `patch(object)`; the slug is immutable. This does not resend or replace any other ruling. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling_slug:\"no-budget-kills\",patch:{status:\"superseded\",rationale:\"...\"}}}]})\n");
+    }
+    // Ordinary field merge remains available after the safer arc item actions.
     if let Some(patch) = contract.mutation(ChangeMode::Patch) {
         sections.push_str(&format!(
             "- [{}]({}): {}\n",
@@ -512,10 +516,6 @@ pub(super) fn artifact_affordance_with_schema(
             example_uri,
             action_summary(patch)
         ));
-    }
-    if addressed_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
-        sections.push_str("- [append one ruling](cairn:~/arc): required `ruling(object)` with text, status, rationale, and provenance; Cairn mints its stable slug. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling:{text:\"...\",status:\"accepted\",rationale:\"...\",provenance:[\"cairn://p/PROJECT/NUMBER\"]}}}]})\n");
-        sections.push_str("- [patch one ruling by slug](cairn:~/arc): required `ruling_slug(str)`, `patch(object)`; slug is immutable. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling_slug:\"no-budget-kills\",patch:{status:\"superseded\",rationale:\"...\"}}}]})\n");
     }
     sections.push('\n');
 
@@ -632,7 +632,7 @@ pub(crate) async fn connect_and_find_node_job(
     number: i32,
     exec_seq: i32,
     node_name: &str,
-) -> Result<(cairn_db::turso::Connection, ResourceJob), String> {
+) -> Result<(TrackedConnection, ResourceJob), String> {
     let conn = connect_for_read(db).await?;
     // A node coordinate names an issue, so an unknown project key or a
     // nonexistent issue is reported as itself rather than collapsed into "node
@@ -690,7 +690,7 @@ pub(super) async fn connect_and_find_task_job(
     exec_seq: i32,
     node_name: &str,
     task_name: &str,
-) -> Result<(cairn_db::turso::Connection, ResourceJob, ResourceJob), String> {
+) -> Result<(TrackedConnection, ResourceJob, ResourceJob), String> {
     // The parent resolves first so a thread with no session reports that rather
     // than reporting a missing task; from there a task is a child job by segment
     // whichever kind of parent owns it.
@@ -1104,18 +1104,18 @@ mod tests {
 
     #[test]
     fn task_home_diff_projects_to_the_owning_node() {
-        let home = "cairn://p/CAIRN/2691/1/builder/task/review";
+        let home = "cairn://p/cairn/2691/1/builder/task/review";
         assert_eq!(
             resolve_home_suffix(home, "diff"),
-            "cairn://p/CAIRN/2691/1/builder/diff"
+            "cairn://p/cairn/2691/1/builder/diff"
         );
         assert_eq!(
             resolve_home_suffix(home, "diff?view=check"),
-            "cairn://p/CAIRN/2691/1/builder/diff?view=check"
+            "cairn://p/cairn/2691/1/builder/diff?view=check"
         );
         assert_eq!(
             resolve_home_suffix(home, "messages"),
-            "cairn://p/CAIRN/2691/1/builder/task/review/messages"
+            "cairn://p/cairn/2691/1/builder/task/review/messages"
         );
     }
 
@@ -1125,27 +1125,27 @@ mod tests {
     /// meet the conflict, since they do the editing.
     #[test]
     fn task_home_rebase_projects_to_the_owning_node() {
-        let home = "cairn://p/CAIRN/2691/1/builder/task/review";
+        let home = "cairn://p/cairn/2691/1/builder/task/review";
         assert_eq!(
             resolve_home_suffix(home, "rebase"),
-            "cairn://p/CAIRN/2691/1/builder/rebase"
+            "cairn://p/cairn/2691/1/builder/rebase"
         );
         assert_eq!(
             resolve_home_suffix(home, "rebase?view=base-theirs&file=a.rs"),
-            "cairn://p/CAIRN/2691/1/builder/rebase?view=base-theirs&file=a.rs"
+            "cairn://p/cairn/2691/1/builder/rebase?view=base-theirs&file=a.rs"
         );
         // The projection is a short, deliberate list, not a general rule.
         assert_eq!(
             resolve_home_suffix(home, "todos"),
-            "cairn://p/CAIRN/2691/1/builder/task/review/todos"
+            "cairn://p/cairn/2691/1/builder/task/review/todos"
         );
     }
 
     #[test]
     fn node_home_diff_stays_on_the_node() {
         assert_eq!(
-            resolve_home_suffix("cairn://p/CAIRN/2691/1/builder", "diff?view=patch"),
-            "cairn://p/CAIRN/2691/1/builder/diff?view=patch"
+            resolve_home_suffix("cairn://p/cairn/2691/1/builder", "diff?view=patch"),
+            "cairn://p/cairn/2691/1/builder/diff?view=patch"
         );
     }
 
@@ -1269,6 +1269,30 @@ mod tests {
                 "create example key `{key}` is not a schema property: {payload}"
             );
         }
+    }
+
+    #[test]
+    fn arc_affordance_leads_with_item_level_ruling_actions() {
+        let schema: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../resources/schemas/arc.json")).unwrap();
+        let block =
+            artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("arc"), &schema)
+                .unwrap();
+        let append = block.find("[append one ruling]").unwrap();
+        let edit = block.find("[patch one ruling by slug]").unwrap();
+        let generic = block
+            .find("[edit, confirm, or act on a PR artifact]")
+            .unwrap();
+        assert!(append < edit && edit < generic, "{block}");
+        assert!(block.contains("payload:{ruling:{text:\"...\",status:\"accepted\",rationale:\"...\",provenance:[\"cairn://p/PROJECT/NUMBER\"]}}"));
+        assert!(block.contains("payload:{ruling_slug:\"no-budget-kills\",patch:{status:\"superseded\",rationale:\"...\"}}"));
+        assert_eq!(
+            block
+                .matches("does not resend or replace any other ruling")
+                .count(),
+            2
+        );
+        assert!(block.contains("the slug is immutable"));
     }
 
     #[test]

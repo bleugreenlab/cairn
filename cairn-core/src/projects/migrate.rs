@@ -1051,7 +1051,7 @@ mod tests {
         assert_eq!(
             local
                 .query_text(
-                    "SELECT team_id FROM project_routes WHERE project_key = 'MOVE'",
+                    "SELECT team_id FROM project_routes WHERE project_key = 'move'",
                     ()
                 )
                 .await

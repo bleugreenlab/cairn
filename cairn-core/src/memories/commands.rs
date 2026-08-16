@@ -723,7 +723,7 @@ mod tests {
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/project', 1, 1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('project-1', 'default', 'Project', 'prj', '/tmp/project', 1, 1)",
                         (),
                     )
                     .await?;
@@ -888,7 +888,7 @@ mod tests {
             .local
             .execute(
                 "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
-                 VALUES (?1, ?1, 'project-1', 'a durable fact', 'draft', 'project', 'project-1', ?2, 1, 'cairn://p/PRJ/42/1/builder/chat/turn/2', 1, 1)",
+                 VALUES (?1, ?1, 'project-1', 'a durable fact', 'draft', 'project', 'project-1', ?2, 1, 'cairn://p/prj/42/1/builder/chat/turn/2', 1, 1)",
                 params![id, job_id],
             )
             .await
@@ -919,7 +919,7 @@ mod tests {
         let issue_id = format!("{team_id}~00000000-0000-4000-8000-100000000002");
         let execution_id = format!("{team_id}~00000000-0000-4000-8000-100000000003");
         db.execute(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'TP', '/tmp/team-project', 1, 1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Team Project', 'tp', '/tmp/team-project', 1, 1)",
             params![project_id.as_str()],
         )
         .await
@@ -945,7 +945,7 @@ mod tests {
         .unwrap();
         db.execute(
             "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, provenance_uri, created_at, updated_at)
-             VALUES (?1, ?1, ?2, 'a durable team fact', 'draft', 'project', ?2, ?3, 1, 'cairn://p/TP/7/1/builder/chat/turn/2', 1, 1)",
+             VALUES (?1, ?1, ?2, 'a durable team fact', 'draft', 'project', ?2, ?3, 1, 'cairn://p/tp/7/1/builder/chat/turn/2', 1, 1)",
             params![memory_id, project_id.as_str(), job_id],
         )
         .await

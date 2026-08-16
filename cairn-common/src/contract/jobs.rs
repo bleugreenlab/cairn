@@ -76,7 +76,7 @@ pub(crate) const NODE_WAKES_CONTRACT: ResourceContract =
             MutationSpec {
                 mode: ChangeMode::Append,
                 required: &[],
-                optional: &[KeySpec::new("subscribe", KeyType::Object, "source filter; kind:\"terminal\" resumes the node when a terminal exits, kind:\"checks\" when a node's project check lanes settle (ref defaults to your own node)"), KeySpec::new("mute", KeyType::Object, "source filter"), KeySpec::new("until", KeyType::Object, "source filter that lifts the mute")],
+                optional: &[KeySpec::new("subscribe", KeyType::Object, "source filter; kind:\"terminal\" resumes the node when a terminal exits, kind:\"checks\" when a node's project check lanes settle (ref defaults to your own node), kind:\"posts\" when a post your home may see is published (no ref)"), KeySpec::new("mute", KeyType::Object, "source filter"), KeySpec::new("until", KeyType::Object, "source filter that lifts the mute")],
                 label: "subscribe or mute wakes",
                 example: "write({changes:[{target:\"cairn:~/wakes\",mode:\"append\",payload:{subscribe:{kind:\"terminal\",ref:\"cairn:~/terminal/<slug>\",on:\"exit\"}}}]})",
             },
@@ -261,7 +261,12 @@ pub(crate) const NODE_PERMISSION_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Patch,
             required: &[],
-            optional: &[PERMISSION_DECISION, PERMISSION_SCOPE],
+            optional: &[
+                PERMISSION_DECISION,
+                PERMISSION_SCOPE,
+                PERMISSION_LIFETIME,
+                PERMISSION_EXPIRES_IN_SECONDS,
+            ],
             label: "answer permission",
             example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/permissions/perm-1\",mode:\"patch\",payload:{decision:\"allow\",scope:\"once\"}}]})",
         }],
@@ -291,7 +296,12 @@ pub(crate) const TASK_PERMISSION_CONTRACT: ResourceContract =
         mutations: &[MutationSpec {
             mode: ChangeMode::Patch,
             required: &[],
-            optional: &[PERMISSION_DECISION, PERMISSION_SCOPE],
+            optional: &[
+                PERMISSION_DECISION,
+                PERMISSION_SCOPE,
+                PERMISSION_LIFETIME,
+                PERMISSION_EXPIRES_IN_SECONDS,
+            ],
             label: "answer permission",
             example: "write({changes:[{target:\"cairn://p/PROJ/1/1/builder/task/review/permissions/perm-1\",mode:\"patch\",payload:{decision:\"allow\",scope:\"once\"}}]})",
         }],

@@ -177,7 +177,7 @@ pub(crate) async fn resolve_issue_uri(
             SELECT i.id, i.number, i.title, i.status
             FROM issues i
             JOIN projects p ON p.id = i.project_id
-            WHERE p.key = ?1 AND i.number = ?2
+            WHERE p.key = ?1 COLLATE NOCASE AND i.number = ?2
             LIMIT 1
             ",
             params![project_key.as_str(), number as i64],
@@ -228,7 +228,7 @@ pub(crate) async fn resolve_issue_uris(
              SELECT requested.uri, requested.project_key,
                     i.id, i.number, i.title, i.status
              FROM requested
-             JOIN projects p ON p.key = requested.project_key
+             JOIN projects p ON p.key = requested.project_key COLLATE NOCASE
              JOIN issues i ON i.project_id = p.id AND i.number = requested.number",
             params![requested_json],
         )
@@ -564,7 +564,7 @@ mod parent_tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
             VALUES('parent', 'p', 1, 'Parent', 'backlog', 'backlog', 'none', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at, parent_issue_id)
@@ -682,7 +682,7 @@ mod parent_tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
             VALUES('parent-a', 'p', 1, 'Parent A', 'backlog', 'backlog', 'none', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
@@ -721,7 +721,7 @@ mod parent_tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-            VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+            VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
             VALUES('parent', 'p', 1, 'Parent', 'backlog', 'backlog', 'none', 1, 1);
             INSERT INTO jobs(id, project_id, issue_id, status, branch, created_at, updated_at)
@@ -745,7 +745,7 @@ mod parent_tests {
         let db = migrated_db().await;
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','PROJ','/tmp/p',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','proj','/tmp/p',1,1);
              INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('thread','p','topic','active','none',1,1);
              INSERT INTO issues(id,project_id,number,title,status,progress,attention,parent_thread_id,created_at,updated_at) VALUES('child','p',1,'Child','backlog','backlog','none','thread',1,1);"
         ).await.unwrap();
@@ -844,10 +844,10 @@ mod tests {
     #[test]
     fn canonicalize_issue_uri_rejects_non_issue_uri() {
         assert_eq!(
-            canonicalize_issue_uri("cairn://p/CAIRN/12").unwrap(),
-            "cairn://p/CAIRN/12"
+            canonicalize_issue_uri("cairn://p/cairn/12").unwrap(),
+            "cairn://p/cairn/12"
         );
-        assert!(canonicalize_issue_uri("cairn://p/CAIRN/messages").is_err());
+        assert!(canonicalize_issue_uri("cairn://p/cairn/messages").is_err());
         assert!(canonicalize_issue_uri("").is_err());
     }
 
@@ -856,7 +856,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_project(conn, "p-cairn", "cairn").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-b", 2, "B", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-c", 3, "C", "backlog").await;
@@ -865,16 +865,16 @@ mod tests {
                     conn,
                     "i-a",
                     &[
-                        " cairn://p/CAIRN/2 ".to_string(),
-                        "cairn://p/CAIRN/3".to_string(),
-                        "cairn://p/CAIRN/2".to_string(),
+                        " cairn://p/cairn/2 ".to_string(),
+                        "cairn://p/cairn/3".to_string(),
+                        "cairn://p/cairn/2".to_string(),
                     ],
                     2,
                 )
                 .await
                 .unwrap();
 
-                assert_eq!(replaced, vec!["cairn://p/CAIRN/2", "cairn://p/CAIRN/3"]);
+                assert_eq!(replaced, vec!["cairn://p/cairn/2", "cairn://p/cairn/3"]);
                 assert_eq!(list_dependency_uris(conn, "i-a").await.unwrap(), replaced);
                 Ok(())
             })
@@ -888,20 +888,20 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
-                seed_project(conn, "p-agg", "AGG").await;
+                seed_project(conn, "p-cairn", "cairn").await;
+                seed_project(conn, "p-agg", "agg").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-agg", "i-b", 2, "B", "backlog").await;
-                replace_dependencies(conn, "i-a", &["cairn://p/AGG/2".to_string()], 2)
+                replace_dependencies(conn, "i-a", &["cairn://p/agg/2".to_string()], 2)
                     .await
                     .unwrap();
                 let error =
-                    replace_dependencies(conn, "i-b", &["cairn://p/CAIRN/1".to_string()], 3)
+                    replace_dependencies(conn, "i-b", &["cairn://p/cairn/1".to_string()], 3)
                         .await
                         .unwrap_err();
                 assert!(error.contains("dependency cycle"));
-                assert!(error.contains("cairn://p/AGG/2"));
-                assert!(error.contains("cairn://p/CAIRN/1"));
+                assert!(error.contains("cairn://p/agg/2"));
+                assert!(error.contains("cairn://p/cairn/1"));
                 Ok(())
             })
         })
@@ -914,10 +914,10 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_project(conn, "p-cairn", "cairn").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-b", 2, "B", "active").await;
-                replace_dependencies(conn, "i-a", &["cairn://p/CAIRN/2".to_string()], 2)
+                replace_dependencies(conn, "i-a", &["cairn://p/cairn/2".to_string()], 2)
                     .await
                     .unwrap();
                 assert!(!dependencies_ready(conn, "i-a").await.unwrap());
@@ -943,7 +943,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_project(conn, "p-cairn", "cairn").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-b", 2, "B", "merged").await;
                 seed_issue(conn, "p-cairn", "i-c", 3, "C", "active").await;
@@ -951,9 +951,9 @@ mod tests {
                     conn,
                     "i-a",
                     &[
-                        "cairn://p/CAIRN/2".to_string(),
-                        "cairn://p/CAIRN/3".to_string(),
-                        "cairn://p/CAIRN/99".to_string(),
+                        "cairn://p/cairn/2".to_string(),
+                        "cairn://p/cairn/3".to_string(),
+                        "cairn://p/cairn/99".to_string(),
                     ],
                     2,
                 )
@@ -965,8 +965,8 @@ mod tests {
                 assert_eq!(
                     unmet,
                     vec![
-                        "cairn://p/CAIRN/3".to_string(),
-                        "cairn://p/CAIRN/99".to_string(),
+                        "cairn://p/cairn/3".to_string(),
+                        "cairn://p/cairn/99".to_string(),
                     ]
                 );
                 assert_eq!(unmet_dependency_count(conn, "i-a").await.unwrap(), 2);
@@ -982,20 +982,20 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_project(conn, "p-cairn", "cairn").await;
                 seed_project(conn, "p-agg", "AGG").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-b", 2, "B", "backlog").await;
                 seed_issue(conn, "p-agg", "i-c", 3, "C", "backlog").await;
-                replace_dependencies(conn, "i-b", &["cairn://p/CAIRN/1".to_string()], 2)
+                replace_dependencies(conn, "i-b", &["cairn://p/cairn/1".to_string()], 2)
                     .await
                     .unwrap();
-                replace_dependencies(conn, "i-c", &["cairn://p/CAIRN/1".to_string()], 2)
+                replace_dependencies(conn, "i-c", &["cairn://p/cairn/1".to_string()], 2)
                     .await
                     .unwrap();
 
                 assert_eq!(
-                    list_dependent_issue_ids(conn, "cairn://p/CAIRN/1")
+                    list_dependent_issue_ids(conn, "cairn://p/cairn/1")
                         .await
                         .unwrap(),
                     vec!["i-b".to_string(), "i-c".to_string()]
@@ -1012,7 +1012,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_project(conn, "p-cairn", "cairn").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-b", 2, "B", "backlog").await;
                 // No parent links yet: adopting B under A is acyclic.
@@ -1029,7 +1029,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed_project(conn, "p-cairn", "CAIRN").await;
+                seed_project(conn, "p-cairn", "cairn").await;
                 seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
                 seed_issue(conn, "p-cairn", "i-b", 2, "B", "backlog").await;
                 // A's parent is B; adopting B under A would close the loop.

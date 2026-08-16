@@ -264,7 +264,7 @@ mod tests {
         local
             .execute_script(
                 "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
-                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p', 'w', 'P', 'P', '/tmp', 1, 1);
+                 INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES('p', 'w', 'P', 'p', '/tmp', 1, 1);
                  INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES('i', 'p', 1, 'I', 'active', 'active', 'none', 1, 1);
                  INSERT INTO jobs(id, project_id, issue_id, status, current_session_id, created_at, updated_at) VALUES('j', 'p', 'i', 'running', 'job-session', 1, 1);
                  INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at) VALUES('t', 'p', 'thread-ux', 'active', 'none', 1, 1);
@@ -458,7 +458,7 @@ mod tests {
             .expect("a thread's running terminal belongs in the running listing");
         assert_eq!(thread.job_id.as_deref(), Some("t-job"));
         assert_eq!(thread.slug.as_deref(), Some("thread-term"));
-        assert_eq!(thread.project_key, "P");
+        assert_eq!(thread.project_key, "p");
         assert_eq!(thread.project_id, "p");
         // No issue coordinate to report, and the thread named instead of it.
         assert_eq!(thread.issue_id, None);

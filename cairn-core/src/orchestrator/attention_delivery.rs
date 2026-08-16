@@ -304,7 +304,7 @@ pub(crate) async fn create_catchup_pushes_for_watchers(
         return Ok(0);
     };
     let (Some(project_key), Some(number)) = (
-        parsed.project().map(str::to_uppercase),
+        parsed.project().map(cairn_common::uri::canonical_project),
         parsed.issue_number(),
     ) else {
         return Ok(0);
@@ -781,7 +781,7 @@ mod tests {
     use super::*;
     use crate::storage::LocalDb;
 
-    const CHILD_URI: &str = "cairn://p/PROJ/2";
+    const CHILD_URI: &str = "cairn://p/proj/2";
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("attention-delivery.db").await
@@ -799,7 +799,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('parent','p',1,'Parent','active','active','none',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
@@ -868,7 +868,7 @@ mod tests {
         .await
         .unwrap();
         let orch = test_orchestrator(db);
-        let uri = "cairn://p/PROJ/2/1/builder/create-pr";
+        let uri = "cairn://p/proj/2/1/builder/create-pr";
         let push = crate::orchestrator::attention_push::Push {
             id: "push-review".into(),
             recipient: "watcher".into(),
@@ -914,7 +914,7 @@ mod tests {
         .await
         .unwrap();
         let orch = test_orchestrator(db);
-        let uri = "cairn://p/PROJ/2/1/builder/checks";
+        let uri = "cairn://p/proj/2/1/builder/checks";
         let push = crate::orchestrator::attention_push::Push {
             id: "push-checks".into(),
             recipient: "child-job".into(),
@@ -953,9 +953,9 @@ mod tests {
             delivered_event_id: None,
         };
         let pushes = vec![
-            make_push("first", "cairn://p/PROJ/1/1/first/create-pr"),
-            make_push("second", "cairn://p/PROJ/2/1/second/create-pr"),
-            make_push("third", "cairn://p/PROJ/3/1/third/create-pr"),
+            make_push("first", "cairn://p/proj/1/1/first/create-pr"),
+            make_push("second", "cairn://p/proj/2/1/second/create-pr"),
+            make_push("third", "cairn://p/proj/3/1/third/create-pr"),
         ];
 
         let rendered = render_pushes_resolved(&orch, &pushes).await.unwrap();
@@ -975,7 +975,7 @@ mod tests {
                 recipient_run_id, content, created_at)
              VALUES
                ('direct-message', 'direct', NULL, NULL,
-                'cairn://p/PROJ/1/1/sender', NULL, 'frozen direct content', 1);",
+                'cairn://p/proj/1/1/sender', NULL, 'frozen direct content', 1);",
         )
         .await
         .unwrap();
@@ -983,7 +983,7 @@ mod tests {
         let push = crate::orchestrator::attention_push::Push {
             id: "direct-push".into(),
             recipient: "watcher".into(),
-            content_ref: "cairn://p/PROJ/1/1/watcher/messages".into(),
+            content_ref: "cairn://p/proj/1/1/watcher/messages".into(),
             wake: Wake::Wake,
             boundary: Boundary::Event,
             key: "direct:direct-message".into(),
@@ -1032,8 +1032,8 @@ mod tests {
 
         let rendered = render_push_resolved(&orch, &push).await;
 
-        assert!(rendered.contains("Attention update (passive): cairn://p/PROJ/2"));
-        assert!(rendered.contains("PROJ-2 \"Child\" merged"), "{rendered}");
+        assert!(rendered.contains("Attention update (passive): cairn://p/proj/2"));
+        assert!(rendered.contains("proj-2 \"Child\" merged"), "{rendered}");
         assert!(rendered.contains("PR #42, by operator (UI)"), "{rendered}");
         assert!(!rendered.contains("Description"));
         assert!(!rendered.contains("This long child issue description"));
@@ -1048,7 +1048,7 @@ mod tests {
             .unwrap();
         let mismatched = render_push_resolved(&orch, &push).await;
         assert!(
-            mismatched.contains("PROJ-2 \"Child\" merged"),
+            mismatched.contains("proj-2 \"Child\" merged"),
             "{mismatched}"
         );
         assert!(!mismatched.contains("PR #42"), "{mismatched}");
@@ -1062,7 +1062,7 @@ mod tests {
         team.execute_script(
             "
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('team-project','default','Team Project','TEAM','/tmp/team',1,1);
+              VALUES('team-project','default','Team Project','team','/tmp/team',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('team-issue','team-project',9,'Failed child','failed','failed','none',1,2);
             ",
@@ -1073,8 +1073,8 @@ mod tests {
         orch.db
             .register_team_db_for_test("team-1".to_string(), team)
             .await;
-        orch.db.set_route("TEAM", Some("team-1".to_string())).await;
-        let issue_uri = "cairn://p/TEAM/9";
+        orch.db.set_route("team", Some("team-1".to_string())).await;
+        let issue_uri = "cairn://p/team/9";
         let push = crate::orchestrator::attention_push::Push {
             id: "team-push".into(),
             recipient: "coordinator".into(),
@@ -1089,7 +1089,7 @@ mod tests {
         let rendered = render_push_resolved(&orch, &push).await;
 
         assert!(
-            rendered.contains("TEAM-9 \"Failed child\" failed"),
+            rendered.contains("team-9 \"Failed child\" failed"),
             "{rendered}"
         );
         assert!(rendered.contains("retry or delegate a fix"), "{rendered}");
@@ -1102,7 +1102,7 @@ mod tests {
         seed(&db, "active", None, None).await;
         let orch = test_orchestrator(db);
 
-        for issue_uri in [CHILD_URI, "cairn://p/PROJ/999"] {
+        for issue_uri in [CHILD_URI, "cairn://p/proj/999"] {
             let push = crate::orchestrator::attention_push::Push {
                 id: format!("unconfirmed-{issue_uri}"),
                 recipient: "coordinator".into(),
@@ -1154,10 +1154,10 @@ mod tests {
             &db,
             CHILD_URI,
             Some("child-job"),
-            "cairn://p/PROJ/2/1/planner/questions/q-1",
+            "cairn://p/proj/2/1/planner/questions/q-1",
             Wake::Wake,
             Boundary::Event,
-            "question:cairn://p/PROJ/2",
+            "question:cairn://p/proj/2",
         )
         .await
         .unwrap();
@@ -1166,10 +1166,10 @@ mod tests {
         assert_eq!(watcher.len(), 1);
         assert_eq!(watcher[0].wake, Wake::Wake);
         assert_eq!(watcher[0].boundary, Boundary::Event);
-        assert_eq!(watcher[0].key, "question:cairn://p/PROJ/2");
+        assert_eq!(watcher[0].key, "question:cairn://p/proj/2");
         assert_eq!(
             watcher[0].content_ref,
-            "cairn://p/PROJ/2/1/planner/questions/q-1"
+            "cairn://p/proj/2/1/planner/questions/q-1"
         );
         // The producing node never receives its own push.
         assert!(list_pending(&db, "child-job").await.unwrap().is_empty());
@@ -1195,7 +1195,7 @@ mod tests {
             &db,
             CHILD_URI,
             Some("child-job"),
-            "cairn://p/PROJ/2/1/planner/plan",
+            "cairn://p/proj/2/1/planner/plan",
             Wake::Wake,
             Boundary::Event,
             &format!("review:{CHILD_URI}"),
@@ -1206,7 +1206,7 @@ mod tests {
         let watcher = list_pending(&db, "watcher").await.unwrap();
         assert_eq!(watcher.len(), 1, "the coordinating node receives the gate");
         assert_eq!(watcher[0].wake, Wake::Wake);
-        assert_eq!(watcher[0].content_ref, "cairn://p/PROJ/2/1/planner/plan");
+        assert_eq!(watcher[0].content_ref, "cairn://p/proj/2/1/planner/plan");
         // The child's own node is still excluded from its own gate.
         assert!(list_pending(&db, "child-job").await.unwrap().is_empty());
     }
@@ -1232,7 +1232,7 @@ mod tests {
                VALUES('successor','p','parent','running','sess3',5,5);
              INSERT INTO wake_subscriptions
                (id, job_id, source_kind, source_ref, fact_kinds_json, state, created_by, created_at, updated_at, one_shot)
-               VALUES('seeded','watcher','issue','cairn://p/PROJ/2',
+               VALUES('seeded','watcher','issue','cairn://p/proj/2',
                       '[\"message\",\"permission\",\"question\",\"resolved\",\"review\"]','muted','system',1,1,0);",
         )
         .await
@@ -1243,7 +1243,7 @@ mod tests {
             &db,
             CHILD_URI,
             Some("child-job"),
-            "cairn://p/PROJ/2/1/planner/plan",
+            "cairn://p/proj/2/1/planner/plan",
             Wake::Wake,
             Boundary::Event,
             &key,
@@ -1275,7 +1275,7 @@ mod tests {
             &db,
             CHILD_URI,
             Some("child-job"),
-            "cairn://p/PROJ/2/1/planner/plan",
+            "cairn://p/proj/2/1/planner/plan",
             Wake::Wake,
             Boundary::Event,
             &key,
@@ -1340,7 +1340,7 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+               VALUES('p','w','Project','proj','/tmp/repo',1,1);
              INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
                VALUES('thread','p','general','active','none',1,1);
              INSERT INTO issues(id, project_id, number, title, status, progress, attention, parent_thread_id, created_at, updated_at)
@@ -1638,7 +1638,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('parent','p',1,'Parent','active','active','none',1,1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)

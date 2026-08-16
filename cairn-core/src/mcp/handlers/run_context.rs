@@ -187,7 +187,7 @@ pub(crate) async fn commit_posture_refusal(
     }
 }
 
-/// Resolve a project's DB id by key (uppercased).
+/// Resolve a project's database ID by canonical lowercase key.
 pub(crate) async fn project_id_by_key(db: &LocalDb, key: &str) -> Result<String, String> {
     let key = cairn_common::uri::canonical_project(key);
     db.query_text(
@@ -234,7 +234,7 @@ mod tests {
         let dbs = local_dbs().await;
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at) VALUES ('t','p','design','active','none',1,1)",
             "INSERT INTO jobs (id, thread_id, project_id, node_name, agent_config_id, status, created_at, updated_at, uri_segment) VALUES ('j','t','p','thread','thread','running',1,1,'thread')",
             "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('r-thread','p','j','live',1,1)",
@@ -246,7 +246,7 @@ mod tests {
             lookup_home_uri_by_run_id(&dbs.local, "r-thread")
                 .await
                 .unwrap(),
-            "cairn://p/PRJ/design"
+            "cairn://p/prj/design"
         );
 
         dbs.local
@@ -265,7 +265,7 @@ mod tests {
             crate::resources::resolve_home_relative_resource_uri(&dbs, &request, "cairn:~/tasks")
                 .await
                 .unwrap();
-        assert_eq!(target, "cairn://p/PRJ/channels/tasks");
+        assert_eq!(target, "cairn://p/prj/channels/tasks");
         assert!(
             crate::resources::mutations::blocking_append_kind(&crate::mcp::types::ChangeItem {
                 target,
@@ -280,7 +280,7 @@ mod tests {
     async fn seed_run(db: &LocalDb) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch) VALUES ('j','e','i','p','Builder','running',1,1,'builder','agent/test')",
@@ -305,7 +305,7 @@ mod tests {
         let (ctx, db) = lookup_run_routed(&dbs, &request_for_run("r"))
             .await
             .expect("a seeded private run resolves");
-        assert_eq!(ctx.project_key, "PRJ");
+        assert_eq!(ctx.project_key, "prj");
         assert_eq!(ctx.run_id, "r");
         assert!(
             Arc::ptr_eq(&db, &dbs.local),
@@ -321,7 +321,7 @@ mod tests {
         // `cairn:~/calls` resolves as a NodeCalls collection.
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',9,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment) VALUES ('j-b','e','i','p','Builder','running',1,1,'builder')",
@@ -382,7 +382,7 @@ mod tests {
             .await
             .expect("the authenticated run resolves regardless of cwd");
         assert_eq!(context.run_id, "r");
-        assert_eq!(context.project_key, "PRJ");
+        assert_eq!(context.project_key, "prj");
     }
 
     /// The commit fence, at the predicate both verbs share.
@@ -475,7 +475,7 @@ mod tests {
             dbs.local.execute(sql, ()).await.unwrap();
         }
 
-        let shared_residence = "/home/tester/.cairn/scratch/PRJ.1.1.parent";
+        let shared_residence = "/home/tester/.cairn/scratch/prj.1.1.parent";
         let first = CallbackRequest {
             cwd: shared_residence.to_string(),
             ..request_for_run("r1")

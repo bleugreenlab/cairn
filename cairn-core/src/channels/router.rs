@@ -4,24 +4,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cairn_common::uri::{
-    build_node_permission_uri, build_node_question_uri, parse_uri, CairnResource,
-};
+use cairn_common::uri::{build_node_permission_uri, build_node_question_uri, parse_uri};
 use cairn_db::turso::params;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    ledger, render_text_floor, AskOption, ChannelProvider, InboundEvent, OperatorPresence,
-    OutboundAsk, OutboundInitiator, OutboundMessage, ResolvedQuestionMessage,
+    bindings::FollowTarget, ledger, render_text_floor, AskOption, ChannelProvider, InboundEvent,
+    OperatorPresence, OutboundAsk, OutboundInitiator, OutboundMessage, ResolvedQuestionMessage,
 };
 use crate::routes::{ChannelSubmission, Presence, RouteContext, RouteFact};
 use crate::{
-    mcp::handlers::{
-        permission::{resolve_permission_request, PermissionDecision, PermissionScope},
-        planning::answer_prompt_id,
-    },
-    models::ChannelRouteConfig,
+    mcp::handlers::permission::PermissionDecision,
+    models::{ChannelInboundCapabilities, MessageClassPolicy},
     orchestrator::Orchestrator,
     storage::{LocalDb, RowExt},
 };
@@ -44,9 +39,10 @@ const FOLLOW_POLL_LIMIT: usize = 10;
 /// Messages balloon renders an option as a wrapped block, so a full thread title
 /// pushes the rest of the list off the screen.
 const FOLLOW_POLL_TITLE_LIMIT: usize = 64;
-/// The durable binding prefix for a follow poll's ledger row. The literal value
-/// names the poll, not the entity it lists: polls issued by earlier sessions are
-/// standing control surfaces still bound by this prefix.
+/// The durable binding prefix for a follow poll's ledger row. Command polls are
+/// not backed by a Cairn prompt, so the gate sweep recognizes this namespace and
+/// leaves their provider bindings intact until a newer poll of the same kind
+/// supersedes them.
 const FOLLOW_POLL_PREFIX: &str = "threads:";
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +50,90 @@ struct StoredQuestion {
     question: String,
     #[serde(default)]
     options: Vec<StoredOption>,
+}
+
+fn permission_answer_token(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "allow",
+        PermissionDecision::Deny => "deny",
+    }
+}
+
+fn route_conversation(address: Option<&crate::channels::ConversationAddress>) -> Option<String> {
+    address.map(|address| match address.destination() {
+        super::ConversationDestination::IMessage { handle } => handle.clone(),
+        super::ConversationDestination::Telegram { chat_id } => chat_id.to_string(),
+        super::ConversationDestination::Discord { channel_id, .. } => channel_id.to_string(),
+    })
+}
+
+fn starts_with_known_slash_command(text: &str) -> bool {
+    text.split_whitespace()
+        .next()
+        .and_then(|token| token.strip_prefix('/'))
+        .and_then(super::commands::command_spec)
+        .is_some()
+}
+
+fn channel_sender_name(provider_id: &str) -> String {
+    format!("operator via {provider_id}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelCommand {
+    Threads,
+    Issues,
+    Focus(String),
+    Unfollow(Option<String>),
+    Help,
+}
+
+fn channel_command(text: &str) -> Option<ChannelCommand> {
+    let mut words = text.split_whitespace();
+    let token = words.next()?;
+    let slash_command = token.strip_prefix('/');
+    let name = slash_command.unwrap_or(token);
+    // Preserve the existing bare iMessage shortcuts. Help remains slash-only so
+    // ordinary conversation containing that word is not captured.
+    if slash_command.is_none() && name.eq_ignore_ascii_case("help") {
+        return None;
+    }
+
+    let spec = super::commands::command_spec(name)?;
+    let argument = words.next();
+    if words.next().is_some() || (!spec.takes_argument && argument.is_some()) {
+        return None;
+    }
+    match (spec.name, argument) {
+        ("threads", None) => Some(ChannelCommand::Threads),
+        ("issues", None) => Some(ChannelCommand::Issues),
+        ("focus", Some(selector)) => Some(ChannelCommand::Focus(selector.to_string())),
+        ("unfollow", selector) => Some(ChannelCommand::Unfollow(selector.map(str::to_string))),
+        ("help", None) => Some(ChannelCommand::Help),
+        _ => None,
+    }
+}
+
+fn follow_poll_kind(binding_ref: &str) -> Option<PollKind> {
+    let kind = binding_ref
+        .strip_prefix(FOLLOW_POLL_PREFIX)?
+        .split(':')
+        .next()?;
+    serde_json::from_value(serde_json::Value::String(kind.to_string())).ok()
+}
+
+fn route_binding_target(binding_ref: &str) -> Option<&str> {
+    let start = binding_ref.find("cairn://")?;
+    binding_ref[start..].split(":event:").next()
+}
+
+fn routed_gate_target(uri: &str) -> Option<String> {
+    let resource = parse_uri(uri)?;
+    Some(format!(
+        "cairn://p/{}/{}",
+        resource.project()?,
+        resource.issue_number()?
+    ))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -89,60 +169,9 @@ fn follow_poll_answer(record: &ledger::OutboundRecord, text: &str) -> String {
         .unwrap_or_else(|| trimmed.to_string())
 }
 
-/// What this channel can follow and converse with.
-///
-/// The vocabulary is deliberately wider than either entity: a first-class thread
-/// is what the operator polls for and what the phone is a window onto, while an
-/// issue node stays addressable for a run the operator wants to watch. Both
-/// travel one pipeline — poll, follow, live edge, event tap, inbound routing —
-/// rather than two that would drift apart.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FollowTarget {
-    Thread { project: String, name: String },
-    Issue { project: String, number: i32 },
-}
-
-impl FollowTarget {
-    /// The syntactic reading of a follow URI. A numeric address is an issue here;
-    /// [`ChannelRouter::resolve_target`] is the resolver that also asks the
-    /// database whether a thread migration vacated that number.
-    fn parse(uri: &str) -> Result<Self, String> {
-        match parse_uri(uri) {
-            Some(CairnResource::Thread {
-                project,
-                name,
-                path,
-            }) if path.is_empty() => Ok(Self::Thread { project, name }),
-            Some(CairnResource::Issue { project, number }) => Ok(Self::Issue { project, number }),
-            _ => Err(format!("not a followable Cairn URI: {uri}")),
-        }
-    }
-
-    fn project(&self) -> &str {
-        match self {
-            Self::Thread { project, .. } | Self::Issue { project, .. } => project,
-        }
-    }
-
-    fn uri(&self) -> String {
-        match self {
-            Self::Thread { project, name } => format!("cairn://p/{project}/{name}"),
-            Self::Issue { project, number } => format!("cairn://p/{project}/{number}"),
-        }
-    }
-
-    /// How the operator names this target in an `unfollow` command: a thread by
-    /// its name, an issue by its number.
-    fn selector(&self) -> String {
-        match self {
-            Self::Thread { name, .. } => name.clone(),
-            Self::Issue { number, .. } => number.to_string(),
-        }
-    }
-}
-
 /// The two collections a poll command offers as follow targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum PollKind {
     Threads,
     Issues,
@@ -168,6 +197,14 @@ impl PollKind {
             Self::Threads => "Could not list active threads",
             Self::Issues => "Could not list active issues",
         }
+    }
+
+    fn binding_prefix(self) -> String {
+        let kind = serde_json::to_value(self).expect("poll kind serializes");
+        format!(
+            "{FOLLOW_POLL_PREFIX}{}:",
+            kind.as_str().expect("poll kind serializes as a string")
+        )
     }
 }
 
@@ -273,24 +310,23 @@ struct ReviewGates {
 /// `threads` means threads: the operator's muscle memory is the word, and after
 /// the thread cutover the word means the entity.
 fn poll_command(text: &str) -> Option<PollKind> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "threads" | "/threads" => Some(PollKind::Threads),
-        "issues" | "/issues" => Some(PollKind::Issues),
+    match channel_command(text)? {
+        ChannelCommand::Threads => Some(PollKind::Threads),
+        ChannelCommand::Issues => Some(PollKind::Issues),
         _ => None,
     }
 }
 
-/// `unfollow` alone targets whatever the reply is bound to; `unfollow <selector>`
-/// names a thread or an issue number among the current follows.
 fn unfollow_selector(text: &str) -> Option<Option<String>> {
-    let mut words = text.split_whitespace();
-    if !words.next()?.eq_ignore_ascii_case("unfollow") {
-        return None;
+    match channel_command(text)? {
+        ChannelCommand::Unfollow(selector) => Some(selector),
+        _ => None,
     }
+}
 
-    match (words.next(), words.next()) {
-        (None, None) => Some(None),
-        (Some(selector), None) => Some(Some(selector.to_string())),
+fn focus_selector(text: &str) -> Option<String> {
+    match channel_command(text)? {
+        ChannelCommand::Focus(selector) => Some(selector),
         _ => None,
     }
 }
@@ -327,7 +363,7 @@ async fn cleanup_resolved_question(
         return Ok(false);
     }
 
-    cleanup_claimed_question(provider, record, receipt).await;
+    cleanup_claimed_question(provider, record, receipt).await?;
     Ok(true)
 }
 
@@ -335,9 +371,9 @@ async fn cleanup_claimed_question(
     provider: &dyn ChannelProvider,
     record: &ledger::OutboundRecord,
     receipt: &str,
-) {
+) -> Result<(), String> {
     let (Some(provider_guid), Some(sent_at)) = (&record.provider_guid, record.sent_at) else {
-        return;
+        return Ok(());
     };
     let message = ResolvedQuestionMessage {
         conversation: record.conversation.clone(),
@@ -346,12 +382,13 @@ async fn cleanup_claimed_question(
         sent_at,
         receipt: receipt.to_string(),
     };
-    if let Err(error) = provider.cleanup_question(&message).await {
+    provider.cleanup_question(&message).await.map_err(|error| {
         log::warn!(
             "channel could not clean up resolved question {}: {error}",
             record.binding_ref
         );
-    }
+        error
+    })
 }
 
 fn review_notice(project: &str, number: i32, title: &str, content_ref: &str) -> String {
@@ -361,6 +398,23 @@ fn review_notice(project: &str, number: i32, title: &str, content_ref: &str) -> 
 impl Gate {
     fn is_presence_aware(&self) -> bool {
         self.initiated_by.is_presence_aware()
+    }
+
+    fn message_class(&self) -> i64 {
+        match self.ask {
+            OutboundAsk::Question { .. } => super::bindings::MESSAGE_CLASS_QUESTION,
+            OutboundAsk::Permission { .. } => super::bindings::MESSAGE_CLASS_PERMISSION,
+            OutboundAsk::Notify { .. } => super::bindings::MESSAGE_CLASS_NOTIFY,
+        }
+    }
+
+    fn delivery_key(&self, provider: &str, default_conversation: &str) -> String {
+        format!(
+            "{provider}\u{0}{}\u{0}{}\u{0}{}",
+            self.conversation.as_deref().unwrap_or(default_conversation),
+            self.kind,
+            self.binding_ref
+        )
     }
 }
 
@@ -445,6 +499,16 @@ struct Gate {
     job_id: Option<String>,
     context: String,
     ask: OutboundAsk,
+    conversation: Option<String>,
+    target_uri: Option<String>,
+}
+
+#[derive(Default)]
+struct GateSnapshot {
+    generation: u64,
+    binding_generation: String,
+    initialized: bool,
+    routed: Vec<Gate>,
 }
 
 pub struct ChannelRouter {
@@ -452,9 +516,67 @@ pub struct ChannelRouter {
     provider: Arc<dyn ChannelProvider>,
     provider_id: &'static str,
     destination: String,
-    route: ChannelRouteConfig,
+    route: MessageClassPolicy,
+    inbound_capabilities: ChannelInboundCapabilities,
     claims: ClaimSet,
     deferred_attention: Mutex<HashMap<String, DeferredAttention>>,
+    gate_snapshots: Mutex<HashMap<std::path::PathBuf, GateSnapshot>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InboundCapability {
+    Permissions,
+    Answers,
+    FreeText,
+}
+
+fn admits_capability(
+    capabilities: ChannelInboundCapabilities,
+    capability: InboundCapability,
+) -> bool {
+    match capability {
+        InboundCapability::Permissions => capabilities.permissions,
+        InboundCapability::Answers => capabilities.answers,
+        InboundCapability::FreeText => capabilities.free_text,
+    }
+}
+
+fn inbound_parts(event: &InboundEvent) -> (Option<&str>, &str, &str) {
+    match event {
+        InboundEvent::Selection {
+            bound_guid,
+            sender,
+            option_text,
+            ..
+        } => (Some(bound_guid), sender, option_text),
+        InboundEvent::Selections {
+            bound_guid,
+            sender,
+            changes,
+            ..
+        } => (
+            Some(bound_guid),
+            sender,
+            changes
+                .first()
+                .map(|change| change.option_text.as_str())
+                .unwrap_or(""),
+        ),
+        InboundEvent::Reply {
+            bound_guid,
+            sender,
+            text,
+            ..
+        } => (Some(bound_guid), sender, text),
+        InboundEvent::Bare { sender, text, .. } | InboundEvent::Rejected { sender, text, .. } => {
+            (None, sender, text)
+        }
+    }
+}
+
+fn inbound_sender_text(event: &InboundEvent) -> (&str, &str) {
+    let (_, sender, text) = inbound_parts(event);
+    (sender, text)
 }
 
 impl ChannelRouter {
@@ -463,7 +585,8 @@ impl ChannelRouter {
         provider: Arc<dyn ChannelProvider>,
         provider_id: &'static str,
         destination: String,
-        route: ChannelRouteConfig,
+        route: MessageClassPolicy,
+        inbound_capabilities: ChannelInboundCapabilities,
     ) -> Self {
         Self {
             orch,
@@ -471,8 +594,10 @@ impl ChannelRouter {
             provider_id,
             destination,
             route,
+            inbound_capabilities,
             claims: ClaimSet::default(),
             deferred_attention: Mutex::new(HashMap::new()),
+            gate_snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -482,7 +607,14 @@ impl ChannelRouter {
         provider: Arc<dyn ChannelProvider>,
         config: crate::models::IMessageChannelConfig,
     ) -> Self {
-        Self::new_for_provider(orch, provider, "imessage", config.to, config.route)
+        Self::new_for_provider(
+            orch,
+            provider,
+            "imessage",
+            config.to,
+            config.route,
+            config.inbound_capabilities,
+        )
     }
 
     async fn submit_gate(
@@ -495,6 +627,7 @@ impl ChannelRouter {
             Some("operator_subscription") => OutboundInitiator::OperatorSubscription,
             _ => OutboundInitiator::CairnPush,
         };
+        let conversation = route_conversation(submission.destination.as_ref());
         self.deliver_or_defer(
             Gate {
                 kind: "route",
@@ -505,6 +638,8 @@ impl ChannelRouter {
                 ask: OutboundAsk::Notify {
                     text: submission.text,
                 },
+                conversation,
+                target_uri: None,
             },
             presence,
             now,
@@ -581,17 +716,20 @@ impl ChannelRouter {
                 ask: OutboundAsk::Notify {
                     text: submission.text.clone(),
                 },
+                conversation: route_conversation(submission.destination.as_ref()),
+                target_uri: None,
             };
             let elapsed_ms = chrono::Utc::now()
                 .timestamp_millis()
                 .saturating_sub(record.created_at)
                 .max(0) as u64;
             let remaining = ATTENTION_GRACE.saturating_sub(Duration::from_millis(elapsed_ms));
+            let delivery_key = gate.delivery_key(self.provider_id, &self.destination);
             self.deferred_attention
                 .lock()
                 .expect("deferred attention set poisoned")
                 .insert(
-                    gate.binding_ref.clone(),
+                    delivery_key,
                     DeferredAttention {
                         id: record.id.clone(),
                         gate: gate.clone(),
@@ -637,6 +775,97 @@ impl ChannelRouter {
         Ok(())
     }
 
+    async fn followed_uri(&self, selector: &str) -> Result<Option<String>, String> {
+        let follows = ledger::list_follows(self.ledger(), self.provider_id).await?;
+        if let Some(exact) = follows
+            .iter()
+            .find(|follow| follow.uri.eq_ignore_ascii_case(selector))
+        {
+            return Ok(Some(exact.uri.clone()));
+        }
+        let mut matches = follows.into_iter().filter(|follow| {
+            FollowTarget::parse(&follow.uri).is_ok_and(|target| {
+                target.selector().eq_ignore_ascii_case(selector)
+                    || format!("{}/{}", target.project(), target.selector())
+                        .eq_ignore_ascii_case(selector)
+            })
+        });
+        let first = matches.next().map(|follow| follow.uri);
+        if first.is_some() && matches.next().is_some() {
+            return Err(format!(
+                "More than one follow matches {selector}; use project/{selector}."
+            ));
+        }
+        Ok(first)
+    }
+
+    async fn follow_or_focus(&self, uri: &str, conversation: &str) -> Result<(), String> {
+        let target = self.resolve_target(uri).await?;
+        let canonical = target.uri();
+        let already_followed =
+            ledger::is_target_followed(self.ledger(), self.provider_id, &canonical).await?;
+        if already_followed {
+            ledger::set_focus(
+                self.ledger(),
+                self.provider_id,
+                &canonical,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .await?;
+        } else {
+            self.follow(&canonical).await?;
+        }
+        let action = if already_followed {
+            "Focused"
+        } else {
+            "Following"
+        };
+        self.send_notice(
+            conversation,
+            &format!(
+                "{action} {} — loose messages now go here. /threads to switch.",
+                target.selector()
+            ),
+        )
+        .await
+    }
+
+    async fn unfollow_selector_command(
+        &self,
+        selector: &str,
+        conversation: &str,
+    ) -> Result<(), String> {
+        let Some(uri) = self.followed_uri(selector).await? else {
+            return self
+                .send_notice(conversation, "That follow was not found.")
+                .await;
+        };
+        self.unfollow_uri_command(&uri, conversation).await
+    }
+
+    async fn unfollow_uri_command(&self, uri: &str, conversation: &str) -> Result<(), String> {
+        self.unfollow(uri).await?;
+        let target = FollowTarget::parse(uri)?;
+        self.send_notice(conversation, &format!("Unfollowed {}.", target.selector()))
+            .await
+    }
+
+    async fn focus_selector_command(
+        &self,
+        selector: &str,
+        conversation: &str,
+    ) -> Result<(), String> {
+        let Some(uri) = self.followed_uri(selector).await? else {
+            return self
+                .send_notice(
+                    conversation,
+                    "That follow was not found. Use /threads or /issues to follow it first.",
+                )
+                .await;
+        };
+        self.follow_or_focus(&uri, conversation).await
+    }
+
     /// Every delivery intent lives in the private database. Channel state is tied
     /// to this runner's provider process and personal messaging account, so
     /// `channel_outbound` is private-lineage and a team replica does not carry it
@@ -674,7 +903,22 @@ impl ChannelRouter {
             fenced += result.0;
             expired_dangling += result.1;
         }
+        if ledger::remove_home_relative_focus(self.ledger(), self.provider_id).await? {
+            log::warn!("channel removed unresolvable home-relative focus");
+        }
         for follow in ledger::list_follows(self.ledger(), self.provider_id).await? {
+            if follow.uri == "cairn:~" || follow.uri.starts_with("cairn:~/") {
+                // A home-relative URI only has meaning together with the session
+                // that emitted it. Legacy ledger rows retained neither that
+                // context nor a stable identity, so guessing would risk routing
+                // operator messages to an unrelated session after restart.
+                log::warn!(
+                    "channel removed unresolvable home-relative followed URI {}",
+                    follow.uri
+                );
+                ledger::unfollow_target(self.ledger(), self.provider_id, &follow.uri).await?;
+                continue;
+            }
             // A URI that cannot PARSE is permanently unusable: skip it, with a
             // note, rather than parking the whole channel behind one dangling
             // follow forever. Everything past this point is a database error,
@@ -726,6 +970,7 @@ impl ChannelRouter {
         &self,
         record: &ledger::OutboundRecord,
         selected_label: &str,
+        conversation: &str,
     ) -> Result<(), String> {
         let options = follow_poll_options(record)
             .ok_or_else(|| "follow poll has no option bindings".to_string())?;
@@ -733,11 +978,43 @@ impl ChannelRouter {
             .bindings
             .get(selected_label)
             .ok_or_else(|| format!("unknown follow poll option: {selected_label}"))?;
-        if ledger::is_target_followed(self.ledger(), self.provider_id, uri).await? {
-            self.unfollow(uri).await
-        } else {
-            self.follow(uri).await
+        let uri = self.resolve_bound_target(record, uri).await?;
+        self.follow_or_focus(&uri, conversation).await
+    }
+
+    /// Resolve a binding while the outbound row still carries the emitting
+    /// session's job. Once reduced to a follow row, a home-relative URI has no
+    /// context and cannot be recovered safely.
+    async fn resolve_bound_target(
+        &self,
+        record: &ledger::OutboundRecord,
+        uri: &str,
+    ) -> Result<String, String> {
+        let Some(suffix) = uri
+            .strip_prefix("cairn:~/")
+            .or_else(|| (uri == "cairn:~").then_some(""))
+        else {
+            return Ok(uri.to_string());
+        };
+        let job_id = record
+            .job_id
+            .as_deref()
+            .ok_or_else(|| format!("home-relative follow binding has no session context: {uri}"))?;
+        for db in self.orch.db.all_dbs().await {
+            if let Some(home) = crate::jobs::queries::home_uri_for_job(&db, job_id)
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                return if suffix.is_empty() {
+                    Ok(home)
+                } else {
+                    Ok(format!("{}/{suffix}", home.trim_end_matches('/')))
+                };
+            }
         }
+        Err(format!(
+            "home-relative follow binding references unknown job {job_id}"
+        ))
     }
 
     /// Record a follow under the target's CANONICAL URI, whatever address the
@@ -766,7 +1043,8 @@ impl ChannelRouter {
                 )
                 .await?
             {
-                cleanup_claimed_question(self.provider.as_ref(), &update, "✓ unfollowed").await;
+                let _ =
+                    cleanup_claimed_question(self.provider.as_ref(), &update, "✓ unfollowed").await;
             }
         }
         Ok(())
@@ -774,8 +1052,8 @@ impl ChannelRouter {
 
     async fn send_follow_poll(&self, conversation: &str, kind: PollKind) -> Result<(), String> {
         // Unlike an answered one-shot question, a follow poll is a standing
-        // control surface. Its GUID binding remains live for the lifetime of the
-        // durable ledger row, including after newer polls are issued.
+        // control surface. Its GUID binding remains live through ordinary gate
+        // sweeps and outbound traffic; only a newer poll of the same kind replaces it.
         let followed = ledger::list_follows(self.ledger(), self.provider_id)
             .await?
             .into_iter()
@@ -802,8 +1080,10 @@ impl ChannelRouter {
         } else {
             kind.caption().to_string()
         };
-        let binding_ref = format!("{FOLLOW_POLL_PREFIX}{}", Uuid::new_v4());
+        let binding_ref = format!("{}{}", kind.binding_prefix(), Uuid::new_v4());
         let gate = Gate {
+            conversation: None,
+            target_uri: None,
             kind: "question",
             initiated_by: OutboundInitiator::OperatorInbound,
             binding_ref: binding_ref.clone(),
@@ -852,6 +1132,17 @@ impl ChannelRouter {
             &serde_json::to_string(&options).map_err(|error| error.to_string())?,
         )
         .await?;
+
+        for previous in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
+            if previous.id != id
+                && previous.status == "sent"
+                && previous.conversation == conversation
+                && follow_poll_kind(&previous.binding_ref) == Some(kind)
+            {
+                self.finish_question(&previous, "✓ replaced by a newer command")
+                    .await?;
+            }
+        }
         Ok(())
     }
 
@@ -875,7 +1166,11 @@ impl ChannelRouter {
                             // for the elision to shorten; issues still carry a
                             // title and still take the `Some` arm.
                             title: None,
-                            uri: format!("cairn://p/{}/{}", row.text(0)?, row.text(1)?),
+                            uri: format!(
+                                "cairn://p/{}/{}",
+                                cairn_common::uri::canonical_project(row.text(0)?),
+                                row.text(1)?
+                            ),
                         })
                     },
                 )
@@ -904,7 +1199,11 @@ impl ChannelRouter {
                             project: row.text(0)?,
                             head: row.i64(1)?.to_string(),
                             title: Some(row.text(2)?),
-                            uri: format!("cairn://p/{}/{}", row.text(0)?, row.i64(1)?),
+                            uri: format!(
+                                "cairn://p/{}/{}",
+                                cairn_common::uri::canonical_project(row.text(0)?),
+                                row.i64(1)?
+                            ),
                         })
                     },
                 )
@@ -956,7 +1255,7 @@ impl ChannelRouter {
             FollowTarget::Thread { project, name } => {
                 db.query_opt_i64(
                     format!(
-                        "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 AND {}",
+                        "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2 AND {}",
                         crate::threads::SESSION_JOB_SHAPE
                     ),
                     params![cairn_common::uri::canonical_project(project), name.clone()],
@@ -965,7 +1264,7 @@ impl ChannelRouter {
             }
             FollowTarget::Issue { project, number } => {
                 db.query_opt_i64(
-                    "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE p.key = ?1 AND i.number = ?2",
+                    "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2",
                     params![cairn_common::uri::canonical_project(project), *number],
                 )
                 .await
@@ -987,7 +1286,7 @@ impl ChannelRouter {
             FollowTarget::Thread { project, name } => db
                 .query_all(
                     format!(
-                        "SELECT e.rowid, e.data, p.key, t.name, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2 AND {} AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
+                        "SELECT e.rowid, e.data, p.key, t.name, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2 AND {} AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
                         crate::threads::SESSION_JOB_SHAPE
                     ),
                     params![cairn_common::uri::canonical_project(project), name.clone(), cursor],
@@ -1008,7 +1307,7 @@ impl ChannelRouter {
                 .await,
             FollowTarget::Issue { project, number } => db
                 .query_all(
-                    "SELECT e.rowid, e.data, p.key, i.number, i.title, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE p.key = ?1 AND i.number = ?2 AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
+                    "SELECT e.rowid, e.data, p.key, i.number, i.title, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
                     params![cairn_common::uri::canonical_project(project), *number, cursor],
                     |row| {
                         Ok(FollowedEvent {
@@ -1032,11 +1331,12 @@ impl ChannelRouter {
     /// ordinary queue-at-send job path.
     async fn route_to_target(&self, target: &FollowTarget, text: &str) -> Result<(), String> {
         let db = self.orch.db.for_project(target.project()).await;
+        let sender_name = channel_sender_name(self.provider_id);
         match target {
             FollowTarget::Thread { project, name } => {
                 let thread_id = db
                     .query_opt(
-                        "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE p.key = ?1 AND t.name = ?2",
+                        "SELECT t.id FROM threads t JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2",
                         params![cairn_common::uri::canonical_project(project), name.clone()],
                         |row| row.text(0),
                     )
@@ -1044,22 +1344,28 @@ impl ChannelRouter {
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("{project} has no thread named {name}"))?;
                 crate::messages::delivery::append_thread_message(
-                    &self.orch, &db, &thread_id, None, "operator", text,
+                    &self.orch,
+                    &db,
+                    &thread_id,
+                    None,
+                    &sender_name,
+                    text,
                 )
                 .await
                 .map(|_| ())
             }
             FollowTarget::Issue { project, number } => {
                 let job_id = db.query_opt(
-                    "SELECT j.id FROM jobs j JOIN runs r ON r.job_id = j.id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE p.key = ?1 AND i.number = ?2 AND j.parent_job_id IS NULL ORDER BY r.created_at DESC LIMIT 1",
+                    "SELECT j.id FROM jobs j JOIN runs r ON r.job_id = j.id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND j.parent_job_id IS NULL ORDER BY r.created_at DESC LIMIT 1",
                     params![cairn_common::uri::canonical_project(project), *number],
                     |row| row.text(0),
                 ).await.map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("{} has no addressable node", target.uri()))?;
+                let attributed = format!("[Direct message from {sender_name}] {text}");
                 crate::execution::jobs::continue_job_or_enqueue(
                     &self.orch,
                     &job_id,
-                    Some(text),
+                    Some(&attributed),
                     None,
                     None,
                 )
@@ -1102,7 +1408,7 @@ impl ChannelRouter {
             &self.claims,
             self.ledger(),
             self.provider_id,
-            &self.destination,
+            gate.conversation.as_deref().unwrap_or(&self.destination),
             self.rendering_for(&gate.ask),
             gate,
         )
@@ -1129,6 +1435,121 @@ impl ChannelRouter {
         if let Err(error) = self.sweep_followed_updates().await {
             log::warn!("channel followed-target update sweep failed: {error}");
         }
+        if let Err(error) = self.sweep_pending_domain_actions().await {
+            log::warn!("channel ask domain-action sweep failed: {error}");
+        }
+        if let Err(error) = self.sweep_pending_cleanup().await {
+            log::warn!("channel ask cleanup sweep failed: {error}");
+        }
+    }
+
+    async fn sweep_pending_domain_actions(&self) -> Result<(), String> {
+        const ACTION_LEASE_MS: i64 = 60_000;
+        for (action_ref, kind) in ledger::pending_ask_actions(self.ledger()).await? {
+            let answers = match ledger::answers_for_action(self.ledger(), &action_ref).await {
+                Ok(answers) => answers,
+                Err(error) => {
+                    log::warn!("channel could not load pending action {action_ref}: {error}");
+                    continue;
+                }
+            };
+            if kind == "question" && answers.len() != 1 {
+                continue;
+            }
+            let now = chrono::Utc::now().timestamp_millis();
+            let Some(lease) =
+                ledger::try_lease_ask_action(self.ledger(), &action_ref, now, ACTION_LEASE_MS)
+                    .await?
+            else {
+                continue;
+            };
+
+            let result = if kind == "question" {
+                let response = answers[0].1.clone();
+                let winner = ledger::resolution_for_action(self.ledger(), &action_ref)
+                    .await?
+                    .ok_or_else(|| format!("question action has no provenance: {action_ref}"))?;
+                crate::mcp::handlers::planning::answer_prompt_id_domain(
+                    &self.orch,
+                    &action_ref,
+                    response,
+                    winner.resolution_provenance()?,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                let provenance = ledger::resolution_for_action(self.ledger(), &action_ref)
+                    .await?
+                    .ok_or_else(|| format!("permission action has no provenance: {action_ref}"))?;
+                let answer = answers
+                    .first()
+                    .map(|(_, answer)| answer.as_str())
+                    .ok_or_else(|| format!("permission action has no answer: {action_ref}"));
+                match answer.and_then(parse_permission) {
+                    Ok(decision) => {
+                        let recovered =
+                            crate::mcp::handlers::permission::recovered_permission_answer(
+                                decision,
+                                &provenance,
+                            )?;
+                        crate::mcp::handlers::permission::resolve_permission_request_domain(
+                            &self.orch,
+                            &action_ref,
+                            recovered,
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                    Err(error) => Err(error),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    let receipt_answer = answers
+                        .first()
+                        .map(|(_, answer)| answer.as_str())
+                        .unwrap_or("answered");
+                    ledger::finalize_ask_resolution(
+                        self.ledger(),
+                        &action_ref,
+                        &format!("✓ answered: {receipt_answer}"),
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?;
+                }
+                Err(error) => {
+                    ledger::release_ask_action(self.ledger(), &lease, &error).await?;
+                    log::warn!("channel domain action {action_ref} will retry: {error}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn sweep_pending_cleanup(&self) -> Result<(), String> {
+        for record in ledger::list_cleanup_pending(self.ledger(), self.provider_id).await? {
+            let receipt = record
+                .options_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|value| {
+                    value
+                        .get("receipt")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "✓ answered in another conversation".to_string());
+            match cleanup_claimed_question(self.provider.as_ref(), &record, &receipt).await {
+                Ok(()) => {
+                    ledger::acknowledge_cleanup(self.ledger(), &record.id).await?;
+                }
+                Err(error) => {
+                    ledger::record_cleanup_failure(self.ledger(), &record.id, &error).await?;
+                    log::warn!("channel cleanup deferred for {}: {error}", record.id);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn sweep_followed_updates(&self) -> Result<(), String> {
@@ -1183,6 +1604,7 @@ impl ChannelRouter {
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_owned),
                         fields,
+                        origin: Some(crate::routes::installation_machine_origin(&self.orch)?),
                         route_provenance: None,
                     };
                     match crate::routes::dispatch(
@@ -1231,16 +1653,24 @@ impl ChannelRouter {
     async fn sweep_live_gates(&self) -> Result<(), String> {
         let mut gates = Vec::new();
         let mut snapshot_complete = true;
+        let mut live_gates = Vec::new();
+        let binding_generation = ledger::binding_generation(self.ledger()).await?;
         for db in self.orch.db.all_dbs().await {
-            match self.load_routed_gates(&db).await {
-                Ok(mut db_gates) => gates.append(&mut db_gates),
+            match self.load_routed_gates(&db, &binding_generation).await {
+                Ok((mut db_gates, mut db_live)) => {
+                    gates.append(&mut db_gates);
+                    live_gates.append(&mut db_live);
+                }
                 Err(error) => {
                     snapshot_complete = false;
                     log::warn!("channel skipped one project database during gate sweep: {error}");
                 }
             }
         }
-        let live: HashSet<_> = gates.iter().map(|gate| gate.binding_ref.clone()).collect();
+        let live: HashSet<_> = live_gates
+            .iter()
+            .map(|gate| gate.delivery_key(self.provider_id, &self.destination))
+            .collect();
         let presence = if gates.iter().any(Gate::is_presence_aware) {
             super::operator_presence(Some(self.provider.as_ref())).await
         } else {
@@ -1272,6 +1702,7 @@ impl ChannelRouter {
             for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
                 if record.kind == "question"
                     && record.status == "sent"
+                    && !record.binding_ref.starts_with(FOLLOW_POLL_PREFIX)
                     && !live.contains(&record.binding_ref)
                 {
                     self.finish_question(&record, "✓ question closed in Cairn")
@@ -1282,7 +1713,82 @@ impl ChannelRouter {
         Ok(())
     }
 
-    async fn load_routed_gates(&self, db: &LocalDb) -> Result<Vec<Gate>, String> {
+    async fn route_gates(&self, db: &LocalDb, gates: Vec<Gate>) -> Result<Vec<Gate>, String> {
+        let mut routed = Vec::new();
+        for gate in gates {
+            let Some(target_uri) = gate.target_uri.as_deref() else {
+                routed.push(gate);
+                continue;
+            };
+            let bindings = ledger::list_eligible_bindings(
+                self.ledger(),
+                self.provider_id,
+                target_uri,
+                gate.message_class(),
+            )
+            .await?;
+            if bindings.is_empty() {
+                if self.provider_id == "discord" {
+                    self.ensure_discord_issue_surface(db, target_uri).await?;
+                    // Surface reconciliation installs the structural binding. Until
+                    // then this event remains unclaimed and is retried by the next
+                    // sweep; a guild ID is never a deliverable conversation.
+                    continue;
+                }
+                routed.push(gate);
+                continue;
+            }
+            routed.extend(bindings.into_iter().map(|binding| {
+                let mut rendering = gate.clone();
+                rendering.conversation = Some(binding.conversation);
+                rendering
+            }));
+        }
+        Ok(routed)
+    }
+
+    /// Returns `(work, live)`: `work` contains gates whose database changed and
+    /// need routing now; `live` is the complete cached identity set used for cleanup.
+    /// LocalDb's monotonic mutation generation makes the safety tick query-free at
+    /// idle while preserving a full live set for fencing and resolution cleanup.
+    async fn load_routed_gates(
+        &self,
+        db: &LocalDb,
+        binding_generation: &str,
+    ) -> Result<(Vec<Gate>, Vec<Gate>), String> {
+        let path = db.path().to_path_buf();
+        let generation = db.mutation_generation();
+        if let Some(snapshot) = self
+            .gate_snapshots
+            .lock()
+            .expect("gate snapshot cache poisoned")
+            .get(&path)
+            .filter(|snapshot| {
+                snapshot.initialized
+                    && snapshot.generation == generation
+                    && snapshot.binding_generation == binding_generation
+            })
+        {
+            let deferred = self
+                .deferred_attention
+                .lock()
+                .expect("deferred attention set poisoned");
+            let work = snapshot
+                .routed
+                .iter()
+                .filter(|gate| {
+                    let key = gate.delivery_key(self.provider_id, &self.destination);
+                    !self.claims.holds(&key) || deferred.contains_key(&key)
+                })
+                .cloned()
+                .collect();
+            return Ok((work, snapshot.routed.clone()));
+        }
+
+        // Capture generation before querying and store that exact value. A write
+        // racing this snapshot advances the database generation beyond the stored
+        // value and therefore forces one follow-up refresh instead of being lost.
+        let started = Instant::now();
         let mut gates = Vec::new();
         if self.route.question {
             gates.extend(load_questions(db).await?);
@@ -1290,10 +1796,82 @@ impl ChannelRouter {
         if self.route.permission {
             gates.extend(load_permissions(db).await?);
         }
-        if self.route.review {
-            gates.extend(load_reviews(db).await?.gates);
+        let mut review_pushes = 0;
+        let mut expired = 0;
+        if self.route.notify {
+            let reviews = load_reviews(db).await?;
+            review_pushes = reviews.gates.len();
+            expired = reviews.expired_dangling;
+            gates.extend(reviews.gates);
         }
-        Ok(gates)
+        let routed = self.route_gates(db, gates).await?;
+        log::info!(
+            "channel gate refresh reason=generation dbs=1 pushes={} gates={} expired={} duration_ms={}",
+            review_pushes,
+            routed.len(),
+            expired,
+            started.elapsed().as_millis()
+        );
+        self.gate_snapshots
+            .lock()
+            .expect("gate snapshot cache poisoned")
+            .insert(
+                path,
+                GateSnapshot {
+                    generation,
+                    binding_generation: binding_generation.to_string(),
+                    initialized: true,
+                    routed: routed.clone(),
+                },
+            );
+        Ok((routed.clone(), routed))
+    }
+
+    async fn ensure_discord_issue_surface(
+        &self,
+        db: &LocalDb,
+        target_uri: &str,
+    ) -> Result<(), String> {
+        let Some(cairn_common::uri::CairnResource::Issue { project, number }) =
+            parse_uri(target_uri)
+        else {
+            return Ok(());
+        };
+        let guild_id = self
+            .destination
+            .parse::<u64>()
+            .map_err(|_| "Discord router destination must be a guild ID".to_string())?;
+        let details = db
+            .query_opt(
+                "SELECT i.status, t.name FROM issues i
+                 JOIN projects p ON p.id = i.project_id
+                 LEFT JOIN threads t ON t.id = i.parent_thread_id
+                 WHERE upper(p.key) = upper(?1) AND i.number = ?2",
+                (project.clone(), number),
+                |row| Ok((row.text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let Some((status, parent_thread)) = details else {
+            return Ok(());
+        };
+        if matches!(status.as_str(), "complete" | "failed" | "merged" | "closed") {
+            return Ok(());
+        }
+        let parent_target = parent_thread
+            .as_deref()
+            .map(|name| format!("cairn://p/{project}/{name}"));
+        super::discord_surfaces::ensure_issue_surface(
+            db,
+            guild_id,
+            &project,
+            target_uri,
+            parent_target.as_deref(),
+            chrono::Utc::now().timestamp(),
+        )
+        .await?;
+        super::wake_discord_surfaces();
+        Ok(())
     }
 
     async fn deliver_or_defer(
@@ -1302,24 +1880,27 @@ impl ChannelRouter {
         presence: OperatorPresence,
         now: Instant,
     ) -> Result<bool, String> {
+        let delivery_key = gate.delivery_key(self.provider_id, &self.destination);
         let deferred = self
             .deferred_attention
             .lock()
             .expect("deferred attention set poisoned")
-            .remove(&gate.binding_ref);
+            .remove(&delivery_key);
         if let Some(deferred) = deferred {
             if attention_timing(presence, now, deferred.deadline) == AttentionTiming::Defer {
                 self.deferred_attention
                     .lock()
                     .expect("deferred attention set poisoned")
-                    .insert(gate.binding_ref.clone(), deferred);
+                    .insert(delivery_key.clone(), deferred);
                 return Ok(false);
             }
             return self.send_claimed(deferred.id, deferred.gate).await;
         }
-        if let Some(record) = ledger::get_by_binding(
+        let conversation = gate.conversation.as_deref().unwrap_or(&self.destination);
+        if let Some(record) = ledger::get_by_conversation_binding(
             self.ledger(),
             self.provider_id,
+            conversation,
             gate.kind,
             &gate.binding_ref,
         )
@@ -1341,7 +1922,7 @@ impl ChannelRouter {
                 .lock()
                 .expect("deferred attention set poisoned")
                 .insert(
-                    gate.binding_ref.clone(),
+                    delivery_key,
                     DeferredAttention {
                         id,
                         gate,
@@ -1373,7 +1954,10 @@ impl ChannelRouter {
         };
         let message = OutboundMessage {
             intent_id: id.clone(),
-            conversation: self.destination.clone(),
+            conversation: gate
+                .conversation
+                .clone()
+                .unwrap_or_else(|| self.destination.clone()),
             initiated_by: gate.initiated_by,
             ask: gate.ask,
             context_header: gate.context,
@@ -1410,6 +1994,124 @@ impl ChannelRouter {
     }
 
     pub async fn handle_inbound(&self, event: InboundEvent) -> Result<(), String> {
+        let conversation = match &event {
+            InboundEvent::Selection { conversation, .. }
+            | InboundEvent::Selections { conversation, .. }
+            | InboundEvent::Reply { conversation, .. }
+            | InboundEvent::Bare { conversation, .. }
+            | InboundEvent::Rejected { conversation, .. } => conversation.clone(),
+        };
+        if matches!(event, InboundEvent::Rejected { .. }) {
+            let (sender, text) = inbound_sender_text(&event);
+            return self
+                .store_rejected(None, sender, text, "allowlist", false)
+                .await;
+        }
+        let (guid, sender, text) = inbound_parts(&event);
+        let bound = if let Some(guid) = guid {
+            ledger::get_by_provider_guid(self.ledger(), self.provider_id, guid).await?
+        } else {
+            None
+        };
+        let capability = if bound
+            .as_ref()
+            .is_some_and(|record| record.kind == "permission")
+        {
+            InboundCapability::Permissions
+        } else if bound.as_ref().is_some_and(|record| {
+            record.binding_ref.starts_with(FOLLOW_POLL_PREFIX)
+                || matches!(record.kind.as_str(), "question" | "review")
+        }) || channel_command(text).is_some()
+            || poll_command(text).is_some()
+            || starts_with_known_slash_command(text)
+        {
+            InboundCapability::Answers
+        } else if guid.is_none() {
+            let unresolved = ledger::list_unresolved(self.ledger(), self.provider_id)
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    record.status == "sent"
+                        && super::imessage::normalize_handle(&record.conversation)
+                            == super::imessage::normalize_handle(sender)
+                })
+                .collect::<Vec<_>>();
+            if unresolved.len() == 1 {
+                if unresolved[0].kind == "permission" {
+                    InboundCapability::Permissions
+                } else {
+                    InboundCapability::Answers
+                }
+            } else {
+                InboundCapability::FreeText
+            }
+        } else {
+            InboundCapability::FreeText
+        };
+        if !admits_capability(self.inbound_capabilities, capability) {
+            self.store_rejected(guid, sender, text, "policy", false)
+                .await?;
+            let notice = match capability {
+                InboundCapability::Permissions => {
+                    "Permission answers are disabled for this channel."
+                }
+                InboundCapability::Answers => {
+                    "Answers and channel controls are disabled for this channel."
+                }
+                InboundCapability::FreeText => "Free-text messages are disabled for this channel.",
+            };
+            return self.send_notice(&conversation, notice).await;
+        }
+        if self.provider_id == "discord" {
+            let target_uri =
+                ledger::lookup_conversation_target(self.ledger(), self.provider_id, &conversation)
+                    .await?;
+            match &event {
+                InboundEvent::Bare { sender, text, .. } => {
+                    let Some(target_uri) = target_uri else {
+                        self.store_rejected(None, sender, text, "unbound_conversation", false)
+                            .await?;
+                        return self
+                            .send_notice(
+                                &conversation,
+                                "This Discord channel is not bound to a Cairn conversation.",
+                            )
+                            .await;
+                    };
+                    let target = self.resolve_target(&target_uri).await?;
+                    return self.route_to_target(&target, text).await;
+                }
+                InboundEvent::Reply {
+                    bound_guid,
+                    sender,
+                    text,
+                    ..
+                } if ledger::get_by_provider_guid(self.ledger(), self.provider_id, bound_guid)
+                    .await?
+                    .is_none() =>
+                {
+                    let Some(target_uri) = target_uri else {
+                        self.store_rejected(
+                            Some(bound_guid),
+                            sender,
+                            text,
+                            "unbound_conversation",
+                            false,
+                        )
+                        .await?;
+                        return self
+                            .send_notice(
+                                &conversation,
+                                "This Discord channel is not bound to a Cairn conversation.",
+                            )
+                            .await;
+                    };
+                    let target = self.resolve_target(&target_uri).await?;
+                    return self.route_to_target(&target, text).await;
+                }
+                _ => {}
+            }
+        }
         match event {
             InboundEvent::Selection {
                 bound_guid,
@@ -1418,17 +2120,19 @@ impl ChannelRouter {
                 selected,
                 ..
             } => {
-                self.resolve_selection(&bound_guid, &sender, &option_text, selected)
+                self.resolve_selection(&bound_guid, &conversation, &sender, &option_text, selected)
                     .await
             }
             InboundEvent::Selections {
                 bound_guid,
                 sender,
                 changes,
+                ..
             } => {
                 for change in changes {
                     self.resolve_selection(
                         &bound_guid,
+                        &conversation,
                         &sender,
                         &change.option_text,
                         change.selected,
@@ -1441,12 +2145,30 @@ impl ChannelRouter {
                 bound_guid,
                 sender,
                 text,
-            } => self.resolve_bound(&bound_guid, &sender, &text).await,
-            InboundEvent::Bare { sender, text } => self.resolve_bare(&sender, &text).await,
+                ..
+            } => {
+                self.resolve_bound(&bound_guid, &conversation, &sender, &text)
+                    .await
+            }
+            InboundEvent::Bare { sender, text, .. } => {
+                self.resolve_bare(&conversation, &sender, &text).await
+            }
+            InboundEvent::Rejected { .. } => {
+                unreachable!("rejected inbound handled by policy gate")
+            }
         }
     }
 
-    async fn resolve_bound(&self, guid: &str, sender: &str, text: &str) -> Result<(), String> {
+    async fn resolve_bound(
+        &self,
+        guid: &str,
+        conversation: &str,
+        sender: &str,
+        text: &str,
+    ) -> Result<(), String> {
+        if text.trim_start().starts_with('/') {
+            return self.resolve_bare(conversation, sender, text).await;
+        }
         if let Some(record) =
             ledger::get_by_provider_guid(self.ledger(), self.provider_id, guid).await?
         {
@@ -1472,7 +2194,9 @@ impl ChannelRouter {
                             .map(|follow| follow.uri),
                     };
                     let Some(followed_uri) = followed_uri else {
-                        return self.send_notice(sender, "That follow was not found.").await;
+                        return self
+                            .send_notice(conversation, "That follow was not found.")
+                            .await;
                     };
                     let changed =
                         ledger::is_target_followed(self.ledger(), self.provider_id, &followed_uri)
@@ -1485,21 +2209,30 @@ impl ChannelRouter {
                     } else {
                         format!("{followed_uri} was already unfollowed.")
                     };
-                    self.send_notice(sender, &confirmation).await?;
+                    self.send_notice(conversation, &confirmation).await?;
                     return Ok(());
                 }
             }
-            return self.resolve_record(record, text).await;
+            if record.kind == "route" {
+                let target_uri = route_binding_target(&record.binding_ref).ok_or_else(|| {
+                    format!("route reply has no target binding: {}", record.binding_ref)
+                })?;
+                let target = self.resolve_target(target_uri).await?;
+                return self.route_to_target(&target, text).await;
+            }
+            return self.resolve_record(record, sender, text).await;
         }
-        if poll_command(text).is_some() {
-            return self.resolve_bare(sender, text).await;
+        if poll_command(text).is_some() || text.trim_start().starts_with('/') {
+            return self.resolve_bare(conversation, sender, text).await;
         }
-        self.store_unsolicited(Some(guid), sender, text).await
+        self.store_unsolicited(Some(guid), conversation, sender, text)
+            .await
     }
 
     async fn resolve_selection(
         &self,
         guid: &str,
+        conversation: &str,
         sender: &str,
         text: &str,
         selected: bool,
@@ -1507,46 +2240,79 @@ impl ChannelRouter {
         let Some(record) =
             ledger::get_by_provider_guid(self.ledger(), self.provider_id, guid).await?
         else {
-            return self.store_unsolicited(Some(guid), sender, text).await;
+            return self
+                .store_unsolicited(Some(guid), conversation, sender, text)
+                .await;
         };
         if record.binding_ref.starts_with(FOLLOW_POLL_PREFIX) {
             let options = follow_poll_options(&record)
                 .ok_or_else(|| "follow poll has no option bindings".to_string())?;
             if let Some(uri) = options.bindings.get(text) {
                 if selected {
-                    self.follow(uri).await?;
+                    self.follow_or_focus(uri, &record.conversation).await?;
                 } else {
                     self.unfollow(uri).await?;
+                    let target = FollowTarget::parse(uri)?;
+                    self.send_notice(
+                        &record.conversation,
+                        &format!("Unfollowed {}.", target.selector()),
+                    )
+                    .await?;
                 }
             }
             return Ok(());
         }
         if selected {
-            self.resolve_record(record, text).await
+            self.resolve_record(record, sender, text).await
         } else {
             Ok(())
         }
     }
 
-    async fn resolve_bare(&self, sender: &str, text: &str) -> Result<(), String> {
+    async fn resolve_bare(
+        &self,
+        conversation: &str,
+        sender: &str,
+        text: &str,
+    ) -> Result<(), String> {
         if let Some(kind) = poll_command(text) {
-            if let Err(error) = self.send_follow_poll(sender, kind).await {
+            if let Err(error) = self.send_follow_poll(conversation, kind).await {
                 log::warn!("channel could not answer the {kind:?} command: {error}");
-                self.send_notice(sender, &format!("{}: {error}", kind.failure_prefix()))
+                self.send_notice(conversation, &format!("{}: {error}", kind.failure_prefix()))
                     .await?;
             }
             return Ok(());
         }
-        if !text.trim_start().starts_with('/') {
-            let focused = ledger::get_focus(self.ledger(), self.provider_id)
-                .await?
-                .unwrap_or_else(|| {
-                    crate::config::settings::load_settings(&self.orch.config_dir)
-                        .channels
-                        .default_thread
-                });
-            let target = self.resolve_target(&focused).await?;
-            return self.route_to_target(&target, text).await;
+        if let Some(selector) = unfollow_selector(text) {
+            return match selector {
+                Some(selector) => {
+                    self.unfollow_selector_command(&selector, conversation)
+                        .await
+                }
+                None => {
+                    let Some(focused) = ledger::get_focus(self.ledger(), self.provider_id).await?
+                    else {
+                        return self
+                            .send_notice(conversation, "There is no focused follow to unfollow.")
+                            .await;
+                    };
+                    self.unfollow_uri_command(&focused, conversation).await
+                }
+            };
+        }
+        if let Some(selector) = focus_selector(text) {
+            return self.focus_selector_command(&selector, conversation).await;
+        }
+        if matches!(channel_command(text), Some(ChannelCommand::Help)) {
+            return self.send_notice(conversation, "Commands: /threads, /issues, /focus <name>, /unfollow [name], /help. Without a name, /unfollow stops the current focus. Reply to a pushed update to message that thread directly.").await;
+        }
+        if starts_with_known_slash_command(text) {
+            return self
+                .send_notice(
+                    conversation,
+                    "Invalid command usage. Use /help for channel commands.",
+                )
+                .await;
         }
         let mut matches = ledger::list_unresolved(self.ledger(), self.provider_id)
             .await?
@@ -1559,17 +2325,33 @@ impl ChannelRouter {
             .collect::<Vec<_>>();
         if matches.len() == 1 {
             let record = matches.pop().expect("one match");
-            return self.resolve_record(record, text).await;
+            return self.resolve_record(record, sender, text).await;
         }
         if matches.len() > 1 {
-            return self.send_notice(sender, "I found more than one active ask. Please reply to the specific message you want to answer.").await;
+            return self.send_notice(conversation, "I found more than one active ask. Please reply to the specific message you want to answer.").await;
         }
-        self.store_unsolicited(None, sender, text).await
+        if !text.trim_start().starts_with('/') {
+            let focused = ledger::get_focus(self.ledger(), self.provider_id)
+                .await?
+                .unwrap_or_else(|| {
+                    crate::config::settings::load_settings(&self.orch.config_dir)
+                        .channels
+                        .default_thread
+                });
+            let target = self.resolve_target(&focused).await?;
+            return self.route_to_target(&target, text).await;
+        }
+        self.send_notice(
+            conversation,
+            "Unknown command. Use /help for channel commands.",
+        )
+        .await
     }
 
     async fn resolve_record(
         &self,
         record: ledger::OutboundRecord,
+        sender: &str,
         text: &str,
     ) -> Result<(), String> {
         if record.status == "resolved" {
@@ -1579,77 +2361,107 @@ impl ChannelRouter {
             "question" => {
                 if record.binding_ref.starts_with(FOLLOW_POLL_PREFIX) {
                     let selected_label = follow_poll_answer(&record, text);
-                    return self.follow_poll_selection(&record, &selected_label).await;
+                    return self
+                        .follow_poll_selection(&record, &selected_label, &record.conversation)
+                        .await;
                 }
                 let answer = question_answer(&record, text);
-                let won_answer_claim = ledger::claim_question_answer(
-                    self.ledger(),
-                    &record.id,
-                    &answer,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-                .await?;
-                if won_answer_claim {
-                    cleanup_claimed_question(
-                        self.provider.as_ref(),
-                        &record,
-                        &format!("✓ answered: {answer}"),
-                    )
-                    .await;
-                } else if !ledger::record_answer_after_cleanup_claim(
-                    self.ledger(),
-                    &record.id,
-                    &answer,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
                 let (prompt_id, _) = record
                     .binding_ref
                     .rsplit_once(':')
                     .ok_or_else(|| format!("invalid question binding: {}", record.binding_ref))?;
-                let question_count = prompt_question_count(&self.orch, prompt_id).await?;
-                let answers =
-                    ledger::answered_for_prompt(self.ledger(), self.provider_id, prompt_id).await?;
-                if answers.len() == question_count {
-                    let response = if question_count == 1 {
-                        answers[0].1.clone()
-                    } else {
-                        answers
-                            .into_iter()
-                            .map(|(index, answer)| format!("Question {}: {}", index + 1, answer))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
-                    answer_prompt_id(&self.orch, prompt_id, response).await?;
-                }
-            }
-            "permission" => {
-                let decision = parse_permission(text)?;
-                // A chat reply answers with the narrowest containment scope
-                // available: there is no picker in a channel message, and
-                // inferring a broader one from a one-word reply would grant more
-                // than the replier said. It carries no operator capability
-                // either — a message in a room is not an authenticated operator
-                // at the desktop prompt — so an authority allow arriving here is
-                // refused and the prompt stays pending.
-                resolve_permission_request(
-                    &self.orch,
-                    &record.binding_ref,
-                    crate::mcp::handlers::permission::PermissionAnswer::from_surface(
-                        decision,
-                        crate::mcp::handlers::permission::AnswerSurface::ChannelReply,
+                if let Some(winner) =
+                    ledger::resolution_for_action(self.ledger(), prompt_id).await?
+                {
+                    self.send_notice(
+                        &record.conversation,
+                        &format!(
+                            "Already answered: {} via {}",
+                            winner.answer, winner.winner_surface
+                        ),
                     )
-                    .with_containment_scope(PermissionScope::Once),
-                )
-                .await?;
-                ledger::mark_resolved(
+                    .await?;
+                    return Ok(());
+                }
+                ledger::claim_question_answer(
                     self.ledger(),
                     &record.id,
+                    &answer,
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
+                let answers = ledger::staged_answers_for_prompt(
+                    self.ledger(),
+                    self.provider_id,
+                    &record.conversation,
+                    prompt_id,
+                )
+                .await?;
+                if answers.len() != prompt_question_count(&self.orch, prompt_id).await? {
+                    return Ok(());
+                }
+                let response = if answers.len() == 1 {
+                    answers[0].1.clone()
+                } else {
+                    answers
+                        .iter()
+                        .map(|(index, answer)| format!("Question {}: {}", index + 1, answer))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let claim = ledger::claim_ask_resolution(
+                    self.ledger(),
+                    prompt_id,
+                    &response,
+                    cairn_common::identity::AppearanceTransport::ChannelReply,
+                    Some(self.provider_id),
+                    Some(&record.conversation),
+                    Some(sender),
+                    "question",
+                    prompt_id,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                self.sweep_pending_domain_actions().await?;
+                self.sweep_pending_cleanup().await?;
+                if let ledger::AskClaim::Existing(winner) = claim {
+                    self.send_notice(
+                        &record.conversation,
+                        &format!(
+                            "Already answered: {} via {}",
+                            winner.answer, winner.winner_surface
+                        ),
+                    )
+                    .await?;
+                }
+            }
+            "permission" => {
+                let answer = permission_answer_token(parse_permission(text)?);
+                let claim = ledger::claim_ask_resolution(
+                    self.ledger(),
+                    &record.binding_ref,
+                    &answer,
+                    cairn_common::identity::AppearanceTransport::ChannelReply,
+                    Some(self.provider_id),
+                    Some(&record.conversation),
+                    Some(sender),
+                    "permission",
+                    &record.binding_ref,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                self.sweep_pending_domain_actions().await?;
+                self.sweep_pending_cleanup().await?;
+                if let ledger::AskClaim::Existing(winner) = claim {
+                    self.send_notice(
+                        &record.conversation,
+                        &format!(
+                            "Already answered: {} via {}",
+                            winner.answer, winner.winner_surface
+                        ),
+                    )
+                    .await?;
+                }
             }
             "review" => {
                 let job_id = record
@@ -1675,9 +2487,41 @@ impl ChannelRouter {
         Ok(())
     }
 
+    async fn store_rejected(
+        &self,
+        guid: Option<&str>,
+        sender: &str,
+        text: &str,
+        reason: &str,
+        acknowledged: bool,
+    ) -> Result<(), String> {
+        let db = &self.orch.db.local;
+        let id = Uuid::new_v4().to_string();
+        ledger::insert_inbound(
+            db,
+            &ledger::InboundRecord {
+                id,
+                channel: self.provider_id.into(),
+                provider_guid: guid.map(str::to_string),
+                sender: sender.into(),
+                text: text.into(),
+                received_at: chrono::Utc::now().timestamp_millis(),
+                rejection_reason: Some(reason.into()),
+                acknowledged_at: acknowledged.then(|| chrono::Utc::now().timestamp_millis()),
+            },
+        )
+        .await?;
+        let _ = self.orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table":"channel_inbound","action":"insert"}),
+        );
+        Ok(())
+    }
+
     async fn store_unsolicited(
         &self,
         guid: Option<&str>,
+        conversation: &str,
         sender: &str,
         text: &str,
     ) -> Result<(), String> {
@@ -1692,12 +2536,16 @@ impl ChannelRouter {
                 sender: sender.into(),
                 text: text.into(),
                 received_at: chrono::Utc::now().timestamp_millis(),
+                rejection_reason: Some("unmatched".into()),
                 acknowledged_at: None,
             },
         )
         .await?;
-        self.send_notice(sender, "No active ask — your message is visible in Cairn.")
-            .await?;
+        self.send_notice(
+            conversation,
+            "No active ask — your message is visible in Cairn.",
+        )
+        .await?;
         ledger::mark_inbound_acknowledged(db, &id, chrono::Utc::now().timestamp_millis()).await?;
         let _ = self.orch.services.emitter.emit(
             "db-change",
@@ -1725,7 +2573,8 @@ pub fn spawn(
     provider: Arc<dyn ChannelProvider>,
     provider_id: &'static str,
     destination: String,
-    route: ChannelRouteConfig,
+    route: MessageClassPolicy,
+    inbound_capabilities: ChannelInboundCapabilities,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let router = Arc::new(ChannelRouter::new_for_provider(
         orch,
@@ -1733,6 +2582,7 @@ pub fn spawn(
         provider_id,
         destination,
         route,
+        inbound_capabilities,
     ));
     let (route_tx, mut route_rx) = tokio::sync::mpsc::unbounded_channel();
     super::route_submission_slot()
@@ -1804,7 +2654,7 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
             let questions: Vec<StoredQuestion> = serde_json::from_str(&questions_json).map_err(|e| crate::storage::DbError::Row(e.to_string()))?;
             for (index, question) in questions.into_iter().enumerate() {
                 let text = match &question_uri { Some(uri) => format!("{}\n\n{}", question.question, uri), None => question.question };
-                gates.push(Gate { kind: "question", initiated_by: OutboundInitiator::CairnPush, binding_ref: format!("{prompt_id}:{index}"), job_id: job_id.clone(), context: context.clone(), ask: OutboundAsk::Question { prompt_id: prompt_id.clone(), question_index: index, text, options: question.options.into_iter().map(|o| AskOption { label:o.label, description:o.description }).collect() } });
+                gates.push(Gate { conversation: None, target_uri: question_uri.as_deref().and_then(routed_gate_target), kind: "question", initiated_by: OutboundInitiator::CairnPush, binding_ref: format!("{prompt_id}:{index}"), job_id: job_id.clone(), context: context.clone(), ask: OutboundAsk::Question { prompt_id: prompt_id.clone(), question_index: index, text, options: question.options.into_iter().map(|o| AskOption { label:o.label, description:o.description }).collect() } });
             }
         }
         Ok(gates)
@@ -1814,67 +2664,115 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
 async fn load_permissions(db: &LocalDb) -> Result<Vec<Gate>, String> {
     db.read(|conn| Box::pin(async move {
         let mut rows = conn.query("SELECT req.id, req.tool_name, req.tool_input, COALESCE(req.job_id,r.job_id), COALESCE(j.node_name,j.uri_segment,'agent'), p.key, i.number, e.seq, j.uri_segment, req.uri_segment FROM permission_requests req JOIN runs r ON r.id=req.run_id LEFT JOIN jobs j ON j.id=COALESCE(req.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) LEFT JOIN projects p ON p.id=i.project_id LEFT JOIN executions e ON e.id=j.execution_id WHERE req.status='pending' AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY req.created_at DESC", ()).await?;
-        let mut gates=Vec::new(); while let Some(row)=rows.next().await? { let id=row.text(0)?; let tool=row.text(1)?; let input=row.text(2)?; let uri=match(row.opt_text(5)?,row.opt_i64(6)?,row.opt_i64(7)?,row.opt_text(8)?,row.opt_text(9)?){(Some(project),Some(number),Some(exec_seq),Some(node),Some(segment))=>Some(build_node_permission_uri(&project,number as i32,exec_seq as i32,&node,&segment)),_=>None}; let summary=match uri{Some(uri)=>format!("Allow {tool}?\n{input}\n\n{uri}"),None=>format!("Allow {tool}?\n{input}")}; gates.push(Gate { kind:"permission", initiated_by: OutboundInitiator::CairnPush, binding_ref:id.clone(), job_id:row.opt_text(3)?, context:format!("[Cairn · {}]",row.text(4)?), ask:OutboundAsk::Permission { request_id:id, summary } }); } Ok(gates)
+        let mut gates=Vec::new(); while let Some(row)=rows.next().await? { let id=row.text(0)?; let tool=row.text(1)?; let input=row.text(2)?; let uri=match(row.opt_text(5)?,row.opt_i64(6)?,row.opt_i64(7)?,row.opt_text(8)?,row.opt_text(9)?){(Some(project),Some(number),Some(exec_seq),Some(node),Some(segment))=>Some(build_node_permission_uri(&project,number as i32,exec_seq as i32,&node,&segment)),_=>None}; let summary=permission_ask_body(&tool, &input, uri.as_deref()); let target_uri = uri.as_deref().and_then(routed_gate_target); gates.push(Gate { conversation: None, target_uri, kind:"permission", initiated_by: OutboundInitiator::CairnPush, binding_ref:id.clone(), job_id:row.opt_text(3)?, context:format!("[Cairn · {}]",row.text(4)?), ask:OutboundAsk::Permission { request_id:id, summary } }); } Ok(gates)
     })).await.map_err(|e| e.to_string())
 }
 
+fn permission_ask_body(tool: &str, tool_input: &str, permission_uri: Option<&str>) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(tool_input).ok();
+    let field = |name| {
+        parsed
+            .as_ref()
+            .and_then(|value| value.get(name))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let mut sections = match (field("summary"), field("descriptor")) {
+        (Some(summary), Some(descriptor)) => vec![summary.to_string(), descriptor.to_string()],
+        (Some(summary), None) => vec![summary.to_string()],
+        (None, Some(descriptor)) => vec![descriptor.to_string()],
+        (None, None) => vec![format!("Allow {tool}?"), tool_input.to_string()],
+    };
+    if let Some(uri) = permission_uri {
+        sections.push(uri.to_string());
+    }
+    sections.join("\n\n")
+}
+
 async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
-    let pushes = db.read(|conn| Box::pin(async move {
-        let mut rows=conn.query("SELECT id,recipient,content_ref,wake,boundary,\"key\",created_at,delivered_event_id FROM attention_pushes WHERE delivered_event_id IS NULL AND \"key\" LIKE 'review:%' ORDER BY created_at DESC",()).await?; let mut out=Vec::new(); while let Some(row)=rows.next().await? { out.push(crate::orchestrator::attention_push::Push { id:row.text(0)?,recipient:row.text(1)?,content_ref:row.text(2)?,wake:crate::orchestrator::attention_push::Wake::from_db(&row.text(3)?).unwrap(),boundary:crate::orchestrator::attention_push::Boundary::from_db(&row.text(4)?).unwrap(),key:row.text(5)?,created_at:row.i64(6)?,delivered_event_id:row.opt_text(7)? }); } Ok(out)
-    })).await.map_err(|e| e.to_string())?;
-    let mut result = ReviewGates::default();
-    for push in pushes {
-        if crate::orchestrator::attention_push::lazy_resolve_live(db, &push)
-            .await
-            .map_err(|e| e.to_string())?
-        {
-            let parsed = parse_uri(&push.content_ref);
-            let reference = parsed
-                .as_ref()
-                .and_then(|parsed| Some((parsed.project()?.to_string(), parsed.issue_number()?)));
-            let Some((project, number)) = reference else {
-                crate::orchestrator::attention_push::delete_pending_by_id(db, &push.id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                result.expired_dangling += 1;
-                log::warn!(
-                    "channel expired dangling review {} because its reference is invalid: {}",
-                    push.id,
-                    push.content_ref
-                );
-                continue;
-            };
-            let title = db
-                .query_opt_text(
-                    "SELECT i.title FROM issues i JOIN projects p ON p.id=i.project_id WHERE upper(p.key)=upper(?1) AND i.number=?2",
-                    (project.clone(), number),
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let Some(title) = title else {
-                crate::orchestrator::attention_push::delete_pending_by_id(db, &push.id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                result.expired_dangling += 1;
-                log::warn!(
-                    "channel expired dangling review {} because issue {project}/{number} no longer exists",
-                    push.id
-                );
-                continue;
-            };
-            result.gates.push(Gate {
-                kind: "review",
-                initiated_by: OutboundInitiator::CairnPush,
-                // Bind the external once-only fence to the semantic review fact,
-                // never to the randomly generated queue-row UUID.
-                binding_ref: push.key.clone(),
-                job_id: Some(push.recipient),
-                context: String::new(),
-                ask: OutboundAsk::Notify {
-                    text: review_notice(&project, number, &title, &push.content_ref),
-                },
+    struct ReviewRow {
+        id: String,
+        recipient: String,
+        content_ref: String,
+        key: String,
+        project: Option<String>,
+        number: Option<i64>,
+        title: Option<String>,
+        live: bool,
+    }
+
+    // One snapshot and one statement for the whole backlog. The joins resolve the
+    // issue encoded in the semantic review key; correlated EXISTS arms mirror the
+    // attention-push liveness predicate without opening a transaction per push.
+    let rows = db.read(|conn| Box::pin(async move {
+        let mut rows = conn.query(
+            "SELECT ap.id, ap.recipient, ap.content_ref, ap.\"key\", p.key, i.number, i.title,
+                    CASE WHEN i.id IS NULL THEN 0
+                         WHEN EXISTS (SELECT 1 FROM merge_requests mr
+                                      WHERE mr.issue_id=i.id AND mr.status NOT IN ('merged','closed')) THEN 1
+                         WHEN EXISTS (SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
+                                      WHERE j.issue_id=i.id AND a.artifact_type='plan' AND a.confirmed=0) THEN 1
+                         WHEN EXISTS (SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
+                                      WHERE j.issue_id=i.id AND a.artifact_type='create-pr')
+                          AND NOT EXISTS (SELECT 1 FROM merge_requests mr WHERE mr.issue_id=i.id) THEN 1
+                         ELSE 0 END
+               FROM attention_pushes ap
+               LEFT JOIN projects p
+                 ON lower(ap.content_ref) LIKE lower('cairn://p/' || p.key || '/%')
+               LEFT JOIN issues i
+                 ON i.project_id=p.id
+                AND (lower(ap.content_ref)=lower('cairn://p/' || p.key || '/' || i.number)
+                     OR lower(ap.content_ref)
+                        LIKE lower('cairn://p/' || p.key || '/' || i.number || '/%'))
+              WHERE ap.delivered_event_id IS NULL AND ap.\"key\" LIKE 'review:%'
+              ORDER BY ap.created_at DESC, ap.id DESC",
+            (),
+        ).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(ReviewRow {
+                id: row.text(0)?, recipient: row.text(1)?, content_ref: row.text(2)?, key: row.text(3)?,
+                project: row.opt_text(4)?, number: row.opt_i64(5)?, title: row.opt_text(6)?, live: row.i64(7)? != 0,
             });
         }
+        Ok(out)
+    })).await.map_err(|error| error.to_string())?;
+
+    let mut result = ReviewGates::default();
+    for row in rows {
+        let Some((project, number, title)) = row
+            .project
+            .zip(row.number)
+            .zip(row.title)
+            .map(|((project, number), title)| (project, number, title))
+        else {
+            crate::orchestrator::attention_push::delete_pending_by_id(db, &row.id)
+                .await
+                .map_err(|error| error.to_string())?;
+            result.expired_dangling += 1;
+            log::warn!(
+                "channel expired dangling review {} because its semantic key does not resolve: {}",
+                row.id,
+                row.key
+            );
+            continue;
+        };
+        if !row.live {
+            continue;
+        }
+        result.gates.push(Gate {
+            conversation: None,
+            target_uri: Some(format!("cairn://p/{project}/{number}")),
+            kind: "review",
+            initiated_by: OutboundInitiator::CairnPush,
+            binding_ref: row.key,
+            job_id: Some(row.recipient),
+            context: String::new(),
+            ask: OutboundAsk::Notify {
+                text: review_notice(&project, number as i32, &title, &row.content_ref),
+            },
+        });
     }
     Ok(result)
 }
@@ -1903,7 +2801,8 @@ async fn claim_gate_for_provider(
     rendering: &'static str,
     gate: &Gate,
 ) -> Result<Option<String>, String> {
-    if claims.holds(&gate.binding_ref) {
+    let delivery_key = gate.delivery_key(provider_id, conversation);
+    if claims.holds(&delivery_key) {
         return Ok(None);
     }
     let id = Uuid::new_v4().to_string();
@@ -1925,7 +2824,7 @@ async fn claim_gate_for_provider(
     .await?;
     // Claimed either way: a gate the ledger already fenced in an earlier session
     // is just as much this session's business to leave alone.
-    claims.claim(&gate.binding_ref);
+    claims.claim(&delivery_key);
     Ok(inserted.then_some(id))
 }
 
@@ -1989,7 +2888,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
                VALUES('reviewer-issue', 'p', 1, 'Reviewer', 'active', 1, 1);
              INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
@@ -2000,9 +2899,9 @@ mod tests {
              INSERT INTO attention_pushes
                (id, recipient, content_ref, wake, boundary, key, created_at)
              VALUES
-               ('missing-issue', 'reviewer', 'cairn://p/CAIRN/1790/1/reviewer/create-pr', 'wake', 'event', 'review:missing', 1),
+               ('missing-issue', 'reviewer', 'cairn://p/cairn/1790/1/reviewer/create-pr', 'wake', 'event', 'review:missing', 1),
                ('invalid-ref', 'reviewer', 'not-a-cairn-uri', 'wake', 'event', 'review:invalid', 2),
-               ('live-review', 'reviewer', 'cairn://p/CAIRN/1/1/reviewer/create-pr', 'wake', 'event', 'review:live', 3);",
+               ('live-review', 'reviewer', 'cairn://p/cairn/1/1/reviewer/create-pr', 'wake', 'event', 'review:live', 3);",
         )
         .await
         .unwrap();
@@ -2032,18 +2931,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unchanged_review_backlog_is_generation_bounded() {
+        let (orch, db) = route_test_orchestrator("review-generation-bounded.db").await;
+        db.execute_batch(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+               VALUES('issue', 'p', 1, 'Review', 'active', 1, 1);
+             INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+               VALUES('reviewer', 'p', 'issue', 'running', 1, 1);
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+               VALUES('mr', 'reviewer', 'p', 'issue', 'Review', 'feature', 'main', 'open', 1, 1);
+             INSERT INTO attention_pushes
+               (id, recipient, content_ref, wake, boundary, key, created_at)
+               VALUES('push', 'reviewer', 'cairn://p/cairn/1/1/reviewer/create-pr', 'wake', 'event',
+                      'review:cairn://p/cairn/1', 1);",
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(PresentProvider {
+            sends: Mutex::new(Vec::new()),
+            presence_checks: Mutex::new(0),
+            presence: Mutex::new(OperatorPresence::Away),
+        });
+        let router = ChannelRouter::new_for_provider(
+            orch,
+            provider,
+            "imessage",
+            "+15551234567".into(),
+            MessageClassPolicy {
+                question: false,
+                permission: false,
+                notify: true,
+            },
+            ChannelInboundCapabilities::default(),
+        );
+
+        let (first_work, first_live) = router.load_routed_gates(&db, "").await.unwrap();
+        let (pending_work, _) = router.load_routed_gates(&db, "").await.unwrap();
+        assert_eq!((first_work.len(), first_live.len()), (1, 1));
+        assert_eq!(
+            pending_work.len(),
+            1,
+            "unclaimed cached work cannot be stranded"
+        );
+        let delivery_key = first_work[0].delivery_key(router.provider_id, &router.destination);
+        router.claims.claim(&delivery_key);
+        let (idle_work, idle_live) = router.load_routed_gates(&db, "").await.unwrap();
+        assert!(
+            idle_work.is_empty(),
+            "a fenced unchanged generation performs no work"
+        );
+        assert_eq!(
+            idle_live.len(),
+            1,
+            "the cached live set still protects route fencing"
+        );
+
+        db.execute(
+            "UPDATE issues SET updated_at=updated_at+1 WHERE id='issue'",
+            (),
+        )
+        .await
+        .unwrap();
+        let (invalidated_work, _) = router.load_routed_gates(&db, "").await.unwrap();
+        let (settled_work, _) = router.load_routed_gates(&db, "").await.unwrap();
+        assert_eq!(
+            invalidated_work.len(),
+            1,
+            "one mutation causes one bounded refresh"
+        );
+        assert!(
+            settled_work.is_empty(),
+            "the refreshed generation settles immediately"
+        );
+    }
+
     // Operator presence is process-global, and a review gate is presence-aware:
     // a sibling test pinning presence Active would make this sweep defer its
     // delivery instead of sending it. Joining that serial group is what keeps
     // the assertion about this gate rather than about test interleaving.
     #[tokio::test]
     #[serial_test::serial(operator_presence)]
-    async fn pending_review_across_many_sweeps_delivers_one_push_and_one_text() {
+    async fn pending_review_across_many_sweeps_stays_off_imessage_notify_policy() {
         let (orch, db) = route_test_orchestrator("review-many-sweeps.db").await;
         db.execute_batch(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
                VALUES('issue', 'p', 3727, 'Frontend minimal slice', 'active', 1, 1);
              INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
@@ -2053,8 +3031,8 @@ mod tests {
                VALUES('mr', 'reviewer', 'p', 'issue', 'Review', 'feature', 'main', 'open', 1, 1);
              INSERT INTO attention_pushes
                (id, recipient, content_ref, wake, boundary, key, created_at, fingerprint)
-               VALUES('push', 'reviewer', 'cairn://p/CAIRN/3727/1/builder/pr', 'wake', 'event',
-                      'review:cairn://p/CAIRN/3727', 1, 'sha:stable');",
+               VALUES('push', 'reviewer', 'cairn://p/cairn/3727/1/builder/pr', 'wake', 'event',
+                      'review:cairn://p/cairn/3727', 1, 'sha:stable');",
         )
         .await
         .unwrap();
@@ -2081,8 +3059,8 @@ mod tests {
             db.execute(
                 "INSERT INTO attention_pushes
                    (id, recipient, content_ref, wake, boundary, key, created_at, fingerprint)
-                 VALUES(?1, 'reviewer', 'cairn://p/CAIRN/3727/1/builder/pr', 'wake', 'event',
-                        'review:cairn://p/CAIRN/3727', ?2, ?3)",
+                 VALUES(?1, 'reviewer', 'cairn://p/cairn/3727/1/builder/pr', 'wake', 'event',
+                        'review:cairn://p/cairn/3727', ?2, ?3)",
                 params![
                     format!("push-{revision}"),
                     revision,
@@ -2096,8 +3074,8 @@ mod tests {
 
         assert_eq!(
             provider.sends.lock().unwrap().len(),
-            1,
-            "new row UUIDs and fingerprints for one review-ready fact never cross the channel fence"
+            0,
+            "ordinary review notifications stay off the iMessage attention surface"
         );
         assert_eq!(
             db.query_opt_i64("SELECT COUNT(*) FROM attention_pushes", ())
@@ -2109,8 +3087,14 @@ mod tests {
             db.query_opt_i64("SELECT COUNT(*) FROM channel_outbound", ())
                 .await
                 .unwrap(),
-            Some(1)
+            Some(0)
         );
+    }
+
+    #[test]
+    fn shared_channel_attribution_names_the_allowlisted_operator_and_provider() {
+        assert_eq!(channel_sender_name("telegram"), "operator via telegram");
+        assert_eq!(channel_sender_name("imessage"), "operator via imessage");
     }
 
     #[test]
@@ -2124,26 +3108,45 @@ mod tests {
     }
 
     #[test]
+    fn registered_commands_and_parser_stay_in_agreement() {
+        for spec in super::super::commands::CHANNEL_COMMANDS {
+            let text = if spec.takes_argument {
+                format!("/{} target", spec.name)
+            } else {
+                format!("/{}", spec.name)
+            };
+            assert!(
+                channel_command(&text).is_some(),
+                "registered command did not parse: {text}"
+            );
+            assert!(starts_with_known_slash_command(&text));
+        }
+
+        assert!(channel_command("/not-registered").is_none());
+        assert!(!starts_with_known_slash_command("/not-registered"));
+    }
+
+    #[test]
     fn a_follow_uri_reads_as_a_thread_name_or_an_issue_number() {
         assert_eq!(
             FollowTarget::parse("cairn://p/cairn/settings-ui").unwrap(),
             FollowTarget::Thread {
-                project: "CAIRN".into(),
+                project: "cairn".into(),
                 name: "settings-ui".into()
             }
         );
         assert_eq!(
-            FollowTarget::parse("cairn://p/CAIRN/3404").unwrap(),
+            FollowTarget::parse("cairn://p/cairn/3404").unwrap(),
             FollowTarget::Issue {
-                project: "CAIRN".into(),
+                project: "cairn".into(),
                 number: 3404
             }
         );
         assert_eq!(
-            FollowTarget::parse("cairn://p/CAIRN/settings-ui")
+            FollowTarget::parse("cairn://p/cairn/settings-ui")
                 .unwrap()
                 .uri(),
-            "cairn://p/CAIRN/settings-ui"
+            "cairn://p/cairn/settings-ui"
         );
         assert!(FollowTarget::parse("not-a-uri").is_err());
     }
@@ -2162,12 +3165,12 @@ mod tests {
         assert_eq!(unfollow_selector("unfollow 3404 please"), None);
         assert_eq!(unfollow_selector("follow 3404"), None);
 
-        let bound_project = parse_uri("cairn://p/CAIRN/settings-ui")
+        let bound_project = parse_uri("cairn://p/cairn/settings-ui")
             .and_then(|uri| uri.project().map(str::to_string));
         let follows = [
             "cairn://p/OTHER/settings-ui",
-            "cairn://p/CAIRN/3404",
-            "cairn://p/CAIRN/settings-ui",
+            "cairn://p/cairn/3404",
+            "cairn://p/cairn/settings-ui",
         ];
         let selected = follows.into_iter().find(|uri| {
             FollowTarget::parse(uri).is_ok_and(|target| {
@@ -2175,7 +3178,7 @@ mod tests {
                     && Some(target.project()) == bound_project.as_deref()
             })
         });
-        assert_eq!(selected, Some("cairn://p/CAIRN/settings-ui"));
+        assert_eq!(selected, Some("cairn://p/cairn/settings-ui"));
     }
 
     #[test]
@@ -2283,7 +3286,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
              INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
                VALUES ('i', 'p', 1, 'Followed work', 'active', 1, 1);
              INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -2298,7 +3301,7 @@ mod tests {
         )
         .await
         .unwrap();
-        ledger::follow_target(&db, CHANNEL, "cairn://p/CAIRN/1", 1, 0)
+        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/1", 1, 0)
             .await
             .unwrap();
 
@@ -2336,7 +3339,7 @@ mod tests {
             &db,
             CHANNEL,
             "route",
-            "route:followed-thread-stream:cairn://p/CAIRN/1:event:1",
+            "route:followed-thread-stream:cairn://p/cairn/1:event:1",
         )
         .await
         .unwrap()
@@ -2375,7 +3378,7 @@ mod tests {
             &db,
             CHANNEL,
             "route",
-            "route:followed-thread-stream:cairn://p/CAIRN/1:event:3",
+            "route:followed-thread-stream:cairn://p/cairn/1:event:3",
         )
         .await
         .unwrap();
@@ -2401,7 +3404,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(firings.len(), 1);
-        assert_eq!(firings[0].fact_identity, "cairn://p/CAIRN/1:event:3");
+        assert_eq!(firings[0].fact_identity, "cairn://p/cairn/1:event:3");
         assert_eq!(firings[0].status, "fired");
         super::super::set_operator_presence_mode(crate::channels::OperatorPresenceMode::Auto);
     }
@@ -2417,7 +3420,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
              INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
                VALUES ('t1', 'p', 'general', 'active', 1, 2),
                       ('t2', 'p', 'performance', 'active', 1, 3);",
@@ -2447,6 +3450,7 @@ mod tests {
 
         router
             .handle_inbound(InboundEvent::Reply {
+                conversation: "imessage:+15551234567".into(),
                 bound_guid: "stale-messages-reply-guid".into(),
                 sender: "+15551234567".into(),
                 text: "Threads".into(),
@@ -2479,6 +3483,7 @@ mod tests {
 
     struct RecordingPollProvider {
         sends: Mutex<Vec<OutboundAsk>>,
+        deliveries: Mutex<Vec<OutboundMessage>>,
         next_guid: std::sync::atomic::AtomicUsize,
         cleanups: std::sync::atomic::AtomicUsize,
     }
@@ -2499,6 +3504,7 @@ mod tests {
             message: &OutboundMessage,
         ) -> Result<crate::channels::SentIds, String> {
             self.sends.lock().unwrap().push(message.ask.clone());
+            self.deliveries.lock().unwrap().push(message.clone());
             let guid = self
                 .next_guid
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2524,7 +3530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn thread_poll_replies_toggle_forever_and_fresh_polls_show_follow_state() {
+    async fn follow_poll_selection_focuses_on_tap_and_only_deselection_unfollows() {
         use crate::db::DbState;
         use crate::services::testing::TestServicesBuilder;
         use crate::storage::SearchIndex;
@@ -2534,7 +3540,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
              INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
                VALUES ('t1', 'p', 'general', 'active', 1, 3),
                       ('t2', 'p', 'performance', 'active', 1, 2);",
@@ -2542,7 +3548,7 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            ledger::follow_target(&db, CHANNEL, "cairn://p/CAIRN/general", 1, 0)
+            ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/general", 1, 0)
                 .await
                 .unwrap()
         );
@@ -2556,6 +3562,7 @@ mod tests {
         .build();
         let provider = Arc::new(RecordingPollProvider {
             sends: Mutex::new(Vec::new()),
+            deliveries: Mutex::new(Vec::new()),
             next_guid: std::sync::atomic::AtomicUsize::new(1),
             cleanups: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -2581,8 +3588,8 @@ mod tests {
             _ => panic!("threads command must send a poll"),
         }
         let legacy_bindings = serde_json::json!({
-            "✓ general": "cairn://p/CAIRN/general",
-            "performance": "cairn://p/CAIRN/performance"
+            "✓ general": "cairn://p/cairn/general",
+            "performance": "cairn://p/cairn/performance"
         })
         .to_string();
         db.execute(
@@ -2593,7 +3600,19 @@ mod tests {
         .unwrap();
 
         router
+            .send_notice("+15551234567", "intervening routed update")
+            .await
+            .unwrap();
+        router.sweep_live_gates().await.unwrap();
+        assert_eq!(
+            provider.cleanups.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "ordinary traffic and the next gate sweep must not clear a command poll"
+        );
+
+        router
             .handle_inbound(InboundEvent::Reply {
+                conversation: "imessage:+15551234567".into(),
                 bound_guid: "poll-1".into(),
                 sender: "+15551234567".into(),
                 text: "1".into(),
@@ -2601,12 +3620,18 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/CAIRN/general")
+            ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
                 .await
                 .unwrap()
         );
+        assert_eq!(
+            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
+            Some("cairn://p/cairn/general"),
+            "tap-only providers focus an existing follow instead of toggling it off"
+        );
         router
             .handle_inbound(InboundEvent::Reply {
+                conversation: "imessage:+15551234567".into(),
                 bound_guid: "poll-1".into(),
                 sender: "+15551234567".into(),
                 text: "1".into(),
@@ -2614,7 +3639,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            ledger::is_target_followed(&db, CHANNEL, "cairn://p/CAIRN/general")
+            ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
                 .await
                 .unwrap()
         );
@@ -2626,6 +3651,7 @@ mod tests {
         for selected in [false, false] {
             router
                 .handle_inbound(InboundEvent::Selection {
+                    conversation: "imessage:+15551234567".into(),
                     bound_guid: "poll-1".into(),
                     sender: "+15551234567".into(),
                     option_id: "option-1".into(),
@@ -2636,13 +3662,14 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/CAIRN/general")
+            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
                 .await
                 .unwrap()
         );
         for selected in [true, true] {
             router
                 .handle_inbound(InboundEvent::Selection {
+                    conversation: "imessage:+15551234567".into(),
                     bound_guid: "poll-1".into(),
                     sender: "+15551234567".into(),
                     option_id: "option-1".into(),
@@ -2653,7 +3680,7 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            ledger::is_target_followed(&db, CHANNEL, "cairn://p/CAIRN/general")
+            ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
                 .await
                 .unwrap()
         );
@@ -2665,7 +3692,7 @@ mod tests {
         {
             let sends = provider.sends.lock().unwrap();
             assert!(
-                matches!(&sends[1], OutboundAsk::Question { options, .. } if options[0].label.starts_with("✓ "))
+                matches!(sends.iter().rev().find(|ask| matches!(ask, OutboundAsk::Question { .. })), Some(OutboundAsk::Question { options, .. }) if options[0].label.starts_with("✓ "))
             );
         }
         let polls = ledger::list_unresolved(&db, CHANNEL)
@@ -2674,12 +3701,12 @@ mod tests {
             .into_iter()
             .filter(|record| record.binding_ref.starts_with(FOLLOW_POLL_PREFIX))
             .collect::<Vec<_>>();
-        assert_eq!(polls.len(), 2);
+        assert_eq!(polls.len(), 1);
         assert!(polls.iter().all(|poll| poll.status == "sent"));
         assert_eq!(
             provider.cleanups.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "standing controls are never routed through answered-question cleanup"
+            1,
+            "a newer /threads replaces the old keyboard after the new poll is delivered"
         );
 
         ledger::insert_intent(
@@ -2688,7 +3715,7 @@ mod tests {
                 id: "stream-intent",
                 channel: CHANNEL,
                 kind: "review",
-                binding_ref: "cairn://p/CAIRN/general:event:42",
+                binding_ref: "cairn://p/cairn/general:event:42",
                 conversation: "+15551234567",
                 job_id: Some("unused-for-unfollow"),
                 rendered_text: "stream update",
@@ -2703,6 +3730,7 @@ mod tests {
             .unwrap();
         router
             .handle_inbound(InboundEvent::Reply {
+                conversation: "imessage:+15551234567".into(),
                 bound_guid: "stream-guid".into(),
                 sender: "+15551234567".into(),
                 text: "unfollow".into(),
@@ -2710,19 +3738,227 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/CAIRN/general")
+            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
                 .await
                 .unwrap()
         );
         assert!(matches!(
             provider.sends.lock().unwrap().last(),
-            Some(OutboundAsk::Notify { text }) if text == "Unfollowed cairn://p/CAIRN/general."
+            Some(OutboundAsk::Notify { text }) if text == "Unfollowed cairn://p/cairn/general."
         ));
         let stream = ledger::get_by_provider_guid(&db, CHANNEL, "stream-guid")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stream.status, "resolved");
+    }
+
+    #[tokio::test]
+    async fn slash_commands_switch_focus_and_unfollow_without_provider_deselection() {
+        let (orch, db) = route_test_orchestrator("channel-router-slash-controls.db").await;
+        seed_threads_and_an_issue(&db).await;
+        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/general", 1, 0)
+            .await
+            .unwrap();
+        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/performance", 2, 0)
+            .await
+            .unwrap();
+        ledger::set_focus(&db, CHANNEL, "cairn://p/cairn/performance", 2)
+            .await
+            .unwrap();
+        let (router, provider) = test_router(orch);
+
+        ledger::insert_intent(
+            &db,
+            &ledger::NewOutbound {
+                id: "bound-update",
+                channel: CHANNEL,
+                kind: "route",
+                binding_ref: "route:follow:cairn://p/cairn/performance:event:9",
+                conversation: "operator",
+                job_id: None,
+                rendered_text: "update",
+                rendering: "text",
+                created_at: 3,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::mark_sent(&db, "bound-update", "bound-guid", None, None, 3)
+            .await
+            .unwrap();
+
+        for (id, guid, created_at) in [
+            ("active-ask-one", "ask-guid-one", 4),
+            ("active-ask-two", "ask-guid-two", 5),
+        ] {
+            ledger::insert_intent(
+                &db,
+                &ledger::NewOutbound {
+                    id,
+                    channel: CHANNEL,
+                    kind: "question",
+                    binding_ref: id,
+                    conversation: "operator",
+                    job_id: None,
+                    rendered_text: "question",
+                    rendering: "text",
+                    created_at,
+                },
+            )
+            .await
+            .unwrap();
+            ledger::mark_sent(&db, id, guid, None, None, created_at)
+                .await
+                .unwrap();
+        }
+
+        router
+            .resolve_bound("bound-guid", "operator", "operator", "/focus general")
+            .await
+            .unwrap();
+        assert_eq!(
+            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
+            Some("cairn://p/cairn/general")
+        );
+        assert!(matches!(
+            provider.sends.lock().unwrap().last(),
+            Some(OutboundAsk::Notify { text }) if text.starts_with("Focused general")
+        ));
+
+        let messages_before_commands = db
+            .query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        router
+            .resolve_bare("operator", "operator", "/unfollow")
+            .await
+            .unwrap();
+        assert!(
+            !ledger::is_target_followed(&db, CHANNEL, "cairn://p/cairn/general")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
+            Some("cairn://p/cairn/performance"),
+            "unfollowing the focus moves loose-message routing to a remaining follow"
+        );
+        assert!(matches!(
+            provider.sends.lock().unwrap().last(),
+            Some(OutboundAsk::Notify { text }) if text == "Unfollowed general."
+        ));
+        router
+            .resolve_bare("operator", "operator", "/help")
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.sends.lock().unwrap().last(),
+            Some(OutboundAsk::Notify { text })
+                if text.contains("/unfollow [name]")
+                    && text.contains("stops the current focus")
+        ));
+        router
+            .resolve_bare("operator", "operator", "/focus general extra")
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.sends.lock().unwrap().last(),
+            Some(OutboundAsk::Notify { text }) if text.starts_with("Invalid command usage.")
+        ));
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            messages_before_commands,
+            "known loose commands are neither ask answers nor routed chat text"
+        );
+
+        router
+            .resolve_bare("operator", "operator", "ambiguous answer")
+            .await
+            .unwrap();
+        assert!(matches!(
+            provider.sends.lock().unwrap().last(),
+            Some(OutboundAsk::Notify { text }) if text.starts_with("I found more than one active ask.")
+        ));
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            messages_before_commands,
+            "an ambiguous free-text answer is not routed to the focused thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn replying_to_a_followed_update_routes_with_each_providers_attribution() {
+        for (provider_id, db_name) in [
+            ("imessage", "channel-router-imessage-route-reply.db"),
+            ("telegram", "channel-router-telegram-route-reply.db"),
+        ] {
+            let (orch, db) = route_test_orchestrator(db_name).await;
+            seed_threads_and_an_issue(&db).await;
+            let provider = Arc::new(RecordingPollProvider {
+                sends: Mutex::new(Vec::new()),
+                deliveries: Mutex::new(Vec::new()),
+                next_guid: std::sync::atomic::AtomicUsize::new(1),
+                cleanups: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let router = ChannelRouter::new_for_provider(
+                orch,
+                provider,
+                provider_id,
+                "operator".into(),
+                MessageClassPolicy::default(),
+                ChannelInboundCapabilities {
+                    permissions: true,
+                    answers: true,
+                    free_text: true,
+                },
+            );
+            ledger::insert_intent(
+                &db,
+                &ledger::NewOutbound {
+                    id: "route-update",
+                    channel: provider_id,
+                    kind: "route",
+                    binding_ref: "route:follow:cairn://p/cairn/general:event:42",
+                    conversation: "operator",
+                    job_id: None,
+                    rendered_text: "thread update",
+                    rendering: "text",
+                    created_at: 10,
+                },
+            )
+            .await
+            .unwrap();
+            ledger::mark_sent(&db, "route-update", "route-guid", None, None, 10)
+                .await
+                .unwrap();
+
+            router
+                .resolve_bound("route-guid", "operator", "operator", "channel reply")
+                .await
+                .unwrap();
+
+            for channel_type in ["thread", "direct"] {
+                assert_eq!(
+                    db.query_one(
+                        "SELECT sender_name, content FROM messages WHERE channel_type = ?1 ORDER BY created_at DESC LIMIT 1",
+                        params![channel_type],
+                        |row| Ok((row.text(0)?, row.text(1)?)),
+                    )
+                    .await
+                    .unwrap(),
+                    (
+                        format!("operator via {provider_id}"),
+                        "channel reply".to_string()
+                    ),
+                    "{channel_type} delivery must preserve channel attribution"
+                );
+            }
+        }
     }
 
     /// A project with two first-class threads, a live session for the first, a
@@ -2732,7 +3968,7 @@ mod tests {
         db.execute_batch(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'Workspace', 1, 1);
              INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
                VALUES ('t-general', 'p', 'general', 'active', 1, 9),
                       ('t-perf', 'p', 'performance', 'active', 1, 8),
@@ -2765,6 +4001,7 @@ mod tests {
     fn test_router(orch: Orchestrator) -> (ChannelRouter, Arc<RecordingPollProvider>) {
         let provider = Arc::new(RecordingPollProvider {
             sends: Mutex::new(Vec::new()),
+            deliveries: Mutex::new(Vec::new()),
             next_guid: std::sync::atomic::AtomicUsize::new(1),
             cleanups: std::sync::atomic::AtomicUsize::new(0),
         });
@@ -2780,6 +4017,285 @@ mod tests {
         (router, provider)
     }
 
+    #[tokio::test]
+    async fn capability_rejection_notice_returns_to_the_arriving_discord_conversation() {
+        let (orch, _db) = route_test_orchestrator("channel-router-discord-bounded-notice.db").await;
+        let provider = Arc::new(RecordingPollProvider {
+            sends: Mutex::new(Vec::new()),
+            deliveries: Mutex::new(Vec::new()),
+            next_guid: std::sync::atomic::AtomicUsize::new(1),
+            cleanups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let router = ChannelRouter::new_for_provider(
+            orch,
+            provider.clone(),
+            "discord",
+            "discord-user-snowflake".into(),
+            MessageClassPolicy::default(),
+            ChannelInboundCapabilities {
+                permissions: true,
+                answers: true,
+                free_text: false,
+            },
+        );
+
+        router
+            .handle_inbound(InboundEvent::Bare {
+                conversation: "discord:42/7".into(),
+                sender: "discord-user-snowflake".into(),
+                text: "route this".into(),
+            })
+            .await
+            .unwrap();
+
+        let deliveries = provider.deliveries.lock().unwrap();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(deliveries[0].conversation, "discord:42/7");
+        assert!(matches!(
+            &deliveries[0].ask,
+            OutboundAsk::Notify { text } if text.contains("Free-text messages are disabled")
+        ));
+    }
+
+    #[tokio::test]
+    async fn unbound_discord_bare_and_stale_reply_reject_at_the_arriving_conversation() {
+        let (orch, db) = route_test_orchestrator("channel-router-discord-unbound-inbound.db").await;
+        seed_threads_and_an_issue(&db).await;
+        ledger::follow_target(&db, "discord", "cairn://p/cairn/general", 1, 0)
+            .await
+            .unwrap();
+        ledger::set_focus(&db, "discord", "cairn://p/cairn/general", 2)
+            .await
+            .unwrap();
+        let provider = Arc::new(RecordingPollProvider {
+            sends: Mutex::new(Vec::new()),
+            deliveries: Mutex::new(Vec::new()),
+            next_guid: std::sync::atomic::AtomicUsize::new(1),
+            cleanups: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let router = ChannelRouter::new_for_provider(
+            orch,
+            provider.clone(),
+            "discord",
+            "discord:42/99".into(),
+            MessageClassPolicy::default(),
+            ChannelInboundCapabilities {
+                permissions: true,
+                answers: true,
+                free_text: true,
+            },
+        );
+
+        for event in [
+            InboundEvent::Bare {
+                conversation: "discord:42/7".into(),
+                sender: "operator".into(),
+                text: "loose input".into(),
+            },
+            InboundEvent::Reply {
+                conversation: "discord:42/8".into(),
+                bound_guid: "stale-guid".into(),
+                sender: "operator".into(),
+                text: "stale reply".into(),
+            },
+            InboundEvent::Selection {
+                conversation: "discord:42/9".into(),
+                bound_guid: "stale-component".into(),
+                sender: "operator".into(),
+                option_id: "approve".into(),
+                option_text: "Approve".into(),
+                selected: true,
+            },
+        ] {
+            router.handle_inbound(event).await.unwrap();
+        }
+
+        assert_eq!(
+            db.query_one("SELECT COUNT(*) FROM messages", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            0,
+            "unbound Discord input must not fall through to the legacy global focus"
+        );
+        let deliveries = provider.deliveries.lock().unwrap();
+        assert_eq!(
+            deliveries
+                .iter()
+                .map(|message| message.conversation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["discord:42/7", "discord:42/8", "discord:42/9"]
+        );
+        assert!(deliveries[..2].iter().all(|message| matches!(
+            &message.ask,
+            OutboundAsk::Notify { text } if text.contains("not bound")
+        )));
+        assert!(matches!(
+            &deliveries[2].ask,
+            OutboundAsk::Notify { text } if text.contains("No active ask")
+        ));
+    }
+
+    #[test]
+    fn capabilities_are_independently_admitted() {
+        let capabilities = ChannelInboundCapabilities {
+            permissions: true,
+            answers: false,
+            free_text: true,
+        };
+        assert!(admits_capability(
+            capabilities,
+            InboundCapability::Permissions
+        ));
+        assert!(!admits_capability(capabilities, InboundCapability::Answers));
+        assert!(admits_capability(capabilities, InboundCapability::FreeText));
+    }
+
+    #[test]
+    fn inbound_capabilities_migrate_legacy_forms_and_round_trip_exactly() {
+        for (legacy, expected) in [
+            ("open", (true, true, true)),
+            ("bounded", (true, true, false)),
+            ("outbound_only", (false, false, false)),
+        ] {
+            let config: crate::models::TelegramChannelConfig =
+                serde_json::from_value(serde_json::json!({
+                    "inboundPolicy": legacy
+                }))
+                .unwrap();
+            assert_eq!(
+                (
+                    config.inbound_capabilities.permissions,
+                    config.inbound_capabilities.answers,
+                    config.inbound_capabilities.free_text,
+                ),
+                expected
+            );
+        }
+        let omitted: crate::models::TelegramChannelConfig =
+            serde_json::from_value(serde_json::json!({
+                "enabled": true,
+                "chatId": "1",
+                "allowFrom": ["2"],
+                "route": {}
+            }))
+            .unwrap();
+        assert_eq!(
+            omitted.inbound_capabilities,
+            ChannelInboundCapabilities {
+                permissions: true,
+                answers: true,
+                free_text: true,
+            }
+        );
+        let exact = crate::models::TelegramChannelConfig {
+            inbound_capabilities: ChannelInboundCapabilities {
+                permissions: false,
+                answers: true,
+                free_text: true,
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&exact).unwrap();
+        assert_eq!(
+            json["inboundCapabilities"],
+            serde_json::json!({
+                "permissions": false,
+                "answers": true,
+                "freeText": true
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<crate::models::TelegramChannelConfig>(json).unwrap(),
+            exact
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_drops_an_orphaned_home_relative_focus() {
+        let (orch, db) = route_test_orchestrator("channel-router-relative-focus.db").await;
+        db.execute(
+            "INSERT INTO channel_conversation_binding
+               (provider, conversation, target_uri, binding_kind, message_classes, followed_at, selected_at)
+             VALUES ('imessage', 'imessage:legacy', 'cairn:~/', 'follow', 7, 4, 4)",
+            (),
+        )
+        .await
+        .unwrap();
+        let (router, _provider) = test_router(orch);
+
+        router.draw_the_session_line().await.unwrap();
+
+        assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn startup_drops_a_home_relative_follow_and_its_focus() {
+        let (orch, db) = route_test_orchestrator("channel-router-relative-follow.db").await;
+        db.execute_batch(
+            "INSERT INTO channel_conversation_binding
+               (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid, selected_at)
+             VALUES ('imessage', 'imessage:legacy', 'cairn:~/', 'follow', 7, 4, 30, 4);",
+        )
+        .await
+        .unwrap();
+        let (router, _provider) = test_router(orch);
+
+        router.draw_the_session_line().await.unwrap();
+
+        assert!(ledger::list_follows(&db, CHANNEL).await.unwrap().is_empty());
+        assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_session_relative_poll_binding_persists_its_canonical_thread_uri() {
+        let (orch, db) = route_test_orchestrator("channel-router-relative-binding.db").await;
+        let session = seed_threads_and_an_issue(&db).await;
+        let (router, _provider) = test_router(orch);
+        let options = FollowPollOptions {
+            labels: vec!["general".to_string()],
+            bindings: HashMap::from([("general".to_string(), "cairn:~/".to_string())]),
+        };
+        let record = ledger::OutboundRecord {
+            id: "relative-poll".to_string(),
+            channel: CHANNEL.to_string(),
+            kind: "question".to_string(),
+            binding_ref: format!("{FOLLOW_POLL_PREFIX}relative"),
+            conversation: "+15551234567".to_string(),
+            job_id: Some(session),
+            rendered_text: "Follow threads\n1. general".to_string(),
+            rendering: "poll".to_string(),
+            options_json: Some(serde_json::to_string(&options).unwrap()),
+            status: "sent".to_string(),
+            provider_guid: Some("poll-guid".to_string()),
+            caption_guid: None,
+            created_at: 1,
+            sent_at: Some(1),
+            resolved_at: None,
+            last_error: None,
+        };
+
+        assert_eq!(
+            router
+                .resolve_bound_target(&record, "cairn:~/task/example")
+                .await
+                .unwrap(),
+            "cairn://p/cairn/general/task/example"
+        );
+
+        router
+            .follow_poll_selection(&record, "general", &record.conversation)
+            .await
+            .unwrap();
+
+        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
+        assert_eq!(follows.len(), 1);
+        assert_eq!(follows[0].uri, "cairn://p/cairn/general");
+        assert_eq!(
+            ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
+            Some("cairn://p/cairn/general")
+        );
+    }
+
     /// `threads` offers threads and `issues` offers issues — each labelled and
     /// bound the way its own entity is addressed.
     #[tokio::test]
@@ -2792,10 +4308,10 @@ mod tests {
         assert_eq!(
             threads,
             vec![
-                ("general".to_string(), "cairn://p/CAIRN/general".to_string()),
+                ("general".to_string(), "cairn://p/cairn/general".to_string()),
                 (
                     "performance".to_string(),
-                    "cairn://p/CAIRN/performance".to_string()
+                    "cairn://p/cairn/performance".to_string()
                 ),
             ],
             "a closed thread is not offered, and a thread is offered as its one name"
@@ -2807,7 +4323,7 @@ mod tests {
             issues,
             vec![(
                 "3757 · Resource library slice 1".to_string(),
-                "cairn://p/CAIRN/3757".to_string()
+                "cairn://p/cairn/3757".to_string()
             )]
         );
         assert_eq!(issue_total, 1);
@@ -2849,15 +4365,15 @@ mod tests {
             vec![
                 (
                     "AGG/general".to_string(),
-                    "cairn://p/AGG/general".to_string()
+                    "cairn://p/agg/general".to_string()
                 ),
                 (
-                    "CAIRN/general".to_string(),
-                    "cairn://p/CAIRN/general".to_string()
+                    "cairn/general".to_string(),
+                    "cairn://p/cairn/general".to_string()
                 ),
                 (
-                    "CAIRN/performance".to_string(),
-                    "cairn://p/CAIRN/performance".to_string()
+                    "cairn/performance".to_string(),
+                    "cairn://p/cairn/performance".to_string()
                 ),
             ]
         );
@@ -2884,11 +4400,11 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            ledger::follow_target(&db, CHANNEL, "cairn://p/CAIRN/3404", 5, 40)
+            ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/3404", 5, 40)
                 .await
                 .unwrap()
         );
-        ledger::set_focus(&db, CHANNEL, "cairn://p/CAIRN/3404", 5)
+        ledger::set_focus(&db, CHANNEL, "cairn://p/cairn/3404", 5)
             .await
             .unwrap();
         let (router, _provider) = test_router(orch);
@@ -2898,13 +4414,13 @@ mod tests {
         let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
         assert_eq!(
             follows.iter().map(|f| f.uri.as_str()).collect::<Vec<_>>(),
-            vec!["cairn://p/CAIRN/general"],
+            vec!["cairn://p/cairn/general"],
             "one target keeps one identity"
         );
         assert_eq!(follows[0].followed_at, 5, "the follow is as old as it was");
         assert_eq!(
             ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/CAIRN/general"),
+            Some("cairn://p/cairn/general"),
             "bare text still routes to the thread the operator last chose"
         );
 
@@ -2924,25 +4440,25 @@ mod tests {
     #[tokio::test]
     async fn canonicalizing_onto_an_existing_row_keeps_the_further_cursor() {
         let db = migrated_test_db("channel-ledger-canonicalize-merge.db").await;
-        ledger::follow_target(&db, CHANNEL, "cairn://p/CAIRN/3404", 5, 90)
+        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/3404", 5, 90)
             .await
             .unwrap();
-        ledger::follow_target(&db, CHANNEL, "cairn://p/CAIRN/general", 9, 40)
+        ledger::follow_target(&db, CHANNEL, "cairn://p/cairn/general", 9, 40)
             .await
             .unwrap();
 
         ledger::canonicalize_follow(
             &db,
             CHANNEL,
-            "cairn://p/CAIRN/3404",
-            "cairn://p/CAIRN/general",
+            "cairn://p/cairn/3404",
+            "cairn://p/cairn/general",
         )
         .await
         .unwrap();
 
         let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
         assert_eq!(follows.len(), 1);
-        assert_eq!(follows[0].uri, "cairn://p/CAIRN/general");
+        assert_eq!(follows[0].uri, "cairn://p/cairn/general");
         assert_eq!(
             follows[0].cursor_rowid, 90,
             "nothing already sent is resent"
@@ -2966,7 +4482,7 @@ mod tests {
             ));
         }
         db.execute_batch(&busier).await.unwrap();
-        let followed = HashSet::from(["cairn://p/CAIRN/performance".to_string()]);
+        let followed = HashSet::from(["cairn://p/cairn/performance".to_string()]);
         let (router, _provider) = test_router(orch);
 
         let (targets, total) = router.active_threads(&followed).await.unwrap();
@@ -2977,11 +4493,11 @@ mod tests {
             targets[0],
             (
                 "performance".to_string(),
-                "cairn://p/CAIRN/performance".to_string()
+                "cairn://p/cairn/performance".to_string()
             ),
             "the followed thread leads, then the most recently active"
         );
-        assert_eq!(targets[1].1, "cairn://p/CAIRN/busy-9");
+        assert_eq!(targets[1].1, "cairn://p/cairn/busy-9");
     }
 
     /// Following a thread has to resolve through the thread's SESSION job. Its
@@ -2995,13 +4511,13 @@ mod tests {
         let (router, _provider) = test_router(orch);
 
         let target = router
-            .resolve_target("cairn://p/CAIRN/general")
+            .resolve_target("cairn://p/cairn/general")
             .await
             .unwrap();
         assert_eq!(
             target,
             FollowTarget::Thread {
-                project: "CAIRN".into(),
+                project: "cairn".into(),
                 name: "general".into()
             }
         );
@@ -3021,15 +4537,15 @@ mod tests {
                 .iter()
                 .map(|event| (event.rowid, event.context.clone()))
                 .collect::<Vec<_>>(),
-            vec![(session_rowid, "CAIRN/general".to_string())]
+            vec![(session_rowid, "cairn/general".to_string())]
         );
         assert!(assistant_text(&events[0].data).as_deref() == Some("the thread speaking"));
 
         // A fresh follow starts at the live edge, so nothing already said is
         // replayed onto the phone.
-        router.follow("cairn://p/CAIRN/general").await.unwrap();
+        router.follow("cairn://p/cairn/general").await.unwrap();
         let follow = ledger::list_follows(&db, CHANNEL).await.unwrap();
-        assert_eq!(follow[0].uri, "cairn://p/CAIRN/general");
+        assert_eq!(follow[0].uri, "cairn://p/cairn/general");
         assert_eq!(follow[0].cursor_rowid, session_rowid);
         assert!(router
             .followed_events(&target, follow[0].cursor_rowid)
@@ -3038,7 +4554,7 @@ mod tests {
             .is_empty());
         assert_eq!(
             ledger::get_focus(&db, CHANNEL).await.unwrap().as_deref(),
-            Some("cairn://p/CAIRN/general"),
+            Some("cairn://p/cairn/general"),
             "the newest selection is what bare text routes to"
         );
     }
@@ -3071,7 +4587,7 @@ mod tests {
         let (router, _provider) = test_router(orch);
 
         let warm = router
-            .resolve_target("cairn://p/CAIRN/general")
+            .resolve_target("cairn://p/cairn/general")
             .await
             .unwrap();
         router.route_to_target(&warm, "ship it").await.unwrap();
@@ -3083,7 +4599,11 @@ mod tests {
             )
             .await
             .unwrap(),
-            ("t-general".to_string(), "operator".to_string(), "ship it".to_string())
+            (
+                "t-general".to_string(),
+                "operator via imessage".to_string(),
+                "ship it".to_string()
+            )
         );
         assert_eq!(
             db.query_opt_text(
@@ -3112,7 +4632,7 @@ mod tests {
         );
 
         let dormant = router
-            .resolve_target("cairn://p/CAIRN/performance")
+            .resolve_target("cairn://p/cairn/performance")
             .await
             .unwrap();
         router
@@ -3134,7 +4654,7 @@ mod tests {
         );
 
         let missing = FollowTarget::Thread {
-            project: "CAIRN".into(),
+            project: "cairn".into(),
             name: "no-such-thread".into(),
         };
         assert!(router
@@ -3160,16 +4680,16 @@ mod tests {
         let (router, _provider) = test_router(orch);
 
         assert_eq!(
-            router.resolve_target("cairn://p/CAIRN/3404").await.unwrap(),
+            router.resolve_target("cairn://p/cairn/3404").await.unwrap(),
             FollowTarget::Thread {
-                project: "CAIRN".into(),
+                project: "cairn".into(),
                 name: "general".into()
             }
         );
         assert_eq!(
-            router.resolve_target("cairn://p/CAIRN/3757").await.unwrap(),
+            router.resolve_target("cairn://p/cairn/3757").await.unwrap(),
             FollowTarget::Issue {
-                project: "CAIRN".into(),
+                project: "cairn".into(),
                 number: 3757
             }
         );
@@ -3222,6 +4742,7 @@ mod tests {
                 source: "attention".into(),
                 identity: identity.into(),
                 fields: std::collections::BTreeMap::new(),
+                origin: None,
                 summary: Some("Went idle with work remaining".into()),
                 route_provenance: None,
             },
@@ -3232,12 +4753,13 @@ mod tests {
             context: "[Cairn]".into(),
             job_id: None,
             initiated_by: None,
+            destination: None,
         }
     }
 
     async fn route_test_orchestrator(name: &str) -> (Orchestrator, Arc<LocalDb>) {
         use crate::db::DbState;
-        use crate::services::testing::TestServicesBuilder;
+        use crate::services::testing::{RecordingProcessSpawner, TestServicesBuilder};
         use crate::storage::SearchIndex;
 
         let temp = tempfile::tempdir().unwrap().keep();
@@ -3246,7 +4768,11 @@ mod tests {
         (
             Orchestrator::builder(
                 Arc::new(DbState::new(db.clone(), search)),
-                Arc::new(TestServicesBuilder::new().build()),
+                Arc::new(
+                    TestServicesBuilder::new()
+                        .with_process(RecordingProcessSpawner::new().clone())
+                        .build(),
+                ),
                 temp.join("config"),
             )
             .build(),
@@ -3275,7 +4801,7 @@ mod tests {
         for _ in 0..24 {
             router
                 .submit_route(
-                    route_submission("cairn://p/CAIRN/3727:review_ready"),
+                    route_submission("cairn://p/cairn/3727:review_ready"),
                     OperatorPresence::Away,
                     Instant::now(),
                 )
@@ -3291,6 +4817,43 @@ mod tests {
             Some(1),
             "one stable fact owns one durable intent across every poll"
         );
+    }
+
+    #[tokio::test]
+    async fn directed_route_uses_addressed_conversation_in_provider_and_ledger() {
+        let (orch, db) = route_test_orchestrator("route-directed-conversation.db").await;
+        let provider = Arc::new(PresentProvider {
+            sends: Mutex::new(Vec::new()),
+            presence_checks: Mutex::new(0),
+            presence: Mutex::new(OperatorPresence::Away),
+        });
+        let router = ChannelRouter::new(
+            orch,
+            provider.clone(),
+            IMessageChannelConfig {
+                enabled: true,
+                to: "default@example.com".into(),
+                ..Default::default()
+            },
+        );
+        let mut submission = route_submission("directed");
+        submission.destination = Some("imessage:TARGET@example.com".parse().unwrap());
+        router
+            .submit_route(submission, OperatorPresence::Away, Instant::now())
+            .await
+            .unwrap();
+
+        {
+            let sends = provider.sends.lock().unwrap();
+            assert_eq!(sends.len(), 1);
+            assert_eq!(sends[0].conversation, "target@example.com");
+        }
+        let outbound = ledger::get_by_binding(&db, CHANNEL, "route", "route:route-test:directed")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(outbound.conversation, "target@example.com");
+        assert_eq!(outbound.status, "sent");
     }
 
     #[tokio::test]
@@ -3674,7 +5237,9 @@ mod tests {
                     .await
                     .unwrap();
                 if won {
-                    cleanup_claimed_question(&provider, &record, "✓ answered: Ship it").await;
+                    cleanup_claimed_question(&provider, &record, "✓ answered: Ship it")
+                        .await
+                        .unwrap();
                     true
                 } else {
                     ledger::record_answer_after_cleanup_claim(&db, &record.id, "Ship it")
@@ -3705,12 +5270,161 @@ mod tests {
     }
 
     #[test]
-    fn permission_words_are_strict() {
+    fn directed_route_addresses_resolve_to_provider_native_conversations() {
+        let imessage: crate::channels::ConversationAddress =
+            "imessage:USER@example.com".parse().unwrap();
+        let telegram: crate::channels::ConversationAddress = "telegram:-123".parse().unwrap();
+        let discord: crate::channels::ConversationAddress = "discord:1/2".parse().unwrap();
         assert_eq!(
-            parse_permission("Approve").unwrap(),
-            PermissionDecision::Allow
+            route_conversation(Some(&imessage)).as_deref(),
+            Some("user@example.com")
         );
-        assert_eq!(parse_permission("2").unwrap(), PermissionDecision::Deny);
+        assert_eq!(route_conversation(Some(&telegram)).as_deref(), Some("-123"));
+        assert_eq!(route_conversation(Some(&discord)).as_deref(), Some("2"));
+        assert_eq!(route_conversation(None), None);
+    }
+
+    #[tokio::test]
+    async fn non_channel_permission_winner_recovers_after_an_independent_lease() {
+        let db = migrated_test_db("channel-router-non-channel-permission-recovery.db").await;
+        let claim = ledger::claim_ask_resolution(
+            &db,
+            "permission-recovery",
+            "Deny",
+            cairn_common::identity::AppearanceTransport::ResourcePatch,
+            None,
+            None,
+            Some("cairn://p/cairn/4008/1/builder"),
+            "permission",
+            "permission-recovery",
+            10,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(claim, ledger::AskClaim::Won(_)));
+
+        let first = ledger::try_lease_ask_action(&db, "permission-recovery", 11, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger::try_lease_ask_action(&db, "permission-recovery", 11, 1)
+                .await
+                .unwrap()
+                .is_none(),
+            "an active worker owns the first lease"
+        );
+        let second = ledger::try_lease_ask_action(&db, "permission-recovery", 13, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.token, second.token);
+
+        let winner = ledger::resolution_for_action(&db, "permission-recovery")
+            .await
+            .unwrap()
+            .unwrap();
+        let answer = crate::mcp::handlers::permission::recovered_permission_answer(
+            PermissionDecision::Deny,
+            &winner,
+        )
+        .unwrap();
+        let (_, transport, surface, actor) = answer.resolution_provenance().unwrap();
+        assert_eq!(
+            transport,
+            cairn_common::identity::AppearanceTransport::ResourcePatch
+        );
+        assert_eq!(surface, "resource_patch");
+        assert_eq!(actor.as_deref(), Some("cairn://p/cairn/4008/1/builder"));
+        assert_eq!(answer.channel_provenance(), (None, None));
+    }
+
+    #[test]
+    fn permission_body_prefers_human_fields_and_keeps_the_link_separate() {
+        assert_eq!(
+            permission_ask_body(
+                "Bash",
+                r#"{"summary":"command blocked by the sandbox","descriptor":"git checkout main","command":"ignored"}"#,
+                Some("cairn://p/cairn/4080/1/builder/permissions/ask")
+            ),
+            "command blocked by the sandbox\n\ngit checkout main\n\ncairn://p/cairn/4080/1/builder/permissions/ask"
+        );
+    }
+
+    #[test]
+    fn permission_body_falls_back_to_raw_input_without_human_fields() {
+        assert_eq!(
+            permission_ask_body("Bash", r#"{"command":"git status"}"#, None),
+            "Allow Bash?\n\n{\"command\":\"git status\"}"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_poll_vote_and_numbered_reply_resolve_once_with_channel_provenance() {
+        let (orch, db) = route_test_orchestrator("channel-permission-poll-race.db").await;
+        let (router, _) = test_router(orch);
+        let intent = ledger::NewOutbound {
+            id: "permission-intent",
+            channel: CHANNEL,
+            kind: "permission",
+            binding_ref: "permission-request",
+            conversation: "imessage:+15551234567",
+            job_id: None,
+            rendered_text: "Allow this command?",
+            rendering: "poll",
+            created_at: 10,
+        };
+        assert!(ledger::insert_intent(&db, &intent).await.unwrap());
+        assert!(
+            ledger::mark_sent(&db, intent.id, "permission-poll", None, None, 11)
+                .await
+                .unwrap()
+        );
+
+        let _ = tokio::join!(
+            router.handle_inbound(InboundEvent::Selection {
+                conversation: "imessage:+15551234567".into(),
+                bound_guid: "permission-poll".into(),
+                sender: "+15551234567".into(),
+                option_id: "approve-option".into(),
+                option_text: "Approve".into(),
+                selected: true,
+            }),
+            router.handle_inbound(InboundEvent::Reply {
+                conversation: "imessage:+15551234567".into(),
+                bound_guid: "permission-poll".into(),
+                sender: "+15551234567".into(),
+                text: "2".into(),
+            })
+        );
+
+        assert_eq!(db.query_one("SELECT COUNT(*) FROM channel_ask_resolution WHERE binding_ref = 'permission-request'", (), |row| row.i64(0)).await.unwrap(), 1);
+        let winner = ledger::resolution_for_action(&db, "permission-request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(winner.answer.as_str(), "allow" | "deny"));
+        assert_eq!(winner.winner_surface, "channel_reply");
+        assert_eq!(winner.winner_provider, "imessage");
+        assert_eq!(winner.winner_conversation, "imessage:+15551234567");
+        assert_eq!(winner.winner_actor, "+15551234567");
+        assert!(db.query_one("SELECT resolved_at FROM channel_ask_resolution WHERE binding_ref = 'permission-request'", (), |row| row.i64(0)).await.unwrap() > 0);
+    }
+
+    #[test]
+    fn permission_words_are_strict() {
+        for spelling in ["1", "yes", "y", "approve", "allow", "Approve"] {
+            assert_eq!(
+                permission_answer_token(parse_permission(spelling).unwrap()),
+                "allow"
+            );
+        }
+        for spelling in ["2", "no", "n", "deny", "denied", "Deny"] {
+            assert_eq!(
+                permission_answer_token(parse_permission(spelling).unwrap()),
+                "deny"
+            );
+        }
         assert!(parse_permission("maybe").is_err());
     }
 
@@ -3755,6 +5469,8 @@ mod tests {
             AttentionTiming::Send
         );
         let review = Gate {
+            conversation: None,
+            target_uri: None,
             kind: "review",
             initiated_by: OutboundInitiator::CairnPush,
             binding_ref: "review".into(),
@@ -3767,6 +5483,7 @@ mod tests {
         assert!(review.is_presence_aware());
 
         let response = Gate {
+            conversation: None,
             initiated_by: OutboundInitiator::OperatorInbound,
             ..review
         };
@@ -3779,9 +5496,11 @@ mod tests {
     #[test]
     fn followed_thread_stream_is_a_presence_aware_subscription_push() {
         let subscription = Gate {
+            conversation: None,
+            target_uri: None,
             kind: "review",
             initiated_by: OutboundInitiator::OperatorSubscription,
-            binding_ref: "cairn://p/CAIRN/1: event:1".into(),
+            binding_ref: "cairn://p/cairn/1: event:1".into(),
             job_id: None,
             context: String::new(),
             ask: OutboundAsk::Notify {
@@ -3804,6 +5523,8 @@ mod tests {
     #[test]
     fn one_failed_database_cannot_cancel_a_healthy_deferred_question() {
         let gate = Gate {
+            conversation: None,
+            target_uri: None,
             kind: "question",
             initiated_by: OutboundInitiator::CairnPush,
             binding_ref: "healthy:0".into(),
@@ -3836,15 +5557,15 @@ mod tests {
 
     #[test]
     fn review_notice_leads_with_issue_title_and_event_without_boilerplate() {
-        let content_ref = "cairn://p/CAIRN/3445/1/builder/artifact";
+        let content_ref = "cairn://p/cairn/3445/1/builder/artifact";
         assert_eq!(
             review_notice(
-                "CAIRN",
+                "cairn",
                 3445,
                 "Reap nested Linux process groups when checks stop",
                 content_ref,
             ),
-            "CAIRN-3445 review ready — Reap nested Linux process groups when checks stop\ncairn://p/CAIRN/3445/1/builder/artifact"
+            "cairn/3445 review ready — Reap nested Linux process groups when checks stop\ncairn://p/cairn/3445/1/builder/artifact"
         );
     }
 }

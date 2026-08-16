@@ -45,6 +45,62 @@ impl SecretId {
     }
 }
 
+/// Encode the contents of one JSON string under bounded serializer-wide modes.
+/// Quotes are deliberately omitted because the secret can be a substring of a
+/// larger JSON string value.
+#[derive(Clone, Copy)]
+enum JsonUnicodeMode {
+    Literal,
+    AsciiOnly,
+    /// Go's `encoding/json` default: escape HTML-sensitive characters and the
+    /// two Unicode line separators that are hazardous in JavaScript contexts.
+    HtmlSafe,
+}
+
+fn json_string_contents(
+    value: &str,
+    unicode_mode: JsonUnicodeMode,
+    upper_hex: bool,
+    escape_solidus: bool,
+) -> Vec<u8> {
+    let digits = if upper_hex {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let mut out = Vec::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.extend_from_slice(br#"\""#),
+            '\\' => out.extend_from_slice(br"\\"),
+            '/' if escape_solidus => out.extend_from_slice(br"\/"),
+            '\u{08}' => out.extend_from_slice(br"\b"),
+            '\u{0c}' => out.extend_from_slice(br"\f"),
+            '\n' => out.extend_from_slice(br"\n"),
+            '\r' => out.extend_from_slice(br"\r"),
+            '\t' => out.extend_from_slice(br"\t"),
+            ch if ch <= '\u{1f}'
+                || matches!(unicode_mode, JsonUnicodeMode::AsciiOnly) && !ch.is_ascii()
+                || matches!(unicode_mode, JsonUnicodeMode::HtmlSafe)
+                    && matches!(ch, '<' | '>' | '&' | '\u{2028}' | '\u{2029}') =>
+            {
+                let mut units = [0u16; 2];
+                for unit in ch.encode_utf16(&mut units) {
+                    out.extend_from_slice(br"\u");
+                    for shift in [12, 8, 4, 0] {
+                        out.push(digits[((*unit >> shift) & 0x0f) as usize]);
+                    }
+                }
+            }
+            _ => {
+                let mut bytes = [0u8; 4];
+                out.extend_from_slice(ch.encode_utf8(&mut bytes).as_bytes());
+            }
+        }
+    }
+    out
+}
+
 impl fmt::Display for SecretId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -151,6 +207,10 @@ pub enum MatchRule {
     ExactBase64Url,
     /// URL-safe base64 of the raw bytes, unpadded.
     ExactBase64UrlNoPad,
+    /// The credential encoded as the contents of one JSON string, without the
+    /// surrounding quotes. The bounded variants cover serializer-wide choices
+    /// for Unicode, hex case, and solidus escaping.
+    ExactJsonString,
     /// A structural heuristic (sensitive field name, bearer/JWT/assignment
     /// shape, URL userinfo). Never used to reject an invocation.
     Structural,
@@ -237,6 +297,26 @@ impl SecretMaterial {
         };
 
         push(MatchRule::ExactRaw, self.bytes.to_vec());
+        if let Ok(value) = std::str::from_utf8(&self.bytes) {
+            // JSON permits several spellings for the same string. Register the
+            // finite product of serializer-wide modes rather than decoding
+            // arbitrary observed output: literal/ASCII-only Unicode,
+            // lower/upper hex, and literal/escaped solidus.
+            for unicode_mode in [
+                JsonUnicodeMode::Literal,
+                JsonUnicodeMode::AsciiOnly,
+                JsonUnicodeMode::HtmlSafe,
+            ] {
+                for upper_hex in [false, true] {
+                    for escape_solidus in [false, true] {
+                        push(
+                            MatchRule::ExactJsonString,
+                            json_string_contents(value, unicode_mode, upper_hex, escape_solidus),
+                        );
+                    }
+                }
+            }
+        }
         push(
             MatchRule::ExactPercentUpper,
             percent_encode(&self.bytes, true),
@@ -376,6 +456,39 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), total, "forms must be distinct");
+    }
+
+    #[test]
+    fn derived_forms_include_bounded_json_string_spellings() {
+        let value = "SYNTH-é-😀/Q7\"m2Zx9\\line\n\t\u{0001}-RedTeam";
+        let forms = SecretMaterial::from_string(value.to_string())
+            .derived_forms()
+            .into_vec();
+        let json_forms: Vec<&[u8]> = forms
+            .iter()
+            .filter(|(rule, _)| *rule == MatchRule::ExactJsonString)
+            .map(|(_, form)| form.as_slice())
+            .collect();
+
+        // Independently authored spellings: Python-style ASCII JSON, uppercase
+        // hex with surrogate pairs and escaped solidus, and literal UTF-8.
+        for expected in [
+            br#"SYNTH-\u00e9-\ud83d\ude00/Q7\"m2Zx9\\line\n\t\u0001-RedTeam"#.as_slice(),
+            br#"SYNTH-\u00E9-\uD83D\uDE00\/Q7\"m2Zx9\\line\n\t\u0001-RedTeam"#.as_slice(),
+            "SYNTH-é-😀/Q7\\\"m2Zx9\\\\line\\n\\t\\u0001-RedTeam".as_bytes(),
+        ] {
+            assert!(json_forms.contains(&expected), "missing JSON form");
+        }
+
+        let go_value = "SYNTH-é-<>&\u{2028}\u{2029}-Q7m2Zx9-RedTeam";
+        let go_forms = SecretMaterial::from_string(go_value.to_string())
+            .derived_forms()
+            .into_vec();
+        assert!(go_forms.iter().any(|(rule, form)| {
+            *rule == MatchRule::ExactJsonString
+                && form.as_slice()
+                    == "SYNTH-é-\\u003c\\u003e\\u0026\\u2028\\u2029-Q7m2Zx9-RedTeam".as_bytes()
+        }));
     }
 
     /// Compile-time proof that no formatting or serialization API can reveal

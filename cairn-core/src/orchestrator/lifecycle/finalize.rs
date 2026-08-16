@@ -517,15 +517,21 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
 }
 
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
-    finalize_run_inner(orch, run_id, status, true);
+    if let Err(error) = finalize_run_inner(orch, run_id, status, true) {
+        log::error!("Failed to finalize run {run_id}: {error}");
+    }
 }
 
 /// Finalize a crashed turn that already has an automatic successor planned.
 /// The old turn is still interrupted and the run terminalized, but publishing a
 /// failed-agent attention between those two turns would turn recovery into a
 /// false operator alarm.
-pub(crate) fn finalize_run_for_recovery(orch: &Orchestrator, run_id: &str, status: RunStatus) {
-    finalize_run_inner(orch, run_id, status, false);
+pub(crate) fn finalize_run_for_recovery(
+    orch: &Orchestrator,
+    run_id: &str,
+    status: RunStatus,
+) -> Result<(), String> {
+    finalize_run_inner(orch, run_id, status, false)
 }
 
 /// Restore the failure signal when successor launch fails after recovery-aware
@@ -548,7 +554,8 @@ fn finalize_run_inner(
     run_id: &str,
     status: RunStatus,
     emit_terminal_failure_attention: bool,
-) {
+) -> Result<(), String> {
+    let mut first_error = None;
     // Clean up system prompt temp file
     crate::orchestrator::session::cleanup_prompt_file(run_id);
 
@@ -562,7 +569,17 @@ fn finalize_run_inner(
     let had_active_turn = turn_id.is_some();
     if let Some(ref turn_id) = turn_id {
         if let Some(turn_state) = turn_state(orch, turn_id) {
-            let result = if status == RunStatus::Exited {
+            // A terminal turn is authoritative even when its owning process exits
+            // later. Terminal tools complete the turn before the retained provider
+            // process reaches EOF, and watchdog recovery can race that handoff.
+            // Finalization still owns the run/session/job cleanup below, but must
+            // never rewrite an already-settled turn to match the later process exit.
+            let result = if matches!(
+                turn_state.as_str(),
+                "complete" | "failed" | "cancelled" | "interrupted" | "yielded"
+            ) {
+                Ok(())
+            } else if status == RunStatus::Exited {
                 // Clean exit: a Running turn completed; a turn that never reached
                 // Running (Pending) produced nothing, so fail it rather than
                 // leaving it live (which would keep the job derived as Running).
@@ -584,6 +601,7 @@ fn finalize_run_inner(
                     run_id,
                     e
                 );
+                first_error.get_or_insert(e);
             }
         }
     }
@@ -612,11 +630,12 @@ fn finalize_run_inner(
         // re-entry; still flush any direct queued against it so a parent that
         // finalized that way isn't left unaware of a stuck child (CAIRN-1297).
         crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
-        return;
+        return first_error.map_or(Ok(()), Err);
     }
 
     if let Err(e) = transition_run(orch, run_id, status.clone()) {
         log::error!("Failed to transition run {}: {}", run_id, e);
+        first_error.get_or_insert(e);
     }
 
     // Release this run's call-admission slot (if it held one) and start the next
@@ -735,6 +754,7 @@ fn finalize_run_inner(
     if let Some(plan) = reseed_fallback {
         spawn_digest_reseed_fallback(orch, plan);
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// A crashed run whose native resume handle the backend could not resolve, and
@@ -1144,7 +1164,7 @@ mod ordering_tests {
             .expect("recompute_job call present");
         assert!(
             spawn < recompute,
-            "{func_signature}: spawn_turn_end_checks must precede recompute_job (CAIRN-2483)"
+            "{func_signature}: spawn_turn_end_checks must precede recompute_job (cairn-2483)"
         );
     }
 
@@ -1174,7 +1194,7 @@ mod ordering_tests {
             .expect("spawn_checks_settled_edge call present");
         assert!(
             spawn < settled,
-            "{func_signature}: spawn_checks_settled_edge must follow spawn_turn_end_checks (CAIRN-3437)"
+            "{func_signature}: spawn_checks_settled_edge must follow spawn_turn_end_checks (cairn-3437)"
         );
     }
 
@@ -1203,7 +1223,7 @@ mod ordering_tests {
             .expect("spawn_digest_reseed_fallback call present");
         assert!(
             recompute < fallback,
-            "finalize_run: the reseed fallback must be spawned after recompute_job (CAIRN-3104)"
+            "finalize_run: the reseed fallback must be spawned after recompute_job (cairn-3104)"
         );
     }
 }

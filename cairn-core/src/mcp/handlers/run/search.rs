@@ -1229,7 +1229,7 @@ mod tests {
 
         // Absolute into a materialized checkout: no coordinate vouches for it.
         assert!(
-            classify("/cairn-home/build-slots/CAIRN/slot-3/src").is_none(),
+            classify("/cairn-home/build-slots/cairn/slot-3/src").is_none(),
             "a materialized checkout must execute for real, never be served as host bytes"
         );
         // The operation store is a copy too when it is distinct from the repo.

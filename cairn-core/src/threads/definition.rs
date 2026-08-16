@@ -87,7 +87,7 @@ mod tests {
     #[test]
     fn rejects_terminal_status_subsets_that_wake_rows_cannot_preserve() {
         let error = resolve_thread_definition(Some(
-            r#"{"agent":"thread","artifacts":["arc"],"triggers":[{"fact":"attention","detailUri":"cairn://p/CAIRN/1","status":"merged"}]}"#,
+            r#"{"agent":"thread","artifacts":["arc"],"triggers":[{"fact":"attention","detailUri":"cairn://p/cairn/1","status":"merged"}]}"#,
         ))
         .unwrap_err();
         assert!(error.contains("all terminal statuses"), "{error}");

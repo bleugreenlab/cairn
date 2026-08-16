@@ -23,7 +23,7 @@ use cairn_core::models::{
 use cairn_db::turso::params;
 use tempfile::TempDir;
 
-const CHILD_URI: &str = "cairn://p/COORD/2";
+const CHILD_URI: &str = "cairn://p/coord/2";
 
 fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> (Orchestrator, RecordingProcessSpawner) {
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
@@ -81,7 +81,7 @@ async fn seed_coordinator(db: &LocalDb, root: &std::path::Path) {
     db.execute_script(&format!(
         "
         INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-          VALUES('project','default','Coordinator','COORD','{root}',1,1);
+          VALUES('project','default','Coordinator','coord','{root}',1,1);
         INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
           VALUES('parent','project',1,'Parent','active','active','none',1,1);
         INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)

@@ -33,6 +33,7 @@ fn settings_path(temp: &TempDir) -> std::path::PathBuf {
 /// minimal filler.
 fn agent_snapshot(sandbox: LegacySandbox, on_escape: LegacyOnEscape) -> AgentSnapshot {
     AgentSnapshot {
+        edited_at: None,
         id: "agent-1".to_string(),
         name: "Builder".to_string(),
         description: String::new(),
@@ -143,7 +144,7 @@ fn create_request() -> McpCallbackRequest {
 async fn workspace_mcp_create_denied_by_fence_changes_nothing() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "MRF").await;
+    let project_id = common::create_project(&db, "mrf").await;
     seed_run(
         &db,
         &project_id,
@@ -179,7 +180,7 @@ async fn workspace_mcp_create_denied_by_fence_changes_nothing() {
 async fn workspace_mcp_create_allowed_by_fence_still_awaits_authority() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "MRF").await;
+    let project_id = common::create_project(&db, "mrf").await;
     seed_run(
         &db,
         &project_id,

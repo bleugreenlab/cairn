@@ -6,7 +6,7 @@
 //!   - re-allow writes under the worktree, temp dirs, granted crossings, /dev,
 //!   - deny reads of the sensitive denylist.
 
-use super::SandboxPolicy;
+use super::{NestedSandboxWriteProbe, SandboxPolicy};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -30,6 +30,43 @@ pub(crate) fn current_process_is_confined() -> bool {
             .stderr(Stdio::null())
             .status()
             .map_or(true, |status| !status.success())
+    })
+}
+
+pub(crate) fn probe_nested_sandbox_write() -> NestedSandboxWriteProbe {
+    let outcome = tempfile::tempdir().map(|dir| {
+        let root = dir.path().canonicalize().unwrap_or_else(|_| dir.path().into());
+        let probe = root.join("probe");
+        let profile = format!(
+            "(version 1)(allow default)(deny file-write* (subpath \"/\"))(allow file-write* (subpath \"{}\"))",
+            root.display()
+        );
+        let ran = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/sh", "-c", "echo ok > probe"])
+            .current_dir(&root)
+            .output();
+        match ran {
+            Ok(output) if output.status.success() && probe.exists() => NestedSandboxWriteProbe {
+                available: true,
+                detail: "an in-bounds temp write succeeded under a nested Seatbelt profile".into(),
+            },
+            Ok(output) => NestedSandboxWriteProbe {
+                available: false,
+                detail: format!(
+                    "nested Seatbelt in-bounds temp write refused (exit {:?}): {}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr).lines().next().unwrap_or("no stderr")
+                ),
+            },
+            Err(error) => NestedSandboxWriteProbe {
+                available: false,
+                detail: format!("could not launch nested Seatbelt probe: {error}"),
+            },
+        }
+    });
+    outcome.unwrap_or_else(|error| NestedSandboxWriteProbe {
+        available: false,
+        detail: format!("could not create nested Seatbelt probe directory: {error}"),
     })
 }
 use std::time::SystemTime;
@@ -635,6 +672,22 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn nested_write_probe_is_authoritative_when_allow_default_false_negatives() {
+        let allow_default_claims_unconfined = !current_process_is_confined();
+        let measured = probe_nested_sandbox_write();
+        if allow_default_claims_unconfined && !measured.available {
+            assert!(
+                measured.detail.contains("refused") || measured.detail.contains("could not"),
+                "the measured refusal must retain actionable provenance: {}",
+                measured.detail
+            );
+        }
+        // Capability classification is the behavioral result in every state;
+        // the allow-default probe is intentionally not consulted.
+        assert_eq!(measured.available, probe_nested_sandbox_write().available);
     }
 
     #[test]

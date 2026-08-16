@@ -173,16 +173,16 @@ async fn create_skill_rejects_duplicate_and_missing_fields() {
 
 #[tokio::test]
 async fn explicit_project_mutation_does_not_bleed_into_workspace() {
-    let (temp, _db, orch, _repo) = project_resource_fixture("PROJ").await;
+    let (temp, _db, orch, _repo) = project_resource_fixture("proj").await;
     let cfg = config_dir(&temp);
 
     // A skill that exists ONLY at workspace scope.
     write_workspace_skill(&cfg, "shared", "Workspace shared skill", "Body.");
 
     // Reading it through an explicit project URI must not surface the workspace skill.
-    let read_proj = read(&orch, "cairn://p/PROJ/skills/shared").await;
+    let read_proj = read(&orch, "cairn://p/proj/skills/shared").await;
     assert!(
-        read_proj.contains("Skill not found in project PROJ"),
+        read_proj.contains("Skill not found in project proj"),
         "read_proj: {read_proj}"
     );
 
@@ -190,14 +190,14 @@ async fn explicit_project_mutation_does_not_bleed_into_workspace() {
     let patched = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/skills/shared",
+            "target": "cairn://p/proj/skills/shared",
             "mode": "patch",
             "payload": { "description": "hijacked" }
         }]),
     )
     .await;
     assert!(
-        patched.contains("Skill not found in project PROJ"),
+        patched.contains("Skill not found in project proj"),
         "patched: {patched}"
     );
     let body = std::fs::read_to_string(cfg.join("skills/shared/SKILL.md")).unwrap();
@@ -210,13 +210,13 @@ async fn explicit_project_mutation_does_not_bleed_into_workspace() {
     let deleted = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/skills/shared",
+            "target": "cairn://p/proj/skills/shared",
             "mode": "delete"
         }]),
     )
     .await;
     assert!(
-        deleted.contains("Skill not found in project PROJ"),
+        deleted.contains("Skill not found in project proj"),
         "deleted: {deleted}"
     );
     assert!(
@@ -227,7 +227,7 @@ async fn explicit_project_mutation_does_not_bleed_into_workspace() {
 
 #[tokio::test]
 async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
-    let (_temp, _db, orch, repo) = project_resource_fixture("PROJ").await;
+    let (_temp, _db, orch, repo) = project_resource_fixture("proj").await;
 
     let skill_md = repo.join(".cairn/skills/builder-helper/SKILL.md");
 
@@ -235,7 +235,7 @@ async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
     let created = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/skills",
+            "target": "cairn://p/proj/skills",
             "mode": "create",
             "payload": {
                 "name": "builder-helper",
@@ -250,17 +250,17 @@ async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
 
     // Read it back via the explicit project URI; the body is served inline and
     // package links must be project-scoped (no SKILL.md sub-resource).
-    let root = read(&orch, "cairn://p/PROJ/skills/builder-helper").await;
+    let root = read(&orch, "cairn://p/proj/skills/builder-helper").await;
     assert!(root.contains("Project helper"), "root: {root}");
     assert!(root.contains("Original."), "root body: {root}");
-    assert!(!root.contains("cairn://p/PROJ/skills/builder-helper/SKILL.md"));
+    assert!(!root.contains("cairn://p/proj/skills/builder-helper/SKILL.md"));
     assert!(root.contains("[project]"));
 
     // Patch a section.
     let patched = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/skills/builder-helper",
+            "target": "cairn://p/proj/skills/builder-helper",
             "mode": "patch",
             "payload": { "replaceSection": { "heading": "## Body", "content": "Updated." } }
         }]),
@@ -277,7 +277,7 @@ async fn project_scoped_skill_create_read_patch_delete_roundtrip() {
     let deleted = change(
         &orch,
         json!([{
-            "target": "cairn://p/PROJ/skills/builder-helper",
+            "target": "cairn://p/proj/skills/builder-helper",
             "mode": "delete"
         }]),
     )

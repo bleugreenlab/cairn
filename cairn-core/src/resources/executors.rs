@@ -68,6 +68,10 @@ fn runner_restart_section(exit: Option<&AbnormalExit>, captured_at_unix_ms: u64)
     out
 }
 
+fn is_artifact_publish_wait(reason: &str) -> bool {
+    reason.starts_with("waiting for v") && reason.ends_with(" artifact publish")
+}
+
 /// Render the fleet collection: one line per machine, plus the toolchains and
 /// load an agent weighs before targeting one.
 ///
@@ -240,8 +244,19 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
         RemoteLinkState::Unreachable => {
             "This machine is enrolled and did not answer. That is ordinary when it is powered off or this runner is away from the network it lives on; the runner keeps retrying on a backoff and it will attach on its own once the host is reachable.\n"
         }
+        RemoteLinkState::AttachFailed
+            if remote
+                .last_attempt
+                .as_ref()
+                .is_some_and(|attempt| is_artifact_publish_wait(&attempt.reason)) =>
+        {
+            "This machine is enrolled and waiting for the runner's checksummed CLI sidecar release. Retries continue on a backoff and attachment resumes without intervention when publication completes.\n"
+        }
         RemoteLinkState::AttachFailed => {
             "This machine answered and the runner could not bring an executor up on it. The reason above is the runner's own account of the last attempt; retries continue on a backoff but will keep failing the same way until the cause is fixed.\n"
+        }
+        RemoteLinkState::Pending if remote.last_attempt.is_some() => {
+            "This machine is enrolled and waiting for the runner's checksummed CLI sidecar release. Retries continue on a backoff and attachment resumes without intervention when publication completes.\n"
         }
         RemoteLinkState::Pending => {
             "This machine is enrolled and no attempt has completed since the runner started.\n"
@@ -260,13 +275,18 @@ fn enrolled_link_summary(remote: &EnrolledRemote) -> String {
         RemoteLinkState::Unreachable => attempt
             .map(|reason| format!("unreachable — {reason}"))
             .unwrap_or_else(|| "unreachable — the host did not answer".to_string()),
+        RemoteLinkState::AttachFailed if attempt.is_some_and(is_artifact_publish_wait) => {
+            attempt.unwrap().to_string()
+        }
         RemoteLinkState::AttachFailed => attempt
             .map(|reason| format!("attach failed — {reason}"))
             .unwrap_or_else(|| {
                 "attach failed — the host answered and the executor could not be started"
                     .to_string()
             }),
-        RemoteLinkState::Pending => "not yet attempted since the runner started".to_string(),
+        RemoteLinkState::Pending => attempt
+            .map(str::to_string)
+            .unwrap_or_else(|| "not yet attempted since the runner started".to_string()),
     }
 }
 
@@ -441,6 +461,30 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     }
     out.push('\n');
 
+    out.push_str("## Process ownership\n");
+    out.push_str(&format!(
+        "- Resident ownership: {} tracked, {} stale reaped, {} unverified{}\n",
+        health.resident_processes.tracked_live_count,
+        health.resident_processes.reaped_stale_count,
+        health.resident_processes.unverified_stale_count,
+        health
+            .resident_processes
+            .oldest_stale_age_ms
+            .map(|value| format!(", oldest stale {}", age(value)))
+            .unwrap_or_default()
+    ));
+    out.push_str(&format!(
+        "- Command ownership: {} tracked, {} stale reaped, {} unverified{}\n\n",
+        health.command_processes.tracked_live_count,
+        health.command_processes.reaped_stale_count,
+        health.command_processes.unverified_count,
+        health
+            .command_processes
+            .oldest_age_ms
+            .map(|value| format!(", oldest {}", age(value)))
+            .unwrap_or_default()
+    ));
+
     out.push_str("## Occupancy\n");
     let occupancy = &executor.occupancy;
     out.push_str(&format!(
@@ -592,6 +636,13 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
                 selection.executor_name,
                 selection.reason.as_str()
             ));
+            if let Some(tie_break) = &selection.tie_break {
+                out.push_str(&format!(
+                    "  - Tie-break: {} ({})\n",
+                    tie_break.deciding_reason,
+                    tie_break.candidates.join(", ")
+                ));
+            }
             out.push_str(&format!(
                 "  - CPU: {}\n",
                 reading(
@@ -1052,8 +1103,8 @@ mod tests {
     use cairn_common::executor_protocol::{
         CpuPressure, ExecutorAdvertisement, ExecutorCapabilities, ExecutorHealthSnapshot,
         ExecutorIdentity, ExecutorSubstrateReport, FleetSnapshot, MachineMemory, MachineVolume,
-        RemoteAttachAttempt, ResidentOccupancyEvidence, ResourceReservation, ToolchainDetection,
-        ToolchainProbe,
+        RemoteAttachAttempt, ResidentOccupancyEvidence, ResidentProcessHealth, ResourceReservation,
+        ToolchainDetection, ToolchainProbe,
     };
 
     const CAPTURED_AT: u64 = 1_000_000;
@@ -1082,10 +1133,12 @@ mod tests {
                         os: "linux".into(),
                         arch: "x86_64".into(),
                         logical_cores: 16,
+                        concurrency_capacity: None,
                         toolchains: vec!["rust".into(), "bun".into()],
                         projects_served: Vec::new(),
                         disk_budget_bytes: None,
                         memory_budget_bytes: None,
+                        sandbox: None,
                         toolchain_detection: None,
                     },
                     current_load: 0,
@@ -1102,12 +1155,30 @@ mod tests {
                 connection_generation: 3,
                 applied_policy: ExecutorSubstrateReport::default().applied_policy,
                 drain_mode: false,
+                resident_processes: Default::default(),
+                command_processes: Default::default(),
                 build_skew: None,
             },
             executor_build_id: Some("build-abc".into()),
             occupancy: FleetSnapshot::default(),
             captured_at_unix_ms: CAPTURED_AT,
         }
+    }
+
+    #[test]
+    fn resident_ownership_health_appears_once_on_the_executor() {
+        let mut executor = inspection("local", true);
+        executor.health.resident_processes = ResidentProcessHealth {
+            tracked_live_count: 2,
+            reaped_stale_count: 3,
+            unverified_stale_count: 1,
+            oldest_stale_age_ms: Some(90_000),
+        };
+
+        let rendered = render_executor(&executor);
+        let summary =
+            "Resident ownership: 2 tracked, 3 stale reaped, 1 unverified, oldest stale 1m ago";
+        assert_eq!(rendered.matches(summary).count(), 1, "{rendered}");
     }
 
     /// Stages the state bglab-win was actually in: a machine whose probe ran
@@ -1537,6 +1608,20 @@ mod tests {
         assert!(failed.contains("2m ago"), "{failed}");
     }
 
+    #[test]
+    fn an_expected_artifact_publish_wait_uses_the_calm_register() {
+        let mut waiting = enrolled("bglab-mac", RemoteLinkState::AttachFailed);
+        waiting.last_attempt.as_mut().unwrap().reason = "waiting for v48 artifact publish".into();
+        let rendered = render_enrolled_remote(&waiting, REMOTE_CAPTURED_AT);
+
+        assert!(
+            rendered.contains("Status: waiting for v48 artifact publish"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Status: attach failed"), "{rendered}");
+        assert!(!rendered.contains("until the cause is fixed"), "{rendered}");
+    }
+
     /// Nothing on an unattached machine was measured, so nothing about its load
     /// is printed. A zero here would describe an idle machine, not an absent one.
     #[test]
@@ -1672,6 +1757,26 @@ mod tests {
         assert!(render_executor(&executor).contains("Resident processes: 2"));
     }
 
+    #[test]
+    fn command_and_resident_ownership_render_as_distinct_health() {
+        let mut executor = inspection("bglab-ub", false);
+        executor.health.resident_processes.tracked_live_count = 2;
+        executor.health.command_processes.tracked_live_count = 3;
+        executor.health.command_processes.reaped_stale_count = 4;
+        executor.health.command_processes.unverified_count = 1;
+        executor.health.command_processes.oldest_age_ms = Some(5_000);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Resident ownership: 2 tracked"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("Command ownership: 3 tracked, 4 stale reaped, 1 unverified, oldest 5s",),
+            "{rendered}"
+        );
+    }
+
     /// A name that addresses nothing is answered with every name that does — the
     /// same list the collection renders, from the same cache — so the refusal
     /// and the resource cannot disagree.
@@ -1705,6 +1810,7 @@ mod tests {
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
                 reason: PlacementReason::PredictedEarliestVerdict,
+                tie_break: None,
                 readings: PlacementReadings {
                     cpu: Measurement::measured(
                         CAPTURED_AT - 2_000,

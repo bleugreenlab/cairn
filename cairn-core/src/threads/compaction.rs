@@ -364,7 +364,7 @@ mod tests {
     async fn seed_job(db: &LocalDb) {
         db.execute_script(
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
-             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
              INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at) VALUES ('i','p',1,'T','active','none',1,1);
              INSERT INTO jobs (id,issue_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('j','i','p','running','thread','thread',1,1);",
         )
@@ -375,7 +375,7 @@ mod tests {
     fn mark(id: &str, at: i64) -> ChildMark {
         ChildMark {
             child_issue_id: id.to_string(),
-            child_issue_uri: format!("cairn://p/PRJ/{id}"),
+            child_issue_uri: format!("cairn://p/prj/{id}"),
             child_title: format!("child {id}"),
             final_status: "merged".to_string(),
             marked_at: at,
@@ -456,7 +456,7 @@ mod tests {
             &db,
             "j",
             &applied(
-                vec![entry("cairn://p/PRJ/c1", 0, 3)],
+                vec![entry("cairn://p/prj/c1", 0, 3)],
                 vec!["c1".to_string()],
             ),
             1_000,
@@ -486,7 +486,7 @@ mod tests {
             &db,
             "j",
             &applied(
-                vec![entry("cairn://p/PRJ/c1", 0, 3)],
+                vec![entry("cairn://p/prj/c1", 0, 3)],
                 vec!["c1".to_string()],
             ),
             1_000,
@@ -512,7 +512,7 @@ mod tests {
         persist_generation(
             &db,
             "j",
-            &applied(vec![entry("cairn://p/PRJ/c1", 0, 3)], vec![]),
+            &applied(vec![entry("cairn://p/prj/c1", 0, 3)], vec![]),
             1_000,
         )
         .await
@@ -521,8 +521,8 @@ mod tests {
         // into, and rotates again.
         let mut second_compaction = applied(
             vec![
-                entry("cairn://p/PRJ/c1", 0, 3),
-                entry("cairn://p/PRJ/c2", 4, 9),
+                entry("cairn://p/prj/c1", 0, 3),
+                entry("cairn://p/prj/c2", 4, 9),
             ],
             vec![],
         );
@@ -543,8 +543,8 @@ mod tests {
             2,
             "the newest generation carries the whole table of contents"
         );
-        assert_eq!(entries[0].content_uri, "cairn://p/PRJ/c1");
-        assert_eq!(entries[1].content_uri, "cairn://p/PRJ/c2");
+        assert_eq!(entries[0].content_uri, "cairn://p/prj/c1");
+        assert_eq!(entries[1].content_uri, "cairn://p/prj/c2");
         assert_eq!(entries[1].start_block, 4);
     }
 
@@ -566,7 +566,7 @@ mod tests {
             &db,
             "j",
             &applied(
-                vec![entry("cairn://p/PRJ/c1", 0, 3)],
+                vec![entry("cairn://p/prj/c1", 0, 3)],
                 vec!["c1".to_string()],
             ),
             1_000,
@@ -595,7 +595,7 @@ mod tests {
             &db,
             "j",
             &applied(
-                vec![entry("cairn://p/PRJ/c1", 0, 3)],
+                vec![entry("cairn://p/prj/c1", 0, 3)],
                 vec!["c1".to_string()],
             ),
             2_000,

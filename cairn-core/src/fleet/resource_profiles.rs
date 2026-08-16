@@ -844,10 +844,12 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             logical_cores: 8,
+            concurrency_capacity: None,
             toolchains: vec!["rust".into()],
             projects_served: Vec::new(),
             disk_budget_bytes: None,
             memory_budget_bytes: None,
+            sandbox: None,
             toolchain_detection: None,
         }
     }
@@ -1168,6 +1170,7 @@ mod tests {
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            sandbox: None,
             toolchain_fingerprint: None,
         };
         let (left, right) = tokio::join!(
@@ -1240,6 +1243,7 @@ mod tests {
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            sandbox: None,
             toolchain_fingerprint: None,
         };
 
@@ -1398,6 +1402,7 @@ mod tests {
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            sandbox: None,
             toolchain_fingerprint: None,
         }
     }

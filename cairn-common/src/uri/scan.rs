@@ -23,6 +23,61 @@ pub struct UriMatch {
     pub resource: CairnResource,
 }
 
+/// Stored-image destinations from actual Markdown image syntax, excluding
+/// fenced code blocks. This is deliberately narrower than [`scan_stored_images`]:
+/// callers that attach native image bytes must not reinterpret URI examples in
+/// prose or logs as attachments.
+pub fn scan_markdown_stored_images(text: &str) -> Vec<UriMatch> {
+    let mut found = Vec::new();
+    let mut fence: Option<(char, usize)> = None;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        let marker = trimmed.chars().next();
+        let marker_len = marker
+            .filter(|c| matches!(c, '`' | '~'))
+            .map(|c| trimmed.chars().take_while(|next| *next == c).count())
+            .unwrap_or_default();
+        if indent <= 3 && marker_len >= 3 {
+            match fence {
+                None => fence = Some((marker.unwrap(), marker_len)),
+                Some((open, width)) if marker == Some(open) && marker_len >= width => fence = None,
+                _ => {}
+            }
+            continue;
+        }
+        if fence.is_some() {
+            continue;
+        }
+
+        let mut rest = line;
+        while let Some(image_start) = rest.find("![") {
+            let after_bang = &rest[image_start + 2..];
+            let Some(destination_start) = after_bang.find("](") else {
+                break;
+            };
+            let destination = &after_bang[destination_start + 2..];
+            let Some(destination_end) = destination.find(')') else {
+                break;
+            };
+            let uri = destination[..destination_end]
+                .trim()
+                .trim_matches(['<', '>']);
+            if let Some(resource) = parse_uri(uri) {
+                if matches!(resource, CairnResource::ProjectImage { .. }) {
+                    found.push(UriMatch {
+                        uri: uri.to_string(),
+                        resource,
+                    });
+                }
+            }
+            rest = &destination[destination_end + 1..];
+        }
+    }
+    found
+}
+
 /// Characters that continue a URI in prose. Whitespace ends one; so do the
 /// closing delimiters of the markdown and HTML constructs a URI is embedded in.
 fn continues_uri(c: char) -> bool {
@@ -146,5 +201,18 @@ mod tests {
     fn a_malformed_image_uri_yields_nothing() {
         // A zero ordinal is not a reference, and neither is a truncated hash.
         assert!(uris("cairn://p/CAIRN/images/0 cairn://p/CAIRN/images/abc123").is_empty());
+    }
+
+    #[test]
+    fn markdown_image_scan_ignores_bare_uris_and_fenced_examples() {
+        let uri = "cairn://p/cairn/3242/images/1";
+        let text = format!("bare {uri}\n```md\n![example]({uri})\n```\n![attached]({uri})");
+        assert_eq!(
+            scan_markdown_stored_images(&text)
+                .into_iter()
+                .map(|found| found.uri)
+                .collect::<Vec<_>>(),
+            vec![uri]
+        );
     }
 }

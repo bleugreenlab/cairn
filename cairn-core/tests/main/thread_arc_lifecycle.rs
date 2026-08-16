@@ -12,8 +12,9 @@
 //!   write, which is why migrated threads never saw it);
 //! - the arc is a living document: writing it auto-confirms and never arms the
 //!   turn-ending handoff a terminal artifact arms;
-//! - both patch forms work over it — appending one ruling by `payload.ruling`
-//!   (Cairn mints the slug), editing one by slug, and replacing the array wholesale;
+//! - normal lifecycle patches append one ruling by `payload.ruling` (Cairn mints
+//!   the slug) or edit one by slug; guarded migration coverage retains wholesale
+//!   array replacement;
 //! - ruling operations compose atomically with ordinary arc field updates;
 //! - the schema is enforced, not merely resolvable.
 
@@ -24,7 +25,7 @@ use cairn_core::internal::storage::{DbError, LocalDb, RowExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-const ARC_URI: &str = "cairn://p/THR/library/arc";
+const ARC_URI: &str = "cairn://p/thr/library/arc";
 
 /// A project and a thread with no session job: the state every thread is in
 /// before its first turn, and the only state in which the arc's contract is
@@ -33,7 +34,7 @@ async fn seed(db: &LocalDb) {
     db.write(|conn| {
         Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','THR','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','thr','/tmp/p',1,1)", ()).await?;
             conn.execute("INSERT INTO threads (id, project_id, name, status, created_at, updated_at) VALUES ('t-1','p-1','library','active',1,1)", ()).await?;
             Ok::<_, DbError>(())
         })
@@ -90,7 +91,7 @@ fn ruling(text: &str, status: &str) -> Value {
         "text": text,
         "status": status,
         "rationale": "argued in the terms it was actually argued",
-        "provenance": ["cairn://p/THR/1"]
+        "provenance": ["cairn://p/thr/1"]
     })
 }
 
@@ -131,7 +132,7 @@ async fn ruling_operations_compose_with_arc_field_updates_in_one_version() {
             json!({
                 "ruling": ruling("published packs are immutable", "accepted"),
                 "current_intent": "Name packs without weakening immutability.",
-                "open_questions": [{"question": "who owns aliases?", "provenance": ["cairn://p/THR/2"]}]
+                "open_questions": [{"question": "who owns aliases?", "provenance": ["cairn://p/thr/2"]}]
             }),
         ),
     )
@@ -211,7 +212,7 @@ async fn a_new_thread_creates_and_keeps_its_arc() {
                 "current_intent": "Standing up the resource library.",
                 "working": "reading the pack format",
                 "rulings": [ruling("packs resolve by content hash", "accepted")],
-                "open_questions": [{"question": "who owns pack GC?", "provenance": ["cairn://p/THR/2"]}]
+                "open_questions": [{"question": "who owns pack GC?", "provenance": ["cairn://p/thr/2"]}]
             }),
         ),
     )
@@ -257,7 +258,7 @@ async fn a_new_thread_creates_and_keeps_its_arc() {
         "a ruling append leaves the rest of the arc alone: {arc}"
     );
 
-    // --- whole-array replacement, carrying the stable slugs ----------------
+    // --- guarded bulk migration, carrying the stable slugs -----------------
     let replaced = common::change_resource(
         &orch,
         write_to(
@@ -267,7 +268,7 @@ async fn a_new_thread_creates_and_keeps_its_arc() {
                 "text": "packs resolve by content hash",
                 "status": "superseded",
                 "rationale": "the catalog now addresses them by name",
-                "provenance": ["cairn://p/THR/1", "cairn://p/THR/3"]
+                "provenance": ["cairn://p/thr/1", "cairn://p/thr/3"]
             }]}),
         ),
     )

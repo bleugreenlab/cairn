@@ -22,6 +22,20 @@ pub(crate) const DB_CONTRACT: ResourceContract =
         mutations: NO_MUTATIONS,
     };
 
+pub(crate) const CHANNELS_CONVERSATIONS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ChannelsConversations,
+    uri_template: "cairn://channels/conversations",
+    name: "Channel conversations",
+    description: "Every active binding on an enabled external-channel provider, with its canonical conversation address, target, outbound message classes, transport capabilities, and current deliverability. Compatibility rows also contain label, provider, and optional last_error.",
+    read_projections: &[
+        ProjectionSpec { key: "provider", values: "imessage | telegram | discord" },
+        ProjectionSpec { key: "deliverability", values: "ready | degraded | stopped" },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const EXECUTOR_ACTION_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ExecutorAction,
     uri_template: "cairn://executors/{name}/{action}",
@@ -222,6 +236,7 @@ pub(crate) const MCP_CONTRACT: ResourceContract =
                     MCP_URL,
                     MCP_HEADERS,
                     MCP_ENABLED,
+                    MCP_OAUTH,
                     MCP_SCOPE,
                 ],
                 label: "add MCP server",
@@ -238,6 +253,7 @@ pub(crate) const MCP_CONTRACT: ResourceContract =
                     MCP_URL,
                     MCP_HEADERS,
                     MCP_ENABLED,
+                    MCP_OAUTH,
                     MCP_SCOPE,
                 ],
                 label: "edit MCP server",

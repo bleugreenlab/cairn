@@ -550,7 +550,7 @@ mod tests {
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','ws',0,0)",
         )
         .await;
-        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','P','/tmp',0,0)").await;
+        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','p','/tmp',0,0)").await;
         exec(&db, "INSERT INTO jobs (id, project_id, status, created_at, updated_at) VALUES ('wf-node','proj','live',0,0)").await;
         exec(&db, "INSERT INTO jobs (id, project_id, parent_job_id, model, status, created_at, updated_at) VALUES ('call','proj','wf-node','haiku','running',1,1)").await;
         // Predecessor (killed by restart) then the replacement, newer.
@@ -576,7 +576,7 @@ mod tests {
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws', 'ws', 0, 0)",
         )
         .await;
-        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj', 'ws', 'P', 'P', '/tmp', 0, 0)").await;
+        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj', 'ws', 'P', 'p', '/tmp', 0, 0)").await;
         // The workflow node job plus two child call jobs.
         exec(&db, "INSERT INTO jobs (id, project_id, status, created_at, updated_at) VALUES ('wf-node', 'proj', 'live', 0, 0)").await;
         exec(&db, "INSERT INTO jobs (id, project_id, parent_job_id, model, status, created_at, updated_at) VALUES ('call-a', 'proj', 'wf-node', 'haiku', 'exited', 1, 1)").await;
@@ -673,7 +673,7 @@ mod tests {
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','ws',0,0)",
         )
         .await;
-        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','P','/tmp',0,0)").await;
+        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','p','/tmp',0,0)").await;
         exec(&db, "INSERT INTO jobs (id, project_id, agent_config_id, task_description, status, created_at, updated_at) VALUES ('wf-node','proj','workflow','Workflow: deep-research','live',0,0)").await;
         exec(&db, "INSERT INTO workflow_run (run_id, job_id, session_id, workflow_id, script_path, args_json, output_name, created_at) VALUES ('wf-run','wf-node','sess','deep-research','/wf/main.ts','{\"query\":\"rust async\"}','return',0)").await;
 
@@ -702,7 +702,7 @@ mod tests {
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('ws','ws',0,0)",
         )
         .await;
-        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','P','/tmp',0,0)").await;
+        exec(&db, "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('proj','ws','P','p','/tmp',0,0)").await;
         exec(&db, "INSERT INTO jobs (id, project_id, status, created_at, updated_at) VALUES ('plain','proj','live',0,0)").await;
         let mon = get_workflow_monitor(&db, &db, "plain").await.unwrap();
         assert_eq!(mon.identity, WorkflowIdentity::default());

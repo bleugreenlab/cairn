@@ -23,6 +23,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "diff",
     "todos",
     "memories",
+    "feed",
     "tasks",
     "wakes",
     "checks",
@@ -102,6 +103,13 @@ pub enum CairnResource {
         handle: String,
     },
     ProjectIssues {
+        project: String,
+    },
+    Posts,
+    Post {
+        id: i64,
+    },
+    ProjectPosts {
         project: String,
     },
     /// Immutable check observations addressed by a revision coordinate.
@@ -304,6 +312,22 @@ pub enum CairnResource {
     /// `task_name: None` addresses a node job's todos; `Some(name)` addresses a
     /// sub-agent task job's todos. A job is a job — both URI shapes resolve here.
     JobTodos {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        task_name: Option<String>,
+    },
+    /// The unread post feed of one durable home, with its acknowledgement.
+    ///
+    /// Addressed exactly as [`Self::JobTodos`] is — `task_name: None` names the
+    /// node (or thread session) itself, `Some(name)` a sub-agent task beneath
+    /// it — because the address is a coordinate, not the cursor identity. The
+    /// cursor a coordinate resolves to is DURABLE: a thread session resolves to
+    /// its thread row, which outlives any one session, while every other node
+    /// and task resolves to its own job. `cairn:~/feed` is how an agent reaches
+    /// its own.
+    HomeFeed {
         project: String,
         number: i32,
         exec_seq: i32,
@@ -699,6 +723,8 @@ pub enum CairnResource {
     /// Read-only projection of the running app's JSONL log entries
     /// (URI parity with the in-app Logs viewer).
     Logs,
+    /// Configured, enabled external-channel conversations and their deliverability.
+    ChannelsConversations,
     /// Workspace-level fleet collection: every enrolled executor by public name.
     ///
     /// Machines are machine-scoped rather than project-scoped, so the family
@@ -753,6 +779,9 @@ impl CairnResource {
             Self::ProjectSettings { .. } => ResourceKind::ProjectSettings,
             Self::Project { .. } => ResourceKind::Project,
             Self::ProjectIssues { .. } => ResourceKind::ProjectIssues,
+            Self::Posts => ResourceKind::Posts,
+            Self::Post { .. } => ResourceKind::Post,
+            Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
             Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,
@@ -795,6 +824,7 @@ impl CairnResource {
             Self::TaskChatEvent { .. } => ResourceKind::TaskChatEvent,
             Self::TaskArtifact { .. } => ResourceKind::TaskArtifact,
             Self::JobTodos { .. } => ResourceKind::JobTodos,
+            Self::HomeFeed { .. } => ResourceKind::HomeFeed,
             Self::NodeTasks { .. } => ResourceKind::NodeTasks,
             Self::NodeCalls { .. } => ResourceKind::NodeCalls,
             Self::NodeWakes { .. } => ResourceKind::NodeWakes,
@@ -811,6 +841,7 @@ impl CairnResource {
             Self::DevDb => ResourceKind::DevDb,
             Self::DevPid => ResourceKind::DevPid,
             Self::Logs => ResourceKind::Logs,
+            Self::ChannelsConversations => ResourceKind::ChannelsConversations,
             Self::Executors => ResourceKind::Executors,
             Self::Executor { .. } => ResourceKind::Executor,
             Self::ExecutorAction { .. } => ResourceKind::ExecutorAction,

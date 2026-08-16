@@ -11,6 +11,7 @@ use super::common::{
 use crate::issues::relations;
 use crate::models::{ExecutionSnapshot, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
+use cairn_common::identity::PrincipalRef;
 use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
 struct IssuePrSummary {
@@ -21,6 +22,67 @@ struct IssuePrSummary {
     actor_kind: Option<String>,
     actor_identity: Option<String>,
     resolved_at: Option<i64>,
+}
+
+#[cfg(test)]
+mod issue_author_display_tests {
+    use super::*;
+
+    #[test]
+    fn formats_all_principal_kinds_and_legacy_absence() {
+        let cases = [
+            (None, "Unattributed"),
+            (
+                Some(PrincipalRef::Human {
+                    issuer: "https://identity.example".into(),
+                    subject: "user-42".into(),
+                    organization: Some("org-1".into()),
+                }),
+                "user-42 (https://identity.example)",
+            ),
+            (
+                Some(PrincipalRef::Agent {
+                    node: "cairn://p/test/1/1/builder".into(),
+                    run_id: Some("run-1".into()),
+                }),
+                "cairn://p/test/1/1/builder",
+            ),
+            (
+                Some(PrincipalRef::Machine {
+                    device_id: "studio-mac".into(),
+                }),
+                "studio-mac",
+            ),
+            (
+                Some(PrincipalRef::External {
+                    provider: "discord".into(),
+                    namespace: "guild-3".into(),
+                    id: "sender-9".into(),
+                }),
+                "discord:guild-3/sender-9",
+            ),
+        ];
+
+        for (principal, expected) in cases {
+            assert_eq!(issue_author_display(principal.as_ref()), expected);
+        }
+    }
+}
+
+fn issue_author_display(author: Option<&PrincipalRef>) -> String {
+    match author {
+        None => "Unattributed".to_string(),
+        Some(PrincipalRef::Human {
+            issuer, subject, ..
+        }) => format!("{subject} ({issuer})"),
+        Some(PrincipalRef::Agent { node, .. }) => node.clone(),
+        Some(PrincipalRef::Machine { device_id }) => device_id.clone(),
+        Some(PrincipalRef::External {
+            provider,
+            namespace,
+            id,
+        }) => format!("{provider}:{namespace}/{id}"),
+    }
 }
 
 async fn render_dependencies_block(conn: &cairn_db::turso::Connection, issue_id: &str) -> String {
@@ -205,7 +267,8 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     let mut issue_rows = match conn
         .query(
             "
-            SELECT id, title, status, description, created_at, parent_issue_id, parent_thread_id
+            SELECT id, title, status, description, created_at, parent_issue_id, parent_thread_id,
+                   author_principal_json, appearance_snapshot_json
             FROM issues
             WHERE project_id = ?1 AND number = ?2
             LIMIT 1
@@ -218,28 +281,41 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         Err(error) => return storage_error("Failed to load issue", error.into()),
     };
 
-    let (issue_id, title, status, description, created_at, parent_issue_id, parent_thread_id) =
-        match issue_rows.next().await {
-            Ok(Some(row)) => {
-                let parsed: DbResult<_> = (|| {
-                    Ok((
-                        row.text(0)?,
-                        row.text(1)?,
-                        row.text(2)?,
-                        row.opt_text(3)?,
-                        row.i64(4)? as i32,
-                        row.opt_text(5)?,
-                        row.opt_text(6)?,
-                    ))
-                })();
-                match parsed {
-                    Ok(issue) => issue,
-                    Err(error) => return storage_error("Failed to decode issue", error),
-                }
+    let (
+        issue_id,
+        title,
+        status,
+        description,
+        created_at,
+        parent_issue_id,
+        parent_thread_id,
+        author,
+    ) = match issue_rows.next().await {
+        Ok(Some(row)) => {
+            let parsed: DbResult<_> = (|| {
+                let authorship = crate::issues::crud::decode_issue_authorship(
+                    row.opt_text(7)?,
+                    row.opt_text(8)?,
+                )?;
+                Ok((
+                    row.text(0)?,
+                    row.text(1)?,
+                    row.text(2)?,
+                    row.opt_text(3)?,
+                    row.i64(4)? as i32,
+                    row.opt_text(5)?,
+                    row.opt_text(6)?,
+                    authorship.map(|value| value.author),
+                ))
+            })();
+            match parsed {
+                Ok(issue) => issue,
+                Err(error) => return storage_error("Failed to decode issue", error),
             }
-            Ok(None) => return format!("Issue {}/{} not found", project_key, number),
-            Err(error) => return storage_error("Failed to load issue", error.into()),
-        };
+        }
+        Ok(None) => return format!("Issue {}/{} not found", project_key, number),
+        Err(error) => return storage_error("Failed to load issue", error.into()),
+    };
 
     let description = description.unwrap_or_default();
     let labels = crate::labels::attach::list_labels_for_issue(&conn, &issue_id)
@@ -252,6 +328,10 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
 
     let mut output = format!("# {}/{}: {}\n\n", project_key, number, title);
     output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
+    output.push_str(&format!(
+        "Created by: {}\n",
+        issue_author_display(author.as_ref())
+    ));
     if !labels.is_empty() {
         output.push_str(&format!(
             "Labels: {}\n",
@@ -927,6 +1007,7 @@ mod routing_render_tests {
         agents.insert(
             "builder".to_string(),
             AgentSnapshot {
+                edited_at: None,
                 id: "builder".to_string(),
                 name: "Builder".to_string(),
                 description: String::new(),
@@ -976,7 +1057,7 @@ mod routing_render_tests {
     #[test]
     fn a_routed_execution_reads_its_labels_generation_and_per_agent_reason() {
         let rendered = render_execution_snapshot(
-            "CAIRN",
+            "cairn",
             1,
             1,
             &snapshot(Some(ModelRouting {
@@ -1009,7 +1090,7 @@ mod routing_render_tests {
     #[test]
     fn an_unrouted_agent_reads_as_the_agent_default() {
         let rendered = render_execution_snapshot(
-            "CAIRN",
+            "cairn",
             1,
             1,
             &snapshot(Some(ModelRouting {
@@ -1039,7 +1120,7 @@ mod routing_render_tests {
     /// than claiming it was routed to its default.
     #[test]
     fn a_pre_routing_execution_renders_no_routing_section() {
-        let rendered = render_execution_snapshot("CAIRN", 1, 1, &snapshot(None));
+        let rendered = render_execution_snapshot("cairn", 1, 1, &snapshot(None));
         assert!(!rendered.contains("model routing"), "{rendered}");
         assert!(!rendered.contains("routing:"), "{rendered}");
     }
@@ -1089,6 +1170,7 @@ mod execution_snapshot_read_tests {
             edges: vec![],
         };
         let agent = AgentSnapshot {
+            edited_at: None,
             id: "builder".to_string(),
             name: "Builder".to_string(),
             description: String::new(),
@@ -1141,7 +1223,7 @@ mod execution_snapshot_read_tests {
         exec(
             db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-1','default','Cairn','CAIRN','/tmp/repo',1,1)",
+             VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1)",
         )
         .await;
         exec(
@@ -1176,9 +1258,9 @@ mod execution_snapshot_read_tests {
     async fn renders_seeded_snapshot() {
         let db = test_db().await;
         seed(&db).await;
-        let out = read_issue_execution(&db, "CAIRN", 1, 3).await;
+        let out = read_issue_execution(&db, "cairn", 1, 3).await;
         assert!(
-            out.contains("# Execution snapshot CAIRN-1 / execution 3"),
+            out.contains("# Execution snapshot cairn/1 / execution 3"),
             "{out}"
         );
         assert!(out.contains("name: My Recipe (r)"), "{out}");
@@ -1194,7 +1276,7 @@ mod execution_snapshot_read_tests {
     async fn missing_execution_reports_clearly() {
         let db = test_db().await;
         seed(&db).await;
-        let out = read_issue_execution(&db, "CAIRN", 1, 99).await;
+        let out = read_issue_execution(&db, "cairn", 1, 99).await;
         assert!(out.contains("not found"), "{out}");
     }
 }

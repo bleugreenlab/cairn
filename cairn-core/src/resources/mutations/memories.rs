@@ -356,7 +356,7 @@ mod tests {
             .unwrap();
         db.execute(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) \
-             VALUES ('project-1', 'default', 'Project', 'PRJ', '/tmp/prj', 1, 1)",
+             VALUES ('project-1', 'default', 'Project', 'prj', '/tmp/prj', 1, 1)",
             (),
         )
         .await
@@ -373,7 +373,7 @@ mod tests {
 
         let (scope, value) = parse_deferred_scope(
             &db,
-            &json!({"newScope": {"scope": "project", "value": "PRJ"}}),
+            &json!({"newScope": {"scope": "project", "value": "prj"}}),
         )
         .await
         .unwrap();

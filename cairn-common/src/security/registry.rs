@@ -863,6 +863,36 @@ mod tests {
     /// followed by ordinary text followed by another covered span keeps the
     /// text between them.
     #[test]
+    fn json_string_form_overlaps_raw_and_preserves_detection_metadata() {
+        let registry = local();
+        let secret = "SYNTH-Q7\"m2Zx9-RedTeam";
+        let id = SecretId::new("json-string");
+        let _guard = registry
+            .register(
+                id.clone(),
+                SecretCategory::ConfiguredMcp,
+                "test",
+                material(secret),
+            )
+            .unwrap();
+        let encoded = serde_json::to_string(secret).unwrap();
+        let escaped = &encoded[1..encoded.len() - 1];
+        let mut found = Detections::new();
+        let scrubbed = registry
+            .snapshot()
+            .scrub_str(&format!("raw={secret}; json={escaped}"), &mut found)
+            .unwrap();
+
+        assert_eq!(scrubbed, "raw=[REDACTED]; json=[REDACTED]");
+        assert!(found.entries().iter().any(|entry| {
+            entry.secret_id.as_ref() == Some(&id)
+                && entry.category == Some(SecretCategory::ConfiguredMcp)
+                && entry.rule == MatchRule::ExactJsonString
+                && entry.count == 1
+        }));
+    }
+
+    #[test]
     fn separate_matches_stay_separate_and_keep_the_text_between_them() {
         let registry = local();
         let value = "sk-live-9fA3xQ2mZ7";

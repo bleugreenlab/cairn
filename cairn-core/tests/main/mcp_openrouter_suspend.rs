@@ -19,7 +19,7 @@ use cairn_db::turso::params;
 use serde_json::json;
 
 async fn seed(db: &LocalDb) {
-    let project_id = common::create_project(db, "TOR").await;
+    let project_id = common::create_project(db, "tor").await;
     db.write(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {
@@ -112,7 +112,7 @@ async fn owned_loop_question_suspends_without_inline_wait() {
         tool: "write".to_string(),
         payload: json!({
             "changes": [{
-                "target": "cairn://p/TOR/1/1/builder/questions",
+                "target": "cairn://p/tor/1/1/builder/questions",
                 "mode": "append",
                 "payload": {
                     "questions": [{

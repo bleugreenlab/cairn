@@ -1610,7 +1610,7 @@ mod tests {
         exec(
             &db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p', 'default', 'T', 'CAIRN', '/tmp/r', 1, 1)",
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1)",
         )
         .await;
         exec(
@@ -1690,7 +1690,7 @@ mod tests {
         exec(
             &db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p', 'default', 'T', 'CAIRN', '/tmp/r', 1, 1)",
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1)",
         )
         .await;
         exec(
@@ -1786,7 +1786,7 @@ mod tests {
         exec(
             &db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p', 'default', 'T', 'CAIRN', '/tmp/r', 1, 1)",
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1)",
         )
         .await;
         exec(
@@ -1821,12 +1821,12 @@ mod tests {
 
         assert_eq!(
             home_uri_for_job(&db, "j-session").await.unwrap().as_deref(),
-            Some("cairn://p/CAIRN/thread-ux"),
+            Some("cairn://p/cairn/thread-ux"),
             "a thread's session is the thread address itself"
         );
         assert_eq!(
             home_uri_for_job(&db, "j-task").await.unwrap().as_deref(),
-            Some("cairn://p/CAIRN/thread-ux/task/post-migration"),
+            Some("cairn://p/cairn/thread-ux/task/post-migration"),
             "a task the session spawned nests beneath the thread, and is never the thread itself"
         );
 
@@ -1846,7 +1846,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-            Some("cairn://p/CAIRN/thread-ux/task/survey-agent"),
+            Some("cairn://p/cairn/thread-ux/task/survey-agent"),
         );
     }
 

@@ -531,7 +531,7 @@ fn claude_config_dir(explicit: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// The CLI's project-directory name for a cwd: every non-alphanumeric character
-/// becomes `-`, so `/Users/mitch/.cairn/scratch/CAIRN.3263.1.builder` becomes
+/// becomes `-`, so `/Users/mitch/.cairn/scratch/cairn.3263.1.builder` becomes
 /// `-Users-mitch--cairn-scratch-CAIRN-3263-1-builder`.
 fn mangle_cwd(path: &Path) -> String {
     path.to_string_lossy()
@@ -687,15 +687,15 @@ mod tests {
     fn cwd_mangling_matches_the_cli_convention() {
         assert_eq!(
             mangle_cwd(Path::new(
-                "/Users/mitch/.cairn/scratch/CAIRN.3263.1.builder"
+                "/Users/mitch/.cairn/scratch/cairn.3263.1.builder"
             )),
-            "-Users-mitch--cairn-scratch-CAIRN-3263-1-builder"
+            "-Users-mitch--cairn-scratch-cairn-3263-1-builder"
         );
         assert_eq!(
             mangle_cwd(Path::new(
-                "/private/var/folders/tm/d63k08q/T/cairn-scratch-CAIRN.3242.1.builder"
+                "/private/var/folders/tm/d63k08q/T/cairn-scratch-cairn.3242.1.builder"
             )),
-            "-private-var-folders-tm-d63k08q-T-cairn-scratch-CAIRN-3242-1-builder"
+            "-private-var-folders-tm-d63k08q-T-cairn-scratch-cairn-3242-1-builder"
         );
     }
 

@@ -26,6 +26,7 @@ pub mod context_window;
 mod http_loop;
 pub mod ollama;
 mod openai_compat;
+pub mod opencode;
 pub mod openrouter;
 mod run_state;
 pub mod stdin;
@@ -531,12 +532,27 @@ pub trait AgentBackend: Send + Sync {
     ) -> Result<(), String>;
 }
 
+/// Every backend Cairn ships, in product order.
+///
+/// The model-catalog refresh, the responses surface, and the settings provider
+/// list each need the same answer to "which providers exist". They read it here
+/// instead of each carrying a copy, so adding a provider cannot leave one
+/// surface quietly behind.
+pub(crate) const KNOWN_BACKENDS: &[&str] = &[
+    "claude",
+    "codex",
+    "openrouter",
+    opencode::OPENCODE_BACKEND_KEY,
+    "ollama",
+];
+
 /// Create an AgentBackend for the given backend name.
 /// Returns ClaudeBackend for None or "claude", CodexBackend for "codex".
 pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
     match name {
         Some("codex") => Box::new(codex::CodexBackend),
         Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
+        Some(opencode::OPENCODE_BACKEND_KEY) => Box::new(opencode::OpenCodeBackend),
         Some("ollama") => Box::new(ollama::OllamaBackend),
         _ => Box::new(claude::ClaudeBackend),
     }

@@ -7,15 +7,19 @@ use rmcp::{
         wrapper::Parameters,
     },
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
-        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResponse,
-        ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
+        ErrorCode, ErrorData, Implementation, ListToolsResult, PaginatedRequestParams,
+        ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
+        ServerCapabilities, ServerInfo,
     },
-    service::RequestContext,
+    service::{MaybeSendFuture, RequestContext},
     tool, tool_router, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
+use std::{
+    future::Future,
+    sync::{Arc, Mutex},
+};
 
 use cairn_common::protocol::{CallbackRequest, CallbackResponse};
 use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
@@ -187,6 +191,8 @@ Targets (mix freely within one call):
 - Web/PDF: `http(s)://...` URLs and local `.pdf` paths return markdown via the active web-fetch provider (the built-in default is a plain HTTP fetch; PDF extraction needs a configured provider such as `bmd`).
 - Web search: `cairn://websearch?q=QUERY` runs the query through the active web-search provider and returns ranked results as markdown; everything after `q=` is the literal query, so spaces are fine.
 - Fleet: `cairn://executors` lists every machine enrolled with this runner by the public name that addresses it, and `cairn://executors/{name}` shows compact machine status — platform, toolchains, link and build state, timestamped telemetry, admission and queues, and occupancy. Drill into placement history with `?view=placements`, then read one complete decision (including passed-over candidate predictions) with `?view=placement&request=<request-id>`. These names are exactly what the run tool's `executor` selector accepts, so what you can read is what you can target. Served from cached fleet state; a read never probes a machine.
+- Channel conversations: `cairn://channels/conversations` lists every configured and enabled external-channel destination by canonical conversation address, with current deliverability and its latest outbound error.
+- Posts: `cairn://posts` is the workspace post corpus — what agents noticed but did not owe anyone — rendered newest first and cursor-neutral (`?limit=N` default 50 max 100, `?search=TEXT` over title and content, `?format=json`). `cairn://posts/{id}` is one post with its comments in creation order, and `cairn://p/PROJECT/posts` is the same corpus restricted to one project. Writing is append-only: `write cairn://posts {content, title?, scope?}` posts (omit `scope` for workspace-wide, `scope:"project"` for your own project) and `write cairn://posts/{id} {content}` comments. Authorship is captured from your authenticated run, so provenance keys are refused. `cairn:~/feed` is your own home's unread slice of that corpus, oldest first (`?limit=N` default 20 max 100, `?format=json`), carrying how many unread posts are still behind the page and an acknowledgement token; `write cairn:~/feed {ack:"TOKEN"}` advances your reading position to exactly what that token showed, and an unacknowledged page is never passed over — the next read still leads with those posts under a fresh token. Posts never wake you unless you elect it with `write cairn:~/wakes {subscribe:{kind:"posts"}}`.
 - Images: reading an image (an image file, `cairn:~/browser?screenshot`, a stored image URI) shows it to BOTH of you in one step — you see the image, and a durable `![label](cairn://p/PROJECT/ISSUE/images/N)` reference renders in the transcript; paste that reference into a message, issue, or artifact to carry the image forward. Image addresses are ordinal and scoped, so `images/4` addresses a sibling directly and reading `cairn://p/PROJECT/ISSUE/images` lists an issue's images.
 
 Per-target scoping rides in each URI's query string — append `?key=value&...`:
@@ -198,9 +204,12 @@ Per-target scoping rides in each URI's query string — append `?key=value&...`:
 - Raw transcripts: append `format=json` to node or task `/chat/raw` for JSONL with one canonically reconstructed event per line (`runId`, `sequence`, `turnId`, `eventType`, `createdAt`, `payload`); `offset`/`limit` then page events, and an oversized event resumes through the emitted cumulative `char_offset` continuation
 - `/issues`: `status=backlog,active,...` (comma-separated), `limit=N`, `sort=updated_desc|created_asc|...`, `ready=true|false`
 - `/messages`: `before=`, `after=`, `since=EPOCH`, `limit=N`
+- `/channels/conversations`: `provider=imessage|telegram|discord`, `deliverability=ready|degraded|stopped`
 - Project search: `cairn://p/PROJECT?search=QUERY&limit=N&since=EPOCH`
 
-Partial failures never abort: a target that errors shows its message inline as that target's block, and every requested target still contributes a block. A multi-target read shares a single ~45k-char total budget across targets (water-filled so small targets render whole and large ones fair-share); every requested target is included, and a windowed or truncated segment carries an always-valid `continue:` footer — `[lines A–B of T — output truncated to fit budget; continue: ...]`, advancing `offset`/`head_limit`, or a `char_offset=` resume when a single line is itself larger than the budget."#
+Partial failures never abort: every failed target remains in place under an `[error]` header. An unchanged unwindowed repeat suppressed as flailing remains in place under `[duplicate]`; explicit windows carrying `offset`, `limit`, `head_limit`, or `char_offset` are deliberate navigation and are never suppressed. A multi-target read shares a single ~45k-char total budget across targets (water-filled so small targets render whole and large ones fair-share).
+
+For lossless automation, consume the `read_batch` envelope metadata and opt-in bodies: `kind: error|duplicate` is non-content and never completion. Successful completion is derived from `offset`, `shown_units`, `total_units`, `truncated`, and `char_continuation`. In composed text, every requested window must carry its valid paging footer; never accept a footerless `[error]` or `[duplicate]` block as a final page. Successful windowed or truncated segments carry an always-valid `continue:` footer — `[lines A–B of T — output truncated to fit budget; continue: ...]`, advancing `offset`/`head_limit`, or a `char_offset=` resume when a single line is itself larger than the budget."#
     )]
     pub(crate) async fn read(
         &self,
@@ -290,7 +299,7 @@ Partial failures never abort: a target that errors shows its message inline as t
     /// invocations, synchronously. Parallel by default; `sequential: true` runs
     /// in order. Long-running terminals are managed by `write` on terminals.
     #[tool(
-        description = "Suspend this turn without polling with a sole wait item: `{waitFor:{duration:\"3m\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/tests\",on:\"exit\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/dev\",on:\"output\",phrase:\"ready\"}}`, or `{waitFor:{kind:\"checks\",ref:\"cairn://p/CAIRN/3427/1/builder/checks\",on:\"settled\"}}` (add `on:\"verdict\",suite:\"rust-tests\"` for one suite) — the checks wait is how you learn that ANOTHER node's project check lanes have stopped moving, e.g. before merging a child's PR, instead of sleeping a blind duration and re-reading. It resumes with each lane's verdict and a one-word `verdict` of passed/failed/incomplete, where incomplete means a lane stopped without ever producing one. You cannot wait on your OWN lanes (the turn-end wave is armed by this turn ENDING); for that, end your turn on `write cairn:~/wakes {subscribe:{kind:\"checks\"}}`. The pending run call resumes when the condition fires. Otherwise, execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (e.g. `{code:\"console.log(1)\", interpreter:\"typescript\"}`). Inline `code` is the default way to run code that isn't a CLI invocation: the interpreter execs the source directly, so there is no shell and no quoting. `typescript`/`ts` and `javascript`/`js` run via bun with the worktree `node_modules` and zero-config `@cairn/sdk` importable; `python`/`py` runs through the bundled `uv` (a PEP 723 `# /// script` dependency block resolves into a cached environment, and a worktree `pyproject.toml`/`uv.lock` project env is picked up automatically); `matlab` runs via `matlab -batch`. Add `repl:<slug>` to an inline `code` item to evaluate it in a stateful REPL session — create it first with `write cairn:~/repl/<slug> {interpreter:\"python\", deps:[\"pandas\"]}` — so variables, imports, and defs persist across `run` calls (its state is lost if the REPL dies). Prefer inline code over wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`. Keep inline code synchronous and run-to-completion; long-running or background code belongs to terminal resources (and durable workflow scripts). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <header> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — instead of your own, which is how you tell a real regression from a failure already on the base (`run({commands:[{command:\"bun run test\"}], branch:\"main\"})`); it is verdict-only, so tracked writes are discarded, and `commit_msg`, MCP, and REPL items are rejected. `executor` states which machine runs the batch — `{name:\"bglab-ub\"}` for one machine by its public name or `{os:\"linux\"}` for any machine on that platform, either optionally refined by `requiredToolchains`; `name` and `os` are mutually exclusive, and read `cairn://executors` for the names, platforms, and toolchains available. In an agent job, an incompatible explicit selector runs in a fresh checkout at the branch head rather than the job's warm working tree. Omit it and the batch runs in its normal execution home. Not for long-lived/background processes — use a terminal resource via `write` for those. One call in, one final result out: a batch runs to completion, and if it takes longer than 120 seconds this call suspends and resumes with the finished result rather than reporting progress. An item's `timeout` (ms) is a kill bound, not a call bound: the item terminates at the bound and its result block reports the timeout with whatever output it produced — the batch is never aborted with no output. Omitting it lets a shell, code, or skill-script item run to completion, capped only by the 6-hour ceiling on a batch (a command meant to keep running belongs in a terminal); an MCP-tool or REPL item is capped at the 120-second synchronous window."
+        description = "Suspend this turn without polling with a sole wait item: `{waitFor:{duration:\"3m\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/tests\",on:\"exit\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/dev\",on:\"output\",phrase:\"ready\"}}`, or `{waitFor:{kind:\"checks\",ref:\"cairn://p/CAIRN/3427/1/builder/checks\",on:\"settled\"}}` (add `on:\"verdict\",suite:\"rust-tests\"` for one suite) — the checks wait is how you learn that ANOTHER node's project check lanes have stopped moving, e.g. before merging a child's PR, instead of sleeping a blind duration and re-reading. It resumes with each lane's verdict and a one-word `verdict` of passed/failed/incomplete, where incomplete means a lane stopped without ever producing one. You cannot wait on your OWN lanes (the turn-end wave is armed by this turn ENDING); for that, end your turn on `write cairn:~/wakes {subscribe:{kind:\"checks\"}}`. The pending run call resumes when the condition fires. Otherwise, execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (e.g. `{code:\"console.log(1)\", interpreter:\"typescript\"}`). Inline `code` is the default way to run code that isn't a CLI invocation: the interpreter execs the source directly, so there is no shell and no quoting. `typescript`/`ts` and `javascript`/`js` run via bun with the worktree `node_modules` importable and `@cairn/sdk` provided by Cairn in every project, whether or not it depends on the SDK (a project's own copy still wins); `python`/`py` runs through the bundled `uv` (a PEP 723 `# /// script` dependency block resolves into a cached environment, and a worktree `pyproject.toml`/`uv.lock` project env is picked up automatically); `matlab` runs via `matlab -batch`. Add `repl:<slug>` to an inline `code` item to evaluate it in a stateful REPL session — create it first with `write cairn:~/repl/<slug> {interpreter:\"python\", deps:[\"pandas\"]}` — so variables, imports, and defs persist across `run` calls (its state is lost if the REPL dies). Prefer inline code over wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`. Keep inline code synchronous and run-to-completion; long-running or background code belongs to terminal resources (and durable workflow scripts). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <header> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — instead of your own, which is how you tell a real regression from a failure already on the base (`run({commands:[{command:\"bun run test\"}], branch:\"main\"})`); it is verdict-only, so tracked writes are discarded, and `commit_msg`, MCP, and REPL items are rejected. `executor` states which machine runs the batch — `{name:\"bglab-ub\"}` for one machine by its public name or `{os:\"linux\"}` for any machine on that platform, either optionally refined by `requiredToolchains`; `name` and `os` are mutually exclusive, and read `cairn://executors` for the names, platforms, and toolchains available. In an agent job, an incompatible explicit selector runs in a fresh checkout at the branch head rather than the job's warm working tree. Omit it and the batch runs in its normal execution home. Not for long-lived/background processes — use a terminal resource via `write` for those. One call in, one final result out: a batch runs to completion, and if it takes longer than 120 seconds this call suspends and resumes with the finished result rather than reporting progress. An item's `timeout` (ms) is a kill bound, not a call bound: the item terminates at the bound and its result block reports the timeout with whatever output it produced — the batch is never aborted with no output. Omitting it lets a shell, code, or skill-script item run to completion, capped only by the 6-hour ceiling on a batch (a command meant to keep running belongs in a terminal); an MCP-tool or REPL item is capped at the 120-second synchronous window."
     )]
     async fn run(
         &self,
@@ -446,6 +455,20 @@ impl CairnCmd {
 }
 
 impl ServerHandler for CairnCmd {
+    fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<DiscoverResult, ErrorData>> + MaybeSendFuture + '_ {
+        // Claude intermittently selects the 2026 handshake-skipping lifecycle, reports
+        // Cairn connected, and then omits its tools. Declining discovery makes clients
+        // fall back to classic initialization until that lifecycle is tool-bearing.
+        std::future::ready(Err(ErrorData::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "Method not found",
+            None,
+        )))
+    }
+
     fn get_info(&self) -> ServerInfo {
         let mut instructions = "Cairn MCP server for agent orchestration. Three batch verbs: \
              `read` (files, directories, cairn:// resources, and web targets, with per-target \
@@ -605,6 +628,87 @@ pub(crate) struct TerminalReadResult {
 mod tests {
     use super::*;
     use crate::test_support::{create_test_mcp_with_home_uri, get_text};
+    use rmcp::{
+        model::ClientInfo, ClientHandler, ClientLifecycleMode, ClientServiceExt, ServiceExt,
+    };
+
+    #[derive(Clone)]
+    struct LifecycleClient;
+
+    impl ClientHandler for LifecycleClient {
+        fn get_info(&self) -> ClientInfo {
+            let mut info = ClientInfo::default();
+            info.protocol_version = rmcp::model::ProtocolVersion::V_2025_11_25;
+            info
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_declines_negotiated_lifecycle_and_classic_init_lists_core_tools() {
+        let mcp = create_test_mcp_with_home_uri(None);
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = mcp
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await;
+        });
+        let client = LifecycleClient
+            .serve_with_lifecycle(
+                client_transport,
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
+                },
+            )
+            .await
+            .expect("auto client should fall back to classic initialization");
+        assert_eq!(
+            client
+                .peer_info()
+                .expect("initialized server info")
+                .protocol_version,
+            rmcp::model::ProtocolVersion::V_2025_11_25
+        );
+        client.cancel().await.expect("client should cancel");
+        server.await.expect("server task");
+
+        // rmcp retains the discovery peer's per-request metadata requirement even
+        // after Auto initializes. Claude restarts the stdio server for its classic
+        // fallback, so mirror that process boundary before checking inventory.
+        let mcp = create_test_mcp_with_home_uri(None);
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = mcp
+                .serve(server_transport)
+                .await
+                .expect("classic server should start")
+                .waiting()
+                .await;
+        });
+        let classic_client = LifecycleClient
+            .serve(client_transport)
+            .await
+            .expect("classic client should initialize");
+        let mut names = classic_client
+            .list_tools(None)
+            .await
+            .expect("tools/list after classic restart")
+            .tools
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["read", "run", "write"]);
+
+        classic_client
+            .cancel()
+            .await
+            .expect("classic client should cancel");
+        server.await.expect("server task");
+    }
 
     #[test]
     fn test_available_agents_stored_for_change_description() {

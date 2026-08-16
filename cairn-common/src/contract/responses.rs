@@ -12,6 +12,9 @@ const PROMPT: KeySpec = KeySpec::new(
     "prompt template using declared {{variables}}",
 );
 const TIER: KeySpec = KeySpec::new("tier", KeyType::Str, "model tier; defaults to sm");
+const MODEL: KeySpec = KeySpec::new("model", KeyType::Str, "exact model id, overriding tier");
+const BACKEND: KeySpec = KeySpec::new("backend", KeyType::Str, "backend to complete through");
+const OPTIONS: KeySpec = KeySpec::new("options", KeyType::Object, "per-call completion options");
 const VARIABLES: KeySpec = KeySpec::new("variables", KeyType::Array, "declared template variables");
 const OUTPUT: KeySpec = KeySpec::new(
     "output",
@@ -24,10 +27,10 @@ const EXAMPLES: KeySpec =
 const NONE: &[MutationSpec] = &[];
 
 const fn collection(kind: ResourceKind, uri: &'static str, name: &'static str) -> ResourceContract {
-    ResourceContract { kind, uri_template: uri, name, description: "Named one-shot model completion definitions", read_projections: NO_PROJECTIONS, related: NO_RELATED, cross_actions: NO_CROSS_ACTIONS, mutations: &[MutationSpec { mode: ChangeMode::Create, required: &[NAME, DESCRIPTION, PROMPT], optional: &[TIER, VARIABLES, OUTPUT, TIMEOUT, EXAMPLES], label: "create response", example: "write({changes:[{target:\"cairn://responses\",mode:\"create\",payload:{name:\"...\",description:\"...\",prompt:\"...\"}}]})" }] }
+    ResourceContract { kind, uri_template: uri, name, description: "Named one-shot model completion definitions", read_projections: NO_PROJECTIONS, related: NO_RELATED, cross_actions: NO_CROSS_ACTIONS, mutations: &[MutationSpec { mode: ChangeMode::Create, required: &[NAME, DESCRIPTION, PROMPT], optional: &[TIER, MODEL, BACKEND, OPTIONS, VARIABLES, OUTPUT, TIMEOUT, EXAMPLES], label: "create response", example: "write({changes:[{target:\"cairn://responses\",mode:\"create\",payload:{name:\"...\",description:\"...\",prompt:\"...\"}}]})" }] }
 }
 const fn member(kind: ResourceKind, uri: &'static str, name: &'static str) -> ResourceContract {
-    ResourceContract { kind, uri_template: uri, name, description: "A named one-shot model completion definition", read_projections: NO_PROJECTIONS, related: NO_RELATED, cross_actions: NO_CROSS_ACTIONS, mutations: &[MutationSpec { mode: ChangeMode::Patch, required: &[], optional: &[NAME, DESCRIPTION, PROMPT, TIER, VARIABLES, OUTPUT, TIMEOUT, EXAMPLES], label: "patch response", example: "write({changes:[{target:\"cairn://responses/ID\",mode:\"patch\",payload:{prompt:\"...\"}}]})" }, MutationSpec { mode: ChangeMode::Delete, required: &[], optional: &[DELETE_REASON], label: "delete response", example: "write({changes:[{target:\"cairn://responses/ID\",mode:\"delete\"}]})" }] }
+    ResourceContract { kind, uri_template: uri, name, description: "A named one-shot model completion definition", read_projections: NO_PROJECTIONS, related: NO_RELATED, cross_actions: NO_CROSS_ACTIONS, mutations: &[MutationSpec { mode: ChangeMode::Patch, required: &[], optional: &[NAME, DESCRIPTION, PROMPT, TIER, MODEL, BACKEND, OPTIONS, VARIABLES, OUTPUT, TIMEOUT, EXAMPLES], label: "patch response", example: "write({changes:[{target:\"cairn://responses/ID\",mode:\"patch\",payload:{prompt:\"...\"}}]})" }, MutationSpec { mode: ChangeMode::Delete, required: &[], optional: &[DELETE_REASON], label: "delete response", example: "write({changes:[{target:\"cairn://responses/ID\",mode:\"delete\"}]})" }] }
 }
 const fn readonly(
     kind: ResourceKind,

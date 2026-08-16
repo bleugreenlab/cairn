@@ -190,6 +190,23 @@ pub struct AgentSnapshot {
     /// Legacy flat resolved backend — deserialize-only, see `model`.
     #[serde(default, skip_serializing)]
     pub resolved_backend: Option<String>,
+    /// When this agent snapshot was last explicitly edited, in epoch seconds.
+    ///
+    /// `None` means the snapshot still tracks the agent definition it was
+    /// resolved from. A long-lived host — a thread session, which can run for
+    /// months — re-resolves an unedited snapshot from files on each turn so an
+    /// authored prompt change still reaches it, and leaves an edited one alone
+    /// so a per-thread customization is not silently reverted. An execution's
+    /// snapshot is frozen either way; its reproducibility guarantee does not
+    /// depend on this field.
+    ///
+    /// Stamped server-side by the one canonical edit door
+    /// (`execution::snapshot_edit::update_execution_agent`); a caller-supplied
+    /// patch cannot write it, because [`merge_agent_patch`] strips it.
+    /// `#[serde(default)]` reads every pre-existing snapshot as unedited, which
+    /// is the correct reading for all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_at: Option<i64>,
 }
 
 /// Frozen preset matrix captured with an execution snapshot.
@@ -353,6 +370,9 @@ pub struct SnapshotOverrides {
 /// is the same path that produced it in the first place.
 const SELECTION_INPUTS: &[&str] = &["tier", "backend", "backendPreference"];
 
+/// Serialized name of [`AgentSnapshot::edited_at`], which no patch may set.
+const EDITED_AT_FIELD: &str = "editedAt";
+
 /// The authored inputs a frozen `selection` is resolved from, for callers that
 /// need to recognize a patch as an explicit model choice rather than merge one.
 pub(crate) fn selection_inputs() -> &'static [&'static str] {
@@ -373,6 +393,16 @@ pub fn merge_agent_patch(
     base: Option<&AgentSnapshot>,
     patch: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<AgentSnapshot, String> {
+    // `editedAt` is a server-stamped fact about when an edit happened, not a
+    // field an edit gets to assert. Dropping it here means a patch can neither
+    // forge an edit (freezing a snapshot that was never customized) nor erase
+    // one (handing a customized snapshot back to file re-resolution); a base
+    // that already carries the stamp keeps it.
+    let patch = &patch
+        .iter()
+        .filter(|(key, _)| key.as_str() != EDITED_AT_FIELD)
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
     let merged = match base {
         Some(base) => {
             let mut fields = match serde_json::to_value(base) {
@@ -472,6 +502,7 @@ mod tests {
             agents: HashMap::from([(
                 "build".to_string(),
                 AgentSnapshot {
+                    edited_at: None,
                     id: "build".to_string(),
                     name: "Build Agent".to_string(),
                     description: "Builds things".to_string(),
@@ -635,6 +666,7 @@ mod tests {
     #[test]
     fn agent_snapshot_with_extras_roundtrip() {
         let snap = AgentSnapshot {
+            edited_at: None,
             id: "test".to_string(),
             name: "Test".to_string(),
             description: "desc".to_string(),
@@ -669,6 +701,7 @@ mod tests {
     #[test]
     fn agent_snapshot_skips_null_extras() {
         let snap = AgentSnapshot {
+            edited_at: None,
             id: "test".to_string(),
             name: "Test".to_string(),
             description: "desc".to_string(),

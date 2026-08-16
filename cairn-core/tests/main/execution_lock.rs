@@ -184,7 +184,7 @@ async fn count_packets(db: &LocalDb, execution_id: &str) -> usize {
 async fn concurrent_persist_with_lock_preserves_all_packets() {
     let (_temp, orch) = common::test_orchestrator().await;
     let exec_id = "exec-locked";
-    let project_id = common::create_project(&orch.db.local, "LOCK").await;
+    let project_id = common::create_project(&orch.db.local, "lock").await;
     create_execution_with_snapshot(&orch.db.local, exec_id, &project_id).await;
     create_parent_job(&orch.db.local, "job-1", &project_id).await;
 

@@ -621,6 +621,7 @@ mod tests {
 
     fn agent_snapshot(id: &str, model: &str) -> AgentSnapshot {
         AgentSnapshot {
+            edited_at: None,
             id: id.to_string(),
             name: id.to_string(),
             description: String::new(),
@@ -1119,6 +1120,7 @@ mod pinned_agent_tests {
 
     fn agent(id: &str, selection: Option<ModelSelection>) -> AgentSnapshot {
         AgentSnapshot {
+            edited_at: None,
             id: id.to_string(),
             name: id.to_string(),
             description: String::new(),

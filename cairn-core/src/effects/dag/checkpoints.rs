@@ -101,12 +101,17 @@ fn resolve_checkpoint_coordinate(
     })?;
 
     let repository = PathBuf::from(repo_path);
-    let store = crate::jj::project_store_dir(&orch.config_dir, &repository);
-    let coordinate_repository = if crate::jj::is_jj_dir(&store) {
-        store
-    } else {
-        repository
-    };
+    let jj_binary_path = orch.jj_binary_path.clone();
+    let config_dir = orch.config_dir.clone();
+    let project_repo = repository.clone();
+    let coordinate_repository = run_advancement_db(async move {
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("checkpoint coordinate repository task failed: {error}"))?
+    })?;
     run_advancement_db(async move {
         cairn_vcs::resolve_coordinate(&coordinate_repository, &branch)
             .await

@@ -26,15 +26,15 @@ use cairn_common::executor_protocol::{
     ObjectTransferCoordinate, ObservationReuse, PlacementDecision, PlacementMobility,
     PlacementOutcome, PlacementPolicyEvidence, PlacementPrediction, PlacementReadings,
     PlacementReason, PlacementRejection, PlacementRejectionReason, PlacementSelection,
-    PlacementSyncCost, PreparationForecast, ProcessBatch, ProcessBatchExecution, ProcessBatchFile,
-    ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
+    PlacementSyncCost, PlacementTieBreak, PreparationForecast, ProcessBatch, ProcessBatchExecution,
+    ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
     QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget, RemoteAttachAttempt,
     RemoteLinkState, RepositoryLocator, ReservationFallback, ReservationRationale,
     ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyHolder,
-    ResidencyOperation, ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind,
-    RunnerCallback, RunnerCallbackResult, WarmthUnknownReason, CPU_ADMISSION_SAMPLE_INTERVAL_MS,
-    EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS,
-    RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig, ResidentProcessEvent,
+    ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult, WarmthUnknownReason,
+    CPU_ADMISSION_SAMPLE_INTERVAL_MS, EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME,
+    MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
@@ -70,6 +70,22 @@ pub enum PlacementStance {
     RemoteOnly,
     #[default]
     Any,
+}
+
+fn residency_runtime_config_request(residency: &CellResidency) -> CellRequest {
+    residency_placement_request(&ResidencyAcquireRequest {
+        holder: residency.holder.clone(),
+        repository: residency.repository.clone(),
+        executor: None,
+        owner_ref: residency.owner_ref.clone(),
+        selector: residency.selector.clone(),
+        initial_base_commit: residency.current_base_commit.clone(),
+        footprint: residency.footprint,
+        death_policy: residency.death_policy.clone(),
+        priority: CellPriority::AgentInteractive,
+        wait_horizon_unix_ms: unix_time_ms().saturating_add(30_000),
+        waiting_since_unix_ms: unix_time_ms(),
+    })
 }
 
 /// One executor admission transition, recorded with the placement survey that
@@ -777,7 +793,7 @@ impl FleetConfig {
         if self.capacity_wait_horizon_seconds < MIN_CAPACITY_WAIT_HORIZON_SECONDS {
             log::warn!(
                 "settings.yaml buildSlots.capacityWaitHorizonSeconds is {}, below the {MIN_CAPACITY_WAIT_HORIZON_SECONDS}s floor; \
-                 using {}s instead. A value this small is usually a pre-CAIRN-3268 acquisitionDeadlineSeconds \
+                 using {}s instead. A value this small is usually a pre-cairn-3268 acquisitionDeadlineSeconds \
                  carried across the rename, where it meant a per-attempt queue budget rather than a total wait.",
                 self.capacity_wait_horizon_seconds,
                 default_capacity_wait_horizon_seconds(),
@@ -1226,6 +1242,9 @@ struct ExplorationState {
     /// Least recently explored first. Executors not present have never received
     /// a bootstrap attempt and precede every entry here.
     explored_executors: VecDeque<String>,
+    /// Least recently selected first. Missing executors have never won and sort
+    /// ahead of every executor present here when all authoritative keys tie.
+    selected_executors: VecDeque<String>,
 }
 
 impl Default for ExplorationState {
@@ -1233,6 +1252,7 @@ impl Default for ExplorationState {
         Self {
             decisions_since_exploration: EXPLORATION_INTERVAL - 1,
             explored_executors: VecDeque::new(),
+            selected_executors: VecDeque::new(),
         }
     }
 }
@@ -1252,6 +1272,11 @@ impl ExplorationState {
                     .min(EXPLORATION_INTERVAL - 1);
             }
         }
+    }
+
+    fn record_selection(&mut self, executor_id: &str) {
+        self.selected_executors.retain(|known| known != executor_id);
+        self.selected_executors.push_back(executor_id.to_string());
     }
 }
 
@@ -2156,10 +2181,12 @@ impl Fleet {
                 os: std::env::consts::OS.into(),
                 arch: std::env::consts::ARCH.into(),
                 logical_cores: 1,
+                concurrency_capacity: None,
                 toolchains: Vec::new(),
                 projects_served: Vec::new(),
                 disk_budget_bytes: None,
                 memory_budget_bytes: None,
+                sandbox: None,
                 toolchain_detection: None,
             },
             current_load: 0,
@@ -4227,7 +4254,27 @@ impl Fleet {
                     Ok(selected) => selected,
                     Err(failure) => return failure,
                 } {
-                    (selected, None, None, None)
+                    // The persisted route is repository-address authority. Resolve
+                    // it before preparing configuration so a retry whose locator
+                    // has the same identity but a stale coordinate loads policy
+                    // from the address the residency actually holds.
+                    let placement = residency_placement_request(acquisition);
+                    let prepared = match self.prepare_execution(orch, &placement).await {
+                        Ok(prepared) => prepared,
+                        Err(outcome) => {
+                            return residency_core_failure(
+                                ResidencyFailureKind::Admission,
+                                "prepare execution environment reattachment",
+                                Some(outcome),
+                            )
+                        }
+                    };
+                    (
+                        selected,
+                        ResidencyRuntimeConfig::Install(prepared.executor_config),
+                        None,
+                        None,
+                    )
                 } else {
                     let mut placement = residency_placement_request(acquisition);
                     let prepared = match self.prepare_execution(orch, &placement).await {
@@ -4293,7 +4340,7 @@ impl Fleet {
                     });
                     (
                         selected,
-                        Some(prepared.executor_config),
+                        ResidencyRuntimeConfig::Install(prepared.executor_config),
                         Some(placement),
                         Some(prepared.object_plane),
                     )
@@ -4307,38 +4354,60 @@ impl Fleet {
                         None,
                     );
                 };
-                let connections = self.connections.lock().unwrap();
-                let routed = connections.iter().find_map(|(executor_id, connection)| {
-                    connection
-                        .snapshot
-                        .cells
-                        .iter()
-                        .find_map(|cell| {
-                            cell.residency
-                                .as_ref()
-                                .filter(|residency| residency.holder == *holder)
-                                .cloned()
-                        })
-                        .map(|residency| {
-                            (
-                                SelectedExecutor {
-                                    executor_id: executor_id.clone(),
-                                    device_id: connection.identity.device_id.clone(),
-                                    generation: connection.generation,
-                                    sender: connection.sender.clone(),
-                                    colocated: connection.colocated,
-                                    capabilities: connection.advertisement.capabilities.clone(),
-                                },
-                                residency,
-                            )
-                        })
-                });
+                let routed = {
+                    let connections = self.connections.lock().unwrap();
+                    connections.iter().find_map(|(executor_id, connection)| {
+                        connection
+                            .snapshot
+                            .cells
+                            .iter()
+                            .find_map(|cell| {
+                                cell.residency
+                                    .as_ref()
+                                    .filter(|residency| residency.holder == *holder)
+                                    .cloned()
+                            })
+                            .map(|residency| {
+                                (
+                                    SelectedExecutor {
+                                        executor_id: executor_id.clone(),
+                                        device_id: connection.identity.device_id.clone(),
+                                        generation: connection.generation,
+                                        sender: connection.sender.clone(),
+                                        colocated: connection.colocated,
+                                        capabilities: connection.advertisement.capabilities.clone(),
+                                    },
+                                    residency,
+                                )
+                            })
+                    })
+                };
                 let Some((selected, residency)) = routed else {
                     return residency_core_failure(
                         ResidencyFailureKind::Unavailable,
                         "no connected executor reports this execution environment",
                         None,
                     );
+                };
+                let executor_config = if matches!(
+                    operation,
+                    ResidencyOperation::StartProcess { .. }
+                        | ResidencyOperation::RefreshCheckout { .. }
+                        | ResidencyOperation::MaterializeConflict { .. }
+                ) {
+                    let config_request = residency_runtime_config_request(&residency);
+                    match self.prepare_execution(orch, &config_request).await {
+                        Ok(prepared) => ResidencyRuntimeConfig::Install(prepared.executor_config),
+                        Err(outcome) => {
+                            return residency_core_failure(
+                                ResidencyFailureKind::Admission,
+                                "prepare execution environment operation",
+                                Some(outcome),
+                            )
+                        }
+                    }
+                } else {
+                    ResidencyRuntimeConfig::NotRequired
                 };
                 if !selected.colocated {
                     if let ResidencyOperation::RefreshCheckout {
@@ -4353,15 +4422,15 @@ impl Fleet {
                         );
                         (
                             selected,
-                            None,
+                            executor_config,
                             Some(request),
                             Some(orch.object_plane.clone()),
                         )
                     } else {
-                        (selected, None, None, None)
+                        (selected, executor_config, None, None)
                     }
                 } else {
-                    (selected, None, None, None)
+                    (selected, executor_config, None, None)
                 }
             }
         };
@@ -4397,20 +4466,14 @@ impl Fleet {
                 queue_entry_id: acquire_queue_entry_id.clone(),
             },
         );
-        let configured = executor_config.is_none_or(|config| {
-            selected
-                .sender
-                .send(ExecutorMessage::Configure { config })
-                .is_ok()
-        });
-        let sent = configured
-            && selected
-                .sender
-                .send(ExecutorMessage::ResidencyRequest {
-                    correlation_id: correlation_id.clone(),
-                    operation,
-                })
-                .is_ok();
+        let sent = selected
+            .sender
+            .send(ExecutorMessage::ResidencyRequest {
+                correlation_id: correlation_id.clone(),
+                config: executor_config,
+                operation,
+            })
+            .is_ok();
         if !sent {
             self.pending_residency
                 .lock()
@@ -4938,6 +5001,7 @@ impl Fleet {
         }
         ProcessBatch {
             files,
+            runtime_packages: Vec::new(),
             sequential: true,
             stop_on_error: false,
             sandbox_mode: Self::CHECK_CADENCE_SANDBOX_MODE,
@@ -5227,12 +5291,22 @@ impl Fleet {
                 },
             ),
         );
-        let sandbox_mode = Self::batch_sandbox_mode(
-            crate::mcp::handlers::fence::resolve_run_fence(orch, &batch.request)
-                .await
-                .map(|(_, fence)| fence),
-            &request.repository,
-        );
+        let resolved_fence =
+            match crate::mcp::handlers::fence::resolve_run_fence(orch, &batch.request).await {
+                crate::mcp::handlers::fence::RunFenceResolution::Resolved(_, fence) => Some(fence),
+                crate::mcp::handlers::fence::RunFenceResolution::Ambient => None,
+                crate::mcp::handlers::fence::RunFenceResolution::Unavailable(diagnostic) => {
+                    self.runner_contexts
+                        .lock()
+                        .unwrap()
+                        .remove(&runner_context_id);
+                    return CellOutcome::Unavailable {
+                        reason: CellUnavailableReason::RunnerContext,
+                        diagnostic,
+                    };
+                }
+            };
+        let sandbox_mode = Self::batch_sandbox_mode(resolved_fence, &request.repository);
         let batch = match serialize_process_batch(
             batch,
             &request.env,
@@ -5450,12 +5524,12 @@ impl Fleet {
                             "check batch sandbox denial cannot be interactively adjudicated".into(),
                     };
                 };
-                let Some((run_id, mode)) = fence::resolve_run_fence(orch, request).await else {
-                    return RunnerCallbackResult::Rejected {
-                        diagnostic:
-                            "sandbox denial cannot be adjudicated without an originating run fence"
-                                .into(),
-                    };
+                let (run_id, mode) = match fence::resolve_run_fence(orch, request).await {
+                    fence::RunFenceResolution::Resolved(run_id, mode) => (run_id, mode),
+                    fence::RunFenceResolution::Unavailable(diagnostic) => return RunnerCallbackResult::Failed { diagnostic },
+                    fence::RunFenceResolution::Ambient => return RunnerCallbackResult::Failed {
+                        diagnostic: "permission context unavailable: sandbox denial has no authenticated originating run".into(),
+                    },
                 };
                 let crossing = match denial {
                     cairn_common::executor_protocol::SandboxDenial::Path(path) => {
@@ -5473,6 +5547,9 @@ impl Fleet {
                     FenceDecision::Allow => RunnerCallbackResult::Allowed,
                     FenceDecision::Deny(diagnostic) => {
                         RunnerCallbackResult::Rejected { diagnostic }
+                    }
+                    FenceDecision::Unavailable(diagnostic) => {
+                        RunnerCallbackResult::Failed { diagnostic }
                     }
                     FenceDecision::Suspended => RunnerCallbackResult::Suspended,
                 }
@@ -5706,17 +5783,14 @@ impl Fleet {
             guard.disarm();
             return executor_unavailable(diagnostic);
         }
-        let configured = selected
+        let sent = selected
             .sender
-            .send(ExecutorMessage::Configure {
+            .send(ExecutorMessage::Submit {
                 config: executor_config,
+                request,
+                batch,
             })
             .is_ok();
-        let sent = configured
-            && selected
-                .sender
-                .send(ExecutorMessage::Submit { request, batch })
-                .is_ok();
         let cancelled_before_correlation = self.cancelled_leaders.lock().unwrap().remove(&key);
         if cancelled_before_correlation {
             let _ = self.send_to(
@@ -6069,6 +6143,7 @@ impl Fleet {
                 (selection.reason == PlacementReason::BootstrapExploration)
                     .then_some(selection.executor_id.as_str()),
             );
+            exploration.record_selection(selection.executor_id.as_str());
         }
         drop(exploration_by_work_class);
         let reservation = reservations.remove(&selected.executor_id);
@@ -6817,14 +6892,15 @@ fn rank_survey(
         })
         .collect();
 
-    let (winner, ranked, changed_earliest_winner, bootstrap_exploration) = rank_candidates(
-        &scored,
-        settled,
-        exercising_spill,
-        request,
-        policy,
-        exploration,
-    );
+    let (winner, ranked, changed_earliest_winner, bootstrap_exploration, tie_break) =
+        rank_candidates(
+            &scored,
+            settled,
+            exercising_spill,
+            request,
+            policy,
+            exploration,
+        );
     let Some(winner) = winner else {
         // Every usable machine was measured-blind and none of them was a
         // machine policy is allowed to spill onto. Say so with the evidence.
@@ -6866,6 +6942,7 @@ fn rank_survey(
         executor_id: winner.entry.identity.executor_id.clone(),
         colocated: winner.entry.colocated,
         reason,
+        tie_break,
         readings: placement_readings(&winner.entry.health.machine),
         reservation: winner
             .reservation
@@ -7111,6 +7188,7 @@ fn rank_candidates<'a, 'b>(
     Vec<&'b ScoredCandidate<'a>>,
     bool,
     bool,
+    Option<PlacementTieBreak>,
 ) {
     let hard_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
         a.blindness
@@ -7141,12 +7219,28 @@ fn rank_candidates<'a, 'b>(
                     .cmp(&b.prediction.evidence_rank())
             })
             .then_with(|| sync_cost_key(a.sync_cost).cmp(&sync_cost_key(b.sync_cost)))
-            .then_with(|| {
-                a.entry
-                    .identity
-                    .executor_id
-                    .cmp(&b.entry.identity.executor_id)
-            })
+    };
+    let recent_selection_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
+        let age = |candidate: &&ScoredCandidate<'a>| {
+            exploration
+                .selected_executors
+                .iter()
+                .position(|executor_id| executor_id == &candidate.entry.identity.executor_id)
+        };
+        match (age(a), age(b)) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(a_age), Some(b_age)) => a_age.cmp(&b_age),
+        }
+    };
+    let stable_order = |a: &&ScoredCandidate<'a>, b: &&ScoredCandidate<'a>| {
+        recent_selection_order(a, b).then_with(|| {
+            a.entry
+                .identity
+                .executor_id
+                .cmp(&b.entry.identity.executor_id)
+        })
     };
     let selectable = |candidate: &&ScoredCandidate<'a>| {
         (candidate.blindness.is_none()
@@ -7162,13 +7256,17 @@ fn rank_candidates<'a, 'b>(
     };
 
     let mut baseline: Vec<&ScoredCandidate<'a>> = scored.iter().collect();
-    baseline.sort_by(|a, b| hard_order(a, b).then_with(|| forecast_order(a, b)));
+    baseline.sort_by(|a, b| {
+        hard_order(a, b)
+            .then_with(|| forecast_order(a, b))
+            .then_with(|| stable_order(a, b))
+    });
     let earliest = baseline.iter().copied().find(selectable);
     let Some(earliest) = earliest else {
-        return (None, baseline, false, false);
+        return (None, baseline, false, false, None);
     };
     if settled_by_caller || !exercising_spill {
-        return (Some(earliest), baseline, false, false);
+        return (Some(earliest), baseline, false, false, None);
     }
 
     // A prior is not evidence about a machine, and pure exploitation can never
@@ -7187,39 +7285,78 @@ fn rank_candidates<'a, 'b>(
             .iter()
             .position(|executor_id| executor_id == &candidate.entry.identity.executor_id)
     };
+    let bootstrap_eligible = |candidate: &&ScoredCandidate<'a>| {
+        selectable(candidate)
+            && candidate.misfit.is_none()
+            && candidate.admission_accepts
+            && candidate.prediction.queue.predicted_ms() == Some(0)
+            && candidate.prediction.run.profile_key.is_some()
+            && matches!(
+                candidate.prediction.run.fallback,
+                Some(
+                    DurationFallback::NoProfileRecorded
+                        | DurationFallback::BelowConfidenceFloor
+                        | DurationFallback::ProfileTooOld
+                )
+            )
+    };
     let exploration = exploration_due
         .then(|| {
             baseline
                 .iter()
                 .copied()
-                .filter(|candidate| {
-                    selectable(candidate)
-                        && candidate.misfit.is_none()
-                        && candidate.admission_accepts
-                        && candidate.prediction.queue.predicted_ms() == Some(0)
-                        && candidate.prediction.run.profile_key.is_some()
-                        && matches!(
-                            candidate.prediction.run.fallback,
-                            Some(
-                                DurationFallback::NoProfileRecorded
-                                    | DurationFallback::BelowConfidenceFloor
-                                    | DurationFallback::ProfileTooOld
-                            )
-                        )
-                })
+                .filter(bootstrap_eligible)
                 .min_by(|a, b| match (last_explored(a), last_explored(b)) {
-                    (None, None) => forecast_order(a, b),
+                    (None, None) => forecast_order(a, b).then_with(|| stable_order(a, b)),
                     (None, Some(_)) => std::cmp::Ordering::Less,
                     (Some(_), None) => std::cmp::Ordering::Greater,
-                    (Some(a_age), Some(b_age)) => {
-                        a_age.cmp(&b_age).then_with(|| forecast_order(a, b))
-                    }
+                    (Some(a_age), Some(b_age)) => a_age
+                        .cmp(&b_age)
+                        .then_with(|| forecast_order(a, b))
+                        .then_with(|| stable_order(a, b)),
                 })
         })
         .flatten();
     if let Some(exploration) = exploration {
         let changed = exploration.entry.identity.executor_id != earliest.entry.identity.executor_id;
-        return (Some(exploration), baseline, changed, true);
+        let bootstrap_candidates = scored
+            .iter()
+            .filter(bootstrap_eligible)
+            .map(|candidate| executor_public_name(candidate.entry))
+            .collect::<Vec<_>>();
+        let exploration_age_decided = scored
+            .iter()
+            .filter(bootstrap_eligible)
+            .any(|candidate| last_explored(&&exploration) != last_explored(&candidate));
+        let tied_forecasts = scored
+            .iter()
+            .filter(bootstrap_eligible)
+            .filter(|candidate| forecast_order(&&exploration, candidate).is_eq())
+            .count();
+        let deciding_reason =
+            exploration_age_decided
+                .then_some("least recently explored bootstrap candidate")
+                .or_else(|| {
+                    (tied_forecasts > 1).then(|| {
+                        if scored.iter().filter(bootstrap_eligible).any(|candidate| {
+                            recent_selection_order(&&exploration, &candidate).is_ne()
+                        }) {
+                            "least recently selected among equal bootstrap candidates"
+                        } else {
+                            "stable executor identity seeded recent-selection history"
+                        }
+                    })
+                });
+        return (
+            Some(exploration),
+            baseline,
+            changed,
+            true,
+            deciding_reason.map(|reason| PlacementTieBreak {
+                candidates: bootstrap_candidates,
+                deciding_reason: reason.into(),
+            }),
+        );
     }
 
     let deadline = earliest.prediction.predicted_verdict_ms.saturating_add(
@@ -7261,12 +7398,44 @@ fn rank_candidates<'a, 'b>(
                 }
             })
             .then_with(|| forecast_order(a, b))
+            .then_with(|| stable_order(a, b))
     });
     let winner = ranked.iter().copied().find(selectable);
     let changed = winner.is_some_and(|winner| {
         winner.entry.identity.executor_id != earliest.entry.identity.executor_id
     });
-    (winner, ranked, changed, false)
+    let tie_break = winner.and_then(|winner| {
+        let tied = ranked
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                hard_order(&&winner, candidate).is_eq()
+                    && forecast_order(&&winner, candidate).is_eq()
+                    && same_hard_group(candidate)
+                    && preference(&&winner) == preference(candidate)
+                    && priority(&&winner) == priority(candidate)
+            })
+            .map(|candidate| executor_public_name(candidate.entry))
+            .collect::<Vec<_>>();
+        let recent_selection_decided = ranked.iter().copied().any(|candidate| {
+            hard_order(&&winner, &candidate).is_eq()
+                && forecast_order(&&winner, &candidate).is_eq()
+                && same_hard_group(&candidate)
+                && preference(&&winner) == preference(&candidate)
+                && priority(&&winner) == priority(&candidate)
+                && recent_selection_order(&&winner, &candidate).is_ne()
+        });
+        (tied.len() > 1).then(|| PlacementTieBreak {
+            candidates: tied,
+            deciding_reason: if recent_selection_decided {
+                "least recently selected among candidates equal on every earlier placement key"
+            } else {
+                "stable executor identity seeded recent-selection history"
+            }
+            .into(),
+        })
+    });
+    (winner, ranked, changed, false, tie_break)
 }
 
 /// What this machine already holds for this request, read off the facts it
@@ -8273,6 +8442,8 @@ fn executor_health_snapshot(
         connection_generation: entry.generation,
         applied_policy: entry.health.applied_policy.clone(),
         drain_mode: entry.health.drain_mode,
+        resident_processes: entry.health.resident_processes.clone(),
+        command_processes: entry.health.command_processes.clone(),
         build_skew: expected_build_ids
             .get(&entry.identity.executor_id)
             .zip(entry.executor_build_id.as_ref())
@@ -8343,6 +8514,19 @@ fn matches_selector(entry: &ExecutorConnectionState, selector: &ExecutorSelector
                 .iter()
                 .any(|available| available == required)
         })
+        && matches_sandbox_capability(&entry.advertisement.capabilities, selector)
+}
+
+fn matches_sandbox_capability(
+    capabilities: &ExecutorCapabilities,
+    selector: &ExecutorSelector,
+) -> bool {
+    !selector.requires_macos_nested_sandbox_write
+        || !capabilities.os.eq_ignore_ascii_case("macos")
+        || capabilities
+            .sandbox
+            .as_ref()
+            .is_some_and(|evidence| evidence.nested_sandbox_write_available)
 }
 
 /// The fleet as a refusal has to describe it: every live machine by the name a
@@ -8362,8 +8546,27 @@ fn known_executor_inventory(connections: &HashMap<String, ExecutorConnectionStat
             } else {
                 format!("toolchains {}", capabilities.toolchains.join(", "))
             };
+            let sandbox = capabilities.sandbox.as_ref().map_or_else(
+                || "nested Seatbelt write capability not reported".to_string(),
+                |evidence| {
+                    format!(
+                        "CAIRN_SANDBOXED={}, nested Seatbelt write={} ({})",
+                        if evidence.cairn_sandboxed_marker {
+                            "set"
+                        } else {
+                            "unset"
+                        },
+                        if evidence.nested_sandbox_write_available {
+                            "available"
+                        } else {
+                            "unavailable"
+                        },
+                        evidence.nested_sandbox_write_detail
+                    )
+                },
+            );
             format!(
-                "{} ({}, {toolchains})",
+                "{} ({}, {toolchains}, {sandbox})",
                 executor_public_name(entry),
                 capabilities.os
             )
@@ -8428,6 +8631,28 @@ fn no_matching_executor_diagnostic(
     )
 }
 
+/// Whether this batch runs JavaScript, and so needs the Cairn packages to travel
+/// with it.
+///
+/// A direct item names its program, which is how an inline TypeScript item
+/// arrives. A shell item carries its whole command line in `args` instead, so
+/// `bun script.ts` written as a shell command has exactly the same import to
+/// resolve; answering only the inline form would leave the shell form as a
+/// second, worse answer to one question. The scan is deliberately generous --
+/// a command that merely mentions a runtime carries a few unread kilobytes,
+/// while a missed one is the failure this whole mechanism exists to remove.
+fn batch_runs_javascript(items: &[ProcessBatchItem]) -> bool {
+    const RUNTIMES: [&str; 4] = ["bun", "bunx", "node", "npx"];
+    items.iter().any(|item| match item.execution {
+        ProcessBatchExecution::NativeShell => item.args.iter().any(|command| {
+            command
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| RUNTIMES.contains(&word))
+        }),
+        _ => RUNTIMES.contains(&item.program.as_str()),
+    })
+}
+
 fn serialize_process_batch(
     batch: ResolvedRunBatch,
     env: &[(String, String)],
@@ -8477,8 +8702,24 @@ fn serialize_process_batch(
             verdict_environment_names: Vec::new(),
         });
     }
+    // A batch that runs bun carries the version-matched SDK with it, so inline
+    // TypeScript resolves `@cairn/sdk` on whichever machine takes the batch --
+    // including a project with no JavaScript toolchain of its own. Batches that
+    // run no JavaScript carry nothing, so shell, Python, and MATLAB work is not
+    // taxed with runtime bytes it will never read.
+    //
+    // A runner that cannot produce its own SDK fails the batch here, naming the
+    // installation, rather than letting bun report a missing project dependency
+    // and sending the reader to look for a mistake in their own project.
+    let runtime_packages = if batch_runs_javascript(&items) {
+        crate::runtime::sdk_packages()
+            .map_err(|error| format!("Cairn cannot provide @cairn/sdk to this batch: {error}"))?
+    } else {
+        Vec::new()
+    };
     Ok(ProcessBatch {
         files: Vec::new(),
+        runtime_packages,
         sequential: batch.originally_sequential,
         stop_on_error: batch.stop_on_error,
         sandbox_mode,
@@ -8873,7 +9114,7 @@ mod tests {
             ("CAIRN_RUN_ID".to_string(), "run-7".to_string()),
             (
                 "CAIRN_WORKTREE_BRANCH".to_string(),
-                "agent/CAIRN-3381-builder-0".to_string(),
+                "agent/cairn-3381-builder-0".to_string(),
             ),
         ];
         let batch = serialize_process_batch(
@@ -8916,12 +9157,70 @@ mod tests {
         }
     }
 
+    /// The SDK travels with a batch that can run JavaScript and with no other,
+    /// so shell, Python, and MATLAB work is not taxed with bytes it never reads
+    /// -- and so neither way of reaching bun is left out.
+    #[test]
+    fn the_sdk_travels_with_javascript_batches_by_either_route() {
+        let item = |execution, program: &str, args: Vec<&str>| ProcessBatchItem {
+            header: "item".into(),
+            stream_id: "item".into(),
+            execution,
+            program: program.into(),
+            args: args.into_iter().map(String::from).collect(),
+            env: Vec::new(),
+            stdin: None,
+            timeout_ms: 1_000,
+            command_resource_identity: None,
+            verdict_environment_names: Vec::new(),
+        };
+
+        // An inline TypeScript item resolves to a direct `bun` program.
+        assert!(batch_runs_javascript(&[item(
+            ProcessBatchExecution::Direct,
+            "bun",
+            vec!["-e", "import {read} from '@cairn/sdk'"]
+        )]));
+        // A shell item carries its command line in `args` instead.
+        assert!(batch_runs_javascript(&[item(
+            ProcessBatchExecution::NativeShell,
+            "",
+            vec!["bun run scripts/report.ts"]
+        )]));
+        assert!(batch_runs_javascript(&[item(
+            ProcessBatchExecution::NativeShell,
+            "",
+            vec!["bunx --bun vite build"]
+        )]));
+        // A batch with no JavaScript in it carries nothing.
+        assert!(!batch_runs_javascript(&[
+            item(
+                ProcessBatchExecution::Direct,
+                "python3",
+                vec!["-c", "print(1)"]
+            ),
+            item(
+                ProcessBatchExecution::NativeShell,
+                "",
+                vec!["cargo test --workspace"]
+            ),
+        ]));
+        // A program whose name merely CONTAINS a runtime name is not that
+        // runtime, so the direct match is exact rather than a substring.
+        assert!(!batch_runs_javascript(&[item(
+            ProcessBatchExecution::Direct,
+            "nodemon",
+            Vec::new()
+        )]));
+    }
+
     #[test]
     fn every_item_of_a_cell_batch_is_pointed_at_the_compile_cache() {
         let injected = vec![("SCCACHE_SERVER_PORT".to_string(), "4227".to_string())];
         let batch = with_cell_client_env(
             ProcessBatch {
                 files: Vec::new(),
+                runtime_packages: Vec::new(),
                 sequential: false,
                 stop_on_error: true,
                 sandbox_mode: ProcessSandboxMode::Unconfined,
@@ -8952,7 +9251,7 @@ mod tests {
     /// runs each cache-miss compile itself, so a live-checkout build pointed at
     /// it fails outright with `Operation not permitted`.
     #[tokio::test]
-    async fn only_a_cell_batch_is_pointed_at_this_machine_s_compile_cache() {
+    async fn configured_build_service_env_is_limited_to_cells() {
         let temp = tempfile::tempdir().unwrap();
         let orch = test_orchestrator(temp.path()).await;
 
@@ -8964,9 +9263,10 @@ mod tests {
                 object_format: cairn_common::executor_protocol::GitObjectFormat::Sha1,
             },
         );
-        assert!(cell
-            .iter()
-            .any(|(key, value)| key == "SCCACHE_SERVER_PORT" && value == "4227"));
+        assert!(
+            cell.is_empty(),
+            "without an explicit buildServices setting, cells receive no daemon env: {cell:?}"
+        );
 
         let live = cell_build_service_env(
             &orch,
@@ -9286,12 +9586,39 @@ mod tests {
             os: "macos".into(),
             arch: "aarch64".into(),
             logical_cores,
+            concurrency_capacity: None,
             toolchains: Vec::new(),
             projects_served: Vec::new(),
             disk_budget_bytes: None,
             memory_budget_bytes: None,
+            sandbox: None,
             toolchain_detection: None,
         }
+    }
+
+    #[test]
+    fn measured_nested_sandbox_capability_controls_only_sensitive_placement() {
+        let selector = ExecutorSelector {
+            requires_macos_nested_sandbox_write: true,
+            ..ExecutorSelector::default()
+        };
+        let mut capabilities = capabilities_with_cores(8);
+
+        assert!(
+            !matches_sandbox_capability(&capabilities, &selector),
+            "an old or incapable macOS executor must not receive sandbox-sensitive work"
+        );
+        assert!(
+            matches_sandbox_capability(&capabilities, &ExecutorSelector::default()),
+            "ordinary work remains placeable"
+        );
+
+        capabilities.sandbox = Some(cairn_common::executor_protocol::SandboxCapabilityEvidence {
+            cairn_sandboxed_marker: false,
+            nested_sandbox_write_available: true,
+            nested_sandbox_write_detail: "live probe succeeded".into(),
+        });
+        assert!(matches_sandbox_capability(&capabilities, &selector));
     }
 
     /// Whole-machine demand is declared as saturation, because a submitter cannot
@@ -9319,6 +9646,21 @@ mod tests {
                 "the budget floor is two, so a one-core host cannot resolve to one"
             );
         }
+    }
+
+    #[test]
+    fn colocated_whole_machine_demand_uses_advertised_effective_capacity() {
+        let mut capabilities = capabilities_with_cores(16);
+        capabilities.concurrency_capacity = Some(
+            cairn_common::executor_protocol::executor_cpu_budget(16, true),
+        );
+        assert_eq!(
+            clamp_declared_concurrency(
+                ResourceReservation::WHOLE_MACHINE_CONCURRENCY,
+                &capabilities,
+            ),
+            14
+        );
     }
 
     /// A reservation has two independent halves, and the record must carry both.
@@ -9902,7 +10244,7 @@ mod tests {
             ),
             &[(
                 "CAIRN_WORKTREE_BRANCH".into(),
-                "agent/CAIRN-2929-builder-0".into(),
+                "agent/cairn-2929-builder-0".into(),
             )],
             "runner-context".into(),
             ProcessSandboxMode::Confined,
@@ -9917,7 +10259,7 @@ mod tests {
             batch.items[0].env,
             [(
                 "CAIRN_WORKTREE_BRANCH".into(),
-                "agent/CAIRN-2929-builder-0".into()
+                "agent/cairn-2929-builder-0".into()
             )]
         );
         assert_eq!(batch.items[0].execution, ProcessBatchExecution::NativeShell);
@@ -9942,7 +10284,7 @@ mod tests {
             .local
             .execute_script(&format!(
                 "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
-                 VALUES ('p', 'default', 'Project', 'P', '{}', 1, 1);",
+                 VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
                 repository.to_string_lossy()
             ))
             .await
@@ -10058,17 +10400,13 @@ mod tests {
             .wait_for_executor(request.wait_horizon_unix_ms)
             .await
             .unwrap();
-        sender.send(ExecutorMessage::Configure { config }).unwrap();
         sender
             .send(ExecutorMessage::Submit {
+                config,
                 request,
                 batch: None,
             })
             .unwrap();
-        assert!(matches!(
-            rx.recv().await,
-            Some(ExecutorMessage::Configure { .. })
-        ));
         assert!(matches!(
             rx.recv().await,
             Some(ExecutorMessage::Submit { .. })
@@ -10593,7 +10931,7 @@ mod tests {
         request.timeout_ms = 500;
         let config = ExecutorConfig {
             project_id: request.project_id.clone(),
-            project_key: "CAIRN".into(),
+            project_key: "cairn".into(),
             default_timeout_seconds: 2,
             setup_commands: Vec::new(),
             populate: Default::default(),
@@ -10601,6 +10939,7 @@ mod tests {
         };
         let batch = ProcessBatch {
             files: Vec::new(),
+            runtime_packages: Vec::new(),
             sequential: true,
             stop_on_error: false,
             sandbox_mode: ProcessSandboxMode::Unconfined,
@@ -10647,7 +10986,7 @@ mod tests {
         request.timeout_ms = 60_000;
         let config = ExecutorConfig {
             project_id: request.project_id.clone(),
-            project_key: "CAIRN".into(),
+            project_key: "cairn".into(),
             default_timeout_seconds: 60,
             setup_commands: Vec::new(),
             populate: Default::default(),
@@ -10677,7 +11016,7 @@ mod tests {
         request.timeout_ms = u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS);
         let config = ExecutorConfig {
             project_id: request.project_id.clone(),
-            project_key: "CAIRN".into(),
+            project_key: "cairn".into(),
             default_timeout_seconds: 1_800,
             setup_commands: Vec::new(),
             populate: Default::default(),
@@ -10697,6 +11036,7 @@ mod tests {
         };
         let batch = |sequential: bool| ProcessBatch {
             files: Vec::new(),
+            runtime_packages: Vec::new(),
             sequential,
             stop_on_error: false,
             sandbox_mode: ProcessSandboxMode::Unconfined,
@@ -10798,10 +11138,12 @@ mod tests {
                         os: os.into(),
                         arch: "x86_64".into(),
                         logical_cores: 8,
+                        concurrency_capacity: None,
                         toolchains: vec!["rust".into()],
                         projects_served: vec!["p".into()],
                         disk_budget_bytes: None,
                         memory_budget_bytes: None,
+                        sandbox: None,
                         toolchain_detection: None,
                     },
                     current_load: load,
@@ -10979,10 +11321,12 @@ mod tests {
                     os: "linux".into(),
                     arch: "x86_64".into(),
                     logical_cores: 8,
+                    concurrency_capacity: None,
                     toolchains: Vec::new(),
                     projects_served: Vec::new(),
                     disk_budget_bytes: None,
                     memory_budget_bytes: None,
+                    sandbox: None,
                     toolchain_detection: None,
                 },
             ),
@@ -11052,7 +11396,7 @@ mod tests {
         ];
 
         let request = spillable_request();
-        let (winner, _, _, _) = rank_candidates(
+        let (winner, _, _, _, _) = rank_candidates(
             &scored,
             false,
             true,
@@ -11147,7 +11491,7 @@ mod tests {
             ),
         ];
         let request = spillable_request();
-        let (winner, _, _, _) = rank_candidates(
+        let (winner, _, _, _, _) = rank_candidates(
             &scored,
             false,
             true,
@@ -11223,7 +11567,7 @@ mod tests {
         ];
         let request = spillable_request();
 
-        let (winner, _, changed, exploring) = rank_candidates(
+        let (winner, _, changed, exploring, _) = rank_candidates(
             &scored,
             false,
             true,
@@ -11239,7 +11583,7 @@ mod tests {
 
         let mut history = ExplorationState::default();
         history.record(Some(&fresh_id));
-        let (winner, _, _, exploring) = rank_candidates(
+        let (winner, _, _, exploring, _) = rank_candidates(
             &scored,
             false,
             true,
@@ -11253,7 +11597,7 @@ mod tests {
         for _ in 0..3 {
             history.record(None);
         }
-        let (winner, _, _, exploring) = rank_candidates(
+        let (winner, _, _, exploring, _) = rank_candidates(
             &scored,
             false,
             true,
@@ -11263,6 +11607,158 @@ mod tests {
         );
         assert_eq!(winner.unwrap().entry.identity.executor_id, fresh_id);
         assert!(exploring, "the fourth wave restores the exploration budget");
+    }
+
+    #[test]
+    fn equal_predictions_rotate_while_a_faster_prediction_remains_authoritative() {
+        let (first_id, mut first) = fleet_entry("first", "linux", 0, &[]);
+        let (second_id, mut second) = fleet_entry("second", "linux", 0, &[]);
+        measured(&mut first, 0.1, 8_000_000_000, 8_000_000_000);
+        measured(&mut second, 0.1, 8_000_000_000, 8_000_000_000);
+        let warmth = CacheWarmthEvidence::Observed {
+            warmth: ExecutionWarmth::Cold,
+            observed_at_unix_ms: NOW,
+        };
+        let queue = QueueForecast::Forecast {
+            predicted_ms: 0,
+            requests_ahead: 0,
+            running_ahead: 0,
+            fully_measured: true,
+            observed_at_unix_ms: NOW,
+        };
+        let mut learned = test_prior_duration();
+        learned.source = cairn_common::executor_protocol::DurationEvidence::Learned;
+        learned.sample_count = 20;
+        learned.fallback = None;
+        let predictions = [
+            placement_prediction(
+                &first,
+                warmth.clone(),
+                queue.clone(),
+                learned.clone(),
+                SyncCost::Known(0),
+            ),
+            placement_prediction(&second, warmth, queue, learned, SyncCost::Known(0)),
+        ];
+        let scored = vec![
+            ScoredCandidate::new(
+                &first,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[0].clone(),
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &second,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[1].clone(),
+                NOW,
+            ),
+        ];
+        let request = spillable_request();
+        let policy = ActivePlacementPolicy::default_profile();
+        let mut history = ExplorationState::default();
+        history.decisions_since_exploration = 0;
+
+        let (winner, _, _, _, tie_break) =
+            rank_candidates(&scored, false, true, &request, &policy, &history);
+        let first_winner = winner.unwrap().entry.identity.executor_id.clone();
+        assert_eq!(
+            tie_break.unwrap().deciding_reason,
+            "stable executor identity seeded recent-selection history"
+        );
+        history.record_selection(&first_winner);
+
+        let (winner, _, _, _, tie_break) =
+            rank_candidates(&scored, false, true, &request, &policy, &history);
+        let second_winner = winner.unwrap().entry.identity.executor_id.clone();
+        assert_ne!(first_winner, second_winner);
+        assert_eq!(
+            tie_break.unwrap().deciding_reason,
+            "least recently selected among candidates equal on every earlier placement key"
+        );
+        assert!([first_id.clone(), second_id.clone()].contains(&second_winner));
+
+        let mut faster = predictions[1].clone();
+        faster.predicted_verdict_ms = predictions[0].predicted_verdict_ms - 1;
+        faster.adjusted_run_ms = faster.adjusted_run_ms.saturating_sub(1);
+        let faster_scored = vec![
+            ScoredCandidate::new(
+                &first,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                predictions[0].clone(),
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &second,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                faster,
+                NOW,
+            ),
+        ];
+        history.record_selection(&second_id);
+        let (winner, _, _, _, tie_break) =
+            rank_candidates(&faster_scored, false, true, &request, &policy, &history);
+        assert_eq!(winner.unwrap().entry.identity.executor_id, second_id);
+        assert!(tie_break.is_none());
+
+        let mut faster_unmeasured = predictions[0].clone();
+        faster_unmeasured.run.profile_key = Some("check:rust".into());
+        faster_unmeasured.run.fallback = Some(DurationFallback::NoProfileRecorded);
+        let mut slower_unmeasured = predictions[1].clone();
+        slower_unmeasured.run.profile_key = Some("check:rust".into());
+        slower_unmeasured.run.fallback = Some(DurationFallback::NoProfileRecorded);
+        slower_unmeasured.predicted_verdict_ms += 10_000;
+        let bootstrap_scored = vec![
+            ScoredCandidate::new(
+                &first,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                faster_unmeasured,
+                NOW,
+            ),
+            ScoredCandidate::new(
+                &second,
+                SyncCost::Known(0),
+                None,
+                &ResourceReservation::default(),
+                slower_unmeasured,
+                NOW,
+            ),
+        ];
+        let mut bootstrap_history = ExplorationState::default();
+        bootstrap_history.record(Some(&first_id));
+        for _ in 0..3 {
+            bootstrap_history.record(None);
+        }
+        let (winner, _, _, exploring, evidence) = rank_candidates(
+            &bootstrap_scored,
+            false,
+            true,
+            &request,
+            &policy,
+            &bootstrap_history,
+        );
+        assert_eq!(
+            winner.unwrap().entry.identity.executor_id,
+            second_id,
+            "unexplored bootstrap capacity gets its turn even with a slower prior"
+        );
+        assert!(exploring);
+        let evidence = evidence.unwrap();
+        assert_eq!(
+            evidence.deciding_reason,
+            "least recently explored bootstrap candidate"
+        );
+        assert_eq!(evidence.candidates.len(), 2);
     }
 
     #[test]
@@ -11349,7 +11845,7 @@ mod tests {
         ];
         let request = spillable_request();
 
-        let (winner, _, _, exploring) = rank_candidates(
+        let (winner, _, _, exploring, _) = rank_candidates(
             &scored,
             false,
             true,
@@ -13242,7 +13738,7 @@ mod tests {
             },
             Some(cairn_common::executor_protocol::CellOwnerRef {
                 project_id: "p".into(),
-                project_key: Some("CAIRN".into()),
+                project_key: Some("cairn".into()),
                 issue_number: Some(1),
                 job_id: Some(job_id.into()),
                 execution_seq: Some(1),
@@ -13383,6 +13879,144 @@ mod tests {
             .unwrap();
         assert_eq!(selected.executor_id, "first");
         assert_eq!(request.repository, persisted_repository);
+    }
+
+    #[tokio::test]
+    async fn executor_restart_reconfigures_a_reacquired_live_residency() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let repository_path = temp.path().join("repository");
+        std::fs::create_dir_all(&repository_path).unwrap();
+        orch.db
+            .local
+            .execute_script(&format!(
+                "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
+                 VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
+                repository_path.to_string_lossy()
+            ))
+            .await
+            .unwrap();
+        let holder = ResidencyHolder::Job {
+            job_id: "survives-restart".into(),
+        };
+        let repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "p".into(),
+            absolute_path: repository_path.to_string_lossy().into_owned(),
+        };
+        let stale_incoming_repository = RepositoryLocator::ExistingCheckout {
+            project_id: "p".into(),
+            repository_id: "p".into(),
+            absolute_path: "/stale/caller/coordinate".into(),
+        };
+        assert_eq!(repository.identity(), stale_incoming_repository.identity());
+
+        let (first_sender, first_executor) = mpsc::unbounded_channel();
+        let first_generation = orch.fleet.attach_executor(first_sender);
+        orch.fleet.residency_routes.lock().unwrap().insert(
+            (COLOCATED_EXECUTOR_ID.into(), holder.storage_key()),
+            ResidencyRoute {
+                holder: holder.clone(),
+                repository: repository.clone(),
+                executor_id: COLOCATED_EXECUTOR_ID.into(),
+                pending: false,
+            },
+        );
+        drop(first_executor);
+
+        let (replacement_sender, mut replacement_executor) = mpsc::unbounded_channel();
+        let replacement_generation = orch.fleet.attach_executor(replacement_sender);
+        assert!(replacement_generation > first_generation);
+
+        let mut cell = materialization_read_cell("resident-cell", "survives-restart");
+        cell.project_id = "p".into();
+        cell.residency.as_mut().unwrap().repository = repository.clone();
+        assert!(orch.fleet.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            replacement_generation,
+            FleetSnapshot {
+                cells: vec![cell.clone()],
+                ..FleetSnapshot::default()
+            },
+            ExecutorSubstrateReport::default(),
+        ));
+        let answering_fleet = orch.fleet.clone();
+        let answer = tokio::spawn(async move {
+            let Some(ExecutorMessage::ResidencyRequest {
+                correlation_id,
+                config: ResidencyRuntimeConfig::Install(config),
+                operation: ResidencyOperation::Acquire { .. },
+            }) = replacement_executor.recv().await
+            else {
+                panic!("a restarted executor must receive config atomically with re-acquire");
+            };
+            assert_eq!(config.project_id, "p");
+            assert_eq!(config.project_key, "p");
+            answering_fleet.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                replacement_generation,
+                ExecutorMessage::ResidencyResponse {
+                    correlation_id,
+                    result: ResidencyResult::State { cell },
+                },
+            );
+        });
+
+        let mut request = fleet_residency_request(holder);
+        request.repository = stale_incoming_repository;
+        request.wait_horizon_unix_ms = unix_time_ms().saturating_add(5_000);
+        let result = orch
+            .fleet
+            .operate_residency(&orch, ResidencyOperation::Acquire { request })
+            .await;
+        answer.await.unwrap();
+        assert!(matches!(result, ResidencyResult::State { .. }));
+    }
+
+    #[tokio::test]
+    async fn executor_restart_configures_a_cell_in_the_submission_that_consumes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (first_sender, first_executor) = mpsc::unbounded_channel();
+        let first_generation = orch.fleet.attach_executor(first_sender);
+        drop(first_executor);
+
+        let (replacement_sender, mut replacement_executor) = mpsc::unbounded_channel();
+        let replacement_generation = orch.fleet.attach_executor(replacement_sender);
+        assert!(replacement_generation > first_generation);
+
+        let answering_fleet = orch.fleet.clone();
+        let answer = tokio::spawn(async move {
+            let Some(ExecutorMessage::Submit {
+                config,
+                request,
+                batch: None,
+            }) = replacement_executor.recv().await
+            else {
+                panic!("a cell must carry runtime config in its submission");
+            };
+            assert_eq!(config.project_id, request.project_id);
+            answering_fleet.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                replacement_generation,
+                ExecutorMessage::Result {
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    outcome: CellOutcome::Cancelled {
+                        request_id: request.request_id,
+                        attempt_id: request.attempt_id,
+                    },
+                },
+            );
+        });
+
+        let mut request = provenance_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        let result = orch.fleet.submit(&orch, request).await;
+        answer.await.unwrap();
+        assert!(matches!(result, CellOutcome::Cancelled { .. }));
     }
 
     #[test]
@@ -13771,7 +14405,7 @@ mod tests {
         request.executor.as_mut().unwrap().name = Some("remote".into());
         let config = ExecutorConfig {
             project_id: "p".into(),
-            project_key: "P".into(),
+            project_key: "p".into(),
             default_timeout_seconds: 5,
             setup_commands: Vec::new(),
             populate: cairn_worktree::PopulateConfig {
@@ -14497,6 +15131,7 @@ mod tests {
             residency: Some(residency),
             occupancy: CellOccupancy {
                 command: None,
+                command_ownership: None,
                 processes: std::collections::BTreeMap::from([(
                     "main".into(),
                     cairn_common::executor_protocol::ResidentProcess {
@@ -14741,6 +15376,7 @@ mod tests {
                 verdict_platform: None,
                 verdict_arch: None,
                 verdict_environment_hash: None,
+                sandbox: None,
                 toolchain_fingerprint: None,
             },
             mutation_delta: None,
@@ -14876,6 +15512,7 @@ mod tests {
                     cairn_common::executor_protocol::ResidentProcessStatus::Running {
                         started_at_unix_ms: 42,
                         process_group_id: None,
+                        ownership: None,
                     },
                 )],
                 ..Default::default()

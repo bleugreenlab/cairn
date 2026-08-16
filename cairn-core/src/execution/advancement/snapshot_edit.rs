@@ -228,7 +228,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
-             VALUES ('proj-1','w-1','P','CAIRN','/tmp/repo','main',1,1)",
+             VALUES ('proj-1','w-1','P','cairn','/tmp/repo','main',1,1)",
             (),
         )
         .await

@@ -273,7 +273,7 @@ mod tests {
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p','w','Project','PROJ','/tmp/repo',1,1);
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
             INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
               VALUES('job-1','p','running','sess-1',1,1);
             INSERT INTO sessions(id, job_id, status, created_at, updated_at)
@@ -350,7 +350,7 @@ mod tests {
             seed_prior_run(&db, launch_type).await;
             let orch = test_orchestrator(db);
 
-            let replayed = load_prior_chat_messages(&orch, "sess-1", "run-2", "p", "PROJ").unwrap();
+            let replayed = load_prior_chat_messages(&orch, "sess-1", "run-2", "p", "proj").unwrap();
 
             assert_eq!(
                 replayed.len(),

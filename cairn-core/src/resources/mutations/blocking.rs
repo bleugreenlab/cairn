@@ -635,27 +635,27 @@ mod blocking_group_tests {
     #[test]
     fn classifies_node_tasks_and_questions_appends() {
         assert_eq!(
-            blocking_append_kind(&append("cairn://p/CAIRN/1/1/builder/tasks")),
+            blocking_append_kind(&append("cairn://p/cairn/1/1/builder/tasks")),
             Some(BlockingKind::Tasks)
         );
         assert_eq!(
-            blocking_append_kind(&append("cairn://p/CAIRN/1/1/builder/questions")),
+            blocking_append_kind(&append("cairn://p/cairn/1/1/builder/questions")),
             Some(BlockingKind::Questions)
         );
         assert_eq!(
-            blocking_append_kind(&append("cairn://p/CAIRN/design-review/tasks")),
+            blocking_append_kind(&append("cairn://p/cairn/design-review/tasks")),
             Some(BlockingKind::Tasks)
         );
         assert_eq!(
-            blocking_append_kind(&append("cairn://p/CAIRN/design-review/questions")),
+            blocking_append_kind(&append("cairn://p/cairn/design-review/questions")),
             Some(BlockingKind::Questions)
         );
         // Non-collection or non-append targets are not blocking.
         assert_eq!(
-            blocking_append_kind(&append("cairn://p/CAIRN/1/messages")),
+            blocking_append_kind(&append("cairn://p/cairn/1/messages")),
             None
         );
-        let mut create = append("cairn://p/CAIRN/1/1/builder/tasks");
+        let mut create = append("cairn://p/cairn/1/1/builder/tasks");
         create.mode = ChangeMode::Create;
         assert_eq!(blocking_append_kind(&create), None);
     }
@@ -663,29 +663,29 @@ mod blocking_group_tests {
     #[test]
     fn validates_group_combinations() {
         let tasks = vec![
-            append("cairn://p/CAIRN/1/1/builder/tasks"),
-            append("cairn://p/CAIRN/1/1/builder/tasks"),
+            append("cairn://p/cairn/1/1/builder/tasks"),
+            append("cairn://p/cairn/1/1/builder/tasks"),
         ];
         assert_eq!(
             validate_blocking_group(&tasks, &[0, 1]).unwrap(),
             Some(BlockingKind::Tasks)
         );
 
-        let question = vec![append("cairn://p/CAIRN/1/1/builder/questions")];
+        let question = vec![append("cairn://p/cairn/1/1/builder/questions")];
         assert_eq!(
             validate_blocking_group(&question, &[0]).unwrap(),
             Some(BlockingKind::Questions)
         );
 
         let mixed = vec![
-            append("cairn://p/CAIRN/1/1/builder/tasks"),
-            append("cairn://p/CAIRN/1/1/builder/questions"),
+            append("cairn://p/cairn/1/1/builder/tasks"),
+            append("cairn://p/cairn/1/1/builder/questions"),
         ];
         assert!(validate_blocking_group(&mixed, &[0, 1]).is_err());
 
         let two_questions = vec![
-            append("cairn://p/CAIRN/1/1/builder/questions"),
-            append("cairn://p/CAIRN/1/1/builder/questions"),
+            append("cairn://p/cairn/1/1/builder/questions"),
+            append("cairn://p/cairn/1/1/builder/questions"),
         ];
         assert!(validate_blocking_group(&two_questions, &[0, 1]).is_err());
 
@@ -752,7 +752,7 @@ mod blocking_group_tests {
     #[test]
     fn classifies_node_calls_append() {
         assert_eq!(
-            blocking_append_kind(&append("cairn://p/CAIRN/1/1/builder/calls")),
+            blocking_append_kind(&append("cairn://p/cairn/1/1/builder/calls")),
             Some(BlockingKind::Calls)
         );
     }
@@ -760,8 +760,8 @@ mod blocking_group_tests {
     #[test]
     fn validate_blocking_group_calls_only_and_mixes() {
         let calls = vec![
-            append("cairn://p/CAIRN/1/1/builder/calls"),
-            append("cairn://p/CAIRN/1/1/builder/calls"),
+            append("cairn://p/cairn/1/1/builder/calls"),
+            append("cairn://p/cairn/1/1/builder/calls"),
         ];
         assert_eq!(
             validate_blocking_group(&calls, &[0, 1]).unwrap(),
@@ -770,13 +770,13 @@ mod blocking_group_tests {
 
         // Mixing calls with tasks or questions is rejected.
         let call_task = vec![
-            append("cairn://p/CAIRN/1/1/builder/calls"),
-            append("cairn://p/CAIRN/1/1/builder/tasks"),
+            append("cairn://p/cairn/1/1/builder/calls"),
+            append("cairn://p/cairn/1/1/builder/tasks"),
         ];
         assert!(validate_blocking_group(&call_task, &[0, 1]).is_err());
         let call_question = vec![
-            append("cairn://p/CAIRN/1/1/builder/calls"),
-            append("cairn://p/CAIRN/1/1/builder/questions"),
+            append("cairn://p/cairn/1/1/builder/calls"),
+            append("cairn://p/cairn/1/1/builder/questions"),
         ];
         assert!(validate_blocking_group(&call_question, &[0, 1]).is_err());
     }
@@ -825,20 +825,20 @@ mod blocking_group_tests {
     #[test]
     fn node_tasks_coords_extracts_addressed_node() {
         assert_eq!(
-            node_tasks_coords("cairn://p/CAIRN/1295/1/builder/tasks"),
-            Some(("CAIRN".to_string(), 1295, 1, "builder".to_string()))
+            node_tasks_coords("cairn://p/cairn/1295/1/builder/tasks"),
+            Some(("cairn".to_string(), 1295, 1, "builder".to_string()))
         );
         // Query strings on the target do not break extraction.
         assert_eq!(
-            node_tasks_coords("cairn://p/CAIRN/42/2/planner/tasks?limit=5"),
-            Some(("CAIRN".to_string(), 42, 2, "planner".to_string()))
+            node_tasks_coords("cairn://p/cairn/42/2/planner/tasks?limit=5"),
+            Some(("cairn".to_string(), 42, 2, "planner".to_string()))
         );
         // Non-tasks targets yield no coordinates.
         assert_eq!(
-            node_tasks_coords("cairn://p/CAIRN/1/1/builder/questions"),
+            node_tasks_coords("cairn://p/cairn/1/1/builder/questions"),
             None
         );
-        assert_eq!(node_tasks_coords("cairn://p/CAIRN/1/messages"), None);
+        assert_eq!(node_tasks_coords("cairn://p/cairn/1/messages"), None);
     }
 
     /// Seed a minimal project/issue/execution with two sibling node jobs
@@ -874,7 +874,7 @@ mod blocking_group_tests {
         exec(
             &db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-1', 'default', 'Test', 'MCP', '/tmp/repo', 1, 1)",
+             VALUES ('proj-1', 'default', 'Test', 'mcp', '/tmp/repo', 1, 1)",
         )
         .await;
         exec(
@@ -910,8 +910,8 @@ mod blocking_group_tests {
         )
         .await;
 
-        let builder = node_tasks_coords("cairn://p/MCP/1/1/builder/tasks").unwrap();
-        let coordinator = node_tasks_coords("cairn://p/MCP/1/1/coordinator/tasks").unwrap();
+        let builder = node_tasks_coords("cairn://p/mcp/1/1/builder/tasks").unwrap();
+        let coordinator = node_tasks_coords("cairn://p/mcp/1/1/coordinator/tasks").unwrap();
 
         // Cross-node: the builder URI, issued by the coordinator caller, resolves
         // to the BUILDER's job (the fix) and routes cross-node — i.e. it would
@@ -938,7 +938,7 @@ mod blocking_group_tests {
 
         // A nonexistent target surfaces a clear error rather than a silent
         // fallback to the caller's node.
-        let ghost = node_tasks_coords("cairn://p/MCP/1/1/ghost/tasks").unwrap();
+        let ghost = node_tasks_coords("cairn://p/mcp/1/1/ghost/tasks").unwrap();
         let err = resolve_task_routing(&db, "run-coord", std::slice::from_ref(&ghost))
             .await
             .unwrap_err();
@@ -955,7 +955,7 @@ mod blocking_group_tests {
         ] {
             exec(&db, sql).await;
         }
-        let renamed = node_tasks_coords("cairn://p/MCP/channels/tasks").unwrap();
+        let renamed = node_tasks_coords("cairn://p/mcp/channels/tasks").unwrap();
         let renamed_route = resolve_task_routing(&db, "run-thread", &[renamed])
             .await
             .unwrap();

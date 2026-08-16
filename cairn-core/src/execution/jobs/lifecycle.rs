@@ -776,6 +776,7 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 "update",
                 &job.id,
                 job.issue_id.as_deref(),
+                job.thread_id.as_deref(),
                 job.execution_id.as_deref(),
                 job.parent_job_id.as_deref(),
                 job.parent_tool_use_id.as_deref(),
@@ -1455,6 +1456,27 @@ pub fn in_flight_launch_for_test(
     in_flight_launch(orch, job_id).map(|run| run.map(|run| run.id))
 }
 
+/// Launch watchdog recovery while its caller holds this job's launch lock.
+///
+/// This deliberately skips the public funnel's second lock acquisition. The
+/// recovery caller performs its claim-epoch and exact-head compare-and-set under
+/// the same guard immediately before entering here.
+pub(crate) fn continue_job_launch_locked_for_watchdog(
+    orch: &Orchestrator,
+    job_id: &str,
+    prompt_resume: Option<ResumeContext>,
+) -> Result<Run, String> {
+    continue_job_launch_locked(
+        orch,
+        job_id,
+        None,
+        None,
+        prompt_resume,
+        ContinuationIntent::Normal,
+        std::time::Instant::now(),
+    )
+}
+
 fn continue_job_launch_locked(
     orch: &Orchestrator,
     job_id: &str,
@@ -1481,7 +1503,7 @@ fn continue_job_launch_locked(
     event.emit();
 
     // ---- Load job -------------------------------------------------------
-    let (job, project_id, issue_id, project_path) = run_db(load_job_context(
+    let (mut job, project_id, issue_id, project_path) = run_db(load_job_context(
         owning_db.clone(),
         orch.db.clone(),
         job_id.to_string(),
@@ -1551,6 +1573,31 @@ fn continue_job_launch_locked(
             log::warn!("Failed to transition job {} to running: {}", job_id, e);
         }
     }
+
+    // ---- Host agent snapshot ---------------------------------------------
+    // A run's fence and sandbox policy resolve through job → execution →
+    // snapshot → the job's own agent, so a job whose agent appears in no
+    // snapshot cannot be granted anything. This is the one funnel a turn can
+    // start from, which makes guaranteeing the snapshot here both the invariant
+    // (nothing can start a turn around it) and the backfill (a thread that
+    // predates this repairs itself on its next turn, with no migration). It must
+    // precede `load_agent_config` so the turn runs on what the ensure just
+    // wrote.
+    //
+    // This refuses the resume rather than logging and continuing. Launching
+    // anyway would not be graceful degradation: `load_agent_config` falls back to
+    // the live config files and would happily start the turn, which then refuses
+    // every `run` batch with the unresolvable-fence error this exists to make
+    // impossible — the failure moved out of the launch, where it is legible, and
+    // into the agent's tool calls, where it is not. The ensure only fails when it
+    // could not establish the invariant; a snapshot that already exists is
+    // returned without consulting the agent files at all.
+    job.execution_id = run_db_borrowed(ensure_host_agent_snapshot(
+        orch,
+        &job,
+        project_path.as_deref(),
+        SnapshotFreshness::for_job(&job),
+    ))?;
 
     let agent_config = load_agent_config(orch, &job, project_path.as_deref())?;
     let process_residence = crate::scratch::ensure_job_scratch_dir(job_id, None);
@@ -1757,12 +1804,38 @@ fn continue_job_launch_locked(
             // "Session cf7a2f00 is Closed and cannot be continued", which told
             // them nothing they could act on (CAIRN-3253).
             SessionStatus::Closed => {
-                return Err(match session.terminal_reason.as_deref() {
+                if session.terminal_reason.as_deref()
+                    == Some(crate::orchestrator::lifecycle::ALREADY_TERMINAL_RECONCILED_REASON)
+                    && run_db(needs_fresh_session(owning_db.clone(), job_id.to_string()))?
+                {
+                    let new_session = run_db({
+                        let db = owning_db.clone();
+                        let session = session.clone();
+                        let job_id = job_id.to_string();
+                        let emitter = orch.services.emitter.clone();
+                        async move {
+                            crate::sessions::queries::rotate_watchdog_reconciled_job_session(
+                                db.as_ref(),
+                                &session,
+                                &job_id,
+                                emitter.as_ref(),
+                            )
+                            .await
+                        }
+                    })?;
+                    let session_start = crate::backends::SessionStart::New {
+                        session_id: new_session.id.clone(),
+                    };
+                    let run_start_mode = run_start_mode(&session_start).to_string();
+                    (new_session.id, session_start, run_start_mode)
+                } else {
+                    return Err(match session.terminal_reason.as_deref() {
                     Some("issue_merged") => "This node's issue has been merged, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog) and start a new execution on it.".to_string(),
                     Some("issue_closed") => "This node's issue has been closed, which stopped its work and closed its session, so it cannot take another turn. To pick the work back up, reopen the issue (set its status to backlog) and start a new execution on it.".to_string(),
                     Some("node_removed") => "This node was removed from its execution, which closed its session, so it cannot take another turn. Add the node back to the execution to run it again.".to_string(),
                     _ => "This node's session has been closed, so it cannot take another turn. Start a new execution on the issue to carry the work forward.".to_string(),
-                });
+                    });
+                }
             }
             SessionStatus::Failed => {
                 return Err("This node's session ended in a failure, so it cannot take another turn. Start a new execution on the issue to carry the work forward.".to_string());
@@ -1996,16 +2069,28 @@ fn continue_job_launch_locked(
     event.emit();
     // Persist the same compact content the agent received alongside the wake-card
     // payload. The detail modal retains the summary and canonical resource links.
-    let push_summary = if has_pushes {
-        Some(
-            crate::orchestrator::attention_push::push_event_content_json(
-                &drained_pushes,
-                push_prompt.as_deref().unwrap_or_default(),
-            ),
+    let push_summary =
+        if has_pushes {
+            Some(
+            crate::storage::run_db_blocking({
+                let db = owning_db.clone();
+                let pushes = drained_pushes.clone();
+                let resolved = push_prompt.clone().unwrap_or_default();
+                move || async move {
+                    crate::orchestrator::attention_push::push_event_content_json_with_resolutions(
+                        &db, &pushes, &resolved,
+                    ).await.map_err(|error| error.to_string())
+                }
+            }).unwrap_or_else(|error| {
+                log::warn!("Failed to resolve resume push receipts: {}", error);
+                crate::orchestrator::attention_push::push_event_content_json(
+                    &drained_pushes, push_prompt.as_deref().unwrap_or_default(),
+                )
+            }),
         )
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let trigger = resolve_resume_trigger(message, has_queued, has_pushes);
     let base_prompt = resolve_skill_slash_command(orch, &trigger.message, project_path.as_deref());
     let side_channel_notices =
@@ -3357,7 +3442,7 @@ mod tests {
 
     #[test]
     fn wake_coordinate_parser_distinguishes_nested_tasks() {
-        match push_job_coordinate("cairn://p/CAIRN/42/2/builder/task/review-rust/checks") {
+        match push_job_coordinate("cairn://p/cairn/42/2/builder/task/review-rust/checks") {
             Some(PushJobCoordinate::Task {
                 project,
                 number,
@@ -3373,12 +3458,12 @@ mod tests {
                         node.as_str(),
                         task.as_str()
                     ),
-                    ("CAIRN", 42, 2, "builder", "review-rust")
+                    ("cairn", 42, 2, "builder", "review-rust")
                 );
             }
             other => panic!("expected task coordinate, got {other:?}"),
         }
-        assert!(push_job_coordinate("cairn://p/CAIRN/42").is_none());
+        assert!(push_job_coordinate("cairn://p/cairn/42").is_none());
         assert!(push_job_coordinate("not-a-cairn-uri").is_none());
     }
 
@@ -3388,7 +3473,7 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p','w','P','P','/tmp/p',1,1);
+               VALUES('p','w','P','p','/tmp/p',1,1);
              INSERT INTO jobs(id, project_id, status, needs_fresh_session, created_at, updated_at)
                VALUES('j','p','blocked',1,1,1);",
         )
@@ -3414,7 +3499,7 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p','w','P','P','/tmp/p',1,1);
+               VALUES('p','w','P','p','/tmp/p',1,1);
              INSERT INTO jobs(id, project_id, status, needs_fresh_session, created_at, updated_at)
                VALUES('j','p','blocked',1,1,1);",
         )
@@ -3439,7 +3524,7 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p','w','P','P','/tmp/p',1,1);
+               VALUES('p','w','P','p','/tmp/p',1,1);
              INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
                VALUES('j','p','running','s',1,1);
              INSERT INTO sessions(id, job_id, backend, status, created_at, updated_at)

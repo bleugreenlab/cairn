@@ -133,8 +133,8 @@ impl Orchestrator {
     /// `reconcile_team_routes` seeds the team's `is_workspace` `projects` row and
     /// a path-LESS `project_routes` stub, so until this runs the middle config
     /// layer is always absent (the route has no `local_repo_path`). This seeds a
-    /// remoteless git repo at `<config_dir>/teams/<team>/workspace` — an exact
-    /// twin of `~/.cairn` via [`sync_workspace_packs`] — then fills that route's
+    /// machine-local config home at `<config_dir>/teams/<team>/workspace` — an
+    /// exact twin of `~/.cairn` via [`sync_workspace_packs`] — then fills that route's
     /// clone path under the team-scoped [`team_workspace_key`]. Idempotent: a
     /// re-run only re-syncs the bundle and re-asserts the same route.
     ///
@@ -152,8 +152,8 @@ impl Orchestrator {
             .join("workspace");
         let key = crate::projects::crud::team_workspace_key(team_id);
 
-        // Seed the remoteless bundle twin BEFORE recording the route, so a
-        // resolved clone path always points at an initialized repo.
+        // Seed the bundle twin BEFORE recording the route, so a resolved clone
+        // path always points at a materialized config home.
         crate::workspace::bundle::sync_workspace_packs(
             &crate::services::RealGitClient,
             &crate::services::RealFileSystem,
@@ -1117,7 +1117,7 @@ mod tests {
                 ).await?;
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                     VALUES ('project', 'default', 'Project', 'PROJ', '/tmp/project', 1, 1, 0)",
+                     VALUES ('project', 'default', 'Project', 'proj', '/tmp/project', 1, 1, 0)",
                     (),
                 ).await?;
                 Ok(())
@@ -1325,7 +1325,7 @@ mod tests {
         }).await.unwrap();
 
         // Private route: the workspace project's (team-scoped) key -> its
-        // machine-local clone. Routes are stored upper-cased, as reconcile and
+        // machine-local clone. Routes are stored canonically, as reconcile and
         // `resolve_local_repo_path` both normalize the key. A NULL route team_id
         // is fine here (the clone lookup keys on `project_key` only) and sidesteps
         // the private `teams` registry FK.
@@ -1333,7 +1333,7 @@ mod tests {
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, local_repo_path, created_at)
-                 VALUES ('WORKSPACE-TEAM1', NULL, ?1, 1)",
+                 VALUES ('workspace-team1', NULL, ?1, 1)",
                 (team_ws_str.as_str(),),
             )
             .await
@@ -1534,7 +1534,7 @@ mod tests {
                 ).await?;
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                     VALUES ('team1~00000000-0000-4000-8000-0000000000ff', 'default', 'Team Workspace', 'WORKSPACE-TEAM1', '', 1, 1, 1)",
+                     VALUES ('team1~00000000-0000-4000-8000-0000000000ff', 'default', 'Team Workspace', 'workspace-team1', '', 1, 1, 1)",
                     (),
                 ).await?;
                 Ok(())
@@ -1547,7 +1547,7 @@ mod tests {
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, created_at)
-                 VALUES ('WORKSPACE-TEAM1', NULL, 1)",
+                 VALUES ('workspace-team1', NULL, 1)",
                 (),
             )
             .await
@@ -1569,11 +1569,8 @@ mod tests {
         // Materialize.
         let got = orch.ensure_team_workspace(&resource_dir, team_id).unwrap();
         assert_eq!(got, expected_ws);
-        // The bundle twin exists on disk as a git repo carrying the seeded agent.
-        assert!(
-            expected_ws.join(".git").exists(),
-            "workspace repo initialized"
-        );
+        // The bundle twin exists on disk as a config home carrying the seeded agent.
+        assert!(expected_ws.is_dir(), "workspace config home initialized");
         assert!(
             expected_ws.join("agents").join("example.md").exists(),
             "bundled agent seeded into the team workspace clone"
@@ -1629,7 +1626,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                     VALUES ('team1~00000000-0000-4000-8000-0000000000ff', 'default', 'Team Workspace', 'WORKSPACE-TEAM1', '', 1, 1, 1)",
+                     VALUES ('team1~00000000-0000-4000-8000-0000000000ff', 'default', 'Team Workspace', 'workspace-team1', '', 1, 1, 1)",
                     (),
                 ).await?;
                 Ok(())
@@ -1638,7 +1635,7 @@ mod tests {
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, created_at)
-                 VALUES ('WORKSPACE-TEAM1', NULL, 1)",
+                 VALUES ('workspace-team1', NULL, 1)",
                 (),
             )
             .await
@@ -1784,7 +1781,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                     VALUES ('team1~00000000-0000-4000-8000-0000000000ff', 'default', 'Team Workspace', 'WORKSPACE-TEAM1', '', 1, 1, 1)",
+                     VALUES ('team1~00000000-0000-4000-8000-0000000000ff', 'default', 'Team Workspace', 'workspace-team1', '', 1, 1, 1)",
                     (),
                 ).await?;
                 Ok(())
@@ -1793,7 +1790,7 @@ mod tests {
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, created_at)
-                 VALUES ('WORKSPACE-TEAM1', NULL, 1)",
+                 VALUES ('workspace-team1', NULL, 1)",
                 (),
             )
             .await
@@ -1929,11 +1926,11 @@ mod tests {
             })
         }).await.unwrap();
 
-        // Distinct, non-colliding routes (upper-cased team-scoped keys).
+        // Distinct, non-colliding canonical team-scoped routes.
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, local_repo_path, created_at)
-                 VALUES ('WORKSPACE-TEAMAAA', NULL, ?1, 1)",
+                 VALUES ('workspace-teamaaa', NULL, ?1, 1)",
                 (ws_a.to_str().unwrap(),),
             )
             .await
@@ -1941,7 +1938,7 @@ mod tests {
         local
             .execute(
                 "INSERT INTO project_routes(project_key, team_id, local_repo_path, created_at)
-                 VALUES ('WORKSPACE-TEAMBBB', NULL, ?1, 1)",
+                 VALUES ('workspace-teambbb', NULL, ?1, 1)",
                 (ws_b.to_str().unwrap(),),
             )
             .await
@@ -2087,7 +2084,7 @@ mod tests {
         // The workspace config dir is a git repo, as CAIRN-1468 makes ~/.cairn.
         assert!(git(&["init", "-q"], &config_dir).status.success());
         // Unrelated dirty state in the same repo must survive every commit.
-        std::fs::write(config_dir.join("settings.yaml"), "activeBackend: x\n").unwrap();
+        std::fs::write(config_dir.join("settings.yaml"), "tiers: [sm]\n").unwrap();
 
         let db = LocalDb::open(root.join("test.db")).await.unwrap();
         MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
@@ -2247,7 +2244,7 @@ mod tests {
             Box::pin(async move {
                 conn.execute(
                     "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
-                     VALUES ('project', 'default', 'Project', 'PROJ', ?1, 1, 1, 0)",
+                     VALUES ('project', 'default', 'Project', 'proj', ?1, 1, 1, 0)",
                     (repo_path.as_str(),),
                 ).await?;
                 Ok(())

@@ -18,7 +18,7 @@ use crate::config::mcp_servers::{
     upsert_workspace_mcp_server, McpServerConfig, OAuthServerConfig,
 };
 use crate::config::mcp_tools::{self, ToolScope};
-use crate::config::project_settings::load_project_settings;
+use crate::config::project_settings::load_project_settings_read_only;
 use crate::mcp::handlers::skills_resources;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
@@ -216,6 +216,8 @@ fn base_config() -> McpServerConfig {
         // the resource mutation surface does not offer them, so a server
         // created here starts with the keychain as its only declaration.
         secrets: Vec::new(),
+        cwd: None,
+        agent_plugin_runtime: None,
     }
 }
 
@@ -380,7 +382,7 @@ async fn existing_servers(
         McpWriteScope::Workspace => Ok(mcp_servers::load_workspace_mcp_servers(&orch.config_dir)),
         McpWriteScope::Project => {
             let project_path = resolve_project_path(orch, request).await?;
-            Ok(load_project_settings(&project_path)
+            Ok(load_project_settings_read_only(&project_path)
                 .mcp_servers
                 .unwrap_or_default())
         }

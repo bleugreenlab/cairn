@@ -269,7 +269,7 @@ mod tests {
         db.execute_script(
             "
             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-1', 'default', 'Test Project', 'PROJ', '/tmp/test-repo', 1, 1);
+             VALUES ('proj-1', 'default', 'Test Project', 'proj', '/tmp/test-repo', 1, 1);
             INSERT INTO issues (id, project_id, number, title, created_at, updated_at)
              VALUES ('issue-1', 'proj-1', 42, 'test issue', 1, 1);
             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -296,11 +296,11 @@ mod tests {
             .expect("sub-task job context");
 
         assert_eq!(ctx.node_name, "review");
-        assert_eq!(ctx.issue_key, "PROJ/42");
+        assert_eq!(ctx.issue_key, "proj/42");
         assert_eq!(
             ctx.uri.as_deref(),
-            Some("cairn://p/PROJ/42/1/builder/task/review"),
-            "sub-task URI must nest under its parent (was the bug — it used to be cairn://p/PROJ/42/1/review)"
+            Some("cairn://p/proj/42/1/builder/task/review"),
+            "sub-task URI must nest under its parent (was the bug — it used to be cairn://p/proj/42/1/review)"
         );
     }
 
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(ctx.node_name, "builder");
         assert_eq!(
             ctx.uri.as_deref(),
-            Some("cairn://p/PROJ/42/1/builder"),
+            Some("cairn://p/proj/42/1/builder"),
             "top-level job URI shape must not regress from the parent-join change"
         );
     }

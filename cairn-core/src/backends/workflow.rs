@@ -234,6 +234,7 @@ pub(crate) async fn spawn_workflow_process(
                     source: ResourceReservationSource::Declared,
                 }),
                 process: ResidentProcessSpec {
+                    runtime_packages: Vec::new(),
                     program: "bun".into(),
                     args: vec!["-e".into(), loader],
                     cwd: if params.branch_mode == "inherit" {
@@ -324,82 +325,20 @@ pub(crate) async fn spawn_workflow_process(
 
 fn workflow_runtime_assets(package: &Path) -> Result<Vec<ResidentRuntimeAsset>, String> {
     let mut assets = Vec::new();
-    collect_assets(package, Path::new("workflow"), &mut assets)?;
-    collect_assets(
-        &workflow_runtime_package("harness")?,
+    crate::runtime::collect_package_assets(package, Path::new("workflow"), &mut assets)?;
+    crate::runtime::collect_package_assets(
+        &crate::runtime::runtime_package("harness")?,
         Path::new("workflow/node_modules/@cairn/harness"),
         &mut assets,
     )?;
-    collect_assets(
-        &workflow_runtime_package("sdk")?,
+    crate::runtime::collect_package_assets(
+        &crate::runtime::runtime_package("sdk")?,
         Path::new("workflow/node_modules/@cairn/sdk"),
         &mut assets,
     )?;
-    let total = assets.iter().map(|asset| asset.data.len()).sum::<usize>();
-    if assets.len() > cairn_common::executor_protocol::MAX_RESIDENT_RUNTIME_ASSETS
-        || total > cairn_common::executor_protocol::MAX_RESIDENT_RUNTIME_ASSETS_BYTES
-        || assets.iter().any(|asset| {
-            asset.data.len() > cairn_common::executor_protocol::MAX_RESIDENT_RUNTIME_ASSET_BYTES
-        })
-    {
-        return Err(
-            "workflow package and runtime exceed executor runtime-asset limits".to_string(),
-        );
-    }
+    cairn_common::runtime::validate_runtime_assets(&assets)
+        .map_err(|error| format!("workflow package and runtime rejected: {error}"))?;
     Ok(assets)
-}
-
-fn workflow_runtime_package(name: &str) -> Result<PathBuf, String> {
-    if let Some(installed) =
-        installed_workflow_runtime_package(&cairn_common::paths::cairn_home(), name)
-    {
-        return Ok(installed);
-    }
-    #[cfg(debug_assertions)]
-    {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let repo = manifest
-            .ancestors()
-            .nth(4)
-            .ok_or("cannot locate Cairn development repository root")?;
-        let dev = repo.join("packages").join(name);
-        if dev.join("package.json").is_file() {
-            return Ok(dev);
-        }
-    }
-    Err(format!(
-        "Cairn workflow runtime package @cairn/{name} is not installed under CAIRN_HOME/runtime/node_modules"
-    ))
-}
-
-fn installed_workflow_runtime_package(home: &Path, name: &str) -> Option<PathBuf> {
-    let installed = home.join("runtime/node_modules/@cairn").join(name);
-    if installed.join("package.json").is_file() {
-        Some(installed)
-    } else {
-        None
-    }
-}
-
-fn collect_assets(
-    source: &Path,
-    destination: &Path,
-    out: &mut Vec<ResidentRuntimeAsset>,
-) -> Result<(), String> {
-    for entry in std::fs::read_dir(source).map_err(|e| format!("read {}: {e}", source.display()))? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let target = destination.join(entry.file_name());
-        let ty = entry.file_type().map_err(|e| e.to_string())?;
-        if ty.is_dir() {
-            collect_assets(&entry.path(), &target, out)?;
-        } else if ty.is_file() {
-            out.push(ResidentRuntimeAsset {
-                path: target.to_string_lossy().replace('\\', "/"),
-                data: std::fs::read(entry.path()).map_err(|e| e.to_string())?,
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Drop a workflow run's durable spawn record (private, runner-transient) once
@@ -486,23 +425,5 @@ fn finalize_workflow_run(
 
     if let Ok(mut processes) = orch.process_state.processes.lock() {
         processes.remove(run_id);
-    }
-}
-
-#[cfg(test)]
-mod runtime_asset_tests {
-    use super::*;
-
-    #[test]
-    fn installed_runtime_resolves_without_a_source_checkout() {
-        let temp = tempfile::tempdir().unwrap();
-        let package = temp.path().join("runtime/node_modules/@cairn/harness");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("package.json"), "{}").unwrap();
-
-        assert_eq!(
-            installed_workflow_runtime_package(temp.path(), "harness"),
-            Some(package)
-        );
     }
 }

@@ -445,11 +445,11 @@ mod tests {
 
     #[test]
     fn resource_job_for_nonempty_text() {
-        let job = EmbedJob::resource("cairn://p/PROJ/1", "hello".to_string());
+        let job = EmbedJob::resource("cairn://p/proj/1", "hello".to_string());
         assert_eq!(
             job,
             EmbedJob::Resource {
-                uri: "cairn://p/PROJ/1".to_string(),
+                uri: "cairn://p/proj/1".to_string(),
                 text: "hello".to_string(),
             }
         );
@@ -458,9 +458,9 @@ mod tests {
     #[test]
     fn resource_job_empty_text_becomes_delete() {
         assert_eq!(
-            EmbedJob::resource("cairn://p/PROJ/1", String::new()),
+            EmbedJob::resource("cairn://p/proj/1", String::new()),
             EmbedJob::ResourceDelete {
-                uri: "cairn://p/PROJ/1".to_string(),
+                uri: "cairn://p/proj/1".to_string(),
             }
         );
     }

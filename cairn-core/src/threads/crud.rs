@@ -205,6 +205,13 @@ pub async fn update(db: &LocalDb, input: UpdateThread) -> Result<Thread, CairnEr
 /// another provider must not reinterpret the model stored here (CAIRN-3798). The
 /// model menu offers only runtime-representable selections, so the name a thread
 /// stores always carries its provider.
+///
+/// This column stays the authoritative launch fact even though a thread now also
+/// carries an agent snapshot on its host execution. The snapshot's `selection` is
+/// DERIVED from this column: an unedited host snapshot re-resolves every turn
+/// (`execution::jobs::ensure_host_agent_snapshot`), so writing here alone is what
+/// makes the two agree instead of compete, and there is no second write path to
+/// keep in step.
 pub(crate) async fn set_session_model_conn(
     conn: &cairn_db::turso::Connection,
     thread_id: &str,
@@ -428,7 +435,7 @@ mod tests {
             "artifacts": ["arc"],
             "triggers": [{
                 "fact": "attention",
-                "detailUri": "cairn://p/PROJECT-A/9",
+                "detailUri": "cairn://p/project-a/9",
                 "status": ["merged", "closed", "failed"]
             }]
         })
@@ -671,7 +678,7 @@ mod tests {
              INSERT INTO thread_compactions(job_id, generation, source_session_id, recency_start_block, source_bytes, candidate_bytes, trigger, created_at)
              VALUES ('job-1', 1, 'session-1', 0, 10, 5, 'manual', 1);
              INSERT INTO thread_compaction_entries(job_id, generation, position, source_kind, overview, content_uri, start_block, end_block)
-             VALUES ('job-1', 1, 1, 'interstitial', 'summary', 'cairn://p/P/1', 0, 1);
+             VALUES ('job-1', 1, 1, 'interstitial', 'summary', 'cairn://p/p/1', 0, 1);
              UPDATE jobs SET current_turn_id = 'turn-1', resume_session_id = 'session-1' WHERE id = 'job-1';",
             thread.id, thread.id, thread.id, thread.id
         ))

@@ -769,7 +769,7 @@ mod tests {
             .write(|conn| {
                 Box::pin(async move {
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-brw', 'default', 'Browsers', 'brw', '/tmp/brw', 1, 1)",
                         (),
                     )
                     .await?;
@@ -803,7 +803,7 @@ mod tests {
 
     fn default_browser() -> CairnResource {
         CairnResource::ProjectBrowser {
-            project: "BRW".into(),
+            project: "brw".into(),
             slug: "default".into(),
         }
     }

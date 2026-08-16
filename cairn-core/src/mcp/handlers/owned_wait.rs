@@ -567,7 +567,7 @@ mod tests {
             .unwrap();
         for sql in [
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id,project_id,number,title,status,created_at,updated_at) VALUES ('i','p',1,'T','active',1,1)",
             "INSERT INTO executions (id,recipe_id,issue_id,project_id,status,started_at,seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id,execution_id,issue_id,project_id,node_name,status,created_at,updated_at,uri_segment) VALUES ('job-1','e','i','p','Builder','running',1,1,'builder')",
@@ -645,7 +645,7 @@ mod tests {
             (
                 "checks settled wait, suite omitted",
                 serde_json::json!({
-                    "waitFor":{"kind":"checks","ref":"cairn://p/CAIRN/3427/1/builder/checks","on":"settled"}
+                    "waitFor":{"kind":"checks","ref":"cairn://p/cairn/3427/1/builder/checks","on":"settled"}
                 }),
             ),
             (
@@ -844,7 +844,7 @@ mod tests {
             orch.db.local.clone(),
             record(
                 Condition::Terminal {
-                    uri: "cairn://p/PRJ/1/1/builder/terminal/tests".into(),
+                    uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
                     slug: "tests".into(),
                     on: TerminalWaitEvent::Output,
                     phrase: Some("ready".into()),
@@ -922,7 +922,7 @@ mod tests {
             statuses,
             terminal_reason: Some("issue merged before submission".to_string()),
         };
-        let uri = "cairn://p/CAIRN/3427/1/builder/checks";
+        let uri = "cairn://p/cairn/3427/1/builder/checks";
         let value: serde_json::Value =
             serde_json::from_str(&settled_result(uri, None, &snapshot, 1234)).unwrap();
 
@@ -978,7 +978,7 @@ mod tests {
             orch.db.local.clone(),
             record(
                 Condition::Terminal {
-                    uri: "cairn://p/PRJ/1/1/builder/terminal/tests".into(),
+                    uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
                     slug: "tests".into(),
                     on: TerminalWaitEvent::Exit,
                     phrase: None,
@@ -1022,7 +1022,7 @@ mod tests {
             .unwrap();
         let armed = record(
             Condition::Terminal {
-                uri: "cairn://p/PRJ/1/1/builder/terminal/tests".into(),
+                uri: "cairn://p/prj/1/1/builder/terminal/tests".into(),
                 slug: "tests".into(),
                 on: TerminalWaitEvent::Exit,
                 phrase: None,
@@ -1065,7 +1065,7 @@ mod tests {
             orch.db.local.clone(),
             record(
                 Condition::Terminal {
-                    uri: "cairn://p/PRJ/1/1/builder/terminal/missing".into(),
+                    uri: "cairn://p/prj/1/1/builder/terminal/missing".into(),
                     slug: "missing".into(),
                     on: TerminalWaitEvent::Exit,
                     phrase: None,

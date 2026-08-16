@@ -370,6 +370,7 @@ mod snapshot_edit_guard_tests {
 
     fn agent_struct(id: &str, prompt: &str, fence: Fence) -> AgentSnapshot {
         AgentSnapshot {
+            edited_at: None,
             id: id.to_string(),
             name: id.to_string(),
             description: String::new(),
@@ -455,7 +456,7 @@ mod snapshot_edit_guard_tests {
         exec(
             db,
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('proj-1','default','Cairn','CAIRN','/tmp/repo',1,1)",
+             VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1)",
         )
         .await;
         exec(
@@ -568,7 +569,7 @@ mod snapshot_edit_guard_tests {
         let err = edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "builder",
@@ -590,7 +591,7 @@ mod snapshot_edit_guard_tests {
         let err = edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "builder",
@@ -614,7 +615,7 @@ mod snapshot_edit_guard_tests {
         let err = edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "planner",
@@ -638,7 +639,7 @@ mod snapshot_edit_guard_tests {
         edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "planner",
@@ -661,7 +662,7 @@ mod snapshot_edit_guard_tests {
         edit_execution_agent(
             &orch,
             &request(Some("run-other")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "builder",
@@ -683,7 +684,7 @@ mod snapshot_edit_guard_tests {
         edit_execution_agent(
             &orch,
             &request(None),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "builder",
@@ -703,7 +704,7 @@ mod snapshot_edit_guard_tests {
         let summary = edit_execution_agent(
             &orch,
             &request(None),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "builder",
@@ -727,7 +728,7 @@ mod snapshot_edit_guard_tests {
         let err = edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "builder",
@@ -751,7 +752,7 @@ mod snapshot_edit_guard_tests {
         let err = edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "planner",
@@ -772,7 +773,7 @@ mod snapshot_edit_guard_tests {
         edit_execution_agent(
             &orch,
             &request(Some("run-builder")),
-            "CAIRN",
+            "cairn",
             1,
             1,
             "planner",

@@ -393,7 +393,19 @@ mod tests {
 
     /// A value long and varied enough to register, unique to this module so it
     /// cannot collide with another test's needle in the process registry.
-    const ECHOED: &str = "mcp-echo-Zx91Qw82Lm73Pv";
+    const ECHOED: &str = "SYNth-MCp-Q7\"m2Zx9-RedTeam";
+    const GO_ECHOED: &str = "SYNth-MCp-é-<>&\u{2028}\u{2029}-Q7m2Zx9-RedTeam";
+    const GO_SERIALIZED_ECHO: &str =
+        r#"{"credential":"SYNth-MCp-é-\u003c\u003e\u0026\u2028\u2029-Q7m2Zx9-RedTeam"}"#;
+
+    fn serialized_echo() -> String {
+        serde_json::to_string(&serde_json::json!({"credential": ECHOED})).unwrap()
+    }
+
+    fn escaped_echo() -> String {
+        let encoded = serde_json::to_string(ECHOED).unwrap();
+        encoded[1..encoded.len() - 1].to_string()
+    }
 
     fn register() -> SecretGuard<'static> {
         registry()
@@ -426,7 +438,7 @@ mod tests {
             Ok(McpToolCatalog {
                 tools: vec![McpToolDef {
                     name: "search".to_string(),
-                    description: Some(format!("authenticate with {ECHOED}")),
+                    description: Some(serialized_echo()),
                     input_schema: serde_json::json!({
                         "properties": {"token": {"default": ECHOED}}
                     }),
@@ -474,7 +486,15 @@ mod tests {
             _: Option<&str>,
         ) -> Result<McpCallOutcome, String> {
             match tool {
-                "fail" => Err(format!("rejected request with header Bearer {ECHOED}")),
+                "fail" => Err(serialized_echo()),
+                "json-result" => Ok(McpCallOutcome::Complete(McpToolCallResult {
+                    text: serialized_echo(),
+                    images: Vec::new(),
+                })),
+                "go-json-result" => Ok(McpCallOutcome::Complete(McpToolCallResult {
+                    text: GO_SERIALIZED_ECHO.to_string(),
+                    images: Vec::new(),
+                })),
                 "defer" => Ok(McpCallOutcome::Task {
                     task_id: format!("task-{ECHOED}"),
                     poll_interval_ms: None,
@@ -520,7 +540,7 @@ mod tests {
                 "s",
                 "srv",
                 &config(),
-                "go",
+                "json-result",
                 json_args(),
                 None,
                 None,
@@ -533,7 +553,41 @@ mod tests {
             panic!("expected a complete outcome");
         };
         assert!(!result.text.contains(ECHOED), "{}", result.text);
-        assert!(result.text.contains("[REDACTED]"), "{}", result.text);
+        assert!(!result.text.contains(&escaped_echo()), "{}", result.text);
+        assert_eq!(result.text, r#"{"credential":"[REDACTED]"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_go_html_safe_tool_result_cannot_carry_a_registered_credential_back() {
+        let _guard = registry()
+            .register(
+                SecretId::new("test:untrusted-gateway-go-json"),
+                SecretCategory::ConfiguredMcp,
+                "test",
+                SecretMaterial::from_string(GO_ECHOED.to_string()),
+            )
+            .expect("fixture value is registerable");
+        let outcome = wrapped()
+            .call_tool_once(
+                "s",
+                "srv",
+                &config(),
+                "go-json-result",
+                json_args(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let McpCallOutcome::Complete(result) = outcome else {
+            panic!("expected a complete outcome");
+        };
+        assert_eq!(result.text, r#"{"credential":"[REDACTED]"}"#);
+        assert!(!result
+            .text
+            .contains(r#"SYNth-MCp-é-\u003c\u003e\u0026\u2028\u2029-Q7m2Zx9-RedTeam"#));
     }
 
     /// Errors are the likeliest echo: a server that rejects a request usually
@@ -556,6 +610,8 @@ mod tests {
             .await
             .expect_err("the fixture fails this tool");
         assert!(!error.contains(ECHOED), "{error}");
+        assert!(!error.contains(&escaped_echo()), "{error}");
+        assert_eq!(error, r#"{"credential":"[REDACTED]"}"#);
     }
 
     /// An input request and its opaque continuation state are persisted into a
@@ -598,6 +654,15 @@ mod tests {
         let catalog = wrapped().list_tools("s", "srv", &config()).await.unwrap();
         let encoded = serde_json::to_string(&catalog.tools).unwrap();
         assert!(!encoded.contains(ECHOED), "{encoded}");
+        assert!(!catalog.tools[0]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains(&escaped_echo()));
+        assert_eq!(
+            catalog.tools[0].description.as_deref(),
+            Some(r#"{"credential":"[REDACTED]"}"#)
+        );
     }
 
     #[tokio::test]

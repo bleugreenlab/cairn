@@ -765,6 +765,17 @@ fn source_query(source_table: &str) -> Option<&'static str> {
              FROM issues
              WHERE id = ?1",
         ),
+        "posts" => Some(
+            "SELECT CAST(id AS TEXT), 'post', COALESCE(project_id, ''), NULL, NULL,
+                    COALESCE(title, 'Post'), content, created_at
+             FROM posts WHERE id = CAST(?1 AS INTEGER)",
+        ),
+        "post_comments" => Some(
+            "SELECT CAST(c.id AS TEXT), 'post_comment', COALESCE(p.project_id, ''), NULL, NULL,
+                    'Post Comment', c.content, c.created_at
+             FROM post_comments c JOIN posts p ON p.id = c.post_id
+             WHERE c.id = CAST(?1 AS INTEGER)",
+        ),
         "comments" => Some(
             "SELECT c.id, 'comment', i.project_id, c.issue_id, NULL,
                     CASE WHEN c.source = 'user' THEN 'User Comment' ELSE 'Agent Comment' END,
@@ -820,7 +831,7 @@ fn source_query(source_table: &str) -> Option<&'static str> {
 
 /// Rebuild sources that are safe to read straight from SQL. Events are handled
 /// separately by `load_event_documents` so archived rows reconstruct first.
-fn rebuild_source_queries() -> [&'static str; 4] {
+fn rebuild_source_queries() -> [&'static str; 6] {
     [
         "SELECT id, 'issue', project_id, id, NULL, title, COALESCE(description, ''), created_at
          FROM issues",
@@ -855,6 +866,11 @@ fn rebuild_source_queries() -> [&'static str; 4] {
                 m.created_at
          FROM messages m
          LEFT JOIN issues i ON m.channel_type = 'issue' AND i.id = m.channel_id",
+        "SELECT CAST(id AS TEXT), 'post', COALESCE(project_id, ''), NULL, NULL,
+                COALESCE(title, 'Post'), content, created_at FROM posts",
+        "SELECT CAST(c.id AS TEXT), 'post_comment', COALESCE(p.project_id, ''), NULL, NULL,
+                'Post Comment', c.content, c.created_at
+         FROM post_comments c JOIN posts p ON p.id = c.post_id",
     ]
 }
 
@@ -2219,5 +2235,44 @@ mod tests {
             )
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn indexes_posts_and_comments_with_project_filtering() {
+        let db = migrated_db().await.unwrap();
+        insert_workspace_and_project(&db, "project-1")
+            .await
+            .unwrap();
+        insert_workspace_and_project(&db, "project-2")
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO posts(project_id, title, content, author_principal_json, appearance_snapshot_json)
+             VALUES ('project-1', 'Alpha post', 'storage needle', '{}', '{}');
+             INSERT INTO posts(project_id, title, content, author_principal_json, appearance_snapshot_json)
+             VALUES ('project-2', 'Other post', 'storage needle', '{}', '{}');
+             INSERT INTO post_comments(post_id, content, author_principal_json, appearance_snapshot_json)
+             VALUES (1, 'commentary needle', '{}', '{}');",
+        ).await.unwrap();
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        assert_eq!(index.apply_pending(&db).await.unwrap(), 3);
+        let hits = index
+            .search(
+                "needle",
+                Some(SearchFilters {
+                    project_id: Some("project-1".into()),
+                    content_types: Some(vec!["post".into(), "post_comment".into()]),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|hit| hit.project_id == "project-1"));
+        index.rebuild(&db).await.unwrap();
+        assert_eq!(
+            index.search("commentary", None).unwrap()[0].content_type,
+            SearchContentType::PostComment
+        );
     }
 }

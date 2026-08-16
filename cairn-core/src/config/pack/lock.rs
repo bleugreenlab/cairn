@@ -25,6 +25,8 @@ pub enum PackSourceKind {
     Bundled,
     /// Fetched from a URL.
     Url,
+    /// Imported from a local Agent Plugin directory and installed from a managed snapshot.
+    Local,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,6 +44,9 @@ pub struct PackSource {
     pub sha: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<PackFormat>,
+    /// Canonical original directory for a local import. Runtime reads use the managed snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 impl PackSource {
@@ -52,6 +57,18 @@ impl PackSource {
             git_ref: None,
             sha: None,
             format: Some(format),
+            path: None,
+        }
+    }
+
+    pub fn local(path: String) -> Self {
+        PackSource {
+            kind: PackSourceKind::Local,
+            url: None,
+            git_ref: None,
+            sha: None,
+            format: Some(PackFormat::AgentPlugin),
+            path: Some(path),
         }
     }
 }
@@ -511,6 +528,7 @@ mod tests {
                 git_ref: Some("main".into()),
                 sha: Some("9f2c".into()),
                 format: Some(PackFormat::ClaudeCode),
+                path: None,
             },
             vec![],
         );

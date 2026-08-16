@@ -156,7 +156,7 @@ mod tests {
     use cairn_common::read::{ImageBlock, NaturalUnit, SegmentKind, SegmentMeta};
     use std::sync::Mutex;
 
-    const STORED: &str = "cairn://p/CAIRN/3242/images/1";
+    const STORED: &str = "cairn://p/cairn/3242/images/1";
 
     struct Fake {
         failure: Option<String>,

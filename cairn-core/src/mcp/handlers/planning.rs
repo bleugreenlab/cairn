@@ -54,6 +54,40 @@ pub async fn ask_questions(
     ask_questions_owned(orch, request, payload, background, tool_use_id, None).await
 }
 
+fn canonical_prompt_answers(
+    prompt_id: &str,
+    response: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let lines = response.lines().collect::<Vec<_>>();
+    if lines.len() == 1 && !response.starts_with("Question 1: ") {
+        return Ok(vec![(format!("{prompt_id}:0"), response.to_string())]);
+    }
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let prefix = format!("Question {}: ", index + 1);
+            let answer = line.strip_prefix(&prefix).ok_or_else(|| {
+                "multi-question responses must use canonical `Question N: answer` lines".to_string()
+            })?;
+            Ok((format!("{prompt_id}:{index}"), answer.to_string()))
+        })
+        .collect()
+}
+
+fn render_canonical_prompt_answers(answers: &[String]) -> String {
+    if answers.len() == 1 {
+        answers[0].clone()
+    } else {
+        answers
+            .iter()
+            .enumerate()
+            .map(|(index, answer)| format!("Question {}: {answer}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 /// Create the ordinary Cairn question surface for input requested by an
 /// external MCP call. The durable MCP wait owns the answer, so this path never
 /// binds a provider tool use and never yields or resumes the asking agent turn.
@@ -291,7 +325,7 @@ async fn ask_questions_owned(
                     &detail_uri,
                     crate::orchestrator::attention_push::Wake::Wake,
                     crate::orchestrator::attention_push::Boundary::Event,
-                    &format!("question:{issue_uri}"),
+                    &format!("question:{detail_uri}"),
                 )
                 .await
                 {
@@ -744,6 +778,34 @@ pub async fn answer_node_question(
     prompt_segment: &str,
     payload: &Value,
 ) -> Result<PromptAnswerOutcome, String> {
+    let actor = format!("cairn://p/{project_key}/{issue_number}/{exec_seq}/{node_segment}");
+    answer_node_question_with_provenance(
+        orch,
+        project_key,
+        issue_number,
+        exec_seq,
+        node_segment,
+        prompt_segment,
+        payload,
+        crate::turns::queries::ResolutionProvenance::new(
+            cairn_common::identity::AppearanceTransport::ResourcePatch,
+            Some(actor),
+        ),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn answer_node_question_with_provenance(
+    orch: &Orchestrator,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    node_segment: &str,
+    prompt_segment: &str,
+    payload: &Value,
+    provenance: crate::turns::queries::ResolutionProvenance,
+) -> Result<PromptAnswerOutcome, String> {
     let (prompt_id, questions_json) = lookup_prompt_for_node_question(
         orch,
         project_key,
@@ -754,14 +816,101 @@ pub async fn answer_node_question(
     )
     .await?;
     let response = normalize_prompt_answer_payload(&questions_json, payload)?;
-    answer_prompt_id(orch, &prompt_id, response).await
+    answer_prompt_id(orch, &prompt_id, response, provenance).await
 }
 
-pub(crate) async fn answer_prompt_id(
+pub async fn answer_prompt_id(
     orch: &Orchestrator,
     prompt_id: &str,
     response: String,
+    provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
+    answer_prompt_id_impl(orch, prompt_id, response, provenance, true).await
+}
+
+pub(crate) async fn answer_prompt_id_domain(
+    orch: &Orchestrator,
+    prompt_id: &str,
+    response: String,
+    provenance: crate::turns::queries::ResolutionProvenance,
+) -> Result<PromptAnswerOutcome, String> {
+    answer_prompt_id_impl(orch, prompt_id, response, provenance, false).await
+}
+
+async fn answer_prompt_id_impl(
+    orch: &Orchestrator,
+    prompt_id: &str,
+    response: String,
+    provenance: crate::turns::queries::ResolutionProvenance,
+    use_gate: bool,
+) -> Result<PromptAnswerOutcome, String> {
+    if use_gate {
+        let gate_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        canonical_prompt_answers(prompt_id, &response)?;
+        let claim = crate::channels::ledger::claim_ask_resolution(
+            &gate_db,
+            prompt_id,
+            &response,
+            provenance.surface,
+            provenance.provider.as_deref(),
+            provenance.conversation.as_deref(),
+            provenance.actor.as_deref(),
+            "question",
+            prompt_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .await?;
+        let (winner, duplicate) = match claim {
+            crate::channels::ledger::AskClaim::Won(winner) => (winner, false),
+            crate::channels::ledger::AskClaim::Existing(winner) => (winner, true),
+        };
+        let winners = canonical_prompt_answers(prompt_id, &winner.answer)?
+            .into_iter()
+            .map(|(_, answer)| answer)
+            .collect::<Vec<_>>();
+        let winning_response = render_canonical_prompt_answers(&winners);
+        // The claim winner and the domain-action lease winner are independent.
+        // Always execute with the persisted claim winner's identity, even when
+        // this caller acquired the lease after losing the claim.
+        let winning_provenance = winner.resolution_provenance()?;
+        let now = chrono::Utc::now().timestamp_millis();
+        let Some(lease) =
+            crate::channels::ledger::try_lease_ask_action(&gate_db, prompt_id, now, 60_000).await?
+        else {
+            return Ok(PromptAnswerOutcome {
+                duplicate: true,
+                response: winning_response,
+            });
+        };
+        let result = Box::pin(answer_prompt_id_impl(
+            orch,
+            prompt_id,
+            winning_response.clone(),
+            winning_provenance,
+            false,
+        ))
+        .await;
+        return match result {
+            Ok(mut outcome) => {
+                crate::channels::ledger::finalize_ask_resolution(
+                    &gate_db,
+                    prompt_id,
+                    &format!("✓ answered: {winning_response}"),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+                outcome.duplicate |= duplicate;
+                outcome.response = winning_response;
+                Ok(outcome)
+            }
+            Err(error) => {
+                crate::channels::ledger::release_ask_action(&gate_db, &lease, &error).await?;
+                Err(error)
+            }
+        };
+    }
     let now = chrono::Utc::now().timestamp();
     let prompt_id_owned = prompt_id.to_string();
     let response_for_db = response.clone();
@@ -779,8 +928,19 @@ pub(crate) async fn answer_prompt_id(
         .write(|conn| {
             let prompt_id = prompt_id_owned.clone();
             let response = response_for_db.clone();
+            let provenance = provenance.clone();
             Box::pin(
-                async move { record_prompt_response_conn(conn, &prompt_id, &response, now).await },
+                async move {
+                    let result = record_prompt_response_conn(conn, &prompt_id, &response, now).await?;
+                    if !result.duplicate {
+                        let surface = provenance.surface_name();
+                        conn.execute(
+                            "UPDATE prompts SET resolution_id = ?2, resolution_surface = ?3, resolution_provider = ?4, resolution_conversation = ?5, resolution_actor = ?6 WHERE id = ?1",
+                            params![prompt_id, provenance.id, surface, provenance.provider, provenance.conversation, provenance.actor],
+                        ).await?;
+                    }
+                    Ok(result)
+                },
             )
         })
         .await
@@ -854,7 +1014,15 @@ pub(crate) async fn answer_prompt_id(
             (resume.tool_use_id.as_deref(), resume.session_id.as_deref())
         {
             let now = chrono::Utc::now().timestamp() as i32;
-            if let Err(error) = crate::execution::jobs::store_tool_result_event_with_turn(
+            let receipt = cairn_db::models::ResolutionReceipt {
+                id: Some(provenance.id.clone()),
+                surface: provenance.surface_name(),
+                provider: provenance.provider.clone(),
+                conversation: provenance.conversation.clone(),
+                actor: provenance.actor.clone(),
+                resolved_at: now as i64 * 1000,
+            };
+            if let Err(error) = crate::execution::jobs::store_tool_result_event_with_resolution(
                 orch,
                 &resume.run_id,
                 session_id,
@@ -863,6 +1031,7 @@ pub(crate) async fn answer_prompt_id(
                 false,
                 now,
                 resume.predecessor_turn_id.as_deref(),
+                Some(&receipt),
             ) {
                 // The prompt answer and successor are already durable. Dispatching
                 // with a visible user event keeps retry semantics intact, while

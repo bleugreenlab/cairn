@@ -568,7 +568,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','p','/tmp/p',1,1)", ()).await?;
             conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
             conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
             conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_commit, base_branch, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','agent/parent','head-1','main','executor','Executor',1,1)", ()).await?;
@@ -602,7 +602,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','p','/tmp/p',1,1)", ()).await?;
             conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
             conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
             conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_commit, base_branch, uri_segment, node_name, created_at, updated_at) VALUES ('thread-job','e-1','i-1','p-1','running',NULL,'main-head','main','thread','Thread',1,1)", ()).await?;
@@ -639,7 +639,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| Box::pin(async move {
             conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+            conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','p','/tmp/p',1,1)", ()).await?;
             conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
             conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e-1','default','i-1','p-1','running',1,1)", ()).await?;
             conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, branch, base_commit, base_branch, uri_segment, node_name, created_at, updated_at) VALUES ('parent-job','e-1','i-1','p-1','running','agent/parent','head-1','main','executor','Executor',1,1)", ()).await?;

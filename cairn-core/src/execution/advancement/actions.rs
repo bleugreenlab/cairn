@@ -203,7 +203,7 @@ pub fn create_action_run(
                 // (e.g. name "PR" -> "pr"), deduped across both jobs and
                 // action_runs for this execution so an agent and an action
                 // can't both claim the same segment. This makes the action node
-                // resolvable at cairn://p/PROJ/N/EXEC/<segment> (CAIRN-1222).
+                // resolvable at cairn://p/proj/N/EXEC/<segment> (CAIRN-1222).
                 let segment_base = crate::node_segments::node_segment_base(
                     Some(node_name.as_str()),
                     None,

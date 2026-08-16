@@ -17,6 +17,7 @@ mod globals;
 mod issues;
 mod jobs;
 mod nodes;
+mod posts;
 mod projects;
 mod registry;
 mod responses;
@@ -52,6 +53,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::DEV_DB_CONTRACT,
     globals::DEV_PID_CONTRACT,
     globals::LOGS_CONTRACT,
+    globals::CHANNELS_CONVERSATIONS_CONTRACT,
     globals::EXECUTORS_CONTRACT,
     globals::EXECUTOR_CONTRACT,
     globals::GRANTS_CONTRACT,
@@ -67,6 +69,10 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     projects::PROJECTS_CONTRACT,
     projects::PROJECT_SETTINGS_CONTRACT,
     projects::PROJECT_ISSUES_CONTRACT,
+    posts::POSTS_CONTRACT,
+    posts::POST_CONTRACT,
+    posts::PROJECT_POSTS_CONTRACT,
+    posts::HOME_FEED_CONTRACT,
     projects::PROJECT_CHECK_RESULTS_CONTRACT,
     projects::PROJECT_CHECK_OBSERVATION_CONTRACT,
     projects::PROJECT_MESSAGES_CONTRACT,
@@ -309,6 +315,89 @@ mod tests {
                 "label create example key `{key}` is not a declared key: {}",
                 spec.example
             );
+        }
+    }
+
+    /// Extract the depth-1 keys of every `payload:{...}` object in an example.
+    /// String literals are tracked so a brace inside a quoted value cannot throw
+    /// off the depth count.
+    fn example_payload_keys(example: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let bytes: Vec<char> = example.chars().collect();
+        let mut i = 0;
+        while i < bytes.len() {
+            if !example[..].is_char_boundary(0) {
+                break;
+            }
+            let rest: String = bytes[i..].iter().collect();
+            let Some(start) = rest.find("payload:{") else {
+                break;
+            };
+            let mut j = i + start + "payload:{".len();
+            let mut depth = 1usize;
+            let mut in_string = false;
+            let mut token = String::new();
+            let mut expecting_key = true;
+            while j < bytes.len() && depth > 0 {
+                let c = bytes[j];
+                if in_string {
+                    if c == '"' {
+                        in_string = false;
+                    } else if expecting_key && depth == 1 {
+                        token.push(c);
+                    }
+                } else {
+                    match c {
+                        '"' => in_string = true,
+                        '{' | '[' => depth += 1,
+                        '}' | ']' => depth -= 1,
+                        ':' if depth == 1 && expecting_key => {
+                            let key = token.trim().trim_matches('"').to_string();
+                            if !key.is_empty() {
+                                keys.push(key);
+                            }
+                            token.clear();
+                            expecting_key = false;
+                        }
+                        ',' if depth == 1 => {
+                            token.clear();
+                            expecting_key = true;
+                        }
+                        _ if expecting_key && depth == 1 => token.push(c),
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            i = j;
+        }
+        keys
+    }
+
+    /// Every key a mutation ADVERTISES in its copy-paste example must be a key
+    /// that mutation ACCEPTS. The example is what an agent copies and the
+    /// declared keys are what the write gate enforces, so a key in one and not
+    /// the other is an affordance that teaches a payload the gate then rejects.
+    ///
+    /// Artifact kinds are exempt: their accepted keys come from the addressed
+    /// artifact's schema at write time, not from this table.
+    #[test]
+    fn every_example_key_is_a_declared_key() {
+        for contract in RESOURCE_CONTRACTS {
+            if contract.kind.payload_keys_are_schema_resolved() {
+                continue;
+            }
+            for spec in contract.mutations {
+                for key in example_payload_keys(spec.example) {
+                    assert!(
+                        spec.accepts_key(&key),
+                        "{:?} {} example advertises `{key}`, which the mutation does not accept: {}",
+                        contract.kind,
+                        spec.label,
+                        spec.example
+                    );
+                }
+            }
         }
     }
 

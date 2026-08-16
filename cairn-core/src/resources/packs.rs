@@ -373,6 +373,7 @@ fn source_info(view: &PackView) -> PackSourceInfo {
             kind: match lock.source.kind {
                 pack::PackSourceKind::Bundled => "bundled",
                 pack::PackSourceKind::Url => "url",
+                pack::PackSourceKind::Local => "local",
             }
             .to_string(),
             url: lock.source.url.clone(),

@@ -1015,6 +1015,7 @@ pub fn kill_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
 /// an automatic same-session recovery. It remains a crashed/interrupted turn,
 /// but terminal failure attention must not fire between the two turns.
 pub(crate) const PROVIDER_SILENCE_RECOVERY_EXIT_REASON: &str = "provider_silence_recovery";
+pub(crate) const WATCHDOG_ARM_FAILED_EXIT_REASON: &str = "watchdog_arm_failed";
 
 /// Kill a session with a specific exit reason.
 pub fn kill_session_with_reason(
@@ -1041,11 +1042,21 @@ pub fn kill_session_with_reason(
     cleanup_job_terminals(orch, run_id);
 
     // Kill the process
+    // A panic while another thread holds the registry must not strand durable
+    // run state. The child handle may still be safely removed from a poisoned
+    // mutex; more importantly, exit-reason persistence and finalization below
+    // must remain unconditional.
     let mut processes = orch
         .process_state
         .processes
         .lock()
-        .map_err(|e| e.to_string())?;
+        .unwrap_or_else(|poisoned| {
+            log::error!(
+                "Process registry lock was poisoned while killing run {}; recovering to finalize it",
+                &run_id[..run_id.len().min(8)]
+            );
+            poisoned.into_inner()
+        });
 
     if let Some(handle) = processes.remove(run_id) {
         if let Ok(mut child_guard) = handle.child.lock() {
@@ -1056,20 +1067,29 @@ pub fn kill_session_with_reason(
         }
     }
 
+    // `into_inner` repairs access for this caller but does not clear the mutex's
+    // poison bit. Clear it while the repaired registry is still locked: releasing
+    // first would let a successor observe stale poison, or let a new panic's
+    // poison be cleared without this caller inspecting that state.
+    orch.process_state.processes.clear_poison();
+
     // Drop the lock before calling finalize_run (which also locks)
     drop(processes);
 
     // Set exit reason and finalize as Exited (clean kill) or Crashed
-    let final_status = if matches!(exit_reason, "crash" | PROVIDER_SILENCE_RECOVERY_EXIT_REASON) {
+    let final_status = if matches!(
+        exit_reason,
+        "crash" | PROVIDER_SILENCE_RECOVERY_EXIT_REASON | WATCHDOG_ARM_FAILED_EXIT_REASON
+    ) {
         RunStatus::Crashed
     } else {
         RunStatus::Exited
     };
 
-    let _ = set_exit_reason(orch, run_id, exit_reason);
+    set_exit_reason(orch, run_id, exit_reason)?;
 
     if exit_reason == PROVIDER_SILENCE_RECOVERY_EXIT_REASON {
-        super::finalize_run_for_recovery(orch, run_id, final_status);
+        super::finalize_run_for_recovery(orch, run_id, final_status)?;
     } else {
         finalize_run(orch, run_id, final_status);
     }

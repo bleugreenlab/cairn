@@ -36,7 +36,7 @@ fn crossing_tool_input() -> String {
 /// has no `turn_id`, so resolving it does not create a successor turn or resume
 /// a (nonexistent) process — keeping the test to the resolution semantics.
 async fn insert_permission_fixture(db: &LocalDb) {
-    let project_id = common::create_project(db, "TPA").await;
+    let project_id = common::create_project(db, "tpa").await;
     let tool_input = crossing_tool_input();
     db.write(|conn| {
         let project_id = project_id.clone();
@@ -89,7 +89,7 @@ fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
         thread_id: None,
         cwd: String::new(),
-        run_id: None,
+        run_id: Some("run-1".to_string()),
         tool: "write".to_string(),
         payload,
         tool_use_id: None,
@@ -137,7 +137,7 @@ async fn node_permission_patch_allow_session_resolves_and_grants() {
     insert_permission_fixture(&db).await;
     let orch = orchestrator(&temp, db.clone());
 
-    let target = "cairn://p/TPA/1/1/builder/permissions/perm-1";
+    let target = "cairn://p/tpa/1/1/builder/permissions/perm-1";
     let result = handle_write(
         &orch,
         &change_request(json!({
@@ -180,7 +180,7 @@ async fn node_permission_patch_deny_resolves() {
     insert_permission_fixture(&db).await;
     let orch = orchestrator(&temp, db.clone());
 
-    let target = "cairn://p/TPA/1/1/builder/permissions/perm-1";
+    let target = "cairn://p/tpa/1/1/builder/permissions/perm-1";
     let result = handle_write(
         &orch,
         &change_request(json!({
@@ -204,6 +204,37 @@ async fn node_permission_patch_deny_resolves() {
 }
 
 #[tokio::test]
+async fn case_colliding_project_keys_make_permission_identity_ambiguous() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_permission_fixture(&db).await;
+    common::create_project(&db, "TPA").await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/tpa/1/1/builder/permissions/perm-1",
+                "mode": "patch",
+                "payload": {"decision": "deny"}
+            }]
+        })),
+    )
+    .await;
+
+    assert!(
+        result.contains("project key tpa is ambiguous"),
+        "expected project identity ambiguity, got: {result}"
+    );
+    assert_eq!(
+        perm_status(&db).await.as_deref(),
+        Some("pending"),
+        "an ambiguous project identity must not answer either project's permission"
+    );
+}
+
+#[tokio::test]
 async fn pending_permission_read_shows_answer_action() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
@@ -217,7 +248,7 @@ async fn pending_permission_read_shows_answer_action() {
             cwd: String::new(),
             run_id: None,
             tool: "read".to_string(),
-            payload: json!({"path": "cairn://p/TPA/1/1/builder/permissions/perm-1"}),
+            payload: json!({"path": "cairn://p/tpa/1/1/builder/permissions/perm-1"}),
             tool_use_id: None,
         },
     )
@@ -373,7 +404,7 @@ fn authority_tool_input() -> String {
         },
         "reason": "workspace_tool_capability",
         "principal": {
-            "node_uri": "cairn://p/TPA/1/1/builder",
+            "node_uri": "cairn://p/tpa/1/1/builder",
             "run_id": "run-1",
             "agent_id": "build"
         },
@@ -442,7 +473,7 @@ async fn an_agent_cannot_approve_an_authority_prompt_at_any_lifetime() {
             &orch,
             &change_request(json!({
                 "changes": [{
-                    "target": "cairn://p/TPA/1/1/builder/permissions/perm-1",
+                    "target": "cairn://p/tpa/1/1/builder/permissions/perm-1",
                     "mode": "patch",
                     "payload": {"decision": "allow", "lifetime": lifetime}
                 }]
@@ -483,7 +514,7 @@ async fn an_agent_can_still_deny_an_authority_prompt() {
         &orch,
         &change_request(json!({
             "changes": [{
-                "target": "cairn://p/TPA/1/1/builder/permissions/perm-1",
+                "target": "cairn://p/tpa/1/1/builder/permissions/perm-1",
                 "mode": "patch",
                 "payload": {"decision": "deny"}
             }]

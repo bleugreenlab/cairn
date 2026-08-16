@@ -251,7 +251,7 @@ async fn insert_prompt(
 async fn list_runs_filters_by_issue_and_job() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RUNS").await;
+    let project_id = common::create_project(&db, "runs").await;
     insert_issue(&db, "issue-1", &project_id, 1).await;
     insert_issue(&db, "issue-2", &project_id, 2).await;
     insert_job(&db, "job-1", &project_id, Some("issue-1")).await;
@@ -313,7 +313,7 @@ async fn list_runs_filters_by_issue_and_job() {
 async fn get_run_maps_runtime_fields() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RUNGET").await;
+    let project_id = common::create_project(&db, "runget").await;
     insert_run(
         &db,
         "run-1",
@@ -563,7 +563,7 @@ async fn list_events_for_session_spans_reseed_rotation_lineage() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
 
-    let project_id = common::create_project(&db, "RESEED").await;
+    let project_id = common::create_project(&db, "reseed").await;
     insert_job(&db, "job-1", &project_id, None).await;
 
     // session-old (root) was rotated in place into session-new; both on job-1.
@@ -664,7 +664,7 @@ async fn list_events_for_session_excludes_cross_job_fork_parent() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
 
-    let project_id = common::create_project(&db, "FORK").await;
+    let project_id = common::create_project(&db, "fork").await;
     insert_job(&db, "job-parent", &project_id, None).await;
     insert_job(&db, "job-child", &project_id, None).await;
 
@@ -768,7 +768,7 @@ async fn job_transcript_delta_follows_a_session_reconstruction() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
 
-    let project_id = common::create_project(&db, "RESUME").await;
+    let project_id = common::create_project(&db, "resume").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_session(&db, "session-old", "job-1", 1).await;
     set_current_session(&db, "job-1", "session-old").await;
@@ -877,7 +877,7 @@ async fn job_transcript_delta_resolves_the_newest_run_before_a_session_is_stampe
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
 
-    let project_id = common::create_project(&db, "NEWCHAT").await;
+    let project_id = common::create_project(&db, "newchat").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_session(&db, "session-1", "job-1", 1).await;
     insert_run(
@@ -1372,7 +1372,7 @@ async fn active_streams_append_after_existing_events() {
 async fn pending_prompt_queries_use_run_and_current_turn() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "PROMPTS").await;
+    let project_id = common::create_project(&db, "prompts").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1420,7 +1420,7 @@ async fn pending_prompt_queries_use_run_and_current_turn() {
 async fn prompts_tool_use_id_round_trips() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "PTUID").await;
+    let project_id = common::create_project(&db, "ptuid").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1459,7 +1459,7 @@ async fn prompts_tool_use_id_round_trips() {
 async fn reconcile_stale_runs_marks_process_and_turn_terminal() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "STALE").await;
+    let project_id = common::create_project(&db, "stale").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1547,7 +1547,7 @@ async fn reconcile_stale_runs_marks_process_and_turn_terminal() {
 async fn reconcile_stale_runs_reaps_the_orphan_that_names_a_stale_session() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "ORPHAN").await;
+    let project_id = common::create_project(&db, "orphan").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1650,7 +1650,7 @@ async fn set_run_timestamps(db: &LocalDb, run_id: &str, started_at: i64, created
 async fn reconcile_stale_runs_never_touches_a_run_this_host_spawned() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "OWNED").await;
+    let project_id = common::create_project(&db, "owned").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1733,7 +1733,7 @@ async fn reconcile_stale_runs_never_touches_a_run_this_host_spawned() {
 async fn reconcile_stale_runs_leaves_a_run_stamped_at_the_boot_second_alone() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "BOUND").await;
+    let project_id = common::create_project(&db, "bound").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1776,7 +1776,7 @@ async fn reconcile_stale_runs_leaves_a_run_stamped_at_the_boot_second_alone() {
 async fn reconcile_stale_runs_does_not_overwrite_a_run_that_finalized_meanwhile() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "RACE").await;
+    let project_id = common::create_project(&db, "race").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,
@@ -1864,7 +1864,7 @@ async fn reconcile_stale_runs_does_not_overwrite_a_run_that_finalized_meanwhile(
 async fn reconcile_stale_runs_does_not_claim_a_reap_it_could_not_confirm() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "UNSTOP").await;
+    let project_id = common::create_project(&db, "unstop").await;
     insert_job(&db, "job-1", &project_id, None).await;
     insert_run(
         &db,

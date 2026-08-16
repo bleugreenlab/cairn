@@ -190,6 +190,17 @@ pub struct Event {
 }
 
 /// A prompt awaiting user response
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolutionReceipt {
+    pub id: Option<String>,
+    pub surface: String,
+    pub provider: Option<String>,
+    pub conversation: Option<String>,
+    pub actor: Option<String>,
+    pub resolved_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Prompt {
@@ -199,6 +210,8 @@ pub struct Prompt {
     pub response: Option<String>,
     pub created_at: i64,
     pub answered_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resolution: Option<ResolutionReceipt>,
 }
 
 /// A permission request awaiting user approval
@@ -214,6 +227,8 @@ pub struct PermissionRequest {
     pub response: Option<serde_json::Value>,
     pub created_at: i64,
     pub responded_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resolution: Option<ResolutionReceipt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -259,6 +274,7 @@ impl From<crate::db_records::DbPermissionRequest> for PermissionRequest {
             response: db.response.and_then(|r| serde_json::from_str(&r).ok()),
             created_at: db.created_at as i64,
             responded_at: db.responded_at.map(|t| t as i64),
+            resolution: None,
         }
     }
 }
@@ -266,6 +282,30 @@ impl From<crate::db_records::DbPermissionRequest> for PermissionRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_receipt_serializes_for_shared_ui_contract() {
+        let receipt = ResolutionReceipt {
+            id: Some("resolution-1".into()),
+            surface: "channel".into(),
+            provider: Some("discord".into()),
+            conversation: Some("guild/channel".into()),
+            actor: Some("discord:guild/channel:user".into()),
+            resolved_at: 42,
+        };
+
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap(),
+            serde_json::json!({
+                "id": "resolution-1",
+                "surface": "channel",
+                "provider": "discord",
+                "conversation": "guild/channel",
+                "actor": "discord:guild/channel:user",
+                "resolvedAt": 42
+            })
+        );
+    }
 
     #[test]
     fn test_is_terminal() {

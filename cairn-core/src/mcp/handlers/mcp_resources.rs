@@ -541,6 +541,8 @@ mod tests {
                 enabled: true,
                 oauth: None,
                 secrets: Vec::new(),
+                cwd: None,
+                agent_plugin_runtime: None,
             },
         );
         servers.insert(
@@ -555,6 +557,8 @@ mod tests {
                 enabled: true,
                 oauth: None,
                 secrets: Vec::new(),
+                cwd: None,
+                agent_plugin_runtime: None,
             },
         );
 
@@ -603,6 +607,8 @@ mod tests {
                 enabled: true,
                 oauth: None,
                 secrets: Vec::new(),
+                cwd: None,
+                agent_plugin_runtime: None,
             },
         );
         let mut catalogs = HashMap::new();

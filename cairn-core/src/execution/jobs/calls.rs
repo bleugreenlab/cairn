@@ -43,6 +43,7 @@ pub(crate) fn prepare_call_run(
     ))?;
     let project_id = parent_job.project_id.clone();
     let issue_id = parent_job.issue_id.clone();
+    let thread_id = parent_job.thread_id.clone();
     // The call job hangs off the parent's task-execution (created/ensured by the
     // spawn pipeline) so its snapshot carries the call packet.
     let execution_id = input
@@ -199,6 +200,7 @@ pub(crate) fn prepare_call_run(
             "insert",
             &job_id,
             issue_id.as_deref(),
+            thread_id.as_deref(),
             execution_id.as_deref(),
             Some(&input.parent_job_id),
             None,
@@ -1161,7 +1163,7 @@ mod restart_call_tests {
     async fn seed_call(db: &LocalDb, parent_agent: &str) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)".to_string(),
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)".to_string(),
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)".to_string(),
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',3,'T','active',1,1)".to_string(),
             format!("INSERT INTO jobs (id, project_id, issue_id, status, agent_config_id, uri_segment, node_name, created_at, updated_at) VALUES ('j-wf','p','i','running','{parent_agent}','wf','Flow',1,1)"),
             "INSERT INTO jobs (id, project_id, issue_id, parent_job_id, status, agent_config_id, output_contract, uri_segment, node_name, created_at, updated_at) VALUES ('j-call','p','i','j-wf','running','Explore','{\"schemaType\":\"return\"}','call','Explore',1,1)".to_string(),

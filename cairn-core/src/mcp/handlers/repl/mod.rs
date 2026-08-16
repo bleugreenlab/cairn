@@ -651,6 +651,16 @@ pub async fn spawn_session(
             )
         }
     };
+    // A TypeScript REPL resolves `@cairn/sdk` exactly as an inline TypeScript run
+    // item does: the runner ships the version-matched package and the cell
+    // installs it above the checkout. A runner that cannot produce its own SDK
+    // says so here, rather than letting bun report a missing project dependency
+    // and sending the reader to look for a mistake in their own project.
+    let runtime_packages = match interpreter {
+        ReplLang::Typescript => crate::runtime::sdk_packages()
+            .map_err(|error| format!("Cairn cannot provide @cairn/sdk to this REPL: {error}"))?,
+        ReplLang::Python => Vec::new(),
+    };
     let (sandbox_mode, policy) = repl_sandbox(
         orch,
         job_id,
@@ -812,6 +822,7 @@ pub async fn spawn_session(
                 // only measurement can tell them apart.
                 reservation: None,
                 process: ResidentProcessSpec {
+                    runtime_packages,
                     program,
                     args,
                     cwd: String::new(),
@@ -1328,7 +1339,7 @@ mod cap_output_tests {
     fn truncation_lands_on_a_char_boundary() {
         // A 3-byte char straddling the cap must be dropped whole, not split.
         let mut s = "x".repeat(OUTPUT_CAP - 1);
-        s.push('\u{20AC}'); // euro sign occupies OUTPUT_CAP-1..OUTPUT_CAP+1
+        s.push('\u{20AC}'); // euro sign occupies OUTPUT_CAp-1..OUTPUT_CAP+1
         let (out, cut) = cap_output(&s);
         assert!(cut);
         assert!(out.is_char_boundary(out.len()));

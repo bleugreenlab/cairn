@@ -489,6 +489,11 @@ async fn fire_scheduled_recipe(
         None,
         None,
         None,
+        crate::issues::crud::installation_machine_authorship(
+            orch.anon_device_manager.device_id(),
+            orch.services.clock.now(),
+        )
+        .map_err(|error| error.to_string())?,
     )
     .await?;
 
@@ -779,8 +784,8 @@ edges:
     fn due_at_fires_every_tied_recipe() {
         let fire = Utc::now();
         let batch = vec![
-            (scheduled_recipe("a", "PROJ", "p"), fire),
-            (scheduled_recipe("b", "PROJ", "p"), fire),
+            (scheduled_recipe("a", "proj", "p"), fire),
+            (scheduled_recipe("b", "proj", "p"), fire),
         ];
 
         let due = due_at(&batch, fire + Duration::seconds(1));
@@ -852,7 +857,7 @@ edges:
             "
             INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES('p', 'w', 'Project', 'PROJ', '{}', 1, 1);
+             VALUES('p', 'w', 'Project', 'proj', '{}', 1, 1);
             ",
             project_dir.display()
         ))
@@ -864,7 +869,7 @@ edges:
             id: "nightly".to_string(),
             name: "Nightly".to_string(),
             project_id: "p".to_string(),
-            project_key: "PROJ".to_string(),
+            project_key: "proj".to_string(),
             project_path: project_dir.clone(),
             schedule_config: daily_config(),
         };

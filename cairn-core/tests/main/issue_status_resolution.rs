@@ -126,7 +126,7 @@ async fn job_status(db: &LocalDb, job_id: &str) -> String {
 #[tokio::test]
 async fn agent_status_merged_with_open_pr_is_refused() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     insert_open_mr(&orch.db.local, &project_id, "issue-1").await;
 
@@ -159,7 +159,7 @@ async fn agent_status_merged_with_open_pr_is_refused() {
 #[tokio::test]
 async fn agent_status_merged_without_pr_resolves() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
 
     // No merge_requests row — a record-only resolution is legitimate.
@@ -178,7 +178,7 @@ async fn agent_status_merged_without_pr_resolves() {
 #[tokio::test]
 async fn user_status_merged_with_open_pr_overrides() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     insert_open_mr(&orch.db.local, &project_id, "issue-1").await;
 
@@ -199,7 +199,7 @@ async fn user_status_merged_with_open_pr_overrides() {
 #[tokio::test]
 async fn unconfirmed_close_enumerates_live_work_and_names_the_key() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     insert_running_job(&orch.db.local, &project_id).await;
     insert_job(
@@ -251,7 +251,7 @@ async fn unconfirmed_close_enumerates_live_work_and_names_the_key() {
 #[tokio::test]
 async fn user_close_with_live_work_needs_the_same_confirmation() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     insert_running_job(&orch.db.local, &project_id).await;
 
@@ -286,7 +286,7 @@ async fn user_close_with_live_work_needs_the_same_confirmation() {
 #[tokio::test]
 async fn confirmed_close_stops_running_work_and_cancels_queued_work() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     insert_running_job(&orch.db.local, &project_id).await;
     insert_job(
@@ -385,7 +385,7 @@ async fn confirmed_close_stops_running_work_and_cancels_queued_work() {
 #[tokio::test]
 async fn close_with_no_live_work_needs_no_confirmation() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     insert_job(
         &orch.db.local,
@@ -412,7 +412,7 @@ async fn close_with_no_live_work_needs_no_confirmation() {
 #[tokio::test]
 async fn archived_jobs_are_not_live_work() {
     let (_temp, orch) = common::test_orchestrator().await;
-    let project_id = common::create_project(&orch.db.local, "RES").await;
+    let project_id = common::create_project(&orch.db.local, "res").await;
     insert_issue(&orch.db.local, &project_id, "issue-1").await;
     // A node removed from the snapshot is archived, not live: it would never run
     // again, and counting it taxed every later close with a confirmation.

@@ -37,6 +37,29 @@ pub(crate) fn clamp_compact_threshold(value: f64) -> f64 {
     value.clamp(0.1, 1.0)
 }
 
+/// Read the persisted voice opt-in. Missing settings are deliberately disabled.
+pub fn load_voice_preferences(config_dir: &std::path::Path) -> crate::voice::VoicePreferences {
+    load_settings_file(config_dir)
+        .ok()
+        .and_then(|file| file.voice)
+        .unwrap_or_default()
+}
+
+/// Surgically persist voice intent without rewriting unrelated settings.
+pub fn set_voice_preferences(
+    config_dir: &std::path::Path,
+    preferences: &crate::voice::VoicePreferences,
+) -> Result<(), String> {
+    mutate_workspace_settings(config_dir, "cairn: update voice settings", |root| {
+        root.insert(
+            serde_yaml::Value::String("voice".to_string()),
+            serde_yaml::to_value(preferences)
+                .map_err(|error| format!("Failed to serialize voice settings: {error}"))?,
+        );
+        Ok(())
+    })
+}
+
 /// Number of days to retain JSONL logs. Invalid zero values heal to one day;
 /// an absent setting uses the shared seven-day default.
 pub fn load_log_retention_days(config_dir: &std::path::Path) -> u64 {
@@ -93,9 +116,14 @@ pub fn set_fleet(
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsFile {
-    // === Preset fields (new) ===
+    /// User intent only. Installed voice components are discovered and verified
+    /// from the managed voice manifest rather than trusted from settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    active_backend: Option<String>,
+    pub(crate) voice: Option<crate::voice::VoicePreferences>,
+    // === Preset fields (new) ===
+    /// Tier name -> the backend that serves it by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tier_defaults: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tiers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +133,12 @@ pub struct SettingsFile {
     /// Keyed by server name. Project config overlays this set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mcp_servers: Option<HashMap<String, crate::config::mcp_servers::McpServerConfig>>,
+
+    /// Legacy global default provider. Read only, and dropped from the file on
+    /// the next save: it meant "every tier resolves against this one backend",
+    /// which `tier_defaults` now says per tier.
+    #[serde(default, skip_serializing)]
+    active_backend: Option<String>,
 
     // === Legacy model fields (kept for deserialization, skipped on serialize) ===
     #[serde(default, skip_serializing)]
@@ -176,10 +210,9 @@ pub struct SettingsFile {
     /// names always apply; this config-only list can only add to them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     browser_network_sensitive_names: Option<Vec<String>>,
-    /// Managed Build Services: Cairn-supervised shared daemons (e.g. an sccache
-    /// server) that run under a service sandbox and inject client env into the
-    /// spawns that build inside the roots that sandbox grants. Config-only (YAML, not in the Settings DTO). Absent = the
-    /// built-in default (a disabled-unless-`sccache`-on-PATH sccache entry). See
+    /// Managed Build Services: optional user-configured shared daemons that run
+    /// under a service sandbox and inject client env into eligible spawns.
+    /// Config-only (YAML, not in the Settings DTO). Absent means no services. See
     /// `docs/worktree-fence.md` — Managed Build Services.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     build_services: Option<HashMap<String, crate::config::build_services::BuildServiceConfig>>,
@@ -297,6 +330,27 @@ fn migrate_legacy_models_to_presets(
 }
 
 impl SettingsFile {
+    /// The per-tier default backends this file describes, narrowed to `tiers`.
+    ///
+    /// Precedence is explicit `tierDefaults`, then the legacy global
+    /// `activeBackend` expanded across every tier (which is what it meant), then
+    /// Claude for every tier. Entries naming a tier that no longer exists are
+    /// dropped rather than persisted, so a deleted tier leaves nothing behind.
+    fn resolved_tier_defaults(&self, tiers: &[String]) -> HashMap<String, String> {
+        if let Some(configured) = &self.tier_defaults {
+            return tiers
+                .iter()
+                .filter_map(|tier| {
+                    configured
+                        .get(tier)
+                        .map(|backend| (tier.clone(), backend.clone()))
+                })
+                .collect();
+        }
+        let legacy = self.active_backend.as_deref().unwrap_or("claude");
+        crate::config::presets::tier_defaults_from_single_backend(legacy, tiers)
+    }
+
     /// Convert to Settings DTO with defaults applied.
     ///
     /// Migration: if `backends` is absent but legacy model fields are present,
@@ -321,17 +375,15 @@ impl SettingsFile {
             for (name, presets) in backends.clone() {
                 merged.insert(name, presets);
             }
+            let tiers = self.tiers.clone().unwrap_or_else(|| {
+                crate::config::presets::DEFAULT_TIERS
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
             PresetsConfig {
-                active_backend: self
-                    .active_backend
-                    .clone()
-                    .unwrap_or_else(|| "claude".to_string()),
-                tiers: self.tiers.clone().unwrap_or_else(|| {
-                    crate::config::presets::DEFAULT_TIERS
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect()
-                }),
+                tier_defaults: self.resolved_tier_defaults(&tiers),
+                tiers,
                 backends: merged,
             }
         } else {
@@ -353,11 +405,12 @@ impl SettingsFile {
                 }
             }
 
+            config.tier_defaults = self.resolved_tier_defaults(&config.tiers);
             config
         };
 
         Settings {
-            active_backend: presets.active_backend,
+            tier_defaults: presets.tier_defaults,
             tiers: presets.tiers,
             backends: presets.backends,
             system_prompt: String::new(), // Deprecated, always empty
@@ -405,7 +458,9 @@ impl SettingsFile {
     /// Create from Settings DTO
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
-            active_backend: Some(settings.active_backend.clone()),
+            voice: None,
+            tier_defaults: Some(settings.tier_defaults.clone()),
+            active_backend: None,
             tiers: Some(settings.tiers.clone()),
             backends: Some(settings.backends.clone()),
             mcp_servers: None,
@@ -588,26 +643,15 @@ pub(crate) fn load_sandbox_deny_read(config_dir: &std::path::Path) -> Vec<PathBu
     }
 }
 
-/// Load the configured Managed Build Services, or the built-in default set when
-/// none are configured. The supervisor decides which to actually launch (e.g.
-/// the default sccache entry only runs when `sccache` is on `PATH`).
+/// Load user-configured Managed Build Services. Cairn has no built-in service:
+/// dependency reuse for executor cells is owned by the Cargo dependency catalog.
 pub(crate) fn load_build_services(
     config_dir: &std::path::Path,
 ) -> HashMap<String, crate::config::build_services::BuildServiceConfig> {
-    let configured = load_settings_file(config_dir)
+    load_settings_file(config_dir)
         .ok()
-        .and_then(|f| f.build_services);
-    match configured {
-        Some(map) => map,
-        None => {
-            let mut defaults = HashMap::new();
-            defaults.insert(
-                "sccache".to_string(),
-                crate::config::build_services::default_sccache_service(),
-            );
-            defaults
-        }
-    }
+        .and_then(|file| file.build_services)
+        .unwrap_or_default()
 }
 
 /// Load the per-project map of user-accepted fence-crossing commands from
@@ -711,14 +755,7 @@ fn mutate_build_services<T>(
         let mut map = match root.get(&key).cloned() {
             Some(value) if !value.is_null() => serde_yaml::from_value(value)
                 .map_err(|error| format!("Failed to parse build services: {error}"))?,
-            None | Some(_) => {
-                let mut defaults = HashMap::new();
-                defaults.insert(
-                    "sccache".to_string(),
-                    crate::config::build_services::default_sccache_service(),
-                );
-                defaults
-            }
+            None | Some(_) => HashMap::new(),
         };
         let result = mutate(&mut map)?;
         root.insert(
@@ -779,6 +816,9 @@ pub(crate) fn load_settings_file(config_dir: &std::path::Path) -> Result<Setting
 }
 
 const SETTINGS_DTO_KEYS: &[&str] = &[
+    "tierDefaults",
+    // Removed DTO key: the next save deletes the legacy global toggle once its
+    // value has migrated into per-tier defaults.
     "activeBackend",
     "tiers",
     "backends",
@@ -855,10 +895,12 @@ pub fn update_settings(
 }
 
 fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
-    if let Some(value) = input.active_backend {
-        current.active_backend = value;
+    if let Some(value) = input.tier_defaults {
+        current.tier_defaults = value;
     }
     if let Some(value) = input.tiers {
+        // A tier that no longer exists keeps no default binding behind it.
+        current.tier_defaults.retain(|tier, _| value.contains(tier));
         current.tiers = value;
     }
     if let Some(value) = input.backends {
@@ -1087,9 +1129,11 @@ mod tests {
         let file = SettingsFile::default();
         let settings = file.to_settings();
 
-        // Preset defaults
-        assert_eq!(settings.active_backend, "claude");
+        // Preset defaults: every tier starts bound to claude.
         assert_eq!(settings.tiers, vec!["sm", "md", "lg"]);
+        assert_eq!(settings.tier_defaults["sm"], "claude");
+        assert_eq!(settings.tier_defaults["md"], "claude");
+        assert_eq!(settings.tier_defaults["lg"], "claude");
         assert!(settings.backends.contains_key("claude"));
         assert!(settings.backends.contains_key("codex"));
 
@@ -1185,7 +1229,7 @@ externalReplies: disabled
         let file = SettingsFile::from_settings(&settings);
         let restored = file.to_settings();
 
-        assert_eq!(restored.active_backend, settings.active_backend);
+        assert_eq!(restored.tier_defaults, settings.tier_defaults);
         assert_eq!(restored.backends, settings.backends);
         assert_eq!(restored.max_thinking_tokens, settings.max_thinking_tokens);
         assert_eq!(restored.merge_type, settings.merge_type);
@@ -1202,16 +1246,21 @@ externalReplies: disabled
     #[test]
     fn channel_settings_yaml_roundtrip_and_defaults() {
         use crate::models::{
-            ChannelRouteConfig, ChannelsConfig, IMessageChannelConfig, TelegramChannelConfig,
+            ChannelsConfig, DiscordChannelConfig, IMessageChannelConfig, MessageClassPolicy,
+            TelegramChannelConfig,
         };
 
         let defaults: SettingsFile = serde_yaml::from_str("channels:\n  imessage: {}\n").unwrap();
         let default_channel = defaults.to_settings().channels.imessage;
         assert!(!default_channel.enabled);
-        assert_eq!(default_channel.route, ChannelRouteConfig::default());
+        assert_eq!(default_channel.route, MessageClassPolicy::default());
         assert_eq!(
             defaults.to_settings().channels.telegram,
             TelegramChannelConfig::default()
+        );
+        assert_eq!(
+            defaults.to_settings().channels.discord,
+            DiscordChannelConfig::default()
         );
         assert_eq!(
             defaults.to_settings().channels.default_thread,
@@ -1225,21 +1274,38 @@ externalReplies: disabled
                 executor: Some("bglab-mac".to_string()),
                 to: "+15551234567".to_string(),
                 allow_from: vec!["+15551234567".to_string()],
-                route: ChannelRouteConfig {
+                inbound_capabilities: crate::models::ChannelInboundCapabilities {
+                    permissions: false,
+                    answers: true,
+                    free_text: true,
+                },
+                route: MessageClassPolicy {
                     question: true,
                     permission: false,
-                    review: true,
+                    notify: true,
                 },
             },
             telegram: TelegramChannelConfig {
                 enabled: true,
                 chat_id: "-1001234567890".to_string(),
                 allow_from: vec!["123456789".to_string()],
-                route: ChannelRouteConfig {
+                inbound_capabilities: crate::models::ChannelInboundCapabilities::default(),
+                route: MessageClassPolicy {
                     question: true,
                     permission: true,
-                    review: false,
+                    notify: false,
                 },
+            },
+            discord: DiscordChannelConfig {
+                enabled: true,
+                guild_id: "111111111111111111".to_string(),
+                allow_from: vec!["987654321098765432".to_string()],
+                inbound_capabilities: crate::models::ChannelInboundCapabilities {
+                    permissions: false,
+                    answers: false,
+                    free_text: false,
+                },
+                route: MessageClassPolicy::default(),
             },
         };
         let settings = Settings {
@@ -1250,6 +1316,9 @@ externalReplies: disabled
         let yaml = serde_yaml::to_string(&file).unwrap();
         assert!(yaml.contains("allowFrom"));
         assert!(yaml.contains("chatId"));
+        assert!(yaml.contains("guildId"));
+        assert!(yaml.contains("inboundCapabilities:"));
+        assert!(yaml.contains("freeText: true"));
         assert!(!yaml.contains("botToken"));
         assert!(!yaml.contains("BOT_TOKEN"));
         assert_eq!(file.to_settings().channels, channels);
@@ -1524,9 +1593,9 @@ buildServices:
         upsert_build_service(dir, "mycache", &cfg).unwrap();
 
         let map = load_build_services(dir);
-        // The new service is present AND the built-in default sccache survives.
+        // Only the explicitly configured service is present.
         assert!(map.contains_key("mycache"));
-        assert!(map.contains_key("sccache"));
+        assert_eq!(map.len(), 1);
         assert_eq!(map["mycache"].start, vec!["mycache", "--serve"]);
         assert_eq!(
             map["mycache"].env.get("FOO").map(String::as_str),
@@ -1540,16 +1609,15 @@ buildServices:
         delete_build_service(dir, "mycache").unwrap();
         let after = load_build_services(dir);
         assert!(!after.contains_key("mycache"));
-        assert!(after.contains_key("sccache"));
+        assert!(after.is_empty());
     }
 
     #[test]
-    fn build_services_defaults_to_sccache_when_unset() {
+    fn build_services_defaults_to_empty_when_unset() {
         let temp = TempDir::new().unwrap();
-        // No settings file: the built-in default sccache entry is synthesized.
+        // No settings file means no managed daemon is launched.
         let services = load_build_services(temp.path());
-        assert!(services.contains_key("sccache"));
-        assert!(services["sccache"].enabled);
+        assert!(services.is_empty());
     }
 
     #[test]
@@ -1742,7 +1810,7 @@ logLevel: verbose
             settings.backends["claude"]["md"].model,
             Model::new(Model::SONNET)
         );
-        assert_eq!(settings.active_backend, "claude");
+        assert_eq!(settings.tier_defaults["md"], "claude");
     }
 
     #[test]
@@ -1759,7 +1827,7 @@ logLevel: standard
             settings.backends["claude"]["lg"].model,
             Model::new(Model::OPUS)
         );
-        assert_eq!(settings.active_backend, "claude");
+        assert_eq!(settings.tier_defaults["lg"], "claude");
         assert_eq!(
             settings.backends["claude"]["lg"].model,
             Model::new(Model::OPUS)
@@ -1916,7 +1984,10 @@ backends:
         let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
         let settings = file.to_settings();
 
-        assert_eq!(settings.active_backend, "codex");
+        // A legacy global activeBackend loads as every tier defaulting to it.
+        assert_eq!(settings.tier_defaults["sm"], "codex");
+        assert_eq!(settings.tier_defaults["md"], "codex");
+        assert_eq!(settings.tier_defaults["lg"], "codex");
         assert_eq!(
             settings.backends["codex"]["md"].model.as_str(),
             "gpt-5.3-codex"
@@ -1925,7 +1996,7 @@ backends:
         // Roundtrip
         let file2 = SettingsFile::from_settings(&settings);
         let restored = file2.to_settings();
-        assert_eq!(restored.active_backend, "codex");
+        assert_eq!(restored.tier_defaults, settings.tier_defaults);
         assert_eq!(restored.backends.get("codex").unwrap().len(), 3);
     }
 
@@ -1973,7 +2044,7 @@ autoStartJobs: false
             assert!(loaded_settings.auto_start_jobs); // Always true
             assert_eq!(loaded_settings.max_thinking_tokens, None);
             // Default presets should be present
-            assert_eq!(loaded_settings.active_backend, "claude");
+            assert_eq!(loaded_settings.tier_defaults["md"], "claude");
         });
     }
 
@@ -2063,8 +2134,12 @@ thinkingDisplayMode: full
 
         // Preset fields should appear
         assert!(
-            yaml.contains("activeBackend"),
-            "activeBackend should be serialized"
+            yaml.contains("tierDefaults"),
+            "tierDefaults should be serialized"
+        );
+        assert!(
+            !yaml.contains("activeBackend"),
+            "the legacy global toggle should not be serialized"
         );
         assert!(
             !yaml.contains("defaultTier"),
@@ -2078,16 +2153,114 @@ thinkingDisplayMode: full
     fn test_settings_preset_roundtrip_preserves_backends() {
         // Build settings with custom backends and verify they survive roundtrip
         let mut settings = test_settings();
-        settings.active_backend = "codex".to_string();
+        settings
+            .tier_defaults
+            .insert("md".to_string(), "codex".to_string());
 
         let file = SettingsFile::from_settings(&settings);
         let yaml = serde_yaml::to_string(&file).unwrap();
         let parsed: SettingsFile = serde_yaml::from_str(&yaml).unwrap();
         let restored = parsed.to_settings();
 
-        assert_eq!(restored.active_backend, "codex");
+        assert_eq!(restored.tier_defaults["md"], "codex");
         assert!(restored.backends.contains_key("claude"));
         assert!(restored.backends.contains_key("codex"));
+    }
+
+    #[test]
+    fn tier_defaults_may_differ_per_tier_and_survive_a_roundtrip() {
+        // The end state the per-tier model exists for: best model on top, cheap
+        // faucet at the bottom, each written and read back independently.
+        let yaml = r#"
+tierDefaults:
+  sm: openrouter
+  md: codex
+  lg: claude
+tiers:
+  - sm
+  - md
+  - lg
+backends:
+  claude:
+    lg:
+      model: opus
+"#;
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let settings = file.to_settings();
+        assert_eq!(settings.tier_defaults["sm"], "openrouter");
+        assert_eq!(settings.tier_defaults["md"], "codex");
+        assert_eq!(settings.tier_defaults["lg"], "claude");
+
+        let restored = SettingsFile::from_settings(&settings).to_settings();
+        assert_eq!(restored.tier_defaults, settings.tier_defaults);
+    }
+
+    #[test]
+    fn an_explicit_tier_defaults_map_wins_over_a_legacy_active_backend() {
+        // A file carrying both is not ambiguous: the per-tier map is the current
+        // vocabulary and the global key is what it superseded.
+        let yaml = r#"
+activeBackend: codex
+tierDefaults:
+  lg: claude
+tiers:
+  - sm
+  - md
+  - lg
+backends:
+  claude:
+    lg:
+      model: opus
+"#;
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let settings = file.to_settings();
+        assert_eq!(settings.tier_defaults["lg"], "claude");
+        // sm/md carry no binding, so they resolve to their first defined provider.
+        assert!(!settings.tier_defaults.contains_key("sm"));
+        assert!(!settings.tier_defaults.contains_key("md"));
+    }
+
+    #[test]
+    fn the_legacy_global_key_is_dropped_from_the_file_once_it_has_migrated() {
+        let yaml = r#"
+activeBackend: codex
+tiers:
+  - sm
+  - md
+  - lg
+backends:
+  codex:
+    md:
+      model: gpt-5.3-codex
+"#;
+        let file: SettingsFile = serde_yaml::from_str(yaml).unwrap();
+        let settings = file.to_settings();
+        let rendered = serde_yaml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
+        assert!(
+            !rendered.contains("activeBackend"),
+            "legacy global toggle must not be written back: {rendered}"
+        );
+        assert!(rendered.contains("tierDefaults"), "{rendered}");
+    }
+
+    #[test]
+    fn deleting_a_tier_removes_its_default_binding() {
+        let mut settings = test_settings();
+        settings
+            .tier_defaults
+            .insert("md".to_string(), "codex".to_string());
+        apply_settings_update(
+            &mut settings,
+            UpdateSettings {
+                tiers: Some(vec!["sm".to_string(), "lg".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(
+            !settings.tier_defaults.contains_key("md"),
+            "a removed tier must not leave a default binding behind"
+        );
+        assert!(settings.tier_defaults.contains_key("lg"));
     }
 }
 

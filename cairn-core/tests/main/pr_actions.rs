@@ -734,7 +734,7 @@ fn merge_response(status: u16) -> HttpResponse {
 #[tokio::test]
 async fn try_resolve_and_render_are_none_for_non_pr_job() {
     let (_temp, db) = common::migrated_db().await;
-    let project = create_project(&db, "NP", "/tmp/none").await;
+    let project = create_project(&db, "np", "/tmp/none").await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     // No merge_requests row for this job.
@@ -757,7 +757,7 @@ async fn refresh_pr_for_job_updates_cache() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "RF", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "rf", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -803,7 +803,7 @@ async fn refresh_pr_for_job_populates_github_state_fields() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "RFS", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "rfs", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -853,7 +853,7 @@ async fn render_live_pr_section_includes_actions_and_honors_diff_full() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "RV", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "rv", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let _mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -866,7 +866,7 @@ async fn render_live_pr_section_includes_actions_and_honors_diff_full() {
         .respond_to("/pulls/5", pr_response("open", false));
     let (_cfg, orch) = orchestrator_with_http(db, http).await;
 
-    let uri = "cairn://p/RV/1/1/builder/pr";
+    let uri = "cairn://p/rv/1/1/builder/pr";
     let default = actions::render_live_pr_section(&orch, &job, uri, false)
         .await
         .expect("PR artifact should yield a section");
@@ -892,7 +892,7 @@ async fn close_pr_for_job_marks_closed() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "CL", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "cl", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     // A recipe-backed producing job: standalone (execution-less) jobs were
     // retired, so resolving the PR recomputes through the job's execution sweep.
@@ -917,7 +917,7 @@ async fn reconcile_after_merge_for_action_run_owner_stores_files_under_parent_jo
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "ARF", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "arf", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     insert_execution(&db, "exec-arf", &project, &issue).await;
     let parent_job = create_job_with_execution(&db, &project, &issue, Some("exec-arf")).await;
@@ -976,7 +976,7 @@ async fn merge_pr_for_job_marks_merged_and_resolves_issue() {
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    let project = create_project(&db, "MG", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "mg", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     // A recipe-backed producing job: standalone (execution-less) jobs were
     // retired, so resolving the PR recomputes through the job's execution sweep.
@@ -1005,7 +1005,7 @@ async fn merge_pr_for_job_remote_default_branch_merges_via_github() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "GH", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "gh", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     // A recipe-backed producing job: standalone (execution-less) jobs were
     // retired, so resolving the PR recomputes through the job's execution sweep.
@@ -1041,7 +1041,7 @@ async fn merge_pr_for_job_remote_merge_failure_leaves_unmarked() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "GHF", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "ghf", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -1073,7 +1073,7 @@ async fn merge_pr_for_job_refuses_conflicted_source_with_actionable_detail() {
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    let project = create_project(&db, "MGC", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "mgc", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_local_merge_request(&db, &job, &project, &issue).await;
@@ -1119,7 +1119,7 @@ async fn render_live_pr_section_flags_conflicted_history() {
     let repo = temp_jj_project();
     add_github_origin(repo.path());
     insert_github_app(&db).await;
-    let project = create_project(&db, "RVC", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "rvc", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let _mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -1144,7 +1144,7 @@ async fn render_live_pr_section_flags_conflicted_history() {
     let orch = orchestrator_with_http_in(db, http, &cfg).await;
 
     let section =
-        actions::render_live_pr_section(&orch, &job, "cairn://p/RVC/1/1/builder/pr", false)
+        actions::render_live_pr_section(&orch, &job, "cairn://p/rvc/1/1/builder/pr", false)
             .await
             .expect("PR artifact should yield a section");
     // GitHub reports mergeable=true (+12/-3); jj overrides with the conflict reality.
@@ -1191,7 +1191,7 @@ async fn render_live_pr_section_publishes_no_verdict_for_a_conflicted_tip_at_a_s
     let repo = temp_jj_project();
     add_github_origin(repo.path());
     insert_github_app(&db).await;
-    let project = create_project(&db, "RVCS", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "rvcs", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -1209,7 +1209,7 @@ async fn render_live_pr_section_publishes_no_verdict_for_a_conflicted_tip_at_a_s
     let branch_head = jj_bookmark_commit(&bin, &config_dir, repo.path(), "feature");
 
     let section =
-        actions::render_live_pr_section(&orch, &job, "cairn://p/RVCS/1/1/builder/pr", false)
+        actions::render_live_pr_section(&orch, &job, "cairn://p/rvcs/1/1/builder/pr", false)
             .await
             .expect("PR artifact should yield a section");
 
@@ -1273,7 +1273,7 @@ async fn render_live_pr_section_flags_a_pull_request_behind_its_branch() {
     let repo = temp_jj_project();
     add_github_origin(repo.path());
     insert_github_app(&db).await;
-    let project = create_project(&db, "RVSTALE", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "rvstale", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     let job = create_job(&db, &project, &issue).await;
     let mr = create_merge_request(&db, &job, &project, &issue, 5).await;
@@ -1293,7 +1293,7 @@ async fn render_live_pr_section_flags_a_pull_request_behind_its_branch() {
     let branch_head = jj_bookmark_commit(&bin, &config_dir, repo.path(), "feature");
 
     let section =
-        actions::render_live_pr_section(&orch, &job, "cairn://p/RVSTALE/1/1/builder/pr", false)
+        actions::render_live_pr_section(&orch, &job, "cairn://p/rvstale/1/1/builder/pr", false)
             .await
             .expect("PR artifact should yield a section");
 
@@ -1348,7 +1348,7 @@ async fn merge_pr_for_job_squashes_multiple_commits_to_one() {
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    let project = create_project(&db, "MGSQ", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "mgsq", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     // A recipe-backed producing job: standalone (execution-less) jobs were
     // retired, so resolving the PR recomputes through the job's execution sweep.
@@ -1405,7 +1405,7 @@ async fn merge_pr_for_job_squash_retry_is_idempotent() {
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    let project = create_project(&db, "MGRT", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "mgrt", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     // A recipe-backed producing job: standalone (execution-less) jobs were
     // retired, so resolving the PR recomputes through the job's execution sweep.
@@ -1487,7 +1487,7 @@ async fn merge_pr_for_job_workspace_keeps_real_commits() {
 #[tokio::test]
 async fn helper_advances_when_mr_has_producing_execution() {
     let (_temp, db) = common::migrated_db().await;
-    let project = create_project(&db, "AD1", "/tmp/ad1").await;
+    let project = create_project(&db, "ad1", "/tmp/ad1").await;
     let issue = create_issue(&db, &project, 1).await;
     insert_execution(&db, "exec-ad1", &project, &issue).await;
     let job = create_job_with_execution(&db, &project, &issue, Some("exec-ad1")).await;
@@ -1547,7 +1547,7 @@ async fn helper_is_noop_when_mr_id_unknown() {
 #[tokio::test]
 async fn helper_is_noop_when_job_has_no_execution_id() {
     let (_temp, db) = common::migrated_db().await;
-    let project = create_project(&db, "AD3", "/tmp/ad3").await;
+    let project = create_project(&db, "ad3", "/tmp/ad3").await;
     let issue = create_issue(&db, &project, 1).await;
     // Job exists but has no execution_id (non-recipe / one-off run).
     let job = create_job_with_execution(&db, &project, &issue, None).await;
@@ -1569,7 +1569,7 @@ async fn helper_is_noop_when_job_has_no_execution_id() {
 #[tokio::test]
 async fn helper_is_idempotent_across_repeat_calls() {
     let (_temp, db) = common::migrated_db().await;
-    let project = create_project(&db, "AD4", "/tmp/ad4").await;
+    let project = create_project(&db, "ad4", "/tmp/ad4").await;
     let issue = create_issue(&db, &project, 1).await;
     insert_execution(&db, "exec-ad4", &project, &issue).await;
     let job = create_job_with_execution(&db, &project, &issue, Some("exec-ad4")).await;
@@ -1611,7 +1611,7 @@ async fn merge_pr_for_job_advances_producing_execution() {
     };
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_jj_project();
-    let project = create_project(&db, "MGA", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "mga", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     insert_execution(&db, "exec-mga", &project, &issue).await;
     let job = create_job_with_execution(&db, &project, &issue, Some("exec-mga")).await;
@@ -1650,7 +1650,7 @@ async fn close_pr_for_job_advances_producing_execution() {
     let (_temp, db) = common::migrated_db().await;
     let repo = temp_git_repo();
     insert_github_app(&db).await;
-    let project = create_project(&db, "CLA", repo.path().to_str().unwrap()).await;
+    let project = create_project(&db, "cla", repo.path().to_str().unwrap()).await;
     let issue = create_issue(&db, &project, 1).await;
     insert_execution(&db, "exec-cla", &project, &issue).await;
     let job = create_job_with_execution(&db, &project, &issue, Some("exec-cla")).await;

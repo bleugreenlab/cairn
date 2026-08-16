@@ -655,16 +655,16 @@ mod tests {
 
     #[test]
     fn a_checks_ref_accepts_the_shapes_an_agent_actually_holds() {
-        let home = "cairn://p/CAIRN/3437/1/builder";
+        let home = "cairn://p/cairn/3437/1/builder";
         for reference in [
-            "cairn://p/CAIRN/3427/1/builder/checks",
+            "cairn://p/cairn/3427/1/builder/checks",
             // The bare node URI names the same node; requiring the suffix would
             // be a spelling test, not a scoping one.
-            "cairn://p/CAIRN/3427/1/builder",
-            "cairn://p/CAIRN/3427/1/builder/checks/",
+            "cairn://p/cairn/3427/1/builder",
+            "cairn://p/cairn/3427/1/builder/checks/",
         ] {
             let coords = checks_coords(reference, Some(home)).expect(reference);
-            assert_eq!(coords.canonical, "cairn://p/CAIRN/3427/1/builder/checks");
+            assert_eq!(coords.canonical, "cairn://p/cairn/3427/1/builder/checks");
             assert_eq!(coords.number, 3427);
             assert_eq!(coords.node_id, "builder");
             assert_eq!(coords.task_name, None);
@@ -674,7 +674,7 @@ mod tests {
         assert_eq!(own.canonical, format!("{home}/checks"));
 
         let task =
-            checks_coords("cairn://p/CAIRN/3427/1/builder/task/review/checks", None).unwrap();
+            checks_coords("cairn://p/cairn/3427/1/builder/task/review/checks", None).unwrap();
         assert_eq!(task.task_name.as_deref(), Some("review"));
     }
 
@@ -683,13 +683,13 @@ mod tests {
     #[test]
     fn a_ref_that_is_not_a_node_is_refused_with_the_shape_it_needed() {
         for reference in [
-            "cairn://p/CAIRN/3427",
+            "cairn://p/cairn/3427",
             "cairn:~/terminal/dev",
             "rust-tests",
             "",
         ] {
             let error =
-                checks_coords(reference, Some("cairn://p/CAIRN/1/1/builder")).expect_err(reference);
+                checks_coords(reference, Some("cairn://p/cairn/1/1/builder")).expect_err(reference);
             assert!(
                 error.contains("node or task checks URI"),
                 "{reference}: {error}"

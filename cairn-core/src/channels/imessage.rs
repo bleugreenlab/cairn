@@ -742,6 +742,7 @@ impl IMessageProvider {
                     return Ok(Some((
                         rowid,
                         InboundEvent::Selections {
+                            conversation: format!("imessage:{participant}"),
                             bound_guid,
                             sender: participant,
                             changes: changes
@@ -780,11 +781,16 @@ impl IMessageProvider {
             rowid,
             match bound_guid {
                 Some(bound_guid) => InboundEvent::Reply {
+                    conversation: format!("imessage:{sender}"),
                     bound_guid,
                     sender,
                     text,
                 },
-                None => InboundEvent::Bare { sender, text },
+                None => InboundEvent::Bare {
+                    conversation: format!("imessage:{sender}"),
+                    sender,
+                    text,
+                },
             },
         )))
     }
@@ -1061,7 +1067,20 @@ impl ChannelProvider for IMessageProvider {
             rendered.append(body);
         }
         if self.capabilities().structured_asks {
-            if let OutboundAsk::Question { text, options, .. } = &message.ask {
+            let poll = match &message.ask {
+                OutboundAsk::Question { text, options, .. } => Some((
+                    text.as_str(),
+                    options
+                        .iter()
+                        .map(|option| option.label.as_str())
+                        .collect::<Vec<_>>(),
+                )),
+                OutboundAsk::Permission { summary, .. } => {
+                    Some((summary.as_str(), vec!["Approve", "Deny"]))
+                }
+                OutboundAsk::Notify { .. } => None,
+            };
+            if let Some((text, options)) = poll {
                 // A Messages poll balloon needs at least two options; imsg rejects a
                 // single `--option`. A one-option ask takes the numbered-text floor
                 // rather than failing the delivery outright.
@@ -1081,10 +1100,7 @@ impl ChannelProvider for IMessageProvider {
                             ),
                         ];
                         for option in options {
-                            args.extend([
-                                "--option".into(),
-                                render_channel_text(&option.label).text,
-                            ]);
+                            args.extend(["--option".into(), render_channel_text(option).text]);
                         }
                         let output = self.executor.run(args).await?;
                         let caption = format!(
@@ -1404,6 +1420,13 @@ mod tests {
         value.to_string()
     }
 
+    /// The captured history preserves the uppercase project key that was actually sent.
+    /// Tests using the lowercase canonical message must mock the history produced by that
+    /// send, because production reconciliation deliberately matches rendered text exactly.
+    fn canonical_message_history() -> String {
+        REAL_HISTORY.replacen("[CAIRN-3373", "[cairn-3373", 1)
+    }
+
     struct FakeExecutor {
         results: Mutex<VecDeque<Result<CommandResult, String>>>,
         calls: Mutex<Vec<Vec<String>>>,
@@ -1526,10 +1549,10 @@ mod tests {
 
     #[test]
     fn channel_text_removes_markdown_without_losing_deep_links() {
-        let markdown = "# **CAIRN-3550** stream update\n\nUse `render_channel_text`:\n* first item\n* [Open in Cairn](cairn://p/CAIRN/3550)\n\n_Ready_.";
+        let markdown = "# **cairn-3550** stream update\n\nUse `render_channel_text`:\n* first item\n* [Open in Cairn](cairn://p/cairn/3550)\n\n_Ready_.";
         assert_eq!(
             render_channel_text(markdown).text,
-            "CAIRN-3550 stream update\n\nUse render_channel_text:\n\n- first item\n- cairn://p/CAIRN/3550\n\nReady."
+            "cairn-3550 stream update\n\nUse render_channel_text:\n\n- first item\n- cairn://p/cairn/3550\n\nReady."
         );
     }
 
@@ -1595,7 +1618,7 @@ mod tests {
             intent_id: "intent".into(),
             conversation: "+15551234567".into(),
             initiated_by: crate::channels::OutboundInitiator::CairnPush,
-            context_header: "[CAIRN-3373 · builder]".into(),
+            context_header: "[cairn-3373 · builder]".into(),
             ask: OutboundAsk::Question {
                 prompt_id: "p".into(),
                 question_index: 0,
@@ -1645,7 +1668,7 @@ mod tests {
             bridgeless,
             "{}".into(),
             REAL_CHATS.into(),
-            REAL_HISTORY.into(),
+            canonical_message_history(),
         ]));
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert!(matches!(
@@ -1681,7 +1704,7 @@ mod tests {
         let mut message = message();
         message.context_header.clear();
         message.ask = OutboundAsk::Notify {
-            text: "**Bold** and `inline_code`\n- [Open](cairn://p/CAIRN/3550)".into(),
+            text: "**Bold** and `inline_code`\n- [Open](cairn://p/cairn/3550)".into(),
         };
 
         provider.send(&message).await.unwrap();
@@ -1690,7 +1713,7 @@ mod tests {
         assert_eq!(calls[1][0], "send");
         assert!(calls[1]
             .windows(2)
-            .any(|pair| { pair == ["--text", "Bold and inline_code\n\n- cairn://p/CAIRN/3550"] }));
+            .any(|pair| { pair == ["--text", "Bold and inline_code\n\n- cairn://p/cairn/3550"] }));
     }
 
     #[tokio::test]
@@ -1739,7 +1762,7 @@ mod tests {
 
     #[tokio::test]
     async fn ready_health_sends_poll_with_argument_boundaries() {
-        let poll_caption = r#"{"guid":"caption-guid","chat_id":2,"is_from_me":true,"text":"[CAIRN-3373 · builder]\n\nWhich path?"}"#;
+        let poll_caption = r#"{"guid":"caption-guid","chat_id":2,"is_from_me":true,"text":"[cairn-3373 · builder]\n\nWhich path?"}"#;
         let fake = Arc::new(FakeExecutor::new([
             REAL_STATUS,
             REAL_CHATS,
@@ -1750,7 +1773,7 @@ mod tests {
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
         let mut markdown_message = message_with(&["**Legacy**", "_New_"]);
-        markdown_message.context_header = "**[CAIRN-3373 · builder]**".into();
+        markdown_message.context_header = "**[cairn-3373 · builder]**".into();
         if let OutboundAsk::Question { text, .. } = &mut markdown_message.ask {
             *text = "Which `path`?".into();
         }
@@ -1773,7 +1796,42 @@ mod tests {
         assert!(calls[2].windows(2).any(|pair| pair == ["--option", "New"]));
         assert!(calls[2]
             .windows(2)
-            .any(|pair| { pair == ["--question", "[CAIRN-3373 · builder]\n\nWhich path?"] }));
+            .any(|pair| { pair == ["--question", "[cairn-3373 · builder]\n\nWhich path?"] }));
+    }
+
+    #[tokio::test]
+    async fn ready_health_sends_permission_as_approve_deny_poll() {
+        let poll_caption = r#"{"guid":"caption-guid","chat_id":2,"is_from_me":true,"text":"[cairn-3373 · builder]\n\nReadable permission"}"#;
+        let fake = Arc::new(FakeExecutor::new([
+            REAL_STATUS,
+            REAL_CHATS,
+            REAL_POLL_SEND,
+            REAL_CHATS,
+            poll_caption,
+        ]));
+        let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
+        assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
+        let mut permission = message();
+        permission.ask = OutboundAsk::Permission {
+            request_id: "permission-request".into(),
+            summary: "Readable permission".into(),
+        };
+
+        provider.send(&permission).await.unwrap();
+
+        let calls = fake.calls.lock().unwrap();
+        assert_eq!(&calls[2][..2], &["poll", "send"]);
+        let options = calls[2]
+            .windows(2)
+            .filter(|pair| pair[0] == "--option")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(options, vec!["Approve", "Deny"]);
+        assert!(calls[2].windows(2).any(|pair| pair
+            == [
+                "--question",
+                "[cairn-3373 · builder]\n\nReadable permission"
+            ]));
     }
 
     /// A handle imsg has no chat for has nothing to hold a balloon, so the first ask to
@@ -1782,11 +1840,11 @@ mod tests {
     #[tokio::test]
     async fn a_chat_that_does_not_exist_yet_takes_the_text_floor() {
         let fake = Arc::new(FakeExecutor::new([
-            REAL_STATUS,
-            "",
-            "{}",
-            REAL_CHATS,
-            REAL_HISTORY,
+            REAL_STATUS.into(),
+            String::new(),
+            "{}".into(),
+            REAL_CHATS.into(),
+            canonical_message_history(),
         ]));
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);
@@ -1843,7 +1901,7 @@ mod tests {
     /// ask has to reach the operator as text instead of failing the delivery.
     #[tokio::test]
     async fn single_option_ask_takes_the_text_floor_a_poll_cannot_hold() {
-        let floor = r#"{"guid":"m1","chat_id":2,"is_from_me":true,"text":"[CAIRN-3373 · builder]\n\nWhich path?\n\n1. New\n\nReply to this message with a number or your answer."}"#;
+        let floor = r#"{"guid":"m1","chat_id":2,"is_from_me":true,"text":"[cairn-3373 · builder]\n\nWhich path?\n\n1. New\n\nReply to this message with a number or your answer."}"#;
         let fake = Arc::new(FakeExecutor::new([REAL_STATUS, "{}", REAL_CHATS, floor]));
         let provider = IMessageProvider::new(fake.clone(), vec!["+15551234567".into()]);
         assert_eq!(provider.refresh_health().await, ChannelHealth::Ready);

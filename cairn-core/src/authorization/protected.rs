@@ -385,7 +385,7 @@ mod tests {
         for ordinary in [
             config.join("settings.yaml.bak"),
             config.join("agents/build.md"),
-            config.join("build-slots/CAIRN/slot-1/src/lib.rs"),
+            config.join("build-slots/cairn/slot-1/src/lib.rs"),
             dir.path().join("project/settings.yaml"),
             dir.path().join("project/.cairn/config.yaml"),
         ] {

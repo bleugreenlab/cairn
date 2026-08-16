@@ -6,6 +6,28 @@ pub fn canonical_project(project: impl AsRef<str>) -> String {
     project.as_ref().to_lowercase()
 }
 
+/// Canonicalize the project segment of a `cairn://p/...` identity while
+/// preserving every other byte. Identity keys may embed a URI behind a prefix
+/// (for example `review:cairn://p/PROJECT/42`), so parsing only a standalone URI
+/// is insufficient at storage boundaries.
+pub fn canonicalize_uri_identity(value: &str) -> String {
+    const MARKER: &str = "cairn://p/";
+    let Some(marker_start) = value.find(MARKER) else {
+        return value.to_string();
+    };
+    let project_start = marker_start + MARKER.len();
+    let project_end = value[project_start..]
+        .find('/')
+        .map(|offset| project_start + offset)
+        .unwrap_or(value.len());
+    format!(
+        "{}{}{}",
+        &value[..project_start],
+        canonical_project(&value[project_start..project_end]),
+        &value[project_end..]
+    )
+}
+
 pub fn build_project_check_observation_uri(project: &str, handle: &str) -> String {
     format!("{}/check-observations/{handle}", build_project_uri(project))
 }
@@ -424,6 +446,23 @@ pub fn build_job_todos_uri(
     }
 }
 
+/// The feed of the home a node/task coordinate names. Composes through
+/// [`build_node_uri`], so a thread's feed renders at the thread address.
+pub fn build_home_feed_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    task_name: Option<&str>,
+) -> String {
+    match task_name {
+        Some(task_name) => {
+            build_task_subresource_uri(project, number, exec_seq, node_id, task_name, "feed")
+        }
+        None => build_node_subresource_uri(project, number, exec_seq, node_id, "feed"),
+    }
+}
+
 fn build_node_tasks_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
     build_node_subresource_uri(project, number, exec_seq, node_id, "tasks")
 }
@@ -815,6 +854,9 @@ impl CairnResource {
         match self {
             Self::Project { project } => build_project_uri(project),
             Self::ProjectIssues { project } => build_project_issues_uri(project),
+            Self::Posts => "cairn://posts".to_string(),
+            Self::Post { id } => format!("cairn://posts/{id}"),
+            Self::ProjectPosts { project } => format!("{}/posts", build_project_uri(project)),
             Self::ProjectCheckResults { project, revision } => {
                 build_project_check_results_uri(project, revision)
             }
@@ -1017,6 +1059,13 @@ impl CairnResource {
                 node_id,
                 task_name,
             } => build_job_todos_uri(project, *number, *exec_seq, node_id, task_name.as_deref()),
+            Self::HomeFeed {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                task_name,
+            } => build_home_feed_uri(project, *number, *exec_seq, node_id, task_name.as_deref()),
             Self::NodeTasks {
                 project,
                 number,
@@ -1161,6 +1210,7 @@ impl CairnResource {
             Self::DevDb => "cairn://dev/db".to_string(),
             Self::DevPid => "cairn://dev/pid".to_string(),
             Self::Logs => "cairn://logs".to_string(),
+            Self::ChannelsConversations => "cairn://channels/conversations".to_string(),
             Self::Executors => "cairn://executors".to_string(),
             Self::Grants => "cairn://grants".to_string(),
             Self::Grant { id } => format!("cairn://grants/{id}"),

@@ -20,6 +20,92 @@ pub enum ExternalReplyMode {
     Disabled,
 }
 
+/// Independent actions admitted from an allowlisted channel sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelInboundCapabilities {
+    pub permissions: bool,
+    pub answers: bool,
+    pub free_text: bool,
+}
+
+impl Default for ChannelInboundCapabilities {
+    fn default() -> Self {
+        Self {
+            permissions: true,
+            answers: true,
+            free_text: false,
+        }
+    }
+}
+
+fn legacy_open_capabilities() -> ChannelInboundCapabilities {
+    ChannelInboundCapabilities {
+        permissions: true,
+        answers: true,
+        free_text: true,
+    }
+}
+
+impl<'de> Deserialize<'de> for ChannelInboundCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Capabilities {
+            permissions: bool,
+            answers: bool,
+            free_text: bool,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Persisted {
+            Legacy(String),
+            Capabilities(Capabilities),
+        }
+
+        match Persisted::deserialize(deserializer)? {
+            Persisted::Legacy(value) => match value.as_str() {
+                "open" => Ok(legacy_open_capabilities()),
+                "bounded" => Ok(Self::default()),
+                "outbound_only" => Ok(Self {
+                    permissions: false,
+                    answers: false,
+                    free_text: false,
+                }),
+                _ => Err(serde::de::Error::unknown_variant(
+                    &value,
+                    &["open", "bounded", "outbound_only"],
+                )),
+            },
+            Persisted::Capabilities(value) => Ok(Self {
+                permissions: value.permissions,
+                answers: value.answers,
+                free_text: value.free_text,
+            }),
+        }
+    }
+}
+
+/// Discord delivery configuration. The bot token lives only in the operating-system keychain.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscordChannelConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub guild_id: String,
+    #[serde(default)]
+    pub allow_from: Vec<String>,
+    #[serde(default = "legacy_open_capabilities", alias = "inboundPolicy")]
+    pub inbound_capabilities: ChannelInboundCapabilities,
+    #[serde(default)]
+    pub route: MessageClassPolicy,
+}
+
 /// Telegram delivery configuration. The bot token is deliberately absent: it
 /// is stored in the operating-system keychain under the Telegram credential.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,8 +117,10 @@ pub struct TelegramChannelConfig {
     pub chat_id: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    #[serde(default = "legacy_open_capabilities", alias = "inboundPolicy")]
+    pub inbound_capabilities: ChannelInboundCapabilities,
     #[serde(default)]
-    pub route: ChannelRouteConfig,
+    pub route: MessageClassPolicy,
 }
 
 /// Custom deserializer for nullable optional fields in UpdateSettings.
@@ -61,6 +149,8 @@ pub struct ChannelsConfig {
     pub imessage: IMessageChannelConfig,
     #[serde(default)]
     pub telegram: TelegramChannelConfig,
+    #[serde(default)]
+    pub discord: DiscordChannelConfig,
 }
 
 fn default_channel_thread() -> String {
@@ -73,13 +163,14 @@ impl Default for ChannelsConfig {
             default_thread: default_channel_thread(),
             imessage: IMessageChannelConfig::default(),
             telegram: TelegramChannelConfig::default(),
+            discord: DiscordChannelConfig::default(),
         }
     }
 }
 
 /// iMessage delivery configuration. Empty addresses keep the provider
 /// unconfigured even when `enabled` is true.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IMessageChannelConfig {
     #[serde(default)]
@@ -90,28 +181,47 @@ pub struct IMessageChannelConfig {
     pub to: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    #[serde(default = "legacy_open_capabilities", alias = "inboundPolicy")]
+    pub inbound_capabilities: ChannelInboundCapabilities,
     #[serde(default)]
-    pub route: ChannelRouteConfig,
+    pub route: MessageClassPolicy,
 }
 
-/// The human-blocking gate kinds delivered through a channel.
+impl Default for IMessageChannelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executor: None,
+            to: String::new(),
+            allow_from: Vec::new(),
+            inbound_capabilities: ChannelInboundCapabilities::default(),
+            route: MessageClassPolicy {
+                question: true,
+                permission: true,
+                notify: false,
+            },
+        }
+    }
+}
+
+/// Message classes eligible for delivery through a channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ChannelRouteConfig {
+pub struct MessageClassPolicy {
     #[serde(default = "default_true")]
     pub question: bool,
     #[serde(default = "default_true")]
     pub permission: bool,
     #[serde(default = "default_true")]
-    pub review: bool,
+    pub notify: bool,
 }
 
-impl Default for ChannelRouteConfig {
+impl Default for MessageClassPolicy {
     fn default() -> Self {
         Self {
             question: true,
             permission: true,
-            review: true,
+            notify: true,
         }
     }
 }
@@ -162,7 +272,9 @@ pub enum OpenRouterSort {
 #[serde(rename_all = "camelCase")]
 pub struct Settings {
     // === Preset fields ===
-    pub active_backend: String,
+    /// Tier name -> the backend that serves it by default. A tier with no entry
+    /// falls to its first defined provider at resolution time.
+    pub tier_defaults: HashMap<String, String>,
     pub tiers: Vec<String>,
     pub backends: HashMap<String, HashMap<String, Preset>>,
 
@@ -234,7 +346,7 @@ pub struct Settings {
 #[serde(rename_all = "camelCase")]
 pub struct UpdateSettings {
     // === Preset fields ===
-    pub active_backend: Option<String>,
+    pub tier_defaults: Option<HashMap<String, String>>,
     pub tiers: Option<Vec<String>>,
     pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
 

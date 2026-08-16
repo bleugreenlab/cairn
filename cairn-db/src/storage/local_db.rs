@@ -1,13 +1,18 @@
+use std::collections::HashMap;
+use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::atomic::AtomicUsize;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, MutexGuard, Once,
+};
 use std::time::{Duration, Instant};
 
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::sleep;
 use turso::{params::IntoParams, Builder, Connection, Row};
 
@@ -93,6 +98,53 @@ const MAX_IDLE_CONNECTIONS: usize = 32;
 /// [`MAX_IDLE_CONNECTIONS`] plus whatever transactions are genuinely in flight.
 const PAGE_CACHE_LIMIT: i32 = -65536;
 
+/// `PRAGMA mvcc_checkpoint_threshold` value that disables the engine's
+/// commit-path automatic checkpoint outright, leaving Cairn to checkpoint on a
+/// cadence of its own.
+///
+/// The MVCC engine arms a checkpoint on the *committing* connection once the
+/// logical log grows past a byte threshold (about 4.12 MB by default). That
+/// checkpoint runs in TRUNCATE mode — the engine's passive mode is behind an
+/// experimental builder flag Cairn deliberately does not set (see
+/// `docs/database.md`) — and TRUNCATE takes the store's checkpoint lock in write
+/// mode. Every MVCC transaction, read as well as write, explicit
+/// `BEGIN CONCURRENT` as well as a lone autocommit statement, holds that same
+/// lock in read mode for its whole lifetime. So the attempt can only win in an
+/// instant where *zero* transactions are open anywhere in the process, and commit
+/// time is the least likely such instant there is. Nor does it fail cheaply: the
+/// engine honours the connection's `busy_timeout` by retrying internally, so a
+/// losing attempt blocks for that entire timeout (see
+/// [`CHECKPOINT_BUSY_TIMEOUT`]).
+///
+/// Worse, the arming is permanent rather than periodic: the threshold is a level,
+/// not an edge, so once the log is over it every subsequent commit re-arms. In
+/// production this failed roughly 130,000 times a day without succeeding once,
+/// a third of all runner log volume, while the log grew to 537 MB (CAIRN-4146).
+///
+/// Disabling it also revives garbage collection. The engine reclaims invisible
+/// row versions inline only on the commit branch where the checkpoint did *not*
+/// fire, so a permanently-armed checkpoint starves the collector as well as the
+/// log — a database in this state gets neither, and accumulates row versions in
+/// memory without bound.
+const CHECKPOINT_THRESHOLD_DISABLED: i64 = -1;
+
+/// `busy_timeout` for the connection a checkpoint runs on.
+///
+/// Ordinary connections get five seconds ([`RetryConfig::default`]), and the
+/// engine honours a busy timeout by retrying internally rather than returning
+/// promptly — so a contended `PRAGMA wal_checkpoint(TRUNCATE)` blocked for the
+/// full five seconds before reporting `database is locked`. That is what made a
+/// hundred-attempt pass take ten to thirteen minutes against a five-minute
+/// interval, so passes ran back to back with no gap at all (CAIRN-4167). The
+/// design had assumed a losing attempt cost a compare-and-exchange.
+///
+/// A gated checkpoint has already established the precondition it needs before
+/// it issues the statement, so waiting long inside the engine adds nothing:
+/// either the drain emptied the gate and the attempt wins at once, or something
+/// is still holding a transaction and no amount of internal retry will change
+/// that within this pass.
+const CHECKPOINT_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
     pub max_attempts: usize,
@@ -143,6 +195,11 @@ pub struct LocalDb {
     /// writes settle; permit-backed, so a burst of commits collapses to a single
     /// pending wakeup and none is lost.
     commit_signal: Arc<Notify>,
+    /// Monotonic in-process generation advanced after every successful mutation.
+    /// Readers use this to make expensive projections incremental without polling
+    /// the database itself. Relaxed ordering is sufficient: the committed database
+    /// transaction is the synchronization boundary; this counter only detects change.
+    mutation_generation: AtomicU64,
     /// Set ONLY for a team replica: its intrinsic team id plus the per-team
     /// content store archival offloads to and reconstruction fetches from. The
     /// private DB carries `None`, so archival/reconstruct branch on
@@ -159,6 +216,15 @@ pub struct LocalDb {
     /// checked out for the duration of one transaction and returned only when
     /// they are known to hold none.
     idle: Mutex<Vec<Connection>>,
+    /// Every connection this handle has live, and the valve maintenance closes
+    /// to empty that set so a checkpoint has an instant to work in. See
+    /// [`ConnectionGate`].
+    gate: Arc<ConnectionGate>,
+    /// Serializes the full checkpoint pass, from opening its private connection
+    /// through releasing the gate hold. Without this, one overlapping pass can
+    /// drop its hold and reopen the boolean gate while another is still draining
+    /// or running TRUNCATE.
+    checkpoint_lock: AsyncMutex<()>,
     #[cfg(test)]
     read_transaction_count: AtomicUsize,
     /// Connections handed out by [`LocalDb::connect`] over this handle's life.
@@ -192,14 +258,18 @@ impl LocalDb {
         let database = Arc::new(DbHandle::Local(
             Builder::new_local(&path_string).build().await?,
         ));
+        let gate = Arc::new(ConnectionGate::new());
         let db = Self {
             path,
             database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
+            mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database)),
+            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
             idle: Mutex::new(Vec::new()),
+            gate,
+            checkpoint_lock: AsyncMutex::new(()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -243,14 +313,18 @@ impl LocalDb {
             builder = builder.with_auth_token(token);
         }
         let database = Arc::new(DbHandle::Synced(builder.build().await?));
+        let gate = Arc::new(ConnectionGate::new());
         let db = Self {
             path,
             database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
+            mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database)),
+            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
             idle: Mutex::new(Vec::new()),
+            gate,
+            checkpoint_lock: AsyncMutex::new(()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -290,14 +364,18 @@ impl LocalDb {
                 .build()
                 .await?,
         ));
+        let gate = Arc::new(ConnectionGate::new());
         let db = Self {
             path,
             database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
+            mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database)),
+            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
             idle: Mutex::new(Vec::new()),
+            gate,
+            checkpoint_lock: AsyncMutex::new(()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -346,6 +424,27 @@ impl LocalDb {
         self.commit_signal.clone()
     }
 
+    /// How many connections the gate currently counts as live. Tests use this to
+    /// assert the invariant everything else rests on: that every way a
+    /// connection's life can end settles the count back to zero. A registration
+    /// leaked on any of those paths would wedge the drain shut permanently, and
+    /// the symptom — checkpointing quietly stops working — is invisible until
+    /// the log has grown for a day.
+    #[cfg(test)]
+    fn live_connections(&self) -> usize {
+        self.gate.lock().live.len()
+    }
+
+    /// Current in-process mutation generation. Reading it never opens a database
+    /// connection, so generation-driven consumers settle to atomic loads at idle.
+    pub fn mutation_generation(&self) -> u64 {
+        self.mutation_generation.load(Ordering::Relaxed)
+    }
+
+    fn record_mutation(&self) {
+        self.mutation_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The BEGIN statement for concurrent read/write transactions. A local
     /// (MVCC) database uses `BEGIN CONCURRENT` for optimistic concurrency; the
     /// synced engine captures changes via CDC, which is incompatible with MVCC,
@@ -382,7 +481,13 @@ impl LocalDb {
     /// error when the pull fails.
     pub async fn pull(&self) -> DbResult<bool> {
         match self.database.as_ref() {
-            DbHandle::Synced(db) => Ok(db.pull().await?),
+            DbHandle::Synced(db) => {
+                let changed = db.pull().await?;
+                if changed {
+                    self.record_mutation();
+                }
+                Ok(changed)
+            }
             DbHandle::Local(_) => Err(DbError::internal(
                 "pull() called on a local (non-synced) database",
             )),
@@ -395,13 +500,31 @@ impl LocalDb {
 
     /// Open a brand-new connection, outside the free-list.
     ///
-    /// This is the raw escape hatch for the rare caller that needs a connection
-    /// of its own for longer than one transaction — notably
-    /// `MigrationRunner::run_fk_off`, which toggles `PRAGMA foreign_keys` around
-    /// a transaction and must not have that pragma outlive its own use. Ordinary
-    /// data access goes through [`Self::checkout`] instead so it reuses a warm
-    /// connection.
-    pub async fn connect(&self) -> DbResult<Connection> {
+    /// This is the raw escape hatch for the caller that needs a connection of
+    /// its own for longer than one pooled transaction: `MigrationRunner::run_fk_off`,
+    /// which toggles `PRAGMA foreign_keys` around a transaction and must not
+    /// have that pragma outlive its own use, and the resource layer's
+    /// `connect_for_read`, which opens one read transaction and holds it across
+    /// a whole resource render. Ordinary data access goes through
+    /// [`Self::checkout`] instead so it reuses a warm connection.
+    ///
+    /// Out of the pool or not, the connection is registered with the
+    /// [`ConnectionGate`] for as long as it lives. That registration is what
+    /// makes the gate a statement about the whole process rather than about the
+    /// pool, and it is not optional: the resource readers on this path are the
+    /// bulk of the transactions a checkpoint has to wait out.
+    pub async fn connect(&self) -> DbResult<TrackedConnection> {
+        let slot = self.gate.admit("connect").await;
+        Ok(TrackedConnection::new(self.open_connection().await?, slot))
+    }
+
+    /// Open a connection without registering it with the gate.
+    ///
+    /// Two callers only: the gate-aware entry points above, and
+    /// [`Self::checkpoint`], whose own connection must be invisible to the drain
+    /// it is waiting on — a registered one would count itself and the drain
+    /// could never reach zero.
+    async fn open_connection(&self) -> DbResult<Connection> {
         #[cfg(test)]
         self.connections_created.fetch_add(1, Ordering::Relaxed);
         let conn = match self.database.as_ref() {
@@ -426,16 +549,25 @@ impl LocalDb {
     /// connection rather than block forever on one its own caller is holding.
     /// Concurrency is therefore unbounded exactly as it was before pooling;
     /// [`MAX_IDLE_CONNECTIONS`] bounds only what is *retained* when idle.
-    async fn checkout(&self) -> DbResult<Connection> {
+    ///
+    /// It does wait at the [`ConnectionGate`], which is a different thing and
+    /// does not reintroduce that hazard. The gate is shut only while maintenance
+    /// folds the log, it reopens on every exit path including panic, and the
+    /// drain behind it is bounded by a budget. A nested call arriving while the
+    /// gate is shut costs its caller a bounded pause and denies maintenance the
+    /// quiet instant it was after; it cannot wait on its own caller forever.
+    async fn checkout(&self) -> DbResult<TrackedConnection> {
+        let slot = self.gate.admit("pool").await;
         let pooled = self
             .idle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .pop();
-        match pooled {
-            Some(conn) => Ok(conn),
-            None => self.connect().await,
-        }
+        let conn = match pooled {
+            Some(conn) => conn,
+            None => self.open_connection().await?,
+        };
+        Ok(TrackedConnection::new(conn, slot))
     }
 
     /// Return a connection that provably holds no open transaction.
@@ -443,7 +575,15 @@ impl LocalDb {
     /// Every caller passes only connections whose transaction committed or whose
     /// ROLLBACK succeeded; anything else is dropped instead, so a connection in
     /// unknown state can never be handed to the next caller's BEGIN.
-    fn release(&self, conn: Connection) {
+    ///
+    /// Taking the whole [`TrackedConnection`] rather than the bare connection is
+    /// what keeps the gate's count honest on both exits. A count keyed on this
+    /// method would leak on the retire path — the connection whose ROLLBACK
+    /// failed never arrives here (see [`TxAttempt`]) — and one leaked
+    /// registration wedges the gate's drain shut for the life of the process.
+    /// Keyed on the slot's `Drop` instead, release and retire both settle it.
+    fn release(&self, conn: TrackedConnection) {
+        let conn = conn.into_connection();
         let mut idle = self
             .idle
             .lock()
@@ -684,6 +824,7 @@ impl LocalDb {
                     // physical WAL replay OUTSIDE `transaction_with_begin`, so an
                     // applied pull fires no commit signal — there is no
                     // push<->pull feedback loop.
+                    self.record_mutation();
                     if self.is_synced() {
                         self.commit_signal.notify_one();
                     }
@@ -720,22 +861,123 @@ impl LocalDb {
         let result = conn.execute_batch(sql).await;
         if result.is_ok() {
             self.release(conn);
+            self.record_mutation();
         }
         Ok(result?)
     }
 
     pub async fn consume_query(&self, sql: &str) -> DbResult<()> {
         let conn = self.checkout().await?;
-        let result: DbResult<()> = async {
-            let mut rows = conn.query(sql, ()).await?;
-            while rows.next().await?.is_some() {}
-            Ok(())
-        }
-        .await;
+        let result = consume_on(&conn, sql).await;
         if result.is_ok() {
             self.release(conn);
         }
         result
+    }
+
+    /// Size in bytes of this database's logical log (`-log`) sidecar, or zero
+    /// when it has none (an in-memory database, or a synced replica, which does
+    /// not journal through MVCC).
+    ///
+    /// This is the quantity a checkpoint folds back into the main database, and
+    /// therefore the one number that says whether checkpointing is keeping up.
+    /// It is read from the filesystem rather than the engine because it is the
+    /// same figure an operator sees in `~/.cairn`.
+    pub fn logical_log_bytes(&self) -> u64 {
+        std::fs::metadata(sidecar_path(&self.path, "-log"))
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    }
+
+    /// Fold the logical log back into the main database, creating the quiet
+    /// instant it needs rather than waiting to be handed one.
+    ///
+    /// Cairn owns checkpointing because the engine's own commit-path attempt
+    /// cannot win; see [`CHECKPOINT_THRESHOLD_DISABLED`]. A TRUNCATE checkpoint
+    /// succeeds only in an instant when no MVCC transaction is open anywhere in
+    /// the process, and on a machine serving a UI that polls it, no such instant
+    /// occurs. That is measured, not assumed: ten consecutive production passes
+    /// spent 6,651 seconds attempting and never once observed one (CAIRN-4167).
+    /// Retrying does not help, however long the window — there is nothing to
+    /// catch.
+    ///
+    /// So this closes the [`ConnectionGate`] first, holding new connections at
+    /// the door while the ones already open finish, and only then attempts. The
+    /// hold reopens the gate when it drops, on every path out of this function
+    /// including a panic inside the engine, so a caller waiting at the gate waits
+    /// at most `drain_budget` plus this checkpoint.
+    ///
+    /// The attempt is made whether or not the drain completed. A drain that
+    /// expires means a long-lived transaction is still open and the attempt will
+    /// probably lose, but `db_maintenance`'s ceiling exists precisely for the
+    /// machine that will not go quiet, and a losing attempt now costs
+    /// [`CHECKPOINT_BUSY_TIMEOUT`] rather than the pooled five seconds. Always
+    /// attempting is also what keeps `attempts` a real measurement of how hard
+    /// checkpointing is on this machine.
+    ///
+    /// Only contention is retried. Any other failure ends the pass, because a
+    /// checkpoint that failed *after* it began working has touched the pager
+    /// (CAIRN-3838); its connection is private to this call and is dropped on the
+    /// way out either way, so it can never reach another caller's BEGIN.
+    ///
+    /// Calls on the same handle are serialized across the whole pass. The gate
+    /// has one boolean closed state, so overlapping holds would let the first
+    /// completed call reopen admissions while the second still depended on a
+    /// quiet database. Serialization also prevents concurrent TRUNCATE operations.
+    ///
+    /// Returns `Err` only when no connection could be obtained; a checkpoint that
+    /// ran and lost is a successful call reporting an unsuccessful pass.
+    pub async fn checkpoint(
+        &self,
+        max_attempts: usize,
+        between_attempts: Duration,
+        drain_budget: Duration,
+    ) -> DbResult<CheckpointReport> {
+        // `checkpoint` is public and callers are not required to coordinate.
+        // Keep this permit outside every other operation in the pass so a second
+        // call cannot close the gate until the first call's GateHold has dropped.
+        let _checkpoint_permit = self.checkpoint_lock.lock().await;
+        let started = Instant::now();
+        let log_bytes_before = self.logical_log_bytes();
+
+        // Opened before the gate closes and deliberately NOT registered with it:
+        // a tracked connection here would be counted among the transactions this
+        // pass is waiting to drain, and the drain could never reach zero.
+        let conn = self.open_connection().await?;
+        conn.busy_timeout(CHECKPOINT_BUSY_TIMEOUT)?;
+
+        let (_hold, drain) = self.gate.close(drain_budget).await;
+        let mut attempts = 0;
+        let mut error = None;
+
+        for attempt in 1..=max_attempts.max(1) {
+            if attempt > 1 && !between_attempts.is_zero() {
+                sleep(between_attempts).await;
+            }
+            attempts = attempt;
+            match consume_on(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await {
+                Ok(()) => {
+                    error = None;
+                    break;
+                }
+                Err(failure) => {
+                    let contended = failure.is_retryable();
+                    error = Some(failure.to_string());
+                    if !contended {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(CheckpointReport {
+            attempts,
+            error,
+            log_bytes_before,
+            log_bytes_after: self.logical_log_bytes(),
+            duration: started.elapsed(),
+            drain,
+        })
     }
 
     /// Reclaim freelist space by writing a self-contained, compacted image of
@@ -776,9 +1018,372 @@ impl LocalDb {
         // keys are enforced on every connection regardless of backend.
         if matches!(self.database.as_ref(), DbHandle::Local(_)) {
             self.consume_query("PRAGMA journal_mode = 'mvcc'").await?;
+            // Hand checkpointing to Cairn's own maintenance cadence. Unlike
+            // `cache_size`, which is per-connection and therefore set in
+            // `connect`, this threshold writes through to the store shared by
+            // every connection, so setting it once here covers the whole handle.
+            self.consume_query(&format!(
+                "PRAGMA mvcc_checkpoint_threshold = {CHECKPOINT_THRESHOLD_DISABLED}"
+            ))
+            .await?;
         }
         self.consume_query("PRAGMA foreign_keys = ON").await?;
         Ok(())
+    }
+}
+
+/// The set of live connections that might hold an MVCC transaction, and the
+/// valve maintenance closes to empty it.
+///
+/// # Why this gates connections rather than pool checkouts
+///
+/// A TRUNCATE checkpoint needs an instant in which no MVCC transaction is open
+/// anywhere in the process. Production never offers one, so Cairn makes one:
+/// close the gate, let the transactions already open finish, checkpoint, reopen.
+///
+/// That only works if the gate sees every transaction, and gating
+/// [`LocalDb::checkout`] would not. The resource layer's `connect_for_read`
+/// opens a `BEGIN CONCURRENT` on an OUT-OF-POOL connection and holds it for a
+/// whole resource render, at some thirty call sites across ten readers, and
+/// those reads are what the desktop UI's status polling drives. A pool-only gate
+/// would have drained to zero, reported a quiet instant, and lost the lock
+/// anyway.
+///
+/// Every MVCC transaction runs on a `turso::Connection`, so registering the
+/// CONNECTION is a superset of registering the transaction. That is the
+/// direction to err in: an idle registered connection can cost a skipped pass,
+/// but it can never manufacture a quiet instant that does not exist.
+///
+/// # Why a caller waiting here cannot hang
+///
+/// [`Self::close`] returns a [`GateHold`] that reopens the gate in its `Drop`,
+/// so the gate reopens on every exit path — early return, error, panic — and the
+/// drain itself is bounded by a budget. A caller waiting at the gate therefore
+/// waits at most that budget plus one checkpoint. That property is what makes
+/// gating the whole process tractable: a call path this design failed to
+/// anticipate costs a bounded pause and a wasted maintenance pass, not a wedged
+/// application.
+#[derive(Debug)]
+pub(super) struct ConnectionGate {
+    state: Mutex<GateState>,
+    /// Woken when the gate reopens, releasing everyone waiting to be admitted.
+    reopened: Notify,
+    /// Woken when the last live connection is released, so a drain settles the
+    /// instant it can rather than at the end of a polling interval.
+    drained: Notify,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    closed: bool,
+    next_id: u64,
+    live: HashMap<u64, LiveConnection>,
+}
+
+/// One live connection, recorded for the single purpose of explaining a drain
+/// that did not finish.
+#[derive(Debug, Clone, Copy)]
+struct LiveConnection {
+    origin: &'static str,
+    since: Instant,
+}
+
+impl ConnectionGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(GateState::default()),
+            reopened: Notify::new(),
+            drained: Notify::new(),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register one connection, waiting first if maintenance holds the gate
+    /// shut.
+    ///
+    /// Interest in the reopen signal is registered BEFORE `closed` is observed,
+    /// which is what `enable()` does. Checking first and waiting second would
+    /// lose a reopen landing in between and park the caller until the next pass
+    /// closed and reopened the gate — a stall of one whole interval, and one
+    /// that would only show up under load.
+    pub(super) async fn admit(self: &Arc<Self>, origin: &'static str) -> ConnectionSlot {
+        loop {
+            let reopened = self.reopened.notified();
+            tokio::pin!(reopened);
+            reopened.as_mut().enable();
+            {
+                let mut state = self.lock();
+                if !state.closed {
+                    let id = state.next_id;
+                    state.next_id = state.next_id.wrapping_add(1);
+                    state.live.insert(
+                        id,
+                        LiveConnection {
+                            origin,
+                            since: Instant::now(),
+                        },
+                    );
+                    return ConnectionSlot {
+                        gate: self.clone(),
+                        id,
+                    };
+                }
+            }
+            reopened.await;
+        }
+    }
+
+    fn release(&self, id: u64) {
+        let emptied = {
+            let mut state = self.lock();
+            state.live.remove(&id);
+            state.live.is_empty()
+        };
+        if emptied {
+            self.drained.notify_waiters();
+        }
+    }
+
+    /// Close the gate and wait up to `budget` for the connections already open
+    /// to be released.
+    ///
+    /// Returns the hold whether or not the drain finished, so the caller decides
+    /// what a partial drain is worth and the gate reopens when that hold drops
+    /// either way.
+    async fn close(self: &Arc<Self>, budget: Duration) -> (GateHold, DrainReport) {
+        let started = Instant::now();
+        self.lock().closed = true;
+        let hold = GateHold { gate: self.clone() };
+        let deadline = started + budget;
+
+        loop {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+
+            let (still_open, oldest) = {
+                let state = self.lock();
+                let oldest = state
+                    .live
+                    .values()
+                    .min_by_key(|live| live.since)
+                    .map(|live| (live.origin, live.since.elapsed()));
+                (state.live.len(), oldest)
+            };
+            if still_open == 0 {
+                return (hold, DrainReport::drained(started.elapsed()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return (
+                    hold,
+                    DrainReport {
+                        drained: false,
+                        still_open,
+                        oldest,
+                        waited: started.elapsed(),
+                    },
+                );
+            }
+            let _ = tokio::time::timeout(remaining, drained).await;
+        }
+    }
+
+    fn open(&self) {
+        self.lock().closed = false;
+        self.reopened.notify_waiters();
+    }
+}
+
+/// Keeps the gate shut for as long as it lives, and reopens it when dropped.
+///
+/// The reopen lives in `Drop` rather than at the end of the checkpoint so that
+/// it happens on every exit path, including a panic raised inside the database
+/// engine — which this checkpoint path has produced before (CAIRN-3838). A
+/// checkpoint that dies holding the gate open-coded would lock every database
+/// call in the process out permanently.
+struct GateHold {
+    gate: Arc<ConnectionGate>,
+}
+
+impl Drop for GateHold {
+    fn drop(&mut self) {
+        self.gate.open();
+    }
+}
+
+/// One live connection's registration with the gate.
+///
+/// Dropping it deregisters, which is the whole mechanism: every way a
+/// connection's life can end — released to the free-list, retired after a failed
+/// ROLLBACK, dropped on an error path, dropped while unwinding — settles the
+/// count without any of those paths knowing the gate exists.
+pub(super) struct ConnectionSlot {
+    gate: Arc<ConnectionGate>,
+    id: u64,
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.gate.release(self.id);
+    }
+}
+
+/// A `turso::Connection` that counts toward the quiet instant maintenance waits
+/// for.
+///
+/// Derefs to the connection, so callers use it exactly as they used a bare one
+/// and the resource layer's ~30 `connect_for_read` sites needed no edit at all.
+/// The wrapper's entire purpose is its `Drop`.
+pub struct TrackedConnection {
+    conn: Connection,
+    _slot: ConnectionSlot,
+}
+
+impl TrackedConnection {
+    pub(super) fn new(conn: Connection, slot: ConnectionSlot) -> Self {
+        Self { conn, _slot: slot }
+    }
+
+    /// Take the bare connection back, ending its registration.
+    ///
+    /// Only [`LocalDb::release`] does this: a connection resting on the
+    /// free-list holds no transaction, so counting it would hold the drain above
+    /// zero forever.
+    fn into_connection(self) -> Connection {
+        self.conn
+    }
+}
+
+impl Deref for TrackedConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
+impl std::fmt::Debug for TrackedConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TrackedConnection")
+    }
+}
+
+/// What one attempt to empty the gate achieved.
+///
+/// The failure fields are the point of this type. A drain that expires means
+/// some transaction outlived the budget, and the question that decides whether
+/// this whole design holds — is it one pathological reader, or genuinely ten
+/// short ones that never align? — is answerable only if the pass says which.
+/// Production has `read_batch` reaching 109.7 s and
+/// `get_thread_status_indicators` 18.6 s, so naming the oldest holder turns the
+/// follow-up into reading one log line rather than reopening the investigation.
+#[derive(Debug, Clone)]
+pub struct DrainReport {
+    /// Whether every connection open when the gate closed had been released
+    /// before the budget expired.
+    pub drained: bool,
+    /// Connections still live at the deadline.
+    pub still_open: usize,
+    /// Where the longest-held live connection came from, and how long it had
+    /// been out.
+    pub oldest: Option<(&'static str, Duration)>,
+    /// How long the drain waited — the stall every database call in the process
+    /// paid for this pass.
+    pub waited: Duration,
+}
+
+impl DrainReport {
+    fn drained(waited: Duration) -> Self {
+        Self {
+            drained: true,
+            still_open: 0,
+            oldest: None,
+            waited,
+        }
+    }
+}
+
+impl std::fmt::Display for DrainReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "drain_ms={} drained={}",
+            self.waited.as_millis(),
+            self.drained
+        )?;
+        if !self.drained {
+            write!(f, " still_open={}", self.still_open)?;
+            if let Some((origin, age)) = &self.oldest {
+                write!(f, " oldest={origin}/{}ms", age.as_millis())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Run `sql` on an already-checked-out connection, draining its result rows.
+///
+/// Split out from [`LocalDb::consume_query`] so a caller that must issue several
+/// statements on ONE connection — [`LocalDb::checkpoint`] retrying a contended
+/// checkpoint — can do so without returning the connection to the pool and
+/// drawing a different one between attempts.
+async fn consume_on(conn: &Connection, sql: &str) -> DbResult<()> {
+    let mut rows = conn.query(sql, ()).await?;
+    while rows.next().await?.is_some() {}
+    Ok(())
+}
+
+/// What one [`LocalDb::checkpoint`] pass did: whether it won, what it cost, and
+/// how much logical log it folded away.
+#[derive(Debug, Clone)]
+pub struct CheckpointReport {
+    /// TRUNCATE attempts this pass issued.
+    ///
+    /// With the connection gate drained, the first attempt should win. More than
+    /// one attempt means the gate did not establish the quiet window completely;
+    /// repeated failures with `drain.drained == true` mean a checkpoint-lock holder
+    /// exists outside the connections this process tracks.
+    pub attempts: usize,
+    /// The final attempt's failure, or `None` when the pass checkpointed.
+    pub error: Option<String>,
+    pub log_bytes_before: u64,
+    pub log_bytes_after: u64,
+    pub duration: Duration,
+    /// How emptying the gate went before the attempts began. A failed pass whose
+    /// drain also failed is a pass that never had its precondition; a failed pass
+    /// whose drain SUCCEEDED is a different and much more alarming thing, and
+    /// only this field tells them apart.
+    pub drain: DrainReport,
+}
+
+impl CheckpointReport {
+    pub fn succeeded(&self) -> bool {
+        self.error.is_none()
+    }
+}
+
+impl std::fmt::Display for CheckpointReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        write!(
+            f,
+            "attempts={} duration_ms={} log_mib_before={:.1} log_mib_after={:.1} {}",
+            self.attempts,
+            self.duration.as_millis(),
+            mib(self.log_bytes_before),
+            mib(self.log_bytes_after),
+            self.drain,
+        )?;
+        match &self.error {
+            Some(error) => write!(f, " outcome=failed error={error}"),
+            None => write!(f, " outcome=checkpointed"),
+        }
     }
 }
 
@@ -978,6 +1583,19 @@ mod tests {
 
     use super::*;
     use crate::storage::{Migration, MigrationRunner, RowExt};
+
+    /// The drain budget these tests hold the gate open for.
+    ///
+    /// Generous next to the 500 ms `db_maintenance` uses in production, because
+    /// a test asserting that a checkpoint WINS must not be able to fail on a
+    /// loaded CI machine for want of a few milliseconds. Tests that assert the
+    /// budget EXPIRES pass their own short one.
+    const DRAIN_BUDGET: Duration = Duration::from_secs(5);
+
+    /// Attempts a test pass makes. More than production's three, so that a test
+    /// asserting `attempts == 1` is asserting the gate did its job rather than
+    /// being propped up by having nowhere else to go.
+    const ATTEMPTS_FOR_TESTS: usize = 4;
 
     #[tokio::test]
     async fn single_select_helpers_avoid_transaction_round_trip() {
@@ -1542,14 +2160,18 @@ mod tests {
                 .build()
                 .await?,
         ));
+        let gate = Arc::new(ConnectionGate::new());
         let db = LocalDb {
             path: PathBuf::from(":memory:"),
             database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
+            mutation_generation: AtomicU64::new(0),
             team: None,
-            content_store: Arc::new(PrivateContentStore::new(database)),
+            content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
             idle: Mutex::new(Vec::new()),
+            gate,
+            checkpoint_lock: AsyncMutex::new(()),
             #[cfg(test)]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
@@ -1965,6 +2587,267 @@ mod tests {
         assert_eq!(std::fs::read(&to).unwrap(), b"to");
     }
 
+    /// `mvcc_checkpoint_threshold` writes through to the store every connection
+    /// shares, so `configure()` setting it once covers the whole handle. That is
+    /// the whole reason it lives there rather than in `connect` alongside
+    /// `cache_size`, which is genuinely per-connection — a distinction this file
+    /// has had to relearn before. Asserting it from a connection created AFTER
+    /// `configure()` ran is what states the scope directly.
+    #[tokio::test]
+    async fn disabling_auto_checkpoint_applies_to_every_connection() {
+        let db = test_db().await.unwrap();
+
+        let fresh = db.connect().await.unwrap();
+        let mut rows = fresh
+            .query("PRAGMA mvcc_checkpoint_threshold", ())
+            .await
+            .unwrap();
+        let threshold = rows.next().await.unwrap().unwrap().i64(0).unwrap();
+
+        assert_eq!(
+            threshold, CHECKPOINT_THRESHOLD_DISABLED,
+            "a connection opened after configure() must still see auto-checkpoint disabled; \
+             if this reads back the engine default, the threshold has become per-connection \
+             and every non-configuring connection is re-arming the commit-path checkpoint"
+        );
+    }
+
+    /// The engine's own default `mvcc_checkpoint_threshold`, in bytes.
+    ///
+    /// Named here only so the test below can write past it. Nothing in Cairn
+    /// depends on the value; if a future engine pin changes it, this test still
+    /// states the same thing as long as the constant follows.
+    const ENGINE_DEFAULT_CHECKPOINT_THRESHOLD: u64 = 4_120_000;
+
+    /// The behavioural half of `disabling_auto_checkpoint_applies_to_every_connection`:
+    /// the pragma is set, and committing past the engine's threshold genuinely
+    /// does not checkpoint.
+    ///
+    /// This is the assertion that would catch the pragma being dropped even if
+    /// the reading test were also changed. Nothing else holds a transaction open
+    /// here, so an enabled auto-checkpoint would not merely *attempt* at these
+    /// sizes — it would succeed, and truncate the log out from under the final
+    /// assertion. A log that keeps growing past the threshold is proof the commit
+    /// path is no longer checkpointing.
+    #[tokio::test]
+    async fn commits_past_the_engine_threshold_no_longer_checkpoint() {
+        let db = test_db().await.unwrap();
+        let payload = "x".repeat(64 * 1024);
+
+        let mut written = 0;
+        while db.logical_log_bytes() <= ENGINE_DEFAULT_CHECKPOINT_THRESHOLD {
+            db.execute(
+                "INSERT INTO unrelated_writes(id, value) VALUES (?1, ?2)",
+                (format!("grow-{written}"), payload.clone()),
+            )
+            .await
+            .unwrap();
+            written += 1;
+            assert!(
+                written < 4_096,
+                "wrote {written} rows without the logical log passing {ENGINE_DEFAULT_CHECKPOINT_THRESHOLD} bytes"
+            );
+        }
+
+        // Cairn's own checkpoint still folds it, so the log is bounded by
+        // maintenance rather than by nothing at all.
+        let report = db
+            .checkpoint(4, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+        assert!(report.succeeded(), "{report}");
+        assert!(
+            db.logical_log_bytes() < ENGINE_DEFAULT_CHECKPOINT_THRESHOLD,
+            "an owned checkpoint must still fold a log the engine no longer touches"
+        );
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM unrelated_writes")
+                .await
+                .unwrap(),
+            i64::from(written)
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_folds_the_log_and_reports_what_it_cost() {
+        let db = test_db().await.unwrap();
+        for i in 0..200 {
+            db.execute(
+                "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                (format!("fold-{i}"), i64::from(i)),
+            )
+            .await
+            .unwrap();
+        }
+        let before = db.logical_log_bytes();
+        assert!(before > 0, "writes should have grown the logical log");
+
+        let report = db
+            .checkpoint(4, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+
+        assert!(
+            report.succeeded(),
+            "uncontended checkpoint failed: {report}"
+        );
+        assert_eq!(
+            report.attempts, 1,
+            "a checkpoint with no transaction open anywhere should win first try: {report}"
+        );
+        assert_eq!(report.log_bytes_before, before);
+        assert!(
+            report.log_bytes_after < before,
+            "checkpoint reported success without folding the log: {report}"
+        );
+        assert_eq!(
+            db.logical_log_bytes(),
+            report.log_bytes_after,
+            "the report's after-size must be the size on disk"
+        );
+
+        // The rows survive the fold, and the database is still coherent.
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM counters WHERE id LIKE 'fold-%'")
+                .await
+                .unwrap(),
+            200
+        );
+        assert_eq!(
+            query_text(&db, "PRAGMA integrity_check").await.unwrap(),
+            "ok"
+        );
+    }
+
+    /// Measure a checkpoint against a copy of a real, large database.
+    ///
+    /// Ignored by default because it needs a database this repository cannot
+    /// carry. Point it at a COPY of the whole three-file set — `{db, -wal, -log}`,
+    /// never the `.db` alone — and run it to learn what a backlog fold actually
+    /// costs before trusting one to run at startup:
+    ///
+    /// ```text
+    /// CAIRN_CHECKPOINT_PROBE_DB=/tmp/copy/probe.db \
+    ///   cargo test -p cairn-db checkpoint_probe -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "needs a real database copy via CAIRN_CHECKPOINT_PROBE_DB"]
+    async fn checkpoint_probe_against_a_real_database_copy() {
+        let path = std::env::var("CAIRN_CHECKPOINT_PROBE_DB")
+            .expect("set CAIRN_CHECKPOINT_PROBE_DB to a copy of a real database set");
+        let opened = Instant::now();
+        let db = LocalDb::open(&path).await.unwrap();
+        println!("opened in {} ms", opened.elapsed().as_millis());
+
+        let report = db
+            .checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+        println!("checkpoint: {report}");
+
+        let checked = Instant::now();
+        let integrity = query_text(&db, "PRAGMA integrity_check").await.unwrap();
+        println!(
+            "integrity_check: {integrity} ({} ms)",
+            checked.elapsed().as_millis()
+        );
+        assert!(report.succeeded(), "{report}");
+        assert_eq!(integrity, "ok");
+    }
+
+    // ========================================================================
+    // The connection gate
+    //
+    // These encode facts that each took real work to establish and that the
+    // design is wrong without. Several are the CAIRN-4167 investigation probes
+    // kept as tests: they answer in seconds a question that otherwise costs a
+    // session.
+    // ========================================================================
+
+    /// The whole design in one test: a checkpoint wins on its FIRST attempt
+    /// despite transactions being open when the pass begins.
+    ///
+    /// This is the production condition. Ten consecutive real passes made 1,000
+    /// attempts over 6,651 seconds and never once found the process
+    /// transaction-free — with enough short overlapping transactions the union is
+    /// never empty, so waiting for a quiet instant cannot work at any retry
+    /// count. The pass here begins with three transactions open and more work
+    /// arriving, and wins anyway, because it stops new work and waits the open
+    /// ones out instead of sampling for a gap that is not there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_wins_by_waiting_out_the_transactions_already_open() {
+        let db = Arc::new(test_db().await.unwrap());
+        for i in 0..200 {
+            db.execute(
+                "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                (format!("gated-{i}"), i64::from(i)),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Three transactions open before the pass starts. Under the old design
+        // this alone lost every attempt for as long as they lived.
+        let mut holders = Vec::new();
+        for _ in 0..3 {
+            let conn = db.connect().await.unwrap();
+            conn.execute(db.concurrent_begin(), ()).await.unwrap();
+            holders.push(conn);
+        }
+        assert_eq!(db.live_connections(), 3);
+
+        // They end shortly after the pass begins, as ordinary short transactions
+        // do.
+        let finishing = tokio::spawn(async move {
+            sleep(Duration::from_millis(100)).await;
+            for conn in holders.drain(..) {
+                conn.execute("ROLLBACK", ()).await.unwrap();
+            }
+        });
+
+        // Work that ARRIVES mid-pass, finds the gate shut, and must still be
+        // served rather than failed.
+        let arriving = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(50)).await;
+                db.query_one("SELECT COUNT(*) FROM counters", (), |row| row.i64(0))
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let report = db
+            .checkpoint(ATTEMPTS_FOR_TESTS, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+
+        finishing.await.unwrap();
+        let counted = tokio::time::timeout(Duration::from_secs(10), arriving)
+            .await
+            .expect("a caller that arrived while the gate was shut was never served")
+            .unwrap();
+        assert_eq!(counted, 200);
+
+        assert!(report.drain.drained, "the gate did not empty: {report}");
+        assert!(
+            report.drain.waited >= Duration::from_millis(50),
+            "the pass should have WAITED for the open transactions rather than \
+             finding the database already quiet: {report}"
+        );
+        assert!(report.succeeded(), "{report}");
+        assert_eq!(
+            report.attempts, 1,
+            "behind a drained gate the first attempt must win; retrying is no \
+             longer how this finds a quiet instant: {report}"
+        );
+        assert!(
+            report.log_bytes_after < report.log_bytes_before,
+            "reported success without folding the log: {report}"
+        );
+        assert_eq!(db.live_connections(), 0);
+    }
+
     #[tokio::test]
     async fn checkpoint_does_not_lose_committed_rows() {
         let db = test_db().await.unwrap();
@@ -1985,6 +2868,416 @@ mod tests {
                 .unwrap(),
             7
         );
+    }
+
+    /// The regression test for the mistake this change was nearly built on.
+    ///
+    /// The plan for CAIRN-4167 held that every transaction path funnels through
+    /// `checkout()`, so gating the pool would be enough. It is not: the resource
+    /// layer's `connect_for_read` opens `BEGIN CONCURRENT` on an OUT-OF-POOL
+    /// connection and holds it for a whole render, at ~30 call sites, and those
+    /// reads are what the desktop UI's status polling drives. A pool-only gate
+    /// would have drained to zero, declared a quiet instant, and lost the lock.
+    ///
+    /// So: a transaction shaped exactly like a resource read must be visible to
+    /// the drain, and must be NAMED when it outlasts the budget.
+    #[tokio::test]
+    async fn an_out_of_pool_read_transaction_is_visible_to_the_drain() {
+        let db = test_db().await.unwrap();
+        db.execute("INSERT INTO counters(id, value) VALUES ('a', 1)", ())
+            .await
+            .unwrap();
+
+        // Precisely what `connect_for_read` does: connect outside the pool, BEGIN,
+        // and hold it for the life of the read.
+        let reader = db.connect().await.unwrap();
+        reader.execute(db.concurrent_begin(), ()).await.unwrap();
+        let mut rows = reader
+            .query("SELECT COUNT(*) FROM counters", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap();
+        drop(rows);
+
+        assert_eq!(
+            db.live_connections(),
+            1,
+            "an out-of-pool read transaction must count toward the drain"
+        );
+
+        let report = db
+            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert!(
+            !report.drain.drained,
+            "the drain claimed to empty while a read transaction was open: {report}"
+        );
+        assert_eq!(report.drain.still_open, 1, "{report}");
+        let (origin, _age) = report
+            .drain
+            .oldest
+            .expect("a drain that did not finish must name what it was waiting on");
+        assert_eq!(
+            origin, "connect",
+            "the report must say WHERE the blocking transaction came from, or the \
+             follow-up is another investigation instead of one log line"
+        );
+        assert!(!report.succeeded(), "{report}");
+
+        // And the gate reopened regardless, so ordinary work continues.
+        reader.execute("ROLLBACK", ()).await.unwrap();
+        drop(reader);
+        assert_eq!(db.live_connections(), 0);
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM counters")
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    /// A query that abandons most of its rows leaves no transaction behind.
+    ///
+    /// One of the CAIRN-4167 probes, kept because the question it answers looks
+    /// exactly like a bug and is not one. `query_opt` steps a single row of a
+    /// possibly-many-row result and returns the connection to the pool without
+    /// draining the statement, which reads as a permanently-open reader on every
+    /// pooled connection — the cheap explanation for "no quiet instant ever", and
+    /// the first thing to suspect. It is wrong: `Statement::drop` resets the
+    /// statement, so the transaction is gone and a checkpoint wins immediately.
+    ///
+    /// Worth defending because the pool would be free to stop dropping the
+    /// statement, and nothing else would notice until checkpointing quietly died.
+    #[tokio::test]
+    async fn an_abandoned_query_leaves_no_transaction_open() {
+        let db = test_db().await.unwrap();
+        for i in 0..200 {
+            db.execute(
+                "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                (format!("abandon-{i}"), i64::from(i)),
+            )
+            .await
+            .unwrap();
+        }
+
+        // Steps one row of two hundred and returns the connection to the pool.
+        let first = db
+            .query_opt("SELECT value FROM counters ORDER BY id", (), |row| {
+                row.i64(0)
+            })
+            .await
+            .unwrap();
+        assert!(first.is_some());
+
+        // Same for the other hot-path helpers, so the whole set is covered.
+        db.query_all("SELECT value FROM counters LIMIT 5", (), |row| row.i64(0))
+            .await
+            .unwrap();
+        db.query_opt_i64("SELECT value FROM counters LIMIT 1", ())
+            .await
+            .unwrap();
+        db.query_opt_text("SELECT id FROM counters LIMIT 1", ())
+            .await
+            .unwrap();
+        query_i64(&db, "SELECT COUNT(*) FROM counters")
+            .await
+            .unwrap();
+
+        assert_eq!(db.live_connections(), 0);
+        let report = db
+            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(
+            report.succeeded() && report.drain.drained,
+            "mixed hot-path traffic left something holding a transaction: {report}"
+        );
+        assert_eq!(report.attempts, 1, "{report}");
+    }
+
+    /// A result set still being iterated DOES hold a transaction open.
+    ///
+    /// The other half of the probe above, and the reason that one is worth
+    /// stating: the distinction is not "turso does not hold transactions for
+    /// reads", it is "the statement's `Drop` is what ends it". A live `Rows`
+    /// blocks a checkpoint; the same query one line after the rows are dropped
+    /// does not.
+    #[tokio::test]
+    async fn a_live_result_set_holds_a_transaction_open() {
+        let db = test_db().await.unwrap();
+        for i in 0..200 {
+            db.execute(
+                "INSERT INTO counters(id, value) VALUES (?1, ?2)",
+                (format!("live-{i}"), i64::from(i)),
+            )
+            .await
+            .unwrap();
+        }
+
+        let conn = db.connect().await.unwrap();
+        let mut rows = conn
+            .query("SELECT value FROM counters ORDER BY id", ())
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap();
+
+        let blocked = db
+            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(
+            !blocked.succeeded(),
+            "a checkpoint should not win against a live result set: {blocked}"
+        );
+
+        drop(rows);
+        drop(conn);
+        assert_eq!(db.live_connections(), 0);
+
+        let unblocked = db
+            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(
+            unblocked.succeeded() && unblocked.drain.drained,
+            "dropping the result set should have freed the checkpoint: {unblocked}"
+        );
+    }
+
+    /// Migrations must not deadlock against maintenance.
+    ///
+    /// `MigrationRunner::run_fk_off` takes an out-of-pool connection and holds it
+    /// across a whole migration. That is registered with the gate like anything
+    /// else, so this states the consequence: a long-held connection costs
+    /// maintenance its pass, and never the other way round.
+    #[tokio::test]
+    async fn a_long_held_connection_costs_a_pass_and_nothing_else() {
+        let db = Arc::new(test_db().await.unwrap());
+        let held = db.connect().await.unwrap();
+        held.execute(db.concurrent_begin(), ()).await.unwrap();
+
+        let report = db
+            .checkpoint(1, Duration::ZERO, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(!report.drain.drained, "{report}");
+
+        // The held connection is unharmed and can still finish its work.
+        held.execute("INSERT INTO counters(id, value) VALUES ('migrated', 1)", ())
+            .await
+            .unwrap();
+        held.execute("COMMIT", ()).await.unwrap();
+        drop(held);
+
+        assert_eq!(db.live_connections(), 0);
+        let after = db
+            .checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+            .await
+            .unwrap();
+        assert!(
+            after.succeeded() && after.drain.drained,
+            "the next pass should win once the long holder is gone: {after}"
+        );
+    }
+
+    /// A database call nested inside another's transaction closure completes
+    /// while a maintenance pass is pending.
+    ///
+    /// This is the deadlock the whole idea was feared for, and the reason
+    /// `checkout()` has never waited on anything. The nested call CANNOT be
+    /// served while the gate is shut, and the drain CANNOT finish while its
+    /// caller holds a connection, so the two would wait on each other forever if
+    /// the gate had no budget. It has one, and the hold reopens on drop, so this
+    /// resolves into a bounded pause and a wasted pass.
+    ///
+    /// The timeout is load-bearing: without it a regression here would hang the
+    /// test suite rather than fail it, which is how a deadlock test becomes a
+    /// passing no-op.
+    #[tokio::test]
+    async fn a_nested_call_completes_while_a_maintenance_pass_is_pending() {
+        let db = Arc::new(test_db().await.unwrap());
+        db.execute("INSERT INTO counters(id, value) VALUES ('nested', 5)", ())
+            .await
+            .unwrap();
+
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                // Long enough that the outer read is certainly still open when
+                // the gate closes, short enough that the suite does not crawl.
+                sleep(Duration::from_millis(50)).await;
+                db.checkpoint(1, Duration::ZERO, Duration::from_millis(200))
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let inner = db.clone();
+        let nested = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.read(|conn| {
+                let inner = inner.clone();
+                Box::pin(async move {
+                    let mut rows = conn.query("SELECT value FROM counters", ()).await?;
+                    rows.next().await?;
+                    drop(rows);
+                    // The pass closes the gate somewhere in here, while this
+                    // task holds the outer connection.
+                    sleep(Duration::from_millis(150)).await;
+                    inner
+                        .query_one(
+                            "SELECT value FROM counters WHERE id = 'nested'",
+                            (),
+                            |row| row.i64(0),
+                        )
+                        .await
+                })
+            }),
+        )
+        .await
+        .expect(
+            "a nested database call deadlocked against a maintenance pass: the gate did not \
+             reopen when its drain could not finish",
+        )
+        .unwrap();
+
+        assert_eq!(nested, 5);
+        let report = checkpointing.await.unwrap();
+        assert!(
+            !report.drain.drained,
+            "this test is only meaningful if the pass actually failed to drain \
+             behind the held connection: {report}"
+        );
+        assert_eq!(db.live_connections(), 0);
+    }
+
+    /// Every way a transaction can end settles the gate's count.
+    ///
+    /// A registration leaked on any of these paths wedges the drain shut for the
+    /// life of the process, and the symptom — checkpointing silently stops
+    /// working — does not surface until the log has grown for a day. The
+    /// rolled-back arm is the one worth having: a connection whose transaction
+    /// failed is retired rather than released, so a count keyed on the pool's
+    /// `release` would leak exactly here.
+    #[tokio::test]
+    async fn every_transaction_ending_settles_the_gate() {
+        let db = test_db().await.unwrap();
+        assert_eq!(db.live_connections(), 0, "a freshly opened handle is idle");
+
+        db.execute("INSERT INTO counters(id, value) VALUES ('ok', 1)", ())
+            .await
+            .unwrap();
+        assert_eq!(db.live_connections(), 0, "after a committed write");
+
+        query_i64(&db, "SELECT COUNT(*) FROM counters")
+            .await
+            .unwrap();
+        assert_eq!(db.live_connections(), 0, "after a read transaction");
+
+        let rolled_back = db
+            .write(|conn| {
+                Box::pin(async move {
+                    conn.execute("INSERT INTO counters(id, value) VALUES ('gone', 2)", ())
+                        .await?;
+                    Err::<(), DbError>(DbError::internal("force rollback"))
+                })
+            })
+            .await;
+        assert!(rolled_back.is_err());
+        assert_eq!(db.live_connections(), 0, "after a rolled-back write");
+
+        let failed = db
+            .query_all("SELECT nonexistent FROM counters", (), |row| row.i64(0))
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            db.live_connections(),
+            0,
+            "after a query that failed and whose connection was retired rather \
+             than released"
+        );
+    }
+
+    /// Public checkpoint calls need no external coordination. A second pass must
+    /// wait before it opens its private connection or closes the gate; otherwise
+    /// the first pass to finish would reopen admissions underneath the other.
+    #[tokio::test]
+    async fn overlapping_checkpoints_are_serialized_before_the_gate() {
+        let db = Arc::new(test_db().await.unwrap());
+        let first_pass = db.checkpoint_lock.lock().await;
+
+        let mut second_pass = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint(1, Duration::ZERO, DRAIN_BUDGET)
+                    .await
+                    .unwrap()
+            })
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut second_pass)
+                .await
+                .is_err(),
+            "an overlapping checkpoint entered while the first pass still held the permit"
+        );
+
+        // Waiting for the checkpoint permit must not close the connection gate.
+        // A normal caller can still enter until the active pass itself closes it.
+        let conn = tokio::time::timeout(Duration::from_secs(1), db.connect())
+            .await
+            .expect("a queued checkpoint closed the gate before acquiring its permit")
+            .unwrap();
+        drop(conn);
+
+        drop(first_pass);
+        let report = tokio::time::timeout(Duration::from_secs(10), second_pass)
+            .await
+            .expect("the queued checkpoint did not proceed after the first pass released")
+            .unwrap();
+        assert!(report.drain.drained, "{report}");
+    }
+
+    /// A drain that cannot finish must reopen the gate anyway, promptly.
+    ///
+    /// This is the property that turns "one missed path deadlocks the
+    /// application" into "one missed path costs a bounded pause", and it is the
+    /// only reason gating every connection in the process is safe to ship.
+    #[tokio::test]
+    async fn the_gate_reopens_when_the_drain_budget_expires() {
+        let db = Arc::new(test_db().await.unwrap());
+
+        // A transaction that will still be open when the budget expires.
+        let holder = db.connect().await.unwrap();
+        holder.execute(db.concurrent_begin(), ()).await.unwrap();
+
+        let checkpointing = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.checkpoint(1, Duration::ZERO, Duration::from_millis(100))
+                    .await
+                    .unwrap()
+            })
+        };
+
+        // Arrives while the gate is shut and must still be served.
+        let served = tokio::time::timeout(
+            Duration::from_secs(10),
+            db.query_one("SELECT 1", (), |row| row.i64(0)),
+        )
+        .await
+        .expect("the gate never reopened: a caller blocked behind a drain that could not finish")
+        .unwrap();
+        assert_eq!(served, 1);
+
+        let report = checkpointing.await.unwrap();
+        assert!(!report.drain.drained, "{report}");
+
+        holder.execute("ROLLBACK", ()).await.unwrap();
+        drop(holder);
+        assert_eq!(db.live_connections(), 0);
     }
 
     #[tokio::test]

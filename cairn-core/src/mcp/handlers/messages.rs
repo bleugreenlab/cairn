@@ -128,8 +128,11 @@ async fn sender_context(
     db: &LocalDb,
     request: &McpCallbackRequest,
 ) -> Result<(Option<String>, String), String> {
+    // No run_id means the caller is an MCP/CLI session running outside any Cairn
+    // run. It has no node URI, so it is recorded under the shared external-sender
+    // name that `messages::render` renders a no-address reply hint for.
     let Some(_) = request.run_id.as_ref() else {
-        return Ok((None, "external".to_string()));
+        return Ok((None, crate::messages::render::EXTERNAL_SENDER.to_string()));
     };
 
     let run_ctx = super::run_context::lookup_run(db, request).await?;

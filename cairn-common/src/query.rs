@@ -62,6 +62,8 @@ const KNOWN_QUERY_KEYS: &[&str] = &[
     "search",
     "path",
     "status",
+    "provider",
+    "deliverability",
     "name",
     "sort",
     "ready",

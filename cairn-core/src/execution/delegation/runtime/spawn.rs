@@ -1,7 +1,7 @@
 use crate::agent_process::process::SuspendKind;
 use crate::config::{
     agents as config_agents,
-    presets::{load_effective_presets, resolve_runtime_selection},
+    presets::{load_effective_presets, resolve_runtime_selection, spawned_task_backend},
 };
 use crate::execution::delegation::{
     DelegatedTaskPayload, SpawnCallPacketsInput, SpawnTaskPacketsInput, SpawnWorkflowPacketsInput,
@@ -52,7 +52,6 @@ async fn resolve_task_agent_config(
     project_path: Option<&std::path::Path>,
     payload: &DelegatedTaskPayload,
 ) -> Result<AgentConfig, String> {
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, &parent_ctx.job_id).await?;
     let config_dir = orch.config_dir.clone();
     let file_agent =
         match config_agents::get_agent(&config_dir, &payload.subagent_type, project_path) {
@@ -104,27 +103,15 @@ async fn resolve_task_agent_config(
         ));
     }
 
-    let parent_backend = select_optional_text(
-        &db,
-        "SELECT model FROM jobs WHERE id = ?1",
-        &parent_ctx.job_id,
-    )
-    .await
-    .ok()
-    .flatten()
-    .as_deref()
-    .and_then(crate::backends::backend_for_model)
-    .map(str::to_string);
     let presets = load_effective_presets(&config_dir, project_path);
     let authored_tier = payload
         .tier
         .as_deref()
         .or(file_agent.tier.as_ref().map(Model::as_str));
-    let authored_backend = payload
-        .backend_preference
-        .as_deref()
-        .or(parent_backend.as_deref())
-        .or(file_agent.backend_preference.as_deref());
+    let authored_backend = spawned_task_backend(
+        payload.backend_preference.as_deref(),
+        file_agent.backend_preference.as_deref(),
+    );
     // Resolve-early: real resolution (loud) at materialization fills the concrete
     // atomic selection + extras, so the child session never re-resolves a tier.
     let (selection, extras) = resolve_runtime_selection(authored_tier, authored_backend, &presets)?;
@@ -155,7 +142,6 @@ async fn resolve_task_agent_config(
         backend_preference: payload
             .backend_preference
             .clone()
-            .or(parent_backend)
             .or(file_agent.backend_preference),
         selection: Some(selection),
         extras: Some(extras),
@@ -979,7 +965,7 @@ mod journal_replay_tests {
     async fn seed_workflow_run(db: &LocalDb) {
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',7,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, status, uri_segment, node_name, agent_config_id, created_at, updated_at) VALUES ('j-wf','e','i','p','running','flow','Flow','workflow',1,1)",

@@ -1014,7 +1014,7 @@ mod tests {
             let project_id = project_id.clone();
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Browsers', 'BRW', '/tmp/brw', 1, 1)",
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES (?1, 'default', 'Browsers', 'brw', '/tmp/brw', 1, 1)",
                     params![project_id.as_str()],
                 )
                 .await?;

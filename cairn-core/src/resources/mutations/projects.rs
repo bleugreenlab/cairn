@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::project_settings::{
-    load_project_settings, save_project_settings, CheckCommand, PopulateConfig, ProjectSettingsFile,
+    load_project_settings_read_only, mutate_project_settings, CheckCommand, PopulateConfig,
+    ProjectSettingsFile,
 };
 use crate::identity::AccountOverrides;
 use crate::mcp::types::{ChangeItem, ChangeMode};
@@ -26,6 +27,7 @@ use cairn_common::uri::{parse_uri, CairnResource};
 use std::collections::HashMap;
 
 fn emit_db_change(orch: &Orchestrator, action: &str) {
+    orch.invalidate_sidebar_active_issues();
     if let Err(error) = orch
         .services
         .emitter
@@ -189,9 +191,18 @@ pub(super) async fn apply_projects_create(
         repo_path,
         team_id,
     };
-    let (project, target_db) = crud::create_routed(&orch.db, &RealClock, input, None)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (project, target_db) = crud::create_routed(
+        &orch.db,
+        &RealClock,
+        input,
+        None,
+        Some(crud::StoreInit {
+            jj_binary_path: &orch.jj_binary_path,
+            config_dir: &orch.config_dir,
+        }),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
 
     if let Some(branch) = default_branch {
         crud::set_default_branch_db(&target_db, &project.id, &branch)
@@ -253,8 +264,13 @@ pub(super) async fn apply_project_patch(
 }
 
 struct ReferenceOps {
-    changed: bool,
     count: usize,
+    side_effects: Vec<ReferenceSideEffect>,
+}
+
+enum ReferenceSideEffect {
+    Create(ProjectReference),
+    Refresh(ProjectReference),
 }
 
 fn nullable_trimmed(payload: &Value, key: &str) -> Result<Option<Option<String>>, String> {
@@ -342,16 +358,10 @@ fn add_reference_to_config(
 }
 
 fn create_reference_in_config(
-    orch: &Orchestrator,
     config: &mut ProjectSettingsFile,
     payload: &Value,
-    dry_run: bool,
 ) -> Result<ProjectReference, String> {
-    let reference = add_reference_to_config(config, payload)?;
-    if !dry_run {
-        clone_and_save_reference_metadata(orch, &reference)?;
-    }
-    Ok(reference)
+    add_reference_to_config(config, payload)
 }
 
 fn delete_reference_in_config(config: &mut ProjectSettingsFile, name: &str) -> bool {
@@ -452,60 +462,35 @@ fn patch_reference_in_config_pure(
     Ok(plan)
 }
 
-fn patch_reference_in_config(
+fn apply_reference_patch_side_effects(
     orch: &Orchestrator,
-    config: &mut ProjectSettingsFile,
-    name: &str,
-    payload: &Value,
-    dry_run: bool,
-) -> Result<bool, String> {
-    let plan = patch_reference_in_config_pure(config, name, payload)?;
-
-    if !dry_run {
-        if (plan.source_changed || plan.branch_changed) && plan.reference.git.is_some() {
-            crate::references::clone_reference(&orch.config_dir, &plan.reference)?;
-        }
-        if plan.description_present {
+    plan: &ReferencePatchPlan,
+) -> Result<(), String> {
+    if (plan.source_changed || plan.branch_changed) && plan.reference.git.is_some() {
+        crate::references::clone_reference(&orch.config_dir, &plan.reference)?;
+    }
+    if plan.description_present {
+        crate::references::save_reference_description(
+            &orch.config_dir,
+            &plan.reference.name,
+            plan.reference.description.as_deref().unwrap_or(""),
+        )?;
+    } else if let Some(description) = &plan.reference.description {
+        if !description.is_empty() {
             crate::references::save_reference_description(
                 &orch.config_dir,
                 &plan.reference.name,
-                plan.reference.description.as_deref().unwrap_or(""),
+                description,
             )?;
-        } else if let Some(description) = &plan.reference.description {
-            if !description.is_empty() {
-                crate::references::save_reference_description(
-                    &orch.config_dir,
-                    &plan.reference.name,
-                    description,
-                )?;
-            }
-        }
-        if plan.refresh {
-            crate::references::refresh_reference(&orch.config_dir, &plan.reference)?;
         }
     }
-    Ok(plan.changed)
-}
-
-fn refresh_reference_in_config(
-    orch: &Orchestrator,
-    config: &ProjectSettingsFile,
-    name: &str,
-    dry_run: bool,
-) -> Result<(), String> {
-    let reference = config
-        .references
-        .as_ref()
-        .and_then(|refs| refs.iter().find(|r| r.name == name))
-        .cloned()
-        .ok_or_else(|| format!("reference '{name}' not found"))?;
-    if !dry_run {
-        crate::references::refresh_reference(&orch.config_dir, &reference)?;
+    if plan.refresh {
+        crate::references::refresh_reference(&orch.config_dir, &plan.reference)?;
     }
     Ok(())
 }
 
-async fn load_project_settings_for_mutation(
+async fn load_project_settings_read_only_for_mutation(
     orch: &Orchestrator,
     project_key: &str,
 ) -> Result<(String, PathBuf, ProjectSettingsFile), String> {
@@ -516,7 +501,7 @@ async fn load_project_settings_for_mutation(
     let (_owning_db, _id, repo_path, _db_default_branch) =
         resolve_project(orch, project_key).await?;
     let repo = PathBuf::from(repo_path);
-    let config = load_project_settings(&repo);
+    let config = load_project_settings_read_only(&repo);
     Ok((
         cairn_common::uri::canonical_project(project_key),
         repo,
@@ -524,24 +509,12 @@ async fn load_project_settings_for_mutation(
     ))
 }
 
-fn save_project_settings_after_reference_change(
-    orch: &Orchestrator,
-    repo: &Path,
-    config: &ProjectSettingsFile,
-    changed: bool,
-    dry_run: bool,
-) -> Result<(), String> {
-    if changed && !dry_run {
-        save_project_settings(repo, config)?;
-    }
-    if !dry_run {
-        let _ = orch
-            .services
-            .emitter
-            .emit("config-changed", json!({"entity_type": "project_settings"}));
-        emit_db_change(orch, "update");
-    }
-    Ok(())
+fn emit_project_settings_change(orch: &Orchestrator) {
+    let _ = orch
+        .services
+        .emitter
+        .emit("config-changed", json!({"entity_type": "project_settings"}));
+    emit_db_change(orch, "update");
 }
 
 pub(super) async fn apply_project_reference_create(
@@ -550,9 +523,18 @@ pub(super) async fn apply_project_reference_create(
     payload: &Value,
     dry_run: bool,
 ) -> Result<String, String> {
-    let (project, repo, mut config) = load_project_settings_for_mutation(orch, project_key).await?;
-    let reference = create_reference_in_config(orch, &mut config, payload, dry_run)?;
-    save_project_settings_after_reference_change(orch, &repo, &config, true, dry_run)?;
+    let (project, repo, mut config) =
+        load_project_settings_read_only_for_mutation(orch, project_key).await?;
+    let reference = if dry_run {
+        create_reference_in_config(&mut config, payload)?
+    } else {
+        mutate_project_settings(&repo, |config| create_reference_in_config(config, payload))
+            .map_err(|error| error.to_string())?
+    };
+    if !dry_run {
+        clone_and_save_reference_metadata(orch, &reference)?;
+        emit_project_settings_change(orch);
+    }
     let verb = if dry_run { "Would create" } else { "Created" };
     Ok(format!(
         "{verb} project reference '{project}/{}'",
@@ -567,9 +549,20 @@ pub(super) async fn apply_project_reference_patch(
     payload: &Value,
     dry_run: bool,
 ) -> Result<String, String> {
-    let (project, repo, mut config) = load_project_settings_for_mutation(orch, project_key).await?;
-    let changed = patch_reference_in_config(orch, &mut config, name, payload, dry_run)?;
-    save_project_settings_after_reference_change(orch, &repo, &config, changed, dry_run)?;
+    let (project, repo, mut config) =
+        load_project_settings_read_only_for_mutation(orch, project_key).await?;
+    let plan = if dry_run {
+        patch_reference_in_config_pure(&mut config, name, payload)?
+    } else {
+        mutate_project_settings(&repo, |config| {
+            patch_reference_in_config_pure(config, name, payload)
+        })
+        .map_err(|error| error.to_string())?
+    };
+    if !dry_run {
+        apply_reference_patch_side_effects(orch, &plan)?;
+        emit_project_settings_change(orch);
+    }
     let verb = if dry_run { "Would patch" } else { "Patched" };
     Ok(format!("{verb} project reference '{project}/{name}'"))
 }
@@ -580,41 +573,55 @@ pub(super) async fn apply_project_reference_delete(
     name: &str,
     dry_run: bool,
 ) -> Result<String, String> {
-    let (project, repo, mut config) = load_project_settings_for_mutation(orch, project_key).await?;
-    let changed = delete_reference_in_config(&mut config, name);
-    save_project_settings_after_reference_change(orch, &repo, &config, changed, dry_run)?;
+    let (project, repo, mut config) =
+        load_project_settings_read_only_for_mutation(orch, project_key).await?;
+    if dry_run {
+        delete_reference_in_config(&mut config, name);
+    } else {
+        mutate_project_settings(&repo, |config| {
+            delete_reference_in_config(config, name);
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+        emit_project_settings_change(orch);
+    }
     let verb = if dry_run { "Would delete" } else { "Deleted" };
     Ok(format!("{verb} project reference '{project}/{name}'"))
 }
 
 fn apply_references(
-    orch: &Orchestrator,
     config: &mut ProjectSettingsFile,
     refs: &Value,
-    dry_run: bool,
 ) -> Result<ReferenceOps, String> {
-    let mut changed = false;
     let mut count = 0;
+    let mut side_effects = Vec::new();
 
     for item in array(refs, "add")? {
-        create_reference_in_config(orch, config, item, dry_run)?;
-        changed = true;
+        let reference = create_reference_in_config(config, item)?;
+        side_effects.push(ReferenceSideEffect::Create(reference));
         count += 1;
     }
 
     for name in string_array(refs, "remove")? {
-        if delete_reference_in_config(config, &name) {
-            changed = true;
-        }
+        delete_reference_in_config(config, &name);
         count += 1;
     }
 
     for name in string_array(refs, "refresh")? {
-        refresh_reference_in_config(orch, config, &name, dry_run)?;
+        let reference = config
+            .references
+            .as_ref()
+            .and_then(|references| references.iter().find(|reference| reference.name == name))
+            .cloned()
+            .ok_or_else(|| format!("reference '{name}' not found"))?;
+        side_effects.push(ReferenceSideEffect::Refresh(reference));
         count += 1;
     }
 
-    Ok(ReferenceOps { changed, count })
+    Ok(ReferenceOps {
+        count,
+        side_effects,
+    })
 }
 
 pub(super) async fn apply_project_settings_patch(
@@ -625,81 +632,118 @@ pub(super) async fn apply_project_settings_patch(
 ) -> Result<String, String> {
     let (db, id, repo_path, _db_default_branch) = resolve_project(orch, project_key).await?;
     let repo = Path::new(&repo_path);
-    let mut config = load_project_settings(repo);
-    let mut file_changed = false;
-    let mut ops: Vec<String> = Vec::new();
 
-    if let Some(commands) = first_value(payload, &["setupCommands", "setup_commands"]) {
-        let commands: Vec<String> = serde_json::from_value(commands.clone())
-            .map_err(|error| format!("invalid setupCommands: {error}"))?;
-        config.setup_commands = Some(commands);
-        file_changed = true;
-        ops.push("setupCommands".to_string());
-    }
-    if let Some(commands) = first_value(payload, &["terminalCommands", "terminal_commands"]) {
-        let commands: Vec<TerminalCommand> = serde_json::from_value(commands.clone())
-            .map_err(|error| format!("invalid terminalCommands: {error}"))?;
-        config.terminal_commands = Some(commands);
-        file_changed = true;
-        ops.push("terminalCommands".to_string());
-    }
-    if let Some(checks) = payload.get("checks") {
-        let checks: HashMap<String, CheckCommand> = serde_json::from_value(checks.clone())
-            .map_err(|error| format!("invalid checks: {error}"))?;
-        // An empty map clears checks so the key drops out of the YAML entirely,
-        // matching the `update_project` Tauri command's behavior.
-        config.checks = if checks.is_empty() {
-            None
-        } else {
-            Some(checks)
-        };
-        file_changed = true;
-        ops.push("checks".to_string());
-    }
-    if let Some(populate) = first_value(
+    let setup_commands = first_value(payload, &["setupCommands", "setup_commands"])
+        .map(|value| {
+            serde_json::from_value::<Vec<String>>(value.clone())
+                .map_err(|error| format!("invalid setupCommands: {error}"))
+        })
+        .transpose()?;
+    let terminal_commands = first_value(payload, &["terminalCommands", "terminal_commands"])
+        .map(|value| {
+            serde_json::from_value::<Vec<TerminalCommand>>(value.clone())
+                .map_err(|error| format!("invalid terminalCommands: {error}"))
+        })
+        .transpose()?;
+    let checks = payload
+        .get("checks")
+        .map(|value| {
+            serde_json::from_value::<HashMap<String, CheckCommand>>(value.clone())
+                .map_err(|error| format!("invalid checks: {error}"))
+        })
+        .transpose()?;
+    let populate = first_value(
         payload,
         &["materializationPopulate", "materialization_populate"],
-    ) {
-        let populate: PopulateConfig = serde_json::from_value(populate.clone())
-            .map_err(|error| format!("invalid materializationPopulate: {error}"))?;
-        config
-            .materialization
-            .get_or_insert_with(Default::default)
-            .populate = populate;
-        file_changed = true;
+    )
+    .map(|value| {
+        serde_json::from_value::<PopulateConfig>(value.clone())
+            .map_err(|error| format!("invalid materializationPopulate: {error}"))
+    })
+    .transpose()?;
+    let default_branch = opt_trimmed(payload, &["defaultBranch", "default_branch"]);
+    let account_overrides = first_value(payload, &["accountOverrides", "account_overrides"])
+        .map(|value| {
+            if value.is_null() {
+                Ok(None)
+            } else {
+                serde_json::from_value::<AccountOverrides>(value.clone())
+                    .map(Some)
+                    .map_err(|error| format!("invalid accountOverrides: {error}"))
+            }
+        })
+        .transpose()?;
+    let references = payload.get("references");
+
+    let mut ops = Vec::new();
+    if setup_commands.is_some() {
+        ops.push("setupCommands".to_string());
+    }
+    if terminal_commands.is_some() {
+        ops.push("terminalCommands".to_string());
+    }
+    if checks.is_some() {
+        ops.push("checks".to_string());
+    }
+    if populate.is_some() {
         ops.push("materializationPopulate".to_string());
     }
-    if let Some(branch) = opt_trimmed(payload, &["defaultBranch", "default_branch"]) {
-        config.default_branch = Some(branch.clone());
-        file_changed = true;
-        if !dry_run {
-            crud::set_default_branch_db(&db, &id, &branch)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+    if default_branch.is_some() {
         ops.push("defaultBranch".to_string());
     }
-    if let Some(overrides_value) = first_value(payload, &["accountOverrides", "account_overrides"])
-    {
-        let overrides: Option<AccountOverrides> = if overrides_value.is_null() {
-            None
-        } else {
-            Some(
-                serde_json::from_value(overrides_value.clone())
-                    .map_err(|error| format!("invalid accountOverrides: {error}"))?,
-            )
-        };
-        if !dry_run {
-            orch.set_project_overrides(&id, overrides)?;
-        }
+    if account_overrides.is_some() {
         ops.push("accountOverrides".to_string());
     }
-    if let Some(refs) = payload.get("references") {
-        let result = apply_references(orch, &mut config, refs, dry_run)?;
-        if result.changed {
-            file_changed = true;
+
+    let mutate_file = |config: &mut ProjectSettingsFile| -> Result<ReferenceOps, String> {
+        if let Some(commands) = &setup_commands {
+            config.setup_commands = Some(commands.clone());
         }
-        ops.push(format!("references ({} op(s))", result.count));
+        if let Some(commands) = &terminal_commands {
+            config.terminal_commands = Some(commands.clone());
+        }
+        if let Some(checks) = &checks {
+            config.checks = (!checks.is_empty()).then(|| checks.clone());
+        }
+        if let Some(populate) = &populate {
+            config
+                .materialization
+                .get_or_insert_with(Default::default)
+                .populate = populate.clone();
+        }
+        if let Some(branch) = &default_branch {
+            config.default_branch = Some(branch.clone());
+        }
+        match references {
+            Some(refs) => apply_references(config, refs),
+            None => Ok(ReferenceOps {
+                count: 0,
+                side_effects: Vec::new(),
+            }),
+        }
+    };
+
+    let has_file_fields = setup_commands.is_some()
+        || terminal_commands.is_some()
+        || checks.is_some()
+        || populate.is_some()
+        || default_branch.is_some()
+        || references.is_some();
+    let reference_ops = if has_file_fields {
+        if dry_run {
+            let mut config = load_project_settings_read_only(repo);
+            mutate_file(&mut config)?
+        } else {
+            mutate_project_settings(repo, mutate_file).map_err(|error| error.to_string())?
+        }
+    } else {
+        ReferenceOps {
+            count: 0,
+            side_effects: Vec::new(),
+        }
+    };
+    if references.is_some() {
+        ops.push(format!("references ({} op(s))", reference_ops.count));
     }
 
     if ops.is_empty() {
@@ -709,16 +753,26 @@ pub(super) async fn apply_project_settings_patch(
         );
     }
 
-    if file_changed && !dry_run {
-        // `save_project_settings` commits the `config.yaml` rewrite, scoped.
-        save_project_settings(repo, &config)?;
-    }
     if !dry_run {
-        let _ = orch
-            .services
-            .emitter
-            .emit("config-changed", json!({"entity_type": "project_settings"}));
-        emit_db_change(orch, "update");
+        if let Some(branch) = &default_branch {
+            crud::set_default_branch_db(&db, &id, branch)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        if let Some(overrides) = account_overrides {
+            orch.set_project_overrides(&id, overrides)?;
+        }
+        for effect in reference_ops.side_effects {
+            match effect {
+                ReferenceSideEffect::Create(reference) => {
+                    clone_and_save_reference_metadata(orch, &reference)?;
+                }
+                ReferenceSideEffect::Refresh(reference) => {
+                    crate::references::refresh_reference(&orch.config_dir, &reference)?;
+                }
+            }
+        }
+        emit_project_settings_change(orch);
     }
 
     let verb = if dry_run { "Would patch" } else { "Patched" };

@@ -19,6 +19,7 @@ mod launch_deltas;
 mod memory;
 mod message;
 mod permissions;
+mod post;
 mod pr;
 mod project;
 mod provider_usage;
@@ -45,8 +46,9 @@ pub use common::{
 
 // Workspace and settings
 pub use workspace::{
-    ChannelRouteConfig, ChannelsConfig, ExternalReplyMode, IMessageChannelConfig,
-    OpenRouterRouting, OpenRouterSort, Settings, TelegramChannelConfig, UpdateSettings,
+    ChannelInboundCapabilities, ChannelsConfig, DiscordChannelConfig, ExternalReplyMode,
+    IMessageChannelConfig, MessageClassPolicy, OpenRouterRouting, OpenRouterSort, Settings,
+    TelegramChannelConfig, UpdateSettings,
 };
 
 // Project types
@@ -69,9 +71,10 @@ pub use provider_usage::{
 // Issue types
 pub use issue::{
     Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress,
-    IssueStatus, UpdateIssue,
+    IssueStatus, SidebarActiveIssue, UpdateIssue,
 };
 pub use label::{CreateLabel, Label, UpdateLabel};
+pub use post::{CreatePost, CreatePostComment, Post, PostComment};
 
 // Thread types
 pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};
@@ -87,8 +90,8 @@ pub use execution::{
 
 // Run types
 pub use run::{
-    Event, PermissionRequest, PermissionStatus, Prompt, ReadSegmentTokens, Run, RunStartMode,
-    RunStatus, RunTodos, TodoItem,
+    Event, PermissionRequest, PermissionStatus, Prompt, ReadSegmentTokens, ResolutionReceipt, Run,
+    RunStartMode, RunStatus, RunTodos, TodoItem,
 };
 
 // Session types (durable conversation identity)

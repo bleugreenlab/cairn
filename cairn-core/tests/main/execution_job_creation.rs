@@ -173,7 +173,7 @@ fn delegated_packet(parent_job_id: &str, agent_node_id: &str) -> DelegatedWorkPa
 async fn a_task_delegated_by_a_thread_session_is_listed_under_that_thread() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "JCT").await;
+    let project_id = common::create_project(&db, "jct").await;
     let execution_id = "execution-thread";
     let agent_node_id = "delegated-packet-1-agent";
 
@@ -232,7 +232,7 @@ async fn a_task_delegated_by_a_thread_session_is_listed_under_that_thread() {
 async fn creates_jobs_for_reachable_agent_nodes_only() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "JCR").await;
+    let project_id = common::create_project(&db, "jcr").await;
     let execution_id = "execution-1";
     let snapshot = snapshot(
         &project_id,
@@ -269,7 +269,7 @@ async fn creates_jobs_for_reachable_agent_nodes_only() {
 async fn preserves_agent_config_ids() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "JCP").await;
+    let project_id = common::create_project(&db, "jcp").await;
     let execution_id = "execution-2";
     let snapshot = snapshot(
         &project_id,
@@ -292,7 +292,7 @@ async fn preserves_agent_config_ids() {
 async fn inherited_agent_uses_upstream_agent_job_as_parent() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "JCI").await;
+    let project_id = common::create_project(&db, "jci").await;
     let execution_id = "execution-3";
     let snapshot = snapshot(
         &project_id,
@@ -325,7 +325,7 @@ async fn inherited_agent_uses_upstream_agent_job_as_parent() {
 async fn creates_no_jobs_without_trigger_reachability() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "JCN").await;
+    let project_id = common::create_project(&db, "jcn").await;
     let execution_id = "execution-4";
     let snapshot = snapshot(
         &project_id,
@@ -346,7 +346,7 @@ async fn creates_no_jobs_without_trigger_reachability() {
 async fn creates_one_job_per_reachable_agent_in_complex_branching_graph() {
     let (_temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
-    let project_id = common::create_project(&db, "JCB").await;
+    let project_id = common::create_project(&db, "jcb").await;
     let execution_id = "execution-5";
     let snapshot = snapshot(
         &project_id,

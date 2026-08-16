@@ -333,6 +333,10 @@ impl ObjectPlaneState {
         request: &CloudObjectGrantRequest,
         base_commit: &str,
     ) -> bool {
+        Self::valid_cloud_grant_shape(request) && self.authorizes(&request.coordinate, base_commit)
+    }
+
+    pub(crate) fn valid_cloud_grant_shape(request: &CloudObjectGrantRequest) -> bool {
         let valid_hash = request.content_hash.len() == 64
             && request
                 .content_hash
@@ -342,7 +346,7 @@ impl ObjectPlaneState {
             CloudObjectOperation::Get => request.byte_count.is_none(),
             CloudObjectOperation::Put => request.byte_count.is_some_and(|bytes| bytes > 0),
         };
-        valid_hash && valid_size && self.authorizes(&request.coordinate, base_commit)
+        valid_hash && valid_size
     }
 
     pub fn authenticate(

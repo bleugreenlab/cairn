@@ -8,6 +8,9 @@
 mod checks;
 mod child;
 mod matching;
+mod posts;
+#[cfg(test)]
+mod posts_tests;
 mod routing;
 mod side_channel;
 mod store;
@@ -20,6 +23,7 @@ mod tests;
 pub(crate) use checks::*;
 pub use child::*;
 pub use matching::*;
+pub use posts::*;
 pub use routing::*;
 pub use side_channel::*;
 pub use store::*;

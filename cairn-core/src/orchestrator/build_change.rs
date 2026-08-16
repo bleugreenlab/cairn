@@ -176,7 +176,7 @@ mod tests {
         let db = crate::storage::migrated_test_db("build-change.db").await;
         db.execute_script("\
           INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);\
-          INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','PROJ','/tmp/p',1,1);\
+          INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','proj','/tmp/p',1,1);\
           INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('th','p','general','active',1,1);\
           INSERT INTO jobs(id,project_id,status,uri_segment,thread_id,created_at,updated_at) VALUES('thread-job','p','running','thread','th',1,1);\
           INSERT INTO sessions(id,job_id,status,sequence,created_at,updated_at) VALUES('s','thread-job','open',1,1,1);\

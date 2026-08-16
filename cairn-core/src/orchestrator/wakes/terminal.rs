@@ -132,6 +132,7 @@ fn terminal_output_event(
         // must not cross-wake on each other's match.
         delivery: WakeDelivery::Targeted {
             subscriber_job_id: subscriber_job_id.to_string(),
+            sender_name: None,
             message: format_terminal_output_message(slug, detail_uri, phrase, excerpt),
         },
         urgency: DeliveryUrgency::Queue,

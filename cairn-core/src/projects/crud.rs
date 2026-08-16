@@ -7,7 +7,18 @@ use cairn_common::ids;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+/// Runtime paths required to establish the Cairn-managed jj store while a
+/// project is created.
+#[derive(Clone, Copy)]
+pub struct StoreInit<'a> {
+    pub jj_binary_path: &'a str,
+    pub config_dir: &'a Path,
+}
+
 /// Full project creation: DB insert + filesystem setup.
+///
+/// Project keys cross their canonicalization boundary here and are stored in
+/// lowercase. Callers and downstream persistence therefore receive one identity.
 ///
 /// - If `repo_path` is empty and `projects_dir` is provided, creates a directory
 ///   and initializes a git repo there.
@@ -19,7 +30,23 @@ pub async fn create(
     clock: &dyn Clock,
     mut input: CreateProject,
     projects_dir: Option<&Path>,
+    store_init: Option<StoreInit<'_>>,
 ) -> Result<DbProject, CairnError> {
+    input.key = cairn_common::uri::canonical_project(&input.key);
+    if db
+        .query_opt_text(
+            "SELECT id FROM projects WHERE key = ?1 LIMIT 1",
+            (input.key.clone(),),
+        )
+        .await?
+        .is_some()
+    {
+        return Err(CairnError::Internal(format!(
+            "a project with key '{}' already exists",
+            input.key
+        )));
+    }
+
     if input.repo_path.is_empty() {
         if let Some(base) = projects_dir {
             let project_dir = base.join(input.key.to_lowercase());
@@ -57,14 +84,51 @@ pub async fn create(
 
     if !input.repo_path.is_empty() {
         let repo_path = Path::new(&input.repo_path);
-        if repo_path.exists() {
-            if let Err(error) = ensure_project_repository(repo_path) {
+        if !repo_path.exists() {
+            let error = CairnError::Internal(format!(
+                "project repository path does not exist: {}",
+                repo_path.display()
+            ));
+            if let Err(rollback_error) = delete_db(db, &db_project.id).await {
+                return Err(CairnError::Internal(format!(
+                    "{error}; additionally failed to roll back project row: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+
+        if let Err(error) = ensure_project_repository(repo_path) {
+            if let Err(rollback_error) = delete_db(db, &db_project.id).await {
+                return Err(CairnError::Internal(format!(
+                    "{error}; additionally failed to roll back project row: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+
+        if let Some(store_init) = store_init {
+            let jj_binary_path = store_init.jj_binary_path.to_string();
+            let config_dir = store_init.config_dir.to_path_buf();
+            let project_repo = repo_path.to_path_buf();
+            let store_result = tokio::task::spawn_blocking(move || {
+                let jj = crate::jj::JjEnv::with_binary(jj_binary_path, &config_dir);
+                crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+            })
+            .await
+            .map_err(|error| format!("jj store initialization task failed: {error}"))
+            .and_then(|result| result);
+
+            if let Err(error) = store_result {
                 if let Err(rollback_error) = delete_db(db, &db_project.id).await {
                     return Err(CairnError::Internal(format!(
-                        "{error}; additionally failed to roll back project row: {rollback_error}"
+                        "failed to initialize the Cairn-managed jj store for {}: {error}; additionally failed to roll back project row: {rollback_error}",
+                        repo_path.display()
                     )));
                 }
-                return Err(error);
+                return Err(CairnError::Internal(format!(
+                    "failed to initialize the Cairn-managed jj store for {}: {error}. The project row was rolled back; repository files were left in place, and retrying with the same folder is safe",
+                    repo_path.display()
+                )));
             }
         }
     }
@@ -468,9 +532,23 @@ pub async fn create_routed(
     clock: &dyn Clock,
     input: CreateProject,
     projects_dir: Option<&Path>,
+    store_init: Option<StoreInit<'_>>,
 ) -> Result<(DbProject, Arc<LocalDb>), CairnError> {
-    let key = input.key.clone();
+    let key = cairn_common::uri::canonical_project(&input.key);
     let team_id = input.team_id.clone();
+    if dbs
+        .local
+        .query_opt_text(
+            "SELECT project_key FROM project_routes WHERE project_key = ?1 LIMIT 1",
+            (key.clone(),),
+        )
+        .await?
+        .is_some()
+    {
+        return Err(CairnError::Internal(format!(
+            "a project with key '{key}' already exists"
+        )));
+    }
     let target_db = match &team_id {
         None => dbs.local.clone(),
         Some(team) => dbs
@@ -481,8 +559,18 @@ pub async fn create_routed(
                 id: team.clone(),
             })?,
     };
-    let project = create(&target_db, clock, input, projects_dir).await?;
-    insert_project_route(&dbs.local, clock, &key, team_id.as_deref()).await?;
+    let project = create(&target_db, clock, input, projects_dir, store_init).await?;
+    if let Err(error) = insert_project_route(&dbs.local, clock, &key, team_id.as_deref()).await {
+        if let Err(rollback_error) = delete_db(&target_db, &project.id).await {
+            return Err(CairnError::Internal(format!(
+                "a project with key '{key}' already exists; additionally failed to roll back project row: {rollback_error}"
+            )));
+        }
+        log::warn!("route reservation for project key {key} failed: {error}");
+        return Err(CairnError::Internal(format!(
+            "a project with key '{key}' already exists"
+        )));
+    }
     if team_id.is_some() && !project.repo_path.is_empty() {
         set_local_repo_path(&dbs.local, &key, Path::new(&project.repo_path)).await?;
     }
@@ -593,7 +681,9 @@ pub async fn set_remote_url_db(db: &LocalDb, id: &str, remote_url: &str) -> Resu
 /// Record a project's routing target in the PRIVATE database's `project_routes`
 /// catalog (CAIRN-2132). `team_id` is `None` for a local project — the row
 /// stores NULL and `DbState::for_project` resolves it to the private database.
-/// The key is normalized upper-case to match every other route lookup.
+/// The key is normalized lowercase to match every other route lookup. Existing
+/// routes are never replaced: the catalog is the global project-key uniqueness
+/// boundary across private and team databases.
 pub(crate) async fn insert_project_route(
     db: &LocalDb,
     clock: &dyn Clock,
@@ -608,7 +698,7 @@ pub(crate) async fn insert_project_route(
         let team_id = team_id.clone();
         Box::pin(async move {
             conn.execute(
-                "INSERT OR REPLACE INTO project_routes(project_key, team_id, created_at)
+                "INSERT INTO project_routes(project_key, team_id, created_at)
                  VALUES (?1, ?2, ?3)",
                 (key.as_str(), team_id.as_deref(), now),
             )
@@ -1009,6 +1099,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_initializes_the_coordinate_store_before_returning() {
+        let Some(jj_binary_path) = crate::jj::tests::jj_bin() else {
+            eprintln!("skipping create_initializes_the_coordinate_store_before_returning: jj not resolvable");
+            return;
+        };
+        let db = migrated_db().await;
+        let repo = tempdir().unwrap();
+        let config_dir = tempdir().unwrap();
+        let store_dir = crate::jj::project_store_dir(config_dir.path(), repo.path());
+        assert!(!crate::jj::is_jj_dir(&store_dir));
+
+        create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("store-ready".to_string()),
+                name: "Store Ready".to_string(),
+                key: "READY".to_string(),
+                repo_path: repo.path().to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+            Some(StoreInit {
+                jj_binary_path: &jj_binary_path,
+                config_dir: config_dir.path(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(crate::jj::is_jj_dir(&store_dir));
+    }
+
+    #[tokio::test]
+    async fn create_stores_and_resolves_the_canonical_project_key() {
+        let db = migrated_db().await;
+        let project = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("mixed-case".to_string()),
+                name: "Mixed Case".to_string(),
+                key: "LCLTW".to_string(),
+                repo_path: String::new(),
+                team_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(project.key, "lcltw");
+        assert_eq!(
+            crate::mcp::handlers::run_context::project_id_by_key(&db, "LCLTW")
+                .await
+                .unwrap(),
+            project.id
+        );
+        assert_eq!(
+            crate::mcp::handlers::run_context::project_id_by_key(&db, "lcltw")
+                .await
+                .unwrap(),
+            project.id
+        );
+    }
+
+    #[tokio::test]
+    async fn create_explicitly_refuses_a_duplicate_canonical_project_key() {
+        let db = migrated_db().await;
+        for (id, key) in [("first", "abc"), ("second", "ABC")] {
+            let result = create(
+                &db,
+                &FixedClock,
+                CreateProject {
+                    id: Some(id.to_string()),
+                    name: id.to_string(),
+                    key: key.to_string(),
+                    repo_path: String::new(),
+                    team_id: None,
+                },
+                None,
+                None,
+            )
+            .await;
+            if id == "first" {
+                result.unwrap();
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "a project with key 'abc' already exists"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn create_existing_empty_git_repo_creates_initial_commit() {
         let db = migrated_db().await;
         let repo = tempdir().unwrap();
@@ -1024,6 +1211,7 @@ mod tests {
                 repo_path: repo.path().to_string_lossy().to_string(),
                 team_id: None,
             },
+            None,
             None,
         )
         .await
@@ -1075,6 +1263,7 @@ mod tests {
                 repo_path: repo.path().to_string_lossy().to_string(),
                 team_id: None,
             },
+            None,
             None,
         )
         .await
@@ -1135,6 +1324,7 @@ mod tests {
                 team_id: None,
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1163,6 +1353,7 @@ mod tests {
                 team_id: None,
             },
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1174,6 +1365,35 @@ mod tests {
                 .lines()
                 .any(|path| path == "nested.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_nonexistent_explicit_repository_path() {
+        let db = migrated_db().await;
+        let root = tempdir().unwrap();
+        let missing = root.path().join("missing");
+
+        let error = create(
+            &db,
+            &FixedClock,
+            CreateProject {
+                id: Some("missing-repo".to_string()),
+                name: "Missing Repo".to_string(),
+                key: "MISSING".to_string(),
+                repo_path: missing.to_string_lossy().to_string(),
+                team_id: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("project repository path does not exist"));
+        assert!(get_db(&db, "missing-repo").await.unwrap().is_none());
+        assert!(!missing.exists());
     }
 
     #[tokio::test]
@@ -1193,6 +1413,7 @@ mod tests {
                 repo_path: not_a_directory.to_string_lossy().to_string(),
                 team_id: None,
             },
+            None,
             None,
         )
         .await;
@@ -1234,6 +1455,7 @@ mod tests {
                 repo_path: folder.path().to_string_lossy().to_string(),
                 team_id: None,
             },
+            None,
             None,
         )
         .await;
@@ -1281,6 +1503,7 @@ mod tests {
                 repo_path: repo.path().to_string_lossy().to_string(),
                 team_id: None,
             },
+            None,
             None,
         )
         .await;
@@ -1360,7 +1583,7 @@ mod tests {
         );
         let dbs = crate::db::DbState::new(local, index);
 
-        let path = resolve_local_repo_path(&dbs, "local-project", "PRJ", "/repo/local")
+        let path = resolve_local_repo_path(&dbs, "local-project", "prj", "/repo/local")
             .await
             .unwrap();
 
@@ -1381,7 +1604,7 @@ mod tests {
             )
             .await
             .unwrap();
-        insert_project_route(&local, &FixedClock, "PRJ", Some("teamABC123"))
+        insert_project_route(&local, &FixedClock, "prj", Some("teamABC123"))
             .await
             .unwrap();
 
@@ -1401,7 +1624,7 @@ mod tests {
         let resolved = resolve_local_repo_path(
             &dbs,
             "teamABC123~00000000-0000-4000-8000-000000000001",
-            "PRJ",
+            "prj",
             "/creator/repo",
         )
         .await
@@ -1606,8 +1829,8 @@ mod tests {
             &FixedClock,
             &CreateProject {
                 id: Some("p".to_string()),
-                name: "P".to_string(),
-                key: "P".to_string(),
+                name: "p".to_string(),
+                key: "p".to_string(),
                 repo_path: local_path,
                 team_id: None,
             },

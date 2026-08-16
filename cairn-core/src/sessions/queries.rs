@@ -114,7 +114,16 @@ pub(crate) async fn rotate_job_session(
     job_id: &str,
     emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
-    rotate_session(db, old, job_id, true, None, emitter).await
+    rotate_session(db, old, job_id, true, None, false, emitter).await
+}
+
+pub(crate) async fn rotate_watchdog_reconciled_job_session(
+    db: &LocalDb,
+    old: &Session,
+    job_id: &str,
+    emitter: &dyn EventEmitter,
+) -> Result<Session, String> {
+    rotate_session(db, old, job_id, true, None, true, emitter).await
 }
 
 /// Rotate a job's session onto a different backend.
@@ -136,6 +145,7 @@ pub(crate) async fn rotate_job_session_to_backend(
         job_id,
         true,
         Some(new_backend.to_string()),
+        false,
         emitter,
     )
     .await
@@ -158,6 +168,7 @@ async fn rotate_session(
     job_id: &str,
     make_active: bool,
     target_backend: Option<String>,
+    consume_fresh_flag: bool,
     emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
     let source = source.clone();
@@ -188,9 +199,16 @@ async fn rotate_session(
                 let rows = conn
                     .execute(
                         "UPDATE jobs
-                         SET current_session_id = ?1, updated_at = ?2
+                         SET current_session_id = ?1, updated_at = ?2,
+                             needs_fresh_session = CASE WHEN ?5 THEN 0 ELSE needs_fresh_session END
                          WHERE id = ?3 AND current_session_id = ?4",
-                        params![new_id.as_str(), now, job_id.as_str(), source.id.as_str()],
+                        params![
+                            new_id.as_str(),
+                            now,
+                            job_id.as_str(),
+                            source.id.as_str(),
+                            consume_fresh_flag
+                        ],
                     )
                     .await?;
 

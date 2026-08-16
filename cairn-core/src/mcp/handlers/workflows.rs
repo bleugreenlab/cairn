@@ -178,7 +178,7 @@ mod tests {
             .unwrap();
         for sql in [
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1)",
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1)",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1)",
             "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at) VALUES ('i','p',1,'T','active',1,1)",
             "INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('e','recipe','i','p','running',1,1)",
             "INSERT INTO jobs (id, execution_id, issue_id, project_id, node_name, agent_config_id, status, uri_segment, created_at, updated_at) VALUES ('j','e','i','p','Builder','agent-1','running','builder',1,1)",

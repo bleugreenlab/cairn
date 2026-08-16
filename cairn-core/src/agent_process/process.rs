@@ -1557,12 +1557,12 @@ mod tests {
     fn test_note_read_accumulates_consumed() {
         let state = state_with_run("run-1");
         assert_eq!(state.consumed_uris("run-1"), Some(HashSet::new()));
-        state.note_read("run-1", "cairn://p/CAIRN/1");
-        state.note_read("run-1", "cairn://p/CAIRN/1"); // idempotent
-        state.note_read("run-1", "cairn://p/CAIRN/2");
+        state.note_read("run-1", "cairn://p/cairn/1");
+        state.note_read("run-1", "cairn://p/cairn/1"); // idempotent
+        state.note_read("run-1", "cairn://p/cairn/2");
         let consumed = state.consumed_uris("run-1").unwrap();
         assert_eq!(consumed.len(), 2);
-        assert!(consumed.contains("cairn://p/CAIRN/1"));
+        assert!(consumed.contains("cairn://p/cairn/1"));
         assert_eq!(state.consumed_uris("ghost"), None);
     }
 

@@ -268,7 +268,7 @@ mod confirmable_tests {
     async fn seed_job(db: &LocalDb, status: &str) {
         db.execute_script(&format!(
             "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
-             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','PRJ','/tmp/p',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
              INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at) VALUES ('i','p',1,'T','active','none',1,1);
              INSERT INTO jobs (id,issue_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('j','i','p','{status}','b','b',1,1);"
         ))

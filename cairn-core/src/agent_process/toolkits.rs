@@ -133,7 +133,8 @@ pub(crate) fn resolve_tools(tools: &[String]) -> Vec<String> {
 }
 
 /// The three core verbs — the entire working Cairn surface.
-const CORE_VERBS: [&str; 3] = ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"];
+pub(crate) const CORE_VERBS: [&str; 3] =
+    ["mcp__cairn__read", "mcp__cairn__write", "mcp__cairn__run"];
 
 /// Ensure the three core verbs are present in an allow-list, appending any that
 /// are missing (order preserved, deduped).

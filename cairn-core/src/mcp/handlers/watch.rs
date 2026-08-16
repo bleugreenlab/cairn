@@ -561,12 +561,12 @@ mod tests {
     fn external_reply_event_is_actionable_without_projection_attention() {
         let event = AttentionEvent {
             issue_id: "i-1".to_string(),
-            issue_uri: "cairn://p/CAIRN/1".to_string(),
+            issue_uri: "cairn://p/cairn/1".to_string(),
             fact: AttentionFact::ExternalMessageReply {
-                detail_uri: "cairn://p/CAIRN/1/messages".to_string(),
+                detail_uri: "cairn://p/cairn/1/messages".to_string(),
                 message_id: "m-1".to_string(),
                 content: ExternalMessageReplyContent {
-                    sender: "cairn://p/CAIRN/1/1/builder".to_string(),
+                    sender: "cairn://p/cairn/1/1/builder".to_string(),
                     body: "done".to_string(),
                 },
             },
@@ -595,7 +595,7 @@ mod tests {
 
     fn test_issue_ref() -> IssueRef {
         IssueRef {
-            project_key: "CAIRN".to_string(),
+            project_key: "cairn".to_string(),
             number: 1181,
             issue_id: "i-1181".to_string(),
         }
@@ -631,7 +631,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('p-cairn', 'w-1', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1)",
+                     VALUES ('p-cairn', 'w-1', 'Cairn', 'cairn', '/tmp/cairn', 1, 1)",
                     (),
                 )
                 .await?;
@@ -678,7 +678,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('p-cairn', 'w-1', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1)",
+                     VALUES ('p-cairn', 'w-1', 'Cairn', 'cairn', '/tmp/cairn', 1, 1)",
                     (),
                 )
                 .await?;
@@ -691,7 +691,7 @@ mod tests {
                 // The external reply's catch-up cursor is its own created_at.
                 conn.execute(
                     "INSERT INTO messages (id, channel_type, channel_id, sender_run_id, sender_name, recipient_run_id, content, created_at)
-                     VALUES ('m-external', 'issue', 'CAIRN/1181', 'run-builder', 'cairn://p/CAIRN/1181/1/builder', NULL, 'done', ?1)",
+                     VALUES ('m-external', 'issue', 'cairn/1181', 'run-builder', 'cairn://p/cairn/1181/1/builder', NULL, 'done', ?1)",
                     params![marker],
                 )
                 .await?;
@@ -728,14 +728,14 @@ mod tests {
     async fn synthesize_event_uses_blocked_node_real_artifact_name() {
         let db = test_db().await;
         seed_blocked_node(&db, Some("pr")).await;
-        assert_waiting_approval_detail_uri(&db, "cairn://p/CAIRN/1181/1/builder/pr").await;
+        assert_waiting_approval_detail_uri(&db, "cairn://p/cairn/1181/1/builder/pr").await;
     }
 
     #[tokio::test]
     async fn synthesize_event_falls_back_to_generic_artifact_alias() {
         let db = test_db().await;
         seed_blocked_node(&db, None).await;
-        assert_waiting_approval_detail_uri(&db, "cairn://p/CAIRN/1181/1/builder/artifact").await;
+        assert_waiting_approval_detail_uri(&db, "cairn://p/cairn/1181/1/builder/artifact").await;
     }
 
     /// Seed a project + issue + execution + a single blocked `pr` action_run
@@ -751,7 +751,7 @@ mod tests {
                 .await?;
                 conn.execute(
                     "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('p-cairn', 'w-1', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1)",
+                     VALUES ('p-cairn', 'w-1', 'Cairn', 'cairn', '/tmp/cairn', 1, 1)",
                     (),
                 )
                 .await?;
@@ -784,7 +784,7 @@ mod tests {
     async fn synthesize_event_uses_blocked_action_run_bare_node_uri() {
         let db = test_db().await;
         seed_blocked_action_run(&db).await;
-        assert_waiting_approval_detail_uri(&db, "cairn://p/CAIRN/1181/1/pr").await;
+        assert_waiting_approval_detail_uri(&db, "cairn://p/cairn/1181/1/pr").await;
     }
 
     #[test]

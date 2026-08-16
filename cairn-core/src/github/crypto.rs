@@ -38,6 +38,15 @@ pub fn generate_keypair() -> (String, String) {
     )
 }
 
+pub fn public_key_for_private(private_key_b64: &str) -> Result<String, String> {
+    let bytes = BASE64
+        .decode(private_key_b64)
+        .map_err(|e| format!("Invalid secret key base64: {e}"))?;
+    let secret =
+        SecretKey::from_slice(&bytes).map_err(|_| "Invalid secret key format".to_string())?;
+    Ok(BASE64.encode(secret.public_key().as_bytes()))
+}
+
 /// Decrypt a relay sealed-box payload using a base64-encoded X25519 secret key.
 pub fn decrypt_payload(encrypted_b64: &str, secret_key_b64: &str) -> Result<String, String> {
     let encrypted = BASE64
@@ -224,6 +233,20 @@ mod tests {
         let payload = BASE64.encode([1, 2, 3, 4]);
         let err = decrypt_payload(&payload, &secret_key).unwrap_err();
         assert!(err.contains("too short"));
+    }
+
+    #[test]
+    fn decrypts_typescript_relay_sealed_box_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/relay-sealed-box.json"))
+                .unwrap();
+        let plaintext = decrypt_payload(
+            fixture["ciphertext"].as_str().unwrap(),
+            fixture["recipientSecretKey"].as_str().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(plaintext, fixture["plaintext"].as_str().unwrap());
     }
 
     #[test]

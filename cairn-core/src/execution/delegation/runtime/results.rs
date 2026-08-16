@@ -366,7 +366,7 @@ mod callback_response_tests {
         let db = crate::storage::migrated_test_db("delegated-result.db").await;
         db.execute_script(
             r#"INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES ('p1', 'default', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES ('p1', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
                INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, created_at, updated_at)
                VALUES ('i1', 'p1', 7, 'Parent issue', '', 'active', 'active', 'none', 0, 1, 1);
                INSERT INTO jobs (id, project_id, issue_id, status, node_name, uri_segment, created_at, updated_at)
@@ -395,7 +395,7 @@ mod callback_response_tests {
         assert_eq!(response.result, "the explored answer");
         assert_eq!(
             response.artifact_uri.as_deref(),
-            Some("cairn://p/CAIRN/7/1/builder/task/probe/artifact")
+            Some("cairn://p/cairn/7/1/builder/task/probe/artifact")
         );
         assert!(!response.result.contains("unknown status"));
     }

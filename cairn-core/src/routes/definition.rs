@@ -26,6 +26,34 @@ pub struct RouteDefinition {
     pub dedupe: Option<DedupeWindow>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelDestination {
+    Subscriptions,
+    Conversation(crate::channels::ConversationAddress),
+}
+
+impl Serialize for ChannelDestination {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Subscriptions => serializer.serialize_str("subscriptions"),
+            Self::Conversation(address) => address.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChannelDestination {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "subscriptions" | "notify" => Ok(Self::Subscriptions),
+            _ => value
+                .parse()
+                .map(Self::Conversation)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 /// Where a node sits on the authoring canvas. Absent in a hand-written file:
 /// the editor derives a layout from the graph's shape and writes positions back
 /// on the next save, so hand-authored and canvas-authored routes are one object
@@ -111,7 +139,8 @@ pub enum ArgumentBinding {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RouteSink {
     Channel {
-        register: String,
+        #[serde(alias = "register")]
+        destination: ChannelDestination,
         #[serde(default, rename = "initiatedBy")]
         initiated_by: Option<String>,
     },
@@ -305,19 +334,31 @@ fn validate_sink(
 ) -> Result<(), String> {
     match sink {
         RouteSink::Channel {
-            register,
+            destination,
             initiated_by,
-        } => {
-            if register != "notify" {
-                return Err(format!("unknown channel register '{register}'"));
+        } => match destination {
+            ChannelDestination::Subscriptions => {
+                if initiated_by
+                    .as_deref()
+                    .is_some_and(|v| v != "operator_subscription" && v != "cairn_push")
+                {
+                    return Err("unknown channel initiatedBy value".into());
+                }
             }
-            if initiated_by
-                .as_deref()
-                .is_some_and(|v| v != "operator_subscription" && v != "cairn_push")
-            {
-                return Err("unknown channel initiatedBy value".into());
+            ChannelDestination::Conversation(address) => {
+                if initiated_by.is_some() {
+                    return Err("a conversation channel sink is always Cairn-initiated and cannot declare initiatedBy".into());
+                }
+                if !crate::channels::conversation_capabilities(address.provider())
+                    .append_to_conversation
+                {
+                    return Err(format!(
+                        "{} does not support append_to_conversation",
+                        address.provider()
+                    ));
+                }
             }
-        }
+        },
         RouteSink::Message { target }
             if !matches!(
                 cairn_common::uri::parse_uri(target),
@@ -745,7 +786,7 @@ mod tests {
 
     #[test]
     fn a_legacy_linear_file_heals_into_the_graph_and_then_round_trips() {
-        let legacy = "name: test\ndescription: test\nwhen:\n  - fact: attention\n  - fact: thread_stream\ntransforms:\n  - response: conveyor\nto:\n  - { kind: channel, register: notify }\n  - { kind: message, target: 'cairn://p/CAIRN/1' }\ndedupe: 10m\n";
+        let legacy = "name: test\ndescription: test\nwhen:\n  - fact: attention\n  - fact: thread_stream\ntransforms:\n  - response: conveyor\nto:\n  - { kind: channel, register: notify }\n  - { kind: message, target: 'cairn://p/cairn/1' }\ndedupe: 10m\n";
         let healed = parse(legacy).unwrap();
         assert_eq!(
             healed
@@ -807,6 +848,36 @@ mod tests {
         let reparsed = parse(&emitted).unwrap();
         assert_eq!(reparsed.nodes[0].position, placed.nodes[0].position);
         assert_eq!(serde_yaml::to_string(&reparsed).unwrap(), emitted);
+    }
+
+    #[test]
+    fn channel_destinations_round_trip_canonically_and_legacy_notify_heals() {
+        let legacy = parse(&graph_route("{ kind: channel, register: notify }", "")).unwrap();
+        let emitted = serde_yaml::to_string(&legacy).unwrap();
+        assert!(emitted.contains("destination: subscriptions"), "{emitted}");
+        assert!(!emitted.contains("register:"), "{emitted}");
+
+        let directed = parse(&graph_route(
+            "{ kind: channel, destination: ' DISCORD: 12/34 ' }",
+            "",
+        ))
+        .unwrap();
+        let emitted = serde_yaml::to_string(&directed).unwrap();
+        assert!(emitted.contains("destination: discord:12/34"), "{emitted}");
+        assert_eq!(
+            serde_yaml::to_string(&parse(&emitted).unwrap()).unwrap(),
+            emitted
+        );
+    }
+
+    #[test]
+    fn directed_channel_destinations_refuse_meaningless_initiators() {
+        let error = parse(&graph_route(
+            "{ kind: channel, destination: 'telegram:123', initiatedBy: operator_subscription }",
+            "",
+        ))
+        .unwrap_err();
+        assert!(error.contains("always Cairn-initiated"), "{error}");
     }
 
     #[test]
@@ -972,13 +1043,13 @@ mod tests {
             RouteSink::Label { .. }
         ));
         assert!(parse(&graph_route(
-            "{ kind: label, issue: { value: 'cairn://p/CAIRN/1' }, labels: [] }",
+            "{ kind: label, issue: { value: 'cairn://p/cairn/1' }, labels: [] }",
             ""
         ))
         .unwrap_err()
         .contains("at least one label"));
         assert!(parse(&graph_route(
-            "{ kind: label, issue: 'cairn://p/CAIRN/1', labels: [bug] }",
+            "{ kind: label, issue: 'cairn://p/cairn/1', labels: [bug] }",
             ""
         ))
         .unwrap_err()
@@ -988,7 +1059,7 @@ mod tests {
     #[test]
     fn message_sink_rejects_unsupported_project_subresources() {
         let error = parse(&graph_route(
-            "{ kind: message, target: 'cairn://p/CAIRN/42/messages' }",
+            "{ kind: message, target: 'cairn://p/cairn/42/messages' }",
             "",
         ))
         .unwrap_err();

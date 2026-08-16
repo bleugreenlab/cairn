@@ -108,6 +108,9 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         ["symbols"] => at_thread!(NodeSymbols, symbol: None),
         ["symbols", symbol] => at_thread!(NodeSymbols, symbol: Some((*symbol).to_string())),
         ["todos"] => at_thread!(JobTodos, task_name: None),
+        // A session's feed IS the thread's: the cursor keys on the thread row,
+        // so it is the same reading position across every session.
+        ["feed"] => at_thread!(HomeFeed, task_name: None),
         ["tasks"] => at_thread!(NodeTasks),
         ["calls"] => at_thread!(NodeCalls),
         ["wakes"] => at_thread!(NodeWakes),
@@ -144,6 +147,10 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         ["task", task] => at_thread!(Task, task_name: (*task).to_string()),
         ["task", task, "todos"] => at_thread!(
             JobTodos,
+            task_name: Some((*task).to_string()),
+        ),
+        ["task", task, "feed"] => at_thread!(
+            HomeFeed,
             task_name: Some((*task).to_string()),
         ),
         ["task", task, "messages"] => at_thread!(TaskMessages, task_name: (*task).to_string()),
@@ -413,7 +420,7 @@ mod delegation_tests {
     use cairn_common::uri::{parse_uri, CairnResource};
 
     fn delegate(path: &str) -> Result<CairnResource, String> {
-        let uri = format!("cairn://p/CAIRN/design-review/{path}");
+        let uri = format!("cairn://p/cairn/design-review/{path}");
         delegate_thread_descendant(parse_uri(&uri).expect("a thread path always parses"))
     }
 
@@ -439,7 +446,7 @@ mod delegation_tests {
         ));
         // A bare thread stays a thread.
         assert_eq!(
-            delegate_thread_descendant(parse_uri("cairn://p/CAIRN/design-review").unwrap())
+            delegate_thread_descendant(parse_uri("cairn://p/cairn/design-review").unwrap())
                 .unwrap()
                 .kind(),
             ResourceKind::Thread
@@ -504,14 +511,14 @@ mod delegation_tests {
         // verdicts belong to the task job like every other task-level segment.
         for (node_prefix, thread_prefix, level, refused) in [
             (
-                "cairn://p/CAIRN/1/1/builder",
-                "cairn://p/CAIRN/design-review",
+                "cairn://p/cairn/1/1/builder",
+                "cairn://p/cairn/design-review",
                 "node",
                 &["diff", "changed", "checks", "rebase"][..],
             ),
             (
-                "cairn://p/CAIRN/1/1/builder/task/probe",
-                "cairn://p/CAIRN/design-review/task/probe",
+                "cairn://p/cairn/1/1/builder/task/probe",
+                "cairn://p/cairn/design-review/task/probe",
                 "task",
                 &["diff", "changed", "rebase"][..],
             ),
@@ -580,7 +587,7 @@ mod delegation_tests {
                 "task/probe/permissions/perm-1",
             ),
         ] {
-            let node = parse_uri(&format!("cairn://p/CAIRN/1/1/builder/{node_path}"))
+            let node = parse_uri(&format!("cairn://p/cairn/1/1/builder/{node_path}"))
                 .unwrap_or_else(|| panic!("node path {node_path} must parse"));
             let delegated = delegate(thread_path)
                 .unwrap_or_else(|error| panic!("{thread_path} must delegate: {error}"));
@@ -639,7 +646,7 @@ mod tests {
         let db = crate::storage::migrated_test_db("thread-resources.db").await;
         db.execute_script(
             "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p-threads', 'default', 'Threads', 'THR', '/tmp/threads', 1, 1);
+             VALUES ('p-threads', 'default', 'Threads', 'thr', '/tmp/threads', 1, 1);
              INSERT INTO threads (id, project_id, name, jurisdiction, migrated_from_number, created_at, updated_at)
              VALUES ('t-design', 'p-threads', 'design-review', 'Own architecture decisions', 3404, 2, 3);
              INSERT INTO issues (id, project_id, number, title, description, status, progress, attention, priority, parent_thread_id, created_at, updated_at)
@@ -653,19 +660,19 @@ mod tests {
     #[tokio::test]
     async fn collection_and_overview_render_first_class_thread_fields() {
         let db = fixture().await;
-        let collection = read_project_threads(&db, "THR").await;
-        assert!(collection.contains("[design-review](cairn://p/THR/design-review)"));
+        let collection = read_project_threads(&db, "thr").await;
+        assert!(collection.contains("[design-review](cairn://p/thr/design-review)"));
         assert!(collection.contains("Jurisdiction: Own architecture decisions"));
         assert!(collection.contains("Status: active"));
         assert!(collection.contains("Attention: none"));
         assert!(collection.contains("Last activity: 3"));
 
-        let overview = read_thread(&db, "THR", "design-review", &[]).await;
+        let overview = read_thread(&db, "thr", "design-review", &[]).await;
         // A thread's heading is its one identifier, the same string its URI
         // carries and its pane header shows.
         assert!(overview.contains("# design-review"));
-        assert!(overview.contains("[arc](cairn://p/THR/design-review/arc)"));
-        assert!(overview.contains("[12 — Child issue](cairn://p/THR/12)"));
+        assert!(overview.contains("[arc](cairn://p/thr/design-review/arc)"));
+        assert!(overview.contains("[12 — Child issue](cairn://p/thr/12)"));
         assert!(overview.contains("Live session: not started"));
     }
 
@@ -685,18 +692,18 @@ mod tests {
         .await
         .unwrap();
 
-        let collection = read_project_threads(&db, "THR").await;
-        assert!(collection.contains("[design-review](cairn://p/THR/design-review)"));
+        let collection = read_project_threads(&db, "thr").await;
+        assert!(collection.contains("[design-review](cairn://p/thr/design-review)"));
         assert!(
             !collection.contains("retired-topic"),
             "a closed thread is not offered as somewhere to address: {collection}"
         );
 
-        let overview = read_thread(&db, "THR", "retired-topic", &[]).await;
+        let overview = read_thread(&db, "thr", "retired-topic", &[]).await;
         assert!(overview.contains("# retired-topic"));
         assert!(overview.contains("Status: closed"));
         assert!(
-            overview.contains("[44 — Still open child](cairn://p/THR/44)"),
+            overview.contains("[44 — Still open child](cairn://p/thr/44)"),
             "closing routes attention, it does not disown children: {overview}"
         );
     }
@@ -705,21 +712,21 @@ mod tests {
     async fn migrated_number_resolves_only_when_no_issue_owns_it() {
         let db = fixture().await;
         assert_eq!(
-            resolve_migrated_thread_uri(&db, "cairn://p/THR/3404")
+            resolve_migrated_thread_uri(&db, "cairn://p/thr/3404")
                 .await
                 .unwrap(),
             Some((
-                "cairn://p/THR/design-review".into(),
-                "cairn://p/THR/design-review".into()
+                "cairn://p/thr/design-review".into(),
+                "cairn://p/thr/design-review".into()
             ))
         );
         assert_eq!(
-            resolve_migrated_thread_uri(&db, "cairn://p/THR/3404/1/thread/chat")
+            resolve_migrated_thread_uri(&db, "cairn://p/thr/3404/1/thread/chat")
                 .await
                 .unwrap(),
             Some((
-                "cairn://p/THR/design-review/chat".into(),
-                "cairn://p/THR/design-review".into()
+                "cairn://p/thr/design-review/chat".into(),
+                "cairn://p/thr/design-review".into()
             ))
         );
 
@@ -731,7 +738,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            resolve_migrated_thread_uri(&db, "cairn://p/THR/3404")
+            resolve_migrated_thread_uri(&db, "cairn://p/thr/3404")
                 .await
                 .unwrap(),
             None
@@ -774,7 +781,7 @@ mod tests {
         assert_eq!(
             crate::jobs::queries::job_id_for_node_coordinate(
                 &db,
-                "THR",
+                "thr",
                 0,
                 0,
                 "design-review",
@@ -788,7 +795,7 @@ mod tests {
         assert_eq!(
             crate::jobs::queries::job_id_for_node_coordinate(
                 &db,
-                "THR",
+                "thr",
                 0,
                 0,
                 "design-review",
@@ -801,7 +808,7 @@ mod tests {
         );
 
         // The node renderers, driven at the thread coordinate.
-        let wakes = super::super::node::read_node_wakes(&db, "THR", 0, 0, "design-review").await;
+        let wakes = super::super::node::read_node_wakes(&db, "thr", 0, 0, "design-review").await;
         assert!(wakes.contains("# Wakes — design-review"), "{wakes}");
         // `ensure_thread_session` seeds the default system subscriptions so a
         // thread session hears messages from birth.
@@ -809,37 +816,37 @@ mod tests {
         assert!(wakes.contains("user `*`"), "{wakes}");
         // The rendered address is the thread's, not a 0/0 placeholder.
         assert!(
-            wakes.contains("cairn://p/THR/design-review/wakes"),
+            wakes.contains("cairn://p/thr/design-review/wakes"),
             "{wakes}"
         );
         assert!(!wakes.contains("/0/0/"), "{wakes}");
 
         let todos =
-            super::super::node::read_job_todos(&db, "THR", 0, 0, "design-review", None).await;
+            super::super::node::read_job_todos(&db, "thr", 0, 0, "design-review", None).await;
         assert!(!todos.contains("/0/0/"), "{todos}");
 
-        let tasks = super::super::node::read_node_tasks(&db, "THR", 0, 0, "design-review").await;
+        let tasks = super::super::node::read_node_tasks(&db, "thr", 0, 0, "design-review").await;
         assert!(tasks.contains("research"), "{tasks}");
         assert!(!tasks.contains("/0/0/"), "{tasks}");
 
         let task =
-            super::super::node::read_task(&db, "THR", 0, 0, "design-review", "research").await;
+            super::super::node::read_task(&db, "thr", 0, 0, "design-review", "research").await;
         assert!(task.contains("research"), "{task}");
         assert!(!task.contains("/0/0/"), "{task}");
 
         let memories = super::super::memories::render_job_memories(
             &db,
             "design-review",
-            "cairn://p/THR/design-review/memories",
+            "cairn://p/thr/design-review/memories",
             &job_id,
         )
         .await;
         assert!(
-            memories.contains("cairn://p/THR/design-review/memories/1"),
+            memories.contains("cairn://p/thr/design-review/memories/1"),
             "{memories}"
         );
         assert_eq!(
-            crate::memories::db::resolve_node_memory_id(&db, "THR", 0, 0, "design-review", 1)
+            crate::memories::db::resolve_node_memory_id(&db, "thr", 0, 0, "design-review", 1)
                 .await
                 .unwrap()
                 .as_deref(),
@@ -862,12 +869,12 @@ mod tests {
         assert_eq!(job_count(&db).await, 0);
 
         for body in [
-            super::super::node::read_node_wakes(&db, "THR", 0, 0, "design-review").await,
-            super::super::node::read_job_todos(&db, "THR", 0, 0, "design-review", None).await,
-            super::super::node::read_node_tasks(&db, "THR", 0, 0, "design-review").await,
+            super::super::node::read_node_wakes(&db, "thr", 0, 0, "design-review").await,
+            super::super::node::read_job_todos(&db, "thr", 0, 0, "design-review", None).await,
+            super::super::node::read_node_tasks(&db, "thr", 0, 0, "design-review").await,
         ] {
             assert!(body.contains("has no session yet"), "{body}");
-            assert!(body.contains("cairn://p/THR/design-review"), "{body}");
+            assert!(body.contains("cairn://p/thr/design-review"), "{body}");
         }
 
         assert_eq!(
@@ -876,7 +883,7 @@ mod tests {
             "a read must never mint a thread's session job"
         );
 
-        let overview = read_thread(&db, "THR", "design-review", &[]).await;
+        let overview = read_thread(&db, "thr", "design-review", &[]).await;
         assert!(overview.contains("Live session: not started"), "{overview}");
     }
 }

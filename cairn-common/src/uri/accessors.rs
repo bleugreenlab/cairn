@@ -17,6 +17,7 @@ impl CairnResource {
             | ProjectImage { project, .. }
             | ProjectImages { project, .. }
             | ProjectIssues { project, .. }
+            | ProjectPosts { project, .. }
             | ProjectCheckResults { project, .. }
             | Issue { project, .. }
             | ProjectThreads { project, .. }
@@ -41,6 +42,7 @@ impl CairnResource {
             | TaskChatEvent { project, .. }
             | TaskArtifact { project, .. }
             | JobTodos { project, .. }
+            | HomeFeed { project, .. }
             | NodeTasks { project, .. }
             | NodeCalls { project, .. }
             | NodeWakes { project, .. }
@@ -240,6 +242,7 @@ impl CairnResource {
             | Self::TaskChatEvent { .. }
             | Self::TaskArtifact { .. }
             | Self::JobTodos { .. }
+            | Self::HomeFeed { .. }
             | Self::NodeTasks { .. }
             | Self::NodeCalls { .. }
             | Self::NodeWakes { .. }
@@ -255,6 +258,9 @@ impl CairnResource {
             | Self::NodeProgress { .. }
             | Self::TaskMessages { .. }
             | Self::ProjectIssues { .. }
+            | Self::Posts
+            | Self::Post { .. }
+            | Self::ProjectPosts { .. }
             | Self::ProjectMessages { .. }
             | Self::IssueMessages { .. }
             | Self::Changed { .. }
@@ -305,6 +311,7 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::Logs
+            | Self::ChannelsConversations
             | Self::Executors
             | Self::Executor { .. }
             | Self::ExecutorAction { .. }
@@ -340,6 +347,7 @@ impl CairnResource {
             | Self::ProjectImage { project, .. }
             | Self::ProjectImages { project, .. }
             | Self::ProjectIssues { project }
+            | Self::ProjectPosts { project }
             | Self::ProjectCheckResults { project, .. }
             | Self::ProjectCheckObservation { project, .. }
             | Self::Issue { project, .. }
@@ -365,6 +373,7 @@ impl CairnResource {
             | Self::TaskChatEvent { project, .. }
             | Self::TaskArtifact { project, .. }
             | Self::JobTodos { project, .. }
+            | Self::HomeFeed { project, .. }
             | Self::NodeTasks { project, .. }
             | Self::NodeCalls { project, .. }
             | Self::NodeWakes { project, .. }
@@ -415,7 +424,9 @@ impl CairnResource {
             | Self::ProjectAction { project, .. }
             | Self::NodeSymbols { project, .. }
             | Self::ProjectSymbols { project, .. } => Some(project),
-            Self::Routes
+            Self::Posts
+            | Self::Post { .. }
+            | Self::Routes
             | Self::Route { .. }
             | Self::RouteHistory { .. }
             | Self::RouteHistoryEntry { .. }
@@ -442,6 +453,7 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::Logs
+            | Self::ChannelsConversations
             | Self::Executors
             | Self::Executor { .. }
             | Self::ExecutorAction { .. }
@@ -478,6 +490,7 @@ impl CairnResource {
             | Self::TaskChatEvent { number, .. }
             | Self::TaskArtifact { number, .. }
             | Self::JobTodos { number, .. }
+            | Self::HomeFeed { number, .. }
             | Self::NodeTasks { number, .. }
             | Self::NodeCalls { number, .. }
             | Self::NodeWakes { number, .. }
@@ -507,6 +520,9 @@ impl CairnResource {
             | Self::Thread { .. }
             | Self::Project { .. }
             | Self::ProjectIssues { .. }
+            | Self::Posts
+            | Self::Post { .. }
+            | Self::ProjectPosts { .. }
             | Self::ProjectCheckResults { .. }
             | Self::ProjectMessages { .. }
             | Self::ProjectTerminal { .. }
@@ -560,6 +576,7 @@ impl CairnResource {
             | Self::DevDb
             | Self::DevPid
             | Self::Logs
+            | Self::ChannelsConversations
             | Self::Executors
             | Self::Executor { .. }
             | Self::ExecutorAction { .. }
@@ -597,6 +614,7 @@ impl CairnResource {
             | Self::TaskChatEvent { node_id, .. }
             | Self::TaskArtifact { node_id, .. }
             | Self::JobTodos { node_id, .. }
+            | Self::HomeFeed { node_id, .. }
             | Self::NodeTasks { node_id, .. }
             | Self::NodeCalls { node_id, .. }
             | Self::NodeQuestions { node_id, .. }

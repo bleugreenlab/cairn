@@ -26,7 +26,12 @@ fn label_values(labels: &[Label]) -> serde_json::Value {
     )
 }
 
-fn attention_fact(event: AttentionEvent, project: &str, labels: &[Label]) -> RouteFact {
+fn attention_fact(
+    event: AttentionEvent,
+    project: &str,
+    labels: &[Label],
+    origin: crate::issues::crud::IssueAuthorship,
+) -> RouteFact {
     let key = event.fact.key();
     let fact_json = serde_json::to_string(&event.fact).unwrap_or_default();
     let detail_uri = key
@@ -60,6 +65,7 @@ fn attention_fact(event: AttentionEvent, project: &str, labels: &[Label]) -> Rou
             ("detailUri".into(), serde_json::Value::String(detail_uri)),
             ("text".into(), serde_json::Value::String(fact_json)),
         ]),
+        origin: Some(origin),
         summary: Some(summary),
         route_provenance: event.route_provenance,
     }
@@ -76,13 +82,17 @@ mod tests {
     use crate::storage::{migrated_test_db, SearchIndex};
     use std::sync::Arc;
 
+    fn test_origin() -> crate::issues::crud::IssueAuthorship {
+        crate::issues::crud::installation_machine_authorship("test-device", 1).unwrap()
+    }
+
     #[test]
     fn repeated_attention_observations_share_one_fact_identity() {
         let event = |updated_at| AttentionEvent {
             issue_id: "i".into(),
-            issue_uri: "cairn://p/CAIRN/42".into(),
+            issue_uri: "cairn://p/cairn/42".into(),
             fact: AttentionFact::AgentIdleWithWork {
-                detail_uri: "cairn://p/CAIRN/42/1/builder/pr".into(),
+                detail_uri: "cairn://p/cairn/42/1/builder/pr".into(),
             },
             attention: IssueAttention::NeedsApproval,
             status: IssueStatus::Waiting,
@@ -91,19 +101,85 @@ mod tests {
         };
 
         assert_eq!(
-            attention_fact(event(1), "CAIRN", &[]).identity,
-            attention_fact(event(999), "CAIRN", &[]).identity,
+            attention_fact(event(1), "cairn", &[], test_origin()).identity,
+            attention_fact(event(999), "cairn", &[], test_origin()).identity,
             "poll timestamps must not mint new identities for one review-ready fact"
         );
+    }
+
+    #[tokio::test]
+    async fn attention_producer_carries_machine_origin_through_issue_sink() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(config.join("routes")).unwrap();
+        std::fs::write(
+            config.join("routes/attention-issue.yaml"),
+            "name: attention issue\ndescription: test\nwhen:\n  - fact: attention\nto:\n  kind: issue\n  labels: [routed]\n",
+        )
+        .unwrap();
+        let db = Arc::new(migrated_test_db("attention-routes-issue-origin.db").await);
+        db.execute_batch(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Cairn','cairn','/tmp/cairn',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',42,'Target','active',1,1);",
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config,
+        )
+        .build();
+        let expected_device_id = orch.anon_device_manager.device_id();
+
+        dispatch_attention(
+            &orch,
+            AttentionEvent {
+                issue_id: "i".into(),
+                issue_uri: "cairn://p/cairn/42".into(),
+                fact: AttentionFact::AgentIdleWithWork {
+                    detail_uri: "cairn://p/cairn/42".into(),
+                },
+                attention: IssueAttention::Idle,
+                status: IssueStatus::Waiting,
+                updated_at: 2,
+                route_provenance: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let (author, appearance) = db
+            .query_opt(
+                "SELECT author_principal_json, appearance_snapshot_json FROM issues WHERE id != 'i' ORDER BY created_at DESC LIMIT 1",
+                (),
+                |row| Ok((crate::storage::RowExt::text(row, 0)?, crate::storage::RowExt::text(row, 1)?)),
+            )
+            .await
+            .unwrap()
+            .expect("the real attention producer must reach the issue sink");
+        let authorship =
+            crate::issues::crud::decode_issue_authorship(Some(author), Some(appearance))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            authorship.author,
+            cairn_common::identity::PrincipalRef::Machine {
+                device_id: expected_device_id,
+            }
+        );
+        assert_eq!(authorship.appearance.evidence().at, 0);
     }
 
     #[test]
     fn content_change_at_one_uri_mints_a_new_fact_identity() {
         let event = |version| AttentionEvent {
             issue_id: "i".into(),
-            issue_uri: "cairn://p/CAIRN/42".into(),
+            issue_uri: "cairn://p/cairn/42".into(),
             fact: AttentionFact::ArtifactWritten {
-                detail_uri: "cairn://p/CAIRN/42/1/builder/create-pr".into(),
+                detail_uri: "cairn://p/cairn/42/1/builder/create-pr".into(),
                 content: crate::orchestrator::attention::ArtifactSummary {
                     output_name: "create-pr".into(),
                     version,
@@ -120,8 +196,8 @@ mod tests {
         };
 
         assert_ne!(
-            attention_fact(event(1), "CAIRN", &[]).identity,
-            attention_fact(event(2), "CAIRN", &[]).identity,
+            attention_fact(event(1), "cairn", &[], test_origin()).identity,
+            attention_fact(event(2), "cairn", &[], test_origin()).identity,
             "content-bearing fact variants at one URI remain distinct"
         );
     }
@@ -142,17 +218,18 @@ mod tests {
         let fact = attention_fact(
             AttentionEvent {
                 issue_id: "i".into(),
-                issue_uri: "cairn://p/CAIRN/42".into(),
+                issue_uri: "cairn://p/cairn/42".into(),
                 fact: AttentionFact::AgentIdleWithWork {
-                    detail_uri: "cairn://p/CAIRN/42".into(),
+                    detail_uri: "cairn://p/cairn/42".into(),
                 },
                 attention: IssueAttention::Idle,
                 status: IssueStatus::Waiting,
                 updated_at: 1,
                 route_provenance: None,
             },
-            "CAIRN",
+            "cairn",
             &[label("needs-review", "Needs Review"), label("ui", "ui")],
+            test_origin(),
         );
 
         // A label whose display name already is its slug contributes one value,
@@ -196,13 +273,13 @@ mod tests {
         std::fs::create_dir_all(config.join("routes")).unwrap();
         std::fs::write(
             config.join("routes/attention-message.yaml"),
-            "name: attention message\ndescription: test\nwhen:\n  - fact: attention\nto:\n  kind: message\n  target: cairn://p/CAIRN/42\n",
+            "name: attention message\ndescription: test\nwhen:\n  - fact: attention\nto:\n  kind: message\n  target: cairn://p/cairn/42\n",
         )
         .unwrap();
         let db = Arc::new(migrated_test_db("attention-routes-no-channel.db").await);
         db.execute_batch(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Cairn','CAIRN','/tmp/cairn',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Cairn','cairn','/tmp/cairn',1,1);
              INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',42,'Target','active',1,1);",
         )
         .await
@@ -219,9 +296,9 @@ mod tests {
             &orch,
             AttentionEvent {
                 issue_id: "i".into(),
-                issue_uri: "cairn://p/CAIRN/42".into(),
+                issue_uri: "cairn://p/cairn/42".into(),
                 fact: AttentionFact::AgentIdleWithWork {
-                    detail_uri: "cairn://p/CAIRN/42".into(),
+                    detail_uri: "cairn://p/cairn/42".into(),
                 },
                 attention: IssueAttention::Idle,
                 status: IssueStatus::Waiting,
@@ -234,7 +311,7 @@ mod tests {
 
         assert_eq!(
             db.query_opt_i64(
-                "SELECT COUNT(*) FROM messages WHERE channel_type='issue' AND channel_id='CAIRN/42'",
+                "SELECT COUNT(*) FROM messages WHERE channel_type='issue' AND channel_id='cairn/42'",
                 (),
             )
             .await
@@ -253,13 +330,13 @@ mod tests {
         std::fs::create_dir_all(config.join("routes")).unwrap();
         std::fs::write(
             config.join("routes/signal-only.yaml"),
-            "name: signal only\ndescription: test\nwhen:\n  - fact: attention\n    label: [signal]\nto:\n  kind: message\n  target: cairn://p/CAIRN/42\n",
+            "name: signal only\ndescription: test\nwhen:\n  - fact: attention\n    label: [signal]\nto:\n  kind: message\n  target: cairn://p/cairn/42\n",
         )
         .unwrap();
         let db = Arc::new(migrated_test_db("attention-routes-label-filter.db").await);
         db.execute_batch(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Cairn','CAIRN','/tmp/cairn',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','Cairn','cairn','/tmp/cairn',1,1);
              INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('labelled','p',42,'Labelled','active',1,1);
              INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('bare','p',43,'Bare','active',1,1);
              INSERT INTO labels(id,workspace_id,name,color,created_at,updated_at) VALUES('signal','w','signal','#000000',1,1);
@@ -279,9 +356,9 @@ mod tests {
 
         let event = |issue_id: &str, number: u32| AttentionEvent {
             issue_id: issue_id.into(),
-            issue_uri: format!("cairn://p/CAIRN/{number}"),
+            issue_uri: format!("cairn://p/cairn/{number}"),
             fact: AttentionFact::AgentIdleWithWork {
-                detail_uri: format!("cairn://p/CAIRN/{number}"),
+                detail_uri: format!("cairn://p/cairn/{number}"),
             },
             attention: IssueAttention::Idle,
             status: IssueStatus::Waiting,
@@ -290,7 +367,7 @@ mod tests {
         };
         let fired = || async {
             db.query_opt_i64(
-                "SELECT COUNT(*) FROM messages WHERE channel_type='issue' AND channel_id='CAIRN/42'",
+                "SELECT COUNT(*) FROM messages WHERE channel_type='issue' AND channel_id='cairn/42'",
                 (),
             )
             .await
@@ -343,7 +420,12 @@ pub async fn dispatch_attention(orch: &Orchestrator, event: AttentionEvent) -> R
     let presence = crate::channels::operator_presence_status().await.presence;
     let submissions = super::dispatch(
         orch,
-        attention_fact(event, &project, &labels),
+        attention_fact(
+            event,
+            &project,
+            &labels,
+            super::installation_machine_origin(orch)?,
+        ),
         if presence == crate::channels::OperatorPresence::Present {
             Presence::Active
         } else {

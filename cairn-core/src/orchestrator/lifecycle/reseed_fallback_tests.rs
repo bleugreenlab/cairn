@@ -63,7 +63,7 @@ async fn seed_crashed_run(
             .await?;
             conn.execute(
                 "INSERT OR IGNORE INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('p-reseed','w-reseed','Project','PRJ','/tmp/prj',1,1)",
+                 VALUES ('p-reseed','w-reseed','Project','prj','/tmp/prj',1,1)",
                 (),
             )
             .await?;

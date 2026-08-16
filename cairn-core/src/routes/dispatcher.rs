@@ -7,8 +7,8 @@ use cairn_common::uri::{parse_uri, CairnResource};
 use serde_json::{Map, Value};
 
 use super::{
-    matches, ArgumentBinding, Fact, Presence, RouteFact, RouteGraph, RouteNode, RouteNodeConfig,
-    RouteSink,
+    matches, ArgumentBinding, ChannelDestination, Fact, Presence, RouteFact, RouteGraph, RouteNode,
+    RouteNodeConfig, RouteSink,
 };
 use crate::{
     config::{self, ConfigResult},
@@ -342,7 +342,7 @@ pub async fn test_definition(
         let fields = &delivery.fields;
         let bindings = Bindings { graph: &graph, fields, outputs: &walked.outputs };
         match delivery.sink {
-            RouteSink::Channel { register, initiated_by } => serde_json::json!({"nodeId":delivery.node_id,"kind":"channel","register":register,"initiatedBy":initiated_by,"text":text_of(fields),"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()}),
+            RouteSink::Channel { destination, initiated_by } => serde_json::json!({"nodeId":delivery.node_id,"kind":"channel","destination":destination,"initiatedBy":initiated_by,"text":text_of(fields),"context":fields.get("context").and_then(Value::as_str).unwrap_or("[Cairn]"),"jobId":fields.get("jobId").cloned()}),
             RouteSink::Message { target } => serde_json::json!({"nodeId":delivery.node_id,"kind":"message","target":target,"text":text_of(fields)}),
             RouteSink::Label { issue, labels } => match bindings.string(issue) { Ok(issue) => serde_json::json!({"nodeId":delivery.node_id,"kind":"label","issue":issue,"labels":labels}), Err(error) => serde_json::json!({"nodeId":delivery.node_id,"kind":"label","labels":labels,"error":error}) },
             RouteSink::Issue { labels, recipe } => serde_json::json!({"nodeId":delivery.node_id,"kind":"issue","project":fields.get("project"),"title":fields.get("title").or_else(||fields.get("text")),"description":fields.get("body").or_else(||fields.get("description")),"labels":labels,"recipe":recipe}),
@@ -362,7 +362,11 @@ async fn fire_issue_sink(
     fields: &BTreeMap<String, Value>,
     labels: &[String],
     recipe: Option<&str>,
+    origin: Option<&crate::issues::crud::IssueAuthorship>,
 ) -> Result<String, String> {
+    let origin = origin
+        .cloned()
+        .ok_or("issue sink requires typed origin authorship")?;
     let project = fields
         .get("project")
         .and_then(Value::as_str)
@@ -388,6 +392,7 @@ async fn fire_issue_sink(
         None,
         None,
         None,
+        origin,
     )
     .await?;
     if let Some(recipe) = recipe {
@@ -469,6 +474,8 @@ pub struct ChannelSubmission {
     pub context: String,
     pub job_id: Option<String>,
     pub initiated_by: Option<String>,
+    #[serde(default)]
+    pub destination: Option<crate::channels::ConversationAddress>,
 }
 
 pub async fn dispatch(
@@ -601,7 +608,10 @@ pub async fn dispatch(
             let transforms_json = serde_json::to_string(&delivery.transforms).ok();
             let fields = &delivery.fields;
             match delivery.sink {
-                RouteSink::Channel { initiated_by, .. } => {
+                RouteSink::Channel {
+                    destination,
+                    initiated_by,
+                } => {
                     submissions.push(ChannelSubmission {
                         // The once-only delivery key. A second channel sink needs
                         // its own, so the position is appended — but the FIRST
@@ -632,6 +642,10 @@ pub async fn dispatch(
                             .and_then(Value::as_str)
                             .map(str::to_owned),
                         initiated_by: initiated_by.clone(),
+                        destination: match destination {
+                            ChannelDestination::Subscriptions => None,
+                            ChannelDestination::Conversation(address) => Some(address.clone()),
+                        },
                     });
                 }
                 RouteSink::Message { target } => {
@@ -688,7 +702,13 @@ pub async fn dispatch(
                 RouteSink::Issue { labels, recipe } => {
                     let result = super::with_provenance(
                         route.id.clone(),
-                        fire_issue_sink(orch, fields, labels, recipe.as_deref()),
+                        fire_issue_sink(
+                            orch,
+                            fields,
+                            labels,
+                            recipe.as_deref(),
+                            fact.origin.as_ref(),
+                        ),
                     )
                     .await;
                     record(
@@ -711,7 +731,10 @@ pub async fn record_channel_outcome(
     result: Result<String, String>,
 ) -> Result<(), String> {
     let sink = RouteSink::Channel {
-        register: "notify".into(),
+        destination: submission.destination.clone().map_or(
+            ChannelDestination::Subscriptions,
+            ChannelDestination::Conversation,
+        ),
         initiated_by: submission.initiated_by.clone(),
     };
     record(
@@ -740,7 +763,13 @@ async fn record(
     // A sink's declared address is the fallback ref; a firing that reached the
     // sink reports the address it actually landed on.
     let (sink_kind, declared_ref) = match firing.sink {
-        RouteSink::Channel { register, .. } => ("channel", Some(register.clone())),
+        RouteSink::Channel { destination, .. } => (
+            "channel",
+            Some(match destination {
+                ChannelDestination::Subscriptions => "subscriptions".to_string(),
+                ChannelDestination::Conversation(address) => address.to_string(),
+            }),
+        ),
         RouteSink::Message { target } => ("message", Some(target.clone())),
         RouteSink::Issue { .. } => ("issue", None),
         RouteSink::Label { .. } => ("label", None),
@@ -796,6 +825,10 @@ mod tests {
     use crate::routes::{parse_definition, FactRegistry, RouteDefinition};
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{migrated_test_db, SearchIndex};
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+        VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+    };
     use std::sync::Arc;
 
     fn definition(yaml: &str) -> RouteDefinition {
@@ -807,18 +840,82 @@ mod tests {
             source: "thread_stream".into(),
             identity: "event:1".into(),
             fields: BTreeMap::from([("text".into(), Value::String(text.into()))]),
+            origin: None,
             summary: Some(text.into()),
             route_provenance: None,
         }
+    }
+
+    fn external_authorship() -> crate::issues::crud::IssueAuthorship {
+        let principal = PrincipalRef::External {
+            provider: "telegram".into(),
+            namespace: "channel_sender".into(),
+            id: "sender-42".into(),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::ChannelAllowlist,
+            VerificationStatus::Verified,
+            None,
+            None,
+            None,
+            None,
+            VerificationStrength::new("allowlist").unwrap(),
+            41,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::ChannelReply,
+            Address::Channel {
+                provider: "telegram".into(),
+                conversation: "chat-7".into(),
+                sender: "sender-42".into(),
+                observed_alias: Some("Ada".into()),
+            },
+            verification,
+            42,
+            None,
+        )
+        .unwrap();
+        crate::issues::crud::IssueAuthorship::new(
+            principal.clone(),
+            AppearanceSnapshot::new(principal, evidence, Vec::new(), None).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn response_transforms_preserve_the_exact_origin_snapshot() {
+        let definition = definition(
+            "name: Preserve origin\ndescription: transforms content only\nnodes:\n  - id: input\n    type: trigger\n    when: { fact: thread_stream }\n  - id: transform\n    type: response\n    response: conveyor\n  - id: issue\n    type: sink\n    sink: { kind: issue, labels: [routed] }\nedges:\n  - { from: input, to: transform }\n  - { from: transform, to: issue }\n",
+        );
+        let graph = RouteGraph::new(&definition).unwrap();
+        let mut fact = thread_fact("original");
+        fact.origin = Some(external_authorship());
+        let expected = fact.origin.clone();
+        let run: RunResponse =
+            &|_, _| -> ResponseFuture { Box::pin(async { Ok("rewritten".into()) }) };
+        let walked = walk(&graph, &fact, Presence::Away, run).await;
+        assert_eq!(text_of(&walked.deliveries[0].fields), "rewritten");
+        assert_eq!(fact.origin, expected);
+    }
+
+    #[tokio::test]
+    async fn issue_sink_refuses_missing_origin_before_reading_mutable_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, _) = orchestrator(temp.path(), &[]).await;
+        let error = fire_issue_sink(&orch, &BTreeMap::new(), &[], None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error, "issue sink requires typed origin authorship");
     }
 
     #[test]
     fn message_targets_resolve_to_useful_canonical_history_refs() {
         assert_eq!(
             resolve_message_target("cairn://p/cairn/42").unwrap(),
-            ("CAIRN".into(), Some(42), "cairn://p/CAIRN/42".into())
+            ("cairn".into(), Some(42), "cairn://p/cairn/42".into())
         );
-        assert!(resolve_message_target("cairn://p/CAIRN/42/messages").is_err());
+        assert!(resolve_message_target("cairn://p/cairn/42/messages").is_err());
     }
 
     /// The motivating branch: one trigger, one edge through a response node to a
@@ -827,7 +924,7 @@ mod tests {
     #[tokio::test]
     async fn two_branches_off_one_trigger_carry_their_own_content_to_their_own_sink() {
         let definition = definition(
-            "name: Split\ndescription: condensed to the phone, full text to the stream\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: thread, to: stream }\n",
+            "name: Split\ndescription: condensed to the phone, full text to the stream\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: thread, to: stream }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let run: RunResponse = &|_response: &str, _args: Value| -> ResponseFuture {
@@ -860,7 +957,7 @@ mod tests {
     #[tokio::test]
     async fn a_shared_prefix_runs_once_however_many_sinks_hang_off_it() {
         let definition = definition(
-            "name: Fan out\ndescription: one condense, two deliveries\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: condense, to: stream }\n",
+            "name: Fan out\ndescription: one condense, two deliveries\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: phone\n    type: sink\n    sink: { kind: channel, register: notify }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: phone }\n  - { from: condense, to: stream }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let calls = std::sync::atomic::AtomicUsize::new(0);
@@ -884,7 +981,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_response_records_itself_and_passes_its_input_through() {
         let definition = definition(
-            "name: Chain\ndescription: two steps\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: first\n    type: response\n    response: broken\n  - id: second\n    type: response\n    response: conveyor\n    args:\n      text: { field: text }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/1' }\nedges:\n  - { from: thread, to: first }\n  - { from: first, to: second }\n  - { from: second, to: stream }\n",
+            "name: Chain\ndescription: two steps\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: first\n    type: response\n    response: broken\n  - id: second\n    type: response\n    response: conveyor\n    args:\n      text: { field: text }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\nedges:\n  - { from: thread, to: first }\n  - { from: first, to: second }\n  - { from: second, to: stream }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let seen: std::sync::Mutex<Vec<Value>> = std::sync::Mutex::new(Vec::new());
@@ -924,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn only_the_branches_below_a_matching_trigger_are_walked() {
         let definition = definition(
-            "name: Two triggers\ndescription: each with its own sink\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: attention\n    type: trigger\n    when: { fact: attention }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/1' }\n  - id: board\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/2' }\nedges:\n  - { from: thread, to: stream }\n  - { from: attention, to: board }\n",
+            "name: Two triggers\ndescription: each with its own sink\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: attention\n    type: trigger\n    when: { fact: attention }\n  - id: stream\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/1' }\n  - id: board\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/2' }\nedges:\n  - { from: thread, to: stream }\n  - { from: attention, to: board }\n",
         );
         let graph = RouteGraph::new(&definition).unwrap();
         let run: RunResponse =
@@ -963,12 +1060,12 @@ mod tests {
     const PROJECT_FIXTURE: &str =
         "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
              INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-               VALUES('p', 'w', 'Cairn', 'CAIRN', '/tmp/cairn', 1, 1);
+               VALUES('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
              INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
                VALUES('i', 'p', 42, 'Target', 'active', 1, 1);";
 
     fn message_route(name: &str, extra: &str) -> String {
-        format!("name: {name}\ndescription: Routes a thread update into an issue stream\nnodes:\n  - id: thread\n    type: trigger\n    when: {{ fact: thread_stream }}\n  - id: stream\n    type: sink\n    sink: {{ kind: message, target: 'cairn://p/CAIRN/42' }}\nedges:\n  - {{ from: thread, to: stream }}\n{extra}")
+        format!("name: {name}\ndescription: Routes a thread update into an issue stream\nnodes:\n  - id: thread\n    type: trigger\n    when: {{ fact: thread_stream }}\n  - id: stream\n    type: sink\n    sink: {{ kind: message, target: 'cairn://p/cairn/42' }}\nedges:\n  - {{ from: thread, to: stream }}\n{extra}")
     }
 
     #[tokio::test]
@@ -995,7 +1092,7 @@ mod tests {
 
         assert_eq!(
             db.query_text(
-                "SELECT sender_name || ':' || content FROM messages WHERE channel_type = 'issue' AND channel_id = 'CAIRN/42'",
+                "SELECT sender_name || ':' || content FROM messages WHERE channel_type = 'issue' AND channel_id = 'cairn/42'",
                 (),
             )
             .await
@@ -1009,7 +1106,7 @@ mod tests {
             .pop()
             .unwrap();
         assert_eq!(firing.status, "fired");
-        assert_eq!(firing.sink_ref.as_deref(), Some("cairn://p/CAIRN/42"));
+        assert_eq!(firing.sink_ref.as_deref(), Some("cairn://p/cairn/42"));
         // The journal keeps the content, not just the address it landed on, so
         // the firing still reads after the target's messages are compacted.
         assert_eq!(firing.fact_summary.as_deref(), Some("routed update"));
@@ -1021,7 +1118,7 @@ mod tests {
     #[tokio::test]
     async fn every_sink_journals_its_own_row_for_the_path_that_reached_it() {
         let temp = tempfile::tempdir().unwrap();
-        let route = "name: Split\ndescription: one branch transformed, one not\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: transformed\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/42' }\n  - id: verbatim\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/43' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: transformed }\n  - { from: thread, to: verbatim }\n";
+        let route = "name: Split\ndescription: one branch transformed, one not\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: condense\n    type: response\n    response: conveyor\n  - id: transformed\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/42' }\n  - id: verbatim\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/43' }\nedges:\n  - { from: thread, to: condense }\n  - { from: condense, to: transformed }\n  - { from: thread, to: verbatim }\n";
         let (orch, db) = orchestrator(temp.path(), &[("split", route)]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
         db.execute_batch(
@@ -1056,13 +1153,13 @@ mod tests {
         // There is no model backend in a test, so the response step fails and its
         // branch carries the fact through — but the record of that step belongs
         // to that branch alone.
-        assert!(row("cairn://p/CAIRN/42")
+        assert!(row("cairn://p/cairn/42")
             .transforms_json
             .as_deref()
             .unwrap()
             .contains("conveyor"));
         assert_eq!(
-            row("cairn://p/CAIRN/43").transforms_json.as_deref(),
+            row("cairn://p/cairn/43").transforms_json.as_deref(),
             Some("[]")
         );
     }
@@ -1122,7 +1219,7 @@ mod tests {
     #[tokio::test]
     async fn dedupe_records_one_drop_however_many_sinks_the_route_has() {
         let temp = tempfile::tempdir().unwrap();
-        let route = "name: Two sinks\ndescription: both deduped together\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: first\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/42' }\n  - id: second\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN/43' }\nedges:\n  - { from: thread, to: first }\n  - { from: thread, to: second }\ndedupe: 10m\n";
+        let route = "name: Two sinks\ndescription: both deduped together\nnodes:\n  - id: thread\n    type: trigger\n    when: { fact: thread_stream }\n  - id: first\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/42' }\n  - id: second\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn/43' }\nedges:\n  - { from: thread, to: first }\n  - { from: thread, to: second }\ndedupe: 10m\n";
         let (orch, db) = orchestrator(temp.path(), &[("two-sinks", route)]).await;
         db.execute_batch(PROJECT_FIXTURE).await.unwrap();
         db.execute_batch(
@@ -1157,7 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn route_provenance_prevents_sink_reentry() {
         let temp = tempfile::tempdir().unwrap();
-        let route = "name: loop\ndescription: guard\nnodes:\n  - id: attention\n    type: trigger\n    when: { fact: attention }\n  - id: out\n    type: sink\n    sink: { kind: message, target: 'cairn://p/CAIRN' }\nedges:\n  - { from: attention, to: out }\n";
+        let route = "name: loop\ndescription: guard\nnodes:\n  - id: attention\n    type: trigger\n    when: { fact: attention }\n  - id: out\n    type: sink\n    sink: { kind: message, target: 'cairn://p/cairn' }\nedges:\n  - { from: attention, to: out }\n";
         let (orch, db) = orchestrator(temp.path(), &[("loop", route)]).await;
         let submissions = dispatch(
             &orch,
@@ -1165,6 +1262,7 @@ mod tests {
                 source: "attention".into(),
                 identity: "route-produced".into(),
                 fields: BTreeMap::new(),
+                origin: None,
                 summary: None,
                 route_provenance: Some("origin".into()),
             },

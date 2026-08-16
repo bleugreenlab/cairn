@@ -726,7 +726,9 @@ async fn commit_triage_ledger_if_needed(
     // not a warning.
     published
         .export
-        .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))
+        .map_err(|error| format!("Failed to publish memory triage ledger: {error}"))?;
+    orch.invalidate_node_check_status(parent_job_id, "logical-head-tree-or-contract-change");
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2140,7 +2142,7 @@ mod tests {
             let default_branch = default_branch.clone();
             Box::pin(async move {
                 conn.execute(
-                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES (?1, 'default', 'P', 'P', '/tmp/p', ?2, 1, 1)",
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES (?1, 'default', 'P', 'p', '/tmp/p', ?2, 1, 1)",
                     params![project_id.as_str(), default_branch.as_str()],
                 )
                 .await?;
@@ -2159,7 +2161,7 @@ mod tests {
         PrVcs {
             gh_cwd: repo.to_path_buf(),
             jj: crate::jj::JjEnv::resolve("jj", Path::new("/tmp/cairn")),
-            branch: "agent/P-1-builder".to_string(),
+            branch: "agent/p-1-builder".to_string(),
             config_dir: PathBuf::from("/tmp/cairn"),
         }
     }
@@ -2446,10 +2448,10 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-effective','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-effective','default','P','p','/tmp/p','main',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-effective','p-effective',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-effective','recipe','i-effective','p-effective','running',1,1,'{}')", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-effective','e-effective','builder','i-effective','p-effective','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-effective','e-effective','builder','i-effective','p-effective','agent/p-1-builder','complete','builder','Builder',1,1)", ()).await?;
                 Ok::<_, DbError>(())
             })
         }).await.unwrap();
@@ -2466,7 +2468,7 @@ mod tests {
             Some("i-effective"),
             "Title",
             Some("Body"),
-            "agent/P-1-builder",
+            "agent/p-1-builder",
             Some(effective.branch.as_str()),
             None,
             true,
@@ -2523,7 +2525,7 @@ mod tests {
         db.write(|conn| {
             Box::pin(async move {
                 conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P','/tmp/p',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','p','/tmp/p',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-1','p-1',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','recipe-1','i-1','p-1','running',1,1,'{}')", ()).await?;
                 conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at) VALUES ('j-coord','e-1','coord','i-1','p-1','complete','coord','coord',1,1)", ()).await?;
@@ -2577,10 +2579,10 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-mr','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-mr','default','P','p','/tmp/p','main',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-mr','p-mr',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-mr','recipe','i-mr','p-mr','running',1,1,'{}')", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-mr','e-mr','builder','i-mr','p-mr','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-mr','e-mr','builder','i-mr','p-mr','agent/p-1-builder','complete','builder','Builder',1,1)", ()).await?;
                 Ok::<_, DbError>(())
             })
         }).await.unwrap();
@@ -2592,7 +2594,7 @@ mod tests {
             Some("i-mr"),
             "Title",
             Some("Body"),
-            "agent/P-1-builder",
+            "agent/p-1-builder",
             Some("main"),
             None,
             true,
@@ -2622,10 +2624,10 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-int','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-int','default','P','p','/tmp/p','main',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-int','p-int',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-int','recipe','i-int','p-int','running',1,1,'{}')", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-int','e-int','builder','i-int','p-int','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-int','e-int','builder','i-int','p-int','agent/p-1-builder','complete','builder','Builder',1,1)", ()).await?;
                 Ok::<_, DbError>(())
             })
         }).await.unwrap();
@@ -2637,7 +2639,7 @@ mod tests {
             Some("i-int"),
             "Title",
             Some("Body"),
-            "agent/P-1-builder",
+            "agent/p-1-builder",
             Some("agent/coord-integration"),
             None,
             true,
@@ -2661,7 +2663,7 @@ mod tests {
     async fn upsert_merge_request_rejects_dangling_job_id() {
         let db = test_db().await;
         db.execute_script(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-missing','default','P','P','/tmp/p','main',1,1);",
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-missing','default','P','p','/tmp/p','main',1,1);",
         )
         .await
         .unwrap();
@@ -2673,7 +2675,7 @@ mod tests {
             None,
             "Title",
             None,
-            "agent/P-1-builder",
+            "agent/p-1-builder",
             Some("main"),
             None,
             true,
@@ -2692,12 +2694,12 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-relink','default','P','P','/tmp/p','main',1,1)", ()).await?;
+                conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at) VALUES ('p-relink','default','P','p','/tmp/p','main',1,1)", ()).await?;
                 conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-relink','p-relink',1,'T','active','none',1,1)", ()).await?;
                 conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-relink','recipe','i-relink','p-relink','running',1,1,'{}')", ()).await?;
-                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-relink','e-relink','builder','i-relink','p-relink','agent/P-1-builder','complete','builder','Builder',1,1)", ()).await?;
+                conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, branch, status, uri_segment, node_name, created_at, updated_at) VALUES ('job-relink','e-relink','builder','i-relink','p-relink','agent/p-1-builder','complete','builder','Builder',1,1)", ()).await?;
                 conn.execute("INSERT INTO action_runs(id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, parent_job_id, created_at) VALUES ('pr-action-run','e-relink','pr','builtin:pr','i-relink','p-relink','blocked','job-relink',1)", ()).await?;
-                conn.execute("INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at) VALUES ('mr-relink','pr-action-run','p-relink','i-relink','Old','agent/P-1-builder','main','open',1,1)", ()).await?;
+                conn.execute("INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at) VALUES ('mr-relink','pr-action-run','p-relink','i-relink','Old','agent/p-1-builder','main','open',1,1)", ()).await?;
                 Ok::<_, DbError>(())
             })
         }).await.unwrap();
@@ -2709,7 +2711,7 @@ mod tests {
             Some("i-relink"),
             "New",
             None,
-            "agent/P-1-builder",
+            "agent/p-1-builder",
             Some("main"),
             None,
             true,
@@ -2815,10 +2817,10 @@ mod tests {
             local.write(|conn| {
                 let snapshot = snapshot.clone();
                 Box::pin(async move {
-                    conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-pr','default','P','P','/tmp/p',1,1)", ()).await?;
+                    conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-pr','default','P','p','/tmp/p',1,1)", ()).await?;
                     conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-pr','p-pr',1,'PR','active','none',1,1)", ()).await?;
                     conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-pr','recipe','i-pr','p-pr','running',1,1,?1)", params![snapshot.as_str()]).await?;
-                    conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, node_name, uri_segment, branch, created_at, updated_at) VALUES ('j-pr','e-pr','builder','i-pr','p-pr','complete','Builder','builder','agent/P-1-builder',1,1)", ()).await?;
+                    conn.execute("INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, node_name, uri_segment, branch, created_at, updated_at) VALUES ('j-pr','e-pr','builder','i-pr','p-pr','complete','Builder','builder','agent/p-1-builder',1,1)", ()).await?;
                     conn.execute("INSERT INTO action_runs (id, execution_id, recipe_node_id, action_config_id, issue_id, project_id, status, parent_job_id, created_at) VALUES ('ar-pr','e-pr','pr','builtin:pr','i-pr','p-pr','running','j-pr',1)", ()).await?;
                     Ok::<_, DbError>(())
                 })
@@ -2911,7 +2913,7 @@ mod tests {
             &jj,
             &store_dir,
             &ws_path,
-            "agent/CAIRN-7-integrator-0",
+            "agent/cairn-7-integrator-0",
             "main",
             None,
         )
@@ -2932,18 +2934,18 @@ mod tests {
                 Box::pin(async move {
                     conn.execute("INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)", ()).await?;
                     conn.execute(
-                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','P',?1,1,1)",
+                        "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','p',?1,1,1)",
                         params![repo_path.as_str()],
                     ).await?;
                     conn.execute("INSERT INTO issues (id, project_id, number, title, status, attention, created_at, updated_at) VALUES ('i-7','p-1',7,'Memory triage: project=P (2 pending)','active','none',1,1)", ()).await?;
                     conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot) VALUES ('e-1','memory-triage','i-7','p-1','running',1,1,'{}')", ()).await?;
-                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, branch, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator','agent/CAIRN-7-integrator-0',1,1)", ()).await?;
+                    conn.execute("INSERT INTO jobs (id, execution_id, issue_id, project_id, status, node_name, uri_segment, branch, created_at, updated_at) VALUES ('job-x','e-1','i-7','p-1','complete','Integrator','integrator','agent/cairn-7-integrator-0',1,1)", ()).await?;
                     let rows: [(&str, &str, Option<&str>); 2] =
                         [("m-1", "discard", None), ("m-2", "defer", Some("workspace"))];
                     for (seq, (id, decision, deferred)) in rows.iter().enumerate() {
                         conn.execute(
                             "INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, reason, triage_decision, deferred_scope, deferred_scope_value, provenance_uri, created_at, updated_at)
-                             VALUES (?1, ?1, 'p-1', 'obs', 'claimed', 'project', 'p-1', 'job-x', ?2, 'considered', ?3, ?4, ?4, 'cairn://p/P/1/1/builder/chat/turn/2', 1, 1)",
+                             VALUES (?1, ?1, 'p-1', 'obs', 'claimed', 'project', 'p-1', 'job-x', ?2, 'considered', ?3, ?4, ?4, 'cairn://p/p/1/1/builder/chat/turn/2', 1, 1)",
                             params![*id, seq as i64, *decision, *deferred],
                         ).await?;
                     }
@@ -2993,7 +2995,7 @@ mod tests {
         let listed = crate::jj::file_list(
             &jj,
             &store_dir,
-            "agent/CAIRN-7-integrator-0",
+            "agent/cairn-7-integrator-0",
             "docs/memory-triage",
         )
         .unwrap();
@@ -3005,7 +3007,7 @@ mod tests {
             crate::jj::file_show(
                 &jj,
                 &store_dir,
-                "agent/CAIRN-7-integrator-0",
+                "agent/cairn-7-integrator-0",
                 "docs/memory-triage/7.md",
             )
             .unwrap(),

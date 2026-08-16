@@ -290,7 +290,7 @@ mod tests {
                     Err("store failed".into())
                 } else {
                     self.stored.lock().unwrap().push(bytes);
-                    Ok("cairn://p/CAIRN/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
+                    Ok("cairn://p/cairn/images/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into())
                 }
             })
         }
@@ -329,7 +329,7 @@ mod tests {
         assert!(value["body"]
             .as_str()
             .unwrap()
-            .contains("cairn://p/CAIRN/images/"));
+            .contains("cairn://p/cairn/images/"));
         assert!(value["nested"][0]["path"]
             .as_str()
             .unwrap()

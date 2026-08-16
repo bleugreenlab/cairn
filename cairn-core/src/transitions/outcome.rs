@@ -360,7 +360,7 @@ mod tests {
             INSERT INTO workspaces(id, name, created_at, updated_at)
               VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+              VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('i', 'p', 1, 'Issue', 'active', 'active', 'none', 1, 1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -407,7 +407,7 @@ mod tests {
             INSERT INTO workspaces(id, name, created_at, updated_at)
               VALUES('w', 'W', 1, 1);
             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
-              VALUES('p', 'w', 'Project', 'PROJ', '/tmp/repo', 1, 1);
+              VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
               VALUES('i', 'p', 1, 'Issue', 'active', 'active', 'none', 1, 1);
             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
@@ -465,7 +465,7 @@ mod tests {
         let db = migrated_db().await;
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
-             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','PROJ','/tmp/p',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','proj','/tmp/p',1,1);
              INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('th','p','topic','active','none',1,1);
              INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES('j','th','p','idle','thread','thread',1,1);
              INSERT INTO runs(id,job_id,project_id,status,created_at,updated_at) VALUES('r','j','p','live',1,1);"

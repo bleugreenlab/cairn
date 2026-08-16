@@ -525,12 +525,18 @@ async fn run_turn_end_checks_inner(
         return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
     }
     let repo_root = PathBuf::from(&coords.repository_path);
-    let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repo_root);
-    let logical_repository = if crate::jj::is_jj_dir(&store_dir) {
-        store_dir.clone()
-    } else {
-        repo_root.clone()
+    let logical_repository = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = repo_root.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = crate::jj::JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("turn-end coordinate repository task failed: {error}"))??
     };
+    let store_dir = logical_repository.clone();
     let sealed_commit = cairn_vcs::resolve_coordinate(&logical_repository, &coords.branch)
         .await
         .map_err(|error| {
@@ -544,23 +550,29 @@ async fn run_turn_end_checks_inner(
     // the branch was cut at and does not follow a base advance, so diffing from
     // it absorbs every commit the target merged in the meantime — which is how a
     // zero-delta planner selected a full review suite (CAIRN-3108).
-    let base =
-        match crate::diff::live_job_branch_range(&orch.db.local, job_id, &orch.config_dir).await {
-            Ok(Some(range)) => range.base,
-            other => {
-                log::warn!(
-                    "turn-end checks for job {}: no live base coordinate ({}); nothing to run",
-                    short_id(job_id),
-                    match other {
-                        Err(error) => error,
-                        _ => "the job has no branch of its own".to_string(),
-                    }
-                );
-                return Ok(TurnEndDisposition::Skipped(
-                    "job has no live base coordinate",
-                ));
-            }
-        };
+    let base = match crate::diff::live_job_branch_range(
+        &orch.db.local,
+        job_id,
+        &orch.jj_binary_path,
+        &orch.config_dir,
+    )
+    .await
+    {
+        Ok(Some(range)) => range.base,
+        other => {
+            log::warn!(
+                "turn-end checks for job {}: no live base coordinate ({}); nothing to run",
+                short_id(job_id),
+                match other {
+                    Err(error) => error,
+                    _ => "the job has no branch of its own".to_string(),
+                }
+            );
+            return Ok(TurnEndDisposition::Skipped(
+                "job has no live base coordinate",
+            ));
+        }
+    };
 
     // 2. Load the checks contract DECLARED BY the sealed commit this turn is
     // about. Definition and content come from the same tree, so a branch's own
@@ -1817,7 +1829,7 @@ mod tests {
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
-               VALUES('p','w','P','PROJ','/tmp/repo',1,1);
+               VALUES('p','w','P','proj','/tmp/repo',1,1);
              INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at)
                VALUES('i','p',1,'I','active','active','none',1,1);
              INSERT INTO jobs(id,project_id,issue_id,status,node_name,created_at,updated_at)
@@ -1825,7 +1837,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let uri = "cairn://p/PROJ/1/1/builder/checks";
+        let uri = "cairn://p/proj/1/1/builder/checks";
         let first = turn_check_fingerprint(
             "same-tree",
             &[outcome("rust-tests", false, None, "first flaky failure")],
@@ -2052,7 +2064,7 @@ mod tests {
             repository_path: "/repo".into(),
             branch: "agent/test".into(),
             base_branch: None,
-            project_key: "CAIRN".into(),
+            project_key: "cairn".into(),
             number: 42,
             exec_seq: 2,
             node_segment: "review-rust".into(),
@@ -2061,7 +2073,7 @@ mod tests {
         };
         assert_eq!(
             checks_uri_for_job(&coords),
-            "cairn://p/CAIRN/42/2/builder/task/review-rust/checks"
+            "cairn://p/cairn/42/2/builder/task/review-rust/checks"
         );
 
         coords.node_segment = "workflow".into();
@@ -2069,7 +2081,7 @@ mod tests {
         coords.is_workflow = true;
         assert_eq!(
             checks_uri_for_job(&coords),
-            "cairn://p/CAIRN/42/2/workflow/checks"
+            "cairn://p/cairn/42/2/workflow/checks"
         );
 
         coords.node_segment = "builder".into();
@@ -2077,7 +2089,7 @@ mod tests {
         coords.is_workflow = false;
         assert_eq!(
             checks_uri_for_job(&coords),
-            "cairn://p/CAIRN/42/2/builder/checks"
+            "cairn://p/cairn/42/2/builder/checks"
         );
     }
 
@@ -2096,7 +2108,7 @@ mod tests {
             repository_path: "/repo".into(),
             branch: "agent/test".into(),
             base_branch: Some("main".into()),
-            project_key: "CAIRN".into(),
+            project_key: "cairn".into(),
             number: 42,
             exec_seq: 1,
             node_segment: "planner".into(),

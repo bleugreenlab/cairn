@@ -825,7 +825,7 @@ mod tests {
     fn init_project(repo: &Path) {
         git(repo, &["init", "-q", "-b", "main"]);
         git(repo, &["config", "user.email", "p@e.com"]);
-        git(repo, &["config", "user.name", "P"]);
+        git(repo, &["config", "user.name", "p"]);
         std::fs::write(repo.join("shared.rs"), "base\n").unwrap();
         git(repo, &["add", "-A"]);
         git(repo, &["commit", "-q", "-m", "base"]);
@@ -1115,7 +1115,7 @@ mod tests {
         let store = home.path().join("jj-stores").join("proj");
         crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-        let branch = "agent/CAIRN-7-builder-0";
+        let branch = "agent/cairn-7-builder-0";
         let ws = wts.path().join("job");
         crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
         std::fs::write(ws.join("mod.rs"), "code\n").unwrap();
@@ -1170,7 +1170,7 @@ mod tests {
         let jj = crate::jj::JjEnv::resolve(&bin, home.path());
         let store = home.path().join("jj-stores").join("proj");
         crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
-        let branch = "agent/CAIRN-7-builder-0";
+        let branch = "agent/cairn-7-builder-0";
         let ws = wts.path().join("job");
         crate::jj::add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
 
@@ -1247,7 +1247,7 @@ mod tests {
     /// The branch [`owned_workspace`] provisions, and a name no fixture creates — so
     /// finding a bookmark or ref under it can only mean a planted marker was
     /// honoured.
-    const OWNED_BRANCH: &str = "agent/CAIRN-3280-builder-0";
+    const OWNED_BRANCH: &str = "agent/cairn-3280-builder-0";
     const PLANTED_BRANCH: &str = "agent/planted-mid-batch";
 
     /// A jj workspace Cairn provisioned, with its ownership marker in place.
@@ -1807,12 +1807,12 @@ mod tests {
         let store = home.path().join("jj-stores").join("proj");
         crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-        let int = "agent/CAIRN-2288-coordinator-0";
+        let int = "agent/cairn-2288-coordinator-0";
         crate::jj::add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None)
             .unwrap();
         crate::jj::ensure_bookmark_on_origin(&jj, &store, int).unwrap();
 
-        let builder = "agent/CAIRN-1-builder-0";
+        let builder = "agent/cairn-1-builder-0";
         let ws = wts.path().join("builder");
         crate::jj::add_workspace(&jj, &store, &ws, builder, int, None).unwrap();
         std::fs::write(ws.join("shared.rs"), "builder-edit\n").unwrap();
@@ -1902,10 +1902,10 @@ mod tests {
         let store = home.path().join("jj-stores").join("proj");
         crate::jj::ensure_project_store(&jj, &store, proj.path()).unwrap();
 
-        let int = "agent/CAIRN-2288-coordinator-0";
+        let int = "agent/cairn-2288-coordinator-0";
         crate::jj::add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None)
             .unwrap();
-        let builder = "agent/CAIRN-1-builder-0";
+        let builder = "agent/cairn-1-builder-0";
         let ws = wts.path().join("builder");
         crate::jj::add_workspace(&jj, &store, &ws, builder, int, None).unwrap();
         std::fs::write(ws.join("clean.rs"), "clean\n").unwrap();

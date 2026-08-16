@@ -379,7 +379,8 @@ pub(crate) struct RunItemInput {
     /// invocation. Mutually exclusive with `command`/`target`; requires
     /// `interpreter`. The interpreter execs the source directly (no shell, no
     /// quoting): typescript/javascript via bun with the worktree `node_modules`
-    /// and zero-config `@cairn/sdk`, python via the bundled `uv` with PEP 723
+    /// and `@cairn/sdk`, which Cairn provides in every project whether or not it
+    /// depends on the SDK, python via the bundled `uv` with PEP 723
     /// dependency blocks and automatic project-env pickup, or MATLAB via
     /// `matlab -batch`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,6 +1,19 @@
 //! Issue and comment types.
 
+use cairn_common::identity::PrincipalRef;
 use serde::{Deserialize, Serialize};
+
+/// Bounded issue projection shared by the desktop tray and sidebar-equivalent views.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarActiveIssue {
+    pub project_id: String,
+    pub project_name: String,
+    pub issue_number: i32,
+    pub issue_title: String,
+    #[serde(skip)]
+    pub status_rank: i32,
+}
 
 use super::Label;
 
@@ -26,6 +39,9 @@ pub struct Issue {
     pub dismissed_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Principal that created this issue. Historical issues predate attribution.
+    #[serde(default)]
+    pub author: Option<PrincipalRef>,
     pub backend_override: Option<String>,
     /// Timestamp when the issue's PR was merged (resolution)
     pub merged_at: Option<i64>,

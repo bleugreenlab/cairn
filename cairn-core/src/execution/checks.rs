@@ -113,6 +113,38 @@ pub(crate) enum CheckExecMode {
     Shared,
 }
 
+#[derive(Debug)]
+enum CommitChecksContractError {
+    Missing,
+    NoChecks,
+    Read(String),
+    InvalidUtf8(String),
+    Parse(String),
+    BlockingTask(String),
+}
+
+impl CommitChecksContractError {
+    fn manual_diagnostic(&self, commit: &str) -> String {
+        match self {
+            Self::Missing | Self::NoChecks => {
+                format!("commit {commit} declares no configured checks")
+            }
+            Self::Read(error) => {
+                format!("failed to read {CHECKS_CONFIG_PATH} at commit {commit}: {error}")
+            }
+            Self::InvalidUtf8(error) => {
+                format!("{CHECKS_CONFIG_PATH} at commit {commit} is not valid UTF-8: {error}")
+            }
+            Self::Parse(error) => {
+                format!("{CHECKS_CONFIG_PATH} at commit {commit} failed to parse: {error}")
+            }
+            Self::BlockingTask(error) => {
+                format!("failed to load {CHECKS_CONFIG_PATH} at commit {commit}: {error}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn run_planned_checks_at_commit<F, Fut, N, E>(
@@ -598,11 +630,18 @@ async fn resolve_manual_check_contract_snapshot(
     // head) supplies the content to check AND the definition to check it with.
     let commit = match branch {
         Some(branch) => {
-            let store = crate::jj::project_store_dir(&orch.config_dir, &repository);
-            let coordinate_repository = if crate::jj::is_jj_dir(&store) {
-                store
-            } else {
-                repository.clone()
+            let coordinate_repository = {
+                let jj_binary_path = orch.jj_binary_path.clone();
+                let config_dir = orch.config_dir.clone();
+                let project_repo = repository.clone();
+                tokio::task::spawn_blocking(move || {
+                    let jj = JjEnv::resolve(&jj_binary_path, &config_dir);
+                    crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+                })
+                .await
+                .map_err(|error| {
+                    format!("manual check coordinate repository task failed: {error}")
+                })??
             };
             cairn_vcs::resolve_coordinate(&coordinate_repository, branch)
                 .await
@@ -616,9 +655,9 @@ async fn resolve_manual_check_contract_snapshot(
             extra_inputs,
         },
         defined_by_commit,
-    } = load_checks_contract_at_commit(&repository, &commit)
+    } = load_checks_contract_at_commit_detailed(&repository, &commit)
         .await
-        .ok_or_else(|| format!("commit {commit} declares no configured checks"))?;
+        .map_err(|error| error.manual_diagnostic(&commit))?;
     assert_eq!(
         defined_by_commit, commit,
         "a manual check must be defined by the commit it evaluates"
@@ -1511,6 +1550,7 @@ fn merge_batch_executor(
     for selector in items.iter().filter_map(|item| item.executor.as_ref()) {
         merge_scalar(&mut merged.name, &selector.name, "name")?;
         merge_scalar(&mut merged.os, &selector.os, "os")?;
+        merged.requires_macos_nested_sandbox_write |= selector.requires_macos_nested_sandbox_write;
         toolchains.extend(selector.required_toolchains.iter().cloned());
     }
     merged.required_toolchains = toolchains.into_iter().collect();
@@ -1523,6 +1563,7 @@ fn merge_batch_executor(
                 .into(),
         );
     }
+
     Ok((!merged.is_empty()).then_some(merged))
 }
 
@@ -1610,12 +1651,18 @@ pub(crate) async fn execute_job_verdict(
         .map_err(|error| error.to_string())?;
 
     let repository_path = std::path::PathBuf::from(&repository);
-    let store_dir = crate::jj::project_store_dir(&orch.config_dir, &repository_path);
-    let coordinate_repository = if crate::jj::is_jj_dir(&store_dir) {
-        store_dir.clone()
-    } else {
-        repository_path.clone()
+    let coordinate_repository = {
+        let jj_binary_path = orch.jj_binary_path.clone();
+        let config_dir = orch.config_dir.clone();
+        let project_repo = repository_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let jj = JjEnv::resolve(&jj_binary_path, &config_dir);
+            crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
+        })
+        .await
+        .map_err(|error| format!("checkpoint coordinate repository task failed: {error}"))??
     };
+    let store_dir = coordinate_repository.clone();
     let coordinate = cairn_vcs::resolve_coordinate(&coordinate_repository, &branch)
         .await
         .map_err(|error| format!("checkpoint branch '{branch}' is unresolvable: {error}"))?;
@@ -2374,9 +2421,9 @@ fn no_start_shape(
         CellUnavailableReason::SlotUnhealthy => SubstrateFailureShape::EnvironmentRetired,
         // The environment was ready and the command still could not be launched,
         // which is Cairn's own machinery failing rather than the machine's state.
-        CellUnavailableReason::Spawn | CellUnavailableReason::ObjectInfrastructure(_) => {
-            SubstrateFailureShape::Dispatch
-        }
+        CellUnavailableReason::Spawn
+        | CellUnavailableReason::RunnerContext
+        | CellUnavailableReason::ObjectInfrastructure(_) => SubstrateFailureShape::Dispatch,
     }
 }
 
@@ -2796,6 +2843,27 @@ fn classify_check_failure(
                 || line.contains("failed to read")
                 || line.contains("no such file or directory"))
     });
+    let missing_toolchain = lines.iter().position(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        ["node", "bun", "npm", "cargo"].iter().any(|program| {
+            let posix_missing = line.ends_with(&format!("{program}: command not found"))
+                || line.ends_with(&format!("command not found: {program}"))
+                || line.ends_with(&format!("{program}: not found"));
+            let shell_diagnostic = line.starts_with("sh:")
+                || line.starts_with("bash:")
+                || line.starts_with("zsh:")
+                || line.starts_with("/bin/sh:")
+                || line.contains(": line ");
+            (posix_missing && shell_diagnostic)
+                || (line.starts_with("/usr/bin/env:")
+                    && line.contains(program)
+                    && line.contains("no such file or directory"))
+                || (line.starts_with(&format!("'{program}' is not recognized"))
+                    && line.contains("internal or external command"))
+                || (line.starts_with(&format!("the term '{program}' is not recognized"))
+                    && line.contains("name of a cmdlet"))
+        })
+    });
     if let Some(evidence_line) = cache_corruption {
         return Some(FailureClassification {
             kind: CheckFailureKind::Infrastructure,
@@ -2809,6 +2877,7 @@ fn classify_check_failure(
         .or(transport)
         .or(abnormal_254)
         .or(missing_generated)
+        .or(missing_toolchain)
     {
         return Some(FailureClassification {
             kind: CheckFailureKind::Infrastructure,
@@ -3918,52 +3987,65 @@ pub(crate) struct CommitChecksContract {
 /// `object_repository` is the path holding the git object database (the project
 /// checkout); jj writes every sealed commit into it, so a branch commit that was
 /// never checked out anywhere is still readable here.
-pub(crate) fn checks_contract_at_commit(
+fn checks_contract_at_commit_detailed(
     object_repository: &Path,
     commit: &str,
-) -> Option<CommitChecksContract> {
+) -> Result<CommitChecksContract, CommitChecksContractError> {
     let bytes = match crate::mcp::handlers::read::file_at_commit(
         object_repository.to_path_buf(),
         commit.to_string(),
         CHECKS_CONFIG_PATH,
     ) {
         Ok(Some(bytes)) => bytes,
-        Ok(None) => return None,
-        Err(error) => {
-            log::warn!(
-                "checks: cannot read {CHECKS_CONFIG_PATH} at commit {commit}: {error}; \
-                 no checks are selected for it"
-            );
-            return None;
-        }
+        Ok(None) => return Err(CommitChecksContractError::Missing),
+        Err(error) => return Err(CommitChecksContractError::Read(error.to_string())),
     };
     let content = match String::from_utf8(bytes) {
         Ok(content) => content,
-        Err(_) => {
-            log::warn!(
-                "checks: {CHECKS_CONFIG_PATH} at commit {commit} is not valid UTF-8; \
-                 no checks are selected for it"
-            );
-            return None;
-        }
+        Err(error) => return Err(CommitChecksContractError::InvalidUtf8(error.to_string())),
     };
     // The migration flag is ignored on purpose: a sealed commit is read, never
     // rewritten. Only the checkout loader migrates.
     let (settings, _needs_migration) =
         match crate::config::project_settings::parse_project_settings(&content) {
             Ok(parsed) => parsed,
-            Err(error) => {
-                log::warn!(
-                    "checks: {CHECKS_CONFIG_PATH} at commit {commit} is invalid ({error}); \
-                     no checks are selected for it"
-                );
-                return None;
-            }
+            Err(error) => return Err(CommitChecksContractError::Parse(error)),
         };
-    Some(CommitChecksContract {
-        contract: crate::config::project_settings::checks_contract_from(settings)?,
+    let contract = crate::config::project_settings::checks_contract_from(settings)
+        .ok_or(CommitChecksContractError::NoChecks)?;
+    Ok(CommitChecksContract {
+        contract,
         defined_by_commit: commit.to_string(),
     })
+}
+
+/// Automatic cadences intentionally treat every invalid or absent commit config
+/// as selecting no checks. Manual runs use the detailed loader below instead.
+pub(crate) fn checks_contract_at_commit(
+    object_repository: &Path,
+    commit: &str,
+) -> Option<CommitChecksContract> {
+    checks_contract_at_commit_detailed(object_repository, commit)
+        .map_err(|error| {
+            log::warn!(
+                "checks: {}; no checks are selected for it",
+                error.manual_diagnostic(commit)
+            );
+        })
+        .ok()
+}
+
+async fn load_checks_contract_at_commit_detailed(
+    object_repository: &Path,
+    commit: &str,
+) -> Result<CommitChecksContract, CommitChecksContractError> {
+    let object_repository = object_repository.to_path_buf();
+    let commit = commit.to_string();
+    tokio::task::spawn_blocking(move || {
+        checks_contract_at_commit_detailed(&object_repository, &commit)
+    })
+    .await
+    .map_err(|error| CommitChecksContractError::BlockingTask(error.to_string()))?
 }
 
 /// [`checks_contract_at_commit`] off the async caller's runtime thread. The read
@@ -4775,7 +4857,7 @@ where
             // Only a reusable observation is ever admitted as a hit.
             reusable: true,
         };
-        let _ = record_cached_check_observation(
+        let cached_recorded = record_cached_check_observation(
             db.clone(),
             CachedCheckObservationWrite {
                 project_id: project_id.to_string(),
@@ -4793,7 +4875,13 @@ where
                 source_observation_id: source_observation,
                 evaluated_at: chrono::Utc::now().timestamp_millis(),
             },
-        );
+        )
+        .is_ok();
+        if cached_recorded {
+            if let Some(orch) = diagnostic_orch {
+                orch.invalidate_project_check_results(project_id);
+            }
+        }
         if let Some(orch) = diagnostic_orch {
             orch.fleet.record_cached_completion(
                 project_id,
@@ -5216,6 +5304,9 @@ where
                             observation,
                         ) {
                             Ok(()) => {
+                                if let Some(orch) = diagnostic_orch {
+                                    orch.invalidate_project_check_results(project_id);
+                                }
                                 let reason = provenance.as_ref().is_some_and(|meta| {
                                 meta.executor_id != crate::fleet::COLOCATED_EXECUTOR_ID
                                     && meta.environment_fingerprint.is_empty()
@@ -5654,14 +5745,19 @@ fn tail(s: &str, max_chars: usize) -> String {
 /// and does not follow a base advance, so a stale one hands the impact gate
 /// every file the target merged in the meantime.
 async fn live_node_base(orch: &Orchestrator, job_id: &str) -> Option<String> {
-    crate::diff::live_job_branch_range(&orch.db.local, job_id, &orch.config_dir)
-        .await
-        .map_err(|error| {
-            log::debug!("node {job_id} write checks: no live base coordinate ({error})");
-        })
-        .ok()
-        .flatten()
-        .map(|range| range.base)
+    crate::diff::live_job_branch_range(
+        &orch.db.local,
+        job_id,
+        &orch.jj_binary_path,
+        &orch.config_dir,
+    )
+    .await
+    .map_err(|error| {
+        log::debug!("node {job_id} write checks: no live base coordinate ({error})");
+    })
+    .ok()
+    .flatten()
+    .map(|range| range.base)
 }
 
 async fn submit_review_check(
@@ -7036,6 +7132,7 @@ mod tests {
             name: Some("bglab-mac".to_string()),
             os: None,
             required_toolchains: vec!["rust".to_string()],
+            requires_macos_nested_sandbox_write: false,
         });
         assert_ne!(
             key,
@@ -7496,6 +7593,74 @@ cairn-common = { path = "../cairn-common" }
     }
 
     #[test]
+    fn repository_checks_declare_only_the_toolchains_their_lanes_require() {
+        let config = include_str!("../../../../../.cairn/config.yaml");
+        let (settings, _) = crate::config::project_settings::parse_project_settings(config)
+            .expect("repository project config must parse");
+        let contract = crate::config::project_settings::checks_contract_from(settings)
+            .expect("repository must declare checks");
+
+        for (name, check) in contract.checks {
+            let declared = &check
+                .executor
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must declare required toolchains"))
+                .required_toolchains;
+            assert!(
+                !check.command.split_whitespace().any(|word| word == "bunx")
+                    || check.command.contains("bunx --bun "),
+                "{name} must force Bun when invoking package executables through bunx"
+            );
+            let expected: &[&str] = match name.as_str() {
+                "infra-stacks" => &["bun", "node", "npm"],
+                "rust-fmt" | "lockfile" | "rust-lint" | "rust-tests" => &["bun", "rust"],
+                "executor-windows-check" => &["rust"],
+                _ if check
+                    .command
+                    .split_whitespace()
+                    .any(|word| word == "bun" || word == "bunx") =>
+                {
+                    &["bun"]
+                }
+                _ => panic!(
+                    "{name} has an unclassified check command: {}",
+                    check.command
+                ),
+            };
+            assert_eq!(declared, expected, "{name} overdeclares its toolchains");
+        }
+    }
+
+    #[test]
+    fn repository_gates_the_actual_sandbox_sensitive_rust_lane() {
+        let config = include_str!("../../../../../.cairn/config.yaml");
+        let (settings, _) = crate::config::project_settings::parse_project_settings(config)
+            .expect("repository project config must parse");
+        let contract = crate::config::project_settings::checks_contract_from(settings)
+            .expect("repository must declare checks");
+
+        let rust_tests = contract
+            .checks
+            .get("rust-tests")
+            .expect("rust-tests exists");
+        assert!(
+            rust_tests
+                .executor
+                .as_ref()
+                .is_some_and(|selector| selector.requires_macos_nested_sandbox_write),
+            "the lane that executes sandbox lifecycle tests must require the live capability"
+        );
+        assert!(
+            !contract
+                .checks
+                .get("rust-fmt")
+                .and_then(|check| check.executor.as_ref())
+                .is_some_and(|selector| selector.requires_macos_nested_sandbox_write),
+            "ordinary formatting must remain placeable on an incapable macOS host"
+        );
+    }
+
+    #[test]
     fn repository_rust_checks_exclude_tauri_assets_and_cover_harness_inputs() {
         let config = include_str!("../../../../../.cairn/config.yaml");
         let (settings, _) = crate::config::project_settings::parse_project_settings(config)
@@ -7907,6 +8072,74 @@ cairn-common = { path = "../cairn-common" }
             checks_contract_at_commit(&repo, "0000000000000000000000000000000000000000").is_none(),
             "an unresolvable commit selects nothing"
         );
+    }
+
+    #[test]
+    fn detailed_commit_config_outcomes_preserve_their_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "no config here").unwrap();
+        let missing = commit_at(&repo, "missing config");
+
+        write_checkless_config(&repo);
+        let checkless = commit_at(&repo, "checkless config");
+
+        let config_path = crate::config::project_settings::get_project_config_path(&repo);
+        std::fs::write(&config_path, [0xff, 0xfe]).unwrap();
+        let invalid_utf8 = commit_at(&repo, "invalid utf8");
+
+        std::fs::write(&config_path, "checks: [unterminated\n").unwrap();
+        let malformed = commit_at(&repo, "malformed yaml");
+
+        std::fs::write(
+            &config_path,
+            "checks:\n  strict:\n    command: true\n    executor:\n      unknownFutureField: true\n",
+        )
+        .unwrap();
+        let invalid_schema = commit_at(&repo, "invalid schema");
+
+        assert!(matches!(
+            checks_contract_at_commit_detailed(&repo, &missing),
+            Err(CommitChecksContractError::Missing)
+        ));
+        assert!(matches!(
+            checks_contract_at_commit_detailed(&repo, &checkless),
+            Err(CommitChecksContractError::NoChecks)
+        ));
+        assert!(matches!(
+            checks_contract_at_commit_detailed(&repo, &invalid_utf8),
+            Err(CommitChecksContractError::InvalidUtf8(_))
+        ));
+
+        for commit in [&malformed, &invalid_schema] {
+            let error = checks_contract_at_commit_detailed(&repo, commit).unwrap_err();
+            assert!(matches!(&error, CommitChecksContractError::Parse(_)));
+            let diagnostic = error.manual_diagnostic(commit);
+            assert!(diagnostic.contains(".cairn/config.yaml"));
+            assert!(diagnostic.contains(commit));
+            assert!(diagnostic.contains("failed to parse"));
+        }
+
+        let unreadable = "0000000000000000000000000000000000000000";
+        let error = checks_contract_at_commit_detailed(&repo, unreadable).unwrap_err();
+        assert!(matches!(&error, CommitChecksContractError::Read(_)));
+        assert!(error
+            .manual_diagnostic(unreadable)
+            .contains("failed to read"));
+
+        for commit in [&missing, &checkless] {
+            let error = checks_contract_at_commit_detailed(&repo, commit).unwrap_err();
+            assert_eq!(
+                error.manual_diagnostic(commit),
+                format!("commit {commit} declares no configured checks")
+            );
+        }
+
+        assert!(checks_contract_at_commit(&repo, &invalid_utf8).is_none());
+        assert!(checks_contract_at_commit(&repo, &malformed).is_none());
+        assert!(checks_contract_at_commit(&repo, &invalid_schema).is_none());
     }
 
     // --- passing-baseline delta selection ---------------------------------
@@ -9047,6 +9280,7 @@ cairn-common = { path = "../cairn-common" }
                 verdict_platform: None,
                 verdict_arch: None,
                 verdict_environment_hash: None,
+                sandbox: None,
                 toolchain_fingerprint: None,
             },
             mutation_delta: Some(Box::new(cairn_common::executor_protocol::MutationDelta {
@@ -9106,6 +9340,7 @@ cairn-common = { path = "../cairn-common" }
             | CellUnavailableReason::Provisioning
             | CellUnavailableReason::Checkout
             | CellUnavailableReason::Spawn
+            | CellUnavailableReason::RunnerContext
             | CellUnavailableReason::Preparation
             | CellUnavailableReason::SlotUnhealthy
             | CellUnavailableReason::ExecutorUnavailable
@@ -9211,6 +9446,10 @@ cairn-common = { path = "../cairn-common" }
             ),
             (
                 CellUnavailableReason::Spawn,
+                SubstrateFailureShape::Dispatch,
+            ),
+            (
+                CellUnavailableReason::RunnerContext,
                 SubstrateFailureShape::Dispatch,
             ),
             (
@@ -9340,7 +9579,7 @@ cairn-common = { path = "../cairn-common" }
         crate::fleet::occupancy::MachineOccupancy::Predicted(
             crate::fleet::occupancy::OccupancyForecast {
                 relief_ms,
-                blocking: "CAIRN-3414's rust-tests".into(),
+                blocking: "cairn-3414's rust-tests".into(),
                 occupant_count,
             },
         )
@@ -9351,7 +9590,7 @@ cairn-common = { path = "../cairn-common" }
         let known = GroupWait::from_occupancy(predicted(240_000, 3));
         assert_eq!(
             known.description,
-            "parked behind CAIRN-3414's rust-tests, predicted to finish in 4m, behind 2 other cells; holding this check's queue entry until capacity is released"
+            "parked behind cairn-3414's rust-tests, predicted to finish in 4m, behind 2 other cells; holding this check's queue entry until capacity is released"
         );
         let unmeasured =
             GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Unforecastable);
@@ -9386,7 +9625,7 @@ cairn-common = { path = "../cairn-common" }
             };
             let message = failure.agent_message();
             assert!(
-                message.contains("CAIRN-3414's rust-tests"),
+                message.contains("cairn-3414's rust-tests"),
                 "a capacity row names what held the machine: {message}"
             );
             assert!(
@@ -9406,7 +9645,7 @@ cairn-common = { path = "../cairn-common" }
         )));
         assert!(message.contains("no executor advertises matlab"));
         assert!(
-            !message.contains("CAIRN-3414's rust-tests"),
+            !message.contains("cairn-3414's rust-tests"),
             "a refusal that was never about waiting gains no wait story: {message}"
         );
     }
@@ -9426,7 +9665,7 @@ cairn-common = { path = "../cairn-common" }
             &GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Predicted(
                 crate::fleet::occupancy::OccupancyForecast {
                     relief_ms: 300_000,
-                    blocking: "CAIRN-3414's rust-tests".into(),
+                    blocking: "cairn-3414's rust-tests".into(),
                     occupant_count: 1,
                 },
             )),
@@ -9441,7 +9680,7 @@ cairn-common = { path = "../cairn-common" }
             &GroupWait::from_occupancy(crate::fleet::occupancy::MachineOccupancy::Predicted(
                 crate::fleet::occupancy::OccupancyForecast {
                     relief_ms: 4_000,
-                    blocking: "CAIRN-3421's frontend-tests".into(),
+                    blocking: "cairn-3421's frontend-tests".into(),
                     occupant_count: 1,
                 },
             )),
@@ -9456,10 +9695,10 @@ cairn-common = { path = "../cairn-common" }
             }
             _ => panic!("index {index} is a capacity failure"),
         };
-        assert!(waited_on(0).contains("CAIRN-3414's rust-tests"));
-        assert!(waited_on(1).contains("CAIRN-3414's rust-tests"));
+        assert!(waited_on(0).contains("cairn-3414's rust-tests"));
+        assert!(waited_on(1).contains("cairn-3414's rust-tests"));
         assert!(
-            waited_on(2).contains("CAIRN-3421's frontend-tests"),
+            waited_on(2).contains("cairn-3421's frontend-tests"),
             "the second group kept its own blocker: {}",
             waited_on(2)
         );
@@ -9535,7 +9774,7 @@ cairn-common = { path = "../cairn-common" }
     fn every_substrate_outcome_composes_an_agent_message_with_the_failing_step() {
         use cairn_common::executor_protocol::CellUnavailableReason::*;
         // The specimen from the transcript that opened CAIRN-3219.
-        let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/CAIRN/.authority/slot-366/scratch: Directory not empty";
+        let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/cairn/.authority/slot-366/scratch: Directory not empty";
         let outcomes = vec![
             CellOutcome::StorageFailure {
                 request_id: "request".to_string(),
@@ -9564,7 +9803,7 @@ cairn-common = { path = "../cairn-common" }
             },
             CellOutcome::Unavailable {
                 reason: Spawn,
-                diagnostic: "/Users/mitch/.cairn/build-slots/CAIRN/slot-366 spawn refused"
+                diagnostic: "/Users/mitch/.cairn/build-slots/cairn/slot-366 spawn refused"
                     .to_string(),
             },
             CellOutcome::FailedAfterExecution {
@@ -9663,7 +9902,7 @@ cairn-common = { path = "../cairn-common" }
     /// detail read back later.
     #[tokio::test]
     async fn the_agent_facing_verdict_and_cache_row_carry_the_failing_step() {
-        let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/CAIRN/.authority/slot-366/scratch: Directory not empty";
+        let scratch_path = "remove cell scratch /Users/mitch/.cairn/build-slots/cairn/.authority/slot-366/scratch: Directory not empty";
         let failure = check_result_from_cell_outcome(
             CellOutcome::StorageFailure {
                 request_id: "request".to_string(),
@@ -9738,6 +9977,7 @@ cairn-common = { path = "../cairn-common" }
             verdict_platform: None,
             verdict_arch: None,
             verdict_environment_hash: None,
+            sandbox: None,
             toolchain_fingerprint: None,
         };
         let results = run_planned_checks(
@@ -10146,6 +10386,7 @@ cairn-common = { path = "../cairn-common" }
                 verdict_platform: None,
                 verdict_arch: None,
                 verdict_environment_hash: None,
+                sandbox: None,
                 toolchain_fingerprint: None,
             }),
             publication: None,
@@ -10242,7 +10483,7 @@ cairn-common = { path = "../cairn-common" }
 
         let reply = manual_configured_check_result(
             "rust-tests",
-            "CAIRN",
+            "cairn",
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-remote".to_string(),
@@ -10404,7 +10645,7 @@ cairn-common = { path = "../cairn-common" }
 
         let reply = manual_configured_check_result(
             "frontend",
-            "CAIRN",
+            "cairn",
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-local".to_string(),
@@ -10452,7 +10693,7 @@ cairn-common = { path = "../cairn-common" }
         assert_eq!(outcome.failure_kind, Some(CheckFailureKind::Infrastructure));
         let reply = manual_configured_check_result(
             "rust-tests",
-            "CAIRN",
+            "cairn",
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-infra".to_string(),
@@ -10494,7 +10735,7 @@ cairn-common = { path = "../cairn-common" }
         };
         let reply = manual_configured_check_result(
             "rust-tests",
-            "CAIRN",
+            "cairn",
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-suppressed".to_string(),
@@ -10529,7 +10770,7 @@ cairn-common = { path = "../cairn-common" }
         };
         let reply = manual_configured_check_result(
             "rust-tests",
-            "CAIRN",
+            "cairn",
             "commit-target".to_string(),
             "tree-target".to_string(),
             "ih-red".to_string(),
@@ -10567,7 +10808,7 @@ cairn-common = { path = "../cairn-common" }
         let second_id = uuid::Uuid::new_v4();
         let first = manual_configured_check_result(
             "rust-tests",
-            "CAIRN",
+            "cairn",
             "same-commit".into(),
             "tree".into(),
             "input".into(),
@@ -10575,7 +10816,7 @@ cairn-common = { path = "../cairn-common" }
         );
         let second = manual_configured_check_result(
             "rust-tests",
-            "CAIRN",
+            "cairn",
             "same-commit".into(),
             "tree".into(),
             "input".into(),
@@ -12254,10 +12495,17 @@ cairn-common = { path = "../cairn-common" }
                 "signature: {signature}"
             );
         }
+        for near_miss in ["graph node: not found", "registry cargo: not found"] {
+            assert_eq!(
+                classify_check_failure(opaque, Some(1), false, false, None, near_miss),
+                None,
+                "near miss: {near_miss}"
+            );
+        }
         for signature in [
             "sccache: encountered fatal error: failed to create output file",
-            "error: couldn't create a temp dir: Operation not permitted (os error 1) at path /Users/mitch/.cairn/build-slots/CAIRN/slot-542/src-tauri/target/debug/deps/.tmp123456",
-            "Operation not permitted (os error 1) at /Users/dev/.cairn-executor/build-slots/CAIRN/slot-5/src-tauri/target/debug/deps/.tmp123456",
+            "error: couldn't create a temp dir: Operation not permitted (os error 1) at path /Users/mitch/.cairn/build-slots/cairn/slot-542/src-tauri/target/debug/deps/.tmp123456",
+            "Operation not permitted (os error 1) at /Users/dev/.cairn-executor/build-slots/cairn/slot-5/src-tauri/target/debug/deps/.tmp123456",
         ] {
             assert_eq!(
                 classify_check_failure(opaque, Some(1), false, false, None, signature)
@@ -12285,6 +12533,22 @@ cairn-common = { path = "../cairn-common" }
                 .map(|classification| classification.kind),
             Some(CheckFailureKind::Infrastructure)
         );
+        for signature in [
+            "/usr/bin/env: 'node': No such file or directory",
+            "sh: bun: command not found",
+            "bash: npm: command not found",
+            "bash: line 1: cargo: command not found",
+            "zsh: command not found: node",
+            "'node' is not recognized as an internal or external command",
+            "The term 'bun' is not recognized as the name of a cmdlet, function, script file, or operable program.",
+        ] {
+            assert_eq!(
+                classify_check_failure(opaque, Some(1), false, false, None, signature)
+                    .map(|classification| classification.kind),
+                Some(CheckFailureKind::Infrastructure),
+                "signature: {signature}"
+            );
+        }
         assert_eq!(
             classify_check_failure(
                 VITEST_COMMAND,

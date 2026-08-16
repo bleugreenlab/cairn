@@ -1099,10 +1099,10 @@ mod tests {
     async fn unrouted_project_mints_local_bare_ids() {
         let dbs = db_state("db-bridge-local.db").await;
         assert_eq!(
-            dbs.route_scope_for_project("CAIRN").await,
+            dbs.route_scope_for_project("cairn").await,
             RouteScope::Local
         );
-        let id = dbs.mint_for_project("CAIRN").await;
+        let id = dbs.mint_for_project("cairn").await;
         assert!(
             !id.as_str().contains('~'),
             "a local project must mint a bare id"
@@ -1115,12 +1115,12 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn team_routed_project_mints_prefixed_ids() {
         let dbs = db_state("db-bridge-team.db").await;
-        dbs.set_route("CAIRN", Some("teamABC123".to_string())).await;
+        dbs.set_route("cairn", Some("teamABC123".to_string())).await;
         assert_eq!(
             dbs.route_scope_for_project("cairn").await,
             RouteScope::Team("teamABC123".to_string())
         );
-        let id = dbs.mint_for_project("CAIRN").await;
+        let id = dbs.mint_for_project("cairn").await;
         assert_eq!(
             id.route_scope(),
             Ok(RouteScope::Team("teamABC123".to_string()))
@@ -1144,7 +1144,7 @@ mod tests {
                 "
                 INSERT INTO teams(id, name, created_at, updated_at) VALUES ('teamABC123', 'Team', 1, 1);
                 INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
-                 VALUES ('teamABC123~00000000-0000-4000-8000-000000000001', 'teamABC123', 'Project', 'Legacy', '{}', 1, 1);
+                 VALUES ('teamABC123~00000000-0000-4000-8000-000000000001', 'teamABC123', 'Project', 'legacy', '{}', 1, 1);
                 ",
                 repo_path.replace('\'', "''")
             ))
@@ -1170,7 +1170,7 @@ mod tests {
         let stored = dbs
             .local
             .query_opt_text(
-                "SELECT local_repo_path FROM project_routes WHERE project_key = 'LEGACY'",
+                "SELECT local_repo_path FROM project_routes WHERE project_key = 'legacy'",
                 (),
             )
             .await
@@ -1269,7 +1269,7 @@ mod tests {
                 .execute_script(
                     "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('teamNEW123', 'New', 1, 1);
                      INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
-                     VALUES ('teamNEW123~00000000-0000-4000-8000-000000000021', 'teamNEW123', 'Foo', 'FOO', '', 1, 1);",
+                     VALUES ('teamNEW123~00000000-0000-4000-8000-000000000021', 'teamNEW123', 'Foo', 'foo', '', 1, 1);",
                 )
                 .await
                 .unwrap();
@@ -1285,7 +1285,7 @@ mod tests {
             dbs.local
                 .execute(
                     "INSERT INTO project_routes(project_key, team_id, local_repo_path, created_at)
-                     VALUES ('FOO', 'teamOLD123', ?1, 1)",
+                     VALUES ('foo', 'teamOLD123', ?1, 1)",
                     [local_path],
                 )
                 .await
@@ -1293,7 +1293,7 @@ mod tests {
             dbs.routes
                 .write()
                 .await
-                .insert("FOO".to_string(), Some(old_team.clone()));
+                .insert("foo".to_string(), Some(old_team.clone()));
 
             let reconcile_old =
                 || reconcile_team_routes(&dbs.local, &old_db, &dbs.routes, &old_team);
@@ -1317,7 +1317,7 @@ mod tests {
                     Box::pin(async move {
                         let mut rows = conn
                             .query(
-                                "SELECT team_id, local_repo_path FROM project_routes WHERE project_key = 'FOO'",
+                                "SELECT team_id, local_repo_path FROM project_routes WHERE project_key = 'foo'",
                                 (),
                             )
                             .await?;
@@ -1454,10 +1454,10 @@ mod tests {
         dbs.upsert_team_registry("teamABC123", "Team", "http://sync", "/tmp/t.db")
             .await
             .unwrap();
-        dbs.set_route("PROJ", Some("teamABC123".to_string())).await;
+        dbs.set_route("proj", Some("teamABC123".to_string())).await;
         dbs.local
             .execute(
-                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('PROJ', 'teamABC123', 0)",
+                "INSERT INTO project_routes(project_key, team_id, created_at) VALUES ('proj', 'teamABC123', 0)",
                 (),
             )
             .await
@@ -1479,7 +1479,7 @@ mod tests {
             .unwrap();
         assert!(routes.is_empty());
         // Route cache no longer resolves the project to the team.
-        assert_eq!(dbs.route_scope_for_project("PROJ").await, RouteScope::Local);
+        assert_eq!(dbs.route_scope_for_project("proj").await, RouteScope::Local);
     }
 
     /// Forgetting a team that was never registered is a no-op returning `false`.
