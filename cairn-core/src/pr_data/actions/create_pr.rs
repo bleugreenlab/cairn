@@ -142,6 +142,7 @@ pub(crate) async fn sync_create_pr_artifact_for_job(
 
     let now = chrono::Utc::now().timestamp();
     update_merge_request_title_body(&orch.db.local, &mr_context.mr_id, title, body, now).await?;
+    orch.invalidate_pr_refresh(&mr_context.job_id, "pull-request-title-or-body");
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),

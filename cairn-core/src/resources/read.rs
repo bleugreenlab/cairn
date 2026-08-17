@@ -1657,7 +1657,7 @@ async fn render_resource_body(
             if let Some(error) = reject_query_params("issue", &params) {
                 error
             } else {
-                read_issue(db, &project, number).await
+                read_issue(db, &orch.db.local, &project, number).await
             }
         }
         CairnResource::IssueExecutions { project, number } => {

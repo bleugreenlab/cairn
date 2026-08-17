@@ -41,6 +41,10 @@ cairn-common = { path = "../cairn-common" }
 cairn-worktree = { path = "../cairn-worktree" }
 # The gix + zstd event-codec/object substrate; storage/events re-exports it.
 cairn-codec = { path = "../cairn-codec" }
+# Mints and matches the feed acknowledgement token. Agents copy that token out of
+# a rendered page and back into a mutation, so its form is a cost and a
+# transcription-fidelity question, not merely a uniqueness one.
+unigram = { path = "../unigram" }
 
 [dev-dependencies]
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }

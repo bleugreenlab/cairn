@@ -5,7 +5,7 @@ use std::{
 };
 
 use cairn_common::uri::{build_node_permission_uri, build_node_question_uri, parse_uri};
-use cairn_db::turso::params;
+use cairn_db::turso::{params, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -304,6 +304,11 @@ fn poll_label(head: &str, title: Option<&str>) -> String {
 struct ReviewGates {
     gates: Vec<Gate>,
     expired_dangling: usize,
+    /// Undelivered review pushes this load examined, whatever became of them.
+    /// Logged beside the refresh duration so the backlog's size and the sweep's
+    /// cost are readable together: a duration that climbs while this stays flat
+    /// means the loader started paying for something other than the backlog.
+    scanned: usize,
 }
 
 /// The poll a bare command asks for, matched as an exact case-insensitive word.
@@ -1797,16 +1802,23 @@ impl ChannelRouter {
             gates.extend(load_permissions(db).await?);
         }
         let mut review_pushes = 0;
+        let mut review_backlog = 0;
         let mut expired = 0;
         if self.route.notify {
             let reviews = load_reviews(db).await?;
             review_pushes = reviews.gates.len();
+            review_backlog = reviews.scanned;
             expired = reviews.expired_dangling;
             gates.extend(reviews.gates);
         }
         let routed = self.route_gates(db, gates).await?;
+        // `backlog` is the undelivered review rows this refresh read. It is here
+        // next to the duration because the pair is the diagnostic: this refresh
+        // costs what the BACKLOG costs, and a duration that grows while the
+        // backlog does not means it has started paying for the workspace again.
         log::info!(
-            "channel gate refresh reason=generation dbs=1 pushes={} gates={} expired={} duration_ms={}",
+            "channel gate refresh reason=generation dbs=1 backlog={} pushes={} gates={} expired={} duration_ms={}",
+            review_backlog,
             review_pushes,
             routed.len(),
             expired,
@@ -2440,7 +2452,7 @@ impl ChannelRouter {
                 let claim = ledger::claim_ask_resolution(
                     self.ledger(),
                     &record.binding_ref,
-                    &answer,
+                    answer,
                     cairn_common::identity::AppearanceTransport::ChannelReply,
                     Some(self.provider_id),
                     Some(&record.conversation),
@@ -2690,62 +2702,156 @@ fn permission_ask_body(tool: &str, tool_input: &str, permission_uri: Option<&str
     sections.join("\n\n")
 }
 
+/// The undelivered review backlog, and only that.
+///
+/// Named so the regression test can plan it. This statement reads ONE table: the
+/// issue each push is about is recovered from the push's own canonical URI by
+/// [`review_subject`], not by asking the database to rediscover it. See
+/// [`load_review_issue_titles`] for what that replaced and why.
+const REVIEW_BACKLOG_SQL: &str = "SELECT ap.id, ap.recipient, ap.content_ref, ap.\"key\"
+               FROM attention_pushes ap
+              WHERE ap.delivered_event_id IS NULL AND ap.retired_at IS NULL
+                AND ap.\"key\" LIKE 'review:%'
+              ORDER BY ap.created_at DESC, ap.id DESC";
+
+/// The issue a review push is about, read out of the push's own content ref.
+///
+/// This is the same `(project key, issue number)` pair
+/// [`crate::orchestrator::attention_push`] derives to decide the push's
+/// liveness, from the same canonical URI through the same parser, so the two
+/// halves of one sweep cannot disagree about which issue a push names.
+fn review_subject(content_ref: &str) -> Option<(String, i32)> {
+    let parsed = parse_uri(content_ref)?;
+    let project = parsed.project().map(cairn_common::uri::canonical_project)?;
+    Some((project, parsed.issue_number()?))
+}
+
+/// `?, ?, ?` for an `IN (...)` list of `n` bound values.
+fn placeholders(n: usize) -> String {
+    (0..n).map(|_| "?").collect::<Vec<_>>().join(", ")
+}
+
+/// The statement behind [`load_review_issue_titles`], built for a given batch
+/// size. Split out so the regression test can plan the shape the loader runs.
+fn review_issue_titles_sql(numbers: usize, keys: usize) -> String {
+    format!(
+        "SELECT p.key, i.number, i.title
+           FROM issues i JOIN projects p ON p.id = i.project_id
+          WHERE i.number IN ({}) AND lower(p.key) IN ({})",
+        placeholders(numbers),
+        placeholders(keys),
+    )
+}
+
+/// Titles for the issues a review backlog names, in one batched statement.
+///
+/// Shaped like the first step of `attention_push::resolve_subjects`, for the
+/// same reason: the numbers drive `idx_issues_number` (migration 0195), so the
+/// work is proportional to the BACKLOG rather than to the workspace. Keying by
+/// the `(project, number)` pair is what keeps a number that exists in several
+/// projects from cross-resolving.
+///
+/// The loader used to ask SQL to recover the issue instead, by joining every
+/// undelivered push against every project and every issue under `lower(...)
+/// LIKE ...` predicates no index can serve. That is a cross product of the
+/// workspace re-executed by every provider's five-second sweep; on an
+/// installation with a few hundred queued reviews and a few thousand issues it
+/// held three cores permanently and churned gigabytes through the allocator
+/// building the concatenated strings it compared (CAIRN-4194).
+async fn load_review_issue_titles(
+    db: &LocalDb,
+    subjects: &[(String, i32)],
+) -> Result<HashMap<(String, i32), String>, String> {
+    let numbers: Vec<i64> = subjects
+        .iter()
+        .map(|(_, number)| *number as i64)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let keys: Vec<String> = subjects
+        .iter()
+        .map(|(project, _)| project.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if numbers.is_empty() || keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = review_issue_titles_sql(numbers.len(), keys.len());
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut binds: Vec<Value> = numbers.into_iter().map(Value::Integer).collect();
+            binds.extend(keys.into_iter().map(Value::Text));
+            let mut rows = conn.query(&sql, binds).await?;
+            let mut titles = HashMap::new();
+            while let Some(row) = rows.next().await? {
+                titles.insert(
+                    (
+                        cairn_common::uri::canonical_project(row.text(0)?),
+                        row.i64(1)? as i32,
+                    ),
+                    row.text(2)?,
+                );
+            }
+            Ok(titles)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
     struct ReviewRow {
         id: String,
         recipient: String,
         content_ref: String,
         key: String,
-        project: Option<String>,
-        number: Option<i64>,
-        title: Option<String>,
-        live: bool,
     }
 
-    // One snapshot and one statement for the whole backlog. The joins resolve the
-    // issue encoded in the semantic review key; correlated EXISTS arms mirror the
-    // attention-push liveness predicate without opening a transaction per push.
-    let rows = db.read(|conn| Box::pin(async move {
-        let mut rows = conn.query(
-            "SELECT ap.id, ap.recipient, ap.content_ref, ap.\"key\", p.key, i.number, i.title,
-                    CASE WHEN i.id IS NULL THEN 0
-                         WHEN EXISTS (SELECT 1 FROM merge_requests mr
-                                      WHERE mr.issue_id=i.id AND mr.status NOT IN ('merged','closed')) THEN 1
-                         WHEN EXISTS (SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
-                                      WHERE j.issue_id=i.id AND a.artifact_type='plan' AND a.confirmed=0) THEN 1
-                         WHEN EXISTS (SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
-                                      WHERE j.issue_id=i.id AND a.artifact_type='create-pr')
-                          AND NOT EXISTS (SELECT 1 FROM merge_requests mr WHERE mr.issue_id=i.id) THEN 1
-                         ELSE 0 END
-               FROM attention_pushes ap
-               LEFT JOIN projects p
-                 ON lower(ap.content_ref) LIKE lower('cairn://p/' || p.key || '/%')
-               LEFT JOIN issues i
-                 ON i.project_id=p.id
-                AND (lower(ap.content_ref)=lower('cairn://p/' || p.key || '/' || i.number)
-                     OR lower(ap.content_ref)
-                        LIKE lower('cairn://p/' || p.key || '/' || i.number || '/%'))
-              WHERE ap.delivered_event_id IS NULL AND ap.\"key\" LIKE 'review:%'
-              ORDER BY ap.created_at DESC, ap.id DESC",
-            (),
-        ).await?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().await? {
-            out.push(ReviewRow {
-                id: row.text(0)?, recipient: row.text(1)?, content_ref: row.text(2)?, key: row.text(3)?,
-                project: row.opt_text(4)?, number: row.opt_i64(5)?, title: row.opt_text(6)?, live: row.i64(7)? != 0,
-            });
-        }
-        Ok(out)
-    })).await.map_err(|error| error.to_string())?;
+    // One statement for the whole backlog. Liveness is NOT decided here. It comes
+    // from `attention_push::resolve_live_refs`, which is the one place that
+    // predicate lives — this query used to carry its own copy as correlated
+    // EXISTS arms, and two copies of a delivery predicate drift apart silently.
+    let rows = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(REVIEW_BACKLOG_SQL, ()).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(ReviewRow {
+                        id: row.text(0)?,
+                        recipient: row.text(1)?,
+                        content_ref: row.text(2)?,
+                        key: row.text(3)?,
+                    });
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
 
-    let mut result = ReviewGates::default();
+    // The issues those refs name, in one batched lookup keyed by the pair.
+    let subjects: Vec<(String, i32)> = rows
+        .iter()
+        .filter_map(|row| review_subject(&row.content_ref))
+        .collect();
+    let titles = load_review_issue_titles(db, &subjects).await?;
+
+    // Expire what does not resolve, then resolve liveness for everything that
+    // survives in ONE batched call rather than a query per push.
+    let mut result = ReviewGates {
+        scanned: rows.len(),
+        ..Default::default()
+    };
+    let mut resolvable = Vec::with_capacity(rows.len());
     for row in rows {
-        let Some((project, number, title)) = row
-            .project
-            .zip(row.number)
-            .zip(row.title)
-            .map(|((project, number), title)| (project, number, title))
+        let Some((project, number, title)) =
+            review_subject(&row.content_ref).and_then(|(project, number)| {
+                titles
+                    .get(&(project.clone(), number))
+                    .map(|title| (project, number, title.clone()))
+            })
         else {
             crate::orchestrator::attention_push::delete_pending_by_id(db, &row.id)
                 .await
@@ -2758,7 +2864,19 @@ async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
             );
             continue;
         };
-        if !row.live {
+        resolvable.push((row, project, number, title));
+    }
+
+    let refs: Vec<(&str, &str)> = resolvable
+        .iter()
+        .map(|(row, _, _, _)| (row.key.as_str(), row.content_ref.as_str()))
+        .collect();
+    let live = crate::orchestrator::attention_push::resolve_live_refs(db, &refs)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    for ((row, project, number, title), live) in resolvable.into_iter().zip(live) {
+        if !live {
             continue;
         }
         result.gates.push(Gate {
@@ -2770,7 +2888,7 @@ async fn load_reviews(db: &LocalDb) -> Result<ReviewGates, String> {
             job_id: Some(row.recipient),
             context: String::new(),
             ask: OutboundAsk::Notify {
-                text: review_notice(&project, number as i32, &title, &row.content_ref),
+                text: review_notice(&project, number, &title, &row.content_ref),
             },
         });
     }
@@ -2881,6 +2999,115 @@ mod tests {
     use crate::channels::ledger::expire_undelivered;
     use crate::models::IMessageChannelConfig;
     use crate::storage::migrated_test_db;
+
+    /// The rendered plan for a statement, one node per line.
+    async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<Value>) -> String {
+        let sql = format!("EXPLAIN QUERY PLAN {sql}");
+        db.read(move |conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, binds).await?;
+                let mut plan = String::new();
+                while let Some(row) = rows.next().await? {
+                    plan.push_str(&row.text(3)?);
+                    plan.push('\n');
+                }
+                Ok(plan)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Every channel provider re-reads the review backlog on a five-second
+    /// sweep, so what that read costs has to follow the BACKLOG. It used to
+    /// follow the workspace: the loader asked SQL to recover each push's issue by
+    /// joining every undelivered push against every project and every issue under
+    /// `lower(...) LIKE ...` predicates no index can serve, and a rebuilt runner
+    /// with a few hundred queued reviews and a few thousand issues sat at three
+    /// cores permanently (CAIRN-4194).
+    ///
+    /// The plan is what pins this, because the regression is invisible to every
+    /// cheaper seam: the old shape was also two statements, in two read
+    /// transactions, returning one row per push. Only its plan said that reading
+    /// a backlog meant walking the workspace.
+    #[tokio::test]
+    async fn review_backlog_statements_never_walk_the_workspace() {
+        let db = migrated_test_db("channel-router-review-plan.db").await;
+
+        let backlog = query_plan(&db, REVIEW_BACKLOG_SQL, Vec::new()).await;
+        assert!(
+            !backlog.contains("projects") && !backlog.contains("issues"),
+            "the backlog statement reads the push table alone; a plan that reaches \
+             the workspace is the cross product coming back:\n{backlog}"
+        );
+
+        let titles = query_plan(
+            &db,
+            &review_issue_titles_sql(1, 1),
+            vec![Value::Integer(1), Value::Text("cairn".into())],
+        )
+        .await;
+        assert!(
+            titles.contains("idx_issues_number"),
+            "the batched lookup is driven by the backlog's issue numbers \
+             (migration 0195), not by a scan:\n{titles}"
+        );
+    }
+
+    /// Issue numbers repeat across projects, so the lookup is keyed by the PAIR.
+    /// Resolving on the number alone would hand a push the wrong project's title
+    /// and point its notice at the wrong issue.
+    #[tokio::test]
+    async fn a_review_resolves_against_its_own_project_when_numbers_repeat() {
+        let db = migrated_test_db("channel-router-review-cross-project.db").await;
+        db.execute_batch(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w', 'W', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p-cairn', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1),
+                     ('p-atlas', 'w', 'Atlas', 'atlas', '/tmp/atlas', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+               VALUES('cairn-7', 'p-cairn', 7, 'Cairn seven', 'active', 1, 1),
+                     ('atlas-7', 'p-atlas', 7, 'Atlas seven', 'active', 1, 1);
+             INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+               VALUES('cairn-job', 'p-cairn', 'cairn-7', 'running', 1, 1),
+                     ('atlas-job', 'p-atlas', 'atlas-7', 'running', 1, 1);
+             INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+               VALUES('cairn-mr', 'cairn-job', 'p-cairn', 'cairn-7', 'C', 'f', 'main', 'open', 1, 1),
+                     ('atlas-mr', 'atlas-job', 'p-atlas', 'atlas-7', 'A', 'f', 'main', 'open', 1, 1);
+             INSERT INTO attention_pushes
+               (id, recipient, content_ref, wake, boundary, key, created_at)
+             VALUES
+               ('cairn-push', 'cairn-job', 'cairn://p/cairn/7/1/builder/create-pr', 'wake', 'event',
+                'review:cairn://p/cairn/7', 1),
+               ('atlas-push', 'atlas-job', 'cairn://p/atlas/7/1/builder/create-pr', 'wake', 'event',
+                'review:cairn://p/atlas/7', 2);",
+        )
+        .await
+        .unwrap();
+
+        let reviews = load_reviews(&db).await.unwrap();
+
+        assert_eq!(reviews.scanned, 2);
+        assert_eq!(reviews.expired_dangling, 0);
+        let mut notices: Vec<String> = reviews
+            .gates
+            .iter()
+            .map(|gate| match &gate.ask {
+                OutboundAsk::Notify { text } => text.clone(),
+                other => panic!("a review gate notifies, got {other:?}"),
+            })
+            .collect();
+        notices.sort();
+        assert_eq!(
+            notices,
+            vec![
+                "atlas/7 review ready \u{2014} Atlas seven\ncairn://p/atlas/7/1/builder/create-pr",
+                "cairn/7 review ready \u{2014} Cairn seven\ncairn://p/cairn/7/1/builder/create-pr",
+            ],
+            "each push carries its own project's issue"
+        );
+    }
 
     #[tokio::test]
     async fn dangling_review_references_expire_individually_without_aborting_the_batch() {

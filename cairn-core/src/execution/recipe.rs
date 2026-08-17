@@ -782,11 +782,7 @@ fn resolve_launch_nodes(
 
         let resolved = match effective {
             Some(LaunchSelectionOverride::Concrete(selection)) => {
-                Ok(crate::config::presets::ResolvedSelection {
-                    selection: selection.clone(),
-                    extras: RuntimeExtras::default(),
-                    source: ResolutionSource::ExecutionOverride,
-                })
+                crate::config::presets::resolve_concrete_selection(selection, presets)
             }
             Some(LaunchSelectionOverride::Tier(tier)) => resolve_selection_with_provenance(
                 Some(tier),

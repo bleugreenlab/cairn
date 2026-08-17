@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -225,7 +225,12 @@ pub struct LocalDb {
     /// drop its hold and reopen the boolean gate while another is still draining
     /// or running TRUNCATE.
     checkpoint_lock: AsyncMutex<()>,
-    #[cfg(test)]
+    /// Read transactions opened over this handle's life. Lets a test assert
+    /// that an operation's transaction count is a constant rather than a
+    /// function of how much data it covers — a load-independent guard against
+    /// reintroducing per-row resolution. Exposed to `test-utils` consumers
+    /// because the drains that most need that guard live in cairn-core.
+    #[cfg(any(test, feature = "test-utils"))]
     read_transaction_count: AtomicUsize,
     /// Connections handed out by [`LocalDb::connect`] over this handle's life.
     /// Lets tests assert that a run of sequential operations reuses one
@@ -270,7 +275,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
@@ -325,7 +330,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
@@ -376,7 +381,7 @@ impl LocalDb {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
@@ -593,11 +598,17 @@ impl LocalDb {
         }
     }
 
+    /// Read transactions opened over this handle's life. See the field.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn read_transaction_count(&self) -> usize {
+        self.read_transaction_count.load(Ordering::Relaxed)
+    }
+
     pub async fn read<T>(
         &self,
         f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         self.read_transaction_count.fetch_add(1, Ordering::Relaxed);
         let conn = self.checkout().await?;
         let attempt = run_read_tx(&conn, self.concurrent_begin(), f).await;
@@ -2172,7 +2183,7 @@ mod tests {
             idle: Mutex::new(Vec::new()),
             gate,
             checkpoint_lock: AsyncMutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),

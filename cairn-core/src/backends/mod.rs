@@ -18,6 +18,8 @@
 //! backend maps agent-declared tool names into backend-specific allowed and
 //! disallowed lists.
 
+mod anthropic_messages;
+pub mod catalog;
 pub mod claude;
 mod claude_transcript;
 pub mod claude_usage;
@@ -26,6 +28,7 @@ pub mod context_window;
 mod http_loop;
 pub mod ollama;
 mod openai_compat;
+mod openai_responses;
 pub mod opencode;
 pub mod openrouter;
 mod run_state;
@@ -226,6 +229,29 @@ pub struct DiscoveredReasoningEffort {
     description: Option<String>,
 }
 
+/// The HTTP protocol family a discovered model is served over.
+///
+/// Optional metadata on [`DiscoveredModel`], and deliberately so: a backend that
+/// serves its whole catalog through one hardcoded protocol has no reason to
+/// claim one. What matters is that an ABSENT value never reads as "chat
+/// completions" — that guess is exactly what sends a Messages-only model to an
+/// endpoint which cannot answer it, failing mid-session instead of before one
+/// starts. A backend fronting several families (OpenCode Go) records the family
+/// per model and refuses to route a model whose family it cannot name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DiscoveredWireProtocol {
+    /// OpenAI-compatible `chat/completions`.
+    OpenAiChatCompletions,
+    /// Anthropic-style `messages`.
+    AnthropicMessages,
+    /// OpenAI `responses`.
+    OpenAiResponses,
+    /// A family Cairn has no adapter for. Recorded as unknown rather than
+    /// guessed, so the catalog can carry the model and say why it is not served.
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredModel {
@@ -258,6 +284,11 @@ pub struct DiscoveredModel {
     pub(crate) router: bool,
     #[serde(default)]
     pub(crate) architecture_modality: Option<String>,
+    /// Which HTTP protocol family serves this model, when the backend fronts
+    /// more than one. `None` means the backend never claimed one — read it as
+    /// "unrouteable here", never as a default family.
+    #[serde(default)]
+    pub(crate) wire_protocol: Option<DiscoveredWireProtocol>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -531,20 +562,6 @@ pub trait AgentBackend: Send + Sync {
         mode: &str,
     ) -> Result<(), String>;
 }
-
-/// Every backend Cairn ships, in product order.
-///
-/// The model-catalog refresh, the responses surface, and the settings provider
-/// list each need the same answer to "which providers exist". They read it here
-/// instead of each carrying a copy, so adding a provider cannot leave one
-/// surface quietly behind.
-pub(crate) const KNOWN_BACKENDS: &[&str] = &[
-    "claude",
-    "codex",
-    "openrouter",
-    opencode::OPENCODE_BACKEND_KEY,
-    "ollama",
-];
 
 /// Create an AgentBackend for the given backend name.
 /// Returns ClaudeBackend for None or "claude", CodexBackend for "codex".

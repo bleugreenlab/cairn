@@ -10,6 +10,7 @@
 
 pub mod claude_profile;
 pub mod crypto;
+pub mod display;
 pub mod local;
 
 use serde::{Deserialize, Serialize};

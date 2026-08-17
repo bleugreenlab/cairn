@@ -113,8 +113,19 @@ pub struct StreamPartial {
     pub text: String,
 }
 
+/// Every event the webview receives on the `voice-event` channel.
+///
+/// `rename_all` renames the variants; the fields inside them need
+/// `rename_all_fields`, and without it a variant's payload arrives as
+/// `operation_id` while the webview reads `operationId` — an event that is
+/// delivered, parsed, and silently ignored. `Partial` escapes that because its
+/// payload is a struct carrying its own attribute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "type")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "type"
+)]
 pub enum VoiceEvent {
     DownloadStarted {
         operation_id: String,
@@ -202,6 +213,66 @@ mod tests {
                 dictation_mode: DictationMode::Hold,
             }
         );
+    }
+
+    /// The webview reduces download events by name and by camelCase field, and
+    /// correlates one download through `operationId`. Renaming any of them stops
+    /// the progress bar silently rather than failing a build.
+    #[test]
+    fn download_events_serialize_with_the_names_the_webview_reduces() {
+        let started = serde_json::to_value(VoiceEvent::DownloadStarted {
+            operation_id: "op-1".into(),
+            component: "engine".into(),
+            total_bytes: Some(9),
+        })
+        .unwrap();
+        assert_eq!(started["type"], "downloadStarted");
+        assert_eq!(started["operationId"], "op-1");
+        assert_eq!(started["totalBytes"], 9);
+
+        let progress = serde_json::to_value(VoiceEvent::DownloadProgress {
+            operation_id: "op-1".into(),
+            component: "model:fast".into(),
+            downloaded_bytes: 4,
+            total_bytes: Some(9),
+        })
+        .unwrap();
+        assert_eq!(progress["type"], "downloadProgress");
+        assert_eq!(progress["component"], "model:fast");
+        assert_eq!(progress["downloadedBytes"], 4);
+
+        let finished = serde_json::to_value(VoiceEvent::DownloadFinished {
+            operation_id: "op-1".into(),
+            component: "model:fast".into(),
+        })
+        .unwrap();
+        assert_eq!(finished["type"], "downloadFinished");
+        assert_eq!(finished["operationId"], "op-1");
+    }
+
+    /// Dictation matches a live session by `streamId`; a snake_case field here
+    /// means a terminated stream is never noticed and the UI keeps listening.
+    #[test]
+    fn stream_events_serialize_with_the_names_dictation_matches_on() {
+        let terminated = serde_json::to_value(VoiceEvent::StreamTerminated {
+            stream_id: "s-1".into(),
+            reason: "engine exited".into(),
+        })
+        .unwrap();
+        assert_eq!(terminated["type"], "streamTerminated");
+        assert_eq!(terminated["streamId"], "s-1");
+
+        let partial = serde_json::to_value(VoiceEvent::Partial(StreamPartial {
+            stream_id: "s-1".into(),
+            revision: 2,
+            window_start_ms: 0,
+            window_end_ms: 500,
+            text: "hello".into(),
+        }))
+        .unwrap();
+        assert_eq!(partial["type"], "partial");
+        assert_eq!(partial["streamId"], "s-1");
+        assert_eq!(partial["windowEndMs"], 500);
     }
 
     #[test]

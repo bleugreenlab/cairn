@@ -220,6 +220,7 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
             },
             router: false,
             architecture_modality: None,
+            wire_protocol: None,
         })
         .collect()
 }

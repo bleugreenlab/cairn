@@ -96,11 +96,52 @@ async fn mark_publication_unconfirmed(
     )
     .await
     .map_err(|error| format!("invalidate stale pull-request verdict for `{branch}`: {error}"))?;
+    // The row's own cached verdict has just been downgraded, so any snapshot
+    // published from it describes a head the branch has moved past. Advance the
+    // generation for every job whose PR this touched, by the same predicate the
+    // update used, so the next read recomputes instead of serving the old head.
+    for job_id in merge_request_jobs_for_branch(db, project_id, branch).await {
+        orch.invalidate_pr_refresh(&job_id, "source-head-unpublished");
+    }
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),
     );
     Ok(())
+}
+
+/// The jobs owning every unresolved merge request on a branch — the exact set a
+/// branch-scoped `merge_requests` mutation moves.
+async fn merge_request_jobs_for_branch(
+    db: &LocalDb,
+    project_id: &str,
+    branch: &str,
+) -> Vec<String> {
+    let project_id = project_id.to_string();
+    let branch = branch.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        let branch = branch.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT job_id FROM merge_requests
+                      WHERE project_id = ?1 AND source_branch = ?2
+                        AND status NOT IN ('merged', 'closed')",
+                    params![project_id.as_str(), branch.as_str()],
+                )
+                .await?;
+            let mut jobs = Vec::new();
+            while let Some(row) = rows.next().await? {
+                if let Some(job_id) = row.opt_text(0)? {
+                    jobs.push(job_id);
+                }
+            }
+            Ok(jobs)
+        })
+    })
+    .await
+    .unwrap_or_default()
 }
 
 async fn release_reminted_claim_after_failure(

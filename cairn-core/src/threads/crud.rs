@@ -65,8 +65,80 @@ pub async fn list(db: &LocalDb, project_id: &str) -> Result<Vec<Thread>, CairnEr
     .map_err(Into::into)
 }
 
+/// The shape the server allocates when a create arrives with no name.
+///
+/// A placeholder is an address, not a description. The `-` keeps it clear of
+/// the purely-numeric refusal in [`validate_thread_name`], and `thread` is not
+/// a reserved project segment (`threads` is), so an allocated name is routable
+/// from the moment it is minted.
+const PLACEHOLDER_PREFIX: &str = "thread-";
+
+/// Spend the project's next thread address and return it.
+///
+/// The counter is durable (`projects.next_thread_number`) rather than derived
+/// from the names currently in the table, and that is the whole point. Renaming
+/// off the placeholder is this feature's designed path, not an edge case: a
+/// derived maximum would see `thread-1` go free within a minute of being handed
+/// out and reissue it, so a route or a history entry captured at creation would
+/// later open an unrelated conversation. An address that has been handed out
+/// stays spent. This is `projects.next_issue_number`'s mechanism and reasoning,
+/// reused rather than re-invented.
+///
+/// A committed allocation is spent even if the thread is later renamed or
+/// deleted; a rolled-back one is not, because the counter moves in the caller's
+/// transaction alongside the row it names.
+///
+/// The scan is a guard, not the source: an explicit create may take `thread-7`
+/// by name at any time, and stepping over what is actually present keeps that
+/// from turning into a hard collision later.
+async fn allocate_placeholder_name(
+    conn: &cairn_db::turso::Connection,
+    project_id: &str,
+    now: i64,
+) -> DbResult<String> {
+    let mut rows = conn
+        .query(
+            "SELECT next_thread_number FROM projects WHERE id = ?1",
+            params![project_id],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .ok_or_else(|| DbError::Row(format!("project not found: {project_id}")))?;
+    let mut next = row.opt_i64(0)?.unwrap_or(1).max(1);
+
+    let mut rows = conn
+        .query(
+            "SELECT name FROM threads WHERE project_id = ?1 AND name GLOB 'thread-[0-9]*'",
+            params![project_id],
+        )
+        .await?;
+    while let Some(row) = rows.next().await? {
+        let name = row.text(0)?;
+        // Only the exact `thread-<digits>` shape is a placeholder, so a thread
+        // deliberately named `thread-safety` never moves the counter.
+        let suffix = match name.strip_prefix(PLACEHOLDER_PREFIX) {
+            Some(suffix) if suffix.bytes().all(|byte| byte.is_ascii_digit()) => suffix,
+            _ => continue,
+        };
+        if let Ok(taken) = suffix.parse::<i64>() {
+            next = next.max(taken + 1);
+        }
+    }
+
+    conn.execute(
+        "UPDATE projects SET next_thread_number = ?1, updated_at = ?2 WHERE id = ?3",
+        params![next + 1, now, project_id],
+    )
+    .await?;
+    Ok(format!("{PLACEHOLDER_PREFIX}{next}"))
+}
+
 pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnError> {
-    validate_thread_name(&input.name).map_err(CairnError::Internal)?;
+    if let Some(name) = input.name.as_deref() {
+        validate_thread_name(name).map_err(CairnError::Internal)?;
+    }
     if let Some(definition) = input.definition.as_deref() {
         super::resolve_thread_definition(Some(definition)).map_err(CairnError::Internal)?;
     }
@@ -78,6 +150,15 @@ pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnEr
             let input = input.clone();
             let id = id.clone();
             Box::pin(async move {
+                // Resolving the name inside the transaction is what makes a
+                // placeholder durable rather than optimistic: the counter moves,
+                // the row is inserted, and its session is established together,
+                // or none of it happened.
+                let allocated = input.name.is_none();
+                let name = match input.name.clone() {
+                    Some(name) => name,
+                    None => allocate_placeholder_name(conn, &input.project_id, now).await?,
+                };
                 conn.execute(
                     "INSERT INTO threads
                  (id, project_id, name, jurisdiction, definition,
@@ -86,7 +167,7 @@ pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnEr
                     params![
                         id.as_str(),
                         input.project_id,
-                        input.name.as_str(),
+                        name.as_str(),
                         input.jurisdiction,
                         input.definition,
                         input.migrated_from_number,
@@ -101,11 +182,16 @@ pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnEr
                             "thread migration number already exists in project: {}",
                             input.migrated_from_number.unwrap_or_default()
                         ))
-                    } else if message.contains("unique") {
+                    } else if message.contains("unique") && allocated {
+                        // The scan above and the unique index disagreed, which
+                        // no ordinary retry produces. Say so distinctly rather
+                        // than reporting a name the caller never chose, and
+                        // never paper over it with a random suffix.
                         DbError::Row(format!(
-                            "thread name already exists in project: {}",
-                            input.name
+                            "allocated thread placeholder collided with an existing name: {name}"
                         ))
+                    } else if message.contains("unique") {
+                        DbError::Row(format!("thread name already exists in project: {name}"))
                     } else {
                         error.into()
                     }
@@ -295,13 +381,174 @@ mod tests {
 
     fn input(project_id: &str, name: &str) -> CreateThread {
         CreateThread {
+            name: Some(name.into()),
+            ..unnamed(project_id)
+        }
+    }
+
+    /// A create as the launch surface sends it: an opening and a model, and no
+    /// claim about what the topic is called.
+    fn unnamed(project_id: &str) -> CreateThread {
+        CreateThread {
             project_id: project_id.into(),
-            name: name.into(),
+            name: None,
             jurisdiction: Some("Own this topic".into()),
             definition: None,
             migrated_from_number: None,
             model: None,
         }
+    }
+
+    /// An absent name is the server's cue to allocate, and allocation counts
+    /// within one project only — a `thread-1` in another project is a different
+    /// address, not a taken one.
+    #[tokio::test]
+    async fn an_absent_name_allocates_a_project_scoped_placeholder() {
+        let db = db("thread-placeholder-allocation.db").await;
+        seed_project(&db, "project-a").await;
+        seed_project(&db, "project-b").await;
+
+        let first = create(&db, unnamed("project-a")).await.unwrap();
+        let second = create(&db, unnamed("project-a")).await.unwrap();
+        assert_eq!(
+            (first.name.as_str(), second.name.as_str()),
+            ("thread-1", "thread-2")
+        );
+        assert_eq!(
+            create(&db, unnamed("project-b")).await.unwrap().name,
+            "thread-1"
+        );
+
+        // An explicit name is still taken verbatim, still validated, and still
+        // collides with itself.
+        assert_eq!(
+            create(&db, input("project-a", "roadmap"))
+                .await
+                .unwrap()
+                .name,
+            "roadmap"
+        );
+        assert!(create(&db, input("project-a", "Roadmap")).await.is_err());
+        let taken = create(&db, input("project-a", "roadmap"))
+            .await
+            .unwrap_err();
+        assert!(taken.to_string().contains("already exists"), "{taken}");
+    }
+
+    /// Allocation is max-plus-one over the exact `thread-<n>` shape. A high
+    /// suffix already in the project advances it, and names that merely start
+    /// with `thread-` are somebody's chosen name rather than counters.
+    #[tokio::test]
+    async fn allocation_advances_past_the_highest_placeholder_and_ignores_lookalikes() {
+        let db = db("thread-placeholder-max.db").await;
+        seed_project(&db, "project-a").await;
+
+        create(&db, input("project-a", "thread-41")).await.unwrap();
+        create(&db, input("project-a", "thread-safety"))
+            .await
+            .unwrap();
+        create(&db, input("project-a", "thread-9-notes"))
+            .await
+            .unwrap();
+        assert_eq!(
+            create(&db, unnamed("project-a")).await.unwrap().name,
+            "thread-42"
+        );
+    }
+
+    /// An address stays spent after the thread holding it stops using it.
+    ///
+    /// Renaming is this feature's designed path rather than an edge case — every
+    /// thread leaves its placeholder inside its first turn — so an allocator
+    /// reading only live names would put `thread-1` back in circulation within a
+    /// minute of handing it out, and the route captured at creation would later
+    /// open somebody else's conversation.
+    #[tokio::test]
+    async fn a_vacated_placeholder_is_never_reissued() {
+        let db = db("thread-placeholder-durability.db").await;
+        seed_project(&db, "project-a").await;
+
+        let renamed = create(&db, unnamed("project-a")).await.unwrap();
+        assert_eq!(renamed.name, "thread-1");
+        update(
+            &db,
+            UpdateThread {
+                id: renamed.id.clone(),
+                name: Some("placement".into()),
+                jurisdiction: None,
+                definition: None,
+                status: None,
+                model: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            create(&db, unnamed("project-a")).await.unwrap().name,
+            "thread-2",
+            "renaming off thread-1 does not return that address to the pool"
+        );
+
+        let deleted = create(&db, unnamed("project-a")).await.unwrap();
+        assert_eq!(deleted.name, "thread-3");
+        delete(&db, &deleted.id).await.unwrap();
+        assert_eq!(
+            create(&db, unnamed("project-a")).await.unwrap().name,
+            "thread-4",
+            "deleting the newest thread does not reissue its address either"
+        );
+    }
+
+    /// Many launches at once must produce many distinct addresses. Reading the
+    /// counter, bumping it, and inserting share one transaction, so a loser
+    /// re-runs the whole decision instead of committing a name a winner already
+    /// took — and each thread still gets exactly the one session creation
+    /// promises.
+    #[tokio::test]
+    async fn concurrent_unnamed_creates_allocate_a_contiguous_unique_run() {
+        let db = std::sync::Arc::new(db("thread-placeholder-concurrent.db").await);
+        seed_project(&db, "project-a").await;
+
+        const LAUNCHES: usize = 8;
+        let mut handles = Vec::new();
+        for _ in 0..LAUNCHES {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                create(&db, unnamed("project-a")).await
+            }));
+        }
+        let mut names = Vec::new();
+        for handle in handles {
+            names.push(
+                handle
+                    .await
+                    .unwrap()
+                    .expect("every launch gets an address")
+                    .name,
+            );
+        }
+        names.sort();
+        names.dedup();
+        let mut expected: Vec<String> = (1..=LAUNCHES).map(|n| format!("thread-{n}")).collect();
+        expected.sort();
+        assert_eq!(names, expected, "one contiguous run of unique placeholders");
+
+        let sessions = db
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM sessions s JOIN jobs j ON j.id = s.job_id
+                     WHERE j.thread_id IS NOT NULL AND {}",
+                    crate::threads::SESSION_JOB_SHAPE
+                ),
+                (),
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sessions, LAUNCHES as i64,
+            "each allocated thread has one session"
+        );
     }
 
     #[tokio::test]
@@ -349,6 +596,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sessions, 1, "retry creates thread and session together");
+    }
+
+    /// An allocated name is spent only if the whole creation commits. A session
+    /// that fails takes the suffix down with the row, so the retry is not left
+    /// stepping over a number nothing holds.
+    #[tokio::test]
+    async fn a_rolled_back_create_does_not_consume_the_allocated_suffix() {
+        let db = db("thread-placeholder-rollback.db").await;
+        seed_project(&db, "project-a").await;
+
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("ALTER TABLE sessions RENAME TO sessions_hidden", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert!(create(&db, unnamed("project-a")).await.is_err());
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("ALTER TABLE sessions_hidden RENAME TO sessions", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            create(&db, unnamed("project-a")).await.unwrap().name,
+            "thread-1",
+            "the uncommitted suffix is still free"
+        );
     }
 
     #[tokio::test]

@@ -10,6 +10,9 @@
 
 use crate::common;
 use cairn_core::internal::execution::jobs::{continue_job_or_enqueue, resume_job_from_digest};
+use cairn_core::internal::orchestrator::attention_push::{
+    has_pending_waking_live, list_pending, push, Boundary, Wake,
+};
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
 
@@ -111,6 +114,79 @@ async fn a_task_under_a_closed_thread_still_starts_turns() {
     let run = continue_job_or_enqueue(&orch, "job-task", Some("carry on"), None, Some("req-1"))
         .expect("a task the thread spawned is an ordinary job and starts its turn");
     assert_eq!(run.job_id.as_deref(), Some("job-task"));
+}
+
+/// Dormancy and retirement both stop a push being delivered, and CAIRN-4182
+/// makes it possible to confuse them. Only one is permanent.
+///
+/// A closed thread is a recipient that is not listening, not a referent that has
+/// resolved. The queued row must stay pending — not retired, not delivered, not
+/// deleted — and reopening must make the SAME row deliverable again. Mapping
+/// dormancy onto retirement would silently discard everything queued while a
+/// thread was closed, and the loss would be invisible: a push that never arrives
+/// produces no signal at all (CAIRN-2410).
+#[tokio::test(flavor = "current_thread")]
+async fn a_push_queued_before_closure_survives_dormancy_and_delivers_after_reopen() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = &orch.db.local;
+    seed_thread_session(db, "active").await;
+
+    push(
+        db,
+        "job-thread",
+        "cairn://p/PROJ/1/1/builder",
+        Wake::Wake,
+        Boundary::Event,
+        "direct:cairn://p/PROJ/1/1/builder",
+    )
+    .await
+    .unwrap();
+    let queued = list_pending(db, "job-thread").await.unwrap();
+    assert_eq!(queued.len(), 1);
+    let id = queued[0].id.clone();
+    assert!(has_pending_waking_live(db, "job-thread").await.unwrap());
+
+    set_status(db, "closed").await;
+
+    // Suspended: no wake, no delivery — and, critically, no retirement.
+    assert!(
+        !has_pending_waking_live(db, "job-thread").await.unwrap(),
+        "a dormant thread is not roused by its queued pushes"
+    );
+    assert_eq!(
+        count(db, "retired_at IS NOT NULL").await,
+        0,
+        "closing a thread suspends delivery; it does not resolve the referent"
+    );
+    assert_eq!(count(db, "delivered_event_id IS NOT NULL").await, 0);
+    assert_eq!(
+        list_pending(db, "job-thread").await.unwrap().len(),
+        1,
+        "the row is still pending, waiting for the thread to come back"
+    );
+
+    set_status(db, "active").await;
+
+    assert!(
+        has_pending_waking_live(db, "job-thread").await.unwrap(),
+        "reopening restores deliverability"
+    );
+    let after = list_pending(db, "job-thread").await.unwrap();
+    assert_eq!(after.len(), 1, "exactly one delivery, not a duplicate");
+    assert_eq!(
+        after[0].id, id,
+        "the SAME row becomes deliverable again — nothing was reconstructed"
+    );
+}
+
+async fn count(db: &LocalDb, predicate: &str) -> i64 {
+    db.query_one(
+        &format!("SELECT COUNT(*) FROM attention_pushes WHERE {predicate}"),
+        (),
+        |row| row.i64(0),
+    )
+    .await
+    .unwrap()
 }
 
 #[tokio::test(flavor = "current_thread")]

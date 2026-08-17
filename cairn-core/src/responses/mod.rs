@@ -90,7 +90,10 @@ pub fn model_capabilities(
     let presets = crate::config::presets::load_effective_presets(&orch.config_dir, project_path);
     let catalog = orch.get_model_catalog();
     let mut backends = Vec::new();
-    for backend_name in crate::backends::KNOWN_BACKENDS.iter().copied() {
+    // Enabled, not supported: a response is authored to run next, so it may
+    // only offer providers this workspace installed.
+    let enabled = orch.enabled_providers();
+    for backend_name in enabled.iter().map(String::as_str) {
         let backend = backend_for_name(Some(backend_name));
         let availability = backend.response_completion_availability(orch, project_id);
         let mut selections = Vec::new();

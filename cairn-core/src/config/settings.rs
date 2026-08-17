@@ -128,6 +128,16 @@ pub struct SettingsFile {
     tiers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    /// The providers this workspace has installed.
+    ///
+    /// Absent means the workspace predates installable providers, and is read
+    /// as "everything Cairn ships" — exactly the behavior it had — until
+    /// [`migrate_enabled_providers`] narrows it to what the workspace actually
+    /// depends on and writes the result here. Once written, this is the durable
+    /// answer: enablement is configuration the user owns, not something
+    /// re-derived from whichever credentials happen to exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_providers: Option<Vec<String>>,
 
     /// External MCP servers reachable through the `cairn://mcp/...` gateway.
     /// Keyed by server name. Project config overlays this set.
@@ -351,6 +361,55 @@ impl SettingsFile {
         crate::config::presets::tier_defaults_from_single_backend(legacy, tiers)
     }
 
+    /// The tier list this file describes, defaulted when it names none.
+    fn resolved_tiers(&self) -> Vec<String> {
+        self.tiers.clone().unwrap_or_else(|| {
+            crate::config::presets::DEFAULT_TIERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+    }
+
+    /// The providers a workspace that predates installable providers
+    /// demonstrably depends on, given the backends its stored accounts can
+    /// serve.
+    ///
+    /// Every form of dependence counts, because each one is a place the user
+    /// already told Cairn this provider matters: a tier that defaults to it, a
+    /// configured account or host, call routing pointed through it, a
+    /// subscription fee recorded against it. Credentials are one signal among
+    /// these rather than the rule — this runs exactly once and its answer
+    /// becomes durable configuration, so a credential that later expires or is
+    /// deleted leaves the provider installed and visible.
+    fn depended_on_providers(&self, credentialed: &[String]) -> Vec<String> {
+        let mut evidence: Vec<String> = self
+            .resolved_tier_defaults(&self.resolved_tiers())
+            .into_values()
+            .collect();
+        evidence.extend(credentialed.iter().cloned());
+        let routes_calls = self.route_calls_via_openrouter.unwrap_or(false)
+            || self
+                .openrouter_routing
+                .as_ref()
+                .is_some_and(|routing| *routing != OpenRouterRouting::default());
+        if routes_calls {
+            evidence.push("openrouter".to_string());
+        }
+        if let Some(fees) = &self.subscription_fees {
+            evidence.extend(
+                fees.iter()
+                    .filter(|(_, fee)| **fee > 0.0)
+                    .map(|(backend, _)| backend.clone()),
+            );
+        }
+        evidence.retain(|backend| crate::backends::catalog::is_supported(backend));
+        if evidence.is_empty() {
+            evidence.push(crate::backends::CLAUDE_FAMILY_BACKEND.to_string());
+        }
+        crate::backends::catalog::in_catalog_order(evidence)
+    }
+
     /// Convert to Settings DTO with defaults applied.
     ///
     /// Migration: if `backends` is absent but legacy model fields are present,
@@ -375,16 +434,14 @@ impl SettingsFile {
             for (name, presets) in backends.clone() {
                 merged.insert(name, presets);
             }
-            let tiers = self.tiers.clone().unwrap_or_else(|| {
-                crate::config::presets::DEFAULT_TIERS
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            });
+            let tiers = self.resolved_tiers();
             PresetsConfig {
                 tier_defaults: self.resolved_tier_defaults(&tiers),
                 tiers,
                 backends: merged,
+                // Carried on the Settings DTO instead; `load_effective_presets`
+                // is where enablement joins a resolution config.
+                enabled_providers: None,
             }
         } else {
             // Legacy migration: build default presets, then overlay legacy model fields.
@@ -413,6 +470,14 @@ impl SettingsFile {
             tier_defaults: presets.tier_defaults,
             tiers: presets.tiers,
             backends: presets.backends,
+            enabled_providers: match &self.enabled_providers {
+                Some(enabled) => crate::backends::catalog::in_catalog_order(enabled),
+                // Un-migrated: every shipped provider, which is the surface this
+                // workspace already had. `migrate_enabled_providers` narrows it.
+                None => crate::backends::catalog::supported_keys()
+                    .map(str::to_string)
+                    .collect(),
+            },
             system_prompt: String::new(), // Deprecated, always empty
             max_thinking_tokens,
             merge_type: self.merge_type.clone().unwrap_or(MergeType::Squash),
@@ -463,6 +528,7 @@ impl SettingsFile {
             active_backend: None,
             tiers: Some(settings.tiers.clone()),
             backends: Some(settings.backends.clone()),
+            enabled_providers: Some(settings.enabled_providers.clone()),
             mcp_servers: None,
             default_model: None,
             preferred_models: None,
@@ -702,10 +768,10 @@ pub fn set_accepted_fence_command(
 }
 
 /// Persist the `enabled` flag for one build service into the `buildServices`
-/// mapping of `settings.yaml`, materializing the built-in defaults into the file
-/// first if it has no `buildServices` block yet (so a toggle of the default
-/// sccache entry persists). Surgical: only the `buildServices` key is touched,
-/// every other setting and the header comment are preserved.
+/// mapping of `settings.yaml`. Every service is user-configured — there are no
+/// built-in entries — so toggling a name this workspace has not configured is an
+/// error rather than a materialized default. Surgical: only the `buildServices`
+/// key is touched, every other setting and the header comment are preserved.
 pub fn set_build_service_enabled(
     config_dir: &std::path::Path,
     name: &str,
@@ -720,9 +786,8 @@ pub fn set_build_service_enabled(
     })
 }
 
-/// Insert or replace one build service. Starts from the effective map
-/// (configured or built-in default) so adding a sibling preserves the default
-/// sccache entry; writing materializes the whole map into the file.
+/// Insert or replace one build service, preserving the workspace's other
+/// configured services; writing materializes the whole map into the file.
 pub fn upsert_build_service(
     config_dir: &std::path::Path,
     name: &str,
@@ -734,9 +799,9 @@ pub fn upsert_build_service(
     })
 }
 
-/// Remove one build service by name. Writes the remaining map verbatim — an
-/// empty result persists as `buildServices: {}` (explicitly no services),
-/// distinct from an absent block (which yields the built-in default).
+/// Remove one build service by name. Writes the remaining map verbatim; an
+/// empty result persists as `buildServices: {}`, which reads back the same as
+/// an absent block — no services.
 pub fn delete_build_service(config_dir: &std::path::Path, name: &str) -> Result<(), String> {
     mutate_build_services(config_dir, |map| {
         map.remove(name);
@@ -822,6 +887,7 @@ const SETTINGS_DTO_KEYS: &[&str] = &[
     "activeBackend",
     "tiers",
     "backends",
+    "enabledProviders",
     // Removed DTO keys remain here so the next save deletes stale YAML.
     "branchPrefix",
     "maxThinkingTokens",
@@ -888,10 +954,134 @@ pub fn update_settings(
             serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
                 .map_err(|error| format!("Failed to parse settings file: {error}"))?;
         let mut current = file.to_settings();
+        let enablement_changed = input.enabled_providers.is_some();
         apply_settings_update(&mut current, input);
+        validate_enabled_providers(&current, enablement_changed)?;
         merge_settings_keys(root, &current)?;
         Ok(current)
     })
+}
+
+/// Record which providers an existing workspace has installed, once.
+///
+/// `credentialed` is the set of backend keys the workspace's stored accounts
+/// can serve; the caller supplies it because credentials live in the identity
+/// store, not in `settings.yaml`. Returns the set it wrote, or `None` when the
+/// workspace has already answered this question — running it again must never
+/// re-derive enablement from current credentials, which is precisely the
+/// coupling this setting exists to break.
+pub fn migrate_enabled_providers(
+    config_dir: &std::path::Path,
+    credentialed: &[String],
+) -> Result<Option<Vec<String>>, String> {
+    mutate_workspace_settings(config_dir, "cairn: record installed providers", |root| {
+        let key = serde_yaml::Value::String("enabledProviders".to_string());
+        if root.contains_key(&key) {
+            return Ok(None);
+        }
+        let file: SettingsFile =
+            serde_yaml::from_value(serde_yaml::Value::Mapping(root.clone()))
+                .map_err(|error| format!("Failed to parse settings file: {error}"))?;
+        let enabled = file.depended_on_providers(credentialed);
+        let value = serde_yaml::to_value(&enabled)
+            .map_err(|error| format!("Failed to serialize installed providers: {error}"))?;
+        root.insert(key, value);
+        Ok(Some(enabled))
+    })
+}
+
+/// Refuse an enablement change that would leave configuration pointing at a
+/// provider the workspace no longer has.
+///
+/// Removal is prospective configuration, so it may not quietly rewrite the
+/// user's other choices to make itself valid, and it may not leave a tier
+/// resolving to nothing. Each refusal names the exact obstacle and the change
+/// that would clear it, so the caller can offer a replacement in the same
+/// update. Credentials are never consulted here: removing a provider from a
+/// workspace does not touch its stored accounts.
+fn validate_enabled_providers(settings: &Settings, enablement_changed: bool) -> Result<(), String> {
+    use crate::backends::catalog;
+    if settings.enabled_providers.is_empty() {
+        return Err(
+            "A workspace needs at least one provider. Add a provider before removing this one."
+                .to_string(),
+        );
+    }
+    if let Some(unknown) = settings
+        .enabled_providers
+        .iter()
+        .find(|key| !catalog::is_supported(key))
+    {
+        return Err(format!(
+            "Unknown provider '{unknown}'. This version of Cairn ships: {}.",
+            catalog::supported_keys().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let label = |key: &str| {
+        catalog::descriptor(key)
+            .map(|entry| entry.display_name.to_string())
+            .unwrap_or_else(|| key.to_string())
+    };
+    let enabled = |key: &str| settings.enabled_providers.iter().any(|entry| entry == key);
+
+    let mut stranded: Vec<(String, Vec<String>)> = Vec::new();
+    for (tier, backend) in &settings.tier_defaults {
+        if enabled(backend) {
+            continue;
+        }
+        match stranded.iter_mut().find(|(name, _)| name == backend) {
+            Some((_, tiers)) => tiers.push(tier.clone()),
+            None => stranded.push((backend.clone(), vec![tier.clone()])),
+        }
+    }
+    if let Some((backend, tiers)) = stranded.first_mut() {
+        tiers.sort();
+        return Err(format!(
+            "{} still serves {} {}. Assign {} another provider in the same change, or keep {}.",
+            label(backend),
+            if tiers.len() == 1 { "tier" } else { "tiers" },
+            tiers.join(", "),
+            if tiers.len() == 1 {
+                "that tier"
+            } else {
+                "those tiers"
+            },
+            label(backend),
+        ));
+    }
+
+    // A tier default naming a provider with no preset for that tier resolves
+    // through the tier's first defined provider instead — a redirect nobody
+    // asked for. Tolerated where it already exists, refused where an enablement
+    // change would be the thing that created it.
+    if enablement_changed {
+        for tier in &settings.tiers {
+            let Some(backend) = settings.tier_defaults.get(tier) else {
+                continue;
+            };
+            let serves = settings
+                .backends
+                .get(backend)
+                .is_some_and(|presets| presets.contains_key(tier));
+            if !serves {
+                return Err(format!(
+                    "{} has no model for tier {tier}, so it cannot serve it. Give it one in the tier matrix, or point that tier at a provider that already assigns it a model.",
+                    label(backend)
+                ));
+            }
+        }
+    }
+
+    if settings.route_calls_via_openrouter && !enabled("openrouter") {
+        return Err(
+            "This workspace routes tier-based calls through OpenRouter. Turn that off in the \
+             same change, or keep OpenRouter."
+                .to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
@@ -905,6 +1095,9 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     }
     if let Some(value) = input.backends {
         current.backends = value;
+    }
+    if let Some(value) = input.enabled_providers {
+        current.enabled_providers = crate::backends::catalog::in_catalog_order(value);
     }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
@@ -1553,24 +1746,41 @@ buildServices:
     }
 
     #[test]
-    fn set_build_service_enabled_materializes_default_and_preserves_other_settings() {
+    fn toggling_a_build_service_is_surgical_and_preserves_other_settings() {
+        use crate::config::build_services::BuildServiceConfig;
         let temp = TempDir::new().unwrap();
         let dir = temp.path();
         std::fs::write(get_settings_path(dir), "logLevel: verbose\n").unwrap();
 
-        // No buildServices block yet: toggling the default entry materializes it.
-        set_build_service_enabled(dir, "sccache", false).unwrap();
-        assert!(!load_build_services(dir)["sccache"].enabled);
+        // Every build service is user-configured: #3493 replaced the managed
+        // sccache default with Cargo dependency catalogs, so there is no
+        // built-in entry for a toggle to find.
+        assert!(
+            set_build_service_enabled(dir, "nope", true).is_err(),
+            "a service this workspace never configured cannot be toggled"
+        );
+        assert!(load_build_services(dir).is_empty());
+
+        let config: BuildServiceConfig =
+            serde_yaml::from_str("start: [\"my-daemon\", \"--serve\"]\n").unwrap();
+        upsert_build_service(dir, "my-daemon", &config).unwrap();
+
+        set_build_service_enabled(dir, "my-daemon", false).unwrap();
+        assert!(!load_build_services(dir)["my-daemon"].enabled);
         assert!(
             load_settings_file(dir).unwrap().build_services.is_some(),
             "toggle must write an explicit buildServices block"
         );
-        // Unrelated settings survive the surgical write.
 
-        // Toggle back on; unknown service errors.
-        set_build_service_enabled(dir, "sccache", true).unwrap();
-        assert!(load_build_services(dir)["sccache"].enabled);
-        assert!(set_build_service_enabled(dir, "nope", true).is_err());
+        set_build_service_enabled(dir, "my-daemon", true).unwrap();
+        assert!(load_build_services(dir)["my-daemon"].enabled);
+
+        // The surgical write leaves every unrelated setting alone — which the
+        // old comment claimed and nothing checked.
+        assert_eq!(
+            load_settings_file(dir).unwrap().log_level,
+            Some(LogLevel::Verbose)
+        );
     }
 
     #[test]
@@ -2516,5 +2726,299 @@ buildSlots:
         let mut fleet = crate::fleet::FleetConfig::default();
         fleet.cpu_admission.clear_utilization = fleet.cpu_admission.entry_utilization;
         assert!(fleet.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod enabled_provider_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_settings(dir: &std::path::Path, yaml: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(get_settings_path(dir), yaml).unwrap();
+    }
+
+    fn recorded(dir: &std::path::Path) -> Option<Vec<String>> {
+        load_settings_file(dir).unwrap().enabled_providers
+    }
+
+    fn installed(dir: &std::path::Path) -> Vec<String> {
+        load_settings(dir).enabled_providers
+    }
+
+    #[test]
+    fn an_unmigrated_workspace_still_sees_every_shipped_provider() {
+        // Absent is not "nothing installed"; it is "never asked". Reading it as
+        // the full catalog is what makes this change invisible until the
+        // migration has actually looked at the workspace's evidence.
+        let file: SettingsFile = serde_yaml::from_str("tiers: [sm, md, lg]\n").unwrap();
+        let expected: Vec<String> = crate::backends::catalog::supported_keys()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(file.to_settings().enabled_providers, expected);
+    }
+
+    #[test]
+    fn migration_keeps_every_provider_the_workspace_depends_on() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            r#"
+tiers:
+  - sm
+  - md
+  - lg
+tierDefaults:
+  sm: ollama
+  md: claude
+  lg: claude
+routeCallsViaOpenRouter: true
+"#,
+        );
+
+        // "native" is a credential target, not a shipped provider; it drops out.
+        let enabled = migrate_enabled_providers(
+            temp.path(),
+            &["opencode-go".to_string(), "native".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            enabled,
+            vec!["claude", "openrouter", "opencode-go", "ollama"]
+        );
+        assert_eq!(recorded(temp.path()).unwrap(), enabled);
+        assert!(
+            !enabled.contains(&"codex".to_string()),
+            "a provider nothing depends on is not installed by the migration"
+        );
+    }
+
+    #[test]
+    fn a_recorded_subscription_fee_counts_as_dependence() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "tiers: [sm, md, lg]\nsubscriptionFees:\n  codex: 200.0\n",
+        );
+        let enabled = migrate_enabled_providers(temp.path(), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(enabled, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn a_legacy_global_backend_installs_the_provider_it_named() {
+        let temp = TempDir::new().unwrap();
+        write_settings(temp.path(), "activeBackend: codex\ntiers: [sm, md, lg]\n");
+        let enabled = migrate_enabled_providers(temp.path(), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(enabled, vec!["codex"]);
+    }
+
+    #[test]
+    fn a_fresh_workspace_installs_the_provider_its_tiers_default_to() {
+        let temp = TempDir::new().unwrap();
+        let enabled = migrate_enabled_providers(temp.path(), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(enabled, vec!["claude"]);
+        assert_eq!(installed(temp.path()), vec!["claude"]);
+    }
+
+    #[test]
+    fn enablement_is_recorded_once_and_never_re_derived_from_credentials() {
+        let temp = TempDir::new().unwrap();
+        write_settings(temp.path(), "tiers: [sm, md, lg]\n");
+        let first = migrate_enabled_providers(temp.path(), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, vec!["claude"]);
+
+        // A credential added later does not install a provider, and a
+        // credential removed later does not uninstall one.
+        let second = migrate_enabled_providers(temp.path(), &["ollama".to_string()]).unwrap();
+        assert!(second.is_none(), "the migration must not run twice");
+        assert_eq!(recorded(temp.path()).unwrap(), first);
+    }
+
+    #[test]
+    fn removing_a_provider_a_tier_still_defaults_to_is_refused_with_the_obstacle_named() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            r#"
+enabledProviders:
+  - claude
+  - codex
+tiers: [sm, md, lg]
+tierDefaults:
+  sm: codex
+  md: claude
+  lg: claude
+"#,
+        );
+
+        let error = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec!["claude".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("OpenAI"), "{error}");
+        assert!(error.contains("sm"), "{error}");
+        assert_eq!(
+            recorded(temp.path()).unwrap(),
+            vec!["claude", "codex"],
+            "a refused removal leaves the workspace exactly as it was"
+        );
+    }
+
+    #[test]
+    fn a_removal_that_reassigns_the_stranded_tier_succeeds_and_keeps_its_presets() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            r#"
+enabledProviders:
+  - claude
+  - codex
+tiers: [sm, md, lg]
+tierDefaults:
+  sm: codex
+  md: claude
+  lg: claude
+backends:
+  codex:
+    sm:
+      model: gpt-5.3-codex
+"#,
+        );
+
+        let settings = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec!["claude".to_string()]),
+                tier_defaults: Some(HashMap::from([
+                    ("sm".to_string(), "claude".to_string()),
+                    ("md".to_string(), "claude".to_string()),
+                    ("lg".to_string(), "claude".to_string()),
+                ])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(settings.enabled_providers, vec!["claude"]);
+        // Disabling is prospective configuration, not deletion: the removed
+        // provider's tier assignments survive so re-adding it restores them.
+        assert_eq!(
+            settings.backends["codex"]["sm"].model.as_str(),
+            "gpt-5.3-codex"
+        );
+    }
+
+    #[test]
+    fn removing_openrouter_while_calls_route_through_it_is_refused() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            r#"
+enabledProviders:
+  - claude
+  - openrouter
+tiers: [sm, md, lg]
+tierDefaults:
+  sm: claude
+  md: claude
+  lg: claude
+routeCallsViaOpenRouter: true
+"#,
+        );
+
+        let error = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec!["claude".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("OpenRouter"), "{error}");
+
+        // Turning the routing off in the same change clears the obstacle.
+        let settings = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec!["claude".to_string()]),
+                route_calls_via_openrouter: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(settings.enabled_providers, vec!["claude"]);
+    }
+
+    #[test]
+    fn an_unknown_or_empty_provider_set_is_refused() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude]\ntiers: [sm, md, lg]\n",
+        );
+
+        let unknown = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec!["claude".to_string(), "gemini".to_string()]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(unknown.contains("gemini"), "{unknown}");
+
+        let empty = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(Vec::new()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(empty.contains("at least one provider"), "{empty}");
+    }
+
+    #[test]
+    fn adding_a_provider_normalizes_to_catalog_order_and_round_trips() {
+        let temp = TempDir::new().unwrap();
+        write_settings(
+            temp.path(),
+            "enabledProviders: [claude]\ntiers: [sm, md, lg]\n",
+        );
+
+        let settings = update_settings(
+            temp.path(),
+            UpdateSettings {
+                enabled_providers: Some(vec![
+                    "ollama".to_string(),
+                    "claude".to_string(),
+                    "openrouter".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            settings.enabled_providers,
+            vec!["claude", "openrouter", "ollama"]
+        );
+        assert_eq!(installed(temp.path()), settings.enabled_providers);
     }
 }

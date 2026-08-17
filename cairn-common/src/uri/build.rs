@@ -102,6 +102,12 @@ pub fn build_project_issues_uri(project: &str) -> String {
     format!("{}/issues", build_project_uri(project))
 }
 
+/// One project's own slice of the post corpus — where a project-scoped post's
+/// rendered scope points.
+pub fn build_project_posts_uri(project: &str) -> String {
+    format!("{}/posts", build_project_uri(project))
+}
+
 pub fn build_issue_uri(project: &str, number: i32) -> String {
     format!("{}/{}", build_project_uri(project), number)
 }
@@ -856,7 +862,7 @@ impl CairnResource {
             Self::ProjectIssues { project } => build_project_issues_uri(project),
             Self::Posts => "cairn://posts".to_string(),
             Self::Post { id } => format!("cairn://posts/{id}"),
-            Self::ProjectPosts { project } => format!("{}/posts", build_project_uri(project)),
+            Self::ProjectPosts { project } => build_project_posts_uri(project),
             Self::ProjectCheckResults { project, revision } => {
                 build_project_check_results_uri(project, revision)
             }

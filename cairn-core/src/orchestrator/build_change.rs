@@ -85,7 +85,8 @@ pub async fn record_boot(
                     "SELECT n.id FROM attention_pushes p
                      JOIN build_change_notifications n
                        ON p.content_ref=?1 || n.id
-                     WHERE p.recipient=?2 AND p.key=?3 AND p.delivered_event_id IS NULL
+                     WHERE p.recipient=?2 AND p.key=?3
+                       AND p.delivered_event_id IS NULL AND p.retired_at IS NULL
                      LIMIT 1",
                     params![CONTENT_REF_PREFIX, recipient.as_str(), PUSH_KEY],
                 ).await?;
@@ -102,7 +103,8 @@ pub async fn record_boot(
                     ).await?;
                     conn.execute(
                         "UPDATE attention_pushes SET created_at=?1
-                         WHERE recipient=?2 AND key=?3 AND delivered_event_id IS NULL",
+                         WHERE recipient=?2 AND key=?3
+                           AND delivered_event_id IS NULL AND retired_at IS NULL",
                         params![booted_at, recipient.as_str(), PUSH_KEY],
                     ).await?;
                 } else {

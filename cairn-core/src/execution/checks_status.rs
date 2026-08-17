@@ -13,50 +13,51 @@ use crate::execution::inputs::{
 };
 use crate::execution::selection::plan_checks;
 use crate::jj::{logical_changed_files, logical_tree_hash, JjEnv};
+use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
-
-type SettledStatusCell = tokio::sync::OnceCell<Option<Vec<NodeCheckStatus>>>;
-
-#[derive(Default)]
-struct NodeCheckStatusCacheState {
-    generations: HashMap<String, u64>,
-    cells: HashMap<(String, u64), Arc<SettledStatusCell>>,
-    projects: HashMap<String, String>,
-}
+use std::sync::Mutex;
 
 /// In-process materialization of the exact settled check planner projection.
 ///
 /// The generation is the cache's correctness key: every mutation of a job's
 /// logical head/tree, live base, contract, results, runtime attempt, or lifecycle
-/// advances it. Keeping the generation beside the single-flight cell closes the
+/// advances it. The shared [`GenerationCache`] closes the
 /// invalidation-during-compute race: a reader whose miss finishes after an
 /// invalidation retries against the new generation instead of returning stale
 /// work.
-#[derive(Default)]
+///
+/// The one thing layered on top of the primitive here is a job-to-project map, so
+/// a check result recorded for a project can invalidate every job of that project
+/// without the caller having to enumerate them.
 pub(crate) struct NodeCheckStatusCache {
-    state: Mutex<NodeCheckStatusCacheState>,
+    cache: GenerationCache<Vec<NodeCheckStatus>>,
+    projects: Mutex<HashMap<String, String>>,
+}
+
+impl Default for NodeCheckStatusCache {
+    fn default() -> Self {
+        Self {
+            cache: GenerationCache::new("node check projection"),
+            projects: Mutex::new(HashMap::new()),
+        }
+    }
 }
 
 impl NodeCheckStatusCache {
     fn bind_project(&self, job_id: &str, project_id: &str) {
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .projects
-                .insert(job_id.to_string(), project_id.to_string());
+        if let Ok(mut projects) = self.projects.lock() {
+            projects.insert(job_id.to_string(), project_id.to_string());
         }
     }
 
     pub(crate) fn invalidate_project_results(&self, project_id: &str) {
         let jobs = self
-            .state
+            .projects
             .lock()
-            .map(|state| {
-                state
-                    .projects
+            .map(|projects| {
+                projects
                     .iter()
                     .filter(|(_, cached_project)| cached_project.as_str() == project_id)
                     .map(|(job_id, _)| job_id.clone())
@@ -69,17 +70,7 @@ impl NodeCheckStatusCache {
     }
 
     pub(crate) fn invalidate(&self, job_id: &str, reason: &'static str) {
-        if let Ok(mut state) = self.state.lock() {
-            let generation = state.generations.entry(job_id.to_string()).or_default();
-            *generation = generation.wrapping_add(1);
-            let generation = *generation;
-            state
-                .cells
-                .retain(|(cached_job, _), _| cached_job != job_id);
-            log::debug!(
-                "node check projection cache invalidated job={job_id} generation={generation} reason={reason}"
-            );
-        }
+        self.cache.invalidate(job_id, reason);
     }
 
     async fn get_or_compute<F, Fut>(&self, job_id: &str, compute: F) -> Option<Vec<NodeCheckStatus>>
@@ -87,67 +78,7 @@ impl NodeCheckStatusCache {
         F: Fn() -> Fut,
         Fut: Future<Output = Option<Vec<NodeCheckStatus>>>,
     {
-        loop {
-            let (generation, cell, state_kind) = {
-                let mut state = self.state.lock().ok()?;
-                let generation = *state.generations.entry(job_id.to_string()).or_default();
-                let key = (job_id.to_string(), generation);
-                let state_kind = state.cells.get(&key).map_or("miss", |cell| {
-                    if cell.get().is_some() {
-                        "hit"
-                    } else {
-                        "coalesced"
-                    }
-                });
-                let cell = state
-                    .cells
-                    .entry(key)
-                    .or_insert_with(|| Arc::new(SettledStatusCell::new()))
-                    .clone();
-                (generation, cell, state_kind)
-            };
-            log::debug!(
-                "node check projection cache {} job={job_id} generation={} reason={}",
-                state_kind,
-                generation,
-                if state_kind == "hit" {
-                    "same-generation"
-                } else {
-                    "not-materialized"
-                }
-            );
-            let started = Instant::now();
-            let value = cell.get_or_init(&compute).await.clone();
-            if state_kind == "miss" {
-                log::info!(
-                    "node check projection computed job={job_id} generation={} duration_ms={}",
-                    generation,
-                    started.elapsed().as_millis()
-                );
-            }
-            let current = self
-                .state
-                .lock()
-                .ok()?
-                .generations
-                .get(job_id)
-                .copied()
-                .unwrap_or_default();
-            if current == generation && value.is_some() {
-                return value;
-            }
-            if current == generation {
-                if let Ok(mut state) = self.state.lock() {
-                    state.cells.remove(&(job_id.to_string(), generation));
-                }
-                return None;
-            }
-            log::debug!(
-                "node check projection cache retry job={job_id} generation={} current_generation={} reason=invalidated-during-compute",
-                generation,
-                current
-            );
-        }
+        self.cache.get_or_compute(job_id, compute).await
     }
 }
 
@@ -861,6 +792,7 @@ pub(crate) fn formatted_failure_names(status: &NodeCheckStatus) -> Option<String
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn settled_projection_coalesces_concurrent_misses_and_reuses_warm_value() {

@@ -1,5 +1,6 @@
 //! Issue and comment types.
 
+use cairn_common::identity::display::PrincipalDisplay;
 use cairn_common::identity::PrincipalRef;
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +43,12 @@ pub struct Issue {
     /// Principal that created this issue. Historical issues predate attribution.
     #[serde(default)]
     pub author: Option<PrincipalRef>,
+    /// How `author` reads to a person, resolved server-side against alias
+    /// registries only the backend can see. `None` means this projection was
+    /// never resolved (or there is no author to resolve), and a surface falls
+    /// back to spelling the raw ref — it never maps an alias itself.
+    #[serde(default)]
+    pub author_display: Option<PrincipalDisplay>,
     pub backend_override: Option<String>,
     /// Timestamp when the issue's PR was merged (resolution)
     pub merged_at: Option<i64>,

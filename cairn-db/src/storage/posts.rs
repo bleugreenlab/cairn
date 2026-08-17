@@ -67,6 +67,7 @@ pub(super) fn map_post(row: &turso::Row) -> DbResult<Post> {
         content: row.text(3)?,
         author,
         appearance,
+        author_display: None,
         created_at: row.i64(6)?,
     })
 }
@@ -79,6 +80,7 @@ fn map_comment(row: &turso::Row) -> DbResult<PostComment> {
         content: row.text(2)?,
         author,
         appearance,
+        author_display: None,
         created_at: row.i64(5)?,
     })
 }

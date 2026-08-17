@@ -66,7 +66,7 @@ pub(super) async fn dispatch(
                     &db,
                     CreateThread {
                         project_id,
-                        name: name.to_string(),
+                        name: Some(name.to_string()),
                         jurisdiction,
                         definition: None,
                         migrated_from_number: None,

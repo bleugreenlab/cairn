@@ -63,25 +63,30 @@ impl VoiceService {
             move |event| {
                 let event = match event {
                     InstallEvent::Started {
+                        operation_id,
                         component,
                         total_bytes,
                     } => VoiceEvent::DownloadStarted {
-                        operation_id: component.clone(),
+                        operation_id,
                         component,
                         total_bytes,
                     },
                     InstallEvent::Progress {
+                        operation_id,
                         component,
                         downloaded_bytes,
                         total_bytes,
                     } => VoiceEvent::DownloadProgress {
-                        operation_id: component.clone(),
+                        operation_id,
                         component,
                         downloaded_bytes,
                         total_bytes,
                     },
-                    InstallEvent::Finished { component } => VoiceEvent::DownloadFinished {
-                        operation_id: component.clone(),
+                    InstallEvent::Finished {
+                        operation_id,
+                        component,
+                    } => VoiceEvent::DownloadFinished {
+                        operation_id,
                         component,
                     },
                 };

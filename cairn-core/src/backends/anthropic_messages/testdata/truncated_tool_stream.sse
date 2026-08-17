@@ -1,0 +1,14 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_trunc_0001","type":"message","role":"assistant","stop_reason":null,"stop_sequence":null,"model":"minimax-m3","content":[],"usage":{"input_tokens":0,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_cut","name":"write","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"changes\":[{\"target\":\"file:a.rs\",\"mode\":\"create\",\"payload\":{\"content\":\"fn main"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"input_tokens":900,"output_tokens":4096}}
+
+event: message_stop
+data: {"type":"message_stop"}

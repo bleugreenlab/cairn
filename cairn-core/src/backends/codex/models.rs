@@ -209,6 +209,7 @@ pub(super) fn discover_codex_models(
                 supported_parameters: Vec::new(),
                 router: false,
                 architecture_modality: None,
+                wire_protocol: None,
             })
             .collect();
         merge_fallback_models(&mut models);
@@ -312,6 +313,7 @@ fn fallback_model(
         supported_parameters: Vec::new(),
         router: false,
         architecture_modality: None,
+        wire_protocol: None,
     }
 }
 

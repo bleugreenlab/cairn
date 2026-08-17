@@ -112,6 +112,7 @@ fn post(id: i64, project_id: Option<&str>, author: &str, content: &str) -> Post 
         content: content.to_string(),
         appearance: appearance(&author),
         author,
+        author_display: None,
         created_at: 1,
     }
 }
@@ -124,6 +125,7 @@ fn comment(id: i64, post_id: i64, author: &str, content: &str) -> PostComment {
         content: content.to_string(),
         appearance: appearance(&author),
         author,
+        author_display: None,
         created_at: 2,
     }
 }
@@ -656,6 +658,7 @@ async fn a_non_agent_author_has_no_home_to_wake() {
         content: "from a person".to_string(),
         appearance: appearance(&author),
         author,
+        author_display: None,
         created_at: 1,
     };
 

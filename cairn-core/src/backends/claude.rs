@@ -1731,6 +1731,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
             supported_parameters: Vec::new(),
             router: false,
             architecture_modality: None,
+            wire_protocol: None,
         },
         DiscoveredModel {
             id: "sonnet".to_string(),
@@ -1751,6 +1752,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
             supported_parameters: Vec::new(),
             router: false,
             architecture_modality: None,
+            wire_protocol: None,
         },
         DiscoveredModel {
             id: "opus".to_string(),
@@ -1768,6 +1770,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
             supported_parameters: Vec::new(),
             router: false,
             architecture_modality: None,
+            wire_protocol: None,
         },
         DiscoveredModel {
             id: "fable".to_string(),
@@ -1788,6 +1791,7 @@ fn discover_claude_models() -> Result<Vec<DiscoveredModel>, String> {
             supported_parameters: Vec::new(),
             router: false,
             architecture_modality: None,
+            wire_protocol: None,
         },
     ])
 }

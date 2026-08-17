@@ -3,7 +3,9 @@ use super::models::{build_catalog, decode_published_metadata, decode_subscriptio
 use super::{OpenCodeBackend, DEFAULT_MODEL, OPENCODE_BACKEND_KEY};
 use crate::agent_process::stdin::MessageContent;
 use crate::backends::openai_compat::wire::ChatMessage;
-use crate::backends::{AgentBackend, DiscoveredModel, SessionConfig, SessionStart};
+use crate::backends::{
+    AgentBackend, DiscoveredModel, DiscoveredWireProtocol, SessionConfig, SessionStart,
+};
 use crate::config::presets::default_presets_config;
 use crate::models::Model;
 use serde_json::json;
@@ -156,39 +158,78 @@ fn published_price_per_million_becomes_price_per_token() {
 }
 
 #[test]
-fn models_on_endpoints_cairn_cannot_speak_are_carried_but_not_offered() {
+fn every_recognized_endpoint_family_is_offered_and_records_how_to_reach_it() {
+    // Cairn speaks all three of Go's families, so each is selectable — and each
+    // carries the protocol that decides which endpoint its session will reach.
     let catalog = catalog();
 
-    let minimax = entry(&catalog, "minimax-m3");
-    assert!(minimax.hidden, "an Anthropic Messages model is not offered");
-    let reason = minimax.description.as_deref().unwrap_or_default();
-    assert!(
-        reason.contains("Anthropic Messages"),
-        "the entry names the endpoint family that serves it: {reason}"
+    let glm = entry(&catalog, "glm-5.2");
+    assert!(!glm.hidden);
+    assert_eq!(
+        glm.wire_protocol,
+        Some(DiscoveredWireProtocol::OpenAiChatCompletions)
     );
-    assert!(
-        reason.contains("MiniMax multimodal coding model"),
-        "the published description is kept alongside the reason: {reason}"
+
+    let minimax = entry(&catalog, "minimax-m3");
+    assert!(!minimax.hidden, "an Anthropic Messages model is offered");
+    assert_eq!(
+        minimax.wire_protocol,
+        Some(DiscoveredWireProtocol::AnthropicMessages)
+    );
+    // Its own published description survives, with no leftover apology about an
+    // endpoint Cairn could not speak.
+    assert_eq!(
+        minimax.description.as_deref(),
+        Some("MiniMax multimodal coding model")
     );
 
     let grok = entry(&catalog, "grok-4.5");
-    assert!(grok.hidden, "an OpenAI Responses model is not offered");
-    assert!(grok
-        .description
-        .as_deref()
-        .unwrap_or_default()
-        .contains("OpenAI Responses"));
+    assert!(!grok.hidden, "an OpenAI Responses model is offered");
+    assert_eq!(
+        grok.wire_protocol,
+        Some(DiscoveredWireProtocol::OpenAiResponses)
+    );
+}
+
+#[test]
+fn the_protocol_survives_a_catalog_round_trip() {
+    // The catalog is persisted and reloaded, so routing tomorrow has to reach
+    // the same endpoint as routing today.
+    let minimax = entry(&catalog(), "minimax-m3").clone();
+    let json = serde_json::to_string(&minimax).expect("a catalog entry serializes");
+    let restored: DiscoveredModel = serde_json::from_str(&json).expect("and deserializes");
+
+    assert_eq!(
+        restored.wire_protocol,
+        Some(DiscoveredWireProtocol::AnthropicMessages)
+    );
+    assert_eq!(restored, minimax);
+}
+
+#[test]
+fn a_catalog_entry_written_before_protocols_existed_claims_none() {
+    // Absence must never read as "chat completions": that guess is what sends a
+    // Messages-only model to an endpoint which cannot answer it.
+    let legacy = r#"{"id":"x","model":"x","displayName":"X","description":null,
+                    "defaultReasoningEffort":null}"#;
+    let restored: DiscoveredModel = serde_json::from_str(legacy).expect("legacy entries load");
+    assert_eq!(restored.wire_protocol, None);
 }
 
 #[test]
 fn an_unrecognized_sdk_package_is_not_assumed_compatible() {
     // A package Cairn has no mapping for could be any protocol. Guessing
     // chat/completions would fail in the middle of a session instead of before
-    // one starts, so the model is carried unselectable.
+    // one starts, so the model is carried unselectable and says so.
     let ids = vec!["some-future-model".to_string()];
     let published = decode_published_metadata(METADATA_BODY).expect("metadata decodes");
     let catalog = build_catalog(&ids, &published);
+
     assert!(catalog[0].hidden);
+    assert_eq!(
+        catalog[0].wire_protocol,
+        Some(DiscoveredWireProtocol::Unknown)
+    );
 }
 
 #[test]
@@ -197,11 +238,60 @@ fn a_subscription_id_with_no_published_metadata_is_accounted_for_not_dropped() {
     let preview = entry(&catalog, "hy3-preview");
     assert!(preview.hidden);
     assert_eq!(preview.context_window, None);
+    // No metadata means no published package, so there is no protocol to claim.
+    assert_eq!(preview.wire_protocol, None);
     assert!(preview
         .description
         .as_deref()
         .unwrap_or_default()
         .contains("has not published its metadata"));
+}
+
+#[test]
+fn each_family_addresses_its_own_endpoint() {
+    // The three endpoints are the whole reason protocol routing exists; a
+    // transposition here sends a model somewhere that cannot answer it.
+    assert_eq!(
+        super::http::CHAT_URL,
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    );
+    assert_eq!(
+        super::http::messages_endpoint("k").url,
+        "https://opencode.ai/zen/go/v1/messages"
+    );
+    assert_eq!(
+        super::http::responses_endpoint("k").url,
+        "https://opencode.ai/zen/go/v1/responses"
+    );
+}
+
+#[test]
+fn the_messages_endpoint_authenticates_the_way_that_endpoint_actually_requires() {
+    // Verified against the live gateway on 2026-08-16: Go's Messages endpoint
+    // takes Anthropic's own `x-api-key` header and refuses a Bearer token with
+    // "Missing API key", while its other two endpoints take Bearer. Getting this
+    // backwards is a 401 on every Messages turn.
+    let messages = super::http::messages_endpoint("secret");
+    let header = |endpoint: &[(String, String)], name: &str| {
+        endpoint
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        header(&messages.headers, "x-api-key").as_deref(),
+        Some("secret")
+    );
+    assert!(header(&messages.headers, "authorization").is_none());
+    // Mandatory on this protocol: omitting it is an upstream 500, not a default.
+    assert!(messages.max_output_tokens > 0);
+
+    let responses = super::http::responses_endpoint("secret");
+    assert_eq!(
+        header(&responses.headers, "authorization").as_deref(),
+        Some("Bearer secret")
+    );
+    assert!(header(&responses.headers, "x-api-key").is_none());
 }
 
 /// A chat/completions model whose published metadata says it cannot call tools.
@@ -243,10 +333,26 @@ fn a_tool_calling_model_on_a_served_endpoint_can_start_a_session() {
 
 #[test]
 fn a_session_on_an_unservable_model_is_refused_with_the_catalogs_own_reason() {
+    let published = decode_published_metadata(METADATA_BODY).expect("metadata decodes");
+    let unknown = build_catalog(&["some-future-model".to_string()], &published)
+        .pop()
+        .expect("the fixture yields one model");
+    let reason = super::session_blocker(&unknown, "some-future-model")
+        .expect("a model Cairn cannot place cannot run a session");
+    assert!(reason.contains("no mapping for"), "{reason}");
+}
+
+#[test]
+fn a_model_on_a_recognized_family_can_start_a_session() {
+    // Every family Cairn has an adapter for is now runnable, not just the one it
+    // started with.
     let catalog = catalog();
-    let reason = super::session_blocker(entry(&catalog, "minimax-m3"), "minimax-m3")
-        .expect("a model Cairn cannot serve cannot run a session");
-    assert!(reason.contains("Anthropic Messages"), "{reason}");
+    for model in ["glm-5.2", "minimax-m3", "grok-4.5"] {
+        assert!(
+            super::session_blocker(entry(&catalog, model), model).is_none(),
+            "{model} should be able to start a session"
+        );
+    }
 }
 
 #[test]

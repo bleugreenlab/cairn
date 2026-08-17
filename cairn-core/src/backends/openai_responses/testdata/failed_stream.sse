@@ -1,0 +1,11 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_fail_0001","status":"in_progress","model":"grok-4.5","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_f1","type":"message","status":"in_progress","role":"assistant","content":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"output_index":0,"content_index":0,"item_id":"msg_f1","delta":"Starting"}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":3,"response":{"id":"resp_fail_0001","status":"failed","model":"grok-4.5","error":{"code":"server_error","message":"Upstream request failed: Endpoint is unavailable."},"incomplete_details":null,"output":[]}}

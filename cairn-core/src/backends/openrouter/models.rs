@@ -145,6 +145,7 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
         supported_parameters: model.supported_parameters,
         router: model.id == "openrouter/auto",
         architecture_modality: None,
+        wire_protocol: None,
     }
 }
 

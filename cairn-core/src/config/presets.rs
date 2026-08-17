@@ -32,6 +32,19 @@ pub struct PresetsConfig {
     pub(crate) tier_defaults: HashMap<String, String>,
     pub(crate) tiers: Vec<String>,
     pub(crate) backends: HashMap<String, HashMap<String, Preset>>,
+    /// The providers this workspace has installed, when this config knows.
+    ///
+    /// `Some` on the effective config a launch resolves against, which is what
+    /// binds enablement to routing: `backends` deliberately keeps a removed
+    /// provider's presets, so without this the matrix alone would still resolve
+    /// an authored `backend_preference`, a launch override, or a concrete model
+    /// onto a provider the workspace uninstalled.
+    ///
+    /// `None` means "this config cannot answer", and nothing is narrowed — the
+    /// state a frozen execution snapshot is read back under, where the question
+    /// is what a past run resolved to rather than what may run next.
+    #[serde(default)]
+    pub(crate) enabled_providers: Option<Vec<String>>,
 }
 
 impl PresetsConfig {
@@ -39,6 +52,47 @@ impl PresetsConfig {
     pub(crate) fn tier_default(&self, tier: &str) -> Option<&str> {
         self.tier_defaults.get(tier).map(String::as_str)
     }
+
+    /// Whether this workspace has installed `backend`.
+    pub(crate) fn provider_enabled(&self, backend: &str) -> bool {
+        match &self.enabled_providers {
+            Some(enabled) => enabled.iter().any(|key| key == backend),
+            None => true,
+        }
+    }
+}
+
+/// Refuse a backend this workspace has not installed.
+///
+/// Named separately from "this tier is not defined there" on purpose. A stale
+/// rung of the resolution ladder is skipped silently, because the ladder exists
+/// to absorb that. An uninstalled provider is not a rung that does not apply; it
+/// is a workspace-level fact the caller has to settle, and silently routing to
+/// somebody else's model instead would be exactly the substitution this refuses.
+fn ensure_provider_enabled(backend: &str, config: &PresetsConfig) -> Result<(), String> {
+    if config.provider_enabled(backend) {
+        return Ok(());
+    }
+    Err(format!(
+        "Provider '{backend}' is not installed in this workspace. Add it in Settings → Providers, or choose a provider this workspace has."
+    ))
+}
+
+/// Admit a concrete `{ backend, model }` selection for a launch.
+///
+/// The launch composer and recipe preview both accept a fully concrete override,
+/// which bypasses tier resolution entirely — so it is also the one path that
+/// would otherwise carry a uninstalled provider straight into a new job.
+pub(crate) fn resolve_concrete_selection(
+    selection: &ModelSelection,
+    config: &PresetsConfig,
+) -> Result<ResolvedSelection, String> {
+    ensure_provider_enabled(&selection.backend, config)?;
+    Ok(ResolvedSelection {
+        selection: selection.clone(),
+        extras: RuntimeExtras::default(),
+        source: ResolutionSource::ExecutionOverride,
+    })
 }
 
 /// Expand a single backend name into a per-tier default for every named tier.
@@ -142,6 +196,9 @@ impl From<&SnapshotPresets> for PresetsConfig {
             tier_defaults: tier_defaults_from_single_backend(&value.active_backend, &value.tiers),
             tiers: value.tiers.clone(),
             backends: value.backends.clone(),
+            // A frozen snapshot is read to learn what a past run resolved to.
+            // Today's installed set has no authority over that.
+            enabled_providers: None,
         }
     }
 }
@@ -309,6 +366,9 @@ pub(crate) fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig
         tier_defaults: tier_defaults_from_single_backend("claude", &tiers),
         tiers,
         backends,
+        // The shipped defaults describe what Cairn supports; a workspace's own
+        // installed set is layered on in `load_effective_presets`.
+        enabled_providers: None,
     }
 }
 
@@ -329,17 +389,21 @@ pub(crate) fn is_tier_ref(s: &str, config: &PresetsConfig) -> bool {
     config.tiers.contains(&s.to_string())
 }
 
-/// Ordered list of providers (backends) that define a preset for `tier`.
+/// Ordered list of installed providers (backends) that define a preset for `tier`.
 ///
 /// Ordering puts THIS tier's default backend first, then the rest
 /// alphabetically, so the first element is a deterministic "first defined
 /// provider" for the multi-provider fallbacks.
+///
+/// Uninstalled providers are not candidates: every implicit rung of the ladder
+/// draws from this list, so narrowing it here is what keeps a fallback from
+/// quietly landing on a provider the workspace removed.
 fn providers_for_tier(tier: &str, config: &PresetsConfig) -> Vec<String> {
     let default_backend = config.tier_default(tier);
     let mut names: Vec<String> = config
         .backends
         .iter()
-        .filter(|(_, presets)| presets.contains_key(tier))
+        .filter(|(name, presets)| presets.contains_key(tier) && config.provider_enabled(name))
         .map(|(name, _)| name.clone())
         .collect();
     names.sort_by(|a, b| {
@@ -425,6 +489,10 @@ fn resolve_tier_backend(
 pub fn resolve_preset(tier_ref: &str, config: &PresetsConfig) -> Result<ResolvedPreset, String> {
     let (explicit_backend, tier) = parse_tier_ref(tier_ref);
 
+    if let Some(backend) = explicit_backend {
+        ensure_provider_enabled(backend, config)?;
+    }
+
     if let Some(choice) = resolve_tier_backend(tier, explicit_backend, None, config) {
         if let Some(preset) = config
             .backends
@@ -443,6 +511,7 @@ pub fn resolve_preset(tier_ref: &str, config: &PresetsConfig) -> Result<Resolved
     let backend_name = explicit_backend
         .or_else(|| config.tier_default(tier))
         .ok_or_else(|| format!("Unknown tier '{}'", tier))?;
+    ensure_provider_enabled(backend_name, config)?;
     let backend_presets = config
         .backends
         .get(backend_name)
@@ -547,6 +616,23 @@ pub(crate) fn resolve_selection_with_provenance(
     preferred_backend: Option<&str>,
     config: &PresetsConfig,
 ) -> Result<ResolvedSelection, String> {
+    // A backend somebody NAMED — a qualified tier ref, a launch/issue override,
+    // or the agent file's own preference — is refused when the workspace has not
+    // installed it, rather than skipped like a rung that does not apply. This is
+    // the boundary that makes removing a provider mean something: without it an
+    // agent authored `backend_preference: codex` would keep launching Codex jobs
+    // out of presets the removal deliberately preserved.
+    for named in [
+        authored_backend_prefix(tier_selection),
+        override_backend,
+        preferred_backend,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        ensure_provider_enabled(named, config)?;
+    }
+
     let authored = normalize_authored_selection(tier_selection, override_backend, config);
     let tier = authored.tier.as_str();
 
@@ -590,6 +676,9 @@ pub(crate) fn resolve_selection_with_provenance(
                 )
             })?,
     };
+    // A concrete model can also name its provider by inference alone (`gpt-5.5`
+    // resolves to Codex), so the inferred backend is held to the same rule.
+    ensure_provider_enabled(&backend, config)?;
     Ok(ResolvedSelection {
         selection: ModelSelection {
             backend,
@@ -598,6 +687,11 @@ pub(crate) fn resolve_selection_with_provenance(
         extras: RuntimeExtras::default(),
         source: ResolutionSource::ExplicitModel,
     })
+}
+
+/// The backend a tier reference names outright, if it is qualified.
+fn authored_backend_prefix(tier_selection: Option<&str>) -> Option<&str> {
+    tier_selection.and_then(|selection| parse_tier_ref(selection).0)
 }
 
 /// The backend a SPAWNED task authors, given the spawn payload's explicit
@@ -631,6 +725,9 @@ pub fn load_effective_presets(config_dir: &Path, project_path: Option<&Path>) ->
         tier_defaults: settings.tier_defaults.clone(),
         tiers: settings.tiers.clone(),
         backends: settings.backends.clone(),
+        // Enablement is workspace-owned: a project overlay may add presets or
+        // rebind tiers, but it cannot install a provider for the workspace.
+        enabled_providers: Some(settings.enabled_providers.clone()),
     };
 
     // Merge project-level overrides
@@ -715,11 +812,9 @@ pub fn resolve_agent_snapshot(
     };
 
     let resolved = match override_selection {
-        Some(LaunchSelectionOverride::Concrete(selection)) => ResolvedSelection {
-            selection: selection.clone(),
-            extras: RuntimeExtras::default(),
-            source: ResolutionSource::ExecutionOverride,
-        },
+        Some(LaunchSelectionOverride::Concrete(selection)) => {
+            resolve_concrete_selection(selection, config)?
+        }
         Some(LaunchSelectionOverride::Tier(tier)) => resolve_selection_with_provenance(
             Some(tier),
             None,
@@ -1683,7 +1778,7 @@ mod tests {
         );
     }
 
-    fn make_test_agent(tier: Option<&str>) -> FileAgent {
+    pub(super) fn make_test_agent(tier: Option<&str>) -> FileAgent {
         FileAgent {
             id: "test".to_string(),
             name: "Test".to_string(),
@@ -1701,5 +1796,112 @@ mod tests {
             is_project_scoped: false,
             file_path: std::path::PathBuf::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod enablement_tests {
+    use super::*;
+
+    /// Claude and Codex both define every tier; only Claude is installed.
+    fn config() -> PresetsConfig {
+        let mut config = default_presets_config(Some(31999));
+        config.enabled_providers = Some(vec!["claude".to_string()]);
+        config
+    }
+
+    fn agent(tier: Option<&str>, backend_preference: Option<&str>) -> FileAgent {
+        FileAgent {
+            backend_preference: backend_preference.map(str::to_string),
+            ..super::tests::make_test_agent(tier)
+        }
+    }
+
+    #[test]
+    fn an_authored_preference_for_a_removed_provider_cannot_launch() {
+        // The presets survive removal on purpose; they must not become a way
+        // back onto the provider.
+        let error =
+            resolve_agent_snapshot(&agent(Some("md"), Some("codex")), None, &config()).unwrap_err();
+        assert!(error.contains("codex"), "{error}");
+        assert!(error.contains("not installed"), "{error}");
+    }
+
+    #[test]
+    fn a_launch_override_for_a_removed_provider_cannot_launch() {
+        let config = config();
+        let backend = resolve_agent_snapshot(
+            &agent(Some("md"), None),
+            Some(&LaunchSelectionOverride::Backend("codex".to_string())),
+            &config,
+        )
+        .unwrap_err();
+        assert!(backend.contains("not installed"), "{backend}");
+
+        let qualified = resolve_agent_snapshot(
+            &agent(Some("md"), None),
+            Some(&LaunchSelectionOverride::Tier("codex/lg".to_string())),
+            &config,
+        )
+        .unwrap_err();
+        assert!(qualified.contains("not installed"), "{qualified}");
+    }
+
+    #[test]
+    fn a_concrete_selection_naming_a_removed_provider_cannot_launch() {
+        // The one path that skips tier resolution entirely.
+        let error = resolve_agent_snapshot(
+            &agent(Some("md"), None),
+            Some(&LaunchSelectionOverride::Concrete(ModelSelection {
+                backend: "codex".to_string(),
+                model: Model::new("gpt-5.5"),
+            })),
+            &config(),
+        )
+        .unwrap_err();
+        assert!(error.contains("not installed"), "{error}");
+    }
+
+    #[test]
+    fn a_bare_model_that_infers_a_removed_provider_cannot_launch() {
+        // No backend is named anywhere; `backend_for_model` supplies Codex.
+        let error = resolve_runtime_selection(Some("gpt-5.5"), None, &config()).unwrap_err();
+        assert!(error.contains("not installed"), "{error}");
+    }
+
+    #[test]
+    fn an_unqualified_tier_never_falls_onto_a_removed_provider() {
+        // `md` is defined on four providers; only the installed one is a
+        // candidate, and it decides as the sole provider rather than by ladder.
+        let resolved = resolve_runtime_selection(Some("md"), None, &config()).unwrap();
+        assert_eq!(resolved.0.backend, "claude");
+
+        let mut only_codex = default_presets_config(Some(31999));
+        only_codex.enabled_providers = Some(vec!["codex".to_string()]);
+        assert_eq!(
+            resolve_runtime_selection(Some("md"), None, &only_codex)
+                .unwrap()
+                .0
+                .backend,
+            "codex"
+        );
+    }
+
+    #[test]
+    fn resolution_is_unnarrowed_when_the_config_cannot_answer() {
+        // A frozen snapshot reads back through `From<&SnapshotPresets>`, which
+        // leaves enablement unknown: what a past run resolved to is not a
+        // question today's installed set gets to re-answer.
+        let mut config = default_presets_config(Some(31999));
+        config.enabled_providers = None;
+        let resolved = resolve_runtime_selection(Some("codex/lg"), None, &config).unwrap();
+        assert_eq!(resolved.0.backend, "codex");
+    }
+
+    #[test]
+    fn an_installed_provider_still_resolves_normally() {
+        let snapshot =
+            resolve_agent_snapshot(&agent(Some("lg"), Some("claude")), None, &config()).unwrap();
+        assert_eq!(snapshot.selection.unwrap().backend, "claude");
     }
 }

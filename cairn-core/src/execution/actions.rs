@@ -299,6 +299,7 @@ async fn handle_pr_node(
         chrono::Utc::now().timestamp() as i32,
     )
     .await?;
+    orch.invalidate_pr_refresh(producing_job_id, "pull-request-seeded");
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "insert"}),
@@ -361,6 +362,7 @@ async fn handle_pr_node(
     )
     .await?;
 
+    orch.invalidate_pr_refresh(producing_job_id, "pull-request-opened");
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),
@@ -976,6 +978,7 @@ async fn handle_create_pr(
     )
     .await?;
 
+    orch.invalidate_pr_refresh(parent_job_id, "pull-request-opened");
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),

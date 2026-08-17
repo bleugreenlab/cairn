@@ -491,6 +491,7 @@ mod tests {
             created_at: 1000,
             updated_at: 2000,
             author: None,
+            author_display: None,
             backend_override: None,
             merged_at: None,
             closed_at: None,

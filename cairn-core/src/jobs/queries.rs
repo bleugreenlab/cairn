@@ -758,6 +758,89 @@ pub async fn node_status_indicators(
 }
 
 /// Live status for one thread — the unit a thread row renders.
+/// The published thread rollup for one project, materialized once per
+/// generation.
+///
+/// The SQL below joins every thread's jobs and evaluates a correlated head-turn,
+/// prompt and permission lookup per job, so it costs the same whether one thread
+/// moved or none did. Its invalidation sources fire continuously during normal
+/// work, which is how an idle app came to re-run a whole-project rollup in a
+/// loop. Reading through the fence makes a repeat read of unchanged state an
+/// in-memory clone, and collapses a concurrent cold burst to one SQL execution.
+pub async fn published_thread_status_indicators(
+    orch: &crate::orchestrator::Orchestrator,
+    project_id: &str,
+) -> Result<Vec<ThreadStatusIndicator>, CairnError> {
+    let failure: std::sync::Mutex<Option<CairnError>> = std::sync::Mutex::new(None);
+    let published = orch
+        .thread_status_cache
+        .get_or_compute(project_id, || async {
+            let db = match crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+                .await
+            {
+                Ok(db) => db,
+                Err(error) => {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(error);
+                    }
+                    return None;
+                }
+            };
+            match thread_activity_rows(&db, project_id).await {
+                Ok(rows) => Some(std::sync::Arc::new(rows)),
+                Err(error) => {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(error);
+                    }
+                    None
+                }
+            }
+        })
+        .await;
+
+    let activity = match published {
+        Some(rows) => rows,
+        None => {
+            return Err(failure
+                .lock()
+                .ok()
+                .and_then(|mut slot| slot.take())
+                .unwrap_or_else(|| {
+                    CairnError::Internal("failed to rebuild the thread status rollup".to_string())
+                }))
+        }
+    };
+
+    // Unread counts are computed fresh on every read rather than snapshotted
+    // alongside the activity. Their dependency is `events`, which inserts orders
+    // of magnitude more often than anything the activity rollup reads and whose
+    // change notification carries no project scope — wiring it into the same
+    // generation would invalidate every project's snapshot on every event, which
+    // is exactly the continuous whole-project rebuild CAIRN-4190 removed.
+    // Recomputing instead is safe because the count is capped: the work is
+    // bounded by threads-in-project x UNREAD_COUNT_CAP no matter how far behind
+    // the operator has fallen.
+    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id).await?;
+    let unread = thread_unread_counts(&db, project_id).await?;
+
+    Ok(activity
+        .iter()
+        .map(|row| {
+            let unread = unread.get(&row.thread_id).copied().unwrap_or_default();
+            ThreadStatusIndicator {
+                thread_id: row.thread_id.clone(),
+                activity: row.activity,
+                unread_count: unread.count,
+                latest_event_rowid: unread.latest_event_rowid,
+            }
+        })
+        .collect())
+}
+
+/// Everything one thread row shows about itself beyond its name: whether work is
+/// happening under it right now, and how much of its transcript this operator
+/// has not seen. The two are rendered as mutually exclusive trailing states, but
+/// they are computed independently and both travel on one row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStatusIndicator {
@@ -766,7 +849,58 @@ pub struct ThreadStatusIndicator {
     /// `AwaitingInput > Running > Idle` precedence, so a thread reads as live
     /// while either its own session or a task it delegated is working.
     activity: NodeActivity,
+    /// Eligible transcript entries after this operator's acknowledged watermark,
+    /// saturating at [`UNREAD_COUNT_CAP`] so the query cost never scales with how
+    /// long a thread has gone unread. The renderer shows `99+` at the cap.
+    unread_count: i64,
+    /// The newest eligible rowid `unread_count` was computed against. A client
+    /// that decides the operator has read this thread hands this back to
+    /// `mark_thread_viewed`, so the marker advances to exactly the position the
+    /// count described rather than to whatever is newest when the write lands.
+    latest_event_rowid: i64,
 }
+
+/// One thread's live activity — the half of a thread row that is a pure function
+/// of orchestration state, and therefore the half worth caching per generation.
+///
+/// Separate from [`ThreadStatusIndicator`] because the unread count has a
+/// completely different dependency set: it moves on every durable event, which
+/// no snapshot keyed on the activity inputs could notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadActivityRow {
+    pub thread_id: String,
+    pub activity: NodeActivity,
+}
+
+/// The one selector behind every thread activity indicator.
+///
+/// Named so the snapshot rebuild and the query-plan assertion below run the
+/// exact same statement: a second, approximate copy of this SQL would let the
+/// plan test pass while the projection took a different path.
+pub(crate) const THREAD_STATUS_ROWS_SQL: &str = "SELECT
+        t.id,
+        COALESCE(
+            (SELECT ct.state FROM turns ct WHERE ct.id = j.current_turn_id),
+            (SELECT tu.state
+               FROM turns tu
+              WHERE tu.job_id = j.id
+              ORDER BY tu.created_at DESC, tu.sequence DESC
+              LIMIT 1)
+        ) AS head_turn_state,
+        EXISTS (
+            SELECT 1 FROM prompts p
+             WHERE p.turn_id = j.current_turn_id
+               AND p.response IS NULL
+        ) AS has_pending_prompt,
+        EXISTS (
+            SELECT 1 FROM permission_requests pr
+             LEFT JOIN runs r ON pr.run_id = r.id
+             WHERE COALESCE(pr.job_id, r.job_id) = j.id
+               AND pr.status = 'pending'
+        ) AS has_pending_permission
+   FROM threads t
+   LEFT JOIN jobs j ON j.thread_id = t.id
+  WHERE t.project_id = ?1";
 
 /// Batched, project-scoped live activity for every thread, one row per thread.
 ///
@@ -775,44 +909,16 @@ pub struct ThreadStatusIndicator {
 /// now. That is the same head-turn question `node_status_indicators` answers,
 /// rolled up per thread and computed for the whole project in one statement
 /// rather than a per-row fan-out.
-pub async fn thread_status_indicators(
+pub async fn thread_activity_rows(
     db: &LocalDb,
     project_id: &str,
-) -> Result<Vec<ThreadStatusIndicator>, CairnError> {
+) -> Result<Vec<ThreadActivityRow>, CairnError> {
     let project_id = project_id.to_string();
     db.read(|conn| {
         let project_id = project_id.clone();
         Box::pin(async move {
             let mut rows = conn
-                .query(
-                    "SELECT
-                        t.id,
-                        COALESCE(
-                            (SELECT ct.state
-                               FROM turns ct
-                              WHERE ct.id = j.current_turn_id),
-                            (SELECT tu.state
-                               FROM turns tu
-                              WHERE tu.job_id = j.id
-                              ORDER BY tu.created_at DESC, tu.sequence DESC
-                              LIMIT 1)
-                        ) AS head_turn_state,
-                        EXISTS (
-                            SELECT 1 FROM prompts p
-                             WHERE p.turn_id = j.current_turn_id
-                               AND p.response IS NULL
-                        ) AS has_pending_prompt,
-                        EXISTS (
-                            SELECT 1 FROM permission_requests pr
-                             LEFT JOIN runs r ON pr.run_id = r.id
-                             WHERE COALESCE(pr.job_id, r.job_id) = j.id
-                               AND pr.status = 'pending'
-                        ) AS has_pending_permission
-                     FROM threads t
-                     LEFT JOIN jobs j ON j.thread_id = t.id
-                     WHERE t.project_id = ?1",
-                    params![project_id.as_str()],
-                )
+                .query(THREAD_STATUS_ROWS_SQL, params![project_id.as_str()])
                 .await?;
             // Every thread gets a row, including one whose LEFT JOIN found no
             // job at all: a thread with no work under it is idle, not absent.
@@ -827,15 +933,196 @@ pub async fn thread_status_indicators(
                 let entry = by_thread.entry(thread_id).or_insert(NodeActivity::Idle);
                 *entry = rollup_activity([*entry, activity]);
             }
-            Ok::<Vec<ThreadStatusIndicator>, DbError>(
+            Ok::<Vec<ThreadActivityRow>, DbError>(
                 by_thread
                     .into_iter()
-                    .map(|(thread_id, activity)| ThreadStatusIndicator {
+                    .map(|(thread_id, activity)| ThreadActivityRow {
                         thread_id,
                         activity,
                     })
                     .collect(),
             )
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+// ============================================================================
+// Per-thread unread transcript counts
+// ============================================================================
+
+/// The most a thread row will ever report. The badge renders exact values through
+/// 99 and `99+` at or above this, so counting past it buys nothing and costs a
+/// scan proportional to how long the operator ignored the thread. Saturating here
+/// is what makes the rollup's cost independent of transcript size.
+pub(crate) const UNREAD_COUNT_CAP: i64 = 100;
+
+/// What counts as one unread transcript entry, spelled once.
+///
+/// A row in `events` is by definition durable — the live `assistant:streaming`
+/// placeholder is synthesized from `message_streams` at read time and never
+/// stored — so durability needs no clause. What does need saying is that only
+/// TOP-LEVEL entries count: a sub-agent's transcript is nested under the tool use
+/// that spawned it (`parent_tool_use_id`), and a delegated task producing four
+/// hundred events must not read as four hundred things the operator missed in the
+/// parent thread. The task's outcome reaches the thread as its own top-level
+/// entry when the session records it.
+///
+/// Bound to the alias `e`, and used for BOTH the count and the watermark that
+/// clears it, so "what is unread" and "what marking viewed consumes" cannot drift.
+pub(crate) const UNREAD_EVENT_SHAPE: &str = "e.parent_tool_use_id IS NULL";
+
+/// The one selector behind every thread's unread count.
+///
+/// A thread's transcript is its reserved session job's, and a job's whole session
+/// rotation lineage hangs off `sessions.job_id` — a cold-resume or model switch
+/// mints a successor session under the SAME job — so joining through it follows
+/// rotation without walking `parent_session_id` by hand. The watermark is a global
+/// `events.rowid`, which is also the cursor the transcript delta walks, so the
+/// sidebar's notion of "new" and the pane's are the same number.
+///
+/// The inner `LIMIT` is load-bearing, not decoration: without it this counts every
+/// event since the operator last looked, which for an ignored thread is unbounded
+/// and is re-counted on every sidebar read.
+fn thread_unread_rows_sql() -> String {
+    format!(
+        "SELECT
+        t.id,
+        (SELECT COUNT(*) FROM (
+            SELECT e.rowid
+              FROM sessions s
+              JOIN events e ON e.session_id = s.id
+             WHERE s.job_id = j.id
+               AND {UNREAD_EVENT_SHAPE}
+               AND e.rowid > COALESCE(rp.acknowledged_event_rowid, 0)
+             LIMIT {UNREAD_COUNT_CAP}
+        )) AS unread_count,
+        COALESCE((
+            SELECT MAX(e.rowid)
+              FROM sessions s
+              JOIN events e ON e.session_id = s.id
+             WHERE s.job_id = j.id
+               AND {UNREAD_EVENT_SHAPE}
+        ), COALESCE(rp.acknowledged_event_rowid, 0)) AS latest_event_rowid
+   FROM threads t
+   LEFT JOIN jobs j ON j.thread_id = t.id AND {session}
+   LEFT JOIN thread_read_positions rp ON rp.thread_id = t.id
+  WHERE t.project_id = ?1",
+        session = crate::threads::SESSION_JOB_SHAPE
+    )
+}
+
+/// One thread's unread facts: how many entries are waiting, and the exact rowid
+/// that number was computed against.
+///
+/// The rowid travels with the count because marking viewed acknowledges it.
+/// Without it the client could only say "clear this thread", and the backend
+/// would have to re-read its own newest row at command time — which is strictly
+/// later than the moment the operator was shown a count, so it would routinely
+/// consume entries the client had never been told about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThreadUnread {
+    pub count: i64,
+    pub latest_event_rowid: i64,
+}
+
+/// Batched, project-scoped unread transcript counts, one entry per thread.
+///
+/// A thread with no session job, no events, or no read position is present with
+/// an explicit zero rather than missing: the caller renders "nothing unread",
+/// which is a different statement from "unknown".
+pub async fn thread_unread_counts(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<HashMap<String, ThreadUnread>, CairnError> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let sql = thread_unread_rows_sql();
+            let mut rows = conn.query(&sql, params![project_id.as_str()]).await?;
+            let mut by_thread: HashMap<String, ThreadUnread> = HashMap::new();
+            while let Some(row) = rows.next().await? {
+                let thread_id = row.text(0)?;
+                let count = row.opt_i64(1)?.unwrap_or(0);
+                let latest_event_rowid = row.opt_i64(2)?.unwrap_or(0);
+                // A malformed thread with two session-shaped jobs would produce
+                // two rows; the larger of each is the honest answer rather than
+                // whichever arrived last.
+                let entry = by_thread.entry(thread_id).or_default();
+                entry.count = entry.count.max(count);
+                entry.latest_event_rowid = entry.latest_event_rowid.max(latest_event_rowid);
+            }
+            Ok::<HashMap<String, ThreadUnread>, DbError>(by_thread)
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
+/// Advance one thread's read watermark to the newest entry the SERVER can see.
+///
+/// `through_rowid` is the client ACKNOWLEDGING a position it was shown: the
+/// `latest_event_rowid` that travelled with the count it acted on. It is not a
+/// claim the backend trusts — the statement clamps it to the thread's own newest
+/// eligible entry, so it can never address another thread's transcript or a row
+/// that does not exist, and the update takes `MAX(existing, acknowledged)`, so a
+/// stale or concurrent pane cannot walk the marker backwards.
+///
+/// It is REQUIRED, deliberately. There is no caller that can truthfully report
+/// content viewed without knowing which content it displayed, and letting the
+/// backend fall back to "whatever is newest right now" would make consuming
+/// unseen entries a representable, accepted state again: re-reading at write time
+/// is strictly later than the moment the operator was shown a count, so an entry
+/// arriving in between would be swallowed without ever having been offered. A
+/// thread with no transcript reports position 0, so every caller has an honest
+/// value to pass.
+///
+/// Returns whether the watermark actually moved, which is what tells the caller a
+/// projection refresh is worth emitting.
+pub async fn mark_thread_viewed(
+    db: &LocalDb,
+    thread_id: &str,
+    through_rowid: i64,
+    now: i64,
+) -> Result<bool, CairnError> {
+    let thread_id = thread_id.to_string();
+    db.write(|conn| {
+        let thread_id = thread_id.clone();
+        Box::pin(async move {
+            let sql = format!(
+                "WITH observed AS (
+                     SELECT COALESCE((
+                         SELECT MAX(e.rowid)
+                           FROM jobs j
+                           JOIN sessions s ON s.job_id = j.id
+                           JOIN events e ON e.session_id = s.id
+                          WHERE j.thread_id = ?1
+                            AND {session}
+                            AND {shape}
+                     ), 0) AS newest
+                 )
+                 INSERT INTO thread_read_positions
+                        (thread_id, acknowledged_event_rowid, updated_at)
+                 SELECT ?1, MIN(?3, observed.newest), ?2
+                   FROM observed
+                  WHERE EXISTS (SELECT 1 FROM threads WHERE id = ?1)
+                 ON CONFLICT(thread_id) DO UPDATE SET
+                        acknowledged_event_rowid = MAX(
+                            thread_read_positions.acknowledged_event_rowid,
+                            excluded.acknowledged_event_rowid
+                        ),
+                        updated_at = excluded.updated_at
+                 WHERE excluded.acknowledged_event_rowid
+                       > thread_read_positions.acknowledged_event_rowid",
+                session = crate::threads::SESSION_JOB_SHAPE,
+                shape = UNREAD_EVENT_SHAPE,
+            );
+            let changed = conn
+                .execute(&sql, params![thread_id.as_str(), now, through_rowid])
+                .await?;
+            Ok::<bool, DbError>(changed > 0)
         })
     })
     .await
@@ -1249,9 +1536,11 @@ fn has_single_downstream_action(snapshot_json: &str, node_id: &str) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::{
-        derive_node_activity, home_uri_for_job, issue_status_indicators, node_status_indicators,
-        thread_status_indicators, NodeActivity, NodeStatusScope, ISSUE_STATUS_JOB_ROWS_SQL,
-        ISSUE_STATUS_PR_ROWS_SQL,
+        derive_node_activity, home_uri_for_job, issue_status_indicators, mark_thread_viewed,
+        node_status_indicators, published_thread_status_indicators, thread_activity_rows,
+        thread_unread_counts, thread_unread_rows_sql, NodeActivity, NodeStatusScope,
+        ISSUE_STATUS_JOB_ROWS_SQL, ISSUE_STATUS_PR_ROWS_SQL, THREAD_STATUS_ROWS_SQL,
+        UNREAD_COUNT_CAP,
     };
     use crate::storage::{DbError, LocalDb, MigrationRunner, RowExt, TURSO_MIGRATIONS};
     use cairn_db::turso::params;
@@ -1750,11 +2039,11 @@ mod tests {
         )
         .await;
 
-        let by_thread: HashMap<String, NodeActivity> = thread_status_indicators(&db, "p")
+        let by_thread: HashMap<String, NodeActivity> = thread_activity_rows(&db, "p")
             .await
             .unwrap()
             .into_iter()
-            .map(|indicator| (indicator.thread_id, indicator.activity))
+            .map(|row| (row.thread_id, row.activity))
             .collect();
 
         assert_eq!(by_thread.len(), 4, "every thread in the project gets a row");
@@ -1770,6 +2059,628 @@ mod tests {
             NodeActivity::Idle,
             "a thread with no jobs at all is idle, not absent"
         );
+    }
+
+    // ── Per-thread unread transcript counts ────────────────────────────────
+
+    /// A project with one thread whose reserved session job owns one session.
+    /// Everything the unread rollup reads, and nothing it does not.
+    async fn unread_fixture() -> LocalDb {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('th', 'p', 'design', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('th-session', 'th', 'p', 'thread', 'idle', 1, 1, 'thread')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO sessions(id, job_id, created_at, updated_at)
+             VALUES ('s1', 'th-session', 1, 1)",
+        )
+        .await;
+        // Events are foreign-keyed to a run; the unread shape never reads it, but
+        // the row has to exist for the inserts below to land.
+        exec(
+            &db,
+            "INSERT INTO runs(id, job_id, created_at, updated_at)
+             VALUES ('r1', 'th-session', 1, 1)",
+        )
+        .await;
+        db
+    }
+
+    /// One durable transcript event. `parent` non-null makes it a nested
+    /// sub-agent entry, which the unread shape must skip.
+    async fn insert_event(
+        db: &LocalDb,
+        id: &str,
+        run: &str,
+        session: &str,
+        seq: i64,
+        parent: Option<&str>,
+    ) {
+        let id = id.to_string();
+        let run = run.to_string();
+        let session = session.to_string();
+        let parent = parent.map(str::to_string);
+        db.write(|conn| {
+            let (id, run, session, parent) =
+                (id.clone(), run.clone(), session.clone(), parent.clone());
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type,
+                                        data, created_at, parent_tool_use_id)
+                     VALUES (?1, ?2, ?3, ?4, 1, 'assistant', '{}', 1, ?5)",
+                    params![
+                        id.as_str(),
+                        run.as_str(),
+                        session.as_str(),
+                        seq,
+                        parent.as_deref()
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn unread_for(db: &LocalDb, thread_id: &str) -> i64 {
+        thread_unread_counts(db, "p")
+            .await
+            .unwrap()
+            .get(thread_id)
+            .map(|unread| unread.count)
+            .unwrap_or(-1)
+    }
+
+    async fn latest_rowid_for(db: &LocalDb, thread_id: &str) -> i64 {
+        thread_unread_counts(db, "p")
+            .await
+            .unwrap()
+            .get(thread_id)
+            .map(|unread| unread.latest_event_rowid)
+            .unwrap_or(-1)
+    }
+
+    /// Mark a thread viewed the way the UI does: read the position the sidebar
+    /// would have been shown, then acknowledge exactly that. There is no
+    /// "acknowledge whatever is newest" shortcut to reach for — the parameter is
+    /// required precisely so no caller, test or otherwise, can express it.
+    async fn view_at_current_position(db: &LocalDb, thread_id: &str, now: i64) -> bool {
+        let shown = latest_rowid_for(db, thread_id).await;
+        mark_thread_viewed(db, thread_id, shown, now).await.unwrap()
+    }
+
+    async fn acknowledged(db: &LocalDb, thread_id: &str) -> i64 {
+        let thread_id = thread_id.to_string();
+        db.query_opt(
+            "SELECT acknowledged_event_rowid FROM thread_read_positions WHERE thread_id = ?1",
+            params![thread_id.as_str()],
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap()
+        .unwrap_or(-1)
+    }
+
+    /// Marking viewed consumes the position the caller was SHOWN, not whatever
+    /// is newest when the write executes.
+    ///
+    /// This is the race the read cursor exists to survive: the sidebar's count
+    /// query and the pane's transcript query refetch independently, so an entry
+    /// can land in between the count the operator saw and the write that acts on
+    /// it. Re-reading MAX(rowid) at command time would consume that entry
+    /// without it ever having been offered.
+    #[tokio::test]
+    async fn marking_viewed_acknowledges_only_the_position_it_was_given() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        insert_event(&db, "e2", "r1", "s1", 2, None).await;
+        let shown = latest_rowid_for(&db, "th").await;
+        assert_eq!(unread_for(&db, "th").await, 2);
+
+        // An entry lands after the count was computed but before the mark runs.
+        insert_event(&db, "e3", "r1", "s1", 3, None).await;
+
+        assert!(mark_thread_viewed(&db, "th", shown, 100).await.unwrap());
+        assert_eq!(acknowledged(&db, "th").await, shown);
+        assert_eq!(
+            unread_for(&db, "th").await,
+            1,
+            "the entry that arrived after the count stays unread"
+        );
+    }
+
+    /// An acknowledgement is clamped to the thread's own newest entry, so an
+    /// out-of-date or oversized value cannot swallow entries that do not exist
+    /// yet — or that belong to another thread.
+    #[tokio::test]
+    async fn an_oversized_acknowledgement_is_clamped_to_this_threads_newest_entry() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        let newest = latest_rowid_for(&db, "th").await;
+
+        assert!(mark_thread_viewed(&db, "th", 999_999, 100).await.unwrap());
+        assert_eq!(acknowledged(&db, "th").await, newest);
+
+        insert_event(&db, "e2", "r1", "s1", 2, None).await;
+        assert_eq!(
+            unread_for(&db, "th").await,
+            1,
+            "a later entry is unread despite the earlier over-claim"
+        );
+    }
+
+    /// A thread with no transcript reports a floor rather than nothing, so a
+    /// caller always has a position to acknowledge.
+    #[tokio::test]
+    async fn latest_rowid_falls_back_to_the_stored_watermark() {
+        let db = unread_fixture().await;
+        assert_eq!(latest_rowid_for(&db, "th").await, 0);
+
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        view_at_current_position(&db, "th", 100).await;
+        let acked = acknowledged(&db, "th").await;
+        exec(&db, "DELETE FROM events WHERE session_id = 's1'").await;
+
+        assert_eq!(
+            latest_rowid_for(&db, "th").await,
+            acked,
+            "with the transcript gone the acknowledged position is still the floor"
+        );
+    }
+
+    /// A thread nobody has looked at reports everything top-level in its session
+    /// job's lineage, and nothing else: not a nested sub-agent entry, and not
+    /// another thread's transcript.
+    #[tokio::test]
+    async fn unread_counts_top_level_session_entries_only() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        insert_event(&db, "e2", "r1", "s1", 2, Some("toolu_1")).await;
+        insert_event(&db, "e3", "r1", "s1", 3, None).await;
+
+        assert_eq!(
+            unread_for(&db, "th").await,
+            2,
+            "a delegated task's nested transcript is not something the operator \
+             missed in the parent thread"
+        );
+    }
+
+    /// Three shapes that all mean "nothing unread" must all be PRESENT with a
+    /// zero rather than missing: a caller that treats absence as unknown would
+    /// otherwise never learn a thread is caught up.
+    #[tokio::test]
+    async fn unread_reports_explicit_zero_for_empty_threads() {
+        let db = unread_fixture().await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('no-job', 'p', 'no-job', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('no-session', 'no-job', 'p', 'Survey', 'idle', 1, 1, 'survey')",
+        )
+        .await;
+
+        let counts = thread_unread_counts(&db, "p").await.unwrap();
+        assert_eq!(counts.len(), 2, "one row per thread in the project");
+        assert_eq!(
+            counts["th"].count, 0,
+            "a session with no events is caught up"
+        );
+        assert_eq!(
+            counts["no-job"].count, 0,
+            "a thread with only a task job, no session, is caught up"
+        );
+    }
+
+    /// The whole lifecycle in one pass: unread accumulates, viewing clears it to
+    /// the server's own latest rowid, and entries that land afterwards are unread
+    /// again.
+    #[tokio::test]
+    async fn marking_viewed_clears_to_the_server_watermark_and_reaccumulates() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        insert_event(&db, "e2", "r1", "s1", 2, None).await;
+        assert_eq!(unread_for(&db, "th").await, 2);
+
+        assert!(view_at_current_position(&db, "th", 100).await);
+        assert_eq!(unread_for(&db, "th").await, 0);
+
+        insert_event(&db, "e3", "r1", "s1", 3, None).await;
+        assert_eq!(
+            unread_for(&db, "th").await,
+            1,
+            "an entry written after the operator looked away is unread again"
+        );
+    }
+
+    /// Marking viewed twice with nothing new in between must not report movement:
+    /// the caller uses that answer to decide whether to refresh a projection, and
+    /// a permanently-true answer is a refresh loop.
+    #[tokio::test]
+    async fn marking_viewed_is_idempotent_and_never_walks_backwards() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        assert!(view_at_current_position(&db, "th", 100).await);
+        assert!(
+            !view_at_current_position(&db, "th", 200).await,
+            "a second view with nothing new moved no watermark"
+        );
+
+        // Force a stale marker, as a racing second pane would, and prove the
+        // monotonic update refuses to regress it.
+        exec(
+            &db,
+            "UPDATE thread_read_positions SET acknowledged_event_rowid = 999999 WHERE thread_id = 'th'",
+        )
+        .await;
+        assert!(!view_at_current_position(&db, "th", 300).await);
+        assert_eq!(
+            acknowledged(&db, "th").await,
+            999999,
+            "an older watermark cannot overwrite a newer one"
+        );
+    }
+
+    /// A rotated session is the same transcript by another name, and a rename
+    /// changes nothing about what was read: the cursor is keyed by thread id, so
+    /// both survive.
+    #[tokio::test]
+    async fn unread_survives_session_rotation_and_rename() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        assert!(view_at_current_position(&db, "th", 100).await);
+
+        // Cold-resume rotation: a successor session under the SAME job.
+        exec(
+            &db,
+            "INSERT INTO sessions(id, job_id, parent_session_id, sequence, created_at, updated_at)
+             VALUES ('s2', 'th-session', 's1', 2, 2, 2)",
+        )
+        .await;
+        exec(&db, "UPDATE threads SET name = 'renamed' WHERE id = 'th'").await;
+        insert_event(&db, "e2", "r1", "s2", 2, None).await;
+
+        assert_eq!(
+            unread_for(&db, "th").await,
+            1,
+            "the successor session's entry is unread, and the predecessor's stays read"
+        );
+    }
+
+    /// Viewing one thread says nothing about any other.
+    #[tokio::test]
+    async fn marking_viewed_touches_only_the_named_thread() {
+        let db = unread_fixture().await;
+        exec(
+            &db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('other', 'p', 'other', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('other-session', 'other', 'p', 'thread', 'idle', 1, 1, 'thread')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO sessions(id, job_id, created_at, updated_at)
+             VALUES ('s-other', 'other-session', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO runs(id, job_id, created_at, updated_at)
+             VALUES ('r-other', 'other-session', 1, 1)",
+        )
+        .await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        insert_event(&db, "e2", "r-other", "s-other", 1, None).await;
+
+        view_at_current_position(&db, "th", 100).await;
+
+        let counts = thread_unread_counts(&db, "p").await.unwrap();
+        assert_eq!(counts["th"].count, 0);
+        assert_eq!(
+            counts["other"].count, 1,
+            "a sibling thread keeps its unread entries"
+        );
+    }
+
+    /// The count saturates. This is the property that keeps the rollup's cost
+    /// independent of how long a thread has been ignored, so it is asserted as
+    /// behavior rather than left to the SQL to imply.
+    #[tokio::test]
+    async fn unread_saturates_at_the_cap() {
+        let db = unread_fixture().await;
+        for seq in 1..=(UNREAD_COUNT_CAP + 25) {
+            insert_event(&db, &format!("e{seq}"), "r1", "s1", seq, None).await;
+        }
+
+        assert_eq!(unread_for(&db, "th").await, UNREAD_COUNT_CAP);
+    }
+
+    /// A thread deleted takes its read position with it, so a recycled id cannot
+    /// inherit a stranger's watermark.
+    #[tokio::test]
+    async fn deleting_a_thread_cascades_its_read_position() {
+        let db = unread_fixture().await;
+        insert_event(&db, "e1", "r1", "s1", 1, None).await;
+        view_at_current_position(&db, "th", 100).await;
+        // Tear the thread's work down the way a real delete does, innermost first;
+        // the read position is the one row nothing points at, so only the
+        // cascade can remove it.
+        exec(&db, "DELETE FROM events WHERE session_id = 's1'").await;
+        exec(&db, "DELETE FROM runs WHERE job_id = 'th-session'").await;
+        exec(&db, "DELETE FROM sessions WHERE job_id = 'th-session'").await;
+        exec(&db, "DELETE FROM jobs WHERE thread_id = 'th'").await;
+        exec(&db, "DELETE FROM threads WHERE id = 'th'").await;
+
+        let remaining: i64 = db
+            .query_opt(
+                "SELECT COUNT(*) FROM thread_read_positions",
+                params![],
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    /// The unread rollup's plan, held to the same bar as the activity rollup's:
+    /// every access path is a named index. The counted range is
+    /// `events(session_id, rowid > ack)`, which `idx_events_session_id` answers
+    /// directly because a SQLite index is ordered by (key, rowid).
+    #[tokio::test]
+    async fn thread_unread_rows_use_indexed_access_paths() {
+        let db = test_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {}", thread_unread_rows_sql());
+        let plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params!["p"]).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+        let plan_text = plan.join("\n");
+
+        assert!(
+            !plan_text.contains("AUTOMATIC"),
+            "an automatic index means the schema is missing a real access path \
+             this query needs, rebuilt per execution:\n{plan_text}"
+        );
+        assert!(
+            plan_text.contains("idx_jobs_thread_id"),
+            "the thread->session-job join must reach jobs through jobs(thread_id):\n{plan_text}"
+        );
+        assert!(
+            plan_text.contains("idx_events_session_id"),
+            "the counted event range must be seeked through events(session_id):\n{plan_text}"
+        );
+    }
+
+    /// The plan for the thread rollup, captured before assuming anything about
+    /// what it costs.
+    ///
+    /// The snapshot is the primary fix — an idle app stops running this at all.
+    /// This asserts the shape of the one rebuild that remains: the outer scan is
+    /// over `threads` filtered by project, and every join and correlated lookup
+    /// under it reaches its rows through a named index rather than a scan or an
+    /// automatic index Turso built on the fly.
+    #[tokio::test]
+    async fn thread_status_rows_use_indexed_access_paths() {
+        let db = test_db().await;
+        let sql = format!("EXPLAIN QUERY PLAN {THREAD_STATUS_ROWS_SQL}");
+        let plan: Vec<String> = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn.query(&sql, params!["p"]).await?;
+                    let mut steps = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        steps.push(row.text(3)?);
+                    }
+                    Ok(steps)
+                })
+            })
+            .await
+            .unwrap();
+        let plan_text = plan.join("\n");
+
+        assert!(
+            !plan_text.contains("AUTOMATIC"),
+            "an automatic index means the schema is missing a real access path this \
+             query needs, rebuilt per execution:\n{plan_text}"
+        );
+        assert!(
+            plan_text.contains("jobs") && plan_text.contains("idx_jobs_thread_id"),
+            "the thread->jobs join must reach jobs through jobs(thread_id):\n{plan_text}"
+        );
+    }
+
+    /// An orchestrator over a caller-supplied database, so a snapshot test can
+    /// seed rows and then read through the published projection.
+    fn orchestrator_over(db: LocalDb) -> crate::orchestrator::Orchestrator {
+        use crate::services::testing::TestServicesBuilder;
+        let config_dir = tempfile::tempdir().unwrap().keep();
+        let index_path = config_dir.join("search-index.db");
+        let db_state = std::sync::Arc::new(crate::db::DbState::new(
+            std::sync::Arc::new(db),
+            std::sync::Arc::new(crate::storage::SearchIndex::open_or_create(index_path).unwrap()),
+        ));
+        crate::orchestrator::Orchestrator::builder(
+            db_state,
+            std::sync::Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build()
+    }
+
+    /// Seed one project with one thread whose single job is idle.
+    async fn seed_one_quiet_thread(db: &LocalDb) {
+        exec(
+            db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1)",
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('t', 'p', 'quiet', 'active', 'none', 1, 1)",
+        )
+        .await;
+        exec(
+            db,
+            "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+             VALUES ('j', 't', 'p', 'thread', 'idle', 1, 1, 'thread')",
+        )
+        .await;
+    }
+
+    /// The published projection answers repeat reads of unchanged state from
+    /// memory. This is the idle path: a mounted thread list re-asking costs one
+    /// clone, not a whole-project SQL rollup.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_warm_thread_snapshot_runs_no_sql() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        let orch = orchestrator_over(db);
+
+        let first = published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].activity, NodeActivity::Idle);
+        for _ in 0..10 {
+            assert_eq!(
+                published_thread_status_indicators(&orch, "p")
+                    .await
+                    .unwrap(),
+                first
+            );
+        }
+
+        let counters = orch.thread_status_cache.counters();
+        assert_eq!(counters.misses, 1, "one rebuild served every read");
+        assert_eq!(counters.hits, 10);
+    }
+
+    /// A concurrent cold burst produces one rebuild between them, not one each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_thread_reads_rebuild_once() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        let orch = std::sync::Arc::new(orchestrator_over(db));
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(12));
+        let mut readers = Vec::new();
+        for _ in 0..12 {
+            let orch = orch.clone();
+            let barrier = barrier.clone();
+            readers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                published_thread_status_indicators(&orch, "p")
+                    .await
+                    .unwrap()
+                    .len()
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), 1);
+        }
+
+        assert_eq!(orch.thread_status_cache.counters().misses, 1);
+    }
+
+    /// The snapshot follows a real transition, and only a real one. A turn going
+    /// running is visible on the next read; a merge-request change in the same
+    /// project is not an input and does not rebuild anything.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_thread_transition_rebuilds_and_an_unrelated_change_does_not() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        let orch = orchestrator_over(db);
+
+        let idle = published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(idle[0].activity, NodeActivity::Idle);
+
+        // An unrelated table's change must leave the snapshot warm.
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "merge_requests", "projectId": "p"}),
+        );
+        published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(
+            orch.thread_status_cache.counters().misses,
+            1,
+            "a merge request is not an input to thread activity"
+        );
+
+        exec(
+            &orch.db.local,
+            "INSERT INTO sessions(id, job_id, created_at, updated_at) VALUES ('s', 'j', 1, 1)",
+        )
+        .await;
+        exec(
+            &orch.db.local,
+            "INSERT INTO turns(id, session_id, job_id, sequence, state, start_reason, created_at, updated_at)
+             VALUES ('turn', 's', 'j', 1, 'running', 'follow_up', 1, 1)",
+        )
+        .await;
+        exec(
+            &orch.db.local,
+            "UPDATE jobs SET current_turn_id = 'turn' WHERE id = 'j'",
+        )
+        .await;
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "turns", "projectId": "p"}),
+        );
+
+        let running = published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(
+            running[0].activity,
+            NodeActivity::Running,
+            "the transition must reach the UI, not sit behind a warm snapshot"
+        );
+        assert_eq!(orch.thread_status_cache.counters().misses, 2);
     }
 
     /// A thread's session and a task it spawned both resolve a home URI, and the

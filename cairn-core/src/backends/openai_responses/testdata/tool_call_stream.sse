@@ -1,0 +1,38 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_tool_0001","object":"response","status":"in_progress","model":"grok-4.5","output":[],"usage":null,"error":null,"incomplete_details":null}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","sequence_number":1,"response":{"id":"resp_tool_0001","object":"response","status":"in_progress","model":"grok-4.5","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":4,"output_index":0,"item":{"id":"msg_a1","type":"message","status":"completed","role":"assistant","content":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":5,"output_index":0,"content_index":0,"item_id":"msg_a1","delta":"I'll"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":6,"output_index":0,"content_index":0,"item_id":"msg_a1","delta":" read it."}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":16,"output_index":1,"item":{"id":"fc_b1","type":"function_call","status":"completed","name":"read","call_id":"call-first","arguments":"{\"path\":\"/etc/hosts\"}"}}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":17,"output_index":1,"item":{"id":"fc_b1","type":"function_call","status":"completed","name":"read","call_id":"call-first","arguments":"{\"path\":\"/etc/hosts\"}"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":18,"output_index":2,"item":{"id":"fc_b2","type":"function_call","status":"in_progress","name":"mcp__cairn__run","call_id":"call-second","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":19,"output_index":2,"item_id":"fc_b2","delta":"{\"commands\":[{\"command\""}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":20,"output_index":2,"item_id":"fc_b2","delta":":\"ls\"}]}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":21,"output_index":2,"item":{"id":"fc_b2","type":"function_call","status":"completed","name":"mcp__cairn__run","call_id":"call-second","arguments":""}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":22,"response":{"id":"resp_tool_0001","object":"response","status":"completed","model":"grok-4.5","error":null,"incomplete_details":null,"output":[{"id":"fc_b1","type":"function_call","status":"completed","name":"read","call_id":"call-first","arguments":"{\"path\":\"/etc/hosts\"}"}],"usage":{"input_tokens":322,"output_tokens":40,"total_tokens":362,"input_tokens_details":{"cached_tokens":128},"output_tokens_details":{"reasoning_tokens":17}},"cost":"0"}}
+
+event: ping
+data: {"type":"ping","cost":"0"}

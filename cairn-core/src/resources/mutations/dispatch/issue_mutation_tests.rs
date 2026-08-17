@@ -389,7 +389,8 @@ async fn creating_an_issue_with_an_unknown_label_creates_the_label() {
         vec!["execution-fabric"]
     );
 
-    let rendered = crate::resources::issue::read_issue(&orch.db.local, "cairn", 2).await;
+    let rendered =
+        crate::resources::issue::read_issue(&orch.db.local, &orch.db.local, "cairn", 2).await;
     assert!(rendered.contains("execution-fabric"), "in: {rendered}");
 }
 
@@ -1744,6 +1745,40 @@ async fn adopting_under_a_thread_drops_the_inherited_branch() {
 /// silent where it hurts most: two columns set at once routes attention to the
 /// new issue parent while the census still lists the old thread and
 /// `resolve_parent_branch` still refuses the inherited branch.
+// The case this projection exists for: an issue created from the desktop is
+// attributed to this installation's own device id. It must read as this
+// machine's name, with the immutable id still on the line for a reader who
+// needs it — and it must read as the bare id when nothing can resolve it.
+#[tokio::test]
+async fn a_desktop_authored_issue_reads_as_this_machine() {
+    let orch = seeded_orch().await;
+    let (_, number) = seed_issue(&orch).await;
+
+    let unresolved =
+        crate::resources::issue::read_issue(&orch.db.local, &orch.db.local, "cairn", number).await;
+    assert!(
+        unresolved.contains("Created by: test-installation\n"),
+        "in: {unresolved}"
+    );
+
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO anon_device(device_id, created_at, updated_at)
+             VALUES('test-installation', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+    let named =
+        crate::resources::issue::read_issue(&orch.db.local, &orch.db.local, "cairn", number).await;
+    let device_name = crate::account::anon_device::machine_device_name();
+    assert!(
+        named.contains(&format!("Created by: {device_name} (test-installation)\n")),
+        "in: {named}"
+    );
+}
+
 #[tokio::test]
 async fn parent_round_trips_between_thread_issue_and_none() {
     let orch = seeded_orch().await;

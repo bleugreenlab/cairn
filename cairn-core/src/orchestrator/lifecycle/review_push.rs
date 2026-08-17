@@ -705,7 +705,7 @@ pub async fn rearm_one_bounded_failed_review(orch: &Orchestrator) -> bool {
 /// substrate recovers. The ordinary attempt bound still stops a hot failure
 /// loop; the maintenance cadence releases it only after this cooldown and still
 /// dispatches at most one wave per tick.
-const DORMANT_INFRA_RETRY_COOLDOWN_SECONDS: i64 = 5 * 60;
+pub(super) const DORMANT_INFRA_RETRY_COOLDOWN_SECONDS: i64 = 5 * 60;
 
 pub(super) async fn release_cooled_infrastructure_suppression(
     orch: &Orchestrator,
@@ -777,6 +777,113 @@ pub(super) async fn bounded_rearm_candidates(
     Ok(candidates)
 }
 
+/// The dormant-review candidate set, re-read on every `BOUNDED_REARM_INTERVAL`
+/// tick. Named so the regression test can plan the statement that actually runs.
+///
+/// What this read costs has to follow the number of CANDIDATES. It used to
+/// follow the check HISTORY: the statement drove off `check_result_cache`, so
+/// every cached result on the install was visited, and each of the ones carrying
+/// a `capacity` or `infrastructure` failure -- on a production runner, ~12k of
+/// ~34k rows, almost all belonging to issues that closed months ago --
+/// separately paid for a newest-row-per-(job, check) anti-join and two sorted
+/// turn lookups. That is a 17-second query re-run every 30 seconds to find
+/// single-digit candidates, and it gets worse with every check ever recorded
+/// (CAIRN-4196).
+///
+/// The fix has two halves, and both are needed.
+///
+/// First, it drives from live work. `live_job` is the jobs under an unresolved
+/// issue -- 187 of 14,639 jobs in that same production database -- and each one
+/// seeks only its own cache rows through `idx_check_result_cache_job`. That
+/// excludes the history belonging to resolved issues, which is most of it.
+///
+/// Second, the newest row per (job, check) is chosen by RANKING that narrowed
+/// set once, not by asking per row whether a newer row exists. Narrowing alone
+/// would not have been enough: a long-lived unresolved issue accumulates a row
+/// per input hash per check indefinitely, and an anti-join pays for that history
+/// once per row of it, so the quadratic term would simply have moved from the
+/// whole cache to one busy job's slice of it. `ROW_NUMBER()` reads each live
+/// job's rows exactly once. The plan test asserts that single read directly,
+/// because an indexed range walk that grows from tens of rows to thousands looks
+/// identical to a healthy one if you only assert SEARCH rather than SCAN.
+///
+/// Note the order the filters run in: the ranking sees ALL of a live job's rows,
+/// and `failure_kind` is applied after `recency = 1`. A candidate is the current
+/// result for its check AND an infrastructure failure -- filtering first would
+/// promote a superseded failure hiding behind a newer pass.
+///
+/// State the bound honestly, because an overclaimed invariant is worse than a
+/// named limit: this is ONE linear pass over the cache rows of jobs under
+/// unresolved issues, plus a bounded number of index seeks per surviving row. It
+/// is not proportional to the returned candidates alone -- a live job's own
+/// history is still read, once. What it no longer does is read anything twice,
+/// or read the resolved-issue history that is the bulk of the table.
+///
+/// The `CROSS JOIN` spellings are load-bearing. Turso keeps no table statistics,
+/// so it cannot know that `live_job` is the small side; given a plain `JOIN` it
+/// picks the opposite order and goes straight back to scanning the whole cache.
+/// `CROSS JOIN` is how the intended order is stated, and
+/// `bounded_rearm_candidates_never_walk_the_check_history` pins the result --
+/// the plan being the only seam this regression is visible at, since both shapes
+/// are one statement returning the same rows.
+///
+/// One scan remains, over `issues`, and it is the intended floor: `status NOT IN
+/// (...)` is not a predicate any index seeks, and the set of unresolved issues is
+/// the definition of live work. It is a single pass of cheap comparisons per
+/// tick, not per candidate.
+pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
+                        SELECT j.id AS job_id, j.issue_id AS issue_id, j.branch AS branch
+                          FROM issues i
+                         CROSS JOIN jobs j ON j.issue_id = i.id
+                         WHERE i.status NOT IN ('merged', 'closed')
+                      ),
+                      latest AS (
+                        SELECT lj.job_id AS job_id, lj.issue_id AS issue_id,
+                               lj.branch AS branch, c.tree_hash AS tree_hash,
+                               c.ran_at AS ran_at, c.failure_kind AS failure_kind,
+                               c.infra_failure_streak AS infra_failure_streak,
+                               ROW_NUMBER() OVER (
+                                 PARTITION BY c.job_id, c.check_name
+                                 ORDER BY c.ran_at DESC, c.rowid DESC
+                               ) AS recency
+                          FROM live_job lj
+                         CROSS JOIN check_result_cache c ON c.job_id = lj.job_id
+                      )
+                      SELECT job_id, tree_hash, ran_at
+                        FROM latest
+                       WHERE recency = 1
+                         AND failure_kind IN ('capacity', 'infrastructure')
+                         AND (
+                           infra_failure_streak < ?1
+                           OR ran_at <= (unixepoch() - ?2) * 1000
+                         )
+                         AND (
+                           SELECT t.state FROM turns t
+                            WHERE t.job_id = latest.job_id
+                            ORDER BY t.sequence DESC
+                            LIMIT 1
+                         ) = 'complete'
+                         AND COALESCE((
+                           SELECT t.start_reason FROM turns t
+                            WHERE t.job_id = latest.job_id
+                            ORDER BY t.created_at DESC, t.sequence DESC
+                            LIMIT 1
+                         ), '') != 'memory_review'
+                         AND (
+                           EXISTS (
+                             SELECT 1 FROM artifacts a
+                              WHERE a.job_id = latest.job_id
+                                AND a.artifact_type = 'create-pr'
+                           )
+                           OR EXISTS (
+                             SELECT 1 FROM merge_requests mr
+                              WHERE mr.issue_id = latest.issue_id
+                                AND mr.source_branch = latest.branch
+                                AND mr.status = 'open'
+                           )
+                         )
+                       ORDER BY ran_at, job_id";
+
 async fn bounded_rearm_candidates_in_db(
     db: &crate::storage::LocalDb,
 ) -> Result<Vec<BoundedRearmCandidate>, String> {
@@ -784,48 +891,7 @@ async fn bounded_rearm_candidates_in_db(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT j.id, c.tree_hash, c.ran_at
-                       FROM check_result_cache c
-                       JOIN jobs j ON j.id = c.job_id
-                       JOIN issues i ON i.id = j.issue_id
-                      WHERE c.failure_kind IN ('capacity', 'infrastructure')
-                        AND (
-                          c.infra_failure_streak < ?1
-                          OR c.ran_at <= (unixepoch() - ?2) * 1000
-                        )
-                        AND i.status NOT IN ('merged', 'closed')
-                        AND (
-                          SELECT t.state FROM turns t
-                           WHERE t.job_id = j.id
-                           ORDER BY t.sequence DESC
-                           LIMIT 1
-                        ) = 'complete'
-                        AND COALESCE((
-                          SELECT t.start_reason FROM turns t
-                           WHERE t.job_id = j.id
-                           ORDER BY t.created_at DESC, t.sequence DESC
-                           LIMIT 1
-                        ), '') != 'memory_review'
-                        AND NOT EXISTS (
-                          SELECT 1 FROM check_result_cache newer
-                           WHERE newer.job_id = c.job_id
-                             AND newer.check_name = c.check_name
-                             AND (newer.ran_at > c.ran_at
-                                  OR (newer.ran_at = c.ran_at AND newer.rowid > c.rowid))
-                        )
-                        AND (
-                          EXISTS (
-                            SELECT 1 FROM artifacts a
-                             WHERE a.job_id = j.id AND a.artifact_type = 'create-pr'
-                          )
-                          OR EXISTS (
-                            SELECT 1 FROM merge_requests mr
-                             WHERE mr.issue_id = j.issue_id
-                               AND mr.source_branch = j.branch
-                               AND mr.status = 'open'
-                          )
-                        )
-                      ORDER BY c.ran_at, j.id",
+                    BOUNDED_REARM_CANDIDATES_SQL,
                     (
                         crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
                         DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,

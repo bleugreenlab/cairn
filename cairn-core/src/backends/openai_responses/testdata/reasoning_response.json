@@ -1,0 +1,42 @@
+{
+  "id": "resp_reason_0001",
+  "object": "response",
+  "status": "completed",
+  "model": "gpt-5.6-luna",
+  "error": null,
+  "incomplete_details": null,
+  "output": [
+    {
+      "id": "rs_0001",
+      "type": "reasoning",
+      "status": "completed",
+      "encrypted_content": "gAAAAABOPAQUE-REASONING-BLOB",
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "**Calculating the product**\n\n17 times 23 is 340 plus 51, which totals 391."
+        }
+      ]
+    },
+    {
+      "id": "msg_0001",
+      "type": "message",
+      "status": "completed",
+      "role": "assistant",
+      "phase": "final_answer",
+      "content": [
+        { "type": "output_text", "text": "17 × 23 = **391**", "annotations": [], "logprobs": [] }
+      ]
+    }
+  ],
+  "usage": {
+    "input_tokens": 17,
+    "output_tokens": 45,
+    "total_tokens": 62,
+    "input_tokens_details": { "cached_tokens": 0 },
+    "output_tokens_details": { "reasoning_tokens": 31 }
+  },
+  "reasoning": { "context": "all_turns", "effort": "low", "mode": "standard", "summary": "detailed" },
+  "text": { "format": { "type": "text" } },
+  "cost": "0"
+}

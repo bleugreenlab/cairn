@@ -4,25 +4,12 @@
 //! the most recent exchanges). Never touches the stored transcript.
 
 use super::wire::{ChatContent, ChatMessage};
+use crate::backends::http_loop::{CHARS_PER_TOKEN, PROTECT_RECENT_MESSAGES};
+// The budget policy is shared by every HTTP protocol family; re-exported here
+// for this module's callers and tests.
+pub(crate) use crate::backends::http_loop::context_fit_budget;
 use std::borrow::Cow;
 use std::collections::HashMap;
-
-/// Rough chars-per-token ratio for the trim heuristic. English and code average
-/// ~3.5–4 characters per token; 4 deliberately under-counts token volume, with
-/// the slack absorbed by trimming to a fraction of the window
-/// (`CONTEXT_FIT_FRACTION`) rather than to its exact edge. Phase 1 only needs to
-/// stay under the limit, not account perfectly.
-const CHARS_PER_TOKEN: i64 = 4;
-
-/// Trim the outgoing request down to this fraction of the model's real context
-/// window. The remaining headroom covers the response (including reasoning
-/// tokens) plus slack for the approximate char-per-token estimate.
-const CONTEXT_FIT_FRACTION: f64 = 0.75;
-
-/// The most recent messages whose tool outputs are never collapsed, so the model
-/// keeps full fidelity on the exchange it is actively reasoning about. Older tool
-/// outputs are collapsed oldest-first when the request would exceed budget.
-const PROTECT_RECENT_MESSAGES: usize = 8;
 
 /// Rough token estimate for a single message: content, any tool-call name and
 /// arguments, and serialized reasoning, divided by the char heuristic plus a
@@ -46,11 +33,6 @@ fn estimate_message_tokens(message: &ChatMessage) -> i64 {
 
 pub(crate) fn estimate_conversation_tokens(messages: &[ChatMessage]) -> i64 {
     messages.iter().map(estimate_message_tokens).sum()
-}
-
-/// The token budget the outgoing request is trimmed to fit under.
-pub(crate) fn context_fit_budget(context_window: i64) -> i64 {
-    ((context_window as f64) * CONTEXT_FIT_FRACTION) as i64
 }
 
 /// Return a view of `messages` that fits under the model's real context window,

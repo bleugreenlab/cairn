@@ -102,17 +102,20 @@ fn ack_instruction(uri: &str, token: &str) -> String {
     )
 }
 
-fn render_markdown(uri: &str, page: &FeedPage) -> String {
+/// A feed page renders its posts exactly as every other posts surface does, so
+/// it resolves the same rendering context first rather than printing stored ids.
+async fn render_markdown(db: &LocalDb, uri: &str, page: &FeedPage) -> String {
     let Some(token) = page.token.as_deref() else {
         return format!("# Feed\n\n`{uri}`\n\nNo unread posts. Nothing to acknowledge.\n");
     };
+    let context = super::posts::PostContext::resolve(db, &page.posts).await;
     format!(
         "# Feed\n\n`{uri}`\n\n{} unread post(s), oldest first; {} more unread behind this page.\n\n{}\n{}",
         page.posts.len(),
         page.remaining_unread,
         page.posts
             .iter()
-            .map(super::posts::render_post)
+            .map(|post| super::posts::render_post(post, &context))
             .collect::<Vec<_>>()
             .join("\n"),
         ack_instruction(uri, token),
@@ -168,7 +171,7 @@ pub(super) async fn read_home_feed(
     if json {
         render_json(&uri, &page)
     } else {
-        render_markdown(&uri, &page)
+        render_markdown(&orch.db.local, &uri, &page).await
     }
 }
 
@@ -394,7 +397,7 @@ mod tests {
 
         let page = db.issue_feed_page(&thread, 1).await.unwrap();
         let uri = "cairn://p/fed/design-review/feed";
-        let rendered = render_markdown(uri, &page);
+        let rendered = render_markdown(&db, uri, &page).await;
         let token = page.token.clone().unwrap();
         assert!(rendered.contains("cairn://posts/1"), "{rendered}");
         assert!(!rendered.contains("cairn://posts/2"), "{rendered}");
@@ -416,7 +419,7 @@ mod tests {
         let db = fixture().await;
         let thread = home(&db, "design-review", None).await;
         let page = db.issue_feed_page(&thread, 10).await.unwrap();
-        let rendered = render_markdown("cairn://p/fed/design-review/feed", &page);
+        let rendered = render_markdown(&db, "cairn://p/fed/design-review/feed", &page).await;
         assert!(rendered.contains("No unread posts"), "{rendered}");
         assert!(!rendered.contains("ack:"), "{rendered}");
     }

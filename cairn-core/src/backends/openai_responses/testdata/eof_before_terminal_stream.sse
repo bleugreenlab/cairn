@@ -1,0 +1,17 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_eof_0001","object":"response","status":"in_progress","model":"grok-4.5","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"msg_e1","type":"message","status":"in_progress","role":"assistant","content":null}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":2,"output_index":0,"content_index":0,"item_id":"msg_e1","delta":"Removing the stale entries now."}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":3,"output_index":1,"item":{"id":"fc_e1","type":"function_call","status":"in_progress","name":"run","call_id":"call-eof","arguments":""}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":4,"output_index":1,"item_id":"fc_e1","delta":"{\"commands\":[{\"command\":\"rm -rf /tmp/cache\"}]}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":5,"output_index":1,"item":{"id":"fc_e1","type":"function_call","status":"completed","name":"run","call_id":"call-eof","arguments":""}}

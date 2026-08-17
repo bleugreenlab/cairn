@@ -26,7 +26,10 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
     // Provider credentials and the identities agents authenticate as.
     "accounts",
     // Which models and providers agent work is routed to — where prompts,
-    // code, and credentials actually go.
+    // code, and credentials actually go. Installing a provider adds a
+    // destination every future agent can be routed to; removing one takes a
+    // destination away from work already configured to use it.
+    "enabledProviders",
     "tierDefaults",
     "backends",
     "tiers",

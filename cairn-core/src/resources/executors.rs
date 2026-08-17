@@ -461,6 +461,8 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     }
     out.push('\n');
 
+    out.push_str(&render_executor_memory(executor));
+
     out.push_str("## Process ownership\n");
     out.push_str(&format!(
         "- Resident ownership: {} tracked, {} stale reaped, {} unverified{}\n",
@@ -945,6 +947,90 @@ pub(crate) fn unknown_executor(
     )
 }
 
+/// How big the executor daemon is, and which of its own owners is holding it.
+///
+/// The two halves answer different questions and the section is only useful
+/// with both. Resident size says whether there is a problem; the owner table
+/// says where it is. Before this, an operator watching a helper reach a hundred
+/// gigabytes could read the first and had nothing at all for the second, and
+/// restarting to reclaim the machine destroyed the evidence.
+///
+/// Peaks are rendered beside live values because a settled snapshot is read
+/// after the incident far more often than during it, and "empty now, held two
+/// hundred megabytes" is the sentence that identifies a transient owner.
+fn render_executor_memory(executor: &ExecutorInspection) -> String {
+    let process = &executor.health.machine.process;
+    let mut out = String::from("## Executor memory\n");
+    out.push_str(&format!(
+        "- Resident: {}\n",
+        reading(
+            &process.resident_bytes,
+            executor.captured_at_unix_ms,
+            |value| bytes(*value)
+        )
+    ));
+    out.push_str(&format!(
+        "- Physical footprint: {}\n",
+        reading(
+            &process.physical_footprint_bytes,
+            executor.captured_at_unix_ms,
+            |value| bytes(*value)
+        )
+    ));
+    out.push_str(&format!(
+        "- Mapped address space: {}\n",
+        reading(
+            &process.virtual_bytes,
+            executor.captured_at_unix_ms,
+            |value| bytes(*value)
+        )
+    ));
+
+    let retained = &process.retained;
+    if retained.is_unreported() {
+        out.push_str(
+            "- Retained state: not reported by this executor (it predates retained-state \
+             telemetry)\n\n",
+        );
+        return out;
+    }
+    out.push_str(&format!(
+        "- Retained state measured: {}\n",
+        age(executor
+            .captured_at_unix_ms
+            .saturating_sub(retained.measured_at_unix_ms))
+    ));
+    out.push_str(&format!(
+        "- Attributed total: {} across every owner below (estimated from owned string and \
+         vector capacities, so it is a floor rather than a reconciliation of resident size)\n",
+        bytes(retained.total_estimated_bytes())
+    ));
+
+    let owners: Vec<_> = retained
+        .owners()
+        .into_iter()
+        .filter(|(_, owner)| !owner.is_untouched())
+        .collect();
+    if owners.is_empty() {
+        out.push_str("- Owners: every owner is empty and has never held anything\n\n");
+        return out;
+    }
+    out.push_str("\n| Owner | Now | Bytes now | Peak | Peak bytes |\n");
+    out.push_str("| --- | --: | --: | --: | --: |\n");
+    for (kind, owner) in owners {
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            kind.label(),
+            owner.entries,
+            bytes(owner.estimated_bytes),
+            owner.peak_entries,
+            bytes(owner.peak_estimated_bytes),
+        ));
+    }
+    out.push('\n');
+    out
+}
+
 fn link_summary(executor: &ExecutorInspection) -> String {
     match executor.health.status {
         ExecutorHealthStatus::Online => "online".to_string(),
@@ -1098,6 +1184,7 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 #[cfg(test)]
 mod tests {
     use cairn_common::executor_protocol::MeasurementGap;
+    use cairn_common::executor_protocol::{ExecutorRetainedState, RetainedOwner};
 
     use super::*;
     use cairn_common::executor_protocol::{
@@ -1370,6 +1457,104 @@ mod tests {
                 free_bytes: 512 * 1024 * 1024 * 1024,
             },
         );
+    }
+
+    /// The incident this section exists for, rendered.
+    ///
+    /// The shape is the one a live `vmmap` found on a daemon at 59.6 GiB: an
+    /// enormous mapped address space, a much smaller footprint, and owners
+    /// holding almost nothing. A reader has to be able to see all three at
+    /// once, because it is their *combination* that says the growth is
+    /// allocator regions rather than retained data — and that distinction
+    /// decides whether the next person looks for a leak or for an allocation
+    /// rate.
+    #[test]
+    fn executor_memory_shows_size_beside_the_owners_that_account_for_it() {
+        let mut executor = inspection("local", true);
+        executor.health.machine.process.resident_bytes =
+            Measurement::measured(CAPTURED_AT - 5_000, 59_632_304 * 1024);
+        executor.health.machine.process.physical_footprint_bytes =
+            Measurement::measured(CAPTURED_AT - 5_000, 9_448_928_051);
+        executor.health.machine.process.virtual_bytes =
+            Measurement::measured(CAPTURED_AT - 5_000, 124_998_048_154);
+        executor.health.machine.process.retained = ExecutorRetainedState {
+            measured_at_unix_ms: CAPTURED_AT - 5_000,
+            cells: RetainedOwner {
+                entries: 3,
+                estimated_bytes: 2_048,
+                peak_entries: 6,
+                peak_estimated_bytes: 4_096,
+            },
+            queued_output_chunks: RetainedOwner {
+                entries: 0,
+                estimated_bytes: 0,
+                peak_entries: 64,
+                peak_estimated_bytes: 524_288,
+            },
+            ..ExecutorRetainedState::default()
+        };
+
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("## Executor memory"), "{rendered}");
+        assert!(rendered.contains("56.9 GiB"), "resident size: {rendered}");
+        assert!(rendered.contains("8.8 GiB"), "footprint: {rendered}");
+        assert!(
+            rendered.contains("Mapped address space: 116.4 GiB"),
+            "the reading that distinguishes fragmentation from retention: {rendered}"
+        );
+        assert!(rendered.contains("cells"), "{rendered}");
+        // An owner that is empty now but peaked is exactly the transient this
+        // table exists to surface after the fact.
+        assert!(
+            rendered.contains("queued output chunks"),
+            "a drained owner with a peak must still render: {rendered}"
+        );
+        assert!(rendered.contains("512.0 KiB"), "its peak: {rendered}");
+        // Owners that were never touched are noise and stay out.
+        assert!(
+            !rendered.contains("residency reclaim contention"),
+            "an untouched owner must not pad the table: {rendered}"
+        );
+    }
+
+    /// An executor too old to publish retained state says so, rather than
+    /// rendering as a daemon that measured itself and found nothing. The two
+    /// look identical in a defaulted struct and mean opposite things.
+    #[test]
+    fn an_executor_without_retained_telemetry_is_named_as_unreported() {
+        let mut executor = inspection("bglab-ub", false);
+        executor.health.machine.process.resident_bytes =
+            Measurement::measured(CAPTURED_AT - 1_000, 27 * 1024 * 1024);
+        executor.health.machine.process.retained = ExecutorRetainedState::default();
+
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Retained state: not reported"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Attributed total"),
+            "a total of zero would claim a measurement that was never taken: {rendered}"
+        );
+    }
+
+    /// A reading that was never taken renders as its named reason. A process
+    /// size of "0 B" would read as a daemon that is not there.
+    #[test]
+    fn an_unmeasured_process_size_renders_as_its_gap_not_as_zero() {
+        let mut executor = inspection("bglab-win", false);
+        executor.health.machine.process.resident_bytes =
+            Measurement::unavailable(CAPTURED_AT, MeasurementGap::SamplingFailed);
+        executor.health.machine.process.virtual_bytes =
+            Measurement::unavailable(CAPTURED_AT, MeasurementGap::UnsupportedPlatform);
+
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Resident: unavailable"), "{rendered}");
+        assert!(
+            rendered.contains("Mapped address space: unavailable"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Resident: 0 B"), "{rendered}");
     }
 
     #[test]

@@ -8,6 +8,44 @@ macro_rules! private_codex_watchdog_ledger {
     };
 }
 
+macro_rules! shared_tail_liveness_join_indexes {
+    () => {
+        Migration::new(
+            "0195",
+            "index_liveness_joins",
+            include_str!("../../../../turso_migrations/0195_index_liveness_joins.sql"),
+        )
+    };
+}
+
+/// CAIRN-4182: `attention_pushes` gains a retired state, so a push whose
+/// referent resolved stops being re-resolved forever. The table is
+/// ProjectScoped, so the change is written once and composed into both lineages.
+macro_rules! shared_tail_attention_push_retirement {
+    () => {
+        Migration::new(
+            "0196",
+            "attention_push_retirement",
+            include_str!("../../../../turso_migrations/0196_attention_push_retirement.sql"),
+        )
+    };
+}
+
+/// CAIRN-4182: the one-time retirement backfill's keyset cursor. Runner-transient
+/// per-install progress, like `analytics_rollup_backfill_state`, so it is absent
+/// from the team lineage.
+macro_rules! private_attention_push_retirement_backfill {
+    () => {
+        Migration::new(
+            "0197",
+            "attention_push_retirement_backfill",
+            include_str!(
+                "../../../../turso_migrations/0197_attention_push_retirement_backfill.sql"
+            ),
+        )
+    };
+}
+
 macro_rules! private_posts {
     () => {
         Migration::new(
@@ -58,6 +96,43 @@ macro_rules! private_canonicalize_channel_permission_answers {
             include_str!(
                 "../../../../turso_migrations/0190_canonicalize_channel_permission_answers.sql"
             ),
+        )
+    };
+}
+
+/// CAIRN-3759: `projects` gains `next_thread_number`, the durable allocator for
+/// server-assigned thread addresses, mirroring `next_issue_number`. `projects`
+/// is carried by both lineages, so the change is written once and composed into
+/// both.
+macro_rules! shared_tail_project_thread_number {
+    () => {
+        Migration::new(
+            "0199",
+            "project_thread_number",
+            include_str!("../../../../turso_migrations/0199_project_thread_number.sql"),
+        )
+    };
+}
+
+/// CAIRN-4195: the local operator's per-thread transcript read cursor. Private
+/// only — a read position is one person's on one install, and replicating it
+/// would let a teammate's reading clear this operator's unread badge.
+macro_rules! private_thread_read_positions {
+    () => {
+        Migration::new(
+            "0200",
+            "thread_read_positions",
+            include_str!("../../../../turso_migrations/0200_thread_read_positions.sql"),
+        )
+    };
+}
+
+macro_rules! shared_tail_thread_status_rollup_index {
+    () => {
+        Migration::new(
+            "0198",
+            "index_thread_status_rollup",
+            include_str!("../../../../turso_migrations/0198_index_thread_status_rollup.sql"),
         )
     };
 }
@@ -1161,6 +1236,10 @@ macro_rules! team_lineage {
             shared_tail_tool_analytics_hourly!(),
             shared_tail_issue_authorship!(),
             shared_tail_canonical_project_keys!(),
+            shared_tail_liveness_join_indexes!(),
+            shared_tail_attention_push_retirement!(),
+            shared_tail_thread_status_rollup_index!(),
+            shared_tail_project_thread_number!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1457,6 +1536,12 @@ macro_rules! private_lineage {
             private_canonical_discord_surface_project_keys!(),
             private_canonical_project_routes!(),
             private_posts!(),
+            shared_tail_liveness_join_indexes!(),
+            shared_tail_attention_push_retirement!(),
+            private_attention_push_retirement_backfill!(),
+            shared_tail_thread_status_rollup_index!(),
+            shared_tail_project_thread_number!(),
+            private_thread_read_positions!(),
         ]
     };
 }
@@ -2084,6 +2169,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("agent_waits", TableScope::ProjectScoped),
     ("artifact_content", TableScope::ProjectScoped),
     ("artifacts", TableScope::ProjectScoped),
+    // Per-install progress of the one-time retirement backfill (CAIRN-4182):
+    // how far THIS runner has classified its own historical queue. A team
+    // replica has no use for another machine's cursor.
+    (
+        "attention_push_retirement_backfill",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
     ("attention_pushes", TableScope::ProjectScoped),
     ("attention_read_cursors", TableScope::ProjectScoped),
     // Authorization state is this operator's decision about this install.
@@ -2177,6 +2269,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("sessions", TableScope::ProjectScoped),
     ("skill_configs", TableScope::ProjectScoped),
     ("suppressed_wakes", TableScope::ProjectScoped),
+    // Where THIS operator has read up to in each thread's transcript. The thread
+    // is shared; the reading of it is not. Replicating this would let a
+    // teammate's attention clear the unread badge on someone else's sidebar,
+    // which is the opposite of what the marker means.
+    (
+        "thread_read_positions",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     ("threads", TableScope::ProjectScoped),
     ("todos", TableScope::ProjectScoped),
     ("token_rollup", TableScope::ProjectScoped),
@@ -3161,6 +3261,12 @@ mod tests {
                 "0192_canonical_discord_surface_project_keys".to_string(),
                 "0193_canonical_project_routes".to_string(),
                 "0194_posts".to_string(),
+                "0195_index_liveness_joins".to_string(),
+                "0196_attention_push_retirement".to_string(),
+                "0197_attention_push_retirement_backfill".to_string(),
+                "0198_index_thread_status_rollup".to_string(),
+                "0199_project_thread_number".to_string(),
+                "0200_thread_read_positions".to_string(),
             ]
         );
         Ok(db)
@@ -3733,6 +3839,252 @@ mod tests {
         db.query_all(format!("EXPLAIN QUERY PLAN {sql}"), (), |row| row.text(3))
             .await
             .unwrap()
+    }
+
+    /// Every arm of the attention-push liveness predicate must be an index seek:
+    /// a drain runs them on every MCP tool call (CAIRN-4181). Turso keeps no
+    /// table statistics, so `EXPLAIN QUERY PLAN` is the only evidence an index is
+    /// load-bearing rather than dead weight.
+    ///
+    /// Each arm is asserted in the batched set form the resolver actually
+    /// issues, because the planner chooses differently for the set form than for
+    /// the single-equality form the row-at-a-time predicate used. That is why
+    /// the artifact arm below already seeks *before* 0195 (0106 created
+    /// `idx_jobs_issue_id` long ago, and the old shape simply never used it):
+    /// the fix there was the query, not the schema. 0195 adds only what the set
+    /// forms genuinely lack -- `issues(number)`, and a `merge_requests(issue_id)`
+    /// the planner will use at all.
+    #[tokio::test]
+    async fn migration_0195_indexes_attention_push_liveness_joins() {
+        // A `review:` artifact arm: reach artifacts through jobs, driving from
+        // the issue rather than scanning every artifact of a type. The two
+        // artifact arms stay separate statements deliberately -- folding them
+        // into one `artifact_type IN ('plan', 'create-pr')` query flips the
+        // planner back to idx_artifacts_type and undoes the whole point.
+        const ARTIFACT_ARM: &str = "SELECT j.issue_id FROM jobs j \
+             WHERE j.issue_id IN ('a', 'b') AND EXISTS \
+             (SELECT 1 FROM artifacts a WHERE a.job_id = j.id AND a.artifact_type = 'create-pr')";
+        // Resolving a whole backlog's issue refs: one statement, one seek per
+        // number, with the project matched on the join.
+        const ISSUE_ARM: &str = "SELECT p.key, i.number, i.id, i.status \
+             FROM issues i JOIN projects p ON p.id = i.project_id \
+             WHERE i.number IN (1, 2) AND p.key IN ('k')";
+        // The first and cheapest `review:` arm: is there an open PR.
+        const MR_ARM: &str = "SELECT issue_id, status FROM merge_requests WHERE issue_id IN ('a')";
+
+        let (artifact_before, issue_before, mr_before) = {
+            let temp = tempdir().unwrap();
+            let path = temp.keep().join("cairn-liveness-index-before.db");
+            let db = LocalDb::open(path).await.unwrap();
+            let without_index: Vec<_> = TURSO_MIGRATIONS
+                .iter()
+                .filter(|m| m.version != "0195")
+                .copied()
+                .collect();
+            MigrationRunner::new(without_index).run(&db).await.unwrap();
+            (
+                explain_plan(&db, ARTIFACT_ARM).await,
+                explain_plan(&db, ISSUE_ARM).await,
+                explain_plan(&db, MR_ARM).await,
+            )
+        };
+        assert!(
+            artifact_before
+                .iter()
+                .any(|step| step.contains("SEARCH j USING INDEX idx_jobs_issue_id")),
+            "the artifact arm needs no new index -- 0106 already created \
+             idx_jobs_issue_id, and the batched set form uses it. What changed is \
+             the query shape, not the schema. Got {artifact_before:?}"
+        );
+        assert!(
+            issue_before
+                .iter()
+                .any(|step| step.contains("idx_issues_project_id")),
+            "without 0195 the UNIQUE (project_id, number) index cannot serve \
+             `number IN (...)`, so the arm falls back to the project index and \
+             loads every issue in the project, got {issue_before:?}"
+        );
+        assert!(
+            mr_before
+                .iter()
+                .any(|step| step.contains("SCAN merge_requests")),
+            "the pre-existing idx_mr_issue is PARTIAL and Turso will not use it, so \
+             this arm is a full scan before 0195, got {mr_before:?}"
+        );
+
+        let db = migrated_db().await.unwrap();
+        let artifact = explain_plan(&db, ARTIFACT_ARM).await;
+        assert!(
+            artifact
+                .iter()
+                .any(|step| step.contains("SEARCH j USING INDEX idx_jobs_issue_id"))
+                && artifact
+                    .iter()
+                    .any(|step| step.contains("SEARCH a USING INDEX idx_artifacts_job_id")),
+            "the batched artifact arm must drive from jobs(issue_id) into \
+             artifacts(job_id), got {artifact:?}"
+        );
+        let issue = explain_plan(&db, ISSUE_ARM).await;
+        assert!(
+            issue
+                .iter()
+                .any(|step| step.contains("SEARCH i USING INDEX idx_issues_number")),
+            "expected the issue arm to seek once per number after 0195, got {issue:?}"
+        );
+        let mr = explain_plan(&db, MR_ARM).await;
+        assert!(
+            mr.iter()
+                .any(|step| step.contains("SEARCH merge_requests USING INDEX idx_mr_issue")),
+            "expected the merge-request arm to seek after 0195 replaced the partial \
+             index with a plain one of the same name, got {mr:?}"
+        );
+    }
+
+    /// 0196 makes `delivered_event_id IS NULL AND retired_at IS NULL` the
+    /// canonical pending population, and the drain's index is what has to make
+    /// that predicate cheap. This pins the plan for the two exact production
+    /// queries, because Turso keeps no table statistics -- a plan is the only
+    /// evidence an index is load-bearing rather than dead weight.
+    ///
+    /// The point of the assertions is narrower than "an index is used": a drain
+    /// must not SCAN `attention_pushes`. Retirement exists so that historical
+    /// rows stop being re-examined, and a plan that scans the table would give
+    /// that back -- the queue would grow forever in the planner even though it
+    /// no longer grows in the drain.
+    ///
+    /// The index is PARTIAL, and the sorter assertions are why that is not
+    /// merely tidy. Measured on this engine: `IS NULL` is not a seekable
+    /// equality, so a plain index carrying `delivered_event_id` and `retired_at`
+    /// in its key is used for `recipient=?` alone and the ORDER BY degrades to
+    /// `USE SORTER FOR ORDER BY`. A partial index instead removes the delivered
+    /// and retired rows from the structure itself, which is what ties drain cost
+    /// to the live backlog rather than to the table.
+    ///
+    /// That refines, rather than contradicts, 0195's note on `idx_mr_issue`:
+    /// this planner does use partial indexes, but it will not infer that a
+    /// query's `issue_id IN (...)` implies an index's `issue_id IS NOT NULL`.
+    /// The missing capability is predicate implication. So a partial index is
+    /// only reachable when the query repeats its predicate verbatim -- which is
+    /// exactly why `attention_push`'s drains spell out
+    /// `delivered_event_id IS NULL AND retired_at IS NULL` term for term, and
+    /// why changing that clause's wording would silently cost the index.
+    #[tokio::test]
+    async fn migration_0196_retirement_defines_the_pending_population() {
+        // Byte-for-byte the predicate `attention_push::list_pending` issues.
+        const PENDING: &str = "SELECT id, recipient, content_ref, wake, boundary, key, \
+             created_at, delivered_event_id FROM attention_pushes \
+             WHERE recipient=?1 AND delivered_event_id IS NULL AND retired_at IS NULL \
+             ORDER BY created_at ASC, id ASC";
+        // ... and `pending_at_boundary`, which adds `boundary` as a residual
+        // filter over the same seek.
+        const BOUNDARY: &str = "SELECT id, recipient, content_ref, wake, boundary, key, \
+             created_at, delivered_event_id FROM attention_pushes \
+             WHERE recipient=?1 AND delivered_event_id IS NULL AND retired_at IS NULL \
+               AND boundary=?2 ORDER BY created_at ASC, id ASC";
+
+        let db = migrated_db().await.unwrap();
+
+        let columns = table_columns(&db, "attention_pushes").await;
+        for column in ["retired_at", "retirement_reason"] {
+            assert!(
+                columns.iter().any(|name| name == column),
+                "0196 must add {column} to attention_pushes, got {columns:?}"
+            );
+        }
+
+        let pending = explain_plan(&db, PENDING).await;
+        assert!(
+            pending
+                .iter()
+                .any(|step| step.contains("idx_attention_pushes_pending")),
+            "the pending drain must seek the pending index, got {pending:?}"
+        );
+        assert!(
+            !pending
+                .iter()
+                .any(|step| step.contains("SCAN attention_pushes")),
+            "the pending drain must never scan attention_pushes -- retiring rows \
+             is pointless if the planner still walks them, got {pending:?}"
+        );
+
+        assert!(
+            !pending.iter().any(|step| step.contains("USE SORTER")),
+            "the pending index must supply `ORDER BY created_at, id` directly; a \
+             sorter means the drain materializes and sorts the whole backlog on \
+             every MCP tool call, got {pending:?}"
+        );
+
+        let boundary = explain_plan(&db, BOUNDARY).await;
+        assert!(
+            boundary
+                .iter()
+                .any(|step| step.contains("idx_attention_pushes_pending")),
+            "the boundary drain must seek the pending index, got {boundary:?}"
+        );
+        assert!(
+            !boundary
+                .iter()
+                .any(|step| step.contains("SCAN attention_pushes")),
+            "the boundary drain must never scan attention_pushes, got {boundary:?}"
+        );
+        assert!(
+            !boundary.iter().any(|step| step.contains("USE SORTER")),
+            "`boundary` is a residual filter over an already-ordered seek, not a \
+             reason to sort, got {boundary:?}"
+        );
+
+        // The supersede index is the one place a PARTIAL index is still correct:
+        // it is a uniqueness constraint, and enforcement does not go through the
+        // planner. Its predicate is what lets a retired row leave the index, so
+        // a later same-key push inserts fresh instead of reviving history.
+        let supersede = index_sql(&db, "idx_attention_pushes_supersede")
+            .await
+            .expect("0196 must leave a supersede index in place");
+        assert!(
+            supersede.contains("delivered_event_id IS NULL")
+                && supersede.contains("retired_at IS NULL"),
+            "supersession must cover only ACTIVE pending rows, got {supersede}"
+        );
+    }
+
+    /// Column names of `table`, in declaration order.
+    async fn table_columns(db: &LocalDb, table: &str) -> Vec<String> {
+        let sql = format!("PRAGMA table_info({table})");
+        db.read(move |conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, ()).await?;
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    out.push(row.text(1)?);
+                }
+                Ok(out)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The stored `CREATE INDEX` text for `name`, or `None` if it does not exist.
+    async fn index_sql(db: &LocalDb, name: &str) -> Option<String> {
+        let name = name.to_string();
+        db.read(move |conn| {
+            let name = name.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?1",
+                        (name,),
+                    )
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => row.opt_text(0)?,
+                    None => None,
+                })
+            })
+        })
+        .await
+        .unwrap()
     }
 
     /// 0078 indexes the session-transcript loader's hottest query. This asserts
@@ -5427,6 +5779,10 @@ mod tests {
                 "0177_tool_analytics_hourly".to_string(),
                 "0187_issue_authorship".to_string(),
                 "0191_canonical_project_keys".to_string(),
+                "0195_index_liveness_joins".to_string(),
+                "0196_attention_push_retirement".to_string(),
+                "0198_index_thread_status_rollup".to_string(),
+                "0199_project_thread_number".to_string(),
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

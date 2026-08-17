@@ -1,0 +1,17 @@
+[package]
+name = "unigram"
+version.workspace = true
+edition = "2021"
+license = "BUSL-1.1"
+description = "Bijective codec between bytes and single-token words, for moving identifiers through a language model"
+
+[dependencies]
+# The OS CSPRNG, and this crate's only runtime dependency. Because the alphabet
+# is exactly 256 entries, every byte maps to one word with no rejection sampling,
+# so raw entropy is all `mint` needs.
+getrandom = "0.3"
+
+[dev-dependencies]
+# Test-time only: the gate proving every alphabet entry costs one token. Nothing
+# at runtime tokenizes.
+cairn-tokenize = { path = "../cairn-tokenize" }

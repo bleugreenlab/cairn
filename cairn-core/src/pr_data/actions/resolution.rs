@@ -348,6 +348,9 @@ pub async fn resolve_pr_node(
         });
     }
 
+    // Merged/closed is the settled terminal state the snapshot caches without an
+    // expiry, so the transition into it must advance the generation exactly once.
+    orch.invalidate_pr_refresh(&merge_context.mr.job_id, "pull-request-resolved");
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "merge_requests", "action": "update"}),

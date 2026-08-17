@@ -80,6 +80,33 @@ pub enum FeedAck {
     Rejected(String),
 }
 
+/// Choose an issuance nonce that cannot be confused with the one that last
+/// advanced this position.
+///
+/// A fresh nonce equal to `acknowledged` would create a genuinely ambiguous
+/// state. A later presentation of that string could be this issuance's
+/// acknowledgement, or a retry of the earlier acknowledgement whose reply was
+/// lost — and the two histories are indistinguishable, because they are the same
+/// string against the same row. No comparison order resolves it: preferring the
+/// replay strands a fresh page that was genuinely acknowledged, and preferring
+/// the outstanding issuance lets a stale retry acknowledge posts its caller never
+/// received. So the state is never created rather than adjudicated.
+///
+/// This is what keeps a four-byte nonce honest. The width is chosen for what the
+/// token costs to carry, not for making a collision unimaginable, so the one
+/// place a collision would actually matter excludes it outright.
+///
+/// `mint` is a parameter so the exclusion can be tested directly instead of
+/// waiting on one-in-four-billion odds to arrive.
+fn issuance_nonce(acknowledged: Option<&str>, mut mint: impl FnMut() -> String) -> String {
+    loop {
+        let candidate = mint();
+        if !acknowledged.is_some_and(|prior| unigram::matches(prior, &candidate)) {
+            return candidate;
+        }
+    }
+}
+
 impl LocalDb {
     /// Read `home`'s contiguous unread prefix and record the issuance that
     /// acknowledges it.
@@ -93,20 +120,21 @@ impl LocalDb {
         let kind = home.kind.as_str();
         let id = home.id.clone();
         let project_id = home.project_id.clone();
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
         self.write(move |conn| {
-            let (id, project_id, nonce) = (id.clone(), project_id.clone(), nonce.clone());
+            let (id, project_id) = (id.clone(), project_id.clone());
             Box::pin(async move {
+                // The acknowledged nonce is read alongside the position because the
+                // issuance minted below must not repeat it — see `issuance_nonce`.
                 let mut rows = conn
                     .query(
-                        "SELECT acknowledged_post_id FROM feed_cursors
+                        "SELECT acknowledged_post_id, acknowledged_nonce FROM feed_cursors
                          WHERE home_kind = ?1 AND home_id = ?2",
                         params![kind, id.as_str()],
                     )
                     .await?;
-                let position = match rows.next().await? {
-                    Some(row) => row.i64(0)?,
-                    None => 0,
+                let (position, acknowledged_nonce) = match rows.next().await? {
+                    Some(row) => (row.i64(0)?, row.opt_text(1)?),
+                    None => (0, None),
                 };
                 drop(rows);
 
@@ -157,6 +185,13 @@ impl LocalDb {
                     .ok_or_else(|| DbError::internal("feed backlog count returned no row"))?
                     .i64(0)?;
                 drop(rows);
+
+                // Four bytes of entropy as four words: 32 bits, chosen for what the
+                // token costs an agent to carry rather than for cryptographic
+                // width. Minted here rather than before the transaction so the
+                // exclusion below sees this home's committed acknowledged nonce,
+                // and so an empty page mints nothing at all.
+                let nonce = issuance_nonce(acknowledged_nonce.as_deref(), || unigram::mint(4));
 
                 // The issuance supersedes any earlier outstanding one, which is
                 // what makes an unacknowledged token from a previous read stale.
@@ -216,35 +251,75 @@ impl LocalDb {
                 let acknowledged_nonce = row.opt_text(3)?;
                 drop(rows);
 
-                // Replay of the token that last advanced this position. Checked
-                // before the outstanding issuance so a retry that raced a fresh
-                // read still reads as the success it already was.
-                if acknowledged_nonce.as_deref() == Some(token.as_str()) {
+                // An issuance recorded as EQUAL to the acknowledged nonce is a
+                // consumed one, not an outstanding one, so it is discarded here.
+                //
+                // This is what rows written before this change look like: the older
+                // acknowledgement set `acknowledged_nonce` to the presented token
+                // without clearing `last_issued_nonce`, so every already-
+                // acknowledged row carries the same token in both columns. Reading
+                // that as an outstanding issuance would let a retry of an
+                // acknowledgement report as a fresh advance. Discarding it also
+                // restores, for legacy rows, the invariant `issuance_nonce`
+                // maintains for new ones: the outstanding and acknowledged nonces
+                // are never the same value, so at most one branch below can match
+                // and the comparison order carries no weight.
+                let issued_nonce = issued_nonce.filter(|issued| {
+                    !acknowledged_nonce
+                        .as_deref()
+                        .is_some_and(|prior| unigram::matches(prior, issued))
+                });
+
+                // Comparisons go through `unigram::matches`, which forgives the
+                // damage a round trip through a model does to a token — case,
+                // surrounding and interior whitespace, a separator swapped for a
+                // hyphen or a newline. What it does not forgive is a token that
+                // decodes to different bytes, so forgiveness never widens what is
+                // accepted beyond the value actually issued. A token issued in the
+                // older opaque format matches itself under the same call, which is
+                // why swapping the minted form needs no migration.
+                if let Some((outstanding, through)) = issued_nonce
+                    .as_deref()
+                    .zip(issued_through)
+                    .filter(|(nonce, _)| unigram::matches(nonce, &token))
+                {
+                    // Monotonic, and bounded by what this token actually showed:
+                    // posts that arrived after the issuance stay unread.
+                    let advanced = position.max(through);
+                    // The issuance is CONSUMED here, which is the third leg of the
+                    // invariant: minting excludes the acknowledged nonce, reading
+                    // discards a legacy issuance equal to it, and acknowledging
+                    // clears the issuance it just spent. Together they mean an
+                    // outstanding issuance is never the acknowledged one. The ISSUED
+                    // form is recorded, not the presented one, so mangled whitespace
+                    // cannot persist into the value a later replay is compared
+                    // against.
+                    conn.execute(
+                        "UPDATE feed_cursors
+                         SET acknowledged_post_id = ?3, acknowledged_nonce = ?4,
+                             last_issued_nonce = NULL, last_issued_through = NULL,
+                             updated_at = unixepoch()
+                         WHERE home_kind = ?1 AND home_id = ?2",
+                        params![kind, id.as_str(), advanced, outstanding],
+                    )
+                    .await?;
+                    return Ok(FeedAck::Advanced {
+                        from: position,
+                        to: advanced,
+                    });
+                }
+
+                // Replay of the token that last advanced this position: a retry
+                // whose reply was lost, possibly racing a fresh read that has since
+                // superseded the issuance. Reported as the success it already was.
+                if acknowledged_nonce
+                    .as_deref()
+                    .is_some_and(|nonce| unigram::matches(nonce, &token))
+                {
                     return Ok(FeedAck::AlreadyAcknowledged { at: position });
                 }
 
-                let (Some(outstanding), Some(through)) = (issued_nonce, issued_through) else {
-                    return Ok(FeedAck::Rejected(NOT_OUTSTANDING.to_string()));
-                };
-                if outstanding != token {
-                    return Ok(FeedAck::Rejected(NOT_OUTSTANDING.to_string()));
-                }
-
-                // Monotonic, and bounded by what this token actually showed:
-                // posts that arrived after the issuance stay unread.
-                let advanced = position.max(through);
-                conn.execute(
-                    "UPDATE feed_cursors
-                     SET acknowledged_post_id = ?3, acknowledged_nonce = ?4,
-                         updated_at = unixepoch()
-                     WHERE home_kind = ?1 AND home_id = ?2",
-                    params![kind, id.as_str(), advanced, token.as_str()],
-                )
-                .await?;
-                Ok(FeedAck::Advanced {
-                    from: position,
-                    to: advanced,
-                })
+                Ok(FeedAck::Rejected(NOT_OUTSTANDING.to_string()))
             })
         })
         .await
@@ -507,6 +582,167 @@ mod tests {
             db.acknowledge_feed(&thread, &borrowed).await.unwrap(),
             FeedAck::Advanced { from: 0, to: 1 }
         );
+    }
+
+    /// The issued token is word-form, and short: what an agent has to copy out of
+    /// a rendered page and back into a mutation is four dictionary words, not a hex
+    /// run whose every character looks like every other.
+    #[tokio::test]
+    async fn an_issued_token_is_four_alphabet_words() {
+        let db = fixture("feed-token-form.db").await;
+        post(&db, None, "first").await;
+        let home = thread_home("t");
+
+        let token = db
+            .issue_feed_page(&home, 10)
+            .await
+            .unwrap()
+            .token
+            .expect("a page that showed a post issues a token");
+        assert_eq!(token.split(' ').count(), 4, "{token}");
+        assert_eq!(unigram::decode(&token).unwrap().len(), 4, "{token}");
+    }
+
+    /// A token that came back from a model mangled still acknowledges. Case,
+    /// stray whitespace and a swapped separator are transcription damage, not a
+    /// different token, and refusing them would strand a reader on a position it
+    /// genuinely reached.
+    #[tokio::test]
+    async fn acknowledging_survives_the_mangling_a_round_trip_introduces() {
+        let db = fixture("feed-mangled-ack.db").await;
+        post(&db, None, "first").await;
+        let home = thread_home("t");
+
+        let token = db.issue_feed_page(&home, 10).await.unwrap().token.unwrap();
+        let mangled = format!("  {}  ", token.to_uppercase().replace(' ', " - "));
+        assert_eq!(
+            db.acknowledge_feed(&home, &mangled).await.unwrap(),
+            FeedAck::Advanced { from: 0, to: 1 }
+        );
+
+        // The replay path forgives the same damage, and differently-mangled forms
+        // of one token are still that one token.
+        assert_eq!(
+            db.acknowledge_feed(&home, &token.to_uppercase())
+                .await
+                .unwrap(),
+            FeedAck::AlreadyAcknowledged { at: 1 }
+        );
+    }
+
+    /// The exclusion that keeps a four-byte nonce honest: an issuance never
+    /// repeats the token that last advanced the position, so the state in which a
+    /// presented token could belong to either of two histories is never created.
+    /// Driven with a scripted mint rather than waiting on one-in-four-billion odds.
+    #[test]
+    fn an_issuance_never_repeats_the_token_that_last_advanced_the_position() {
+        let prior = unigram::encode(&[1, 2, 3, 4]);
+        let fresh = unigram::encode(&[9, 9, 9, 9]);
+        // Popped from the end: the exact prior token first, then a mangled
+        // restatement of it, then a genuinely different one.
+        let mut scripted = vec![fresh.clone(), prior.to_uppercase(), prior.clone()];
+        assert_eq!(
+            issuance_nonce(Some(&prior), || scripted.pop().unwrap()),
+            fresh,
+            "a candidate equal to the acknowledged nonce must be discarded, and so \
+             must one that merely matches it after normalization"
+        );
+
+        // With nothing acknowledged there is nothing to collide with.
+        let mut once = vec![prior.clone()];
+        assert_eq!(issuance_nonce(None, || once.pop().unwrap()), prior);
+    }
+
+    /// A retry of an acknowledgement must never acknowledge a page its caller
+    /// never received, even when the outstanding issuance carries the same token.
+    ///
+    /// The history: a page is acknowledged, its reply is lost, a fresh read issues
+    /// a second page, and the caller retries the original acknowledgement. If that
+    /// retry matched the fresh issuance it would advance past posts nobody showed
+    /// it. Forced here with direct SQL, which is also exactly the shape of every
+    /// row written before issuances were consumed on acknowledgement — so this is
+    /// the upgrade path as much as it is a race.
+    #[tokio::test]
+    async fn a_retry_cannot_acknowledge_a_page_its_caller_never_received() {
+        let db = fixture("feed-stale-retry.db").await;
+        post(&db, None, "first").await;
+        let home = thread_home("t");
+
+        let first = db.issue_feed_page(&home, 10).await.unwrap().token.unwrap();
+        assert_eq!(
+            db.acknowledge_feed(&home, &first).await.unwrap(),
+            FeedAck::Advanced { from: 0, to: 1 }
+        );
+
+        // A second page, with its issuance forced to carry the token the previous
+        // acknowledgement recorded.
+        post(&db, None, "second").await;
+        db.issue_feed_page(&home, 10).await.unwrap();
+        let (kind, id, collided) = (
+            home.kind.as_str().to_string(),
+            home.id.clone(),
+            first.clone(),
+        );
+        db.write(move |conn| {
+            let (kind, id, collided) = (kind.clone(), id.clone(), collided.clone());
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE feed_cursors SET last_issued_nonce = ?3, last_issued_through = 2
+                     WHERE home_kind = ?1 AND home_id = ?2",
+                    params![kind, id, collided],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        // The retry is answered as the success it already was, and the second post
+        // stays unread rather than being acknowledged on its caller's behalf.
+        assert_eq!(
+            db.acknowledge_feed(&home, &first).await.unwrap(),
+            FeedAck::AlreadyAcknowledged { at: 1 }
+        );
+        assert_eq!(position(&db, &home).await, 1);
+        assert_eq!(
+            ids(&db.issue_feed_page(&home, 10).await.unwrap()),
+            vec![2],
+            "the page the retry did not acknowledge is still waiting"
+        );
+    }
+
+    /// Forgiveness stops at the token boundary: a value one word different is a
+    /// different token and moves nothing. Being liberal about separators must not
+    /// become being liberal about which token was presented.
+    #[tokio::test]
+    async fn a_token_one_word_off_is_still_rejected() {
+        let db = fixture("feed-near-miss.db").await;
+        post(&db, None, "first").await;
+        let home = thread_home("t");
+
+        let token = db.issue_feed_page(&home, 10).await.unwrap().token.unwrap();
+        let mut words: Vec<&str> = token.split(' ').collect();
+        let swapped = if words[0] == unigram::ALPHABET[0] {
+            unigram::ALPHABET[1]
+        } else {
+            unigram::ALPHABET[0]
+        };
+        words[0] = swapped;
+        assert!(matches!(
+            db.acknowledge_feed(&home, &words.join(" ")).await.unwrap(),
+            FeedAck::Rejected(_)
+        ));
+        assert_eq!(position(&db, &home).await, 0);
+
+        // And a word that is not in the alphabet at all is no closer to accepted.
+        assert!(matches!(
+            db.acknowledge_feed(&home, "zzzz zzzz zzzz zzzz")
+                .await
+                .unwrap(),
+            FeedAck::Rejected(_)
+        ));
+        assert_eq!(position(&db, &home).await, 0);
     }
 
     /// An acknowledgement is bounded by what its page showed, even when higher

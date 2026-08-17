@@ -9,6 +9,7 @@ pub mod agents;
 pub mod attention;
 pub mod attention_delivery;
 pub mod attention_push;
+pub mod attention_retirement;
 pub mod base_advance;
 pub mod build_change;
 pub mod build_services;
@@ -17,6 +18,7 @@ pub mod conflict_session;
 pub mod device_presence;
 pub mod docs;
 pub mod executor_registry; // Synced visibility; live placement remains in fleet.
+pub(crate) mod generation_cache;
 pub mod identity;
 pub mod lifecycle;
 pub mod object_plane;
@@ -89,6 +91,7 @@ pub struct OrchestratorBuilder {
     vibe_state: Option<Arc<VibeState>>,
     account_manager: Arc<AccountManager>,
     notifier: Notifier,
+    thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
@@ -116,6 +119,27 @@ impl OrchestratorBuilder {
         let session_allowed_tools = Arc::new(Mutex::new(HashSet::new()));
         let session_allowed_crossings = Arc::new(Mutex::new(HashSet::new()));
         let identity_store = Arc::new(Mutex::new(None));
+        // Wrap the host's emitter once, here, so that every notification the
+        // runtime produces — through `Notifier`, through `services.emitter`, from
+        // anywhere in the crate — passes the projection generations on its way
+        // out. Wrapping in `build()` instead would leave `Notifier` bound to the
+        // raw emitter and silently miss the job and thread mutations it carries.
+        let thread_status_cache = Arc::new(generation_cache::ThreadStatusCache::new(
+            "thread status projection",
+        ));
+        let services = Arc::new(Services {
+            process: services.process.clone(),
+            git: services.git.clone(),
+            http: services.http.clone(),
+            emitter: Arc::new(generation_cache::ProjectionInvalidatingEmitter::new(
+                services.emitter.clone(),
+                thread_status_cache.clone(),
+            )),
+            clock: services.clock.clone(),
+            fs: services.fs.clone(),
+            pty_factory: services.pty_factory.clone(),
+            completion: services.completion.clone(),
+        });
         let account_manager = Arc::new(AccountManager::new(db.clone(), services.emitter.clone()));
         let notifier = Notifier::new(services.emitter.clone());
         let recent_turn_end_check_requests = Arc::new(Mutex::new(HashMap::new()));
@@ -146,6 +170,7 @@ impl OrchestratorBuilder {
             vibe_state: None,
             account_manager,
             notifier,
+            thread_status_cache,
             api_config: ApiConfig::default(),
             effect_tx: None,
             browser_command_tx: None,
@@ -400,6 +425,12 @@ impl OrchestratorBuilder {
             node_check_status_cache: Arc::new(
                 crate::execution::checks_status::NodeCheckStatusCache::default(),
             ),
+            pr_refresh_cache: Arc::new(
+                crate::orchestrator::generation_cache::GenerationCache::new(
+                    "pr refresh projection",
+                ),
+            ),
+            thread_status_cache: self.thread_status_cache,
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -977,6 +1008,19 @@ pub struct Orchestrator {
     write_checks_in_flight: Arc<Mutex<HashMap<String, usize>>>,
     /// Exact settled node-check projection, generation-fenced and single-flight.
     pub(crate) node_check_status_cache: Arc<crate::execution::checks_status::NodeCheckStatusCache>,
+    /// The one PR projection, keyed by the job that owns the merge request.
+    ///
+    /// The PR-owner job, not the action run that happens to be asking: several
+    /// action runs render the same pull request, and keying by the asker would
+    /// give each its own copy of one remote fact and its own `jj` fan-out.
+    pub(crate) pr_refresh_cache: Arc<
+        crate::orchestrator::generation_cache::GenerationCache<
+            Arc<crate::pr_data::actions::refresh::PrSnapshot>,
+        >,
+    >,
+    /// Per-project thread activity rollup, keyed by project id. Shared with the
+    /// emitter decorator that advances its generation.
+    pub(crate) thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -1977,6 +2021,29 @@ impl Orchestrator {
             .invalidate_project_results(project_id);
     }
 
+    /// Advance the correctness generation for a job's PR projection.
+    ///
+    /// Call after the durable transition commits: the PR is seeded, bound, or
+    /// opened; its title/body or publication changes; its source head, base, or
+    /// rebase state moves; an authoritative GitHub webhook lands; it merges or
+    /// closes; or an operator asks for a refresh. Anything outside that set does
+    /// not change the projection and must not invalidate it — the notification a
+    /// refresh emits is not itself cache coherence.
+    pub fn invalidate_pr_refresh(&self, job_id: &str, reason: &'static str) {
+        self.pr_refresh_cache.invalidate(job_id, reason);
+    }
+
+    /// Advance the correctness generation for a project's thread activity rollup.
+    ///
+    /// The projection reads threads, their jobs, those jobs' head turns,
+    /// unanswered prompts, and pending permissions — and nothing else. A merge
+    /// request, a check result, or an issue transition cannot move it, so routing
+    /// those here would rebuild a whole-project SQL rollup to arrive at the same
+    /// answer.
+    pub fn invalidate_thread_status(&self, project_id: &str, reason: &'static str) {
+        self.thread_status_cache.invalidate(project_id, reason);
+    }
+
     /// Token provider for the `/embed` gateway: prefers the connected account's
     /// JWT, falling back to the anonymous device JWT when logged out. Returns
     /// `None` only when neither is available (embedding then no-ops).
@@ -2042,6 +2109,24 @@ impl Orchestrator {
         tokio::spawn(async move {
             if let Err(e) = crate::storage::run_integrity_sweep(&db).await {
                 log::warn!("integrity sweep failed: {e}");
+            }
+        });
+    }
+
+    /// Retire the attention queue's historical backlog once, in the background.
+    ///
+    /// Gated by `attention_push_retirement_backfill`, so it runs to completion
+    /// once per install and costs nothing on every later boot. Detached for the
+    /// same reason archival maintenance is: it walks a table whose size is a
+    /// property of how long this install has been running, and boot must not
+    /// wait for it.
+    pub fn spawn_attention_retirement_backfill(&self) {
+        let db = self.db.local.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                crate::orchestrator::attention_retirement::run_retirement_backfill(&db).await
+            {
+                log::warn!("attention retirement backfill failed: {e}");
             }
         });
     }
@@ -2883,7 +2968,10 @@ impl Orchestrator {
 
         // Claude answered above; every other provider sources the window from
         // its discovered catalog rather than a table in Cairn.
-        if crate::backends::KNOWN_BACKENDS.contains(&backend.to_ascii_lowercase().as_str()) {
+        // Supported, not enabled: this reads a window for a session that
+        // already ran, and disabling a provider must not make its transcript
+        // unreadable.
+        if crate::backends::catalog::is_supported(&backend.to_ascii_lowercase()) {
             return model.and_then(|model| {
                 self.model_catalog
                     .read()
@@ -2943,8 +3031,11 @@ impl Orchestrator {
     /// discovery finished. A scoped single-backend refresh deliberately stays
     /// silent: it hands the new entry straight back to the caller that asked.
     fn refresh_model_catalog(&self) {
-        for backend_name in crate::backends::KNOWN_BACKENDS {
-            self.refresh_provider_model_catalog_blocking(backend_name);
+        // Only what this workspace installed. A provider it never enabled has
+        // no models anyone can choose, so discovering them would be an
+        // unprompted network call on a credential the user did not offer.
+        for backend_name in self.enabled_providers() {
+            self.refresh_provider_model_catalog_blocking(&backend_name);
         }
         let _ = self.services.emitter.emit(
             "config-changed",
@@ -2965,8 +3056,13 @@ impl Orchestrator {
         backend: &str,
     ) -> Result<ProviderModelCatalog, String> {
         let backend = backend.to_ascii_lowercase();
-        if !crate::backends::KNOWN_BACKENDS.contains(&backend.as_str()) {
+        if !crate::backends::catalog::is_supported(&backend) {
             return Err(format!("Unsupported backend: {backend}"));
+        }
+        if !self.provider_enabled(&backend) {
+            return Err(format!(
+                "{backend} is not enabled in this workspace. Add it from Settings → Providers first."
+            ));
         }
         let orch = self.clone();
         let name = backend.clone();
@@ -3109,6 +3205,11 @@ mod tests {
                         10,
                         MeasurementGap::UnsupportedPlatform,
                     ),
+                    virtual_bytes: Measurement::unavailable(
+                        10,
+                        MeasurementGap::UnsupportedPlatform,
+                    ),
+                    ..Default::default()
                 },
             },
             inventory: Default::default(),
@@ -3123,11 +3224,12 @@ mod tests {
 
     /// A machine whose only missing reading is one it was never going to have.
     ///
-    /// macOS physical footprint has no equivalent anywhere else, so every
-    /// Windows and Linux executor reports it unavailable forever. Counting that
-    /// as a reason made a completely healthy remote hold the entire fleet at
-    /// `Unknown` permanently, and conflated the daemon's own size with the
-    /// machine pressure placement actually reads.
+    /// macOS physical footprint has no equivalent anywhere else, and Windows
+    /// has no single quantity that means mapped address space, so a healthy
+    /// executor on those platforms reports both unavailable forever. Counting
+    /// either as a reason made a completely healthy remote hold the entire
+    /// fleet at `Unknown` permanently, and conflated the daemon's own size with
+    /// the machine pressure placement actually reads.
     #[test]
     fn a_healthy_non_macos_executor_stays_healthy_despite_its_unsupported_footprint() {
         use cairn_common::executor_protocol::{
@@ -3135,14 +3237,20 @@ mod tests {
         };
 
         let executor = healthy_non_macos_executor();
-        // The gap is real and still visible on the machine itself — it is only
-        // barred from the fleet-wide verdict.
+        // The gaps are real and still visible on the machine itself — they are
+        // only barred from the fleet-wide verdict.
         assert_eq!(
             executor.machine.gaps(),
-            vec![(
-                MachineMeasurement::ProcessPhysicalFootprint,
-                MeasurementGap::UnsupportedPlatform
-            )]
+            vec![
+                (
+                    MachineMeasurement::ProcessPhysicalFootprint,
+                    MeasurementGap::UnsupportedPlatform
+                ),
+                (
+                    MachineMeasurement::ProcessVirtual,
+                    MeasurementGap::UnsupportedPlatform
+                )
+            ]
         );
         assert_eq!(executor.machine.placement_gaps(), vec![]);
 
@@ -3599,6 +3707,7 @@ mod tests {
                     supported_parameters: Vec::new(),
                     router: false,
                     architecture_modality: None,
+                    wire_protocol: None,
                 }],
                 options: Vec::new(),
                 refreshed_at: Some(20),
@@ -3712,6 +3821,7 @@ mod tests {
                     supported_parameters: Vec::new(),
                     router: false,
                     architecture_modality: None,
+                    wire_protocol: None,
                 }],
                 options: Vec::new(),
                 refreshed_at: Some(10),

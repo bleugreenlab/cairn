@@ -9,11 +9,16 @@
 //! [`PostScope::Project`] and [`read_post`] are the addressed surfaces, and
 //! neither narrows by caller.
 
+use std::collections::HashMap;
+
 use crate::mcp::types::McpCallbackRequest;
 use crate::models::Post;
 use crate::orchestrator::Orchestrator;
-use crate::storage::{LocalDb, PostScope};
+use crate::storage::{LocalDb, PostScope, RowExt};
+use cairn_common::identity::display::PrincipalAliases;
+use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 use cairn_common::query::QueryParam;
+use cairn_common::uri::build_project_posts_uri;
 
 fn value<'a>(params: &'a [QueryParam], key: &str) -> Option<&'a str> {
     params
@@ -48,16 +53,78 @@ fn options(params: &[QueryParam]) -> Result<(usize, Option<&str>, bool), String>
     ))
 }
 
+/// What one rendering pass resolves before it renders anything: how principals
+/// are named on this installation, and what the scopes it encountered are
+/// called.
+///
+/// Both are render-time projections of stored ids, never a stored byte — a post
+/// keeps the `PrincipalRef` and the `projects` row id it was written with, and
+/// `format=json` still returns exactly those. Resolved once for a whole page
+/// rather than once per post, so a hundred posts read each registry once.
+pub(super) struct PostContext {
+    aliases: PrincipalAliases,
+    /// `projects.id` → that project's key. Left empty when no post in the pass
+    /// carries a scope, since there is then nothing to name.
+    project_keys: HashMap<String, String>,
+}
+
+impl PostContext {
+    pub(super) async fn resolve(db: &LocalDb, posts: &[Post]) -> Self {
+        let project_keys = if posts.iter().any(|post| post.project_id.is_some()) {
+            db.query_all("SELECT id, key FROM projects", (), |row| {
+                Ok((row.text(0)?, row.text(1)?))
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+        } else {
+            HashMap::new()
+        };
+        Self {
+            aliases: crate::identity::display::principal_aliases(db).await,
+            project_keys,
+        }
+    }
+
+    /// How a post's scope reads: the readable word for the workspace-wide
+    /// corpus, or the project's key linked to that project's own collection.
+    ///
+    /// A scope whose project row this database cannot resolve renders as the id
+    /// it actually holds — the same honesty an unresolved principal gets, since
+    /// a wrong name is worse than a raw id.
+    fn scope(&self, project_id: Option<&str>) -> String {
+        let Some(project_id) = project_id else {
+            return "workspace".to_string();
+        };
+        match self.project_keys.get(project_id) {
+            Some(key) => format!("[{key}]({})", build_project_posts_uri(key)),
+            None => project_id.to_string(),
+        }
+    }
+
+    /// How an author reads on a surface with no tooltip to demote the canonical
+    /// identity into: the readable label followed by the identity it stands for
+    /// — for an agent, the node home URI a reader can go read. The run that
+    /// wrote the row is provenance rather than identity and stays in
+    /// `format=json`.
+    fn author(&self, principal: &PrincipalRef, appearance: &AppearanceSnapshot) -> String {
+        self.aliases
+            .display(Some(principal), Some(appearance))
+            .inline()
+    }
+}
+
 /// One post, rendered the same way wherever it is read — the workspace corpus,
 /// a project projection, or a home's feed.
-pub(super) fn render_post(post: &Post) -> String {
+pub(super) fn render_post(post: &Post, context: &PostContext) -> String {
     format!(
         "## [{}](cairn://posts/{})\n\n{}\n\n- Scope: {}\n- Author: {}\n- Created: {}\n",
         post.title.as_deref().unwrap_or("Untitled"),
         post.id,
         post.content,
-        post.project_id.as_deref().unwrap_or("workspace"),
-        serde_json::to_string(&post.author).unwrap_or_default(),
+        context.scope(post.project_id.as_deref()),
+        context.author(&post.author, &post.appearance),
         post.created_at
     )
 }
@@ -140,9 +207,14 @@ pub(super) async fn read_posts(
             if posts.is_empty() {
                 return "# Posts\n\nNo posts found.".into();
             }
+            let context = PostContext::resolve(db, &posts).await;
             format!(
                 "# Posts\n\n{}",
-                posts.iter().map(render_post).collect::<Vec<_>>().join("\n")
+                posts
+                    .iter()
+                    .map(|post| render_post(post, &context))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             )
         }
         Err(error) => format!("Failed to read posts: {error}"),
@@ -169,10 +241,11 @@ pub(super) async fn read_post(db: &LocalDb, id: i64, params: &[QueryParam]) -> S
     if json {
         return serde_json::json!({"post": post, "comments": comments}).to_string();
     }
+    let context = PostContext::resolve(db, std::slice::from_ref(&post)).await;
     let mut output = format!("# {}\n\n{}\n\n- Post: cairn://posts/{id}\n- Scope: {}\n- Author: {}\n- Created: {}\n\n## Comments\n",
         post.title.as_deref().unwrap_or("Untitled"), post.content,
-        post.project_id.as_deref().unwrap_or("workspace"),
-        serde_json::to_string(&post.author).unwrap_or_default(), post.created_at);
+        context.scope(post.project_id.as_deref()),
+        context.author(&post.author, &post.appearance), post.created_at);
     if comments.is_empty() {
         output.push_str("\nNo comments.\n");
     }
@@ -181,9 +254,180 @@ pub(super) async fn read_post(db: &LocalDb, id: i64, params: &[QueryParam]) -> S
             "\n### Comment {}\n\n{}\n\n- Author: {}\n- Created: {}\n- Parent: cairn://posts/{id}\n",
             comment.id,
             comment.content,
-            serde_json::to_string(&comment.author).unwrap_or_default(),
+            context.author(&comment.author, &comment.appearance),
             comment.created_at
         ));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{CreatePost, CreatePostComment};
+    use cairn_common::identity::{
+        Address, AppearanceEvidence, AppearanceTransport, VerificationMethod, VerificationRecord,
+        VerificationStatus, VerificationStrength,
+    };
+
+    const NODE: &str = "cairn://p/cairn/4198/1/builder";
+    const RUN: &str = "d575806b-1a4d-4a1e-9b0e-2f3c4d5e6f70";
+    /// A project row id, in the shape the scope column actually holds.
+    const PROJECT: &str = "00ace0d0-24a5-4700-83ba-cc719c63f43c";
+
+    /// The principal and appearance an agent's own post is stamped with — the
+    /// same shape `mutations::dispatch::posts` mints from a live run.
+    fn agent() -> (PrincipalRef, AppearanceSnapshot) {
+        let author = PrincipalRef::Agent {
+            node: NODE.to_string(),
+            run_id: Some(RUN.to_string()),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::NodeSession,
+            VerificationStatus::Verified,
+            None,
+            None,
+            Some(RUN.to_string()),
+            None,
+            VerificationStrength::new("session-bound").unwrap(),
+            900,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::ResourcePatch,
+            Address::Resource {
+                node: NODE.to_string(),
+            },
+            verification,
+            900,
+            None,
+        )
+        .unwrap();
+        let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None).unwrap();
+        (author, appearance)
+    }
+
+    async fn fixture() -> LocalDb {
+        let db = crate::storage::migrated_test_db("posts-rendering.db").await;
+        db.execute_script(&format!(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('{PROJECT}', 'default', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);"
+        ))
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn post(db: &LocalDb, project_id: Option<&str>, title: &str) -> i64 {
+        let (author, appearance) = agent();
+        db.create_post(CreatePost {
+            project_id: project_id.map(str::to_string),
+            title: Some(title.to_string()),
+            content: format!("{title} body"),
+            author,
+            appearance,
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// The two stored internals a post carries — the `projects` row id it is
+    /// scoped to and the `PrincipalRef` it is attributed to — are ids, and a
+    /// person reads neither. The default rendering resolves both: the scope to
+    /// the project key, linked to that project's own collection, and the author
+    /// to the home a reader can go read.
+    #[tokio::test]
+    async fn a_scoped_post_renders_its_project_key_and_its_author_s_home() {
+        let db = fixture().await;
+        post(&db, Some(PROJECT), "Scoped").await;
+
+        let rendered = read_posts(&db, PostScope::Corpus, &[]).await;
+        assert!(
+            rendered.contains("- Scope: [cairn](cairn://p/cairn/posts)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("- Author: cairn/4198 / builder ({NODE})")),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(PROJECT),
+            "a resolved scope must not also print its row id: {rendered}"
+        );
+        assert!(
+            !rendered.contains(RUN) && !rendered.contains("\"kind\""),
+            "the run that wrote a post is provenance, not identity: {rendered}"
+        );
+    }
+
+    /// A workspace-wide post has no project to name, and says so in the word a
+    /// person would use.
+    #[tokio::test]
+    async fn a_workspace_post_says_workspace() {
+        let db = fixture().await;
+        post(&db, None, "Everyone").await;
+
+        let rendered = read_posts(&db, PostScope::Corpus, &[]).await;
+        assert!(rendered.contains("- Scope: workspace"), "{rendered}");
+    }
+
+    /// A scope this pass could not resolve renders as the id it actually holds.
+    ///
+    /// `posts.project_id` references `projects` ON DELETE RESTRICT, so a stored
+    /// scope always has a live row and this is not reachable by deleting one; it
+    /// is what a FAILED registry read degrades to, which is why the rule is
+    /// asserted directly. The same honesty an unresolved principal gets: a wrong
+    /// name is worse than a raw id.
+    #[test]
+    fn an_unresolved_scope_renders_as_itself() {
+        let context = PostContext {
+            aliases: PrincipalAliases::default(),
+            project_keys: HashMap::new(),
+        };
+        assert_eq!(context.scope(Some(PROJECT)), PROJECT);
+        assert_eq!(context.scope(None), "workspace");
+    }
+
+    /// One post and its comments resolve the same way the collection does, and
+    /// `format=json` stays the lossless projection of what is persisted — the
+    /// run id and the row-id scope included.
+    #[tokio::test]
+    async fn a_single_post_resolves_its_comments_while_json_stays_lossless() {
+        let db = fixture().await;
+        let id = post(&db, Some(PROJECT), "Scoped").await;
+        let (author, appearance) = agent();
+        db.create_post_comment(CreatePostComment {
+            post_id: id,
+            content: "a reply".to_string(),
+            author,
+            appearance,
+        })
+        .await
+        .unwrap();
+
+        let rendered = read_post(&db, id, &[]).await;
+        assert_eq!(
+            rendered
+                .matches(&format!("- Author: cairn/4198 / builder ({NODE})"))
+                .count(),
+            2,
+            "the post and its comment both resolve their author: {rendered}"
+        );
+        assert!(
+            rendered.contains("- Scope: [cairn](cairn://p/cairn/posts)"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(RUN), "{rendered}");
+
+        let params = vec![QueryParam {
+            key: "format".into(),
+            value: "json".into(),
+        }];
+        let json: serde_json::Value =
+            serde_json::from_str(&read_post(&db, id, &params).await).unwrap();
+        assert_eq!(json["post"]["author"]["run_id"], RUN);
+        assert_eq!(json["post"]["projectId"], PROJECT);
+        assert_eq!(json["comments"][0]["author"]["run_id"], RUN);
+    }
 }

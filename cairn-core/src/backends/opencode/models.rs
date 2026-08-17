@@ -11,19 +11,21 @@
 //!   model is served through. It is the same metadata OpenCode's own client
 //!   reads, not a third-party guess about them.
 //!
-//! That last field decides what Cairn can offer. Go fronts three protocol
-//! families behind one base URL, and Cairn's HTTP turn loop speaks only OpenAI
-//! chat/completions, so a model served over Anthropic Messages or OpenAI
-//! Responses is carried in the catalog as unselectable rather than offered and
-//! then failing mid-session. Its entry says why, so a model that is missing from
-//! the picker can be accounted for instead of just being absent.
+//! That last field decides how Cairn talks to a model. Go fronts three protocol
+//! families behind one base URL, and Cairn speaks all three, so the package is
+//! recorded on the catalog entry as its [`DiscoveredWireProtocol`] and the
+//! backend routes each session and completion by it. A package Cairn has no
+//! mapping for stays unselectable rather than being assumed compatible: that
+//! guess fails in the middle of a session instead of before one starts.
 //!
 //! Metadata is required, not decorative: without it Cairn knows neither the
 //! protocol nor the context window, so a metadata failure is a catalog failure.
 //! The orchestrator retains the last good catalog through one, which is the
 //! behavior that makes this safe to insist on.
 
-use crate::backends::{DiscoveredModel, DiscoveredModelPricing, DiscoveredReasoningEffort};
+use crate::backends::{
+    DiscoveredModel, DiscoveredModelPricing, DiscoveredReasoningEffort, DiscoveredWireProtocol,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -142,13 +144,21 @@ impl Protocol {
         }
     }
 
-    fn endpoint_name(self) -> &'static str {
+    /// The durable routing fact stored on the catalog entry. This is what makes
+    /// the protocol survive serialization and a catalog refresh, so a session
+    /// started tomorrow reaches the same endpoint as one started today.
+    fn discovered(self) -> DiscoveredWireProtocol {
         match self {
-            Protocol::ChatCompletions => "chat/completions",
-            Protocol::AnthropicMessages => "Anthropic Messages",
-            Protocol::OpenAiResponses => "OpenAI Responses",
-            Protocol::Unrecognized => "an unrecognized",
+            Protocol::ChatCompletions => DiscoveredWireProtocol::OpenAiChatCompletions,
+            Protocol::AnthropicMessages => DiscoveredWireProtocol::AnthropicMessages,
+            Protocol::OpenAiResponses => DiscoveredWireProtocol::OpenAiResponses,
+            Protocol::Unrecognized => DiscoveredWireProtocol::Unknown,
         }
+    }
+
+    /// Whether Cairn has an adapter for this family.
+    fn is_served(self) -> bool {
+        !matches!(self, Protocol::Unrecognized)
     }
 }
 
@@ -262,10 +272,10 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
             .as_ref()
             .and_then(|provider| provider.npm.as_deref()),
     );
-    let servable = protocol == Protocol::ChatCompletions;
+    let servable = protocol.is_served();
     let description = match servable {
         true => metadata.description.clone(),
-        false => Some(unservable_note(protocol, metadata.description.as_deref())),
+        false => Some(unservable_note(metadata.description.as_deref())),
     };
 
     DiscoveredModel {
@@ -293,6 +303,7 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
         supported_parameters: supported_parameters(metadata),
         router: false,
         architecture_modality: None,
+        wire_protocol: Some(protocol.discovered()),
     }
 }
 
@@ -320,14 +331,15 @@ fn unpublished_model(id: &str) -> DiscoveredModel {
         supported_parameters: Vec::new(),
         router: false,
         architecture_modality: None,
+        wire_protocol: None,
     }
 }
 
-fn unservable_note(protocol: Protocol, description: Option<&str>) -> String {
-    let note = format!(
-        "Served over the {} endpoint, which Cairn does not speak yet.",
-        protocol.endpoint_name()
-    );
+fn unservable_note(description: Option<&str>) -> String {
+    let note =
+        "Served over an endpoint family Cairn has no mapping for, so Cairn cannot tell how to \
+         talk to it."
+            .to_string();
     match description {
         Some(description) if !description.trim().is_empty() => format!("{note} {description}"),
         _ => note,

@@ -26,8 +26,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
+
 use cairn_common::uri::{parse_uri, CairnResource};
-use cairn_db::turso::params;
+use cairn_db::turso::{params, Value};
 use uuid::Uuid;
 
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -253,24 +255,31 @@ pub struct Push {
     pub delivered_event_id: Option<String>,
 }
 
-fn now_ts() -> i64 {
+pub(crate) fn now_ts() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
 fn push_from_row(row: &cairn_db::turso::Row) -> DbResult<Push> {
-    let wake = row.text(3)?;
-    let boundary = row.text(4)?;
+    push_from_row_offset(row, 0)
+}
+
+/// [`push_from_row`] for a query that selects the push's eight columns starting
+/// at `base` rather than at zero — the retirement backfill selects `rowid`
+/// first, because its keyset walk needs it.
+pub(crate) fn push_from_row_offset(row: &cairn_db::turso::Row, base: usize) -> DbResult<Push> {
+    let wake = row.text(base + 3)?;
+    let boundary = row.text(base + 4)?;
     Ok(Push {
-        id: row.text(0)?,
-        recipient: row.text(1)?,
-        content_ref: row.text(2)?,
+        id: row.text(base)?,
+        recipient: row.text(base + 1)?,
+        content_ref: row.text(base + 2)?,
         wake: Wake::from_db(&wake)
             .ok_or_else(|| DbError::Row(format!("invalid push wake: {wake}")))?,
         boundary: Boundary::from_db(&boundary)
             .ok_or_else(|| DbError::Row(format!("invalid push boundary: {boundary}")))?,
-        key: row.text(5)?,
-        created_at: row.i64(6)?,
-        delivered_event_id: row.opt_text(7)?,
+        key: row.text(base + 5)?,
+        created_at: row.i64(base + 6)?,
+        delivered_event_id: row.opt_text(base + 7)?,
     })
 }
 
@@ -515,7 +524,8 @@ pub async fn push_with_fingerprint(
                     .execute(
                         "UPDATE attention_pushes
                      SET content_ref=?1, wake=?2, boundary=?3, created_at=?4, fingerprint=?5
-                     WHERE recipient=?6 AND key=?7 AND delivered_event_id IS NULL",
+                     WHERE recipient=?6 AND key=?7
+                       AND delivered_event_id IS NULL AND retired_at IS NULL",
                         params![
                             content_ref.as_str(),
                             wake.as_str(),
@@ -550,7 +560,8 @@ pub async fn push_with_fingerprint(
                 let mut rows = conn
                     .query(
                         "SELECT id FROM attention_pushes
-                     WHERE recipient=?1 AND key=?2 AND delivered_event_id IS NULL
+                     WHERE recipient=?1 AND key=?2
+                       AND delivered_event_id IS NULL AND retired_at IS NULL
                      LIMIT 1",
                         params![recipient.as_str(), key.as_str()],
                     )
@@ -614,7 +625,7 @@ pub async fn list_pending(db: &LocalDb, recipient: &str) -> DbResult<Vec<Push>> 
                 .query(
                     "SELECT id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id
                      FROM attention_pushes
-                     WHERE recipient=?1 AND delivered_event_id IS NULL
+                     WHERE recipient=?1 AND delivered_event_id IS NULL AND retired_at IS NULL
                      ORDER BY created_at ASC, id ASC",
                     params![recipient.as_str()],
                 )
@@ -646,7 +657,7 @@ pub async fn pending_at_boundary(
                 .query(
                     "SELECT id, recipient, content_ref, wake, boundary, key, created_at, delivered_event_id
                      FROM attention_pushes
-                     WHERE recipient=?1 AND delivered_event_id IS NULL
+                     WHERE recipient=?1 AND delivered_event_id IS NULL AND retired_at IS NULL
                        AND boundary=?2
                      ORDER BY created_at ASC, id ASC",
                     params![recipient.as_str(), boundary.as_str()],
@@ -667,14 +678,93 @@ pub async fn pending_at_boundary(
 /// `passive` ride-along pushes are returned, with [`lazy_resolve_live`] filtering
 /// out any whose referent already resolved before the drain.
 pub async fn list_pending_live(db: &LocalDb, recipient: &str) -> DbResult<Vec<Push>> {
-    let pending = list_pending(db, recipient).await?;
-    let mut live = Vec::with_capacity(pending.len());
-    for push in pending {
-        if lazy_resolve_live(db, &push).await? {
-            live.push(push);
-        }
+    retain_live(db, list_pending(db, recipient).await?).await
+}
+
+/// Drop the pushes whose referent already resolved, preserving input order, and
+/// retire the ones proved terminal. One batched [`resolve_verdicts`] for the
+/// whole set (see its note on why a drain must not resolve row-at-a-time).
+async fn retain_live(db: &LocalDb, pushes: Vec<Push>) -> DbResult<Vec<Push>> {
+    let verdicts = resolve_verdicts(db, &pushes).await?;
+    // Write down what this drain just proved. Retiring here is what makes the
+    // queue converge: the same resolution that filters a push out of THIS drain
+    // stops it being resolved again in every future one. It costs a write only
+    // while there is something to retire, so a settled recipient pays nothing.
+    retire_terminal(db, &pushes, &verdicts).await?;
+    Ok(pushes
+        .into_iter()
+        .zip(verdicts)
+        .filter_map(|(push, verdict)| verdict.is_live().then_some(push))
+        .collect())
+}
+
+/// Retire the pushes a drain just proved terminal, returning how many rows this
+/// call actually changed. Zero means there was nothing to retire, or another
+/// writer got there first — both are ordinary.
+///
+/// Retirement never sets `delivered_event_id`, never deletes, and never advances
+/// a read cursor. It marks a row invisible to delivery and leaves it legible to
+/// audit.
+///
+/// **Losing is correct.** Classification happens outside the write transaction,
+/// so between deciding and writing, the row may have been delivered or
+/// superseded in place by a fresh push carrying new content. Each update is
+/// therefore guarded on the row still being pending AND still being the row that
+/// was classified: `content_ref` is the resolver's actual input, and `created_at`
+/// is rewritten by every supersession. If either moved, this update matches
+/// nothing, the row stays pending, and the next drain reclassifies whatever is
+/// there now. A delivery or a supersession always wins over a retirement.
+///
+/// (`created_at` has second precision, so a supersession landing in the same
+/// second with an identical `content_ref` can slip past the guard. That case
+/// retires a row naming the same referent with the same content as the one that
+/// was classified terminal, which is the conclusion the resolver would reach
+/// again anyway; a genuinely changed source state changes the fingerprint and
+/// inserts a fresh row rather than superseding.)
+pub async fn retire_terminal(
+    db: &LocalDb,
+    pushes: &[Push],
+    verdicts: &[Verdict],
+) -> DbResult<usize> {
+    let doomed: Vec<(String, String, i64, &'static str)> = pushes
+        .iter()
+        .zip(verdicts)
+        .filter_map(|(push, verdict)| {
+            verdict.retirement_reason().map(|reason| {
+                (
+                    push.id.clone(),
+                    push.content_ref.clone(),
+                    push.created_at,
+                    reason.as_str(),
+                )
+            })
+        })
+        .collect();
+    if doomed.is_empty() {
+        return Ok(0);
     }
-    Ok(live)
+    let now = now_ts();
+    db.write(move |conn| {
+        let doomed = doomed.clone();
+        Box::pin(async move {
+            let mut retired = 0usize;
+            for (id, content_ref, created_at, reason) in &doomed {
+                let affected = conn
+                    .execute(
+                        "UPDATE attention_pushes
+                            SET retired_at=?1, retirement_reason=?2
+                          WHERE id=?3
+                            AND delivered_event_id IS NULL AND retired_at IS NULL
+                            AND content_ref=?4 AND created_at=?5",
+                        params![now, *reason, id.as_str(), content_ref.as_str(), *created_at],
+                    )
+                    .await?;
+                retired += affected as usize;
+            }
+            Ok(retired)
+        })
+    })
+    .await
 }
 
 /// Undelivered pushes for a recipient at a given boundary that are still
@@ -687,14 +777,7 @@ pub async fn pending_deliverable_live(
     recipient: &str,
     boundary: Boundary,
 ) -> DbResult<Vec<Push>> {
-    let pending = pending_at_boundary(db, recipient, boundary).await?;
-    let mut live = Vec::with_capacity(pending.len());
-    for push in pending {
-        if lazy_resolve_live(db, &push).await? {
-            live.push(push);
-        }
-    }
-    Ok(live)
+    retain_live(db, pending_at_boundary(db, recipient, boundary).await?).await
 }
 
 /// Whether the recipient has any undelivered *rousing* (`wake`/`interrupt`) push
@@ -710,16 +793,14 @@ pub async fn has_pending_waking_live(db: &LocalDb, recipient: &str) -> DbResult<
     if crate::threads::is_dormant_thread_session(db, recipient).await {
         return Ok(false);
     }
-    let pending = list_pending(db, recipient).await?;
-    for push in pending {
-        if push.wake == Wake::Passive {
-            continue;
-        }
-        if lazy_resolve_live(db, &push).await? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let rousing: Vec<Push> = list_pending(db, recipient)
+        .await?
+        .into_iter()
+        .filter(|push| push.wake != Wake::Passive)
+        .collect();
+    let verdicts = resolve_verdicts(db, &rousing).await?;
+    retire_terminal(db, &rousing, &verdicts).await?;
+    Ok(verdicts.into_iter().any(Verdict::is_live))
 }
 
 /// The keys of a recipient's undelivered *rousing* (`wake`/`interrupt`) pushes,
@@ -745,7 +826,8 @@ pub async fn delete_pending_by_id(db: &LocalDb, id: &str) -> DbResult<()> {
         let id = id.clone();
         Box::pin(async move {
             conn.execute(
-                "DELETE FROM attention_pushes WHERE id = ?1 AND delivered_event_id IS NULL",
+                "DELETE FROM attention_pushes
+                 WHERE id = ?1 AND delivered_event_id IS NULL AND retired_at IS NULL",
                 params![id.as_str()],
             )
             .await?;
@@ -791,7 +873,7 @@ pub async fn stamp_delivered_conn(
         let affected = conn
             .execute(
                 "UPDATE attention_pushes SET delivered_event_id=?1
-                 WHERE id=?2 AND delivered_event_id IS NULL",
+                 WHERE id=?2 AND delivered_event_id IS NULL AND retired_at IS NULL",
                 params![event_id, id.as_str()],
             )
             .await?;
@@ -958,112 +1040,541 @@ pub async fn advance_read_cursors_conn(
 /// closed/merged/failed issue is dead (nothing cancels those rows on
 /// terminalization, so the terminal check is what retires the push).
 pub async fn lazy_resolve_live(db: &LocalDb, push: &Push) -> DbResult<bool> {
-    let prefix = push
-        .key
-        .split_once(':')
-        .map(|(p, _)| p)
-        .unwrap_or(&push.key);
+    Ok(resolve_live(db, std::slice::from_ref(push)).await?[0])
+}
+
+/// Which resolution tables decide whether a push is still worth delivering,
+/// selected by the push key's prefix. Every other prefix (`catchup:`,
+/// `direct:`, `resolved:`, ...) is informational: it names no referent, is
+/// unconditionally live, and costs no query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Referent {
+    Review,
+    Question,
+    Permission,
+}
+
+/// The issue a push's liveness is decided against, together with the referent
+/// class deciding it. Resolution is coarse and issue-scoped, so two pushes with
+/// the same subject always resolve identically — which makes the subject, not
+/// the push, the unit of batching.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Subject {
+    referent: Referent,
+    project_key: String,
+    number: i32,
+}
+
+/// Classify a push's `(key, content_ref)` into the subject its liveness depends
+/// on. Those two fields are the predicate's entire input, which is why the
+/// batch entry point takes them rather than whole rows.
+///
+/// `None` means there is nothing to resolve — an informational prefix, an
+/// unparseable `content_ref`, or a ref that names no issue. Each of those is
+/// unconditionally live: the predicate fails OPEN, so a push is never silently
+/// dropped for a reason the resolver could not understand.
+fn subject_of(key: &str, content_ref: &str) -> Option<Subject> {
+    let prefix = key.split_once(':').map(|(p, _)| p).unwrap_or(key);
     let referent = match prefix {
-        "review" | "question" | "permission" => prefix.to_string(),
-        _ => return Ok(true),
+        "review" => Referent::Review,
+        "question" => Referent::Question,
+        "permission" => Referent::Permission,
+        _ => return None,
     };
-    // Resolve the subject issue from the content_ref URI.
-    let Some(parsed) = parse_uri(&push.content_ref) else {
-        return Ok(true); // unparseable ref -> don't silently drop
-    };
-    let project = parsed.project().map(cairn_common::uri::canonical_project);
-    let number = parsed.issue_number();
-    let (Some(project_key), Some(number)) = (project, number) else {
-        return Ok(true);
-    };
-    db.read(|conn| {
-        let project_key = project_key.clone();
-        let referent = referent.clone();
+    let parsed = parse_uri(content_ref)?;
+    let project_key = parsed.project().map(cairn_common::uri::canonical_project)?;
+    let number = parsed.issue_number()?;
+    Some(Subject {
+        referent,
+        project_key,
+        number,
+    })
+}
+
+/// `?, ?, ?` for an `IN (...)` list of `n` bound values.
+fn placeholders(n: usize) -> String {
+    (0..n).map(|_| "?").collect::<Vec<_>>().join(", ")
+}
+
+fn text_params(values: &[String]) -> Vec<Value> {
+    values.iter().cloned().map(Value::Text).collect()
+}
+
+/// Collect one column of issue ids from a set query.
+async fn issue_id_set(
+    conn: &cairn_db::turso::Connection,
+    sql: &str,
+    issue_ids: &[String],
+) -> DbResult<HashSet<String>> {
+    let mut out = HashSet::new();
+    let mut rows = conn.query(sql, text_params(issue_ids)).await?;
+    while let Some(row) = rows.next().await? {
+        out.insert(row.text(0)?);
+    }
+    Ok(out)
+}
+
+/// Why a push was retired. Each value is a resolver outcome that PROVED the
+/// referent had resolved -- never an absence of evidence, and never a property
+/// of the recipient. The stored strings are constrained by 0196's CHECK, so this
+/// enum and that vocabulary are one thing in two places.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementReason {
+    ReviewResolved,
+    QuestionResolved,
+    PermissionResolved,
+}
+
+impl RetirementReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RetirementReason::ReviewResolved => "review_resolved",
+            RetirementReason::QuestionResolved => "question_resolved",
+            RetirementReason::PermissionResolved => "permission_resolved",
+        }
+    }
+}
+
+/// What the resolver concluded about one push.
+///
+/// The distinction that matters is between the two NON-live answers, because
+/// today's boolean predicate collapses them and that collapse is why the queue
+/// grows without bound (CAIRN-4182):
+///
+/// - [`Verdict::Terminal`] means the referent resolved and cannot un-resolve:
+///   the merge request merged, the question was answered, the permission was
+///   decided. Retiring is safe because there is no future in which this push
+///   becomes deliverable again.
+/// - [`Verdict::Suspended`] means not deliverable *now*, with no proof of
+///   terminality: an unanswered question on a closed issue, a review push whose
+///   issue carries no merge request or plan artifact at all. Reopening the issue
+///   restores deliverability, so retiring would destroy a live obligation.
+///
+/// Ambiguity resolves to [`Verdict::Live`], never to `Terminal`. A missing
+/// issue, an unparseable ref, or an unrecognized prefix keeps the push
+/// deliverable exactly as before -- the predicate fails OPEN, because a push
+/// wrongly dropped produces no signal at all (CAIRN-2410).
+///
+/// [`Verdict::is_live`] reproduces the previous boolean predicate exactly, term
+/// for term. Retirement is strictly additional information layered on top of
+/// unchanged delivery behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Live,
+    Suspended,
+    Terminal(RetirementReason),
+}
+
+impl Verdict {
+    /// Whether this push is still worth delivering. Identical to the boolean the
+    /// predicate returned before retirement existed.
+    pub fn is_live(self) -> bool {
+        matches!(self, Verdict::Live)
+    }
+
+    /// The reason to record when retiring, or `None` when the push must be left
+    /// pending.
+    pub fn retirement_reason(self) -> Option<RetirementReason> {
+        match self {
+            Verdict::Terminal(reason) => Some(reason),
+            Verdict::Live | Verdict::Suspended => None,
+        }
+    }
+}
+
+/// Whether each push's referent is still unresolved, for a whole batch at once.
+/// Returns one flag per input push, in input order.
+///
+/// This is the canonical liveness predicate; [`lazy_resolve_live`] is the
+/// single-push form over it, and every drain goes through it.
+///
+/// **Why batched.** A drain runs on every MCP tool call
+/// (`dispatch::augment_with_queued_dms`), and a push whose referent resolved is
+/// skipped but never retired — so a long-lived recipient's undelivered backlog
+/// only grows, and the *dead* pushes are precisely the ones that fall past the
+/// cheap first arm into the expensive ones. Resolving row-at-a-time cost one
+/// read transaction per push — each a `BEGIN CONCURRENT` MVCC snapshot — and
+/// re-ran every arm for every push against a query shape the planner could not
+/// index. A coordinator holding 47 stale review pushes was paying roughly 358k
+/// B-tree row visits per tool call (CAIRN-4181).
+///
+/// Batched, a drain is ONE read transaction and at most six index-driven
+/// queries, whatever the size of the backlog. The arms below are the same arms,
+/// combined the same way; only their shape changed, from one issue per
+/// statement to a bound set per statement. That shape is load-bearing rather
+/// than cosmetic: the planner drives the artifact arms from `jobs(issue_id)`
+/// only in the set form (see the plan assertions in `storage::migrations`).
+pub async fn resolve_live(db: &LocalDb, pushes: &[Push]) -> DbResult<Vec<bool>> {
+    Ok(resolve_verdicts(db, pushes)
+        .await?
+        .into_iter()
+        .map(Verdict::is_live)
+        .collect())
+}
+
+/// [`resolve_live`] without collapsing the two non-live answers: one
+/// [`Verdict`] per input push, in input order.
+///
+/// A drain calls this rather than [`resolve_live`] when it is in a position to
+/// write the conclusion down. Deciding terminality costs nothing extra -- it is
+/// read out of the same set queries that already decide liveness -- so the
+/// choice is only about whether the caller can act on it.
+pub async fn resolve_verdicts(db: &LocalDb, pushes: &[Push]) -> DbResult<Vec<Verdict>> {
+    let refs: Vec<(&str, &str)> = pushes
+        .iter()
+        .map(|push| (push.key.as_str(), push.content_ref.as_str()))
+        .collect();
+    resolve_verdict_refs(db, &refs).await
+}
+
+/// [`resolve_live`] for `(key, content_ref)` pairs that are not `Push` rows in
+/// hand — the channel router resolves its review backlog straight out of its
+/// own snapshot query. Sharing this entry point is what keeps ONE liveness
+/// predicate in the system: a second copy expressed as SQL somewhere else
+/// drifts from this one silently, and the two disagreeing means a review is
+/// either texted after it was merged or never texted at all.
+pub async fn resolve_live_refs(db: &LocalDb, refs: &[(&str, &str)]) -> DbResult<Vec<bool>> {
+    Ok(resolve_verdict_refs(db, refs)
+        .await?
+        .into_iter()
+        .map(Verdict::is_live)
+        .collect())
+}
+
+/// [`resolve_verdicts`] for `(key, content_ref)` pairs rather than `Push` rows.
+/// The single place liveness AND terminality are decided, so the two can never
+/// disagree about the same referent.
+pub async fn resolve_verdict_refs(db: &LocalDb, refs: &[(&str, &str)]) -> DbResult<Vec<Verdict>> {
+    let subjects: Vec<Option<Subject>> = refs
+        .iter()
+        .map(|(key, content_ref)| subject_of(key, content_ref))
+        .collect();
+    let distinct: Vec<Subject> = subjects
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    if distinct.is_empty() {
+        return Ok(vec![Verdict::Live; refs.len()]);
+    }
+    let resolved = resolve_subjects(db, &distinct).await?;
+    Ok(subjects
+        .iter()
+        .map(|subject| match subject {
+            // An informational prefix or an unparseable ref names no referent,
+            // so there is nothing that could have resolved.
+            None => Verdict::Live,
+            // A subject the batch could not resolve fails open too, matching the
+            // "issue not found -> don't drop" rule below. Never `Terminal`:
+            // absence of evidence must not retire a row.
+            Some(subject) => resolved.get(subject).copied().unwrap_or(Verdict::Live),
+        })
+        .collect())
+}
+
+/// Resolve a set of distinct subjects in one read transaction.
+///
+/// Each query is the set form of one arm of the predicate documented on
+/// [`lazy_resolve_live`]; an arm is issued only when some subject in the batch
+/// needs it. The two artifact arms stay separate statements deliberately —
+/// folding them into one `artifact_type IN ('plan', 'create-pr')` query flips
+/// the planner back to `idx_artifacts_type` and reinstates the full scan.
+async fn resolve_subjects(
+    db: &LocalDb,
+    subjects: &[Subject],
+) -> DbResult<HashMap<Subject, Verdict>> {
+    let project_keys: Vec<String> = subjects
+        .iter()
+        .map(|subject| subject.project_key.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let numbers: Vec<i64> = subjects
+        .iter()
+        .map(|subject| subject.number as i64)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let subjects = subjects.to_vec();
+
+    db.read(move |conn| {
+        let subjects = subjects.clone();
+        let project_keys = project_keys.clone();
+        let numbers = numbers.clone();
         Box::pin(async move {
-            let Some(issue_id) = lookup_issue_id(conn, &project_key, number).await? else {
-                return Ok(true); // issue not found -> don't drop
+            // 1. Subjects -> issues. The numbers drive `idx_issues_number`; the
+            //    project key is matched exactly here and again per subject
+            //    below, so a number that exists in several projects cannot
+            //    cross-resolve.
+            let sql = format!(
+                "SELECT p.key, i.number, i.id, i.status
+                   FROM issues i JOIN projects p ON p.id = i.project_id
+                  WHERE i.number IN ({}) AND p.key IN ({})",
+                placeholders(numbers.len()),
+                placeholders(project_keys.len()),
+            );
+            let mut binds: Vec<Value> = numbers.iter().copied().map(Value::Integer).collect();
+            binds.extend(text_params(&project_keys));
+            let mut issue_id_of: HashMap<(String, i32), String> = HashMap::new();
+            let mut terminal: HashSet<String> = HashSet::new();
+            let mut rows = conn.query(&sql, binds).await?;
+            while let Some(row) = rows.next().await? {
+                let project_key = row.text(0)?;
+                let number = row.i64(1)? as i32;
+                let issue_id = row.text(2)?;
+                // Mirrors `crate::models::IssueStatus::is_terminal`.
+                if matches!(
+                    row.opt_text(3)?.as_deref(),
+                    Some("merged" | "closed" | "failed")
+                ) {
+                    terminal.insert(issue_id.clone());
+                }
+                issue_id_of.insert((project_key, number), issue_id);
+            }
+
+            // Only probe the issues a given referent class actually asks about.
+            let ids_for = |referent: Referent| -> Vec<String> {
+                subjects
+                    .iter()
+                    .filter(|subject| subject.referent == referent)
+                    .filter_map(|subject| {
+                        issue_id_of.get(&(subject.project_key.clone(), subject.number))
+                    })
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
             };
-            let live = match referent.as_str() {
-                // Live while there is reviewable output. This drain/wake liveness
-                // predicate MIRRORS the push-creation predicate
-                // (`reviewable_ref_and_fingerprint` at the idle edge +
-                // `create_review_push_for_pr_open`, lifecycle/review_push.rs):
-                //   arm 1 — an open, unmerged PR for the issue;
-                //   arm 2 — an unconfirmed `plan` artifact (a plan-review push
-                //           never has a PR row, so it is confirmed-gated);
-                //   arm 3 — a `create-pr` artifact of ANY confirmed state, but ONLY
-                //           while no `merge_requests` row exists for the issue at all.
-                // Arm 3 is the pre-open window the creation predicate is explicitly
-                // designed to cover: a builder's `create-pr` artifact auto-confirms
-                // on write (CAIRN-1219) and the PR opens a few ms later, so between
-                // the artifact write and the `merge_requests` row landing neither arm
-                // 1 nor arm 2 matches — yet the review push IS live (CAIRN-2410, the
-                // lost coordinator wake). The no-MR-row guard keeps arm 1
-                // authoritative once any row exists (open → live, merged/closed →
-                // dead), so a confirmed create-pr artifact left over from a merged PR
-                // never resurrects a retired review. A re-run window (an OLD merged
-                // row plus a fresh create-pr) is covered by the PR-open edge
-                // (`fire_pr_open_review` re-fires with a `pr:` fingerprint once the
-                // new row opens), not by arm 3.
-                "review" => {
-                    exists(
-                        conn,
-                        "SELECT 1 FROM merge_requests
-                         WHERE issue_id=?1 AND status NOT IN ('merged','closed') LIMIT 1",
-                        &issue_id,
-                    )
-                    .await?
-                        || exists(
-                            conn,
-                            "SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
-                             WHERE j.issue_id=?1
-                               AND a.artifact_type='plan'
-                               AND a.confirmed=0 LIMIT 1",
-                            &issue_id,
-                        )
-                        .await?
-                        || (exists(
-                            conn,
-                            "SELECT 1 FROM artifacts a JOIN jobs j ON a.job_id=j.id
-                             WHERE j.issue_id=?1
-                               AND a.artifact_type='create-pr' LIMIT 1",
-                            &issue_id,
-                        )
-                        .await?
-                            && !exists(
-                                conn,
-                                "SELECT 1 FROM merge_requests WHERE issue_id=?1 LIMIT 1",
-                                &issue_id,
-                            )
-                            .await?)
+
+            // 2. `review:` arms.
+            let review_ids = ids_for(Referent::Review);
+            let mut open_mr = HashSet::new();
+            let mut any_mr = HashSet::new();
+            let mut unconfirmed_plan = HashSet::new();
+            let mut any_plan = HashSet::new();
+            let mut create_pr = HashSet::new();
+            let mut create_pr_awaiting_mr = HashSet::new();
+            if !review_ids.is_empty() {
+                let sql = format!(
+                    "SELECT issue_id, status FROM merge_requests WHERE issue_id IN ({})",
+                    placeholders(review_ids.len())
+                );
+                let mut rows = conn.query(&sql, text_params(&review_ids)).await?;
+                while let Some(row) = rows.next().await? {
+                    let issue_id = row.text(0)?;
+                    // `status NOT IN ('merged','closed')` in SQL: a NULL status
+                    // satisfies neither side, so it is not an open PR.
+                    if matches!(row.opt_text(1)?.as_deref(), Some(status)
+                        if status != "merged" && status != "closed")
+                    {
+                        open_mr.insert(issue_id.clone());
+                    }
+                    any_mr.insert(issue_id);
                 }
-                // Live only while the referent is still pending AND the subject
-                // issue is not terminal: a blocker on a closed/merged/failed
-                // issue is dead even if its prompts/permission_requests row was
-                // never resolved.
-                "question" => {
-                    !issue_is_terminal(conn, &issue_id).await?
-                        && exists(
-                            conn,
-                            "SELECT 1 FROM prompts p JOIN runs r ON p.run_id=r.id
-                             WHERE r.issue_id=?1 AND p.response IS NULL LIMIT 1",
-                            &issue_id,
-                        )
-                        .await?
+                unconfirmed_plan = issue_id_set(
+                    conn,
+                    &format!(
+                        "SELECT j.issue_id FROM jobs j
+                          WHERE j.issue_id IN ({}) AND EXISTS (
+                                SELECT 1 FROM artifacts a
+                                 WHERE a.job_id = j.id
+                                   AND a.artifact_type = 'plan'
+                                   AND a.confirmed = 0)",
+                        placeholders(review_ids.len())
+                    ),
+                    &review_ids,
+                )
+                .await?;
+                // Terminality needs positive evidence, so "has a plan artifact"
+                // is asked separately from "has an UNCONFIRMED one". Without it,
+                // an issue that never had a plan is indistinguishable from one
+                // whose plan review completed, and only the second may retire.
+                // Deliberately the same shape as the arm above minus the
+                // `confirmed` term -- folding the two into one statement that
+                // selects `a.confirmed` flips the planner back to
+                // `idx_artifacts_type` and reinstates the full scan 0195 removed.
+                any_plan = issue_id_set(
+                    conn,
+                    &format!(
+                        "SELECT j.issue_id FROM jobs j
+                          WHERE j.issue_id IN ({}) AND EXISTS (
+                                SELECT 1 FROM artifacts a
+                                 WHERE a.job_id = j.id
+                                   AND a.artifact_type = 'plan')",
+                        placeholders(review_ids.len())
+                    ),
+                    &review_ids,
+                )
+                .await?;
+                create_pr = issue_id_set(
+                    conn,
+                    &format!(
+                        "SELECT j.issue_id FROM jobs j
+                          WHERE j.issue_id IN ({}) AND EXISTS (
+                                SELECT 1 FROM artifacts a
+                                 WHERE a.job_id = j.id
+                                   AND a.artifact_type = 'create-pr')",
+                        placeholders(review_ids.len())
+                    ),
+                    &review_ids,
+                )
+                .await?;
+                // Which review GENERATION the evidence belongs to.
+                //
+                // A `create-pr` artifact written AFTER the newest merge request
+                // opened is a review that has not got its PR row yet. Within one
+                // generation the order is always artifact-then-PR (the artifact
+                // auto-confirms on write and the PR opens milliseconds later),
+                // so a newer artifact can only mean a NEW generation.
+                //
+                // This is what keeps a rerun deliverable. An issue whose earlier
+                // run merged carries a merged `merge_requests` row forever, so
+                // "a merge request exists and none is open" is true during the
+                // next run's pre-open window too -- and retiring on that would
+                // permanently drop a review that was about to become live
+                // (CAIRN-2410's failure mode, made durable). Liveness is
+                // unchanged: this window still reads not-live, exactly as
+                // before. It is only barred from reading TERMINAL.
+                create_pr_awaiting_mr = issue_id_set(
+                    conn,
+                    &format!(
+                        "SELECT j.issue_id FROM jobs j
+                          WHERE j.issue_id IN ({}) AND EXISTS (
+                                SELECT 1 FROM artifacts a
+                                 WHERE a.job_id = j.id
+                                   AND a.artifact_type = 'create-pr'
+                                   AND a.created_at > (
+                                       SELECT COALESCE(MAX(m.opened_at), 0)
+                                         FROM merge_requests m
+                                        WHERE m.issue_id = j.issue_id))",
+                        placeholders(review_ids.len())
+                    ),
+                    &review_ids,
+                )
+                .await?;
+            }
+
+            // 3. `question:` and `permission:` arms. Each returns the referent
+            //    rows themselves rather than a pre-filtered id set, so one
+            //    statement yields both "is any still open" (liveness) and "did
+            //    any ever exist" (the evidence terminality requires). An issue
+            //    with no prompt row at all has no question to have been
+            //    answered, and must not retire.
+            let question_ids = ids_for(Referent::Question);
+            let mut open_question = HashSet::new();
+            let mut any_question = HashSet::new();
+            if !question_ids.is_empty() {
+                let sql = format!(
+                    "SELECT r.issue_id, p.response FROM runs r JOIN prompts p ON p.run_id = r.id
+                      WHERE r.issue_id IN ({})",
+                    placeholders(question_ids.len())
+                );
+                let mut rows = conn.query(&sql, text_params(&question_ids)).await?;
+                while let Some(row) = rows.next().await? {
+                    let issue_id = row.text(0)?;
+                    if row.opt_text(1)?.is_none() {
+                        open_question.insert(issue_id.clone());
+                    }
+                    any_question.insert(issue_id);
                 }
-                "permission" => {
-                    !issue_is_terminal(conn, &issue_id).await?
-                        && exists(
-                            conn,
-                            "SELECT 1 FROM permission_requests pr JOIN runs r ON pr.run_id=r.id
-                             WHERE r.issue_id=?1 AND pr.status='pending' LIMIT 1",
-                            &issue_id,
-                        )
-                        .await?
+            }
+            let permission_ids = ids_for(Referent::Permission);
+            let mut open_permission = HashSet::new();
+            let mut any_permission = HashSet::new();
+            if !permission_ids.is_empty() {
+                let sql = format!(
+                    "SELECT r.issue_id, pr.status FROM runs r
+                       JOIN permission_requests pr ON pr.run_id = r.id
+                      WHERE r.issue_id IN ({})",
+                    placeholders(permission_ids.len())
+                );
+                let mut rows = conn.query(&sql, text_params(&permission_ids)).await?;
+                while let Some(row) = rows.next().await? {
+                    let issue_id = row.text(0)?;
+                    if row.opt_text(1)?.as_deref() == Some("pending") {
+                        open_permission.insert(issue_id.clone());
+                    }
+                    any_permission.insert(issue_id);
                 }
-                _ => true,
-            };
-            Ok::<bool, DbError>(live)
+            }
+
+            let mut out = HashMap::with_capacity(subjects.len());
+            for subject in &subjects {
+                let Some(issue_id) =
+                    issue_id_of.get(&(subject.project_key.clone(), subject.number))
+                else {
+                    // Issue not found -> don't drop, and never retire: the
+                    // resolver cannot tell a deleted issue from one it simply
+                    // failed to read.
+                    out.insert(subject.clone(), Verdict::Live);
+                    continue;
+                };
+                // Each arm answers liveness first, exactly as before, then asks
+                // whether the NON-live case is backed by evidence of resolution.
+                // Every `Suspended` below is a case that reopening the referent
+                // makes deliverable again, which is why none of them may retire.
+                let verdict = match subject.referent {
+                    Referent::Review => {
+                        if open_mr.contains(issue_id)
+                            || unconfirmed_plan.contains(issue_id)
+                            || (create_pr.contains(issue_id) && !any_mr.contains(issue_id))
+                        {
+                            Verdict::Live
+                        } else if create_pr_awaiting_mr.contains(issue_id) {
+                            // A rerun has written its create-pr artifact and its
+                            // PR row has not landed. The issue's older merged
+                            // merge request is evidence about the PREVIOUS
+                            // generation, not this push, so it proves nothing
+                            // here. Not deliverable yet, not terminal either.
+                            Verdict::Suspended
+                        } else if any_mr.contains(issue_id) || any_plan.contains(issue_id) {
+                            // A merge request exists and is not open (merged or
+                            // closed), or a plan exists with nothing left
+                            // unconfirmed, and no newer create-pr artifact is
+                            // waiting on a PR row. The review this push names
+                            // has been had.
+                            Verdict::Terminal(RetirementReason::ReviewResolved)
+                        } else {
+                            // No merge request, no plan: nothing durable to
+                            // review yet. The create-pr pre-open window lands
+                            // here once its PR row appears, and a push for an
+                            // issue that never produced either stays pending
+                            // rather than being retired on an assumption.
+                            Verdict::Suspended
+                        }
+                    }
+                    Referent::Question => {
+                        if !terminal.contains(issue_id) && open_question.contains(issue_id) {
+                            Verdict::Live
+                        } else if any_question.contains(issue_id)
+                            && !open_question.contains(issue_id)
+                        {
+                            // Answered. Terminal even on a terminal issue: an
+                            // answer is durable and reopening cannot unmake it.
+                            Verdict::Terminal(RetirementReason::QuestionResolved)
+                        } else {
+                            // Still unanswered, suppressed only because the issue
+                            // is closed/merged/failed -- reopening restores it.
+                            Verdict::Suspended
+                        }
+                    }
+                    Referent::Permission => {
+                        if !terminal.contains(issue_id) && open_permission.contains(issue_id) {
+                            Verdict::Live
+                        } else if any_permission.contains(issue_id)
+                            && !open_permission.contains(issue_id)
+                        {
+                            Verdict::Terminal(RetirementReason::PermissionResolved)
+                        } else {
+                            Verdict::Suspended
+                        }
+                    }
+                };
+                out.insert(subject.clone(), verdict);
+            }
+            Ok::<HashMap<Subject, Verdict>, DbError>(out)
         })
     })
     .await
@@ -1091,43 +1602,9 @@ pub async fn has_open_pr_for_issue(db: &LocalDb, issue_id: &str) -> DbResult<boo
     .await
 }
 
-async fn lookup_issue_id(
-    conn: &cairn_db::turso::Connection,
-    project_key: &str,
-    number: i32,
-) -> DbResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT i.id FROM issues i JOIN projects p ON p.id=i.project_id
-             WHERE p.key=?1 AND i.number=?2 LIMIT 1",
-            params![project_key, number as i64],
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok(Some(row.text(0)?)),
-        None => Ok(None),
-    }
-}
-
 async fn exists(conn: &cairn_db::turso::Connection, sql: &str, issue_id: &str) -> DbResult<bool> {
     let mut rows = conn.query(sql, params![issue_id]).await?;
     Ok(rows.next().await?.is_some())
-}
-
-/// Whether the issue is terminal (`merged`/`closed`/`failed`), mirroring
-/// [`crate::models::IssueStatus::is_terminal`]. A `question:`/`permission:` push
-/// for a terminalized issue is dead — the blocker no longer needs a watcher.
-async fn issue_is_terminal(conn: &cairn_db::turso::Connection, issue_id: &str) -> DbResult<bool> {
-    let mut rows = conn
-        .query("SELECT status FROM issues WHERE id=?1", params![issue_id])
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok(matches!(
-            row.text(0)?.as_str(),
-            "merged" | "closed" | "failed"
-        )),
-        None => Ok(false),
-    }
 }
 
 #[cfg(test)]
@@ -1206,6 +1683,157 @@ mod tests {
             created_at: 1,
             delivered_event_id: None,
         }
+    }
+
+    /// A drain's database cost must be a constant, not a function of how much
+    /// backlog the recipient carries. This is the regression the batched
+    /// resolver exists to prevent: `dispatch::augment_with_queued_dms` drains on
+    /// EVERY MCP tool call, and because a push whose referent resolved is
+    /// skipped but never retired, a long-lived recipient's backlog only grows.
+    /// Resolving row-at-a-time made the per-tool-call cost scale with a number
+    /// nothing bounds (CAIRN-4181).
+    ///
+    /// Asserting read TRANSACTIONS rather than wall time makes this
+    /// deterministic: each one is a `BEGIN CONCURRENT` MVCC snapshot, and the
+    /// old drain opened one per push on top of the arms it then ran.
+    #[tokio::test]
+    async fn drain_transaction_count_does_not_grow_with_the_backlog() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // Distinct subjects, not one subject repeated: batching that only
+        // deduplicated would pass a weaker version of this test.
+        for number in 100..140 {
+            db.execute(
+                "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+                 VALUES('issue-' || ?1, 'p', ?1, 'Extra', 'active', 'active', 'none', 1, 1)",
+                params![number as i64],
+            )
+            .await
+            .unwrap();
+        }
+
+        // One stale review push: the shape a healthy recipient carries.
+        push(
+            &db,
+            "watcher",
+            "cairn://p/proj/100",
+            Wake::Wake,
+            Boundary::Event,
+            "review:cairn://p/proj/100",
+        )
+        .await
+        .unwrap();
+        let before = db.read_transaction_count();
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap()
+            .is_empty());
+        let small = db.read_transaction_count() - before;
+
+        // Thirty-nine more, spanning all three resolvable referent classes, so
+        // every arm is exercised at once.
+        for number in 101..140 {
+            let prefix = match number % 3 {
+                0 => "review",
+                1 => "question",
+                _ => "permission",
+            };
+            push(
+                &db,
+                "watcher",
+                &format!("cairn://p/proj/{number}"),
+                Wake::Wake,
+                Boundary::Event,
+                &format!("{prefix}:cairn://p/proj/{number}"),
+            )
+            .await
+            .unwrap();
+        }
+        let before = db.read_transaction_count();
+        assert!(pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap()
+            .is_empty());
+        let large = db.read_transaction_count() - before;
+
+        assert_eq!(
+            small, large,
+            "a 40x larger backlog must cost the same number of read transactions; \
+             {small} for one push vs {large} for forty means resolution is per-push \
+             again"
+        );
+        assert!(
+            large <= 3,
+            "a drain is the pending-row read plus one batched resolution, got {large}"
+        );
+    }
+
+    /// The batch resolves each push against its OWN subject. A single set query
+    /// per arm makes it possible to smear one issue's verdict across the batch,
+    /// so this pins live and dead pushes together in one drain.
+    #[tokio::test]
+    async fn a_mixed_batch_resolves_each_push_against_its_own_subject() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('issue-live','p',7,'Live','active','active','none',1,1);
+             INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+               VALUES('job-live','p','issue-live','running',1,1);
+             INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+               VALUES('mr-live','job-live','p','issue-live','t','b','main','open',1,1);",
+        )
+        .await
+        .unwrap();
+
+        // `issue-1` (proj/2) has no PR, no artifact -> dead.
+        // `issue-live` (proj/7) has an open PR -> live.
+        // `direct:` has no referent -> always live.
+        let batch = vec![
+            sample_push("review:cairn://p/proj/2", ISSUE_URI),
+            sample_push("review:cairn://p/proj/7", "cairn://p/proj/7"),
+            sample_push("direct:whoever", "cairn://p/proj/2"),
+            sample_push("review:cairn://p/proj/999", "cairn://p/proj/999"),
+        ];
+        assert_eq!(
+            resolve_live(&db, &batch).await.unwrap(),
+            // The last one names an issue that does not exist: fail OPEN, never
+            // silently dropped.
+            vec![false, true, true, true]
+        );
+    }
+
+    /// Batching must not let one project's issue numbers resolve against
+    /// another's. The set query binds numbers and project keys as independent
+    /// lists, so their cross product reaches the row loop; only the exact
+    /// (project, number) pairing may match.
+    #[tokio::test]
+    async fn subjects_do_not_cross_resolve_between_projects() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES('p2','w','Other','other','/tmp/other',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES('issue-other','p2',2,'Other','active','active','none',1,1);
+             INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+               VALUES('job-other','p2','issue-other','running',1,1);
+             INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+               VALUES('mr-other','job-other','p2','issue-other','t','b','main','open',1,1);",
+        )
+        .await
+        .unwrap();
+
+        // Both are issue number 2. Only `other/2` has the open PR.
+        let batch = vec![
+            sample_push("review:cairn://p/proj/2", ISSUE_URI),
+            sample_push("review:cairn://p/other/2", "cairn://p/other/2"),
+        ];
+        assert_eq!(
+            resolve_live(&db, &batch).await.unwrap(),
+            vec![false, true],
+            "proj/2 must not inherit other/2's open PR"
+        );
     }
 
     #[tokio::test]
@@ -1868,6 +2496,503 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    const REVIEW_KEY: &str = "review:cairn://p/proj/2";
+
+    /// The recorded retirement reason for a push, or `None` while it is pending.
+    /// 0196's CHECK makes reason and timestamp inseparable, so the reason alone
+    /// witnesses both.
+    async fn retirement_reason_of(db: &LocalDb, id: &str) -> Option<String> {
+        let id = id.to_string();
+        db.read(move |conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT retirement_reason FROM attention_pushes WHERE id=?1",
+                        (id,),
+                    )
+                    .await?;
+                Ok(match rows.next().await? {
+                    Some(row) => row.opt_text(0)?,
+                    None => None,
+                })
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn count_where(db: &LocalDb, predicate: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM attention_pushes WHERE {predicate}");
+        db.read(move |conn| {
+            let sql = sql.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, ()).await?;
+                rows.next().await?.expect("count row").i64(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn only_pending_id(db: &LocalDb) -> String {
+        list_pending(db, "watcher").await.unwrap()[0].id.clone()
+    }
+
+    /// The central claim: a drain that proves a referent resolved writes that
+    /// down ONCE, the row leaves every pending view, and it is still there to
+    /// read afterwards. Retiring is not deleting and not delivering.
+    #[tokio::test]
+    async fn a_resolved_review_retires_once_and_survives_as_audit_history() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        open_mr(&db).await;
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+        )
+        .await
+        .unwrap();
+        let id = only_pending_id(&db).await;
+
+        // While the merge request is open the push is live and untouched.
+        assert_eq!(list_pending_live(&db, "watcher").await.unwrap().len(), 1);
+        assert_eq!(retirement_reason_of(&db, &id).await, None);
+
+        db.execute_script("UPDATE merge_requests SET status='merged' WHERE id='mr-open';")
+            .await
+            .unwrap();
+
+        assert!(list_pending_live(&db, "watcher").await.unwrap().is_empty());
+        assert_eq!(
+            retirement_reason_of(&db, &id).await.as_deref(),
+            Some("review_resolved"),
+            "a merged merge request proves the review this push named has been had"
+        );
+
+        // Retained as audit history, never delivered, invisible to every
+        // pending view including the idle-resume gate.
+        assert_eq!(count_where(&db, "1=1").await, 1, "retiring must not delete");
+        assert_eq!(count_where(&db, "delivered_event_id IS NOT NULL").await, 0);
+        assert!(list_pending(&db, "watcher").await.unwrap().is_empty());
+        assert!(pending_at_boundary(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!has_pending_waking_live(&db, "watcher").await.unwrap());
+
+        // A second pass has nothing left to do: the row is no longer a
+        // candidate, which is the whole point of writing the conclusion down.
+        let verdicts = resolve_verdicts(&db, &[]).await.unwrap();
+        assert!(verdicts.is_empty());
+        assert_eq!(
+            retire_terminal(&db, &[], &[]).await.unwrap(),
+            0,
+            "a settled recipient must perform no retirement writes"
+        );
+    }
+
+    /// Each resolvable prefix retires under its own reason, so the audit trail
+    /// says which referent resolved rather than merely that something did.
+    #[tokio::test]
+    async fn answered_questions_and_decided_permissions_retire_with_their_own_reasons() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "INSERT INTO prompts(id, run_id, questions, response, created_at)
+               VALUES('q','run-1','[]','answered',1);
+             INSERT INTO permission_requests
+               (id, run_id, tool_use_id, tool_name, tool_input, status, created_at)
+               VALUES('perm','run-1','tu','bash','{}','allowed',1);",
+        )
+        .await
+        .unwrap();
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            "question:cairn://p/proj/2/1/planner/questions/q-1",
+        )
+        .await
+        .unwrap();
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            "permission:cairn://p/proj/2/1/builder/permissions/perm-1",
+        )
+        .await
+        .unwrap();
+
+        assert!(list_pending_live(&db, "watcher").await.unwrap().is_empty());
+        assert_eq!(
+            count_where(&db, "retirement_reason='question_resolved'").await,
+            1
+        );
+        assert_eq!(
+            count_where(&db, "retirement_reason='permission_resolved'").await,
+            1
+        );
+    }
+
+    /// The distinction retirement exists to respect. None of these referents is
+    /// deliverable, and none of them is terminal: an unanswered question is
+    /// suppressed only by its issue's state, and a review push on an issue that
+    /// produced neither a merge request nor a plan has nothing to prove
+    /// resolution with. Retiring either would destroy an obligation that
+    /// reopening the issue restores.
+    #[tokio::test]
+    async fn a_suppressed_or_unevidenced_referent_is_never_retired() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        db.execute_script(
+            "INSERT INTO prompts(id, run_id, questions, response, created_at)
+               VALUES('q','run-1','[]',NULL,1);
+             UPDATE issues SET status='closed' WHERE id='issue-1';",
+        )
+        .await
+        .unwrap();
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            "question:cairn://p/proj/2/1/planner/questions/q-1",
+        )
+        .await
+        .unwrap();
+        // A review push whose issue carries no merge request and no plan.
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+        )
+        .await
+        .unwrap();
+
+        assert!(list_pending_live(&db, "watcher").await.unwrap().is_empty());
+        assert_eq!(
+            count_where(&db, "retired_at IS NOT NULL").await,
+            0,
+            "not deliverable is not the same as terminal"
+        );
+        assert_eq!(
+            list_pending(&db, "watcher").await.unwrap().len(),
+            2,
+            "both must remain pending, so reopening the issue restores them"
+        );
+    }
+
+    /// Fail-open cases must fail open in BOTH directions: still delivered, and
+    /// never retired. Absence of understanding is not evidence of resolution.
+    #[tokio::test]
+    async fn informational_and_unresolvable_pushes_are_never_retired() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        for (key, content_ref) in [
+            ("catchup:cairn://p/proj/2/1/planner", ISSUE_URI),
+            ("direct:cairn://p/proj/2", ISSUE_URI),
+            ("review:not-a-uri", "not-a-uri"),
+            ("review:cairn://p/proj/9999", "cairn://p/proj/9999"),
+        ] {
+            push(
+                &db,
+                "watcher",
+                content_ref,
+                Wake::Wake,
+                Boundary::Event,
+                key,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            list_pending_live(&db, "watcher").await.unwrap().len(),
+            4,
+            "informational, unparseable, and missing-issue pushes stay deliverable"
+        );
+        assert_eq!(count_where(&db, "retired_at IS NOT NULL").await, 0);
+    }
+
+    /// Delivery and retirement are mutually exclusive terminal writes, and the
+    /// stamping guard is what keeps a retired row from being re-sealed as
+    /// delivered by a drain that classified it before it was retired.
+    #[tokio::test]
+    async fn a_retired_row_cannot_be_stamped_delivered() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        open_mr(&db).await;
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+        )
+        .await
+        .unwrap();
+        let id = only_pending_id(&db).await;
+        db.execute_script("UPDATE merge_requests SET status='merged' WHERE id='mr-open';")
+            .await
+            .unwrap();
+        assert!(list_pending_live(&db, "watcher").await.unwrap().is_empty());
+
+        let stamped = stamp_delivered(&db, std::slice::from_ref(&id), "event-late")
+            .await
+            .unwrap();
+        assert_eq!(stamped, 0, "a retired row is not deliverable");
+        assert_eq!(count_where(&db, "delivered_event_id IS NOT NULL").await, 0);
+        assert_eq!(
+            retirement_reason_of(&db, &id).await.as_deref(),
+            Some("review_resolved"),
+            "a refused stamp must leave the retirement intact"
+        );
+    }
+
+    /// Supersession is scoped to ACTIVE pending rows, while the fingerprint
+    /// history spans everything. Together those two facts mean an unchanged
+    /// source state stays deduplicated against retired history, and a genuinely
+    /// changed one opens a fresh row instead of reviving a retired one.
+    #[tokio::test]
+    async fn a_changed_source_state_inserts_a_fresh_row_beside_retired_history() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        open_mr(&db).await;
+        push_with_fingerprint(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+            Some("fp-A"),
+        )
+        .await
+        .unwrap();
+        let retired = only_pending_id(&db).await;
+        db.execute_script("UPDATE merge_requests SET status='merged' WHERE id='mr-open';")
+            .await
+            .unwrap();
+        assert!(list_pending_live(&db, "watcher").await.unwrap().is_empty());
+        assert!(retirement_reason_of(&db, &retired).await.is_some());
+
+        // History is unbroken across retirement, so a creator that recomputes
+        // the same fingerprint still knows not to re-fire.
+        assert_eq!(
+            latest_push_fingerprint(&db, "watcher", REVIEW_KEY)
+                .await
+                .unwrap(),
+            Some(Some("fp-A".to_string())),
+            "retirement must not erase the deduplication history"
+        );
+
+        // A new review on the same key -- the merge request is open again, so
+        // there is something to look at once more. The retired row has left the
+        // supersede index, so this inserts rather than reviving it in place.
+        db.execute_script("UPDATE merge_requests SET status='open' WHERE id='mr-open';")
+            .await
+            .unwrap();
+        push_with_fingerprint(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+            Some("fp-B"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            count_where(&db, "1=1").await,
+            2,
+            "a fresh row, not a revival"
+        );
+        assert_eq!(
+            retirement_reason_of(&db, &retired).await.as_deref(),
+            Some("review_resolved"),
+            "the retired row must stay retired"
+        );
+        let pending = list_pending_live(&db, "watcher").await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_ne!(pending[0].id, retired);
+    }
+
+    /// The rerun case, and the one retirement is most dangerous in.
+    ///
+    /// An issue whose earlier run merged keeps that merged `merge_requests` row
+    /// forever. So when the NEXT run writes its `create-pr` artifact and its
+    /// review push, the issue simultaneously has a create-pr artifact and a
+    /// non-open merge request -- which reads exactly like "the review has been
+    /// had" unless the evidence is tied to a generation.
+    ///
+    /// Getting this wrong is worse than the bug retirement fixes. Previously
+    /// this window was merely filtered and went live the moment the new PR row
+    /// landed; retiring it makes the drop permanent and silent, which is
+    /// CAIRN-2410 made durable.
+    ///
+    /// The push must survive the window as a PENDING row and become live when
+    /// its own merge request opens -- the same row, not a replacement.
+    #[tokio::test]
+    async fn a_rerun_awaiting_its_pr_row_is_suspended_not_retired() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        // The previous generation: a merge request that has already merged.
+        db.execute_script(
+            "INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr-old','child-job','p','issue-1','t','b1','main','merged',10,10);
+             INSERT INTO jobs(id, project_id, issue_id, execution_id, node_name, uri_segment, status, current_session_id, created_at, updated_at)
+               VALUES('child-job-2','p','issue-1','exec-1','builder','builder','running','sess3',100,100);",
+        )
+        .await
+        .unwrap();
+
+        // The rerun writes its create-pr artifact (auto-confirmed on write,
+        // CAIRN-1219) and the review push. The new PR row has not landed yet.
+        db.execute_script(
+            "INSERT INTO artifacts
+               (id, job_id, artifact_type, schema_version, data, version, output_name, confirmed, created_at, updated_at)
+             VALUES('a-pr-2','child-job-2','create-pr',1,'{}',1,'create-pr',1,100,100);",
+        )
+        .await
+        .unwrap();
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+        )
+        .await
+        .unwrap();
+        let id = only_pending_id(&db).await;
+
+        // Not deliverable during the window -- unchanged from before retirement
+        // existed -- but emphatically not retired.
+        assert!(
+            list_pending_live(&db, "watcher").await.unwrap().is_empty(),
+            "the pre-open window still reads not-live, exactly as before"
+        );
+        assert_eq!(
+            retirement_reason_of(&db, &id).await,
+            None,
+            "the old generation's merged merge request is not evidence about \
+             this push; retiring here would drop the rerun's review for good"
+        );
+        assert_eq!(list_pending(&db, "watcher").await.unwrap().len(), 1);
+
+        // The rerun's own merge request opens.
+        db.execute_script(
+            "INSERT INTO merge_requests
+               (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at)
+             VALUES('mr-new','child-job-2','p','issue-1','t','b2','main','open',200,200);",
+        )
+        .await
+        .unwrap();
+
+        let live = list_pending_live(&db, "watcher").await.unwrap();
+        assert_eq!(live.len(), 1, "the review becomes deliverable");
+        assert_eq!(
+            live[0].id, id,
+            "the SAME row goes live -- it was never retired and nothing was \
+             recreated in its place"
+        );
+
+        // And once that merge request merges, it finally retires.
+        db.execute_script("UPDATE merge_requests SET status='merged' WHERE id='mr-new';")
+            .await
+            .unwrap();
+        assert!(list_pending_live(&db, "watcher").await.unwrap().is_empty());
+        assert_eq!(
+            retirement_reason_of(&db, &id).await.as_deref(),
+            Some("review_resolved"),
+            "the generation guard defers retirement, it does not prevent it"
+        );
+    }
+
+    /// CAIRN-4181 proved a drain's cost does not grow with the number of LIVE
+    /// pending pushes. This proves the other axis, which is the one retirement
+    /// is about: it must not grow with accumulated HISTORY either. Otherwise the
+    /// queue simply trades an unbounded pending set for an unbounded retired
+    /// one and the per-tool-call cost creeps back.
+    #[tokio::test]
+    async fn drain_cost_is_bounded_by_live_rows_not_by_retired_history() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        open_mr(&db).await;
+        push(
+            &db,
+            "watcher",
+            ISSUE_URI,
+            Wake::Wake,
+            Boundary::Event,
+            REVIEW_KEY,
+        )
+        .await
+        .unwrap();
+
+        let before = db.read_transaction_count();
+        let fresh = pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap();
+        let without_history = db.read_transaction_count() - before;
+
+        // A thousand retired rows for the same recipient: the production shape,
+        // compressed. They are inserted already-retired because that is exactly
+        // the state an aged install is in after the backfill has run.
+        for n in 0..1000 {
+            db.execute(
+                "INSERT INTO attention_pushes
+                   (id, recipient, content_ref, wake, boundary, key, created_at,
+                    retired_at, retirement_reason)
+                 VALUES('old-' || ?1, 'watcher', ?2, 'wake', 'event',
+                        'review:old-' || ?1, 1, 2, 'review_resolved')",
+                params![n as i64, ISSUE_URI],
+            )
+            .await
+            .unwrap();
+        }
+
+        let before = db.read_transaction_count();
+        let aged = pending_deliverable_live(&db, "watcher", Boundary::Event)
+            .await
+            .unwrap();
+        let with_history = db.read_transaction_count() - before;
+
+        assert_eq!(
+            fresh.len(),
+            aged.len(),
+            "retired history must not change what a drain returns"
+        );
+        assert_eq!(
+            without_history, with_history,
+            "a thousand retired rows must cost the same as none; {without_history} \
+             vs {with_history} means history is being re-resolved"
+        );
+        assert_eq!(
+            count_where(&db, "retired_at IS NOT NULL").await,
+            1000,
+            "the history is genuinely present, so the comparison means something"
+        );
     }
 
     #[tokio::test]

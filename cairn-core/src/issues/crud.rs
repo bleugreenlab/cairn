@@ -235,6 +235,7 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
         created_at: row.i64(11)?,
         updated_at: row.i64(12)?,
         author: authorship.map(|value| value.author),
+        author_display: None,
         backend_override: row.opt_text(13)?,
         merged_at: row.opt_i64(14)?,
         closed_at: row.opt_i64(15)?,

@@ -1,3 +1,4 @@
+use cairn_common::identity::display::PrincipalDisplay;
 use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +11,10 @@ pub struct Post {
     pub content: String,
     pub author: PrincipalRef,
     pub appearance: AppearanceSnapshot,
+    /// How `author` reads to a person. Resolved on the way to a surface, never
+    /// stored; see [`cairn_common::identity::display`].
+    #[serde(default)]
+    pub author_display: Option<PrincipalDisplay>,
     pub created_at: i64,
 }
 
@@ -30,6 +35,10 @@ pub struct PostComment {
     pub content: String,
     pub author: PrincipalRef,
     pub appearance: AppearanceSnapshot,
+    /// How `author` reads to a person. Resolved on the way to a surface, never
+    /// stored; see [`cairn_common::identity::display`].
+    #[serde(default)]
+    pub author_display: Option<PrincipalDisplay>,
     pub created_at: i64,
 }
 

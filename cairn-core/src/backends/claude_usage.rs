@@ -1,7 +1,6 @@
 //! Noninteractive Claude subscription usage probe.
 
 use serde::Deserialize;
-use serde_json::json;
 use std::path::Path;
 
 use crate::identity::ClaudeAuth;
@@ -29,6 +28,10 @@ const USAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// The CLI keys its credential store by profile directory, so a managed profile
 /// has its own entry rather than sharing one account across all of them.
+///
+/// macOS only, like the keychain it names: every other platform reads the
+/// credential file beside the profile and never asks for a service name.
+#[cfg(target_os = "macos")]
 const CREDENTIAL_SERVICE_PREFIX: &str = "Claude Code-credentials-";
 /// Where the CLI keeps credentials when there is no OS keychain to use.
 const CREDENTIAL_FILE: &str = ".credentials.json";
@@ -288,6 +291,10 @@ fn read_credential_file(profile: &Path) -> Result<Option<String>, String> {
 /// The keychain service the CLI stores this profile's credential under:
 /// its prefix plus the first eight hex characters of the SHA-256 of the
 /// profile directory path.
+///
+/// Reached only from the macOS branch of [`read_credential_payload`], so it is
+/// compiled there and nowhere else.
+#[cfg(target_os = "macos")]
 fn credential_service(profile: &Path) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(profile.to_string_lossy().as_bytes());
@@ -396,7 +403,11 @@ mod tests {
         assert_eq!(session.scope, ProviderUsageScope::Session);
         assert_eq!(session.used_percent, 64.0);
         assert_eq!(session.remaining_percent, 36.0);
-        assert_eq!(session.resets_at, Some(1786939799));
+        // The epoch of this window's own `resets_at` in USAGE_BODY
+        // (2026-08-16T02:09:59+00:00). Spelled as a literal rather than parsed
+        // here, so the test still fails if the parse ever loses the timezone;
+        // refresh both together when the captured body is recaptured.
+        assert_eq!(session.resets_at, Some(1786846199));
 
         let weekly = &snapshot.windows[1];
         assert_eq!(weekly.label, "Current week (all models)");

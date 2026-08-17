@@ -11,7 +11,6 @@ use super::common::{
 use crate::issues::relations;
 use crate::models::{ExecutionSnapshot, RecipeNodeType};
 use crate::storage::{DbResult, LocalDb, RowExt};
-use cairn_common::identity::PrincipalRef;
 use cairn_common::uri::{build_issue_comment_uri, build_issue_uri, build_node_uri};
 
 struct IssuePrSummary {
@@ -22,67 +21,6 @@ struct IssuePrSummary {
     actor_kind: Option<String>,
     actor_identity: Option<String>,
     resolved_at: Option<i64>,
-}
-
-#[cfg(test)]
-mod issue_author_display_tests {
-    use super::*;
-
-    #[test]
-    fn formats_all_principal_kinds_and_legacy_absence() {
-        let cases = [
-            (None, "Unattributed"),
-            (
-                Some(PrincipalRef::Human {
-                    issuer: "https://identity.example".into(),
-                    subject: "user-42".into(),
-                    organization: Some("org-1".into()),
-                }),
-                "user-42 (https://identity.example)",
-            ),
-            (
-                Some(PrincipalRef::Agent {
-                    node: "cairn://p/test/1/1/builder".into(),
-                    run_id: Some("run-1".into()),
-                }),
-                "cairn://p/test/1/1/builder",
-            ),
-            (
-                Some(PrincipalRef::Machine {
-                    device_id: "studio-mac".into(),
-                }),
-                "studio-mac",
-            ),
-            (
-                Some(PrincipalRef::External {
-                    provider: "discord".into(),
-                    namespace: "guild-3".into(),
-                    id: "sender-9".into(),
-                }),
-                "discord:guild-3/sender-9",
-            ),
-        ];
-
-        for (principal, expected) in cases {
-            assert_eq!(issue_author_display(principal.as_ref()), expected);
-        }
-    }
-}
-
-fn issue_author_display(author: Option<&PrincipalRef>) -> String {
-    match author {
-        None => "Unattributed".to_string(),
-        Some(PrincipalRef::Human {
-            issuer, subject, ..
-        }) => format!("{subject} ({issuer})"),
-        Some(PrincipalRef::Agent { node, .. }) => node.clone(),
-        Some(PrincipalRef::Machine { device_id }) => device_id.clone(),
-        Some(PrincipalRef::External {
-            provider,
-            namespace,
-            id,
-        }) => format!("{provider}:{namespace}/{id}"),
-    }
 }
 
 async fn render_dependencies_block(conn: &cairn_db::turso::Connection, issue_id: &str) -> String {
@@ -251,7 +189,15 @@ async fn render_possibly_related_block(
     }
 }
 
-pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> String {
+/// `db` owns this issue's rows — the private database, or the team replica for
+/// a shared project. `local` is always the private one: the alias registries a
+/// principal resolves against live there and nowhere else.
+pub(super) async fn read_issue(
+    db: &LocalDb,
+    local: &LocalDb,
+    project_key: &str,
+    number: i32,
+) -> String {
     let conn = match connect_for_read(db).await {
         Ok(conn) => conn,
         Err(error) => return error,
@@ -289,7 +235,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
         created_at,
         parent_issue_id,
         parent_thread_id,
-        author,
+        authorship,
     ) = match issue_rows.next().await {
         Ok(Some(row)) => {
             let parsed: DbResult<_> = (|| {
@@ -305,7 +251,7 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
                     row.i64(4)? as i32,
                     row.opt_text(5)?,
                     row.opt_text(6)?,
-                    authorship.map(|value| value.author),
+                    authorship,
                 ))
             })();
             match parsed {
@@ -330,7 +276,13 @@ pub(super) async fn read_issue(db: &LocalDb, project_key: &str, number: i32) -> 
     output.push_str(&format!("Status: {} | Created: {}\n", status, created_date));
     output.push_str(&format!(
         "Created by: {}\n",
-        issue_author_display(author.as_ref())
+        crate::identity::display::display_for(
+            local,
+            authorship.as_ref().map(|value| &value.author),
+            authorship.as_ref().map(|value| &value.appearance),
+        )
+        .await
+        .inline()
     ));
     if !labels.is_empty() {
         output.push_str(&format!(

@@ -74,7 +74,17 @@ pub struct Thread {
 #[serde(rename_all = "camelCase")]
 pub struct CreateThread {
     pub project_id: String,
-    pub name: String,
+    /// The thread's address, or absence asking the server to allocate one.
+    ///
+    /// A name is a judgment about what a topic IS, and at creation nobody has
+    /// made it yet: the person has typed one message and the Thread agent has
+    /// not read it. So the boundary stays name-free and the server allocates a
+    /// `thread-<n>` placeholder the agent replaces from inside its first
+    /// session. An explicit name is still honoured verbatim — a migration, a
+    /// channel surface, or an agent creating a thread it can already name knows
+    /// what it wants — and only absence invokes allocation.
+    #[serde(default)]
+    pub name: Option<String>,
     pub jurisdiction: Option<String>,
     pub definition: Option<String>,
     pub migrated_from_number: Option<i64>,

@@ -704,7 +704,13 @@ pub struct LearnedResourceEstimate {
 /// Placement decisions carry deterministic tie-break evidence, suspended process
 /// items and unavailable callback context use explicit backend control flow, and
 /// ordinary command batches persist distinct physical PID/start-token ownership.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 56;
+///
+/// Bumped to 57 for attributable executor-memory telemetry: process telemetry
+/// now carries [`ExecutorRetainedState`], naming which of the daemon's own
+/// in-memory owners holds its resident set, and the daemon bounds the callback
+/// queue and per-attempt output capture that could previously grow without
+/// limit behind a slow runner.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 57;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -3263,6 +3269,260 @@ pub struct ProcessTelemetry {
     /// macOS physical footprint, which counts compressed and swapped pages the
     /// resident set does not. Unavailable elsewhere by construction.
     pub physical_footprint_bytes: Measurement<u64>,
+    /// Virtual address space the process has mapped.
+    ///
+    /// The reading that separates the two ways a daemon gets large, which look
+    /// identical from resident size alone. A process holding gigabytes of live
+    /// data has a resident set near its virtual size; a process whose allocator
+    /// has scattered a few megabytes across tens of thousands of regions it
+    /// will not return has a virtual size many times its footprint and an
+    /// attributed total near zero. Only the second is fixed by looking at the
+    /// allocation *rate*, and without this field the two are indistinguishable
+    /// until someone runs `vmmap` on a process that is about to be restarted.
+    #[serde(default)]
+    pub virtual_bytes: Measurement<u64>,
+    /// Which of the daemon's own in-memory owners is holding that resident set.
+    ///
+    /// A resident size alone says a process is large; it never says what is
+    /// large about it, and a restart erases the evidence. This is the other
+    /// half of that question.
+    #[serde(default)]
+    pub retained: ExecutorRetainedState,
+}
+
+/// One owner of retained executor-daemon state: how many things it currently
+/// holds, roughly how many bytes those things own, and the high-water marks
+/// each has reached since the process started.
+///
+/// `estimated_bytes` is an estimate and says so. It is built from owned string
+/// and vector capacities and from the serialized size of queued payloads, never
+/// from the allocator, so it will not reconcile to resident set size and is not
+/// meant to. What it is for is attribution — which owner is carrying the growth
+/// — which is exactly the question a 144 GB process could not answer.
+///
+/// The peaks are what make a settled snapshot readable after the fact. A queue
+/// that is empty now and once held two hundred megabytes is a different machine
+/// from one that never queued anything, and only the peak distinguishes them.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetainedOwner {
+    pub entries: u64,
+    pub estimated_bytes: u64,
+    pub peak_entries: u64,
+    pub peak_estimated_bytes: u64,
+}
+
+impl RetainedOwner {
+    /// Holding nothing now and never having held anything. An owner in this
+    /// state is noise in a report, so the renderer may omit it.
+    pub fn is_untouched(&self) -> bool {
+        self.entries == 0
+            && self.estimated_bytes == 0
+            && self.peak_entries == 0
+            && self.peak_estimated_bytes == 0
+    }
+}
+
+/// The stable name of a retained-state owner, so a report names owners rather
+/// than positions and a reader can grep for the one that grew.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum RetainedOwnerKind {
+    QueuedRequests,
+    ExecutingRequests,
+    CompletedRequests,
+    Cancellations,
+    CommandProcesses,
+    ResidentProcesses,
+    CommandOwnership,
+    Projects,
+    Cells,
+    WaitSamples,
+    ResidencyOperationLocks,
+    ResidencyAcquisitionLocks,
+    ResidencyReclaimContention,
+    CallbackWaiters,
+    OutgoingCallbackQueue,
+    ActiveProcessAttempts,
+    CapturedProcessOutput,
+    QueuedOutputChunks,
+    ManagedManifests,
+    ProcessCensus,
+}
+
+impl RetainedOwnerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueuedRequests => "queuedRequests",
+            Self::ExecutingRequests => "executingRequests",
+            Self::CompletedRequests => "completedRequests",
+            Self::Cancellations => "cancellations",
+            Self::CommandProcesses => "commandProcesses",
+            Self::ResidentProcesses => "residentProcesses",
+            Self::CommandOwnership => "commandOwnership",
+            Self::Projects => "projects",
+            Self::Cells => "cells",
+            Self::WaitSamples => "waitSamples",
+            Self::ResidencyOperationLocks => "residencyOperationLocks",
+            Self::ResidencyAcquisitionLocks => "residencyAcquisitionLocks",
+            Self::ResidencyReclaimContention => "residencyReclaimContention",
+            Self::CallbackWaiters => "callbackWaiters",
+            Self::OutgoingCallbackQueue => "outgoingCallbackQueue",
+            Self::ActiveProcessAttempts => "activeProcessAttempts",
+            Self::CapturedProcessOutput => "capturedProcessOutput",
+            Self::QueuedOutputChunks => "queuedOutputChunks",
+            Self::ManagedManifests => "managedManifests",
+            Self::ProcessCensus => "processCensus",
+        }
+    }
+
+    /// What an operator reads. Deliberately says what the owner *is* rather
+    /// than which field holds it, because the field is what moves between
+    /// releases and the concept is what a recurrence will be described in.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QueuedRequests => "queued requests",
+            Self::ExecutingRequests => "executing requests",
+            Self::CompletedRequests => "recent completions (bounded history)",
+            Self::Cancellations => "cancellation tokens",
+            Self::CommandProcesses => "command-process supervision",
+            Self::ResidentProcesses => "resident-process supervision",
+            Self::CommandOwnership => "durable command ownership",
+            Self::Projects => "configured projects",
+            Self::Cells => "cells",
+            Self::WaitSamples => "queue wait samples (bounded history)",
+            Self::ResidencyOperationLocks => "residency operation locks",
+            Self::ResidencyAcquisitionLocks => "residency acquisition locks",
+            Self::ResidencyReclaimContention => "residency reclaim contention",
+            Self::CallbackWaiters => "callback waiters",
+            Self::OutgoingCallbackQueue => "queued callback payloads",
+            Self::ActiveProcessAttempts => "active process attempts",
+            Self::CapturedProcessOutput => "captured process output",
+            Self::QueuedOutputChunks => "queued output chunks",
+            Self::ManagedManifests => "managed-object manifests",
+            Self::ProcessCensus => "process census (current sample)",
+        }
+    }
+}
+
+/// What the executor daemon is holding in memory, by owner.
+///
+/// Diagnostic in the strongest sense: nothing here is a placement input, and
+/// nothing here is allowed to become one. Its whole job is that the next time
+/// this process grows without bound, a single read of `cairn://executors/{name}`
+/// names the owner instead of a restart erasing the evidence.
+///
+/// Two collection disciplines meet here, and the difference is deliberate.
+/// Flow-through owners — queues, waiters, captured output — carry live gauges
+/// updated at every enqueue and dequeue, because their danger is a spike
+/// between two samples. Structural owners — cells, projects, manifests, lock
+/// maps — are counted by walking them when the snapshot is taken, because they
+/// move slowly and a walk is exact where a hand-maintained counter drifts.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorRetainedState {
+    /// When this snapshot was taken. Its own timestamp rather than the
+    /// heartbeat's, on the same principle as every other measurement here: a
+    /// beat must not be able to freshen a fact it did not collect.
+    pub measured_at_unix_ms: u64,
+    pub queued_requests: RetainedOwner,
+    pub executing_requests: RetainedOwner,
+    pub completed_requests: RetainedOwner,
+    pub cancellations: RetainedOwner,
+    pub command_processes: RetainedOwner,
+    pub resident_processes: RetainedOwner,
+    pub command_ownership: RetainedOwner,
+    pub projects: RetainedOwner,
+    pub cells: RetainedOwner,
+    pub wait_samples: RetainedOwner,
+    pub residency_operation_locks: RetainedOwner,
+    pub residency_acquisition_locks: RetainedOwner,
+    pub residency_reclaim_contention: RetainedOwner,
+    pub callback_waiters: RetainedOwner,
+    pub outgoing_callback_queue: RetainedOwner,
+    pub active_process_attempts: RetainedOwner,
+    pub captured_process_output: RetainedOwner,
+    pub queued_output_chunks: RetainedOwner,
+    pub managed_manifests: RetainedOwner,
+    /// The census is resampled and dropped every tick, so this reports the
+    /// current sample rather than retained history. A census that grows here is
+    /// a machine with more processes on it, not a leak.
+    pub process_census: RetainedOwner,
+}
+
+impl ExecutorRetainedState {
+    /// Every owner in a stable order, so the renderer and any future consumer
+    /// cannot drift into disagreeing about what was measured.
+    pub fn owners(&self) -> [(RetainedOwnerKind, RetainedOwner); 20] {
+        [
+            (RetainedOwnerKind::QueuedRequests, self.queued_requests),
+            (
+                RetainedOwnerKind::ExecutingRequests,
+                self.executing_requests,
+            ),
+            (
+                RetainedOwnerKind::CompletedRequests,
+                self.completed_requests,
+            ),
+            (RetainedOwnerKind::Cancellations, self.cancellations),
+            (RetainedOwnerKind::CommandProcesses, self.command_processes),
+            (
+                RetainedOwnerKind::ResidentProcesses,
+                self.resident_processes,
+            ),
+            (RetainedOwnerKind::CommandOwnership, self.command_ownership),
+            (RetainedOwnerKind::Projects, self.projects),
+            (RetainedOwnerKind::Cells, self.cells),
+            (RetainedOwnerKind::WaitSamples, self.wait_samples),
+            (
+                RetainedOwnerKind::ResidencyOperationLocks,
+                self.residency_operation_locks,
+            ),
+            (
+                RetainedOwnerKind::ResidencyAcquisitionLocks,
+                self.residency_acquisition_locks,
+            ),
+            (
+                RetainedOwnerKind::ResidencyReclaimContention,
+                self.residency_reclaim_contention,
+            ),
+            (RetainedOwnerKind::CallbackWaiters, self.callback_waiters),
+            (
+                RetainedOwnerKind::OutgoingCallbackQueue,
+                self.outgoing_callback_queue,
+            ),
+            (
+                RetainedOwnerKind::ActiveProcessAttempts,
+                self.active_process_attempts,
+            ),
+            (
+                RetainedOwnerKind::CapturedProcessOutput,
+                self.captured_process_output,
+            ),
+            (
+                RetainedOwnerKind::QueuedOutputChunks,
+                self.queued_output_chunks,
+            ),
+            (RetainedOwnerKind::ManagedManifests, self.managed_manifests),
+            (RetainedOwnerKind::ProcessCensus, self.process_census),
+        ]
+    }
+
+    /// The sum of every owner's estimate. A floor on what the daemon is
+    /// holding, never a total: state this does not name is state this cannot
+    /// count, and the gap between this and resident size is itself a reading.
+    pub fn total_estimated_bytes(&self) -> u64 {
+        self.owners().into_iter().fold(0_u64, |total, (_, owner)| {
+            total.saturating_add(owner.estimated_bytes)
+        })
+    }
+
+    /// Whether anything has been collected at all. A defaulted snapshot — an
+    /// executor too old to publish one — must render as "not reported" rather
+    /// than as a daemon holding nothing.
+    pub fn is_unreported(&self) -> bool {
+        self.measured_at_unix_ms == 0 && self.owners().into_iter().all(|(_, o)| o.is_untouched())
+    }
 }
 
 /// The placement-facing vocabulary every enrolled machine speaks.
@@ -3294,6 +3554,7 @@ pub enum MachineMeasurement {
     DiskAccounting,
     ProcessResident,
     ProcessPhysicalFootprint,
+    ProcessVirtual,
 }
 
 impl MachineMeasurement {
@@ -3315,7 +3576,10 @@ impl MachineMeasurement {
     pub fn is_placement_input(self) -> bool {
         match self {
             Self::Cpu | Self::Memory | Self::Volume => true,
-            Self::DiskAccounting | Self::ProcessResident | Self::ProcessPhysicalFootprint => false,
+            Self::DiskAccounting
+            | Self::ProcessResident
+            | Self::ProcessPhysicalFootprint
+            | Self::ProcessVirtual => false,
         }
     }
 
@@ -3327,6 +3591,7 @@ impl MachineMeasurement {
             Self::DiskAccounting => "diskAccounting",
             Self::ProcessResident => "processResident",
             Self::ProcessPhysicalFootprint => "processPhysicalFootprint",
+            Self::ProcessVirtual => "processVirtual",
         }
     }
 }
@@ -3352,6 +3617,10 @@ impl MachineTelemetry {
             (
                 MachineMeasurement::ProcessPhysicalFootprint,
                 self.process.physical_footprint_bytes.gap(),
+            ),
+            (
+                MachineMeasurement::ProcessVirtual,
+                self.process.virtual_bytes.gap(),
             ),
         ]
         .into_iter()
@@ -6818,6 +7087,104 @@ mod tests {
         }
     }
 
+    /// Every owner survives the wire with its live reading and its peak intact.
+    ///
+    /// The peaks are the half most easily lost — they are the only fields that
+    /// still say something once an incident has settled — so a round trip that
+    /// checked cardinality alone would pass while dropping the evidence.
+    #[test]
+    fn retained_state_round_trips_every_owner_with_its_peaks() {
+        let mut retained = ExecutorRetainedState {
+            measured_at_unix_ms: 1_700_000_000_000,
+            ..ExecutorRetainedState::default()
+        };
+        // Distinct values per owner, so a serializer that crossed two fields
+        // fails instead of silently agreeing with itself.
+        for (index, (kind, _)) in retained.owners().into_iter().enumerate() {
+            let base = (index as u64 + 1) * 10;
+            let owner = RetainedOwner {
+                entries: base,
+                estimated_bytes: base * 1_000,
+                peak_entries: base * 2,
+                peak_estimated_bytes: base * 5_000,
+            };
+            match kind {
+                RetainedOwnerKind::QueuedRequests => retained.queued_requests = owner,
+                RetainedOwnerKind::ExecutingRequests => retained.executing_requests = owner,
+                RetainedOwnerKind::CompletedRequests => retained.completed_requests = owner,
+                RetainedOwnerKind::Cancellations => retained.cancellations = owner,
+                RetainedOwnerKind::CommandProcesses => retained.command_processes = owner,
+                RetainedOwnerKind::ResidentProcesses => retained.resident_processes = owner,
+                RetainedOwnerKind::CommandOwnership => retained.command_ownership = owner,
+                RetainedOwnerKind::Projects => retained.projects = owner,
+                RetainedOwnerKind::Cells => retained.cells = owner,
+                RetainedOwnerKind::WaitSamples => retained.wait_samples = owner,
+                RetainedOwnerKind::ResidencyOperationLocks => {
+                    retained.residency_operation_locks = owner
+                }
+                RetainedOwnerKind::ResidencyAcquisitionLocks => {
+                    retained.residency_acquisition_locks = owner
+                }
+                RetainedOwnerKind::ResidencyReclaimContention => {
+                    retained.residency_reclaim_contention = owner
+                }
+                RetainedOwnerKind::CallbackWaiters => retained.callback_waiters = owner,
+                RetainedOwnerKind::OutgoingCallbackQueue => {
+                    retained.outgoing_callback_queue = owner
+                }
+                RetainedOwnerKind::ActiveProcessAttempts => {
+                    retained.active_process_attempts = owner
+                }
+                RetainedOwnerKind::CapturedProcessOutput => {
+                    retained.captured_process_output = owner
+                }
+                RetainedOwnerKind::QueuedOutputChunks => retained.queued_output_chunks = owner,
+                RetainedOwnerKind::ManagedManifests => retained.managed_manifests = owner,
+                RetainedOwnerKind::ProcessCensus => retained.process_census = owner,
+            }
+        }
+
+        let json = serde_json::to_string(&retained).unwrap();
+        let decoded: ExecutorRetainedState = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, retained);
+        for ((kind, before), (_, after)) in retained.owners().into_iter().zip(decoded.owners()) {
+            assert_eq!(before, after, "{} did not survive the wire", kind.as_str());
+            assert!(
+                after.peak_entries >= after.entries,
+                "{}'s peak cannot be below its live reading",
+                kind.as_str()
+            );
+        }
+        assert!(!decoded.is_unreported());
+    }
+
+    /// An executor too old to publish retained state decodes as "not reported",
+    /// which is a different fact from "reported, and holding nothing". Rendering
+    /// the first as the second would tell an operator a leaking daemon was
+    /// clean.
+    #[test]
+    fn a_peer_that_omits_retained_state_decodes_as_unreported() {
+        // Built by deleting the new keys from this serializer's own output
+        // rather than by hand, so the fixture cannot drift away from the
+        // encoding it is meant to be an older version of.
+        let mut older_peer = serde_json::to_value(ProcessTelemetry {
+            resident_bytes: Measurement::measured(7, 9),
+            physical_footprint_bytes: Measurement::measured(7, 9),
+            ..ProcessTelemetry::default()
+        })
+        .unwrap();
+        let fields = older_peer.as_object_mut().unwrap();
+        assert!(fields.remove("virtualBytes").is_some());
+        assert!(fields.remove("retained").is_some());
+
+        let telemetry: ProcessTelemetry = serde_json::from_value(older_peer)
+            .expect("an older peer's process telemetry still decodes");
+        assert!(telemetry.retained.is_unreported());
+        assert_eq!(telemetry.retained.total_estimated_bytes(), 0);
+        // And the reading it never took is a named gap, not a zero.
+        assert_eq!(telemetry.virtual_bytes.value(), None);
+    }
+
     fn fully_populated_health_snapshot() -> SubstrateHealthSnapshot {
         let reservation = ResourceReservation {
             memory_bytes: 32,
@@ -6952,6 +7319,17 @@ mod tests {
                     43,
                     MeasurementGap::UnsupportedPlatform,
                 ),
+                virtual_bytes: Measurement::measured(43, 4_096),
+                retained: ExecutorRetainedState {
+                    measured_at_unix_ms: 43,
+                    cells: RetainedOwner {
+                        entries: 2,
+                        estimated_bytes: 512,
+                        peak_entries: 9,
+                        peak_estimated_bytes: 4_096,
+                    },
+                    ..ExecutorRetainedState::default()
+                },
             },
         };
         let disk = DiskHealth {
@@ -7979,6 +8357,10 @@ mod tests {
                     MachineMeasurement::ProcessPhysicalFootprint,
                     MeasurementGap::NotSampled
                 ),
+                (
+                    MachineMeasurement::ProcessVirtual,
+                    MeasurementGap::NotSampled
+                ),
             ]
         );
         assert_eq!(report.machine.oldest_measured_age_ms(1_000), None);
@@ -8023,15 +8405,23 @@ mod tests {
                     1,
                     MeasurementGap::UnsupportedPlatform,
                 ),
+                virtual_bytes: Measurement::unavailable(1, MeasurementGap::UnsupportedPlatform),
+                retained: ExecutorRetainedState::default(),
             },
         };
         assert_eq!(
             windows_shaped.gaps(),
-            vec![(
-                MachineMeasurement::ProcessPhysicalFootprint,
-                MeasurementGap::UnsupportedPlatform
-            )],
-            "the gap is real and the panel still shows it"
+            vec![
+                (
+                    MachineMeasurement::ProcessPhysicalFootprint,
+                    MeasurementGap::UnsupportedPlatform
+                ),
+                (
+                    MachineMeasurement::ProcessVirtual,
+                    MeasurementGap::UnsupportedPlatform
+                )
+            ],
+            "the gaps are real and the panel still shows them"
         );
         assert_eq!(
             windows_shaped.placement_gaps(),
@@ -8046,6 +8436,7 @@ mod tests {
             MachineMeasurement::DiskAccounting,
             MachineMeasurement::ProcessResident,
             MachineMeasurement::ProcessPhysicalFootprint,
+            MachineMeasurement::ProcessVirtual,
         ] {
             assert!(
                 !diagnostic.is_placement_input(),
@@ -8104,6 +8495,10 @@ mod tests {
                 ),
                 (
                     MachineMeasurement::ProcessPhysicalFootprint,
+                    MeasurementGap::NotSampled
+                ),
+                (
+                    MachineMeasurement::ProcessVirtual,
                     MeasurementGap::NotSampled
                 ),
             ]

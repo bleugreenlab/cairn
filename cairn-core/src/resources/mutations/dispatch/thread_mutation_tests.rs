@@ -67,7 +67,7 @@ async fn seed_thread(orch: &Orchestrator) -> String {
         &orch.db.local,
         CreateThread {
             project_id: "p".into(),
-            name: "roadmap".into(),
+            name: Some("roadmap".into()),
             jurisdiction: None,
             definition: None,
             migrated_from_number: None,

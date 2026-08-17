@@ -41,6 +41,7 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "tierDefaults",
     "tiers",
     "backends",
+    "enabledProviders",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
     "channels",

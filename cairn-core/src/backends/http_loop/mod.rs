@@ -1,8 +1,8 @@
 //! Provider-agnostic in-process HTTP turn/tool loop.
 //!
-//! Cairn owns the turn/tool loop for HTTP chat-completions backends so models
-//! receive Cairn's direct read/write/run tools instead of a CLI's host tools.
-//! This module is the neutral driver: it spawns the owned turn loop, asks a
+//! Cairn owns the turn/tool loop for HTTP generation backends so models receive
+//! Cairn's direct read/write/run tools instead of a CLI's host tools. This
+//! module is the neutral driver: it spawns the owned turn loop, asks a
 //! [`WireAdapter`] to build the conversation and POST each generation, executes
 //! the returned tool calls, persists every transcript event, pushes a
 //! context-token snapshot to the frontend gauge, and finalizes the run (success,
@@ -12,18 +12,34 @@
 //! reader, transcript↔message mapping, context trimming, the api key, and the
 //! backend identity — and converts its wire types to the neutral
 //! [`Generation`]/[`TurnToolCall`]/[`TurnUsage`] at its boundary, so no wire DTO
-//! ever reaches this loop. OpenRouter is the first and today the ONLY adapter
-//! (`backends/openrouter/adapter.rs`); the seam is structural readiness, not a
-//! second implementation.
+//! ever reaches this loop.
+//!
+//! Three HTTP protocol families sit behind this seam as siblings, each owning
+//! its own DTOs, SSE reader, and transcript replay:
+//!
+//! - `backends/openai_compat` — OpenAI-compatible `chat/completions`
+//! - `backends/anthropic_messages` — Anthropic-style `messages`
+//! - `backends/openai_responses` — OpenAI `responses`
+//!
+//! They converge ONLY here. There is deliberately no universal wire-message
+//! enum: an Anthropic content block and a Responses output item are not two
+//! spellings of a chat message, and flattening them into one would push every
+//! protocol's exceptions into every other protocol's parser. What they do share
+//! is [`cairn_tool_definitions`] (so the three describe identical tools) and
+//! Cairn's persisted transcript, which is the neutral history each family
+//! replays into its own legal wire ordering.
 
 mod persist;
 pub(in crate::backends) mod repair;
+mod tool_defs;
 mod tools;
+pub(in crate::backends) mod transcript;
 
 #[cfg(test)]
 mod tests;
 
 pub(in crate::backends) use persist::AssistantStreamState;
+pub(in crate::backends) use tool_defs::cairn_tool_definitions;
 pub(in crate::backends) use tools::render_tool_result;
 
 use persist::{
@@ -58,6 +74,54 @@ use std::sync::{Arc, Mutex};
 // exceed dozens of read/write/run round-trips, so the cap is set high and the
 // turn finalizes gracefully on reaching it rather than crashing the run.
 const MAX_TOOL_ITERATIONS: usize = 200;
+
+/// Rough chars-per-token ratio for the outgoing-trim heuristic. English and code
+/// average ~3.5–4 characters per token; 4 deliberately under-counts token
+/// volume, with the slack absorbed by trimming to a fraction of the window
+/// ([`context_fit_budget`]) rather than to its exact edge.
+///
+/// Neutral on purpose: how many characters make a token is a property of
+/// tokenizers, not of whether the request is shaped as chat messages, Anthropic
+/// content blocks, or Responses items. All three families share this policy so
+/// they cannot drift into trimming to different budgets.
+pub(in crate::backends) const CHARS_PER_TOKEN: i64 = 4;
+
+/// The most recent messages whose tool outputs are never collapsed, so the model
+/// keeps full fidelity on the exchange it is actively reasoning about.
+pub(in crate::backends) const PROTECT_RECENT_MESSAGES: usize = 8;
+
+/// Trim the outgoing request down to this fraction of the model's real context
+/// window. The remaining headroom covers the response (including reasoning
+/// tokens) plus slack for the approximate char-per-token estimate.
+const CONTEXT_FIT_FRACTION: f64 = 0.75;
+
+/// The token budget an outgoing request is trimmed to fit under.
+pub(crate) fn context_fit_budget(context_window: i64) -> i64 {
+    ((context_window as f64) * CONTEXT_FIT_FRACTION) as i64
+}
+
+/// The sentence a provider wrote inside a JSON error body.
+///
+/// Every family here nests the message the same way — `{"error": {"message":
+/// ...}}`, with or without a sibling `type` — so a refusal reaches the transcript
+/// as the explanation the provider gave ("No payment method", "Model X is not
+/// supported") instead of a wall of JSON the reader has to decode. Anything that
+/// is not JSON, or that carries no message, passes through untouched: an
+/// unrecognized body is still evidence, and dropping it would leave the failure
+/// unexplained.
+pub(crate) fn upstream_error_detail(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|parsed| {
+            let error = parsed.get("error").unwrap_or(&parsed);
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| body.to_string())
+}
 
 /// A model-emitted tool call, neutralized from the adapter's wire type: the
 /// dispatch id, the (already tool-name-normalized) verb, and the raw JSON
@@ -96,6 +160,97 @@ pub(in crate::backends) struct TurnUsage {
 }
 
 impl TurnUsage {
+    /// Map an Anthropic Messages `usage` object onto the neutral shape.
+    ///
+    /// Anthropic reports DISJOINT input components: `input_tokens` counts only
+    /// the uncached prompt, with cache reads and cache writes alongside it. The
+    /// neutral shape is OpenAI's, where `prompt_tokens` is the WHOLE prompt and
+    /// `prompt_tokens_details.cached_tokens` names the cached subset of it. So
+    /// the components are summed here rather than passed through: without this,
+    /// a 128-token cache read against a 40-token prompt would render as negative
+    /// input in the context dial (`prompt_tokens - cached_tokens`) and under-
+    /// report occupancy by the entire cached prefix.
+    pub(in crate::backends) fn from_anthropic(
+        input_tokens: Option<i32>,
+        output_tokens: Option<i32>,
+        cache_read: Option<i32>,
+        cache_creation: Option<i32>,
+        cost: Option<f64>,
+    ) -> Self {
+        let prompt_tokens = input_tokens.map(|input| {
+            input
+                .saturating_add(cache_read.unwrap_or(0))
+                .saturating_add(cache_creation.unwrap_or(0))
+        });
+        // Preserve both cache figures: `cached_tokens` is the key the neutral
+        // `token_counts` and the frontend rollup read, and the creation count is
+        // kept beside it so nothing observed is silently dropped.
+        let prompt_tokens_details = (cache_read.is_some() || cache_creation.is_some()).then(|| {
+            let mut details = serde_json::Map::new();
+            if let Some(cache_read) = cache_read {
+                details.insert("cached_tokens".to_string(), Value::from(cache_read));
+            }
+            if let Some(cache_creation) = cache_creation {
+                details.insert(
+                    "cache_creation_input_tokens".to_string(),
+                    Value::from(cache_creation),
+                );
+            }
+            Value::Object(details)
+        });
+        Self {
+            prompt_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: match (prompt_tokens, output_tokens) {
+                (None, None) => None,
+                (prompt, completion) => {
+                    Some(prompt.unwrap_or(0).saturating_add(completion.unwrap_or(0)))
+                }
+            },
+            reasoning_tokens: None,
+            prompt_tokens_details,
+            completion_tokens_details: None,
+            cost,
+            cost_details: None,
+        }
+    }
+
+    /// Map an OpenAI Responses `usage` object onto the neutral shape.
+    ///
+    /// Responses already counts the way the neutral shape does — `input_tokens`
+    /// is the whole prompt and `input_tokens_details.cached_tokens` its cached
+    /// subset — so the components pass through rather than being recombined. The
+    /// detail objects are carried verbatim, which is what preserves
+    /// `output_tokens_details.reasoning_tokens` for the context dial.
+    pub(in crate::backends) fn from_responses(
+        input_tokens: Option<i32>,
+        output_tokens: Option<i32>,
+        total_tokens: Option<i32>,
+        input_tokens_details: Option<Value>,
+        output_tokens_details: Option<Value>,
+        cost: Option<f64>,
+    ) -> Self {
+        let reasoning_tokens = output_tokens_details.as_ref().and_then(|details| {
+            details
+                .get("reasoning_tokens")
+                .and_then(Value::as_i64)
+                .map(|tokens| tokens as i32)
+        });
+        Self {
+            prompt_tokens: input_tokens,
+            completion_tokens: output_tokens,
+            total_tokens: total_tokens.or_else(|| match (input_tokens, output_tokens) {
+                (None, None) => None,
+                (input, output) => Some(input.unwrap_or(0).saturating_add(output.unwrap_or(0))),
+            }),
+            reasoning_tokens,
+            prompt_tokens_details: input_tokens_details,
+            completion_tokens_details: output_tokens_details,
+            cost,
+            cost_details: None,
+        }
+    }
+
     fn token_counts(&self) -> TokenCounts {
         let cache_read = self.prompt_tokens_details.as_ref().and_then(|v| {
             v.get("cached_tokens")

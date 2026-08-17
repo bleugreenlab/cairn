@@ -38,6 +38,10 @@ pub struct MrContext {
     /// inferred from a missing `github_pr_number` (which a remote PR also lacks
     /// during the window between opening it and GitHub returning its number).
     pub(crate) is_local: bool,
+    /// Scope for the `db-change` a mutation of this row emits, so a PR refresh
+    /// invalidates one project's PR queries rather than every mounted one.
+    pub(crate) project_id: Option<String>,
+    pub(crate) issue_id: Option<String>,
 }
 
 /// `MrContext` plus the issue/branch/project fields a merge needs.
@@ -73,7 +77,7 @@ pub async fn query_mr_context_for_job(
 ) -> DbResult<Option<MrContext>> {
     let mut rows = conn
         .query(
-            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
+            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local, mr.project_id, mr.issue_id
              FROM merge_requests mr
              JOIN projects p ON mr.project_id = p.id
              WHERE mr.job_id = ?1
@@ -92,6 +96,8 @@ pub async fn query_mr_context_for_job(
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
+                project_id: row.opt_text(6)?,
+                issue_id: row.opt_text(7)?,
             })
         })
         .transpose()
@@ -164,7 +170,7 @@ async fn query_pr_node_mr_context_for_artifact_job(
     for target_node_id in pr_target_nodes {
         let mut rows = conn
             .query(
-                "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
+                "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local, mr.project_id, mr.issue_id
                  FROM action_runs ar
                  JOIN merge_requests mr ON mr.job_id = ar.parent_job_id OR mr.job_id = ar.id
                  JOIN projects p ON mr.project_id = p.id
@@ -184,6 +190,8 @@ async fn query_pr_node_mr_context_for_artifact_job(
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
+                project_id: row.opt_text(6)?,
+                issue_id: row.opt_text(7)?,
             }));
         }
     }
@@ -202,7 +210,7 @@ async fn query_mr_context_for_action_run_parent(
 ) -> DbResult<Option<MrContext>> {
     let mut rows = conn
         .query(
-            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local
+            "SELECT mr.id, mr.github_pr_url, mr.github_pr_number, p.repo_path, mr.job_id, mr.is_local, mr.project_id, mr.issue_id
              FROM action_runs ar
              JOIN merge_requests mr ON mr.job_id = ar.parent_job_id
              JOIN projects p ON mr.project_id = p.id
@@ -222,6 +230,8 @@ async fn query_mr_context_for_action_run_parent(
                 repo_path: row.text(3)?,
                 job_id: row.text(4)?,
                 is_local: row.opt_i64(5)?.unwrap_or(0) != 0,
+                project_id: row.opt_text(6)?,
+                issue_id: row.opt_text(7)?,
             })
         })
         .transpose()

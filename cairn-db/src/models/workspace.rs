@@ -277,6 +277,17 @@ pub struct Settings {
     pub tier_defaults: HashMap<String, String>,
     pub tiers: Vec<String>,
     pub backends: HashMap<String, HashMap<String, Preset>>,
+    /// The providers this workspace has installed, in catalog order.
+    ///
+    /// Distinct from *supported* (what Cairn ships), *configured* (a credential
+    /// exists), and *runnable* (it can serve a request now). Only these get
+    /// tabs, model discovery, picker presence, warnings, and routing
+    /// participation; an enabled provider stays present while unauthenticated
+    /// or unhealthy. `backends` deliberately keeps presets for providers that
+    /// are not enabled, so removing one and adding it back does not lose the
+    /// workspace's tier assignments.
+    #[serde(default)]
+    pub enabled_providers: Vec<String>,
 
     pub system_prompt: String,
     pub max_thinking_tokens: Option<i32>,
@@ -349,6 +360,10 @@ pub struct UpdateSettings {
     pub tier_defaults: Option<HashMap<String, String>>,
     pub tiers: Option<Vec<String>>,
     pub backends: Option<HashMap<String, HashMap<String, Preset>>>,
+    /// Replace the installed-provider set (adding or removing providers).
+    /// Rejected when it would leave a tier default or call routing pointing at
+    /// a provider the workspace no longer has.
+    pub enabled_providers: Option<Vec<String>>,
 
     /// Deprecated - system_prompt is no longer used
     #[allow(dead_code)]

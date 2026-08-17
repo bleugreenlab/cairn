@@ -1,6 +1,7 @@
 use super::review_push::{
     bounded_rearm_candidates, finish_superseded_turn_end_checks, rearm_one_bounded_failed_review,
-    release_cooled_infrastructure_suppression, spawn_turn_end_checks,
+    release_cooled_infrastructure_suppression, spawn_turn_end_checks, BOUNDED_REARM_CANDIDATES_SQL,
+    DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
 };
 use super::{
     create_review_push_for_pr_open, evaluate_review_readiness, record_bounded_rearm_lookup_failure,
@@ -371,6 +372,170 @@ async fn bounded_rearm_selects_retryable_review_work() {
         vec!["j-later"],
         "a completed memory-review head must not starve later dormant PR recovery"
     );
+}
+
+/// The bounded re-arm sweep re-reads its candidate set every 30 seconds, so what
+/// that read costs has to follow the number of CANDIDATES. It used to follow the
+/// check HISTORY: the statement drove off `check_result_cache`, and on a
+/// production runner with ~34k cached results it spent 17 seconds of every
+/// 30-second tick -- one full core, permanently -- to return single digits
+/// (CAIRN-4196).
+///
+/// The plan is what pins this, because the regression is invisible to every
+/// cheaper seam: the old shape was also one statement, in one read transaction,
+/// returning exactly these rows. Only its plan said that finding a handful of
+/// dormant reviews meant walking every check ever recorded.
+#[tokio::test]
+async fn bounded_rearm_candidates_never_walk_the_check_history() {
+    let db = test_db().await;
+    let plan = query_plan(&db, BOUNDED_REARM_CANDIDATES_SQL).await;
+
+    assert!(
+        !plan.contains("SCAN check_result_cache"),
+        "the sweep reaches the cache one live job at a time; a plan that scans \
+         it is the history walk coming back:\n{plan}"
+    );
+    assert!(
+        plan.contains("SEARCH c USING INDEX idx_check_result_cache_job"),
+        "the driving set is `live_job`, and each of its jobs seeks its own cache \
+         rows through idx_check_result_cache_job (migration 0093):\n{plan}"
+    );
+    let cache_reads = plan
+        .lines()
+        .filter(|step| step.contains("check_result_cache"))
+        .count();
+    assert_eq!(
+        cache_reads, 1,
+        "the cache is read exactly ONCE and ranked; a second access is the \
+         newest-row anti-join coming back, which pays for a job's whole history \
+         once per row of it:\n{plan}"
+    );
+    assert!(
+        plan.contains("SEARCH j USING INDEX idx_jobs_issue_id"),
+        "`live_job` is driven by the unresolved ISSUES and reaches their jobs by \
+         index; driving it from `jobs` walks every job ever run:\n{plan}"
+    );
+}
+
+/// Narrowing to live work does NOT exclude a long-lived unresolved issue's own
+/// history, and `check_result_cache` keeps a row per input hash per check
+/// forever, so one busy job accumulates without bound. That is the case where an
+/// anti-join would have stayed quadratic after the live-work drive: 400 rows
+/// here would have meant re-reading them once per row.
+///
+/// What this test holds is the RESULT at that scale -- only the current row of
+/// each check survives, none of the 396 behind them. The cost shape is held by
+/// the single-read assertion in the plan test above; a runtime bound would only
+/// have been a flake.
+#[tokio::test]
+async fn superseded_history_on_a_live_job_yields_only_its_newest_rows() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_artifact(&db, "create-pr", 1).await;
+
+    let mut script = String::new();
+    for generation in 1..=100 {
+        for check in 0..4 {
+            let ran_at = generation * 1000 + check;
+            script.push_str(&format!(
+                "INSERT INTO check_result_cache
+                   (project_id, tree_hash, input_hash, check_name, exit_code, passed,
+                    output_tail, duration_ms, ran_at, job_id, failure_kind,
+                    infra_failure_streak)
+                 VALUES('p-rev','tree','h{ran_at}','c{check}',-1,0,'failed',0,{ran_at},
+                        'j-prod','infrastructure',0);"
+            ));
+        }
+    }
+    db.execute_script(&script).await.unwrap();
+    let orch = test_orchestrator(db);
+
+    let candidates = bounded_rearm_candidates(&orch.db).await.unwrap();
+    let ran_at: Vec<i64> = candidates.iter().map(|row| row.ran_at).collect();
+    assert_eq!(
+        ran_at,
+        vec![100_000, 100_001, 100_002, 100_003],
+        "one candidate per check name -- its newest row -- and nothing from the \
+         superseded generations behind them"
+    );
+}
+
+/// Each pair removes exactly one reason the seeded job is a candidate, then puts
+/// it back. The issue-status arm is the one CAIRN-4196 MOVED -- it became the
+/// driving CTE rather than an outer predicate -- so what it excludes is the part
+/// of that change a plan assertion cannot speak to.
+const REARM_ARM_MUTATIONS: [(&str, &str, &str); 3] = [
+    (
+        "UPDATE issues SET status='merged' WHERE id='i-rev'",
+        "UPDATE issues SET status='active' WHERE id='i-rev'",
+        "a resolved issue is not live work, and live work is the driving set",
+    ),
+    (
+        "UPDATE check_result_cache SET failure_kind='timed_out'",
+        "UPDATE check_result_cache SET failure_kind='infrastructure'",
+        "only capacity and infrastructure failures are substrate faults",
+    ),
+    (
+        "UPDATE artifacts SET artifact_type='plan'",
+        "UPDATE artifacts SET artifact_type='create-pr'",
+        "without a create-pr artifact or an open PR there is no review to re-arm",
+    ),
+];
+
+#[tokio::test]
+async fn bounded_rearm_candidate_arms_survive_the_live_job_drive() {
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    insert_artifact(&db, "create-pr", 1).await;
+    insert_failed_check(&db, "infrastructure", 0).await;
+    let orch = test_orchestrator(db);
+
+    let baseline = bounded_rearm_candidates(&orch.db).await.unwrap();
+    assert_eq!(
+        baseline.first().map(|candidate| candidate.job_id.as_str()),
+        Some("j-prod"),
+        "the seeded job satisfies every arm of the candidate statement"
+    );
+
+    for (suppress, restore, why) in REARM_ARM_MUTATIONS {
+        orch.db.local.execute(suppress, ()).await.unwrap();
+        let suppressed = bounded_rearm_candidates(&orch.db).await.unwrap();
+        assert!(suppressed.is_empty(), "{why}");
+        orch.db.local.execute(restore, ()).await.unwrap();
+    }
+
+    let restored = bounded_rearm_candidates(&orch.db).await.unwrap();
+    assert_eq!(
+        restored.first().map(|candidate| candidate.job_id.as_str()),
+        Some("j-prod"),
+        "every arm was restored, so the job is a candidate again"
+    );
+}
+
+async fn query_plan(db: &LocalDb, sql: &str) -> String {
+    let sql = format!("EXPLAIN QUERY PLAN {sql}");
+    db.read(move |conn| {
+        let sql = sql.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    &sql,
+                    (
+                        crate::execution::cache::OBSERVED_INFRA_FAILURE_BOUND,
+                        DORMANT_INFRA_RETRY_COOLDOWN_SECONDS,
+                    ),
+                )
+                .await?;
+            let mut plan = String::new();
+            while let Some(row) = rows.next().await? {
+                plan.push_str(&row.text(3)?);
+                plan.push('\n');
+            }
+            Ok::<_, crate::storage::DbError>(plan)
+        })
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]

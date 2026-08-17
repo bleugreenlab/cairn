@@ -4,18 +4,13 @@
 
 use super::wire::{default_function_type, ChatMessage, ToolCall, ToolFunction};
 use crate::agent_process::stream::TranscriptEvent;
+use crate::backends::http_loop::transcript::{
+    load_prior_rows, stored_reasoning_details, ReplayRow, EMPTY_TOOL_RESULT,
+    INTERRUPTED_TOOL_RESULT,
+};
 use crate::backends::{SessionConfig, SessionStart};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{run_db_blocking, RowExt};
-use serde_json::Value;
 use std::collections::HashMap;
-
-const INTERRUPTED_TOOL_RESULT: &str = "Interrupted before the tool result was recorded.";
-
-/// Stands in for a tool result that was stored empty. A blank content block is
-/// rejectable, and a dropped tool message would orphan its call, so the empty
-/// result is stated rather than sent or removed.
-const EMPTY_TOOL_RESULT: &str = "The tool returned no output.";
 
 /// Why a wholly empty turn is refused instead of assembled.
 const EMPTY_USER_MESSAGE: &str = "Refusing to start a turn with an empty user message: an empty text block is rejected by the provider and would poison every later replay of this conversation.";
@@ -53,71 +48,16 @@ fn load_prior_chat_messages(
     project_id: &str,
     project_key: &str,
 ) -> Result<Vec<ChatMessage>, String> {
-    let session_id = session_id.to_string();
-    let current_run_id = current_run_id.to_string();
-    let project_id = project_id.to_string();
-    let project_key = project_key.to_string();
-    let messages = run_db_blocking(|| async move {
-        let session_db = crate::projects::crud::owning_db(&orch.db, &project_id).await?;
-        let rows = session_db
-            .query_all(
-                // `user:launch` carries the task the job was started on. It is
-                // bound as a parameter rather than written into the IN list so
-                // the replay set cannot drift from the constant (CAIRN-3408):
-                // dropping it here would rebuild a conversation whose opening
-                // instruction is missing, and every turn after the first would
-                // continue without ever having been told what to do.
-                "SELECT event_type, data FROM events
-                 WHERE session_id = ?1
-                   AND run_id != ?2
-                   AND (event_type IN ('user', 'assistant', 'tool_result')
-                        OR event_type = ?3)
-                 ORDER BY created_at ASC, rowid ASC",
-                (
-                    session_id.clone(),
-                    current_run_id.clone(),
-                    crate::transcripts::LAUNCH_EVENT_TYPE,
-                ),
-                |row| Ok((row.text(0)?, row.text(1)?)),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut out = Vec::new();
-        for (event_type, data) in rows {
-            let Ok(event) = serde_json::from_str::<TranscriptEvent>(&data) else {
-                continue;
-            };
-            // Blank stored content is dropped rather than replayed: an empty
-            // text block is rejected by the provider, and replaying one turns a
-            // single bad turn into a conversation that can never resume
-            // (CAIRN-3263).
-            // A launch prompt reaches the provider in the same user role it
-            // originally occupied. Namespacing it changed who Cairn says wrote
-            // it, not what the model was told (CAIRN-3408).
-            let message =
-                if event_type == "user" || event_type == crate::transcripts::LAUNCH_EVENT_TYPE {
-                    match event.content.filter(|text| !text.trim().is_empty()) {
-                        Some(content) => {
-                            let content = crate::agent_process::stdin::resolve_stable_images(
-                                &orch.db,
-                                &project_id,
-                                &project_key,
-                                content,
-                            )
-                            .await?;
-                            Some(ChatMessage::user_content(&content))
-                        }
-                        None => None,
-                    }
-                } else {
-                    transcript_event_to_chat_message(&event_type, event)
-                };
-            if let Some(message) = message {
-                out.push(message);
+    let rows = load_prior_rows(orch, session_id, current_run_id, project_id, project_key)?;
+    let messages = rows
+        .into_iter()
+        .filter_map(|row| match row {
+            ReplayRow::User(content) => Some(ChatMessage::user_content(&content)),
+            ReplayRow::Event { event_type, event } => {
+                transcript_event_to_chat_message(&event_type, *event)
             }
-        }
-        Ok::<_, String>(out)
-    })?;
+        })
+        .collect();
     Ok(normalize_tool_call_groups(messages))
 }
 
@@ -199,21 +139,8 @@ pub(crate) fn transcript_event_to_chat_message(
                     })
                     .collect::<Vec<_>>()
             });
-            // Replay structured reasoning verbatim and in original order; stored
-            // under either casing depending on which writer persisted the event.
-            let reasoning_details = event
-                .raw
-                .as_ref()
-                .and_then(|raw| {
-                    raw.get("reasoning_details")
-                        .or_else(|| raw.get("reasoningDetails"))
-                })
-                // Writers store `null` (no reasoning) or `[]`; treat both as absent
-                // so a non-reasoning tool-call turn does not replay `reasoning_details: null`.
-                .filter(|value| {
-                    !value.is_null() && !matches!(value, Value::Array(items) if items.is_empty())
-                })
-                .cloned();
+            // Replay structured reasoning verbatim and in original order.
+            let reasoning_details = stored_reasoning_details(&event);
             // A turn whose text came back blank replays as its tool calls
             // alone, and as nothing at all when it has none.
             let content = event.content.filter(|text| !text.trim().is_empty());

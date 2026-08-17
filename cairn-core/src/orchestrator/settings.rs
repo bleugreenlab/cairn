@@ -12,6 +12,52 @@ impl Orchestrator {
         settings::load_settings(&self.config_dir)
     }
 
+    /// The providers this workspace has installed, in catalog order.
+    ///
+    /// Every prospective surface — model discovery, the responses catalog,
+    /// picker presence — asks here rather than asking which providers Cairn
+    /// supports. Reading *persisted* data (a job's model, a session's backend)
+    /// asks `backends::catalog::is_supported` instead, so disabling a provider
+    /// changes what can be chosen next without making history unreadable.
+    pub fn enabled_providers(&self) -> Vec<String> {
+        self.get_settings().enabled_providers
+    }
+
+    /// Whether this workspace has installed `backend`.
+    pub fn provider_enabled(&self, backend: &str) -> bool {
+        self.enabled_providers().iter().any(|key| key == backend)
+    }
+
+    /// Record which providers this workspace has installed, if it has not
+    /// answered that question yet.
+    ///
+    /// Runs at startup, where the identity store is loaded and can say which
+    /// backends the workspace's accounts serve — evidence `settings.yaml`
+    /// cannot see on its own. Idempotent: once the answer is on disk, this
+    /// never revisits it.
+    pub fn migrate_enabled_providers(&self) -> Result<Option<Vec<String>>, String> {
+        let credentialed: Vec<String> = self
+            .get_identity_store()
+            .map(|store| {
+                store
+                    .accounts
+                    .iter()
+                    .flat_map(|account| account.compatible_backends())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let migrated = settings::migrate_enabled_providers(&self.config_dir, &credentialed)?;
+        if let Some(enabled) = &migrated {
+            log::info!("Recorded installed providers for this workspace: {enabled:?}");
+            let _ = self.services.emitter.emit(
+                "config-changed",
+                serde_json::json!({"entity_type": "settings"}),
+            );
+        }
+        Ok(migrated)
+    }
+
     /// The OS-sandbox read denylist for executor cells: the configured
     /// `sandboxDenyRead` (or the narrow built-in default of external secret
     /// stores), plus the desktop operator credential.

@@ -3,7 +3,7 @@
 
 use crate::db::DbState;
 use crate::orchestrator::Orchestrator;
-use crate::services::testing::{MockGitClient, TestServicesBuilder};
+use crate::services::testing::{CapturingEmitter, MockGitClient, TestServicesBuilder};
 use crate::storage::{LocalDb, SearchIndex};
 use cairn_db::turso::params;
 use std::sync::Arc;
@@ -12,7 +12,30 @@ pub(super) async fn migrated_db() -> LocalDb {
     crate::storage::migrated_test_db("reconcile-test.db").await
 }
 
+/// The service builder takes an emitter by value; the test also needs to read
+/// what was emitted, so it keeps a handle and hands the builder this shim.
+struct SharedEmitter(Arc<CapturingEmitter>);
+
+impl crate::services::EventEmitter for SharedEmitter {
+    fn emit(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+        self.0.emit(event, payload)
+    }
+
+    fn emit_empty(&self, event: &str) -> Result<(), String> {
+        self.0.emit_empty(event)
+    }
+}
+
 pub(super) fn test_orchestrator(db: LocalDb, git: MockGitClient) -> Orchestrator {
+    test_orchestrator_with_emitter(db, git).0
+}
+
+/// A test orchestrator beside the emitter its notifications land in, for the
+/// assertions that care about how many `db-change` events a path produces.
+pub(super) fn test_orchestrator_with_emitter(
+    db: LocalDb,
+    git: MockGitClient,
+) -> (Orchestrator, Arc<CapturingEmitter>) {
     let temp = tempfile::tempdir().unwrap();
     let config_dir = temp.keep();
     let index_path = config_dir.join("search-index.db");
@@ -20,8 +43,17 @@ pub(super) fn test_orchestrator(db: LocalDb, git: MockGitClient) -> Orchestrator
         Arc::new(db),
         Arc::new(SearchIndex::open_or_create(index_path).unwrap()),
     ));
-    let services = Arc::new(TestServicesBuilder::new().with_git(git).build());
-    Orchestrator::builder(db_state, services, config_dir).build()
+    let emitter = Arc::new(CapturingEmitter::new());
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_git(git)
+            .with_emitter(SharedEmitter(emitter.clone()))
+            .build(),
+    );
+    (
+        Orchestrator::builder(db_state, services, config_dir).build(),
+        emitter,
+    )
 }
 
 /// Seed a project + issue + a `merge_requests` row owned by `owner_id` whose

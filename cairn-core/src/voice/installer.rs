@@ -6,27 +6,122 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 const MAX_ENGINE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 1024;
+/// Shortest gap between two progress events for one download.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
+/// One download's observable life. `operation_id` is minted per download and
+/// repeated on every event of that download: the UI latches the id it sees start
+/// while its own request is in flight, so an id that outlived one download (the
+/// component name, say) would let a later background install steer a bar that
+/// belongs to something else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallEvent {
     Started {
+        operation_id: String,
         component: String,
         total_bytes: Option<u64>,
     },
     Progress {
+        operation_id: String,
         component: String,
         downloaded_bytes: u64,
         total_bytes: Option<u64>,
     },
     Finished {
+        operation_id: String,
         component: String,
     },
+}
+
+/// Whether a download that has reached `downloaded` bytes should report again.
+///
+/// Chunk granularity is a firehose — a 547 MiB model arrives in tens of
+/// thousands of chunks, and every event crosses a WebSocket to the webview to
+/// move a progress bar a fraction of a pixel. A slow download still reports on
+/// the time step so the bar never looks stalled; a fast one reports on whole
+/// percent steps of a known total.
+fn should_report(
+    downloaded: u64,
+    last_reported: u64,
+    total_bytes: Option<u64>,
+    since_last_report: Duration,
+) -> bool {
+    since_last_report >= PROGRESS_INTERVAL
+        || total_bytes.is_some_and(|total| {
+            total >= 100 && downloaded.saturating_sub(last_reported) >= total / 100
+        })
+}
+
+/// Emits one download's throttled event stream to the installer's sink.
+struct DownloadReporter<'a> {
+    events: &'a EventSink,
+    operation_id: String,
+    component: String,
+    total_bytes: Option<u64>,
+    reported_at: Instant,
+    reported_bytes: u64,
+}
+
+impl<'a> DownloadReporter<'a> {
+    fn started(events: &'a EventSink, component: &str, total_bytes: Option<u64>) -> Self {
+        let operation_id = Uuid::new_v4().to_string();
+        events(InstallEvent::Started {
+            operation_id: operation_id.clone(),
+            component: component.to_owned(),
+            total_bytes,
+        });
+        Self {
+            events,
+            operation_id,
+            component: component.to_owned(),
+            total_bytes,
+            reported_at: Instant::now(),
+            reported_bytes: 0,
+        }
+    }
+
+    fn advanced(&mut self, downloaded: u64) {
+        if !should_report(
+            downloaded,
+            self.reported_bytes,
+            self.total_bytes,
+            self.reported_at.elapsed(),
+        ) {
+            return;
+        }
+        self.report(downloaded);
+    }
+
+    /// Reports the final byte count before finishing, so a bar that was last
+    /// drawn mid-step lands on complete rather than jumping from 99%.
+    fn finished(&mut self, downloaded: u64) {
+        if self.reported_bytes != downloaded {
+            self.report(downloaded);
+        }
+        (self.events)(InstallEvent::Finished {
+            operation_id: self.operation_id.clone(),
+            component: self.component.clone(),
+        });
+    }
+
+    fn report(&mut self, downloaded: u64) {
+        (self.events)(InstallEvent::Progress {
+            operation_id: self.operation_id.clone(),
+            component: self.component.clone(),
+            downloaded_bytes: downloaded,
+            total_bytes: self.total_bytes,
+        });
+        self.reported_at = Instant::now();
+        self.reported_bytes = downloaded;
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -233,10 +328,7 @@ impl ComponentInstaller {
                 "download Content-Length does not match catalog".into(),
             ));
         }
-        (self.events)(InstallEvent::Started {
-            component: kind.into(),
-            total_bytes: total.or(exact_size),
-        });
+        let mut reporter = DownloadReporter::started(&self.events, kind, total.or(exact_size));
         let mut file = tokio::fs::File::create(&partial)
             .await
             .map_err(|error| VoiceError::Install(error.to_string()))?;
@@ -257,11 +349,7 @@ impl ComponentInstaller {
             file.write_all(&chunk)
                 .await
                 .map_err(|error| VoiceError::Install(error.to_string()))?;
-            (self.events)(InstallEvent::Progress {
-                component: kind.into(),
-                downloaded_bytes: downloaded,
-                total_bytes: total.or(exact_size),
-            });
+            reporter.advanced(downloaded);
         }
         file.flush()
             .await
@@ -282,9 +370,7 @@ impl ComponentInstaller {
         tokio::fs::rename(&partial, destination)
             .await
             .map_err(|error| VoiceError::Install(format!("atomic publication failed: {error}")))?;
-        (self.events)(InstallEvent::Finished {
-            component: kind.into(),
-        });
+        reporter.finished(downloaded);
         Ok(ManagedComponent {
             kind: kind.into(),
             id: destination
@@ -467,6 +553,97 @@ mod tests {
         );
         assert!(parse_checksum(format!("{digest} engine\n").as_bytes(), "engine").is_err());
         assert!(parse_checksum(format!("{digest}  other\n").as_bytes(), "engine").is_err());
+    }
+
+    fn recording_sink() -> (EventSink, Arc<std::sync::Mutex<Vec<InstallEvent>>>) {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = recorded.clone();
+        let events: EventSink = Arc::new(move |event| sink.lock().unwrap().push(event));
+        (events, recorded)
+    }
+
+    fn operation_id(event: &InstallEvent) -> &str {
+        match event {
+            InstallEvent::Started { operation_id, .. }
+            | InstallEvent::Progress { operation_id, .. }
+            | InstallEvent::Finished { operation_id, .. } => operation_id,
+        }
+    }
+
+    /// Streams `chunks` equal parts of `total` through one reporter, the way the
+    /// download loop feeds it running byte counts.
+    fn stream_download(events: &EventSink, total: u64, chunks: u64) {
+        let mut reporter = DownloadReporter::started(events, "model:fast", Some(total));
+        let mut downloaded = 0;
+        for _ in 0..chunks {
+            downloaded += total / chunks;
+            reporter.advanced(downloaded);
+        }
+        reporter.finished(total);
+    }
+
+    #[test]
+    fn progress_reports_on_a_whole_percent_or_the_time_step() {
+        let total = Some(100_000);
+        assert!(!should_report(999, 0, total, Duration::ZERO));
+        assert!(should_report(1_000, 0, total, Duration::ZERO));
+        assert!(should_report(1, 0, total, PROGRESS_INTERVAL));
+        // A total the server never declared leaves only the time step.
+        assert!(!should_report(9_000_000, 0, None, Duration::ZERO));
+        assert!(should_report(1, 0, None, PROGRESS_INTERVAL));
+    }
+
+    /// The webview latches whichever operation starts while its own request is
+    /// in flight, so one download's events must share one id and a later
+    /// download must not reuse it.
+    #[test]
+    fn one_download_carries_one_fresh_operation_id_from_start_to_finish() {
+        let (events, recorded) = recording_sink();
+        stream_download(&events, 1_000_000, 500);
+        let first = recorded.lock().unwrap().clone();
+        recorded.lock().unwrap().clear();
+        stream_download(&events, 1_000_000, 500);
+        let second = recorded.lock().unwrap().clone();
+
+        let id = operation_id(&first[0]).to_owned();
+        assert!(matches!(first[0], InstallEvent::Started { .. }));
+        assert!(first.iter().all(|event| operation_id(event) == id));
+        assert!(matches!(
+            first.last().expect("a download finishes"),
+            InstallEvent::Finished { .. }
+        ));
+        assert_ne!(
+            operation_id(&second[0]),
+            id,
+            "a second download is its own operation"
+        );
+    }
+
+    /// A 547 MiB model arrives in tens of thousands of chunks; reporting each one
+    /// would put that many WebSocket frames behind the bar it draws. The final
+    /// count still has to be exact, or the bar stalls short of complete.
+    #[test]
+    fn a_large_download_reports_percent_steps_rather_than_chunks() {
+        let total = 547 * 1024 * 1024;
+        let (events, recorded) = recording_sink();
+        stream_download(&events, total, 60_000);
+        let recorded = recorded.lock().unwrap();
+
+        let progress: Vec<_> = recorded
+            .iter()
+            .filter_map(|event| match event {
+                InstallEvent::Progress {
+                    downloaded_bytes, ..
+                } => Some(*downloaded_bytes),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            (100..=400).contains(&progress.len()),
+            "expected roughly one report per percent, got {}",
+            progress.len()
+        );
+        assert_eq!(progress.last(), Some(&total));
     }
 
     #[test]

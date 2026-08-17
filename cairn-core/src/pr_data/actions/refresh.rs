@@ -3,6 +3,7 @@
 
 use crate::execution::teardown::{cleanup_issue_jobs, TeardownReason, TeardownScope};
 use crate::github::api;
+use crate::github::api::PrFile;
 use crate::github::credentials::get_owner_repo;
 use crate::models::{Check, CheckState, MergeableState, PrCache, PrState};
 use crate::orchestrator::Orchestrator;
@@ -18,8 +19,11 @@ use crate::security::broker::github::installation_authority;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use super::conflict::{conflict_recovery_hint, format_conflicted_commits, source_conflict_report};
+use super::conflict::{
+    conflict_recovery_hint, format_conflicted_commits, source_conflict_report, SourceConflictReport,
+};
 use super::context::{
     db_error, load_mr_branches, load_mr_issue_id, resolve_mr_context_for_job,
     try_resolve_mr_context_for_job, MrContext, PrNodeResolution,
@@ -79,6 +83,88 @@ fn published_mergeable(
     }
 }
 
+/// The persisted PR projection a refresh can move.
+///
+/// Comparing this before writing is what makes an unchanged refresh silent. The
+/// `merge_requests` row also carries `github_fetched_at`/`updated_at`, and
+/// writing only those is a timestamp-only refresh: it changes no fact anyone
+/// renders, but it still emits a `db-change` that invalidates every mounted PR
+/// query, which re-enters this path. That loop is the self-excitation, so a
+/// no-op refresh must not write and must not emit.
+#[derive(Debug, PartialEq, Eq)]
+struct PersistedProjection {
+    title: Option<String>,
+    body: Option<String>,
+    additions: Option<i32>,
+    deletions: Option<i32>,
+    checks_status: Option<String>,
+    checks_json: Option<String>,
+    github_state: Option<String>,
+    github_review: Option<String>,
+    github_mergeable: Option<String>,
+    /// A row that has never been fetched must be written even when every other
+    /// field matches, because `fetched_at == 0` is itself what the desktop reads
+    /// as "this cache has never been populated" and re-fetches on.
+    fetched: bool,
+}
+
+/// The persisted projection plus the timestamp of the fetch that produced it.
+/// The timestamp is deliberately outside the compared struct: it moves on every
+/// refresh and comparing it would make every refresh look like a change.
+async fn load_persisted_projection(
+    db: &LocalDb,
+    mr_id: &str,
+) -> Option<(PersistedProjection, i64)> {
+    let mr_id = mr_id.to_string();
+    db.read(|conn| {
+        let mr_id = mr_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT title, body, additions, deletions, checks_status, checks_json,
+                            github_state, github_review, github_mergeable, github_fetched_at
+                       FROM merge_requests WHERE id = ?1 LIMIT 1",
+                    params![mr_id.as_str()],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let fetched_at = row.opt_i64(9)?.unwrap_or_default();
+            Ok(Some((
+                PersistedProjection {
+                    title: row.opt_text(0)?,
+                    body: row.opt_text(1)?,
+                    additions: row.opt_i64(2)?.map(|v| v as i32),
+                    deletions: row.opt_i64(3)?.map(|v| v as i32),
+                    checks_status: row.opt_text(4)?,
+                    checks_json: row.opt_text(5)?,
+                    github_state: row.opt_text(6)?,
+                    github_review: row.opt_text(7)?,
+                    github_mergeable: row.opt_text(8)?,
+                    fetched: fetched_at > 0,
+                },
+                fetched_at,
+            )))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// What one persist attempt did: whether the row moved, and the fetch timestamp
+/// the projection should now carry (the new one on a write, the stored one when
+/// nothing moved).
+struct CacheWrite {
+    changed: bool,
+    fetched_at: i64,
+}
+
+/// Persist a freshly fetched projection, returning whether anything moved.
+///
+/// `false` means the row already said exactly this, so no write happened and the
+/// caller must not emit.
 async fn update_merge_request_github_cache(
     db: &LocalDb,
     mr_id: &str,
@@ -86,7 +172,36 @@ async fn update_merge_request_github_cache(
     checks: &[Check],
     checks_status: &Option<crate::models::ChecksStatus>,
     now: i64,
-) -> Result<(), String> {
+) -> Result<CacheWrite, String> {
+    let incoming = PersistedProjection {
+        title: Some(
+            pr_details
+                .title
+                .clone()
+                .unwrap_or_else(|| "Untitled".to_string()),
+        ),
+        body: pr_details.body.clone(),
+        additions: pr_details.additions,
+        deletions: pr_details.deletions,
+        checks_status: checks_status.as_ref().map(|status| status.to_string()),
+        checks_json: Some(serde_json::to_string(checks).unwrap_or_default()),
+        github_state: Some(pr_details.state.to_string()),
+        github_review: pr_details
+            .review_decision
+            .as_ref()
+            .map(|decision| decision.to_string()),
+        github_mergeable: Some(pr_details.mergeable.to_string()),
+        fetched: true,
+    };
+    if let Some((persisted, fetched_at)) = load_persisted_projection(db, mr_id).await {
+        if persisted == incoming {
+            return Ok(CacheWrite {
+                changed: false,
+                fetched_at,
+            });
+        }
+    }
+
     let mr_id = mr_id.to_string();
     let title = pr_details.title.clone();
     let body = pr_details.body.clone();
@@ -137,7 +252,32 @@ async fn update_merge_request_github_cache(
         })
     })
     .await
-    .map_err(|e| db_error("Failed to update merge request", e))
+    .map_err(|e| db_error("Failed to update merge request", e))?;
+    Ok(CacheWrite {
+        changed: true,
+        fetched_at: now,
+    })
+}
+
+/// The `db-change` a `merge_requests` mutation emits, carrying the scope every
+/// consumer needs to decide whether it is affected.
+///
+/// An unscoped emit forces the frontend to invalidate the whole PR family, and
+/// the whole project's status rollups with it, for a change to one row. Scope is
+/// available at every mutation boundary here, so there is no reason to make
+/// every reader recompute.
+fn emit_merge_request_change(orch: &Orchestrator, mr_context: &MrContext, action: &str) {
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({
+            "table": "merge_requests",
+            "action": action,
+            "mergeRequestId": mr_context.mr_id,
+            "jobId": mr_context.job_id,
+            "projectId": mr_context.project_id,
+            "issueId": mr_context.issue_id,
+        }),
+    );
 }
 
 /// The commit the branch store holds for `branch`, or `None` when the store
@@ -196,10 +336,10 @@ fn head_divergence(
 async fn bind_discovered_pr(
     orch: &Orchestrator,
     db: &LocalDb,
-    mr_id: &str,
+    mr_context: &MrContext,
     discovered: &DiscoveredPr,
 ) -> Result<(), String> {
-    let mr_id = mr_id.to_string();
+    let mr_id = mr_context.mr_id.to_string();
     let url = discovered.url.clone();
     let state = discovered.state.clone();
     let number = i64::from(discovered.number);
@@ -221,10 +361,7 @@ async fn bind_discovered_pr(
     })
     .await
     .map_err(|e| db_error("Failed to bind the discovered pull request", e))?;
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
-    );
+    emit_merge_request_change(orch, mr_context, "update");
     Ok(())
 }
 
@@ -233,19 +370,24 @@ async fn bind_discovered_pr(
 async fn adopt_discovered_binding(
     orch: &Orchestrator,
     db: &LocalDb,
-    mr_id: &str,
+    mr_context: &MrContext,
     publication: Option<&Publication>,
 ) -> Option<(i32, String)> {
     let Some(Publication::Bound(discovered)) = publication else {
         return None;
     };
-    match bind_discovered_pr(orch, db, mr_id, discovered).await {
+    let mr_id = &mr_context.mr_id;
+    match bind_discovered_pr(orch, db, mr_context, discovered).await {
         Ok(()) => {
             log::info!(
                 "Re-bound merge request {mr_id} to pull request #{} ({}) found by head branch",
                 discovered.number,
                 discovered.url
             );
+            // The row's binding is what every downstream projection is keyed on,
+            // so the snapshot computed under the old (unbound) generation must
+            // not be published for the now-bound change.
+            orch.invalidate_pr_refresh(&mr_context.job_id, "pull-request-bound");
             Some((discovered.number, discovered.url.clone()))
         }
         Err(error) => {
@@ -255,7 +397,142 @@ async fn adopt_discovered_binding(
     }
 }
 
-pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrCache, String> {
+/// The publication facts an unbound change renders, carried on the snapshot so
+/// the renderer states them instead of re-probing for them.
+pub(crate) struct UnboundFacts {
+    /// What one probe of the world established, or `None` for a change that is
+    /// already merged or closed and has nothing left to publish.
+    pub(crate) publication: Option<Publication>,
+    pub(crate) source_branch: String,
+    /// Why the most recent attempt to open a pull request failed, when it did.
+    pub(crate) failure: Option<String>,
+}
+
+/// The complete PR projection every surface renders, materialized once per
+/// generation.
+///
+/// One structure for all of it is the point. Before this, the desktop's refresh
+/// and the `/pr` artifact each fetched GitHub state and ran their own `jj`
+/// probes to answer the same questions, so two readers of one pull request paid
+/// for it twice and could disagree about the answer.
+pub(crate) struct PrSnapshot {
+    pub(crate) cache: PrCache,
+    /// Present only for a change with no pull request bound to it.
+    pub(crate) unbound: Option<UnboundFacts>,
+    pub(crate) branches: Option<(String, String)>,
+    pub(crate) divergence: Option<HeadDivergence>,
+    pub(crate) conflict: Option<SourceConflictReport>,
+    pub(crate) files: Vec<PrFile>,
+    /// When this snapshot stops describing the live world on its own, or `None`
+    /// for a settled change that only an exact invalidation can move.
+    expires_at: Option<i64>,
+}
+
+/// A change whose remote signals are still resolving — GitHub computes
+/// mergeability asynchronously, and a check run in flight has no verdict yet —
+/// is genuinely live, so it re-reads on a short window.
+const UNRESOLVED_FRESHNESS_SECS: i64 = 15;
+/// An open change whose signals HAVE resolved rides a long window. Every real
+/// transition (a push, a review, a check completing, a merge) advances the
+/// generation exactly, so this window is a backstop for a workspace with no
+/// webhook delivery, not the mechanism liveness depends on.
+const RESOLVED_FRESHNESS_SECS: i64 = 300;
+
+impl PrSnapshot {
+    /// A merged or closed change is settled: no further remote fact about it can
+    /// change without a transition that invalidates this snapshot outright.
+    fn expiry(cache: &PrCache, now: i64) -> Option<i64> {
+        match cache.state {
+            PrState::Merged | PrState::Closed => None,
+            PrState::Open | PrState::Unpublished => {
+                let unresolved = matches!(cache.mergeable, MergeableState::Unknown)
+                    || matches!(
+                        cache.checks_status,
+                        Some(crate::models::ChecksStatus::Pending)
+                    );
+                Some(
+                    now + if unresolved {
+                        UNRESOLVED_FRESHNESS_SECS
+                    } else {
+                        RESOLVED_FRESHNESS_SECS
+                    },
+                )
+            }
+        }
+    }
+
+    fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
+}
+
+/// The one place a PR projection is produced.
+///
+/// Every surface — the desktop panel, the `/pr` artifact, the invoke command —
+/// reads through here, so concurrent readers of one pull request share exactly
+/// one GitHub fetch and one bounded set of `jj` probes, and a read of unchanged
+/// state performs neither.
+///
+/// `live` is explicit operator refresh: it advances the generation once and then
+/// joins the single flight that advance created, so a burst of refresh presses
+/// still costs one refresh.
+pub(crate) async fn pr_snapshot_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+    live: bool,
+) -> Result<Arc<PrSnapshot>, String> {
+    let cache = &orch.pr_refresh_cache;
+    if live {
+        // Replace what is published, or join the refresh already in flight — a
+        // burst of refresh presses is one refresh. Invalidating unconditionally
+        // would advance once per caller, and every advance rejects the readers
+        // already computing, running the GitHub fetch and `jj` probes N times.
+        cache.invalidate_published(job_id, "explicit-refresh");
+    } else {
+        // Every mounted reader observes the same expired snapshot at the moment
+        // a freshness window elapses, so the decision to advance has to be made
+        // under the same lock as the advance itself.
+        let now = chrono::Utc::now().timestamp();
+        cache.invalidate_stale(job_id, "freshness-window-elapsed", |snapshot| {
+            snapshot.is_expired(now)
+        });
+    }
+
+    // A computation that fails is not a fact about the pull request, so it is
+    // never published. Its error still has to reach the caller that ran it; a
+    // reader that merely joined someone else's failed flight gets the generic
+    // message, because the specific one belongs to the reader that produced it.
+    let failure: Mutex<Option<String>> = Mutex::new(None);
+    let snapshot = cache
+        .get_or_compute(job_id, || async {
+            match compute_pr_snapshot(orch, job_id).await {
+                Ok(snapshot) => Some(Arc::new(snapshot)),
+                Err(error) => {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(error);
+                    }
+                    None
+                }
+            }
+        })
+        .await;
+
+    match snapshot {
+        Some(snapshot) => Ok(snapshot),
+        None => Err(failure
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| "Failed to refresh the pull request".to_string())),
+    }
+}
+
+/// The canonical, uncached PR computation: fetch remote PR and check state,
+/// probe local head divergence and source conflicts, persist the projection.
+///
+/// Nothing calls this directly — it runs inside the coordinator's single flight,
+/// so "one refresh" is enforced here rather than trusted at each call site.
+async fn compute_pr_snapshot(orch: &Orchestrator, job_id: &str) -> Result<PrSnapshot, String> {
     // Route to the database that owns this job — the team replica for a team
     // execution, the private DB for a local one. The `merge_requests` row and its
     // producing job live wholly in that database; reading `orch.db.local` for a
@@ -277,12 +554,34 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
             // or one whose binding a failed open never recorded — which is what
             // turns a stranded artifact back into a usable one.
             let unbound = refresh_unbound_pr_for_job(orch, &db, job_id, &mr_context).await?;
-            match adopt_discovered_binding(orch, &db, &mr_id, unbound.publication.as_ref()).await {
+            match adopt_discovered_binding(orch, &db, &mr_context, unbound.publication.as_ref())
+                .await
+            {
                 Some((number, url)) => {
                     pr_url = url;
                     number
                 }
-                None => return Ok(unbound.cache),
+                None => {
+                    let now = chrono::Utc::now().timestamp();
+                    let branches = unbound
+                        .cache
+                        .source_branch
+                        .clone()
+                        .zip(unbound.cache.target_branch.clone());
+                    return Ok(PrSnapshot {
+                        expires_at: PrSnapshot::expiry(&unbound.cache, now),
+                        branches,
+                        cache: unbound.cache,
+                        unbound: Some(UnboundFacts {
+                            publication: unbound.publication,
+                            source_branch: unbound.source_branch,
+                            failure: unbound.failure,
+                        }),
+                        divergence: None,
+                        conflict: None,
+                        files: Vec::new(),
+                    });
+                }
             }
         }
     };
@@ -292,37 +591,64 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
 
     let http = &*orch.services.http;
     let mut pr_details = fetch_pr_via_api(http, &auth, &owner, &repo, pr_number).await?;
-    if let Some((source_branch, target_branch)) = load_mr_branches(&db, &mr_id).await.ok().flatten()
-    {
-        // A green signal on a head the branch has moved past is a verdict on a
-        // tree nobody validated; the artifact renders which commit each side
-        // holds. Both this and the conflict probe feed one decision, so the two
-        // cannot overwrite each other — see `published_mergeable`.
-        let divergence = matches!(pr_details.state, PrState::Open)
-            .then(|| head_divergence(orch, &repo_path, &source_branch, &pr_details.head_sha))
-            .flatten();
-        if let Some(divergence) = divergence.as_ref() {
-            log::warn!(
-                "Pull request #{pr_number} describes {} while `{source_branch}` holds {}; its \
-                 mergeability and checks are not verdicts on the current change",
-                divergence.pr_head,
-                divergence.branch_head
-            );
-        }
+    let branches = load_mr_branches(&db, &mr_id).await.ok().flatten();
+    // A green signal on a head the branch has moved past is a verdict on a tree
+    // nobody validated; both surfaces render which commit each side holds. This
+    // and the conflict probe feed one decision, so the two cannot overwrite each
+    // other — see `published_mergeable`.
+    let divergence = branches
+        .as_ref()
+        .filter(|_| matches!(pr_details.state, PrState::Open))
+        .and_then(|(source_branch, _)| {
+            head_divergence(orch, &repo_path, source_branch, &pr_details.head_sha)
+        });
+    if let (Some(divergence), Some((source_branch, _))) = (divergence.as_ref(), branches.as_ref()) {
+        log::warn!(
+            "Pull request #{pr_number} describes {} while `{source_branch}` holds {}; its \
+             mergeability and checks are not verdicts on the current change",
+            divergence.pr_head,
+            divergence.branch_head
+        );
+    }
+    let conflict = branches
+        .as_ref()
+        .and_then(|(source_branch, target_branch)| {
+            source_conflict_report(
+                &orch.jj_binary_path,
+                &orch.config_dir,
+                &repo_path,
+                source_branch,
+                Some(target_branch),
+            )
+        });
+    if branches.is_some() {
         pr_details.mergeable = published_mergeable(
             pr_details.mergeable.clone(),
             divergence.is_some(),
-            source_tip_is_conflicted(orch, &repo_path, &source_branch, &target_branch),
+            conflict
+                .as_ref()
+                .is_some_and(|report| report.tip_conflicted),
         );
     }
     let checks = fetch_checks_via_api(http, &auth, &owner, &repo, &pr_details.head_sha)
         .await
         .unwrap_or_default();
     let checks_status = compute_checks_status(&checks);
+    // Files ride on the same snapshot as everything else the artifact renders, so
+    // the `/pr` read no longer needs a fetch path of its own.
+    let files = api::fetch_pr_files(http, &auth, &owner, &repo, pr_number)
+        .await
+        .unwrap_or_default();
 
     let now = chrono::Utc::now().timestamp();
+    let write =
+        update_merge_request_github_cache(&db, &mr_id, &pr_details, &checks, &checks_status, now)
+            .await?;
+    if write.changed {
+        emit_merge_request_change(orch, &mr_context, "update");
+    }
 
-    let pr_cache_result = PrCache {
+    let cache = PrCache {
         id: mr_id.clone(),
         job_id: None,
         pr_number: Some(pr_number),
@@ -337,22 +663,36 @@ pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrC
         deletions: pr_details.deletions,
         checks_status: checks_status.clone(),
         checks: checks.clone(),
-        fetched_at: now,
-        updated_at: now,
+        fetched_at: write.fetched_at,
+        updated_at: write.fetched_at,
         is_local: mr_context.is_local,
-        source_branch: None,
-        target_branch: None,
+        source_branch: branches.as_ref().map(|(source, _)| source.clone()),
+        target_branch: branches.as_ref().map(|(_, target)| target.clone()),
     };
 
-    update_merge_request_github_cache(&db, &mr_id, &pr_details, &checks, &checks_status, now)
-        .await?;
+    Ok(PrSnapshot {
+        expires_at: PrSnapshot::expiry(&cache, now),
+        cache,
+        unbound: None,
+        branches,
+        divergence,
+        conflict,
+        files,
+    })
+}
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
-    );
+/// The PR projection for a job, served from the generation-fenced snapshot.
+pub async fn refresh_pr_for_job(orch: &Orchestrator, job_id: &str) -> Result<PrCache, String> {
+    Ok(pr_snapshot_for_job(orch, job_id, false)
+        .await?
+        .cache
+        .clone())
+}
 
-    Ok(pr_cache_result)
+/// Explicit operator refresh: advance the generation once, then join the single
+/// flight that advance created.
+pub async fn refresh_pr_for_job_live(orch: &Orchestrator, job_id: &str) -> Result<PrCache, String> {
+    Ok(pr_snapshot_for_job(orch, job_id, true).await?.cache.clone())
 }
 
 /// The publication facts behind an artifact with no pull request bound to it,
@@ -557,34 +897,44 @@ async fn refresh_unbound_pr_for_job(
     let mergeable = measured.mergeable;
     let now = chrono::Utc::now().timestamp();
     let mergeable_str = mergeable.to_string();
-    db.write(|conn| {
-        let mr_id = mr_id.clone();
-        let mergeable_str = mergeable_str.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE merge_requests
+    // Same no-op rule as the bound path: an unbound refresh that re-derives the
+    // values already on the row must not write and must not emit, or a mounted
+    // `/pr` surface re-enters this probe (and its `jj` fan-out) on its own event.
+    let unchanged = load_persisted_projection(db, &mr_id)
+        .await
+        .is_some_and(|(persisted, _)| {
+            persisted.fetched
+                && persisted.github_mergeable.as_deref() == Some(mergeable_str.as_str())
+                && persisted.additions == additions
+                && persisted.deletions == deletions
+        });
+    if !unchanged {
+        db.write(|conn| {
+            let mr_id = mr_id.clone();
+            let mergeable_str = mergeable_str.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE merge_requests
                      SET github_mergeable = ?1, github_fetched_at = ?2, updated_at = ?2,
                          additions = ?3, deletions = ?4
                      WHERE id = ?5",
-                params![
-                    mergeable_str.as_str(),
-                    now,
-                    additions,
-                    deletions,
-                    mr_id.as_str()
-                ],
-            )
-            .await?;
-            Ok(())
+                    params![
+                        mergeable_str.as_str(),
+                        now,
+                        additions,
+                        deletions,
+                        mr_id.as_str()
+                    ],
+                )
+                .await?;
+                Ok(())
+            })
         })
-    })
-    .await
-    .map_err(|e| db_error("Failed to update local PR cache", e))?;
+        .await
+        .map_err(|e| db_error("Failed to update local PR cache", e))?;
 
-    let _ = orch.services.emitter.emit(
-        "db-change",
-        serde_json::json!({"table": "merge_requests", "action": "update"}),
-    );
+        emit_merge_request_change(orch, mr_context, "update");
+    }
 
     let publication = probe.map(|probe| probe.publication);
     let state = match status.as_str() {
@@ -689,8 +1039,7 @@ pub async fn close_pr_for_job(
 /// failed — what the failure said. It renders no pull-request number, and no
 /// mergeability verdict or change counts unless the change measured is the
 /// change the world can see.
-fn render_unbound_section(unbound: &UnboundPr, artifact_uri: &str) -> String {
-    let cache = &unbound.cache;
+fn render_unbound_section(cache: &PrCache, unbound: &UnboundFacts, artifact_uri: &str) -> String {
     let local_only = matches!(unbound.publication, Some(Publication::LocalOnly));
     let mut out = if local_only {
         String::from("## Local PR\n\n")
@@ -758,10 +1107,12 @@ fn check_icon(state: &CheckState) -> &'static str {
 /// a `merge_requests` row. Returns `None` when the job has no PR, so non-PR
 /// artifacts (e.g. `plan`) are unaffected.
 ///
-/// Fetching live data refreshes the cached row as a side effect
-/// (refresh-on-read). When the PR is open, an `## actions` block advertising
-/// merge/close/refresh is appended. `artifact_uri` is the `/pr` URI used in the
-/// action examples; `diff_full` inlines the full patch text per file.
+/// The section renders the generation-fenced snapshot: one reader materializes
+/// the GitHub state and the `jj` probes behind it, and every other reader of the
+/// same unchanged pull request — including this one — gets it for free. When the
+/// PR is open, an `## actions` block advertising merge/close/refresh is appended.
+/// `artifact_uri` is the `/pr` URI used in the action examples; `diff_full`
+/// inlines the full patch text per file.
 pub async fn render_live_pr_section(
     orch: &Orchestrator,
     job_id: &str,
@@ -770,7 +1121,9 @@ pub async fn render_live_pr_section(
 ) -> Option<String> {
     // Route to the owning database (team replica or private DB). A team node's
     // `merge_requests` row lives in its replica; a closed replica yields no PR
-    // section rather than a wrong read against the private DB.
+    // section rather than a wrong read against the private DB. This resolve is a
+    // single indexed row read and answers "is there a PR here at all", which has
+    // to be decided before entering the coordinator.
     let db = match crate::execution::routing::routing_db_for_id(&orch.db, job_id).await {
         Ok(db) => db,
         Err(_) => return None,
@@ -780,117 +1133,38 @@ pub async fn render_live_pr_section(
         Ok(None) => return None,
         Err(e) => return Some(format!("## Pull Request\n\n(failed to resolve PR: {e})\n")),
     };
-    let (pr_number, pr_url) = match mr_context.github_pr_number {
-        Some(number) => (number, mr_context.pr_url.clone()),
-        None => {
-            let unbound = match refresh_unbound_pr_for_job(orch, &db, job_id, &mr_context).await {
-                Ok(unbound) => unbound,
-                Err(e) => return Some(format!("## Pull Request\n\n(failed to refresh: {e})\n")),
-            };
-            match adopt_discovered_binding(
-                orch,
-                &db,
-                &mr_context.mr_id,
-                unbound.publication.as_ref(),
-            )
-            .await
-            {
-                Some(bound) => bound,
-                None => return Some(render_unbound_section(&unbound, artifact_uri)),
-            }
-        }
-    };
-    let header = format!("## Pull Request\n\nPR #{}: {}\n", pr_number, pr_url);
 
-    let (owner, repo) = match get_owner_repo(&mr_context.repo_path) {
-        Ok(v) => v,
-        Err(e) => return Some(format!("{header}\n(failed to resolve repo: {e})\n")),
+    let snapshot = match pr_snapshot_for_job(orch, job_id, false).await {
+        Ok(snapshot) => snapshot,
+        Err(e) => return Some(format!("## Pull Request\n\n(failed to refresh: {e})\n")),
     };
-    let auth = match installation_authority(&orch.db.local, &owner).await {
-        Ok(c) => c,
-        Err(e) => return Some(format!("{header}\n(failed to resolve credentials: {e})\n")),
-    };
-
-    let http = &*orch.services.http;
-    let mut pr_details = match fetch_pr_via_api(http, &auth, &owner, &repo, pr_number).await {
-        Ok(d) => d,
-        Err(e) => return Some(format!("{header}\n(failed to fetch live PR: {e})\n")),
-    };
-    // Same jj conflict gate as the cache refresh: a jj-conflicted source bookmark
-    // is rendered (and re-cached) as Conflicting, not GitHub's false mergeable.
-    // Keep the full report to enumerate the offending commits/files below so the
-    // live artifact and the node summary tell one consistent story.
-    let source_branches = load_mr_branches(&db, &mr_context.mr_id)
-        .await
-        .ok()
-        .flatten();
-    // Does this pull request describe the branch as it now stands? Everything
-    // GitHub reports below — mergeability, checks, the diffstat — is a verdict on
-    // the head the PR holds, so a lagging head makes every one of them a verdict
-    // on a version nobody reviewed.
-    let divergence = source_branches
-        .as_ref()
-        .filter(|_| matches!(pr_details.state, PrState::Open))
-        .and_then(|(src, _)| {
-            head_divergence(orch, &mr_context.repo_path, src, &pr_details.head_sha)
-        });
-    let source_conflict = source_branches.as_ref().and_then(|(src, tgt)| {
-        source_conflict_report(
-            &orch.jj_binary_path,
-            &orch.config_dir,
-            &mr_context.repo_path,
-            src,
-            Some(tgt),
-        )
-    });
-    // One decision from both probes, in the same precedence the cache refresh
-    // uses, so the rendered verdict and the cached one cannot disagree.
-    pr_details.mergeable = published_mergeable(
-        pr_details.mergeable.clone(),
-        divergence.is_some(),
-        source_conflict.as_ref().is_some_and(|r| r.tip_conflicted),
-    );
-    let checks = fetch_checks_via_api(http, &auth, &owner, &repo, &pr_details.head_sha)
-        .await
-        .unwrap_or_default();
-    let checks_status = compute_checks_status(&checks);
-    let files = api::fetch_pr_files(http, &auth, &owner, &repo, pr_number)
-        .await
-        .unwrap_or_default();
-
-    // Refresh-on-read: persist freshly fetched details to the cache.
-    let now = chrono::Utc::now().timestamp();
-    if let Err(e) = update_merge_request_github_cache(
-        &db,
-        &mr_context.mr_id,
-        &pr_details,
-        &checks,
-        &checks_status,
-        now,
-    )
-    .await
-    {
-        log::warn!("Failed to refresh PR cache on read: {}", e);
-    } else {
-        let _ = orch.services.emitter.emit(
-            "db-change",
-            serde_json::json!({"table": "merge_requests", "action": "update"}),
-        );
+    let cache = &snapshot.cache;
+    if let Some(unbound) = snapshot.unbound.as_ref() {
+        return Some(render_unbound_section(cache, unbound, artifact_uri));
     }
+    let pr_number = cache.pr_number.unwrap_or_default();
+    let header = format!("## Pull Request\n\nPR #{}: {}\n", pr_number, cache.pr_url);
+
+    let source_branches = snapshot.branches.clone();
+    let divergence = snapshot.divergence.as_ref();
+    let source_conflict = snapshot.conflict.as_ref();
+    let checks = &cache.checks;
+    let checks_status = &cache.checks_status;
+    let files = &snapshot.files;
 
     let mut out = header;
     out.push_str(&format!(
         "State: {}{}\n",
-        pr_details.state,
-        if pr_details.is_draft { " (draft)" } else { "" }
+        cache.state,
+        if cache.is_draft { " (draft)" } else { "" }
     ));
-    let expected_action = match pr_details.state {
+    let expected_action = match cache.state {
         PrState::Merged => Some("merge"),
         PrState::Closed => Some("close"),
         _ => None,
     };
     let mut attribution = super::latest_resolution_attribution(&db, &mr_context.mr_id).await;
-    if matches!(pr_details.state, PrState::Merged)
+    if matches!(cache.state, PrState::Merged)
         && attribution
             .as_ref()
             .is_none_or(|event| event.action != "merge")
@@ -927,14 +1201,14 @@ pub async fn render_live_pr_section(
         };
         out.push_str(&format!("{verb} by {actor} at {}\n\n<details><summary>Resolution provenance</summary>\n\nSurface: `{}`\n\nLane snapshot: `{}`\n\n</details>\n", chrono::DateTime::from_timestamp(attribution.created_at, 0).map(|v| v.to_rfc3339()).unwrap_or_else(|| attribution.created_at.to_string()), attribution.surface, attribution.lane_snapshot));
     }
-    if let Some(review) = &pr_details.review_decision {
+    if let Some(review) = &cache.review_decision {
         out.push_str(&format!("Review: {}\n", review));
     }
-    out.push_str(&format!("Mergeable: {}\n", pr_details.mergeable));
-    if let Some(status) = &checks_status {
+    out.push_str(&format!("Mergeable: {}\n", cache.mergeable));
+    if let Some(status) = checks_status {
         out.push_str(&format!("Checks: {}\n", status));
     }
-    if let (Some(divergence), Some((src, _))) = (&divergence, &source_branches) {
+    if let (Some(divergence), Some((src, _))) = (divergence, &source_branches) {
         out.push('\n');
         out.push_str(&divergence.note(src));
         out.push('\n');
@@ -944,17 +1218,17 @@ pub async fn render_live_pr_section(
         // number can't read as a clean, mergeable change.
         out.push_str(&format!(
             "Changes: +{} -{} (stale — branch tip carries conflicts; resolve before trusting)\n",
-            pr_details.additions.unwrap_or(0),
-            pr_details.deletions.unwrap_or(0)
+            cache.additions.unwrap_or(0),
+            cache.deletions.unwrap_or(0)
         ));
     } else {
         out.push_str(&format!(
             "Changes: +{} -{}\n",
-            pr_details.additions.unwrap_or(0),
-            pr_details.deletions.unwrap_or(0)
+            cache.additions.unwrap_or(0),
+            cache.deletions.unwrap_or(0)
         ));
     }
-    if let (Some(report), Some((src, tgt))) = (&source_conflict, &source_branches) {
+    if let (Some(report), Some((src, tgt))) = (source_conflict, &source_branches) {
         if report.tip_conflicted {
             out.push_str("\n⛔ Conflicted history — cannot merge:\n");
             out.push_str(&format_conflicted_commits(&report.commits));
@@ -972,7 +1246,7 @@ pub async fn render_live_pr_section(
         }
     }
 
-    if let Some(body) = pr_details.body.as_deref().filter(|b| !b.is_empty()) {
+    if let Some(body) = cache.body.as_deref().filter(|b| !b.is_empty()) {
         out.push_str("\n### Description\n\n");
         out.push_str(body);
         out.push('\n');
@@ -980,7 +1254,7 @@ pub async fn render_live_pr_section(
 
     if !checks.is_empty() {
         out.push_str("\n### Checks\n\n");
-        for c in &checks {
+        for c in checks {
             out.push_str(&format!("- [{}] {}\n", check_icon(&c.state), c.name));
         }
     }
@@ -995,7 +1269,7 @@ pub async fn render_live_pr_section(
 
     if !files.is_empty() {
         out.push_str("\n### Files\n\n");
-        for f in &files {
+        for f in files {
             out.push_str(&format!(
                 "- {} (+{} -{}) {}\n",
                 f.filename, f.additions, f.deletions, f.status
@@ -1005,7 +1279,7 @@ pub async fn render_live_pr_section(
 
     if diff_full {
         out.push_str("\n### Diff\n\n");
-        for f in &files {
+        for f in files {
             if let Some(patch) = f.patch.as_deref() {
                 out.push_str(&format!(
                     "#### {}\n\n```diff\n{}\n```\n\n",
@@ -1018,7 +1292,7 @@ pub async fn render_live_pr_section(
     }
 
     // Actions are valid only while the PR is open.
-    if matches!(pr_details.state, PrState::Open) {
+    if matches!(cache.state, PrState::Open) {
         out.push_str(&format!(
             "\n## actions\n- [merge]({uri}): patch with action:\"merge\" (optional method, default squash). e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"merge\",method:\"squash\"}}}}]}})\n- [close]({uri}): patch with action:\"close\". e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"close\"}}}}]}})\n- [refresh]({uri}): patch with action:\"refresh\" to re-fetch live PR state. e.g. write({{changes:[{{target:\"{uri}\",mode:\"patch\",payload:{{action:\"refresh\"}}}}]}})",
             uri = artifact_uri
@@ -1032,7 +1306,9 @@ pub async fn render_live_pr_section(
 mod tests {
     use super::*;
     use crate::models::PrState;
-    use crate::pr_data::actions::test_support::{migrated_db, test_orchestrator};
+    use crate::pr_data::actions::test_support::{
+        migrated_db, test_orchestrator, test_orchestrator_with_emitter,
+    };
     use crate::pr_data::publication::DiscoveredPr;
     use crate::services::testing::MockGitClient;
     use crate::services::GitOutput;
@@ -1283,10 +1559,14 @@ mod tests {
         let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
         seed_open_unbound_mr(&orch.db.local, "job-u", Some(0)).await;
 
+        let mr_context = try_resolve_mr_context_for_job(&orch.db.local, "job-u")
+            .await
+            .unwrap()
+            .expect("the row resolves");
         let bound = adopt_discovered_binding(
             &orch,
             &orch.db.local,
-            "mr-u",
+            &mr_context,
             Some(&Publication::Bound(DiscoveredPr {
                 number: 2797,
                 url: "https://github.com/octo/widget/pull/2797".to_string(),
@@ -1445,6 +1725,244 @@ mod tests {
         assert!(
             err.contains("fail-closed") || err.contains("replica"),
             "{err}"
+        );
+    }
+
+    /// A local-only open change: every read of it runs the branch-store probes
+    /// (`store_branch_commit` twice, the publication probe, the local diff) with
+    /// no GitHub involved, so it is the cleanest way to count what a repeat read
+    /// actually costs.
+    async fn seed_local_open_mr(db: &LocalDb, job_id: &str) {
+        let job_id = job_id.to_string();
+        db.write(|conn| {
+            let job_id = job_id.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+                     VALUES ('proj-c', 'default', 'P', 'projc', '/repo', 'main', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                     VALUES ('issue-c', 'proj-c', 1, 'Issue', 'active', 1, 1)",
+                    (),
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO merge_requests (id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, is_local)
+                     VALUES ('mr-c', ?1, 'proj-c', 'issue-c', 'A change', 'agent/proj-1-builder', 'main', 'open', 1, 1, 1)",
+                    params![job_id.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    fn merge_request_events(emitter: &crate::services::testing::CapturingEmitter) -> usize {
+        emitter
+            .events_named("db-change")
+            .into_iter()
+            .filter(|payload| {
+                payload.get("table").and_then(|t| t.as_str()) == Some("merge_requests")
+            })
+            .count()
+    }
+
+    /// The idle case the runner was burning cores on. Once one read has
+    /// materialized the projection, every repeat read of unchanged state does no
+    /// probe work at all — and, just as importantly, emits nothing, because an
+    /// emit is what sends every mounted PR query back around this loop.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_repeat_read_of_unchanged_state_probes_nothing_and_emits_nothing() {
+        let (orch, emitter) =
+            test_orchestrator_with_emitter(migrated_db().await, MockGitClient::new());
+        seed_local_open_mr(&orch.db.local, "job-c").await;
+
+        let first = refresh_pr_for_job(&orch, "job-c").await.unwrap();
+        assert_eq!(first.state, PrState::Open);
+        let after_first = merge_request_events(&emitter);
+
+        for _ in 0..8 {
+            let repeat = refresh_pr_for_job(&orch, "job-c").await.unwrap();
+            assert_eq!(repeat.state, first.state);
+            assert_eq!(repeat.mergeable, first.mergeable);
+        }
+
+        assert_eq!(
+            merge_request_events(&emitter),
+            after_first,
+            "a warm read must not emit a merge_requests change"
+        );
+        assert_eq!(
+            orch.pr_refresh_cache.counters().misses,
+            1,
+            "one computation served every read"
+        );
+        assert_eq!(orch.pr_refresh_cache.counters().hits, 8);
+    }
+
+    /// Sixteen readers arriving together — the desktop panel, the artifact, the
+    /// sidebar — share one computation rather than each running their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_reads_of_one_pull_request_compute_once() {
+        let orch =
+            std::sync::Arc::new(test_orchestrator(migrated_db().await, MockGitClient::new()));
+        seed_local_open_mr(&orch.db.local, "job-c").await;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let orch = orch.clone();
+            let barrier = barrier.clone();
+            readers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                refresh_pr_for_job(&orch, "job-c").await.unwrap().state
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), PrState::Open);
+        }
+
+        assert_eq!(
+            orch.pr_refresh_cache.counters().misses,
+            1,
+            "sixteen concurrent readers must produce one refresh"
+        );
+    }
+
+    /// An explicit operator refresh is the one caller that demands new state, and
+    /// it gets exactly one recomputation — not one per press of the button, and
+    /// not one per mounted surface.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_explicit_refresh_recomputes_once() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        seed_local_open_mr(&orch.db.local, "job-c").await;
+
+        refresh_pr_for_job(&orch, "job-c").await.unwrap();
+        assert_eq!(orch.pr_refresh_cache.counters().misses, 1);
+
+        refresh_pr_for_job_live(&orch, "job-c").await.unwrap();
+        assert_eq!(orch.pr_refresh_cache.counters().misses, 2);
+
+        refresh_pr_for_job(&orch, "job-c").await.unwrap();
+        assert_eq!(
+            orch.pr_refresh_cache.counters().misses,
+            2,
+            "the read after an explicit refresh is warm again"
+        );
+    }
+
+    /// A burst of refresh presses is still one refresh.
+    ///
+    /// Advancing the generation once per caller would be worse than not
+    /// coalescing at all: each advance rejects the readers already computing, so
+    /// N simultaneous demands would run the GitHub fetch and the `jj` probes N
+    /// times over.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_explicit_refreshes_compute_once() {
+        let orch =
+            std::sync::Arc::new(test_orchestrator(migrated_db().await, MockGitClient::new()));
+        seed_local_open_mr(&orch.db.local, "job-c").await;
+
+        // Warm it first, so the burst is a demand to replace a published value.
+        refresh_pr_for_job(&orch, "job-c").await.unwrap();
+        let warm = orch.pr_refresh_cache.counters().misses;
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        let mut readers = Vec::new();
+        for _ in 0..16 {
+            let orch = orch.clone();
+            let barrier = barrier.clone();
+            readers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                refresh_pr_for_job_live(&orch, "job-c").await.unwrap().state
+            }));
+        }
+        for reader in readers {
+            assert_eq!(reader.await.unwrap(), PrState::Open);
+        }
+
+        assert_eq!(
+            orch.pr_refresh_cache.counters().misses,
+            warm + 1,
+            "sixteen simultaneous refresh demands must produce one refresh"
+        );
+    }
+
+    /// One job's transition leaves every other job's projection warm. Without
+    /// this, a single PR moving would re-probe every open pull request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalidating_one_job_leaves_another_warm() {
+        let orch = test_orchestrator(migrated_db().await, MockGitClient::new());
+        seed_local_open_mr(&orch.db.local, "job-c").await;
+        seed_closed_local_mr(&orch.db.local, "job-r").await;
+
+        refresh_pr_for_job(&orch, "job-c").await.unwrap();
+        refresh_pr_for_job(&orch, "job-r").await.unwrap();
+        assert_eq!(orch.pr_refresh_cache.counters().misses, 2);
+
+        orch.invalidate_pr_refresh("job-c", "test");
+        refresh_pr_for_job(&orch, "job-r").await.unwrap();
+        assert_eq!(
+            orch.pr_refresh_cache.counters().misses,
+            2,
+            "the untouched job stayed warm"
+        );
+        refresh_pr_for_job(&orch, "job-c").await.unwrap();
+        assert_eq!(orch.pr_refresh_cache.counters().misses, 3);
+    }
+
+    /// A merged or closed change is settled: it has no freshness window, so it
+    /// stays warm until an exact invalidation rather than re-reading on a timer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resolved_change_settles_and_an_open_one_stays_live() {
+        let now = chrono::Utc::now().timestamp();
+        let settled = PrCache {
+            id: "mr".into(),
+            job_id: None,
+            pr_number: Some(1),
+            pr_url: String::new(),
+            title: None,
+            body: None,
+            state: PrState::Merged,
+            is_draft: false,
+            review_decision: None,
+            mergeable: MergeableState::Unknown,
+            additions: None,
+            deletions: None,
+            checks_status: None,
+            checks: Vec::new(),
+            fetched_at: now,
+            updated_at: now,
+            is_local: false,
+            source_branch: None,
+            target_branch: None,
+        };
+        assert_eq!(PrSnapshot::expiry(&settled, now), None);
+
+        let unresolved = PrCache {
+            state: PrState::Open,
+            ..settled.clone()
+        };
+        assert_eq!(
+            PrSnapshot::expiry(&unresolved, now),
+            Some(now + UNRESOLVED_FRESHNESS_SECS),
+            "a pull request GitHub has not finished judging stays live"
+        );
+
+        let resolved_open = PrCache {
+            state: PrState::Open,
+            mergeable: MergeableState::Mergeable,
+            checks_status: Some(crate::models::ChecksStatus::Success),
+            ..settled
+        };
+        assert_eq!(
+            PrSnapshot::expiry(&resolved_open, now),
+            Some(now + RESOLVED_FRESHNESS_SECS)
         );
     }
 

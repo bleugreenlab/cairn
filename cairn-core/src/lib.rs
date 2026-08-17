@@ -41,6 +41,9 @@ pub mod workflow_journal;
 pub mod workflow_progress;
 
 // ── Stable public operations ───────────────────────────
+/// The canonical catalog of providers Cairn ships — the inventory the settings
+/// surface installs from, and the answer to whether a backend key is supported.
+pub use backends::catalog as provider_catalog;
 pub use backends::SessionStart;
 
 pub mod condition;

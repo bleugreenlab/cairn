@@ -76,6 +76,12 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
 
     // --- Backends ---
     out.push_str("## Backends\n\n");
+    // Installed, not shipped: a provider absent here is one this workspace has
+    // not added, and it takes no part in discovery, pickers, or routing.
+    out.push_str(&format!(
+        "- enabledProviders: {}\n",
+        settings.enabled_providers.join(", ")
+    ));
     out.push_str(&format!("- tiers: {}\n", settings.tiers.join(", ")));
     out.push_str("- tierDefaults:\n");
     for tier in &settings.tiers {

@@ -68,28 +68,9 @@ pub(crate) fn post_chat_completion(
         .map_err(|error| CompletionError::InvalidResponse(error.to_string()))
 }
 
-/// The sentence a provider wrote inside a JSON error body.
-///
-/// Providers on this path nest the message the same way — `{"error":
-/// {"message": ...}}`, with or without a sibling `type` — so a refusal reaches
-/// the transcript as the explanation the provider gave ("No payment method",
-/// "only available hosted in China and requires explicit opt in") instead of a
-/// wall of JSON the reader has to decode. Anything that is not JSON, or that
-/// carries no message, passes through untouched: an unrecognized body is still
-/// evidence, and dropping it would leave the failure unexplained.
-pub(crate) fn upstream_error_detail(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|parsed| {
-            let error = parsed.get("error").unwrap_or(&parsed);
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| body.to_string())
-}
+// Error-body extraction is shared by every HTTP protocol family, so it lives at
+// the neutral boundary and is re-exported here for this module's callers.
+pub(crate) use crate::backends::http_loop::upstream_error_detail;
 
 /// Inject the OpenAI-native structured-output constraint into a chat-completions
 /// request body. `response_format` json_schema with `strict` demands
