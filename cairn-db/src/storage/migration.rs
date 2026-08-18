@@ -264,6 +264,17 @@ pub struct Migration {
 }
 
 impl Migration {
+    /// The registered name, as [`MigrationRunner::run`] reports it on apply.
+    ///
+    /// A test that stages a database at one specific migration selects it by
+    /// name through this accessor. A positional selector — an index, or
+    /// `split_last` on the registry — names a different migration the moment a
+    /// later one is appended, and retargets the test silently rather than
+    /// failing it.
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+
     /// A standard migration, applied inside the normal exclusive transaction
     /// with foreign keys enforced.
     pub(crate) const fn new(version: &'static str, name: &'static str, sql: &'static str) -> Self {

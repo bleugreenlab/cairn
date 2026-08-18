@@ -49,6 +49,12 @@ pub struct VoicePreferences {
     pub preferred_file_model: VoiceModel,
     #[serde(default)]
     pub dictation_mode: DictationMode,
+    /// The microphone dictation opens, named by the `deviceId` the webview's
+    /// `enumerateDevices` reports. `None` means the system default, which is
+    /// also what a device that has since been unplugged falls back to: a
+    /// remembered id is a preference, never a requirement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_device_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +89,7 @@ pub struct VoiceStatus {
     pub accurate_model: ComponentState,
     pub preferred_file_model: VoiceModel,
     pub dictation_mode: DictationMode,
+    pub input_device_id: Option<String>,
     pub detail: Option<String>,
 }
 
@@ -211,6 +218,7 @@ mod tests {
                 enabled: false,
                 preferred_file_model: VoiceModel::Fast,
                 dictation_mode: DictationMode::Hold,
+                input_device_id: None,
             }
         );
     }
@@ -280,5 +288,29 @@ mod tests {
         let preferences: VoicePreferences =
             serde_yaml::from_str("enabled: true\npreferredFileModel: accurate\n").unwrap();
         assert_eq!(preferences.dictation_mode, DictationMode::Hold);
+        assert_eq!(preferences.input_device_id, None);
+    }
+
+    /// The chosen microphone round-trips under the name the webview uses, and
+    /// the system default is written as absence rather than as a sentinel id.
+    #[test]
+    fn an_input_device_round_trips_and_the_default_is_absence() {
+        let chosen = VoicePreferences {
+            enabled: true,
+            input_device_id: Some("a1b2c3".into()),
+            ..VoicePreferences::default()
+        };
+        let yaml = serde_yaml::to_string(&chosen).unwrap();
+        assert!(yaml.contains("inputDeviceId: a1b2c3"), "{yaml}");
+        assert_eq!(
+            serde_yaml::from_str::<VoicePreferences>(&yaml).unwrap(),
+            chosen
+        );
+
+        let default_device = serde_yaml::to_string(&VoicePreferences::default()).unwrap();
+        assert!(
+            !default_device.contains("inputDeviceId"),
+            "{default_device}"
+        );
     }
 }

@@ -399,6 +399,7 @@ impl OrchestratorBuilder {
             browser_loading: Arc::new(Mutex::new(HashMap::new())),
             executor: Arc::new(OnceLock::new()),
             mcp_gateway: Arc::new(OnceLock::new()),
+            desktop_facades: Arc::default(),
             model_catalog: self.model_catalog,
             provider_usage_snapshots: self.provider_usage_snapshots,
             sidebar_active_issues: Arc::new(std::sync::RwLock::new(None)),
@@ -417,6 +418,7 @@ impl OrchestratorBuilder {
             build_service_reconcile: Arc::new(Mutex::new(())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
+            codemap_refresh_in_flight: Arc::new(Mutex::new(HashSet::new())),
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
             turn_end_checks_in_flight: Arc::new(Mutex::new(HashMap::new())),
             recent_turn_end_check_requests: self.recent_turn_end_check_requests,
@@ -618,6 +620,22 @@ fn executor_health_reasons(
         // Unknown disk pressure is exactly the volume reading being a gap, and
         // the gap loop below names it with its own reason.
         DiskHealthStatus::Unknown | DiskHealthStatus::Ok => {}
+    }
+    // Bytes this executor has admitted it cannot reclaim. Independent of the
+    // physical verdict above: a volume with room to spare is still degraded when
+    // the janitor is permanently stuck, and reporting only the physical half is
+    // how two unreclaimable trees read as `Ok` for sixteen days (CAIRN-4217).
+    // A peer that does not report reclamation at all says nothing here, because
+    // silence is not evidence in either direction.
+    if executor
+        .disk
+        .reclamation
+        .as_ref()
+        .is_some_and(|reclamation| reclamation.is_outstanding())
+    {
+        reasons.push(SubstrateHealthReason::StorageCleanupFailed {
+            executor_id: id.clone(),
+        });
     }
     // Each reading this machine needs and cannot take, named. Only placement
     // inputs qualify: the daemon's own size is unavailable by construction off
@@ -865,6 +883,7 @@ struct AttachedUi {
 pub enum CloudObjectGrantMintError {
     InvalidRequest,
     StaleExecution,
+    MissingProjectAssociation { project_id: String },
     Unavailable(String),
 }
 
@@ -875,6 +894,10 @@ impl std::fmt::Display for CloudObjectGrantMintError {
             Self::StaleExecution => {
                 formatter.write_str("cloud object grant execution authorization is stale")
             }
+            Self::MissingProjectAssociation { project_id } => write!(
+                formatter,
+                "project '{project_id}' is not connected to a team; cloud object grants require a team association and retrying cannot repair this project state"
+            ),
             Self::Unavailable(error) => formatter.write_str(error),
         }
     }
@@ -1126,6 +1149,12 @@ pub struct Orchestrator {
     /// and settable after construction via `&self`.
     mcp_gateway: Arc<OnceLock<Arc<dyn McpGateway>>>,
 
+    /// One desktop-automation facade per machine, each owning that machine's
+    /// service residency. Held here because the residency outlives any single
+    /// probe or verb call, and a second facade for a machine is a second
+    /// claimant on a holder that has room for exactly one.
+    pub(crate) desktop_facades: Arc<crate::fleet::desktop::DesktopFacadeRegistry>,
+
     /// Cached provider model catalog loaded at startup and refreshed on demand.
     model_catalog: Arc<RwLock<HashMap<String, ProviderModelCatalog>>>,
     /// Latest usage snapshots keyed by backend and requested account.
@@ -1210,6 +1239,12 @@ pub struct Orchestrator {
     /// run may later EOF/finalize. Keying by run id suppresses cleanup-path
     /// duplicates and repeated crash finalization attempts.
     agent_completion_attention_dedupe: Arc<Mutex<HashSet<String>>>,
+
+    /// Projects whose code map is being recomputed right now. A code map is a
+    /// whole-tree walk, so a second request while one is in flight is dropped
+    /// rather than queued: the running pass re-reads the base after each round
+    /// and already covers whatever advanced.
+    pub(crate) codemap_refresh_in_flight: Arc<Mutex<HashSet<String>>>,
 
     /// Session identities whose crashed native resume was already handed to the
     /// digest-reseed fallback.
@@ -1821,10 +1856,8 @@ impl Orchestrator {
             .team_id_for_project(&request.coordinate.repository.project_id)
             .await
             .map_err(CloudObjectGrantMintError::Unavailable)?
-            .ok_or_else(|| {
-                CloudObjectGrantMintError::Unavailable(
-                    "Cloud object grants require a connected team project".into(),
-                )
+            .ok_or_else(|| CloudObjectGrantMintError::MissingProjectAssociation {
+                project_id: request.coordinate.repository.project_id.clone(),
             })?;
         let device_jwt = crate::account::read_device_jwt(&self.db.local)
             .await
@@ -2823,6 +2856,7 @@ impl Orchestrator {
                 if let Err(error) = tokio::task::spawn_blocking(move || {
                     let _span = tracing::info_span!(target: "profiler", "process_sweep").entered();
                     crate::runs::reap::reap_stale_runs(&orch);
+                    crate::orchestrator::lifecycle::sweep_stranded_watchdog_jobs(&orch);
                     orch.collect_warm(false);
                     if let Some(gc) = orch.warm_gc.as_ref() {
                         gc.cleanup_stale_views();
@@ -2988,6 +3022,10 @@ impl Orchestrator {
         let backend = backend_for_name(Some(backend_name));
         let (mut models, error) = if backend_name == "ollama" {
             crate::backends::ollama::models::discover_catalog_blocking(self)
+        } else if backend_name == crate::backends::actual::ACTUAL_BACKEND_KEY {
+            // Inventory is per target, so discovery needs the configured
+            // accounts rather than a vendor-wide list.
+            crate::backends::actual::models::discover_catalog_blocking(self)
         } else {
             match backend.discover_models() {
                 Ok(models) => (models, None),

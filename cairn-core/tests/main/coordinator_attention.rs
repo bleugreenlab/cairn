@@ -6,7 +6,9 @@ use crate::common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use cairn_core::internal::agent_process::process::AgentProcessState;
 use cairn_core::internal::db::DbState;
+use cairn_core::internal::identity::{ClaudeAuth, IdentityStore, UserIdentity};
 use cairn_core::internal::orchestrator::attention_push::list_pending;
 use cairn_core::internal::orchestrator::lifecycle::{evaluate_review_readiness, finalize_run};
 use cairn_core::internal::orchestrator::Orchestrator;
@@ -25,7 +27,27 @@ use tempfile::TempDir;
 
 const CHILD_URI: &str = "cairn://p/coord/2";
 
+/// A fixture orchestrator whose resumes can reach the process boundary, and the
+/// recorder that observes whether one did.
+///
+/// The launch funnel fails closed twice before it ever spawns: it refuses a
+/// session that has no Cairn-managed credential, and it resolves the backend CLI
+/// off the host's PATH. Neither has anything to do with whether a wake routed
+/// correctly, but both turn "the coordinator was resumed" into an assertion about
+/// the machine running the suite. Supplying an API-key account and a pre-resolved
+/// binary path removes both, so a recorded spawn means what these tests read it
+/// as: the wake reached a launch.
 fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> (Orchestrator, RecordingProcessSpawner) {
+    orchestrator_with_credential(temp, db, Some(ClaudeAuth::ApiKey("test-key".to_string())))
+}
+
+/// [`orchestrator`], with the account made optional so one test can exercise a
+/// launch that fails after its attention briefing is already assembled.
+fn orchestrator_with_credential(
+    temp: &TempDir,
+    db: Arc<LocalDb>,
+    claude_auth: Option<ClaudeAuth>,
+) -> (Orchestrator, RecordingProcessSpawner) {
     let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
     let db_state = Arc::new(DbState::new(db, search_index));
     let recorder = RecordingProcessSpawner::new();
@@ -46,8 +68,28 @@ fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> (Orchestrator, RecordingPro
     let config_dir = temp.path().join("config");
     std::fs::create_dir_all(config_dir.join("agents")).unwrap();
     std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+
+    // Pre-resolved so the spawn never shells out to `which claude`. The recording
+    // spawner never executes it, so the path only has to be a path.
+    let process_state = Arc::new(AgentProcessState::default());
+    *process_state.cli_binary_path.lock().unwrap() = Some("/cairn-test/claude".to_string());
+
+    let identity_store = claude_auth.map(|claude_auth| {
+        IdentityStore::from_user_identity(&UserIdentity {
+            user_id: "test-user".to_string(),
+            email: "test@example.com".to_string(),
+            name: "Test User".to_string(),
+            claude_auth: Some(claude_auth),
+            codex_auth: None,
+            github_token: None,
+        })
+    });
+
     (
-        Orchestrator::builder(db_state, services, config_dir).build(),
+        Orchestrator::builder(db_state, services, config_dir)
+            .process_state(process_state)
+            .identity_store(identity_store)
+            .build(),
         recorder,
     )
 }
@@ -334,6 +376,16 @@ async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<Strin
     .unwrap()
 }
 
+async fn attention_event_count(db: &LocalDb) -> i64 {
+    db.query_one(
+        "SELECT COUNT(*) FROM events WHERE event_type='attention:briefing'",
+        (),
+        |row| row.i64(0),
+    )
+    .await
+    .unwrap()
+}
+
 async fn attention_event_body(db: &LocalDb) -> String {
     db.read(|conn| {
         Box::pin(async move {
@@ -454,6 +506,56 @@ async fn child_plan_gate_wakes_idle_coordinator() {
         recorder.spawn_count(),
         1,
         "the idle coordinator must actually be resumed, not merely have a row written"
+    );
+}
+
+/// A launch that fails after the briefing is assembled must not spend the wake,
+/// and must not leave the briefing behind either.
+///
+/// The delivery stamp commits with the carrying event, necessarily before any
+/// process exists, because the pushes ride in the prompt the spawn carries. So a
+/// refused launch — the fail-closed credential check here, an expired account or
+/// a missing CLI in production — would leave the push marked delivered to an
+/// agent that never ran. Nothing reports that, and nothing retries it: the
+/// coordinator is simply never woken for this child again. Returning the push to
+/// the queue is what keeps a failed launch recoverable instead of silent.
+///
+/// The event has to go with it. Delivery is defined as "carried by a durable
+/// event", so a requeued push whose old briefing still sits in the transcript is
+/// a half-undone delivery: the next successful resume writes a second briefing
+/// for the same fact, and every surface built from durable events — the
+/// transcript, a reseed digest, the wake card — shows the child update twice, one
+/// of them attributed to a turn no agent ever ran.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_launch_returns_the_childs_wake_to_the_queue() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator_and_child(&db, temp.path()).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator_with_credential(&temp, db.clone(), None);
+
+    assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
+    evaluate_review_readiness(&orch, "child").await;
+
+    let rows = push_rows(&db, &format!("review:{CHILD_URI}")).await;
+    assert_eq!(rows.len(), 1, "the review wake is still minted");
+    assert_eq!(
+        recorder.spawn_count(),
+        0,
+        "an uncredentialed launch must be refused"
+    );
+    assert_eq!(
+        rows[0].2, None,
+        "a push stamped delivered by a launch that never started is a wake nobody can ever receive"
+    );
+    assert_eq!(
+        list_pending(&db, "coordinator").await.unwrap().len(),
+        1,
+        "so it must still be queued for the coordinator's next resume"
+    );
+    assert_eq!(
+        attention_event_count(&db).await,
+        0,
+        "and no briefing may survive to be replayed beside the requeued push"
     );
 }
 

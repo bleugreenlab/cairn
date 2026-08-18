@@ -6,7 +6,7 @@ pub(crate) const POSTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Posts,
     uri_template: "cairn://posts",
     name: "Posts",
-    description: "Append-only post corpus, newest first: workspace-wide posts plus your own project's",
+    description: "Append-only post corpus, newest first: workspace-wide posts plus your own project's; authorship is captured from the authenticated run, never supplied",
     read_projections: &[
         ProjectionSpec { key: "limit", values: "N (default 50, max 100)" },
         ProjectionSpec { key: "search", values: "case-insensitive title/content substring" },
@@ -27,7 +27,7 @@ pub(crate) const POST_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Post,
     uri_template: "cairn://posts/{integer}",
     name: "Post",
-    description: "One immutable post and its creation-ordered comments",
+    description: "One immutable post and its creation-ordered comments; comment authorship is captured from the authenticated run, never supplied",
     read_projections: &[ProjectionSpec { key: "format", values: "json for a lossless persisted-field projection" }],
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,

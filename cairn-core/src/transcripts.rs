@@ -1,3 +1,4 @@
+pub mod file_activity;
 pub mod stream_store;
 
 use serde_json::Value;

@@ -1902,40 +1902,121 @@ pub(crate) fn normalize_command(cmd: &str) -> String {
     cmd.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Resolve a job's current runner-owned logical head. The durable branch and
-/// project repository are the complete coordinate; process cwd never participates.
-pub(crate) async fn resolve_job_logical_head(
-    orch: &Orchestrator,
+/// Why a job cannot supply a logical head coordinate.
+///
+/// A branchless job is a structural fact, not a database failure: a thread
+/// session runs on the project's base branch and owns no branch of its own, by
+/// design (see [`crate::threads`]). A caller that can offer its reader a way
+/// forward has to tell that apart from a genuinely missing row, and one
+/// formatted string could not — which is how a thread asking for a check was
+/// told that a database row had failed to convert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum JobLogicalHeadError {
+    /// The job exists and carries no branch. `thread_owned` comes from the one
+    /// canonical ownership answer ([`crate::threads::job_owner`], reading
+    /// `jobs.thread_id`), so a thread reads as a thread rather than as an
+    /// anonymous branchless row.
+    Branchless { job_id: String, thread_owned: bool },
+    /// No job with this id exists in the database that owns the id.
+    MissingJob { job_id: String },
+    /// The lookup itself failed, or the branch it found does not resolve.
+    Failed(String),
+}
+
+impl std::fmt::Display for JobLogicalHeadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Branchless {
+                job_id,
+                thread_owned: true,
+            } => write!(
+                f,
+                "job {job_id} belongs to a thread, which runs on the project's base branch \
+                 and owns no branch of its own, so it has no logical head to resolve"
+            ),
+            Self::Branchless {
+                job_id,
+                thread_owned: false,
+            } => write!(
+                f,
+                "job {job_id} owns no branch, so it has no logical head to resolve"
+            ),
+            Self::MissingJob { job_id } => {
+                write!(f, "job {job_id} was not found in the database that owns it")
+            }
+            Self::Failed(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// A job's durable coordinate: the branch it owns, and the repository that
+/// branch lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct JobBranchCoordinate {
+    pub branch: String,
+    pub repository: String,
+}
+
+/// Read a job's durable coordinate, or name precisely why it has none.
+///
+/// Separate from resolving that coordinate against the repository, because this
+/// half is where the three cases part — owned, branchless, absent — and it is
+/// answerable from the database alone.
+pub(crate) async fn job_branch_coordinate(
+    db: &LocalDb,
     job_id: &str,
-) -> Result<String, String> {
-    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let job_id = job_id.to_string();
-    let (branch, repository) = db
+) -> Result<JobBranchCoordinate, JobLogicalHeadError> {
+    let query_job_id = job_id.to_string();
+    let row = db
         .read(move |conn| {
-            let job_id = job_id.clone();
+            let job_id = query_job_id.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
                         "SELECT j.branch, p.repo_path
                          FROM jobs j
-                         JOIN projects p ON p.id = j.project_id
-                         WHERE j.id = ?1 AND j.branch IS NOT NULL
+                         LEFT JOIN projects p ON p.id = j.project_id
+                         WHERE j.id = ?1
                          LIMIT 1",
                         (job_id.as_str(),),
                     )
                     .await?;
-                let row = rows.next().await?.ok_or_else(|| {
-                    crate::storage::DbError::Row(format!(
-                        "job {job_id} has no resolvable logical coordinate"
-                    ))
-                })?;
-                Ok((row.text(0)?, row.text(1)?))
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                Ok(Some((row.opt_text(0)?, row.opt_text(1)?)))
             })
         })
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| JobLogicalHeadError::Failed(error.to_string()))?;
+    let job_id = job_id.to_string();
+    let Some((branch, repository)) = row else {
+        return Err(JobLogicalHeadError::MissingJob { job_id });
+    };
+    let Some(branch) = branch else {
+        let thread_owned =
+            crate::threads::job_owner(db, &job_id).await == crate::threads::JobOwner::Thread;
+        return Err(JobLogicalHeadError::Branchless {
+            job_id,
+            thread_owned,
+        });
+    };
+    let repository = repository.ok_or_else(|| {
+        JobLogicalHeadError::Failed(format!("job {job_id} has no project repository path"))
+    })?;
+    Ok(JobBranchCoordinate { branch, repository })
+}
+
+/// Resolve a job's current runner-owned logical head. The durable branch and
+/// project repository are the complete coordinate; process cwd never participates.
+pub(crate) async fn resolve_job_logical_head(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<String, JobLogicalHeadError> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|error| JobLogicalHeadError::Failed(error.to_string()))?;
+    let JobBranchCoordinate { branch, repository } = job_branch_coordinate(&db, job_id).await?;
     let repository = std::path::PathBuf::from(repository);
     let coordinate_repository = {
         let jj_binary_path = orch.jj_binary_path.clone();
@@ -1946,11 +2027,18 @@ pub(crate) async fn resolve_job_logical_head(
             crate::jj::coordinate_repository(&jj, &config_dir, &project_repo)
         })
         .await
-        .map_err(|error| format!("logical head coordinate repository task failed: {error}"))??
+        .map_err(|error| {
+            JobLogicalHeadError::Failed(format!(
+                "logical head coordinate repository task failed: {error}"
+            ))
+        })?
+        .map_err(JobLogicalHeadError::Failed)?
     };
     cairn_vcs::resolve_coordinate(&coordinate_repository, &branch)
         .await
-        .map_err(|error| format!("job branch '{branch}' is unresolvable: {error}"))
+        .map_err(|error| {
+            JobLogicalHeadError::Failed(format!("job branch '{branch}' is unresolvable: {error}"))
+        })
 }
 
 pub(crate) fn get_job_logical_head_sha(
@@ -1959,7 +2047,11 @@ pub(crate) fn get_job_logical_head_sha(
 ) -> Result<String, String> {
     let orch = orch.clone();
     let job_id = job_id.to_string();
-    run_checkpoint_cache_db(async move { resolve_job_logical_head(&orch, &job_id).await })
+    run_checkpoint_cache_db(async move {
+        resolve_job_logical_head(&orch, &job_id)
+            .await
+            .map_err(|error| error.to_string())
+    })
 }
 
 /// Get the checkpoint cache result for a job.
@@ -2166,6 +2258,114 @@ mod tests {
         let error = record_fresh_check_observation(db, write)
             .expect_err("mixed sealed and loose coordinates must not become reusable evidence");
         assert!(error.contains("sealed check coordinate"), "{error}");
+    }
+
+    /// One project with three jobs: an issue-owned job that owns a branch, a
+    /// thread session that owns none, and (by omission) an id no job carries.
+    async fn coordinate_db() -> Arc<LocalDb> {
+        let db = crate::storage::migrated_test_db("job-branch-coordinate-test.db").await;
+        db.execute_script(
+            "
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-a', 'default', 'Project A', 'PA', '/tmp/project-a', 1, 1);
+            INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+             VALUES ('t-thread', 'project-a', 'topic', 'active', 'none', 1, 1);
+            INSERT INTO jobs(id, project_id, branch, status, uri_segment, node_name,
+                             created_at, updated_at)
+             VALUES ('job-issue', 'project-a', 'cairn/1-builder', 'running', 'builder',
+                     'builder', 1, 1);
+            INSERT INTO jobs(id, project_id, thread_id, status, uri_segment, node_name,
+                             created_at, updated_at)
+             VALUES ('job-thread', 'project-a', 't-thread', 'running', 'thread',
+                     'thread', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+        Arc::new(db)
+    }
+
+    /// A job that owns a branch yields the coordinate to resolve.
+    #[tokio::test]
+    async fn a_branch_owning_job_yields_its_coordinate() {
+        let db = coordinate_db().await;
+
+        let coordinate = job_branch_coordinate(&db, "job-issue")
+            .await
+            .expect("a job that owns a branch has a coordinate");
+        assert_eq!(coordinate.branch, "cairn/1-builder");
+        assert_eq!(coordinate.repository, "/tmp/project-a");
+    }
+
+    /// The bug this distinction exists for (CAIRN-4237): a thread session owns
+    /// no branch BY DESIGN, and the query that filtered on `branch IS NOT NULL`
+    /// could only report that structural fact as a missing row — so
+    /// `cairn check run` from a thread died with "database row conversion
+    /// failed", which reads as corruption.
+    #[tokio::test]
+    async fn a_thread_session_is_branchless_rather_than_missing() {
+        let db = coordinate_db().await;
+
+        let error = job_branch_coordinate(&db, "job-thread")
+            .await
+            .expect_err("a thread session owns no branch");
+        assert_eq!(
+            error,
+            JobLogicalHeadError::Branchless {
+                job_id: "job-thread".to_string(),
+                thread_owned: true,
+            }
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("thread") && message.contains("owns no branch of its own"),
+            "the refusal states the posture rather than a row failure: {message}"
+        );
+    }
+
+    /// A branchless job that is not thread-owned is still a refusal, but it may
+    /// not borrow a thread's explanation.
+    #[tokio::test]
+    async fn a_branchless_job_without_an_owner_is_not_called_a_thread() {
+        let db = coordinate_db().await;
+        db.execute_script(
+            "INSERT INTO jobs(id, project_id, status, uri_segment, node_name,
+                              created_at, updated_at)
+              VALUES ('job-orphan', 'project-a', 'running', 'node', 'node', 1, 1);",
+        )
+        .await
+        .unwrap();
+
+        let error = job_branch_coordinate(&db, "job-orphan")
+            .await
+            .expect_err("a job with no branch has no coordinate");
+        assert_eq!(
+            error,
+            JobLogicalHeadError::Branchless {
+                job_id: "job-orphan".to_string(),
+                thread_owned: false,
+            }
+        );
+    }
+
+    /// A genuinely absent row stays an error, named as what it is.
+    #[tokio::test]
+    async fn an_absent_job_is_named_as_missing() {
+        let db = coordinate_db().await;
+
+        let error = job_branch_coordinate(&db, "job-nowhere")
+            .await
+            .expect_err("no job carries this id");
+        assert_eq!(
+            error,
+            JobLogicalHeadError::MissingJob {
+                job_id: "job-nowhere".to_string(),
+            }
+        );
+        assert!(
+            error.to_string().contains("was not found"),
+            "a missing job reads as missing: {error}"
+        );
     }
 
     async fn cache_db() -> Arc<LocalDb> {

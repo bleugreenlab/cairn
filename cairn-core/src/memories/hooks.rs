@@ -12,8 +12,10 @@ use std::path::PathBuf;
 ///
 /// `mcp_callback_port` is the port the MCP callback server listens on.
 pub(crate) fn write_hook_settings_file(mcp_callback_port: u16) -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("Could not find home directory")?;
-    let cairn_dir = home.join(".cairn");
+    // The configured Cairn home, not a hardcoded `~/.cairn`: a dev instance keeps
+    // its hook settings in its own home rather than writing into the production
+    // one it is otherwise isolated from.
+    let cairn_dir = cairn_common::paths::cairn_home();
     let settings_path = cairn_dir.join("hook-settings.json");
 
     let hook_command = format!(

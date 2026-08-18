@@ -168,14 +168,16 @@ pub async fn cost_by_project(
     Ok(out)
 }
 
-/// Per-model cost for a single backend, preferring the real metered cost
-/// (`events.cost_usd`) over the price-table estimate, sorted by cost descending.
+/// Per-model cost for a single backend via [`exact_or_priced`], sorted by cost
+/// descending.
 ///
 /// This is the canonical answer for "what did we actually bill per model on this
 /// backend" and powers the provider usage card (e.g. OpenRouter), where the
-/// price table returns ~$0 for many metered models. Distinct from
-/// [`model_role_economics`], the all-backend dashboard view computed purely from
-/// the price table.
+/// price table returns ~$0 for many metered models so the recorded cost carries
+/// the whole answer. It differs from [`crate::model_role_economics`] in scope,
+/// not in pricing: this breaks one backend down by model, while that is the
+/// all-backend dashboard view grouped by model and by agent role. Both price
+/// their groups by the same rule.
 pub async fn provider_model_costs(
     db: &LocalDb,
     backend: &str,
@@ -186,18 +188,16 @@ pub async fn provider_model_costs(
     let mut costs: Vec<ProviderModelCost> = rows
         .into_iter()
         .map(|row| {
-            let cost_usd = if row.exact_cost_count > 0 {
-                row.exact_cost
-            } else {
-                pricing::cost_usd(
-                    &row.backend,
-                    row.model.as_deref(),
-                    row.input,
-                    row.cache_read,
-                    row.cache_create,
-                    row.output,
-                )
-            };
+            let cost_usd = exact_or_priced(
+                &row.backend,
+                row.model.as_deref(),
+                row.input,
+                row.cache_read,
+                row.cache_create,
+                row.output,
+                row.exact_cost,
+                row.exact_cost_count,
+            );
             let model = row
                 .model
                 .filter(|m| !m.is_empty())

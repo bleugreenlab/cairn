@@ -4,7 +4,7 @@
 use crate::mcp::handlers::{emit_attention, AttentionEvent};
 use crate::models::{RunStatus, TurnEndReason, TurnState};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{run_db_blocking, RowExt};
+use crate::storage::{run_db_blocking, DbError, RowExt};
 
 use super::common::*;
 use super::review_push::{
@@ -556,8 +556,14 @@ fn finalize_run_inner(
     emit_terminal_failure_attention: bool,
 ) -> Result<(), String> {
     let mut first_error = None;
-    // Clean up system prompt temp file
-    crate::orchestrator::session::cleanup_prompt_file(run_id);
+    // Clean up this run's assembled system prompt, which lives in its job's
+    // scratch residence.
+    if let Some(job_id) = job_id_for_run(orch, run_id) {
+        crate::orchestrator::session::cleanup_prompt_file(
+            &crate::scratch::job_scratch_dir(&job_id),
+            run_id,
+        );
+    }
 
     // Finalize the current turn based on run outcome.
     // Primary: in-memory process state. Fallback: job's current_turn_id in DB
@@ -974,30 +980,27 @@ fn emit_agent_terminal_attention_once(
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT projects.key, issues.number, issues.title, jobs.node_name, executions.seq
+                        "SELECT projects.key, jobs.id
                          FROM runs
                          JOIN jobs ON runs.job_id = jobs.id
                          JOIN projects ON jobs.project_id = projects.id
-                         LEFT JOIN issues ON jobs.issue_id = issues.id
-                         LEFT JOIN executions ON jobs.execution_id = executions.id
                          WHERE runs.id = ?1
                            AND jobs.parent_job_id IS NULL
                            AND runs.job_id IS NOT NULL",
                         (run_id.as_str(),),
                     )
                     .await?;
-                rows.next()
+                let row = rows
+                    .next()
                     .await?
-                    .map(|row| {
-                        Ok((
-                            row.text(0)?,
-                            row.opt_i64(1)?.map(|n| n as i32),
-                            row.opt_text(2)?,
-                            row.opt_text(3)?,
-                            row.opt_i64(4)?.map(|n| n as i32),
-                        ))
-                    })
-                    .transpose()
+                    .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
+                    .transpose()?;
+                drop(rows);
+                let Some((project_key, job_id)) = row else {
+                    return Ok(None);
+                };
+                let home_uri = crate::jobs::queries::home_uri_for_job_conn(conn, &job_id).await?;
+                Ok(Some((project_key, home_uri)))
             })
         })
         .await
@@ -1006,7 +1009,7 @@ fn emit_agent_terminal_attention_once(
     .ok()
     .flatten();
 
-    let Some((project_key, issue_number, issue_title, node_name, exec_seq)) = row else {
+    let Some((project_key, home_uri)) = row else {
         return;
     };
 
@@ -1015,10 +1018,7 @@ fn emit_agent_terminal_attention_once(
         &AttentionEvent {
             attention_type,
             project_key: &project_key,
-            issue_number,
-            issue_title: issue_title.as_deref(),
-            node_name: node_name.as_deref(),
-            exec_seq,
+            home_uri: home_uri.as_deref(),
             tool_name: None,
         },
     );

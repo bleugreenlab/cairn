@@ -107,6 +107,12 @@ pub enum ApiProvider {
     /// Ollama APIs
     #[serde(rename = "ollama")]
     Ollama,
+    /// Actual Computer. One account authorizes many devices, and the same
+    /// clusters are reachable both from the device itself and through Actual's
+    /// Private Relay, so a credential here names the account rather than any
+    /// single endpoint.
+    #[serde(rename = "actual")]
+    Actual,
     /// GitHub APIs
     #[serde(rename = "github", alias = "git_hub")]
     GitHub,
@@ -121,6 +127,7 @@ impl ApiProvider {
             ApiProvider::OpenRouter => "openrouter",
             ApiProvider::OpenCode => "opencode",
             ApiProvider::Ollama => "ollama",
+            ApiProvider::Actual => "actual",
             ApiProvider::GitHub => "github",
         }
     }
@@ -134,6 +141,7 @@ impl ApiProvider {
             ApiProvider::OpenRouter,
             ApiProvider::OpenCode,
             ApiProvider::Ollama,
+            ApiProvider::Actual,
             ApiProvider::GitHub,
         ]
     }
@@ -148,6 +156,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::OpenRouter => write!(f, "OpenRouter"),
             ApiProvider::OpenCode => write!(f, "OpenCode"),
             ApiProvider::Ollama => write!(f, "Ollama"),
+            ApiProvider::Actual => write!(f, "Actual"),
             ApiProvider::GitHub => write!(f, "GitHub"),
         }
     }
@@ -163,6 +172,33 @@ pub enum AccountSource {
     Server,
 }
 
+/// Which of Actual's two ways of reaching the same clusters a target uses.
+///
+/// This is stored rather than inferred from the presence of a credential. A
+/// relay target whose key has been cleared is a *misconfigured relay target*,
+/// which needs to be reported as exactly that; inferring the kind from the key
+/// would let it masquerade as a local instance that happens to point at
+/// `api.actual.inc`, and the readiness message the user got would be wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActualTargetKind {
+    /// An Actual instance on a machine reachable directly. Loopback needs no
+    /// per-request credential.
+    Local,
+    /// Actual's end-to-end Private Relay, which needs an `ac_` inference
+    /// credential and optionally pins one cluster.
+    Relay,
+}
+
+impl ActualTargetKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ActualTargetKind::Local => "local",
+            ActualTargetKind::Relay => "relay",
+        }
+    }
+}
+
 /// Authentication credential for a provider account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -176,6 +212,28 @@ pub enum ProviderAuth {
     /// Provider host URL. This is connection metadata, not a secret.
     #[serde(rename = "base_url")]
     BaseUrl { url: String },
+    /// One Actual target: where to reach it, the credential it needs, and the
+    /// cluster it pins — held together as one fact.
+    ///
+    /// These three are inseparable in practice. A relay key is meaningless
+    /// against a loopback endpoint, and a cluster id only means anything paired
+    /// with the credential whose account can see that cluster. Splitting the
+    /// cluster id out into global settings (the shape this deliberately avoids)
+    /// would let a second target silently inherit a pin belonging to the first.
+    #[serde(rename = "actual_target", rename_all = "camelCase")]
+    ActualTarget {
+        kind: ActualTargetKind,
+        base_url: String,
+        /// The `ac_` inference credential. Required for relay targets, absent
+        /// for loopback ones, which take no per-request auth.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        /// Optional `X-Cluster-ID` pin. Operator-supplied: Actual's documented
+        /// cluster-listing endpoint is not served by the public relay, so Cairn
+        /// cannot enumerate clusters to choose from.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_id: Option<String>,
+    },
     /// Cairn-managed Claude CLI profile. Its path is derived from the account id.
     #[serde(rename = "claude_profile")]
     ClaudeProfile,
@@ -197,10 +255,61 @@ impl ProviderAuth {
         })
     }
 
+    /// Build and canonicalize an Actual target at its input boundary.
+    ///
+    /// A relay target without a credential is rejected here rather than at the
+    /// first inference request: the relay answers every unauthenticated call
+    /// with the same opaque `missing_or_malformed_credential`, so a target saved
+    /// without a key would only ever fail later with a message that does not say
+    /// which of its fields is missing.
+    pub fn actual_target(
+        kind: ActualTargetKind,
+        base_url: &str,
+        api_key: Option<&str>,
+        cluster_id: Option<&str>,
+    ) -> Result<Self, String> {
+        let ProviderAuth::BaseUrl { url } = Self::base_url(base_url)? else {
+            unreachable!("base_url constructs BaseUrl");
+        };
+        let api_key = api_key.map(str::trim).filter(|value| !value.is_empty());
+        let cluster_id = cluster_id.map(str::trim).filter(|value| !value.is_empty());
+        match kind {
+            ActualTargetKind::Relay if api_key.is_none() => {
+                return Err(
+                    "an Actual Private Relay target needs an ac_ inference credential".to_string(),
+                )
+            }
+            // Loopback takes no per-request auth, so a key here would be stored
+            // and never sent — a credential the user believes is in use.
+            ActualTargetKind::Local if api_key.is_some() => {
+                return Err(
+                    "a local Actual instance takes no per-request credential; leave the key empty"
+                        .to_string(),
+                )
+            }
+            _ => {}
+        }
+        if kind == ActualTargetKind::Local && cluster_id.is_some() {
+            return Err(
+                "cluster pinning applies to Private Relay targets, not a local instance"
+                    .to_string(),
+            );
+        }
+        Ok(Self::ActualTarget {
+            kind,
+            base_url: url,
+            api_key: api_key.map(str::to_string),
+            cluster_id: cluster_id.map(str::to_string),
+        })
+    }
+
     /// Get the raw credential value, if any.
     fn credential_value(&self) -> Option<&str> {
         match self {
             ProviderAuth::ApiKey { value } | ProviderAuth::OAuthToken { value } => Some(value),
+            // The relay key is a secret and must be reachable here, or every
+            // caller that redacts by asking for the credential would leak it.
+            ProviderAuth::ActualTarget { api_key, .. } => api_key.as_deref(),
             ProviderAuth::BaseUrl { .. } | ProviderAuth::ClaudeProfile => None,
         }
     }
@@ -211,6 +320,7 @@ impl ProviderAuth {
             ProviderAuth::ApiKey { .. } => "api_key",
             ProviderAuth::OAuthToken { .. } => "oauth_token",
             ProviderAuth::BaseUrl { .. } => "base_url",
+            ProviderAuth::ActualTarget { .. } => "actual_target",
             ProviderAuth::ClaudeProfile => "claude_profile",
         }
     }
@@ -288,6 +398,7 @@ impl ProviderAccount {
             (ApiProvider::OpenRouter, ProviderAuth::ApiKey { .. }) => vec!["openrouter"],
             (ApiProvider::OpenCode, ProviderAuth::ApiKey { .. }) => vec!["opencode-go"],
             (ApiProvider::Ollama, ProviderAuth::BaseUrl { .. }) => vec!["ollama"],
+            (ApiProvider::Actual, ProviderAuth::ActualTarget { .. }) => vec!["actual"],
             (ApiProvider::GitHub, ProviderAuth::ApiKey { .. }) => vec![],
             // OAuth is CLI-specific
             (ApiProvider::OpenAI, ProviderAuth::OAuthToken { .. }) => vec!["codex"],
@@ -736,9 +847,11 @@ impl IdentityStore {
                     crate::identity::claude_profile::profile_dir_in(&self.config_dir, &a.id),
                 )),
                 // A retired setup token is not Claude auth, and neither is a
-                // host URL. `best_account_for` already filters on
-                // `compatible_backends`, so neither reaches here.
-                ProviderAuth::OAuthToken { .. } | ProviderAuth::BaseUrl { .. } => None,
+                // host URL or an Actual target. `best_account_for` already
+                // filters on `compatible_backends`, so none reach here.
+                ProviderAuth::OAuthToken { .. }
+                | ProviderAuth::BaseUrl { .. }
+                | ProviderAuth::ActualTarget { .. } => None,
             });
 
         // Resolve Codex auth from best OpenAI account
@@ -747,7 +860,9 @@ impl IdentityStore {
             .and_then(|a| match &a.auth {
                 ProviderAuth::ApiKey { value } => Some(CodexAuth::ApiKey(value.clone())),
                 ProviderAuth::OAuthToken { value } => Some(CodexAuth::OAuthToken(value.clone())),
-                ProviderAuth::BaseUrl { .. } | ProviderAuth::ClaudeProfile => None,
+                ProviderAuth::BaseUrl { .. }
+                | ProviderAuth::ActualTarget { .. }
+                | ProviderAuth::ClaudeProfile => None,
             });
 
         // Resolve GitHub token
@@ -831,6 +946,14 @@ pub struct AccountInfo {
     pub(crate) auth_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base_url: Option<String>,
+    /// Which way an Actual target reaches its cluster (`local` or `relay`).
+    /// Absent for every other provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_kind: Option<String>,
+    /// The operator-supplied `X-Cluster-ID` pin, if this target has one. Not a
+    /// secret — it names a cluster, it does not authenticate to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cluster_id: Option<String>,
     compatible_backends: Vec<String>,
     project_id: Option<String>,
     sort_order: i32,
@@ -850,6 +973,15 @@ impl From<&ProviderAccount> for AccountInfo {
             auth_type: account.auth.auth_type_label().to_string(),
             base_url: match &account.auth {
                 ProviderAuth::BaseUrl { url } => Some(url.clone()),
+                ProviderAuth::ActualTarget { base_url, .. } => Some(base_url.clone()),
+                _ => None,
+            },
+            target_kind: match &account.auth {
+                ProviderAuth::ActualTarget { kind, .. } => Some(kind.as_str().to_string()),
+                _ => None,
+            },
+            cluster_id: match &account.auth {
+                ProviderAuth::ActualTarget { cluster_id, .. } => cluster_id.clone(),
                 _ => None,
             },
             compatible_backends: account
@@ -1793,6 +1925,7 @@ mod tests {
                 ApiProvider::OpenRouter,
                 ApiProvider::OpenCode,
                 ApiProvider::Ollama,
+                ApiProvider::Actual,
                 ApiProvider::GitHub,
             ]
         );
@@ -1990,5 +2123,180 @@ mod tests {
             !json.contains("super-secret-key"),
             "AccountInfo should not contain credential values"
         );
+    }
+
+    // === Actual targets ===
+
+    fn relay_target(api_key: &str, cluster: Option<&str>) -> ProviderAuth {
+        ProviderAuth::actual_target(
+            ActualTargetKind::Relay,
+            "https://api.actual.inc",
+            Some(api_key),
+            cluster,
+        )
+        .expect("a relay target with a credential is valid")
+    }
+
+    #[test]
+    fn a_relay_target_without_a_credential_is_refused_at_the_boundary() {
+        // The relay answers every unauthenticated call with the same opaque
+        // token, so a target saved without a key would only fail later with a
+        // message that cannot say which field is missing.
+        for missing in [None, Some(""), Some("   ")] {
+            let error = ProviderAuth::actual_target(
+                ActualTargetKind::Relay,
+                "https://api.actual.inc",
+                missing,
+                None,
+            )
+            .unwrap_err();
+            assert!(error.contains("ac_ inference credential"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_local_target_refuses_a_credential_and_a_cluster_pin() {
+        // Loopback sends neither, so storing either would leave the user
+        // believing a credential is in use that never goes on the wire.
+        let error = ProviderAuth::actual_target(
+            ActualTargetKind::Local,
+            "http://127.0.0.1:8080",
+            Some("ac_key"),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("takes no per-request credential"), "{error}");
+
+        let error = ProviderAuth::actual_target(
+            ActualTargetKind::Local,
+            "http://127.0.0.1:8080",
+            None,
+            Some("cluster-1"),
+        )
+        .unwrap_err();
+        assert!(error.contains("Private Relay targets"), "{error}");
+    }
+
+    #[test]
+    fn an_actual_target_canonicalizes_its_endpoint_and_trims_blank_fields() {
+        let auth = ProviderAuth::actual_target(
+            ActualTargetKind::Relay,
+            "  https://api.actual.inc/  ",
+            Some("  ac_key  "),
+            Some("   "),
+        )
+        .unwrap();
+        let ProviderAuth::ActualTarget {
+            base_url,
+            api_key,
+            cluster_id,
+            kind,
+        } = auth
+        else {
+            panic!("expected an Actual target");
+        };
+        assert_eq!(base_url, "https://api.actual.inc");
+        assert_eq!(api_key.as_deref(), Some("ac_key"));
+        // A blank cluster box is not a pin.
+        assert_eq!(cluster_id, None);
+        assert_eq!(kind, ActualTargetKind::Relay);
+
+        assert!(
+            ProviderAuth::actual_target(ActualTargetKind::Local, "not-a-url", None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn an_actual_target_serves_only_the_actual_backend() {
+        let account = test_account(ApiProvider::Actual, relay_target("ac_key", None));
+        assert_eq!(account.compatible_backends(), vec!["actual"]);
+
+        // A bare base URL is an Ollama host shape, not an Actual target, and
+        // must not quietly become one.
+        let mismatched = test_account(
+            ApiProvider::Actual,
+            ProviderAuth::base_url("http://127.0.0.1:8080").unwrap(),
+        );
+        assert!(mismatched.compatible_backends().is_empty());
+    }
+
+    #[test]
+    fn account_info_shows_the_target_but_never_the_relay_credential() {
+        let account = test_account(
+            ApiProvider::Actual,
+            relay_target("ac_live_supersecret", Some("cluster-7")),
+        );
+        let info = AccountInfo::from(&account);
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            !json.contains("ac_live_supersecret"),
+            "the relay credential must not reach the frontend: {json}"
+        );
+        // Endpoint, kind, and cluster are connection metadata the panel needs.
+        assert_eq!(info.base_url.as_deref(), Some("https://api.actual.inc"));
+        assert_eq!(info.target_kind.as_deref(), Some("relay"));
+        assert_eq!(info.cluster_id.as_deref(), Some("cluster-7"));
+        assert_eq!(info.auth_type, "actual_target");
+    }
+
+    #[test]
+    fn a_local_target_reports_no_kind_confusion_and_no_cluster() {
+        let account = test_account(
+            ApiProvider::Actual,
+            ProviderAuth::actual_target(
+                ActualTargetKind::Local,
+                "http://127.0.0.1:8080",
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let info = AccountInfo::from(&account);
+        assert_eq!(info.target_kind.as_deref(), Some("local"));
+        assert_eq!(info.cluster_id, None);
+        // Providers that are not Actual carry no target fields at all.
+        let other = AccountInfo::from(&test_account(
+            ApiProvider::Ollama,
+            ProviderAuth::base_url("http://localhost:11434").unwrap(),
+        ));
+        assert_eq!(other.target_kind, None);
+        assert_eq!(other.cluster_id, None);
+    }
+
+    #[test]
+    fn an_actual_target_round_trips_through_serde_with_its_pin_intact() {
+        let auth = relay_target("ac_key", Some("cluster-7"));
+        let json = serde_json::to_string(&auth).unwrap();
+        assert!(json.contains(r#""type":"actual_target""#), "{json}");
+        let decoded: ProviderAuth = serde_json::from_str(&json).unwrap();
+        let ProviderAuth::ActualTarget {
+            kind,
+            base_url,
+            api_key,
+            cluster_id,
+        } = decoded
+        else {
+            panic!("expected an Actual target");
+        };
+        assert_eq!(kind, ActualTargetKind::Relay);
+        assert_eq!(base_url, "https://api.actual.inc");
+        assert_eq!(api_key.as_deref(), Some("ac_key"));
+        assert_eq!(cluster_id.as_deref(), Some("cluster-7"));
+    }
+
+    #[test]
+    fn the_actual_provider_key_is_stable() {
+        // Persisted settings and account rows are keyed by this string; changing
+        // it would orphan every configured target.
+        assert_eq!(ApiProvider::Actual.as_str(), "actual");
+        assert_eq!(
+            serde_json::to_string(&ApiProvider::Actual).unwrap(),
+            r#""actual""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiProvider>(r#""actual""#).unwrap(),
+            ApiProvider::Actual
+        );
+        assert!(ApiProvider::all().contains(&ApiProvider::Actual));
     }
 }

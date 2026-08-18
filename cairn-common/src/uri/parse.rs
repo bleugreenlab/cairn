@@ -333,6 +333,11 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "posts"] => Some(CairnResource::ProjectPosts {
             project: canonical_project(project),
         }),
+        // Must precede the thread arm below: a literal `codemap` segment names
+        // this projection, not a thread of that name.
+        [PROJECT_SCOPE, project, "codemap"] => Some(CairnResource::ProjectCodemap {
+            project: canonical_project(project),
+        }),
         [PROJECT_SCOPE, project, "issues"] => Some(CairnResource::ProjectIssues {
             project: canonical_project(project),
         }),

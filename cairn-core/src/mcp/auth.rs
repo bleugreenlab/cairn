@@ -544,9 +544,13 @@ mod tests {
             "src-tauri/cairn-transport/src/auth.rs",
             "src-tauri/cairn-transport/src/runtime.rs",
             "src-tauri/cairn-transport/src/state.rs",
-            // The native desktop shell, the only reader of the bytes.
+            // The native desktop shell. `runner_client` is the only reader of
+            // the bytes; the command modules name the privileged forwarder and
+            // nothing else, so a webview reaches it without the credential ever
+            // crossing into JavaScript.
             "src-tauri/src/runner_client.rs",
             "src-tauri/src/commands/permission.rs",
+            "src-tauri/src/commands/voice.rs",
             // Test fixtures, which mint their own throwaway credentials.
             "src-tauri/cairn-runner/tests/transport.rs",
             "src-tauri/cairn-transport/src/routes/invoke/tests.rs",

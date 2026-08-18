@@ -293,7 +293,8 @@ pub(super) async fn read_project_threads(db: &LocalDb, project_key: &str) -> Str
             continue;
         };
         count += 1;
-        out.push_str(&format!("- [{name}](cairn://p/{}/{name})\n  {}Status: {status}. Attention: {attention}. Last activity: {updated_at}.\n", project.project_key, jurisdiction.map(|v| format!("Jurisdiction: {v}. ")).unwrap_or_default()));
+        let last_activity = crate::clock::age(updated_at);
+        out.push_str(&format!("- [{name}](cairn://p/{}/{name})\n  {}Status: {status}. Attention: {attention}. Last activity: {last_activity}.\n", project.project_key, jurisdiction.map(|v| format!("Jurisdiction: {v}. ")).unwrap_or_default()));
     }
     if count == 0 {
         out.push_str("No threads.\n");
@@ -665,7 +666,16 @@ mod tests {
         assert!(collection.contains("Jurisdiction: Own architecture decisions"));
         assert!(collection.contains("Status: active"));
         assert!(collection.contains("Attention: none"));
-        assert!(collection.contains("Last activity: 3"));
+        // A thread's last activity reads as an age with its absolute anchor
+        // beside it, never as the bare `updated_at` epoch it is stored as.
+        assert!(
+            collection.contains("Last activity: ") && collection.contains(" ago ("),
+            "{collection}"
+        );
+        assert!(
+            !collection.contains("Last activity: 3."),
+            "the stored epoch must not reach the surface: {collection}"
+        );
 
         let overview = read_thread(&db, "thr", "design-review", &[]).await;
         // A thread's heading is its one identifier, the same string its URI

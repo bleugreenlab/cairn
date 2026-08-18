@@ -10,6 +10,7 @@ mod response_invocations;
 mod route_fact_samples;
 mod route_firings;
 mod row;
+mod runtime_admission;
 mod search_index;
 
 pub mod authority;
@@ -58,6 +59,11 @@ pub use route_firings::{
 pub use row::{
     next_i64, next_opt_text, next_text, query_opt_i64_conn, query_opt_text_conn, query_text_conn,
     FromDbRow, RowExt,
+};
+pub use runtime_admission::{
+    enqueue_admission_request, get_admission_request, lease_next_admission,
+    lease_next_admission_with_capacity, transition_admission, AdmissionRequest,
+    NewAdmissionRequest, RuntimeResourceCapacity, RuntimeResourceClaim, DEFAULT_URGENT_BURST,
 };
 pub use search_index::{SearchIndex, SearchIndexHit};
 

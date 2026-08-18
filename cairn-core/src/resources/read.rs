@@ -1526,9 +1526,10 @@ async fn render_resource_body(
                 let view = find_query_value(&params, "view");
                 let request_id = find_query_value(&params, "request");
                 let projection_error = match (view, request_id) {
-                    (None, None) | (Some("placements"), None) | (Some("placement"), Some(_)) => {
-                        None
-                    }
+                    (None, None)
+                    | (Some("placements"), None)
+                    | (Some("placement"), Some(_))
+                    | (Some("attach-log"), None) => None,
                     (None, Some(_)) => {
                         Some("Executor request=<request-id> requires view=placement.")
                     }
@@ -1538,9 +1539,9 @@ async fn render_resource_body(
                     (Some("placement"), None) => {
                         Some("Executor view=placement requires request=<request-id>.")
                     }
-                    (Some(_), _) => {
-                        Some("Unsupported executor view. Expected placements or placement.")
-                    }
+                    (Some(_), _) => Some(
+                        "Unsupported executor view. Expected placements, placement, or attach-log.",
+                    ),
                 };
                 if let Some(error) = projection_error {
                     return error.to_string();
@@ -1559,6 +1560,13 @@ async fn render_resource_body(
                         (Some("placement"), Some(request_id)) => {
                             crate::resources::executors::render_placement(executor, request_id)
                         }
+                        // A machine whose link is up has no failed attach to
+                        // account for. The runner keeps its account only while
+                        // the machine is unattached, so this is an absence to
+                        // state rather than an empty log to render.
+                        (Some("attach-log"), _) => format!(
+                            "No attach log for executor `{name}`: it is attached and its link is up. The runner keeps an attach account only for a machine that is not reporting."
+                        ),
                         _ => unreachable!("executor projection was validated above"),
                     },
                     // A name that addresses an enrolled machine addresses
@@ -1566,6 +1574,9 @@ async fn render_resource_body(
                     // whose link is down is the silent absence this resource
                     // exists to end.
                     None => match enrolled.iter().find(|remote| remote.name == name) {
+                        Some(remote) if view == Some("attach-log") => {
+                            crate::resources::executors::render_attach_log(remote, captured_at)
+                        }
                         Some(_) if view.is_some() => format!("Placement history is unavailable for executor `{name}` because it is enrolled but not attached. Read cairn://executors/{name} for its link status."),
                         Some(remote) => crate::resources::executors::render_enrolled_remote(remote, captured_at),
                         // An enrollment in flight has reserved this name and is
@@ -1573,6 +1584,7 @@ async fn render_resource_body(
                         // for that window would make a working enrollment look
                         // like a typo.
                         None => match orch.fleet.management().operations().latest_for(&name) {
+                            Some(_) if view == Some("attach-log") => format!("No attach log for executor `{name}`: its enrollment is still in progress and no attach attempt has completed. Read cairn://executors/{name} for enrollment status."),
                             Some(_) if view.is_some() => format!("Placement history is unavailable for executor `{name}` because its enrollment is still in progress. Read cairn://executors/{name} for enrollment status."),
                             Some(operation) => crate::resources::executors::render_enrollment(&operation, captured_at),
                             None => crate::resources::executors::unknown_executor(
@@ -1617,6 +1629,9 @@ async fn render_resource_body(
                 &params,
             )
             .await
+        }
+        CairnResource::ProjectCodemap { project } => {
+            super::codemap::read_codemap(orch, db, &project, &params).await
         }
         CairnResource::ProjectThreads { project } => {
             if let Some(error) = reject_query_params("project threads", &params) {
@@ -2571,7 +2586,10 @@ async fn render_desktop_automation(orch: &Orchestrator, name: &str) -> String {
         return "\n## Desktop automation\n- Status: absent\n- This machine has never been probed for desktop automation.\n".into();
     };
     if let Some(error) = state.probe_error {
-        return format!("\n## Desktop automation\n- Status: degraded\n- Probe failed: {error}\n- Probed at: {}\n", state.probed_at);
+        return format!(
+            "\n## Desktop automation\n- Status: degraded\n- Probe failed: {error}\n- Probed: {}\n",
+            crate::clock::age_millis(state.probed_at)
+        );
     }
     if let Some(health_json) = state.health_json.as_deref() {
         match serde_json::from_str::<serde_json::Value>(health_json) {
@@ -2579,20 +2597,20 @@ async fn render_desktop_automation(orch: &Orchestrator, name: &str) -> String {
                 let reason = desktop_health_reason(&health)
                     .map(desktop_reason_sentence)
                     .unwrap_or_else(|| "the desktop daemon is not ready".into());
-                return format!("\n## Desktop automation\n- Status: degraded\n- {reason}\n- Probed at: {}\n", state.probed_at);
+                return format!("\n## Desktop automation\n- Status: degraded\n- {reason}\n- Probed: {}\n", crate::clock::age_millis(state.probed_at));
             }
-            Err(_) => return format!("\n## Desktop automation\n- Status: degraded\n- The cached desktop health document is invalid.\n- Probed at: {}\n", state.probed_at),
+            Err(_) => return format!("\n## Desktop automation\n- Status: degraded\n- The cached desktop health document is invalid.\n- Probed: {}\n", crate::clock::age_millis(state.probed_at)),
             _ => {}
         }
     }
     let tools = serde_json::from_str::<Vec<crate::mcp::gateway::McpToolDef>>(&state.verbs_json)
         .unwrap_or_default();
     if tools.is_empty() {
-        return format!("\n## Desktop automation\n- Status: absent\n- The machine was probed and advertised no desktop verbs.\n- Probed at: {}\n", state.probed_at);
+        return format!("\n## Desktop automation\n- Status: absent\n- The machine was probed and advertised no desktop verbs.\n- Probed: {}\n", crate::clock::age_millis(state.probed_at));
     }
     let mut out = format!(
-        "\n## Desktop automation\n- Status: available\n- Probed at: {}\n- Verbs:\n",
-        state.probed_at
+        "\n## Desktop automation\n- Status: available\n- Probed: {}\n- Verbs:\n",
+        crate::clock::age_millis(state.probed_at)
     );
     for tool in tools {
         out.push_str(&format!("  - cairn://executors/{name}/{}\n", tool.name));

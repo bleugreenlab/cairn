@@ -112,6 +112,11 @@ pub enum CairnResource {
     ProjectPosts {
         project: String,
     },
+    /// One project's code map: the base tree's source inventory, the import
+    /// graph over it, and per-file churn.
+    ProjectCodemap {
+        project: String,
+    },
     /// Immutable check observations addressed by a revision coordinate.
     ProjectCheckResults {
         project: String,
@@ -782,6 +787,7 @@ impl CairnResource {
             Self::Posts => ResourceKind::Posts,
             Self::Post { .. } => ResourceKind::Post,
             Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
+            Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
             Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,

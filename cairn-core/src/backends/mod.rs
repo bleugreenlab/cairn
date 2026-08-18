@@ -18,6 +18,7 @@
 //! backend maps agent-declared tool names into backend-specific allowed and
 //! disallowed lists.
 
+pub mod actual;
 mod anthropic_messages;
 pub mod catalog;
 pub mod claude;
@@ -50,6 +51,100 @@ use std::time::Duration;
 pub enum CompletionRole {
     User,
     Assistant,
+}
+
+/// Canonical descriptor for backends whose agent loop performs provider calls
+/// in-process and owns no resident provider child process.
+pub(crate) fn stateless_http_runtime_capability(lane: &str) -> RuntimeLaunchCapability {
+    RuntimeLaunchCapability {
+        class: RuntimeClass::StatelessHttp,
+        lane: RuntimeLane::new(lane),
+        host_requirement: RuntimeHostRequirement::None,
+        claim: RuntimeResourceClaim {
+            resident_process_units: 0,
+            server_instance_key: None,
+            logical_stream_units: 1,
+            estimated_memory_bytes: None,
+        },
+        supports_warm_reuse: false,
+    }
+}
+
+/// The kind of runtime whose physical cost is incurred by one launch.
+///
+/// This vocabulary is deliberately backend-neutral: admission policy branches
+/// on this enum and the accompanying claim, never on provider display names.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeClass {
+    DedicatedProcess,
+    MultiplexedServer,
+    StatelessHttp,
+}
+
+/// Stable policy lookup key published by a backend.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct RuntimeLane(pub String);
+
+impl RuntimeLane {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+/// Kind of host on which a resident runtime must physically exist.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeHostKind {
+    Runner,
+    Executor,
+}
+
+/// Placement requirement for a runtime claim. Stateless work has no resident
+/// host; current CLI and app-server processes live on the runner.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "requirement", content = "host_kind", rename_all = "snake_case")]
+pub enum RuntimeHostRequirement {
+    None,
+    ResidentOn(RuntimeHostKind),
+}
+
+/// Stable identity of the machine actually paying a resident runtime's cost.
+/// It is intentionally independent of build-executor placement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct RuntimeHostIdentity {
+    pub kind: RuntimeHostKind,
+    pub id: String,
+}
+
+/// Resource units charged for one concrete launch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeResourceClaim {
+    pub resident_process_units: u32,
+    pub server_instance_key: Option<String>,
+    pub logical_stream_units: u32,
+    pub estimated_memory_bytes: Option<u64>,
+}
+
+/// Information known only after the launch path (ordinary session versus
+/// pooled call) and backend configuration have been resolved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeLaunch {
+    pub is_ephemeral_call: bool,
+    /// Required for a multiplexed launch. This must be the same configuration /
+    /// authentication identity used to key the backend's real process pool.
+    pub server_instance_key: Option<String>,
+}
+
+/// Backend-published admission metadata for one concrete launch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLaunchCapability {
+    pub class: RuntimeClass,
+    pub lane: RuntimeLane,
+    pub host_requirement: RuntimeHostRequirement,
+    pub claim: RuntimeResourceClaim,
+    pub supports_warm_reuse: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -529,6 +624,26 @@ pub trait AgentBackend: Send + Sync {
     /// Whether this backend supports warm process retention
     fn supports_warm_processes(&self) -> bool;
 
+    /// Resolve provider-cost admission metadata for a concrete launch.
+    /// Backends with multiple launch shapes must override this method.
+    fn runtime_launch_capability(
+        &self,
+        _launch: &RuntimeLaunch,
+    ) -> Result<RuntimeLaunchCapability, String> {
+        Ok(RuntimeLaunchCapability {
+            class: RuntimeClass::DedicatedProcess,
+            lane: RuntimeLane::new("default-dedicated-process"),
+            host_requirement: RuntimeHostRequirement::ResidentOn(RuntimeHostKind::Runner),
+            claim: RuntimeResourceClaim {
+                resident_process_units: 1,
+                server_instance_key: None,
+                logical_stream_units: 1,
+                estimated_memory_bytes: None,
+            },
+            supports_warm_reuse: self.supports_warm_processes(),
+        })
+    }
+
     /// Ephemeral-call batching capability. Default is the behavior-preserving
     /// dedicated-process, unbounded shape. The calls path (only) consults this;
     /// ordinary node/task sessions never reach it.
@@ -571,6 +686,7 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
         Some("openrouter") => Box::new(openrouter::OpenRouterBackend),
         Some(opencode::OPENCODE_BACKEND_KEY) => Box::new(opencode::OpenCodeBackend),
         Some("ollama") => Box::new(ollama::OllamaBackend),
+        Some(actual::ACTUAL_BACKEND_KEY) => Box::new(actual::ActualBackend),
         _ => Box::new(claude::ClaudeBackend),
     }
 }
@@ -706,6 +822,66 @@ mod backend_failure_tests {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn backend_runtime_capabilities_describe_physical_launch_cost() {
+        let ordinary = RuntimeLaunch::default();
+
+        let claude = claude::ClaudeBackend
+            .runtime_launch_capability(&ordinary)
+            .unwrap();
+        assert_eq!(claude.class, RuntimeClass::DedicatedProcess);
+        assert_eq!(claude.lane, RuntimeLane::new("claude-cli"));
+        assert_eq!(claude.claim.resident_process_units, 1);
+        assert!(claude.claim.estimated_memory_bytes.is_some());
+        assert!(claude.supports_warm_reuse);
+
+        for capability in [
+            openrouter::OpenRouterBackend
+                .runtime_launch_capability(&ordinary)
+                .unwrap(),
+            opencode::OpenCodeBackend
+                .runtime_launch_capability(&ordinary)
+                .unwrap(),
+        ] {
+            assert_eq!(capability.class, RuntimeClass::StatelessHttp);
+            assert_eq!(capability.host_requirement, RuntimeHostRequirement::None);
+            assert_eq!(capability.claim.resident_process_units, 0);
+            assert_eq!(capability.claim.logical_stream_units, 1);
+        }
+    }
+
+    #[test]
+    fn codex_capability_distinguishes_dedicated_and_pooled_launches() {
+        let backend = codex::CodexBackend;
+        let dedicated = backend
+            .runtime_launch_capability(&RuntimeLaunch::default())
+            .unwrap();
+        assert_eq!(dedicated.class, RuntimeClass::DedicatedProcess);
+        assert_eq!(dedicated.claim.resident_process_units, 1);
+        assert!(dedicated.claim.server_instance_key.is_none());
+
+        let pooled = backend
+            .runtime_launch_capability(&RuntimeLaunch {
+                is_ephemeral_call: true,
+                server_instance_key: Some("codex-oauth:account-a".to_string()),
+            })
+            .unwrap();
+        assert_eq!(pooled.class, RuntimeClass::MultiplexedServer);
+        assert_eq!(pooled.claim.resident_process_units, 1);
+        assert_eq!(pooled.claim.logical_stream_units, 1);
+        assert_eq!(
+            pooled.claim.server_instance_key.as_deref(),
+            Some("codex-oauth:account-a")
+        );
+
+        assert!(backend
+            .runtime_launch_capability(&RuntimeLaunch {
+                is_ephemeral_call: true,
+                server_instance_key: None,
+            })
+            .is_err());
+    }
 
     // =========================================================================
     // AgentPermissions::to_legacy_str
@@ -1280,6 +1456,22 @@ pub(crate) mod tests {
         assert!(rt.allowed.contains(&"mcp__cairn__run".into()));
         // Codex disallowed is empty (Codex ignores it)
         assert!(rt.disallowed.is_empty());
+    }
+
+    #[test]
+    fn codex_call_cost_classification_does_not_require_auth_resolution() {
+        let backend = codex::CodexBackend;
+        let capability = backend
+            .runtime_launch_capability(&RuntimeLaunch {
+                is_ephemeral_call: true,
+                server_instance_key: None,
+            })
+            .expect("the pre-auth call funnel must remain launchable");
+
+        assert_eq!(capability.class, RuntimeClass::MultiplexedServer);
+        assert_eq!(capability.claim.resident_process_units, 1);
+        assert_eq!(capability.claim.logical_stream_units, 1);
+        assert_eq!(capability.claim.server_instance_key, None);
     }
 
     // =========================================================================

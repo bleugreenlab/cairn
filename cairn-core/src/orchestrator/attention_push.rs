@@ -882,6 +882,51 @@ pub async fn stamp_delivered_conn(
     Ok(stamped)
 }
 
+/// Undo a delivery whole — the carrying event and every stamp pointing at it —
+/// after the turn that was to carry it never started.
+///
+/// The stamp commits atomically with the carrying event, which on a resume is
+/// necessarily *before* the backend process exists: the pushes have to ride in
+/// the prompt that spawn carries. So every launch has a window where the rows say
+/// "delivered" and no agent has read them, and a launch can still fail inside it
+/// — no credential, no CLI binary, a refused or dormant session. Left alone the
+/// stamp seals a delivery that never happened: the push is spent, the node it was
+/// minted for is never woken for that fact again, and nothing reports it, because
+/// a spent push looks exactly like a read one. That is the silent never-wakes
+/// failure (CAIRN-2410) arriving from the delivery end rather than the routing
+/// end.
+///
+/// The event is removed along with the stamps, and that pairing is the point.
+/// Delivery is defined as "carried by a durable event", so a stamp and its event
+/// are one fact and must be undone as one: clearing only the stamp would leave a
+/// briefing in the transcript for a turn no agent ever ran, which the next
+/// successful resume then duplicates when it redelivers the same push. Undoing
+/// both restores exactly the state a rolled-back delivery transaction would have
+/// left, which is the guarantee the atomic seam already promises for a crash
+/// between injection and commit.
+///
+/// Keyed on the carrying event rather than on push ids, so it can only ever
+/// revert the delivery this launch itself wrote.
+pub async fn revert_delivery(db: &LocalDb, carrying_event_id: &str) -> DbResult<usize> {
+    let event_id = carrying_event_id.to_string();
+    db.write(|conn| {
+        let event_id = event_id.clone();
+        Box::pin(async move {
+            let restored = conn
+                .execute(
+                    "UPDATE attention_pushes SET delivered_event_id=NULL
+                     WHERE delivered_event_id=?1",
+                    params![event_id.as_str()],
+                )
+                .await? as usize;
+            conn.execute("DELETE FROM events WHERE id=?1", params![event_id.as_str()])
+                .await?;
+            Ok(restored)
+        })
+    })
+    .await
+}
+
 /// The parent's last-seen read position in the child chat `source` (the child
 /// job id whose `{node}/chat` a catch-up push renders), or `None` if the parent
 /// has never been shown catch-up for it. Catch-up resolves the start of its
@@ -1100,18 +1145,74 @@ fn text_params(values: &[String]) -> Vec<Value> {
     values.iter().cloned().map(Value::Text).collect()
 }
 
-/// Collect one column of issue ids from a set query.
-async fn issue_id_set(
-    conn: &cairn_db::turso::Connection,
-    sql: &str,
-    issue_ids: &[String],
-) -> DbResult<HashSet<String>> {
-    let mut out = HashSet::new();
-    let mut rows = conn.query(sql, text_params(issue_ids)).await?;
-    while let Some(row) = rows.next().await? {
-        out.insert(row.text(0)?);
-    }
-    Ok(out)
+/// The statement mapping a batch of issue NUMBERS to their issue rows.
+///
+/// Split out, like every statement below, so the plan regression test can plan
+/// exactly what production runs rather than a small stand-in.
+///
+/// The project key is deliberately absent from the SQL and matched in Rust
+/// instead. This planner keeps no table statistics and picks among `issues`'
+/// indexes by predicate shape alone: with a `p.key IN (...)` term present it
+/// drives from the projects key index and reaches issues through
+/// `idx_issues_project_id`, which loads EVERY issue of every named project.
+/// Measured on a live 4.9k-issue workspace that flip appears once the number
+/// list passes a few dozen entries -- so a small-batch plan assertion cannot
+/// see it and a real backlog always hits it. With no key term there is nothing
+/// else to drive from, and the numbers seek `idx_issues_number` (migration
+/// 0195), which is what ties this statement to the backlog. Matching the key in
+/// Rust also folds case through `canonical_project`, the way the channel router
+/// already does, so a project key stored capitalized still resolves.
+fn subject_issues_sql(numbers: usize) -> String {
+    format!(
+        "SELECT p.key, i.number, i.id, i.status
+           FROM issues i JOIN projects p ON p.id = i.project_id
+          WHERE i.number IN ({})",
+        placeholders(numbers)
+    )
+}
+
+/// A batch of issues' merge requests: whether each is open, and when it opened.
+///
+/// `opened_at` rides along because the review generation test needs the newest
+/// merge request per issue. Reading it here is what lets that test be a
+/// comparison in Rust instead of a correlated subquery in SQL -- see
+/// [`review_artifact_facts_sql`] for why that distinction is load-bearing.
+fn review_merge_requests_sql(issues: usize) -> String {
+    format!(
+        "SELECT issue_id, status, opened_at FROM merge_requests WHERE issue_id IN ({})",
+        placeholders(issues)
+    )
+}
+
+/// Every artifact fact the `review:` arms need for a batch of issues, in one
+/// statement.
+///
+/// It carries NO `artifact_type` predicate, and that absence is the whole point.
+/// `artifacts` has two candidate indexes and this planner has no statistics to
+/// choose between them, so any mention of `artifact_type` gives it a reason to
+/// reach for `idx_artifacts_type` -- either directly, or, once the probe also
+/// carries a correlated scalar subquery, as a `MULTI-INDEX AND` that
+/// materializes every artifact of that type and intersects it with the job's,
+/// once per job. Cost then follows artifact HISTORY rather than the backlog.
+///
+/// Measured on a live 16k-artifact workspace with a 443-push review backlog:
+/// the four `EXISTS` statements this replaced cost 8.2 seconds, of which the
+/// generation arm alone -- the only one carrying a correlated subquery -- was
+/// 8.2 of them. This shape costs 70ms. Every enabled channel provider ran that
+/// sweep independently every five seconds, so no sweep finished before the next
+/// began (CAIRN-4207).
+///
+/// With no type predicate there is nothing for `idx_artifacts_type` to serve and
+/// the only path left is the intended one, `jobs(issue_id)` into
+/// `artifacts(job_id)`. The arms then fall out of one pass over these rows,
+/// which is also why they can no longer drift apart: they read the same facts.
+fn review_artifact_facts_sql(issues: usize) -> String {
+    format!(
+        "SELECT j.issue_id, a.artifact_type, a.confirmed, a.created_at
+           FROM jobs j JOIN artifacts a ON a.job_id = j.id
+          WHERE j.issue_id IN ({})",
+        placeholders(issues)
+    )
 }
 
 /// Why a push was retired. Each value is a resolver outcome that PROVED the
@@ -1276,20 +1377,22 @@ pub async fn resolve_verdict_refs(db: &LocalDb, refs: &[(&str, &str)]) -> DbResu
 
 /// Resolve a set of distinct subjects in one read transaction.
 ///
-/// Each query is the set form of one arm of the predicate documented on
-/// [`lazy_resolve_live`]; an arm is issued only when some subject in the batch
-/// needs it. The two artifact arms stay separate statements deliberately —
-/// folding them into one `artifact_type IN ('plan', 'create-pr')` query flips
-/// the planner back to `idx_artifacts_type` and reinstates the full scan.
+/// Each arm of the predicate documented on [`lazy_resolve_live`] is answered
+/// for the whole batch at once, and an arm's statement is issued only when some
+/// subject in the batch needs it. Every statement is named above, and every one
+/// of them is an index seek keyed by something the BACKLOG supplies: the
+/// distinct issue numbers the batch names, then the distinct issue ids those
+/// resolve to. Nothing here may be keyed by a type, a status, or any other
+/// column whose cardinality is a property of the workspace rather than of the
+/// batch -- that is the difference between a bounded sweep and one whose cost
+/// grows with history (CAIRN-4207).
 async fn resolve_subjects(
     db: &LocalDb,
     subjects: &[Subject],
 ) -> DbResult<HashMap<Subject, Verdict>> {
-    let project_keys: Vec<String> = subjects
+    let project_keys: HashSet<String> = subjects
         .iter()
         .map(|subject| subject.project_key.clone())
-        .collect::<HashSet<_>>()
-        .into_iter()
         .collect();
     let numbers: Vec<i64> = subjects
         .iter()
@@ -1304,24 +1407,22 @@ async fn resolve_subjects(
         let project_keys = project_keys.clone();
         let numbers = numbers.clone();
         Box::pin(async move {
-            // 1. Subjects -> issues. The numbers drive `idx_issues_number`; the
-            //    project key is matched exactly here and again per subject
-            //    below, so a number that exists in several projects cannot
-            //    cross-resolve.
-            let sql = format!(
-                "SELECT p.key, i.number, i.id, i.status
-                   FROM issues i JOIN projects p ON p.id = i.project_id
-                  WHERE i.number IN ({}) AND p.key IN ({})",
-                placeholders(numbers.len()),
-                placeholders(project_keys.len()),
-            );
-            let mut binds: Vec<Value> = numbers.iter().copied().map(Value::Integer).collect();
-            binds.extend(text_params(&project_keys));
+            // 1. Subjects -> issues. The numbers seek `idx_issues_number`; the
+            //    project key is matched here and again per subject below, so a
+            //    number that exists in several projects cannot cross-resolve.
+            let sql = subject_issues_sql(numbers.len());
+            let binds: Vec<Value> = numbers.iter().copied().map(Value::Integer).collect();
             let mut issue_id_of: HashMap<(String, i32), String> = HashMap::new();
             let mut terminal: HashSet<String> = HashSet::new();
             let mut rows = conn.query(&sql, binds).await?;
             while let Some(row) = rows.next().await? {
-                let project_key = row.text(0)?;
+                let project_key = cairn_common::uri::canonical_project(row.text(0)?);
+                // Another project happening to use one of these numbers. The
+                // statement cannot exclude it without costing the index, so the
+                // project qualification is applied here instead.
+                if !project_keys.contains(&project_key) {
+                    continue;
+                }
                 let number = row.i64(1)? as i32;
                 let issue_id = row.text(2)?;
                 // Mirrors `crate::models::IssueStatus::is_terminal`.
@@ -1348,19 +1449,20 @@ async fn resolve_subjects(
                     .collect()
             };
 
-            // 2. `review:` arms.
+            // 2. `review:` arms, from two statements: the batch's merge
+            //    requests, then every artifact its jobs carry. Order matters --
+            //    the generation test reads the merge-request timestamps the
+            //    first pass collects.
             let review_ids = ids_for(Referent::Review);
             let mut open_mr = HashSet::new();
             let mut any_mr = HashSet::new();
+            let mut newest_mr_opened_at: HashMap<String, i64> = HashMap::new();
             let mut unconfirmed_plan = HashSet::new();
             let mut any_plan = HashSet::new();
             let mut create_pr = HashSet::new();
             let mut create_pr_awaiting_mr = HashSet::new();
             if !review_ids.is_empty() {
-                let sql = format!(
-                    "SELECT issue_id, status FROM merge_requests WHERE issue_id IN ({})",
-                    placeholders(review_ids.len())
-                );
+                let sql = review_merge_requests_sql(review_ids.len());
                 let mut rows = conn.query(&sql, text_params(&review_ids)).await?;
                 while let Some(row) = rows.next().await? {
                     let issue_id = row.text(0)?;
@@ -1371,89 +1473,72 @@ async fn resolve_subjects(
                     {
                         open_mr.insert(issue_id.clone());
                     }
+                    // `MAX(opened_at)` per issue, skipping NULLs exactly as the
+                    // aggregate does. An issue with no merge request keeps no
+                    // entry at all, which the generation test below reads as the
+                    // 0 its `COALESCE(..., 0)` used to supply.
+                    if let Some(opened_at) = row.opt_i64(2)? {
+                        newest_mr_opened_at
+                            .entry(issue_id.clone())
+                            .and_modify(|newest| *newest = (*newest).max(opened_at))
+                            .or_insert(opened_at);
+                    }
                     any_mr.insert(issue_id);
                 }
-                unconfirmed_plan = issue_id_set(
-                    conn,
-                    &format!(
-                        "SELECT j.issue_id FROM jobs j
-                          WHERE j.issue_id IN ({}) AND EXISTS (
-                                SELECT 1 FROM artifacts a
-                                 WHERE a.job_id = j.id
-                                   AND a.artifact_type = 'plan'
-                                   AND a.confirmed = 0)",
-                        placeholders(review_ids.len())
-                    ),
-                    &review_ids,
-                )
-                .await?;
-                // Terminality needs positive evidence, so "has a plan artifact"
-                // is asked separately from "has an UNCONFIRMED one". Without it,
-                // an issue that never had a plan is indistinguishable from one
-                // whose plan review completed, and only the second may retire.
-                // Deliberately the same shape as the arm above minus the
-                // `confirmed` term -- folding the two into one statement that
-                // selects `a.confirmed` flips the planner back to
-                // `idx_artifacts_type` and reinstates the full scan 0195 removed.
-                any_plan = issue_id_set(
-                    conn,
-                    &format!(
-                        "SELECT j.issue_id FROM jobs j
-                          WHERE j.issue_id IN ({}) AND EXISTS (
-                                SELECT 1 FROM artifacts a
-                                 WHERE a.job_id = j.id
-                                   AND a.artifact_type = 'plan')",
-                        placeholders(review_ids.len())
-                    ),
-                    &review_ids,
-                )
-                .await?;
-                create_pr = issue_id_set(
-                    conn,
-                    &format!(
-                        "SELECT j.issue_id FROM jobs j
-                          WHERE j.issue_id IN ({}) AND EXISTS (
-                                SELECT 1 FROM artifacts a
-                                 WHERE a.job_id = j.id
-                                   AND a.artifact_type = 'create-pr')",
-                        placeholders(review_ids.len())
-                    ),
-                    &review_ids,
-                )
-                .await?;
-                // Which review GENERATION the evidence belongs to.
-                //
-                // A `create-pr` artifact written AFTER the newest merge request
-                // opened is a review that has not got its PR row yet. Within one
-                // generation the order is always artifact-then-PR (the artifact
-                // auto-confirms on write and the PR opens milliseconds later),
-                // so a newer artifact can only mean a NEW generation.
-                //
-                // This is what keeps a rerun deliverable. An issue whose earlier
-                // run merged carries a merged `merge_requests` row forever, so
-                // "a merge request exists and none is open" is true during the
-                // next run's pre-open window too -- and retiring on that would
-                // permanently drop a review that was about to become live
-                // (CAIRN-2410's failure mode, made durable). Liveness is
-                // unchanged: this window still reads not-live, exactly as
-                // before. It is only barred from reading TERMINAL.
-                create_pr_awaiting_mr = issue_id_set(
-                    conn,
-                    &format!(
-                        "SELECT j.issue_id FROM jobs j
-                          WHERE j.issue_id IN ({}) AND EXISTS (
-                                SELECT 1 FROM artifacts a
-                                 WHERE a.job_id = j.id
-                                   AND a.artifact_type = 'create-pr'
-                                   AND a.created_at > (
-                                       SELECT COALESCE(MAX(m.opened_at), 0)
-                                         FROM merge_requests m
-                                        WHERE m.issue_id = j.issue_id))",
-                        placeholders(review_ids.len())
-                    ),
-                    &review_ids,
-                )
-                .await?;
+
+                let sql = review_artifact_facts_sql(review_ids.len());
+                let mut rows = conn.query(&sql, text_params(&review_ids)).await?;
+                while let Some(row) = rows.next().await? {
+                    let issue_id = row.text(0)?;
+                    match row.text(1)?.as_str() {
+                        "plan" => {
+                            // Terminality needs positive evidence, so "has a
+                            // plan artifact" is tracked separately from "has an
+                            // UNCONFIRMED one". Without the distinction an issue
+                            // that never had a plan is indistinguishable from
+                            // one whose plan review completed, and only the
+                            // second may retire.
+                            if row.opt_i64(2)? == Some(0) {
+                                unconfirmed_plan.insert(issue_id.clone());
+                            }
+                            any_plan.insert(issue_id);
+                        }
+                        "create-pr" => {
+                            // Which review GENERATION the evidence belongs to.
+                            //
+                            // A `create-pr` artifact written AFTER the newest
+                            // merge request opened is a review that has not got
+                            // its PR row yet. Within one generation the order is
+                            // always artifact-then-PR (the artifact auto-confirms
+                            // on write and the PR opens milliseconds later), so a
+                            // newer artifact can only mean a NEW generation.
+                            //
+                            // This is what keeps a rerun deliverable. An issue
+                            // whose earlier run merged carries a merged
+                            // `merge_requests` row forever, so "a merge request
+                            // exists and none is open" is true during the next
+                            // run's pre-open window too -- and retiring on that
+                            // would permanently drop a review that was about to
+                            // become live (CAIRN-2410's failure mode, made
+                            // durable). Liveness is unchanged: this window still
+                            // reads not-live, exactly as before. It is only
+                            // barred from reading TERMINAL.
+                            let newest_mr =
+                                newest_mr_opened_at.get(&issue_id).copied().unwrap_or(0);
+                            if row
+                                .opt_i64(3)?
+                                .is_some_and(|created_at| created_at > newest_mr)
+                            {
+                                create_pr_awaiting_mr.insert(issue_id.clone());
+                            }
+                            create_pr.insert(issue_id);
+                        }
+                        // Every other artifact type rides along in the same
+                        // index-driven read and decides nothing. Naming the two
+                        // that do in SQL is precisely what cost the index.
+                        _ => {}
+                    }
+                }
             }
 
             // 3. `question:` and `permission:` arms. Each returns the referent
@@ -1683,6 +1768,93 @@ mod tests {
             created_at: 1,
             delivered_event_id: None,
         }
+    }
+
+    /// The rendered plan for a statement, one node per line.
+    async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<Value>) -> String {
+        let sql = format!("EXPLAIN QUERY PLAN {sql}");
+        db.read(move |conn| {
+            let sql = sql.clone();
+            let binds = binds.clone();
+            Box::pin(async move {
+                let mut rows = conn.query(&sql, binds).await?;
+                let mut plan = String::new();
+                while let Some(row) = rows.next().await? {
+                    plan.push_str(&row.text(3)?);
+                    plan.push('\n');
+                }
+                Ok(plan)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Subject resolution must cost the BACKLOG, never the workspace.
+    ///
+    /// The plan is the only seam where that difference is visible. The
+    /// regression this pins returned the right rows, from the right number of
+    /// statements, in one read transaction -- every cheaper assertion passed
+    /// while a single sweep took 8.2 seconds and every enabled provider ran one
+    /// every five seconds (CAIRN-4207). Only the plan said that resolving a
+    /// 443-push backlog meant walking 16k artifacts.
+    ///
+    /// This planner keeps no table statistics and chooses among a table's
+    /// indexes by predicate SHAPE alone, so both statements below regressed on a
+    /// term that reads like a narrowing: `p.key IN (...)` on the issue
+    /// statement, and `artifact_type = 'create-pr'` under a correlated subquery
+    /// on the artifact statement. Each handed the planner a second candidate
+    /// index keyed by something the WORKSPACE sizes, and it took it.
+    ///
+    /// Batch sizes here are deliberately larger than one. The issue statement's
+    /// old plan flipped only once the number list passed a few dozen entries, so
+    /// a single-value assertion watched the regression go by.
+    #[tokio::test]
+    async fn subject_resolution_statements_stay_on_the_backlog() {
+        let db = migrated_db().await;
+        const BATCH: usize = 64;
+
+        let issues = query_plan(
+            &db,
+            &subject_issues_sql(BATCH),
+            (0..BATCH as i64).map(Value::Integer).collect(),
+        )
+        .await;
+        assert!(
+            issues.contains("idx_issues_number"),
+            "the batch's issue numbers must seek (migration 0195):\n{issues}"
+        );
+        assert!(
+            !issues.contains("idx_issues_project_id"),
+            "reaching issues through the project index loads every issue of \
+             every project the backlog names, which is the workspace:\n{issues}"
+        );
+
+        let ids: Vec<Value> = (0..BATCH)
+            .map(|n| Value::Text(format!("issue-{n}")))
+            .collect();
+
+        let facts = query_plan(&db, &review_artifact_facts_sql(BATCH), ids.clone()).await;
+        assert!(
+            facts.contains("SEARCH j USING INDEX idx_jobs_issue_id")
+                && facts.contains("SEARCH a USING INDEX idx_artifacts_job_id"),
+            "the artifact facts must be reached from the batch's issues, \
+             jobs(issue_id) into artifacts(job_id):\n{facts}"
+        );
+        assert!(
+            !facts.contains("idx_artifacts_type"),
+            "an artifact index keyed by TYPE is keyed by a property of the \
+             workspace: every plan or create-pr artifact ever written matches \
+             it, and intersecting that set per job is the 8.2-second sweep \
+             coming back. Nothing in this statement may mention \
+             artifact_type:\n{facts}"
+        );
+
+        let merge_requests = query_plan(&db, &review_merge_requests_sql(BATCH), ids).await;
+        assert!(
+            merge_requests.contains("SEARCH merge_requests USING INDEX idx_mr_issue"),
+            "the merge-request arm seeks by issue (migration 0195):\n{merge_requests}"
+        );
     }
 
     /// A drain's database cost must be a constant, not a function of how much

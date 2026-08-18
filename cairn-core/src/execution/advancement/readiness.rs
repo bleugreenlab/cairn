@@ -217,7 +217,7 @@ async fn issue_settled_conn(conn: &cairn_db::turso::Connection, issue_id: &str) 
 
     let jobs = super::persistence::load_jobs_for_issue_conn(conn, issue_id).await?;
     for job in &jobs {
-        if super::recompute::latest_turn_is_live(conn, &job.id).await? {
+        if super::recompute::turn_facts(conn, &job.id).await?.live {
             return Ok(false);
         }
         if job.status == "pending" && is_job_ready_conn(conn, job).await? {

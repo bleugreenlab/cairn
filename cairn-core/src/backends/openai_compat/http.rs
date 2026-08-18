@@ -1,7 +1,7 @@
 //! Provider-neutral streaming chat-completions transport.
 
 use super::wire::{ChatResponse, ChatStreamChunk, StreamingAggregate};
-use crate::backends::http_loop::AssistantStreamState;
+use crate::backends::http_loop::{require_terminal_event, AssistantStreamState};
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
@@ -105,6 +105,13 @@ impl Endpoint {
     }
 }
 
+/// What completion looks like on the chat-completions wire.
+///
+/// Either signal satisfies the rule because OpenAI-compatible servers are
+/// reliable about different ones: requiring the sentinel alone would fail turns
+/// that genuinely finished on a server that never sends it.
+pub(crate) const TERMINAL_EVENTS: &str = "finish_reason or [DONE]";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn post_chat_completion_streaming(
     orch: &Orchestrator,
@@ -156,6 +163,7 @@ pub(crate) fn post_chat_completion_streaming(
 
     let mut aggregate = StreamingAggregate::default();
     let mut stream_state: Option<AssistantStreamState> = None;
+    let mut saw_done_sentinel = false;
     let reader = BufReader::new(response);
     for line in reader.lines() {
         // The cancel flag is observed at SSE line boundaries. During a streaming
@@ -183,6 +191,7 @@ pub(crate) fn post_chat_completion_streaming(
             continue;
         }
         if data == "[DONE]" {
+            saw_done_sentinel = true;
             break;
         }
         let chunk: ChatStreamChunk = serde_json::from_str(data).map_err(|error| {
@@ -265,6 +274,18 @@ pub(crate) fn post_chat_completion_streaming(
         )?;
     }
 
+    // Checked after finalizing so a truncated stream does not also leave a live
+    // assistant message dangling in the UI, and before building the response so
+    // no partial generation reaches the turn loop as a whole one. The cancel flag
+    // is read here rather than taken from the loop: a cancellation requested
+    // while the reader was blocked never reaches a line boundary at all.
+    require_terminal_event(
+        endpoint.provider_name,
+        TERMINAL_EVENTS,
+        saw_done_sentinel || aggregate.finish_reason().is_some(),
+        cancel.load(Ordering::SeqCst),
+    )?;
+
     Ok(aggregate.into_response(streamed_text))
 }
 
@@ -336,5 +357,124 @@ mod tests {
         assert_eq!(body["response_format"]["type"], "json_schema");
         assert_eq!(body["response_format"]["json_schema"]["strict"], true);
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+    }
+}
+
+// === Premature end of stream ===
+
+#[cfg(test)]
+mod terminal_event_tests {
+    use super::TERMINAL_EVENTS;
+    use crate::backends::http_loop::require_terminal_event;
+    use crate::backends::openai_compat::wire::{ChatStreamChunk, StreamingAggregate};
+
+    const PROVIDER: &str = "Actual";
+
+    /// Replay an SSE fixture through the same parse-and-aggregate steps the
+    /// streaming loop uses, and report whether the protocol said it was done.
+    /// Everything between the socket and the completion verdict, with no HTTP.
+    fn replay(fixture: &str) -> (StreamingAggregate, bool) {
+        let mut aggregate = StreamingAggregate::default();
+        let mut saw_done_sentinel = false;
+        for line in fixture.lines() {
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                saw_done_sentinel = true;
+                break;
+            }
+            let chunk: ChatStreamChunk =
+                serde_json::from_str(data).unwrap_or_else(|error| panic!("{data}: {error}"));
+            aggregate.apply_chunk(&chunk);
+        }
+        (aggregate, saw_done_sentinel)
+    }
+
+    fn verdict(fixture: &str) -> Result<(), String> {
+        let (aggregate, saw_done_sentinel) = replay(fixture);
+        require_terminal_event(
+            PROVIDER,
+            TERMINAL_EVENTS,
+            saw_done_sentinel || aggregate.finish_reason().is_some(),
+            false,
+        )
+    }
+
+    const TEXT_CUT_OFF: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Deleting \"}}]}\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"nothing\"}}]}\n",
+    );
+
+    const FINISH_REASON_NO_SENTINEL: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n",
+    );
+
+    const SENTINEL_NO_FINISH_REASON: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"}}]}\n",
+        "data: [DONE]\n",
+    );
+
+    /// A tool call whose arguments stopped arriving partway through. This is the
+    /// case the invariant exists for: the JSON is a valid prefix, so nothing
+    /// downstream can tell it was cut off.
+    const TOOL_CALL_CUT_OFF: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"run\",\"arguments\":\"\"}}]}}]}\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"command\\\": \\\"rm -rf \"}}]}}]}\n",
+    );
+
+    #[test]
+    fn a_connection_that_closes_mid_generation_is_not_a_finished_turn() {
+        let error =
+            verdict(TEXT_CUT_OFF).expect_err("a stream with no terminal event is truncated");
+        assert!(error.contains(PROVIDER), "names the provider: {error}");
+        assert!(
+            error.contains("finish_reason") && error.contains("[DONE]"),
+            "says which terminal events were missing: {error}"
+        );
+    }
+
+    #[test]
+    fn a_tool_call_cut_off_mid_arguments_is_refused_rather_than_dispatched() {
+        // Left to the byte stream this looks like a complete turn carrying one
+        // tool call, and the truncated argument JSON is a valid prefix of the
+        // real one. Dispatching it would run a command the model never finished
+        // asking for.
+        assert!(
+            verdict(TOOL_CALL_CUT_OFF).is_err(),
+            "a half-streamed tool call must not reach the turn loop"
+        );
+    }
+
+    #[test]
+    fn a_terminal_finish_reason_completes_a_stream_that_sends_no_sentinel() {
+        // Not every OpenAI-compatible server emits `[DONE]`; requiring the
+        // sentinel alone would fail turns that genuinely finished.
+        assert!(verdict(FINISH_REASON_NO_SENTINEL).is_ok());
+    }
+
+    #[test]
+    fn the_done_sentinel_completes_a_stream_that_reports_no_finish_reason() {
+        assert!(verdict(SENTINEL_NO_FINISH_REASON).is_ok());
+    }
+
+    #[test]
+    fn cancellation_is_the_explicit_early_exit_and_is_never_truncation() {
+        // A cancelled turn ends without a terminal event by construction. That
+        // is the user's decision, not a broken stream, so it must not surface
+        // as a provider error.
+        let (aggregate, saw_done_sentinel) = replay(TEXT_CUT_OFF);
+        assert!(require_terminal_event(
+            PROVIDER,
+            TERMINAL_EVENTS,
+            saw_done_sentinel || aggregate.finish_reason().is_some(),
+            true,
+        )
+        .is_ok());
     }
 }

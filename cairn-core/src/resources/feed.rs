@@ -115,7 +115,7 @@ async fn render_markdown(db: &LocalDb, uri: &str, page: &FeedPage) -> String {
         page.remaining_unread,
         page.posts
             .iter()
-            .map(|post| super::posts::render_post(post, &context))
+            .map(|post| super::posts::render_post(post, &context, super::posts::PostForm::Read))
             .collect::<Vec<_>>()
             .join("\n"),
         ack_instruction(uri, token),

@@ -65,6 +65,32 @@ struct ClaudeLaunchContract {
     env: HashMap<String, String>,
 }
 
+fn terminal_result_is_rate_limit(data: &serde_json::Value) -> bool {
+    data.get("api_error_status")
+        .and_then(serde_json::Value::as_u64)
+        == Some(429)
+}
+
+fn terminal_rate_limit_snapshot() -> ProviderUsageSnapshot {
+    ProviderUsageSnapshot {
+        backend: "claude".to_string(),
+        source: "claude_terminal_429".to_string(),
+        captured_at: chrono::Utc::now().timestamp(),
+        windows: vec![ProviderUsageWindow {
+            id: "claude".to_string(),
+            label: "Rate limit (HTTP 429)".to_string(),
+            scope: ProviderUsageScope::RollingWindow,
+            scope_target: None,
+            used_percent: 100.0,
+            remaining_percent: 0.0,
+            resets_at: None,
+            reset_at_text: None,
+            window_duration_mins: None,
+        }],
+        ..Default::default()
+    }
+}
+
 fn sanitize_mcp_diagnostic(line: &str) -> String {
     let policy = crate::security::sanitize::RedactionPolicy::default();
     let mut sanitizer = crate::security::sanitize::Sanitizer::structural(&policy);
@@ -248,11 +274,7 @@ pub(crate) fn claude_call_concurrency_ceiling(total_ram_bytes: u64) -> usize {
 /// a rate limit. The generic case stays neutral because a terminal result can
 /// arrive before or after a tool call and this payload does not prove which.
 fn terminal_result_error_message(data: &serde_json::Value) -> &'static str {
-    if data
-        .get("api_error_status")
-        .and_then(serde_json::Value::as_u64)
-        == Some(429)
-    {
+    if terminal_result_is_rate_limit(data) {
         "The provider refused the request because its rate limit was reached (HTTP 429). The turn is interrupted and resumable once provider capacity is available."
     } else {
         "The provider returned a terminal error. The turn is interrupted and resumable."
@@ -898,13 +920,14 @@ enum EofVerdict {
 fn classify_eof(
     was_warm: bool,
     saw_terminal_result: bool,
+    saw_blocking_rate_limit: bool,
     run_status: Option<&str>,
     terminal_tool_called: bool,
     is_task_spawned: bool,
 ) -> EofVerdict {
     // Host already warmed the process, or it emitted a terminal Result before
     // closing stdout: it completed. Closing stdout afterward is never a crash.
-    if was_warm || saw_terminal_result {
+    if was_warm || (saw_terminal_result && !saw_blocking_rate_limit) {
         return EofVerdict::Exited;
     }
     // Task-spawned run that called its terminal tool but exited before a Result.
@@ -931,7 +954,6 @@ fn classify_eof(
 
 #[derive(Debug)]
 struct RateLimitRetryTarget {
-    job_id: String,
     session_id: String,
     turn_id: String,
     project_id: Option<String>,
@@ -947,7 +969,7 @@ fn rate_limit_retry_target(
     run_backend_db(CLAUDE_BACKEND_NAME, async move {
         db.read(|conn| Box::pin(async move {
             let mut rows = conn.query(
-                "SELECT j.id, j.current_session_id, j.current_turn_id, COALESCE(r.project_id, i.project_id), s.account_id
+                "SELECT j.current_session_id, j.current_turn_id, COALESCE(r.project_id, i.project_id), s.account_id
                    FROM runs r
                    JOIN jobs j ON j.id = r.job_id
                    LEFT JOIN issues i ON i.id = r.issue_id
@@ -957,12 +979,12 @@ fn rate_limit_retry_target(
                 (run_id.as_str(),),
             ).await?;
             let Some(row) = rows.next().await? else { return Ok(None); };
-            let Some(session_id) = row.opt_text(1)? else { return Ok(None); };
-            let Some(turn_id) = row.opt_text(2)? else { return Ok(None); };
-            let Some(account_id) = row.opt_text(4)? else { return Ok(None); };
+            let Some(session_id) = row.opt_text(0)? else { return Ok(None); };
+            let Some(turn_id) = row.opt_text(1)? else { return Ok(None); };
+            let Some(account_id) = row.opt_text(3)? else { return Ok(None); };
             Ok(Some(RateLimitRetryTarget {
-                job_id: row.text(0)?, session_id, turn_id,
-                project_id: row.opt_text(3)?, account_id,
+                session_id, turn_id,
+                project_id: row.opt_text(2)?, account_id,
             }))
         })).await.map_err(|error| error.to_string())
     })
@@ -1331,8 +1353,13 @@ impl AgentBackend for ClaudeBackend {
             config.system_prompt_content.as_deref(),
             config.system_prompt_dynamic_tail.as_deref(),
         );
-        let system_prompt_path =
-            write_system_prompt_file(&config.run_id, &flatten_prompt_segments(&prompt_segments))?;
+        // `working_dir` is this run's process residence — the job scratch dir the
+        // CLI runs in, which is writable under the fence and reclaimed with the job.
+        let system_prompt_path = write_system_prompt_file(
+            std::path::Path::new(&config.working_dir),
+            &config.run_id,
+            &flatten_prompt_segments(&prompt_segments),
+        )?;
 
         persist_system_prompt_event(
             orch,
@@ -1629,6 +1656,28 @@ impl AgentBackend for ClaudeBackend {
 
     fn supports_warm_processes(&self) -> bool {
         true
+    }
+
+    fn runtime_launch_capability(
+        &self,
+        _launch: &crate::backends::RuntimeLaunch,
+    ) -> Result<crate::backends::RuntimeLaunchCapability, String> {
+        use crate::backends::{
+            RuntimeClass, RuntimeHostKind, RuntimeHostRequirement, RuntimeLane,
+            RuntimeLaunchCapability, RuntimeResourceClaim,
+        };
+        Ok(RuntimeLaunchCapability {
+            class: RuntimeClass::DedicatedProcess,
+            lane: RuntimeLane::new("claude-cli"),
+            host_requirement: RuntimeHostRequirement::ResidentOn(RuntimeHostKind::Runner),
+            claim: RuntimeResourceClaim {
+                resident_process_units: 1,
+                server_instance_key: None,
+                logical_stream_units: 1,
+                estimated_memory_bytes: Some(450 * 1024 * 1024),
+            },
+            supports_warm_reuse: true,
+        })
     }
 
     fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
@@ -1951,6 +2000,7 @@ impl ClaudeBackend {
         let mut saw_terminal_result = false;
         let mut saw_rate_limit_event = false;
         let mut saw_blocking_rate_limit = false;
+        let mut persisted_rate_limit_quarantine = false;
         let mut last_event_kind: &'static str = "none";
 
         log::trace!("reader_thread: about to read lines");
@@ -2186,12 +2236,17 @@ impl ClaudeBackend {
                                 let blocked_until = rate_limit_info
                                     .resets_at
                                     .or(rate_limit_info.overage_resets_at);
-                                if let Err(error) = orch.record_account_health(
+                                match orch.record_account_health(
                                     &target.account_id,
                                     snapshot.windows,
                                     blocked_until,
                                 ) {
-                                    log::warn!("Failed to record Claude account block: {error}");
+                                    Ok(_) => persisted_rate_limit_quarantine = true,
+                                    Err(error) => {
+                                        log::warn!(
+                                            "Failed to record Claude account block: {error}"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2822,6 +2877,24 @@ impl ClaudeBackend {
 
                     // Check for turn completion
                     if let ClaudeEvent::Result { is_error, data, .. } = &event {
+                        let terminal_rate_limit = *is_error && terminal_result_is_rate_limit(data);
+                        if terminal_rate_limit {
+                            saw_blocking_rate_limit = true;
+                            let snapshot = terminal_rate_limit_snapshot();
+                            orch.store_provider_usage_snapshot(snapshot.clone());
+                            if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
+                                match orch.record_account_health(
+                                    &target.account_id,
+                                    snapshot.windows,
+                                    None,
+                                ) {
+                                    Ok(_) => persisted_rate_limit_quarantine = true,
+                                    Err(error) => {
+                                        log::warn!("Failed to record Claude account block from terminal 429: {error}");
+                                    }
+                                }
+                            }
+                        }
                         // The terminal-tool boundary interrupt's ack is the next
                         // Result after we sent it. Consume the expectation on any
                         // Result so it can never leak into a later turn's outcome.
@@ -2840,7 +2913,7 @@ impl ClaudeBackend {
                                 "Swallowed terminal-tool interrupt ack for run {} (work turn already warmed)",
                                 &run_id[..run_id.len().min(8)]
                             );
-                        } else if *is_error {
+                        } else if *is_error && !terminal_rate_limit {
                             // Host-initiated interrupts (durable dependency wait via
                             // suspend_run_for_durable_wait, or user stop_session) flip the
                             // process occupancy to Idle before Claude's interrupt-induced
@@ -3002,6 +3075,7 @@ impl ClaudeBackend {
         match classify_eof(
             was_warm,
             saw_terminal_result,
+            saw_blocking_rate_limit,
             run_status_val.as_deref(),
             terminal_tool_called,
             task_spawned,
@@ -3032,7 +3106,7 @@ impl ClaudeBackend {
                      saw_blocking_rate_limit={saw_blocking_rate_limit} run_status={run_status_val:?}"
                 );
 
-                if saw_blocking_rate_limit {
+                if saw_blocking_rate_limit && persisted_rate_limit_quarantine {
                     if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
                         if let Some((replacement_id, _)) = orch.select_routed_identity(
                             crate::identity::RoutedProvider::Claude,
@@ -3066,55 +3140,26 @@ impl ClaudeBackend {
                                 }
                             });
                             if repinned.is_ok() {
-                                // Remove the exhausted process before launching its immediate successor.
-                                if let Ok(mut processes) = orch.process_state.processes.lock() {
-                                    processes.remove(run_id);
-                                }
-                                crate::orchestrator::lifecycle::fail_run(
+                                let message = format!(
+                                    "Rate limit reached on {old_label}. Switched this session to {new_label}; continue once to resume safely."
+                                );
+                                let _ = crate::messages::transcript::insert_system_message_sync(
                                     orch,
                                     run_id,
-                                    "rate_limit_switch",
+                                    session_id.as_deref(),
+                                    Some(&target.turn_id),
+                                    &message,
+                                    serde_json::json!({"provider":"claude","kind":"rate_limit_account_switch","fromAccountId":target.account_id,"toAccountId":replacement_id,"automaticResume":false}),
                                 );
-                                if let Ok(Some(retry_turn_id)) =
-                                    crate::execution::jobs::claim_retry_successor_if_head_matches(
-                                        orch,
-                                        run_db.clone(),
-                                        &target.job_id,
-                                        &target.session_id,
-                                        &target.turn_id,
-                                    )
-                                {
-                                    let message = format!("Rate limit reached on {old_label}. Continuing on {new_label}.");
-                                    let _ = crate::messages::transcript::insert_system_message_sync(
-                                        orch,
-                                        run_id,
-                                        session_id.as_deref(),
-                                        Some(&target.turn_id),
-                                        &message,
-                                        serde_json::json!({"provider":"claude","kind":"rate_limit_account_switch","fromAccountId":target.account_id,"toAccountId":replacement_id}),
-                                    );
-                                    if let Err(error) =
-                                        crate::execution::jobs::continue_automatic_retry(
-                                            orch,
-                                            &target.job_id,
-                                            &retry_turn_id,
-                                        )
-                                    {
-                                        log::warn!(
-                                            "Claude account failover retry did not launch: {error}"
-                                        );
-                                        let _ = crate::execution::jobs::abandon_pending_retry_if_head_matches(run_db.clone(), &target.job_id, &retry_turn_id);
-                                    }
-                                    return;
-                                }
-                                return;
                             }
                         }
                     }
                 }
 
-                let error_message = if saw_blocking_rate_limit {
-                    "Process exited after the account rate limit was reached, before completing the turn. The turn is interrupted and resumable once the limit resets."
+                let error_message = if saw_blocking_rate_limit && persisted_rate_limit_quarantine {
+                    "Process exited after the account rate limit was reached, before completing the turn. The exhausted profile was quarantined; continue once provider capacity is available to resume safely."
+                } else if saw_blocking_rate_limit {
+                    "Process exited after the account rate limit was reached, but Cairn could not persist the account quarantine. The turn remains interrupted on its existing profile; retry after provider capacity returns."
                 } else if backend_failure == Some(BackendFailure::SessionUnresolvable) {
                     // Deliberately descriptive rather than promissory: the
                     // digest-reseed fallback in `finalize_run` may decline (an
@@ -3413,7 +3458,7 @@ mod terminal_tool_tests {
     fn classify_eof_warm_is_exited() {
         // Host-warmed (interrupt/eviction) closes stdout: completed, not a crash.
         assert_eq!(
-            classify_eof(true, false, Some("running"), false, false),
+            classify_eof(true, false, false, Some("running"), false, false),
             EofVerdict::Exited
         );
     }
@@ -3423,8 +3468,16 @@ mod terminal_tool_tests {
         // A run that emitted a terminal Result and then closed stdout completed,
         // regardless of occupancy — belt-and-suspenders over the warm path.
         assert_eq!(
-            classify_eof(false, true, Some("running"), false, false),
+            classify_eof(false, true, false, Some("running"), false, false),
             EofVerdict::Exited
+        );
+    }
+
+    #[test]
+    fn classify_eof_terminal_429_remains_interrupted_for_rollover() {
+        assert_eq!(
+            classify_eof(false, true, true, Some("running"), false, false),
+            EofVerdict::Crashed
         );
     }
 
@@ -3436,7 +3489,7 @@ mod terminal_tool_tests {
         // the verdict — finalizing Exited would wrongly complete the turn and
         // advance downstream onto work the blocked account never finished.
         assert_eq!(
-            classify_eof(false, false, Some("running"), false, false),
+            classify_eof(false, false, false, Some("running"), false, false),
             EofVerdict::Crashed
         );
     }
@@ -3444,7 +3497,7 @@ mod terminal_tool_tests {
     #[test]
     fn classify_eof_task_spawned_terminal_tool_is_exited() {
         assert_eq!(
-            classify_eof(false, false, Some("running"), true, true),
+            classify_eof(false, false, false, Some("running"), true, true),
             EofVerdict::Exited
         );
     }
@@ -3452,7 +3505,7 @@ mod terminal_tool_tests {
     #[test]
     fn classify_eof_already_terminal_when_not_running() {
         assert_eq!(
-            classify_eof(false, false, Some("exited"), false, false),
+            classify_eof(false, false, false, Some("exited"), false, false),
             EofVerdict::AlreadyTerminal
         );
     }

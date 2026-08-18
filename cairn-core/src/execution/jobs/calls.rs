@@ -262,13 +262,10 @@ pub(crate) fn prepare_call_run(
 /// Start (or queue) a prepared call run. Split from [`prepare_call_run`] so the
 /// call packet is persisted first.
 ///
-/// This is the ONLY consumer of call admission (`CallAdmission`). Ordinary
-/// node/task sessions call `start_agent_session` directly and never reach here.
-/// The backend's [`crate::backends::CallBatchCapability::max_concurrency`] is the
-/// ceiling. `None` (Codex, OpenRouter) makes `admit` a pure passthrough that
-/// starts immediately and tracks nothing; a bounded ceiling (Claude — derived
-/// from physical RAM, CAIRN-2557) admits up to the cap and queues the rest,
-/// with `on_call_run_finalized` promoting queued calls as slots free.
+/// This is the ONLY consumer of the legacy calls-only admission ledger. Runtime
+/// cost and lane identity come from the backend's shared launch capability; the
+/// old batch descriptor is consulted only for its temporary local ceiling until
+/// promotion moves entirely to the durable runtime-admission service.
 pub(crate) fn start_call_run(
     orch: &Orchestrator,
     prepared: &PreparedCallRun,
@@ -277,11 +274,20 @@ pub(crate) fn start_call_run(
     // admission on that backend's canonical name so it can never charge a
     // different backend than the session actually launches.
     let backend = crate::backends::backend_for_name(admission_backend_name(prepared).as_deref());
-    let ceiling = backend.call_batch_capability().max_concurrency;
+    let capability = backend.runtime_launch_capability(&crate::backends::RuntimeLaunch {
+        is_ephemeral_call: true,
+        server_instance_key: None,
+    })?;
+    // A launch that adds no resident process is not constrained by the legacy
+    // process-slot ledger. In particular this prevents stateless HTTP fan-out and
+    // pooled-server stream reuse from competing with dedicated CLI processes.
+    let ceiling = (capability.claim.resident_process_units > 0)
+        .then(|| backend.call_batch_capability().max_concurrency)
+        .flatten();
 
     match orch
         .call_admission
-        .admit(backend.name(), ceiling, prepared)?
+        .admit(&capability.lane.0, ceiling, prepared)?
     {
         Admission::StartNow => {
             if let Err(e) = start_call_run_now(orch, prepared) {

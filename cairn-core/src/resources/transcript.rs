@@ -482,7 +482,7 @@ fn format_single_event(
         output.push_str("**Change Preview:**\n");
         output.push_str(&format!("- Status: `{}`\n", status));
         if let Some(applied_at) = change_applied_at {
-            output.push_str(&format!("- Applied at: `{}`\n", applied_at));
+            output.push_str(&format!("- Applied: {}\n", crate::clock::age(applied_at)));
         }
         if status == "pending" {
             output.push_str(

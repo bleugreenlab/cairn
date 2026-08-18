@@ -12,6 +12,7 @@ use cairn_common::executor_protocol::{
     OwnerDeathPolicy, ResidencyFootprint, ResidentProcessEvent, ResidentProcessEventKind,
     ResidentProcessStatus, ResidentProcessStream,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
@@ -36,7 +37,53 @@ pub(crate) fn placed_desktop_facade(
     executor_name: &str,
     binary: impl Into<String>,
 ) -> Arc<dyn PlacedFacade> {
-    desktop_facade(orch, executor_name, binary)
+    orch.desktop_facades
+        .facade(orch, executor_name, &binary.into())
+}
+
+/// One desktop facade per machine, held for as long as that machine has desktop
+/// automation enabled.
+///
+/// A facade caches its lease in a `OnceCell`, which is only a cache if the
+/// facade itself outlives the call. It did not: the probe loop and every
+/// desktop verb each built a fresh facade, so each acquired another residency
+/// under the one `desktop-automation:<machine>` holder. Because a holder is a
+/// single name, every new lease invalidated the previous one's fence and its
+/// renewal loop recovered by reacquiring, displacing the next — a herd that
+/// grew by one member per probe and filled the machine's admission queue with
+/// interactive residency traffic until real work could not be admitted
+/// (CAIRN-4205). Keying facades by machine is what makes the lifetime this
+/// module documents true rather than aspirational.
+#[derive(Default)]
+pub(crate) struct DesktopFacadeRegistry {
+    facades: std::sync::Mutex<HashMap<String, Arc<DesktopFacade>>>,
+}
+
+impl DesktopFacadeRegistry {
+    fn facade(&self, orch: &Orchestrator, executor_name: &str, binary: &str) -> Arc<DesktopFacade> {
+        let mut facades = self.facades.lock().unwrap();
+        if let Some(held) = facades.get(executor_name) {
+            // A reconfigured binary is a different service to place, so the old
+            // facade is retired rather than reused. Dropping it stops its
+            // renewal loop, which is the only thing keeping its residency alive.
+            if held.binary == binary {
+                return held.clone();
+            }
+        }
+        let facade = desktop_facade(orch, executor_name, binary.to_string());
+        facades.insert(executor_name.to_string(), facade.clone());
+        facade
+    }
+
+    /// Forget this machine's facade, stopping its renewal loop.
+    ///
+    /// Called when desktop automation is turned off for a machine. The residency
+    /// is not released synchronously because nothing is waiting on the release;
+    /// the executor reclaims it under the lease's own death policy, which is the
+    /// mechanism that already covers a runner that exits without releasing.
+    fn forget(&self, executor_name: &str) {
+        self.facades.lock().unwrap().remove(executor_name);
+    }
 }
 
 fn desktop_facade(
@@ -128,8 +175,11 @@ pub async fn probe_attached_desktops(orch: &Orchestrator) -> usize {
         );
         if desktop.enabled {
             probe_desktop(orch, &executor.name, desktop.binary).await;
-        } else if let Some(gateway) = orch.mcp_gateway() {
-            gateway.close_placed(&executor.name).await;
+        } else {
+            orch.desktop_facades.forget(&executor.name);
+            if let Some(gateway) = orch.mcp_gateway() {
+                gateway.close_placed(&executor.name).await;
+            }
         }
     }
     attached
@@ -139,7 +189,7 @@ pub async fn probe_desktop(orch: &Orchestrator, name: &str, binary: String) {
     let Some(gateway) = orch.mcp_gateway() else {
         return;
     };
-    let facade = desktop_facade(orch, name, binary.clone());
+    let facade = orch.desktop_facades.facade(orch, name, &binary);
     let result = probe_with_facade(gateway, facade, &binary).await;
     let state = match result {
         Ok((health, Ok(tools))) => cairn_db::storage::ExecutorDesktopAutomation {
@@ -376,6 +426,43 @@ mod tests {
             process_generation: 1,
             event,
         }
+    }
+
+    /// One machine, one facade, therefore one service residency.
+    ///
+    /// The probe loop and every desktop verb both reach for a machine's facade.
+    /// While each built its own, each acquired another lease on the single
+    /// `desktop-automation:<machine>` holder, and the losers' renewal loops
+    /// fought to take it back (CAIRN-4205).
+    #[tokio::test]
+    async fn a_machine_keeps_one_facade_across_probes_and_verbs() {
+        let (orch, _config) = super::super::service_placement::tests::attached_orchestrator().await;
+        let registry = DesktopFacadeRegistry::default();
+
+        let probe = registry.facade(&orch, "local", "axon");
+        let verb = registry.facade(&orch, "local", "axon");
+        assert!(
+            Arc::ptr_eq(&probe, &verb),
+            "a second facade for a machine is a second claimant on one holder"
+        );
+
+        let elsewhere = registry.facade(&orch, "bglab-mac", "axon");
+        assert!(
+            !Arc::ptr_eq(&probe, &elsewhere),
+            "each machine places its own desktop residency"
+        );
+
+        let reconfigured = registry.facade(&orch, "local", "axon-next");
+        assert!(
+            !Arc::ptr_eq(&probe, &reconfigured),
+            "a different binary is a different service to place"
+        );
+
+        registry.forget("local");
+        assert!(
+            !Arc::ptr_eq(&reconfigured, &registry.facade(&orch, "local", "axon-next")),
+            "turning desktop automation off must drop the facade holding the lease"
+        );
     }
 
     #[tokio::test]

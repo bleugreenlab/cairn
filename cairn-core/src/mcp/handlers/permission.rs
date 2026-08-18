@@ -400,19 +400,16 @@ async fn emit_permission_attention(
         return;
     };
     let services = &orch.services;
-    let issue_title = match ctx.issue_id.as_deref() {
-        Some(issue_id) => get_issue_title(&orch.db.local, issue_id).await,
-        None => None,
-    };
+    let home_uri = crate::jobs::queries::home_uri_for_job(&orch.db.local, &ctx.job_id)
+        .await
+        .ok()
+        .flatten();
     emit_attention(
         &*services.emitter,
         &AttentionEvent {
             attention_type: "permission",
             project_key: &ctx.project_key,
-            issue_number: ctx.issue_number,
-            issue_title: issue_title.as_deref(),
-            node_name: ctx.job_name.as_deref(),
-            exec_seq: ctx.exec_seq,
+            home_uri: home_uri.as_deref(),
             tool_name: Some(tool_name),
         },
     );
@@ -3148,10 +3145,13 @@ mod tests {
     async fn migrated_telegram_winner_is_executed_by_a_desktop_retry() {
         let root = tempfile::tempdir().unwrap().keep();
         let local = LocalDb::open(root.join("test.db")).await.unwrap();
-        let (migration_0190, before_0190) = TURSO_MIGRATIONS
-            .split_last()
-            .expect("migration 0190 is the final local migration");
-        MigrationRunner::new(before_0190.to_vec())
+        const CANONICALIZE_CHANNEL_ANSWERS: &str = "0190_canonicalize_channel_permission_answers";
+        let cut = TURSO_MIGRATIONS
+            .iter()
+            .position(|migration| migration.name() == CANONICALIZE_CHANNEL_ANSWERS)
+            .expect("the canonicalizing migration is registered");
+        let canonicalize = TURSO_MIGRATIONS[cut];
+        MigrationRunner::new(TURSO_MIGRATIONS[..cut].to_vec())
             .run(&local)
             .await
             .unwrap();
@@ -3175,11 +3175,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            MigrationRunner::new(vec![*migration_0190])
+            MigrationRunner::new(vec![canonicalize])
                 .run(&orch.db.local)
                 .await
                 .unwrap(),
-            vec!["0190_canonicalize_channel_permission_answers".to_string()]
+            vec![CANONICALIZE_CHANNEL_ANSWERS.to_string()]
         );
         assert_eq!(
             crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")

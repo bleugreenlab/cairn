@@ -28,6 +28,7 @@ use cairn_common::uri::{
     build_node_chat_uri, build_project_messages_uri, build_project_uri, build_task_artifact_uri,
     build_task_chat_turn_uri, build_task_chat_uri,
 };
+use cairn_db::turso::{Row, Value};
 use std::collections::HashMap;
 
 /// Ceiling the search index enforces on a single query.
@@ -750,54 +751,63 @@ fn unique<'a>(values: impl Iterator<Item = Option<&'a String>>) -> Vec<String> {
     ids
 }
 
+/// Resolve one lookup table for a set of ids in a single query.
+///
+/// `build_sql` receives the `?1, ?2, …` placeholder list bound to `ids`, and
+/// `map` turns each returned row into its key and value. An id with no row is
+/// simply absent from the map: a hit whose referent has since been deleted
+/// loses that context rather than failing the search.
+///
+/// Every caller's ids come from one page of index hits, which the index caps at
+/// [`MAX_INDEX_LIMIT`] per lane, so the bound parameter count stays small.
+async fn load_by_ids<T, F>(
+    db: &LocalDb,
+    ids: &[String],
+    build_sql: impl FnOnce(&str) -> String,
+    map: F,
+) -> Result<HashMap<String, T>, String>
+where
+    F: Fn(&Row) -> Result<(String, T), DbError> + Send + 'static,
+    T: Send + 'static,
+{
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = (1..=ids.len())
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let params: Vec<Value> = ids.iter().cloned().map(Value::Text).collect();
+    db.query_all(build_sql(&placeholders), params, map)
+        .await
+        .map(|rows| rows.into_iter().collect())
+        .map_err(storage_error)
+}
+
 async fn load_project_keys(
     db: &LocalDb,
     project_ids: Vec<String>,
 ) -> Result<HashMap<String, String>, String> {
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut map = HashMap::new();
-            for project_id in project_ids {
-                let mut rows = conn
-                    .query(
-                        "SELECT key FROM projects WHERE id = ?1",
-                        (project_id.as_str(),),
-                    )
-                    .await?;
-                if let Some(row) = rows.next().await? {
-                    map.insert(project_id, row.text(0)?);
-                }
-            }
-            Ok(map)
-        })
-    })
+    load_by_ids(
+        db,
+        &project_ids,
+        |placeholders| format!("SELECT id, key FROM projects WHERE id IN ({placeholders})"),
+        |row| Ok((row.text(0)?, row.text(1)?)),
+    )
     .await
-    .map_err(storage_error)
 }
 
 async fn load_issue_info(
     db: &LocalDb,
     issue_ids: Vec<String>,
 ) -> Result<HashMap<String, (i32, String)>, String> {
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut map = HashMap::new();
-            for issue_id in issue_ids {
-                let mut rows = conn
-                    .query(
-                        "SELECT number, title FROM issues WHERE id = ?1",
-                        (issue_id.as_str(),),
-                    )
-                    .await?;
-                if let Some(row) = rows.next().await? {
-                    map.insert(issue_id, (row.i64(0)? as i32, row.text(1)?));
-                }
-            }
-            Ok(map)
-        })
-    })
+    load_by_ids(
+        db,
+        &issue_ids,
+        |placeholders| format!("SELECT id, number, title FROM issues WHERE id IN ({placeholders})"),
+        |row| Ok((row.text(0)?, (row.i64(1)? as i32, row.text(2)?))),
+    )
     .await
-    .map_err(storage_error)
 }
 
 /// Load the addressable coordinates for each hit's job.
@@ -810,52 +820,47 @@ async fn load_job_nav(
     db: &LocalDb,
     job_ids: Vec<String>,
 ) -> Result<HashMap<String, JobNav>, String> {
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut map = HashMap::new();
-            for job_id in job_ids {
-                let mut rows = conn
-                    .query(
-                        "SELECT COALESCE(parent.uri_segment, job.uri_segment),
-                                CASE WHEN job.parent_job_id IS NULL THEN NULL ELSE job.uri_segment END,
-                                COALESCE(exec.seq, parent_exec.seq),
-                                (SELECT run.session_id
-                                   FROM runs run
-                                  WHERE run.job_id = job.id
-                                  ORDER BY run.created_at ASC
-                                  LIMIT 1),
-                                thread.name
-                           FROM jobs job
-                           LEFT JOIN jobs parent ON parent.id = job.parent_job_id
-                           LEFT JOIN executions exec ON exec.id = job.execution_id
-                           LEFT JOIN executions parent_exec ON parent_exec.id = parent.execution_id
-                           LEFT JOIN threads thread
-                                  ON thread.id = COALESCE(job.thread_id, parent.thread_id)
-                          WHERE job.id = ?1",
-                        (job_id.as_str(),),
-                    )
-                    .await?;
-                if let Some(row) = rows.next().await? {
-                    let thread_name = row.opt_text(4)?;
-                    map.insert(
-                        job_id,
-                        JobNav {
-                            // A thread's own segment reads `thread`; the name is
-                            // what addresses it, so report that as the segment.
-                            node_segment: thread_name.clone().or(row.opt_text(0)?),
-                            task_segment: row.opt_text(1)?,
-                            thread_name,
-                            exec_seq: row.opt_i64(2)?.map(|seq| seq as i32),
-                            primary_session_id: row.opt_text(3)?,
-                        },
-                    );
-                }
-            }
-            Ok(map)
-        })
-    })
+    load_by_ids(
+        db,
+        &job_ids,
+        |placeholders| {
+            format!(
+                "SELECT job.id,
+                        COALESCE(parent.uri_segment, job.uri_segment),
+                        CASE WHEN job.parent_job_id IS NULL THEN NULL ELSE job.uri_segment END,
+                        COALESCE(exec.seq, parent_exec.seq),
+                        (SELECT run.session_id
+                           FROM runs run
+                          WHERE run.job_id = job.id
+                          ORDER BY run.created_at ASC
+                          LIMIT 1),
+                        thread.name
+                   FROM jobs job
+                   LEFT JOIN jobs parent ON parent.id = job.parent_job_id
+                   LEFT JOIN executions exec ON exec.id = job.execution_id
+                   LEFT JOIN executions parent_exec ON parent_exec.id = parent.execution_id
+                   LEFT JOIN threads thread
+                          ON thread.id = COALESCE(job.thread_id, parent.thread_id)
+                  WHERE job.id IN ({placeholders})"
+            )
+        },
+        |row| {
+            let thread_name = row.opt_text(5)?;
+            Ok((
+                row.text(0)?,
+                JobNav {
+                    // A thread's own segment reads `thread`; the name is what
+                    // addresses it, so report that as the segment.
+                    node_segment: thread_name.clone().or(row.opt_text(1)?),
+                    task_segment: row.opt_text(2)?,
+                    thread_name,
+                    exec_seq: row.opt_i64(3)?.map(|seq| seq as i32),
+                    primary_session_id: row.opt_text(4)?,
+                },
+            ))
+        },
+    )
     .await
-    .map_err(storage_error)
 }
 
 /// Load each transcript hit's place in its conversation, in one query. The turn
@@ -865,43 +870,28 @@ async fn load_event_locations(
     db: &LocalDb,
     event_ids: Vec<String>,
 ) -> Result<HashMap<String, EventLocation>, String> {
-    if event_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    db.read(|conn| {
-        let event_ids = event_ids.clone();
-        Box::pin(async move {
-            let placeholders = (1..=event_ids.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
+    load_by_ids(
+        db,
+        &event_ids,
+        |placeholders| {
+            format!(
                 "SELECT event.id, COALESCE(turn.session_id, event.session_id), turn.sequence
                    FROM events event
                    LEFT JOIN turns turn ON turn.id = event.turn_id
                   WHERE event.id IN ({placeholders})"
-            );
-            let params: Vec<cairn_db::turso::Value> = event_ids
-                .iter()
-                .map(|id| cairn_db::turso::Value::Text(id.clone()))
-                .collect();
-
-            let mut map = HashMap::new();
-            let mut rows = conn.query(&sql, params).await?;
-            while let Some(row) = rows.next().await? {
-                map.insert(
-                    row.text(0)?,
-                    EventLocation {
-                        session_id: row.opt_text(1)?,
-                        turn_seq: row.opt_i64(2)?.map(|seq| seq as i32),
-                    },
-                );
-            }
-            Ok(map)
-        })
-    })
+            )
+        },
+        |row| {
+            Ok((
+                row.text(0)?,
+                EventLocation {
+                    session_id: row.opt_text(1)?,
+                    turn_seq: row.opt_i64(2)?.map(|seq| seq as i32),
+                },
+            ))
+        },
+    )
     .await
-    .map_err(storage_error)
 }
 
 /// Where one turn sits in the project graph, for a semantic hit that starts
@@ -922,46 +912,31 @@ async fn load_turn_coordinates(
     db: &LocalDb,
     turn_ids: &[String],
 ) -> Result<HashMap<String, TurnCoordinate>, String> {
-    if turn_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-    db.read(|conn| {
-        let turn_ids = turn_ids.to_vec();
-        Box::pin(async move {
-            let placeholders = (1..=turn_ids.len())
-                .map(|index| format!("?{index}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let sql = format!(
+    load_by_ids(
+        db,
+        turn_ids,
+        |placeholders| {
+            format!(
                 "SELECT turn.id, run.project_id, run.issue_id,
                         COALESCE(turn.job_id, run.job_id), turn.created_at
                    FROM turns turn
                    JOIN runs run ON run.id = turn.run_id
                   WHERE turn.id IN ({placeholders}) AND run.project_id IS NOT NULL"
-            );
-            let params: Vec<cairn_db::turso::Value> = turn_ids
-                .iter()
-                .map(|id| cairn_db::turso::Value::Text(id.clone()))
-                .collect();
-
-            let mut map = HashMap::new();
-            let mut rows = conn.query(&sql, params).await?;
-            while let Some(row) = rows.next().await? {
-                map.insert(
-                    row.text(0)?,
-                    TurnCoordinate {
-                        project_id: row.text(1)?,
-                        issue_id: row.opt_text(2)?,
-                        job_id: row.opt_text(3)?,
-                        created_at: row.i64(4)?,
-                    },
-                );
-            }
-            Ok(map)
-        })
-    })
+            )
+        },
+        |row| {
+            Ok((
+                row.text(0)?,
+                TurnCoordinate {
+                    project_id: row.text(1)?,
+                    issue_id: row.opt_text(2)?,
+                    job_id: row.opt_text(3)?,
+                    created_at: row.i64(4)?,
+                },
+            ))
+        },
+    )
     .await
-    .map_err(storage_error)
 }
 
 fn storage_error(error: DbError) -> String {
@@ -1589,5 +1564,134 @@ mod tests {
                 .map(|result| result.uri.as_str()),
             Some("cairn://posts")
         );
+    }
+
+    // ===== enrichment lookups =====
+
+    /// Two projects, each with its own issue, node, session, and comment. A
+    /// batched lookup that mis-keyed a row would visibly cross the two.
+    async fn seed_two_projects(db: &LocalDb) {
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+             VALUES ('workspace-1', 'Workspace', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project-a', 'workspace-1', 'Alpha', 'alpha', '/tmp/alpha', 1, 1),
+                    ('project-b', 'workspace-1', 'Beta', 'beta', '/tmp/beta', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, description, created_at, updated_at)
+             VALUES ('issue-a', 'project-a', 3, 'Alpha issue', 'body', 1, 1),
+                    ('issue-b', 'project-b', 9, 'Beta issue', 'body', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-a', 'recipe', 'issue-a', 'project-a', 'running', 1, 1),
+                    ('exec-b', 'recipe', 'issue-b', 'project-b', 'running', 1, 2);
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+             VALUES ('job-a', 'exec-a', 'issue-a', 'project-a', 'running', 'Builder', 'builder', 1, 1),
+                    ('job-b', 'exec-b', 'issue-b', 'project-b', 'running', 'Planner', 'planner', 1, 1);
+            INSERT INTO runs(id, issue_id, project_id, job_id, status, session_id, created_at, updated_at)
+             VALUES ('run-a', 'issue-a', 'project-a', 'job-a', 'exited', 'session-a', 1, 1),
+                    ('run-b', 'issue-b', 'project-b', 'job-b', 'exited', 'session-b', 1, 1);
+            INSERT INTO comments(id, issue_id, content, source, created_at)
+             VALUES ('comment-a', 'issue-a', 'a shared quixotry vocabulary', 'user', 2),
+                    ('comment-b', 'issue-b', 'the same quixotry vocabulary', 'user', 3);
+            ",
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Each lookup is asked for two live ids and one that resolves to nothing:
+    /// every row must land under its OWN id, and an absent referent must leave
+    /// no entry rather than borrowing a neighbour's.
+    #[tokio::test]
+    async fn batched_lookups_key_each_row_to_its_own_id_and_skip_the_absent() {
+        let db = migrated_db().await;
+        seed_two_projects(&db).await;
+
+        let keys = load_project_keys(
+            &db,
+            vec![
+                "project-a".to_string(),
+                "project-b".to_string(),
+                "project-gone".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys.get("project-a").map(String::as_str), Some("alpha"));
+        assert_eq!(keys.get("project-b").map(String::as_str), Some("beta"));
+
+        let issues = load_issue_info(
+            &db,
+            vec![
+                "issue-a".to_string(),
+                "issue-b".to_string(),
+                "issue-gone".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues.get("issue-a"), Some(&(3, "Alpha issue".to_string())));
+        assert_eq!(issues.get("issue-b"), Some(&(9, "Beta issue".to_string())));
+
+        let nav = load_job_nav(
+            &db,
+            vec![
+                "job-a".to_string(),
+                "job-b".to_string(),
+                "job-gone".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(nav.len(), 2);
+        let alpha = nav.get("job-a").expect("job-a resolved");
+        assert_eq!(alpha.node_segment.as_deref(), Some("builder"));
+        assert_eq!(alpha.task_segment, None);
+        assert_eq!(alpha.exec_seq, Some(1));
+        assert_eq!(alpha.primary_session_id.as_deref(), Some("session-a"));
+        let beta = nav.get("job-b").expect("job-b resolved");
+        assert_eq!(beta.node_segment.as_deref(), Some("planner"));
+        assert_eq!(beta.exec_seq, Some(2));
+        assert_eq!(beta.primary_session_id.as_deref(), Some("session-b"));
+
+        // Nothing to look up is not a query, and never invents a row.
+        assert!(load_project_keys(&db, Vec::new()).await.unwrap().is_empty());
+        assert!(load_issue_info(&db, Vec::new()).await.unwrap().is_empty());
+        assert!(load_job_nav(&db, Vec::new()).await.unwrap().is_empty());
+    }
+
+    /// The same guarantee seen from the outside: two hits from two projects each
+    /// carry their own project key, issue number, and issue title.
+    #[tokio::test]
+    async fn results_from_two_projects_each_carry_their_own_context() {
+        let db = migrated_db().await;
+        seed_two_projects(&db).await;
+
+        let index_dir = tempdir().unwrap();
+        let index = SearchIndex::open_or_create(index_dir.path()).unwrap();
+        index.rebuild(&db).await.unwrap();
+
+        let results = search_content(&db, &index, "quixotry", None, None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+
+        let alpha = results
+            .iter()
+            .find(|result| result.id == "comment-a")
+            .expect("the alpha comment is a hit");
+        assert_eq!(alpha.uri, "cairn://p/alpha/3");
+        assert_eq!(alpha.issue_number, Some(3));
+        assert_eq!(alpha.issue_title.as_deref(), Some("Alpha issue"));
+
+        let beta = results
+            .iter()
+            .find(|result| result.id == "comment-b")
+            .expect("the beta comment is a hit");
+        assert_eq!(beta.uri, "cairn://p/beta/9");
+        assert_eq!(beta.issue_number, Some(9));
+        assert_eq!(beta.issue_title.as_deref(), Some("Beta issue"));
     }
 }

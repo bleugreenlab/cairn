@@ -39,7 +39,15 @@ pub enum ProviderCategory {
     Subscription,
     /// Metered HTTP APIs billed per token against a key.
     Api,
-    /// Models served from hardware the user controls; no vendor account.
+    /// Models served from hardware the user controls, so there is no per-token
+    /// bill and no provider-side usage window.
+    ///
+    /// This does not mean "no vendor account". Owning the hardware and owning
+    /// the software that runs on it are different things: Ollama needs no
+    /// account at all, while Actual requires one before an install works,
+    /// because a device must be authorized against it. What the category
+    /// actually promises is where inference *happens* and who pays for it, not
+    /// that nobody had to register.
     Local,
 }
 
@@ -140,6 +148,25 @@ pub const PROVIDER_CATALOG: &[ProviderDescriptor] = &[
         catalog_driven: false,
         supports_mcp_install: false,
         keywords: &["ollama", "local", "self-hosted", "private"],
+    },
+    ProviderDescriptor {
+        key: super::actual::ACTUAL_BACKEND_KEY,
+        display_name: "Actual",
+        category: ProviderCategory::Local,
+        api_provider: ApiProvider::Actual,
+        summary: "Your own devices as an inference cluster, reached locally or through Actual's end-to-end Private Relay. Requires a free Actual account to authorize each device.",
+        setup_action: "Add target",
+        setup_requirement: "Install Actual and authorize the device against an Actual account, then add its local address or a Private Relay credential.",
+        catalog_driven: false,
+        supports_mcp_install: false,
+        keywords: &[
+            "actual",
+            "local",
+            "private",
+            "relay",
+            "cluster",
+            "self-hosted",
+        ],
     },
 ];
 

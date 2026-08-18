@@ -588,6 +588,24 @@ struct ManualCheckContractSnapshot {
     timeout_ms: u64,
 }
 
+/// Why a check requested from a thread session cannot resolve its own coordinate.
+///
+/// A manual check records a verdict against a sealed commit, and the commit it
+/// seals is the one the requesting run's job points at. A thread session points
+/// at none of its own: it runs on the project's base branch and owns no branch,
+/// by design (see [`crate::threads`]). So this is a structural refusal, not a
+/// lookup failure — and the reader can act on it, because naming a coordinate
+/// explicitly supplies the sealed commit the job cannot.
+fn thread_session_coordinate_refusal(check_name: &str) -> String {
+    format!(
+        "cairn check run records {check_name:?} against the sealed commit of the branch whose \
+         work it is, and this session belongs to a thread: a thread runs on the project's base \
+         branch and owns no branch of its own. Name the revision explicitly to record a verdict \
+         from here — `cairn check run {check_name} --branch <revision>` — or run the suite's \
+         command in a shell for an answer that is yours alone and records nothing."
+    )
+}
+
 /// Resolve every mutable input to a manual check exactly once. The returned owned
 /// values are the contract carried through cache lookup, execution, and recording;
 /// callers must not consult the live project config again during this operation.
@@ -647,7 +665,15 @@ async fn resolve_manual_check_contract_snapshot(
                 .await
                 .map_err(|error| format!("branch {branch:?} is unresolvable: {error}"))?
         }
-        None => crate::execution::cache::resolve_job_logical_head(orch, &job_id).await?,
+        None => crate::execution::cache::resolve_job_logical_head(orch, &job_id)
+            .await
+            .map_err(|error| match error {
+                crate::execution::cache::JobLogicalHeadError::Branchless {
+                    thread_owned: true,
+                    ..
+                } => thread_session_coordinate_refusal(check_name),
+                other => other.to_string(),
+            })?,
     };
     let CommitChecksContract {
         contract: ChecksContract {
@@ -6440,6 +6466,24 @@ fn unix_time_ms_for_checks() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// The refusal a thread session gets instead of an internal row error
+    /// (CAIRN-4237). It has to state the posture and hand back a command that
+    /// actually parses: `--branch` is a flag, and a bare revision after the
+    /// suite name would be read as a second suite.
+    #[test]
+    fn the_thread_refusal_states_the_posture_and_a_command_that_parses() {
+        let refusal = super::thread_session_coordinate_refusal("rust-lint");
+
+        assert!(
+            refusal.contains("thread") && refusal.contains("owns no branch of its own"),
+            "the refusal states the posture, not a lookup failure: {refusal}"
+        );
+        assert!(
+            refusal.contains("cairn check run rust-lint --branch <revision>"),
+            "the refusal names the coordinate form the CLI accepts: {refusal}"
+        );
+    }
+
     /// Both production check-request constructors obtain their admission horizon
     /// from this boundary. A finite value recreates the wide-wave starvation:
     /// the last suite expires while its siblings visibly hold the machine.

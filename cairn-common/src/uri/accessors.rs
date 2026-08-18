@@ -18,6 +18,7 @@ impl CairnResource {
             | ProjectImages { project, .. }
             | ProjectIssues { project, .. }
             | ProjectPosts { project, .. }
+            | ProjectCodemap { project, .. }
             | ProjectCheckResults { project, .. }
             | Issue { project, .. }
             | ProjectThreads { project, .. }
@@ -261,6 +262,7 @@ impl CairnResource {
             | Self::Posts
             | Self::Post { .. }
             | Self::ProjectPosts { .. }
+            | Self::ProjectCodemap { .. }
             | Self::ProjectMessages { .. }
             | Self::IssueMessages { .. }
             | Self::Changed { .. }
@@ -348,6 +350,7 @@ impl CairnResource {
             | Self::ProjectImages { project, .. }
             | Self::ProjectIssues { project }
             | Self::ProjectPosts { project }
+            | Self::ProjectCodemap { project }
             | Self::ProjectCheckResults { project, .. }
             | Self::ProjectCheckObservation { project, .. }
             | Self::Issue { project, .. }
@@ -523,6 +526,7 @@ impl CairnResource {
             | Self::Posts
             | Self::Post { .. }
             | Self::ProjectPosts { .. }
+            | Self::ProjectCodemap { .. }
             | Self::ProjectCheckResults { .. }
             | Self::ProjectMessages { .. }
             | Self::ProjectTerminal { .. }

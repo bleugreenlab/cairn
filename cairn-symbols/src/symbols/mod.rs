@@ -15,9 +15,12 @@
 //! - [`render`] formats results as the canonical grep-style `path:line:snippet`
 //!   rows plus the `{n} matches[ in {m} files]` header suffix, so agents see no
 //!   new output shape.
+//! - [`dependency`] extracts per-file import edges and resolves each specifier
+//!   to a worktree path, giving the import graph the codemap surface renders.
 //! - [`search`] backs the `?ast=` read modifier: a raw structural pattern search
 //!   over a file or a directory tree (walked with optional `?glob=`).
 
+pub mod dependency;
 pub mod engine;
 pub mod grammar;
 pub mod nav;

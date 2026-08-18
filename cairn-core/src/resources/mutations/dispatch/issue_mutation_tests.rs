@@ -2576,6 +2576,23 @@ async fn issue_create_reports_override_failures_under_its_own_key() {
     );
 }
 
+/// Read the whole corpus, so a test can assert what did *not* land as directly
+/// as what did.
+async fn corpus(orch: &Orchestrator) -> Vec<crate::models::Post> {
+    orch.db
+        .local
+        .list_posts(PostScope::Corpus, None, 10)
+        .await
+        .unwrap()
+}
+
+/// Post authorship is server-captured, so the payload has no say in it. Three
+/// distinct refusals ride on that: a caller with no live run cannot post at
+/// all, a caller naming an `author` is refused that key, and a caller holding a
+/// genuine verified session is *still* refused it. The third is the
+/// security-relevant one — without it the test cannot tell a forgery being
+/// rejected from a missing session being rejected, and a dispatcher that
+/// silently trusted `author` from an authenticated caller would pass.
 #[tokio::test]
 async fn posts_require_a_live_authenticated_identity_and_reject_forged_provenance() {
     let orch = seeded_orch().await;
@@ -2590,31 +2607,58 @@ async fn posts_require_a_live_authenticated_identity_and_reject_forged_provenanc
         "got: {}",
         error.error
     );
-    assert!(orch
-        .db
-        .local
-        .list_posts(PostScope::Corpus, None, 10)
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(corpus(&orch).await.is_empty());
 
-    let forged = change_item(
-        "cairn://posts",
-        ChangeMode::Append,
-        Some(serde_json::json!({
-            "content": "forged",
-            "author": {"kind": "machine", "deviceId": "attacker"}
-        })),
-    );
-    let error = apply(&orch, &forged).await.unwrap_err();
-    assert!(error.error.contains("provenance is server-captured"));
-    assert!(orch
-        .db
-        .local
-        .list_posts(PostScope::Corpus, None, 10)
+    let forged = |content: &str| {
+        change_item(
+            "cairn://posts",
+            ChangeMode::Append,
+            Some(serde_json::json!({
+                "content": content,
+                "author": {"kind": "machine", "deviceId": "attacker"}
+            })),
+        )
+    };
+
+    // The forged key is refused by name, ahead of any identity lookup, so the
+    // caller learns `author` is not a key this mutation accepts rather than
+    // that they merely lack a session.
+    let error = apply(&orch, &forged("forged")).await.unwrap_err();
+    assert!(error.error.contains("`author`"), "got: {}", error.error);
+    assert!(corpus(&orch).await.is_empty());
+
+    // A live, verified run does not buy the right to name an author either.
+    let (number, _, run_id) = seed_running_node(&orch).await;
+    let error = apply_as_run(&orch, &forged("forged with a session"), &run_id)
         .await
-        .unwrap()
-        .is_empty());
+        .unwrap_err();
+    assert!(error.error.contains("`author`"), "got: {}", error.error);
+    assert!(corpus(&orch).await.is_empty());
+
+    // The control: that same session, with only the forged key dropped, posts
+    // successfully and is recorded as the agent that ran it. The empty-corpus
+    // assertions above are therefore the forged key's doing, and the stored
+    // author comes from the run rather than from anything the caller sent.
+    apply_as_run(
+        &orch,
+        &change_item(
+            "cairn://posts",
+            ChangeMode::Append,
+            Some(serde_json::json!({"content": "honest"})),
+        ),
+        &run_id,
+    )
+    .await
+    .unwrap();
+    let posts = corpus(&orch).await;
+    assert_eq!(posts.len(), 1);
+    assert_eq!(
+        posts[0].author,
+        cairn_common::identity::PrincipalRef::Agent {
+            node: format!("cairn://p/cairn/{number}/1/builder"),
+            run_id: Some(run_id.clone()),
+        }
+    );
 }
 
 #[tokio::test]

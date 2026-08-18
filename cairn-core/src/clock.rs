@@ -73,6 +73,32 @@ pub(crate) fn stamp_millis_with_seconds(millis: i64) -> Option<String> {
     host().stamp_millis_with_seconds(millis)
 }
 
+/// `3h 12m ago (2026-08-01 16:47 PDT)` — how a *skimmed* surface states an
+/// instant.
+///
+/// Relative age leads because it is what a reader of a corpus actually wants:
+/// whether a post is an hour old or a month old should not cost arithmetic on
+/// an epoch. The labelled absolute stamp rides in parentheses rather than
+/// replacing it, because a relative age alone is a second, unfalsifiable clock
+/// — it cannot be lined up against a log line or another surface. Both halves
+/// come off the one host clock this module enforces, so the parenthesized
+/// anchor reads identically to [`stamp`] printed anywhere else.
+///
+/// An instant still ahead — a grant's expiry — reads `in 2h 5m (…)`. "ago" on a
+/// deadline is worse than the raw epoch was.
+///
+/// Rendered Markdown only. `format=json` projections keep the epoch, because a
+/// machine consumer wants the instant, not a reading of it.
+pub(crate) fn age(timestamp: i64) -> String {
+    host().age(timestamp, Utc::now().timestamp())
+}
+
+/// [`age`] from a millisecond instant, mirroring the [`stamp`]/[`stamp_millis`]
+/// pair so a caller never rescales at the call site and guesses wrong.
+pub(crate) fn age_millis(millis: i64) -> String {
+    host().age_millis(millis, Utc::now().timestamp_millis())
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct HostClock {
     timezone_name: String,
@@ -222,6 +248,30 @@ impl HostClock {
         )
     }
 
+    /// See [`age`]. `now` is a parameter rather than a call to the process clock
+    /// so the rendered format can be pinned in a test without a clock seam.
+    pub(crate) fn age(&self, timestamp: i64, now: i64) -> String {
+        match self.stamp(timestamp) {
+            Some(stamp) => format!("{} ({stamp})", relative(now.saturating_sub(timestamp))),
+            // An instant chrono cannot place is a broken row, not a time. Saying
+            // so beats printing the number back, which only looks like data.
+            None => UNPLACEABLE_INSTANT.to_string(),
+        }
+    }
+
+    /// See [`age_millis`]. The relative half still reasons in seconds: the
+    /// coarse `1d 3h 12m` vocabulary has no sub-minute term to spend the extra
+    /// precision on.
+    pub(crate) fn age_millis(&self, millis: i64, now_millis: i64) -> String {
+        match self.stamp_millis(millis) {
+            Some(stamp) => format!(
+                "{} ({stamp})",
+                relative(now_millis.saturating_sub(millis) / 1_000)
+            ),
+            None => UNPLACEABLE_INSTANT.to_string(),
+        }
+    }
+
     /// Minute precision, for transcript turn headers.
     pub(crate) fn turn_stamp(
         &self,
@@ -234,6 +284,25 @@ impl HostClock {
             "%H:%M %Z",
             "%Y-%m-%d %H:%M %Z",
         )
+    }
+}
+
+/// What a renderer says instead of a time when the stored value is not one.
+const UNPLACEABLE_INSTANT: &str = "unknown time";
+
+/// The relative half of [`HostClock::age`]: `3h 12m ago`, or `in 3h 12m` when
+/// the instant has not arrived yet.
+///
+/// The span itself goes through [`format_elapsed`] rather than growing a
+/// vocabulary of its own, so a post's age and a resume header's gap describe
+/// the same duration with the same words. That inherits `format_elapsed`'s
+/// floor: anything under a minute reads `0m`, which the absolute anchor beside
+/// it disambiguates.
+fn relative(elapsed_seconds: i64) -> String {
+    if elapsed_seconds < 0 {
+        format!("in {}", format_elapsed(elapsed_seconds.saturating_neg()))
+    } else {
+        format!("{} ago", format_elapsed(elapsed_seconds))
     }
 }
 
@@ -387,6 +456,61 @@ mod tests {
             clock.resume_prefix(utc(at), None).contains(&turn_header),
             "the resume marker reads the same labelled hour as the turn header"
         );
+    }
+
+    /// The CAIRN-4233 specimen. Every posts surface printed `Created: 1786996108`,
+    /// so a reader skimming a corpus could not tell an hour-old post from a
+    /// month-old one without doing arithmetic. Relative age leads now, and the
+    /// labelled stamp stays beside it so the reading is still anchored.
+    #[test]
+    fn age_leads_with_the_span_and_keeps_the_labelled_anchor() {
+        let clock = HostClock::fixed("America/Los_Angeles");
+        let at = 1_752_381_600; // 2025-07-12 21:40 PDT
+        assert_eq!(
+            clock.age(at, at + 3 * 3600 + 12 * 60),
+            "3h 12m ago (2025-07-12 21:40 PDT)"
+        );
+        assert_eq!(
+            clock.age(at, at + 40 * 86400),
+            "40d ago (2025-07-12 21:40 PDT)"
+        );
+    }
+
+    /// A grant's expiry is the case that makes "ago" actively wrong, so a future
+    /// instant states that it is one.
+    #[test]
+    fn a_future_instant_reads_forward_rather_than_ago() {
+        let clock = HostClock::fixed("America/Los_Angeles");
+        let at = 1_752_381_600;
+        assert_eq!(
+            clock.age(at, at - (2 * 3600 + 5 * 60)),
+            "in 2h 5m (2025-07-12 21:40 PDT)"
+        );
+    }
+
+    /// The millisecond entry point names the same instant as the second one, so
+    /// a caller picking the wrong scale is a compile-time choice and not a
+    /// silently wrong reading.
+    #[test]
+    fn age_millis_agrees_with_age_on_the_same_instant() {
+        let clock = HostClock::fixed("America/Los_Angeles");
+        let at = 1_752_381_600;
+        let now = at + 7200;
+        assert_eq!(
+            clock.age_millis(at * 1000, now * 1000),
+            clock.age(at, now),
+            "2h ago (2025-07-12 21:40 PDT)"
+        );
+    }
+
+    /// The one thing this must never do is print the epoch back: a value chrono
+    /// cannot place is a broken row, and rendering it as a number would restore
+    /// exactly the wart being removed.
+    #[test]
+    fn an_unplaceable_instant_says_so_instead_of_printing_its_epoch() {
+        let clock = HostClock::fixed("America/Los_Angeles");
+        assert_eq!(clock.age(i64::MAX, 0), "unknown time");
+        assert_eq!(clock.age_millis(i64::MAX, 0), "unknown time");
     }
 
     #[test]

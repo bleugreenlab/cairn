@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::permission::{
-    emit_successor_turn_events, ensure_and_start_successor_turn, get_issue_title, issue_id_for_run,
+    emit_successor_turn_events, ensure_and_start_successor_turn, issue_id_for_run,
     recompute_issue_status_for_issue, yield_turn_for_host,
 };
 use super::{emit_attention, AttentionEvent};
@@ -138,8 +138,7 @@ async fn ask_questions_owned(
         node_segment,
         project_key,
         issue_number,
-        issue_title,
-        node_name,
+        home_uri,
         exec_seq,
         current_turn_id,
         owns_turn_loop,
@@ -377,10 +376,10 @@ async fn ask_questions_owned(
             }
         }
 
-        let issue_title = match ctx.issue_id.as_deref() {
-            Some(issue_id) => get_issue_title(&owning_db, issue_id).await,
-            None => None,
-        };
+        let home_uri = crate::jobs::queries::home_uri_for_job(&owning_db, &ctx.job_id)
+            .await
+            .ok()
+            .flatten();
         if yielded_turn {
             if let Some(turn_id) = current_turn_id.as_deref() {
                 let change =
@@ -396,8 +395,7 @@ async fn ask_questions_owned(
             node_segment,
             ctx.project_key,
             ctx.issue_number,
-            issue_title,
-            ctx.job_name,
+            home_uri,
             ctx.exec_seq,
             current_turn_id,
             owns_turn_loop,
@@ -430,7 +428,7 @@ async fn ask_questions_owned(
             )),
             _ => None,
         };
-        let _ = (&node_name, &current_turn_id);
+        let _ = &current_turn_id;
         return match question_uri {
             Some(uri) => format!(
                 "Question '{}' recorded; the answer will be available at {}",
@@ -451,10 +449,7 @@ async fn ask_questions_owned(
         &AttentionEvent {
             attention_type: "prompt",
             project_key: &project_key,
-            issue_number,
-            issue_title: issue_title.as_deref(),
-            node_name: node_name.as_deref(),
-            exec_seq,
+            home_uri: home_uri.as_deref(),
             tool_name: None,
         },
     );

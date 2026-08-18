@@ -102,19 +102,6 @@ fn pending_run_tool_results(
     })
 }
 
-fn run_issue_id(orch: &Orchestrator, run_id: &str) -> Result<Option<String>, String> {
-    let run_id = run_id.to_string();
-    let db = orch.db.local.clone();
-    run_db_blocking(move || async move {
-        db.query_opt_text(
-            "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
-            cairn_db::turso::params![run_id.as_str()],
-        )
-        .await
-        .map_err(|e| format!("Failed to load issue id for run db-change: {e}"))
-    })
-}
-
 pub(crate) const USER_STOP_TOOL_RESULT: &str = "Run interrupted by user stop.";
 
 fn fail_pending_run_tool_results(
@@ -176,13 +163,13 @@ fn fail_pending_run_tool_results(
         };
         if stream_store::insert_event(owning.clone(), event_insert)? {
             inserted += 1;
-            let issue_id = run_issue_id(orch, run_id)?;
+            let scope = crate::notify::event_run_scope(orch.db.local.clone(), run_id);
             let _ = orch.services.emitter.emit(
                 "db-change",
                 crate::notify::event_db_change_scoped(
                     run_id,
                     pending_result.session_id.as_deref(),
-                    issue_id.as_deref(),
+                    &scope,
                     "insert",
                 ),
             );

@@ -1360,7 +1360,7 @@ mod tests {
 
         assert_eq!(
             rust.nodes.len(),
-            18,
+            19,
             "every declared workspace member becomes a node: {:?}",
             rust.nodes.keys().collect::<Vec<_>>()
         );
@@ -1386,8 +1386,12 @@ mod tests {
                 "cairn-executor",
                 "cairn-sandbox",
                 "cairn-symbols",
+                "cairn-tokenize",
                 "cairn-vcs",
                 "cairn-worktree",
+                // Reached only through cairn-db, which owns the tokenizer the
+                // search index builds its unigram statistics with.
+                "unigram",
             ]
         );
         assert_eq!(

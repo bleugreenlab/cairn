@@ -120,7 +120,7 @@ pub async fn raise_authority(
         ));
     }
 
-    let Some(run_id) = actor.run_id.clone() else {
+    let Some(run_id) = actor.principal.run_id.clone() else {
         return AuthorityGate::Deny(authorization::refusal_message(authority, reason));
     };
 

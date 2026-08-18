@@ -204,6 +204,13 @@ pub struct CodexAppServerPool {
 }
 
 impl CodexAppServerPool {
+    /// Resident process units a launch must add for this exact pool identity.
+    /// Admission charges one unit for a cold key and zero when the app-server is
+    /// already reusable; every launch still carries its logical-stream claim.
+    pub(crate) fn additional_resident_process_units(&self, key: &PoolKey) -> u32 {
+        u32::from(!self.pools.lock().unwrap().contains_key(key))
+    }
+
     #[cfg(test)]
     fn insert_test_server(&self, key: PoolKey, server: Arc<PooledAppServer>) {
         self.pools.lock().unwrap().insert(key, server);
@@ -393,8 +400,17 @@ mod tests {
     #[test]
     fn binding_for_thread_maps_run_and_clears_on_deregister() {
         let pool = CodexAppServerPool::default();
+        assert_eq!(
+            pool.additional_resident_process_units(&"identity-a".to_string()),
+            1
+        );
         let server = PooledAppServer::for_test(scripted_client());
         pool.insert_test_server("identity-a".to_string(), server.clone());
+        assert_eq!(
+            pool.additional_resident_process_units(&"identity-a".to_string()),
+            0,
+            "reusing an existing app-server must not charge another process"
+        );
 
         let _rx = server.register_call("thread-1", "run-1");
         server.register_call("thread-2", "run-2");

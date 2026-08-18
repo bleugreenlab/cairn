@@ -195,6 +195,16 @@ pub struct LocalDb {
     /// writes settle; permit-backed, so a burst of commits collapses to a single
     /// pending wakeup and none is lost.
     commit_signal: Arc<Notify>,
+    /// Process-unique identity for this OPEN of a database, never reused.
+    ///
+    /// [`Self::mutation_generation`] is per HANDLE and starts at zero, so it
+    /// identifies a state of this handle and says nothing across handles. A
+    /// consumer that caches by `(path, generation)` alone — the channel router's
+    /// gate source is one — would hand a database reopened at the same path the
+    /// previous handle's snapshot the moment its counter reached the same
+    /// number. Pairing the two is what makes a cache key mean "this state of this
+    /// database" rather than "some state of some database that lived here".
+    instance: u64,
     /// Monotonic in-process generation advanced after every successful mutation.
     /// Readers use this to make expensive projections incremental without polling
     /// the database itself. Relaxed ordering is sufficient: the committed database
@@ -252,6 +262,14 @@ impl std::fmt::Debug for LocalDb {
     }
 }
 
+/// Hands every open of a database a process-unique identity. Monotonic and
+/// never reused, so no two live handles — and no handle and its own
+/// predecessor at the same path — can be confused for one another.
+fn next_instance() -> u64 {
+    static INSTANCES: AtomicU64 = AtomicU64::new(0);
+    INSTANCES.fetch_add(1, Ordering::Relaxed)
+}
+
 impl LocalDb {
     pub async fn open(path: impl AsRef<Path>) -> DbResult<Self> {
         Self::open_with_retry(path, RetryConfig::default()).await
@@ -269,6 +287,7 @@ impl LocalDb {
             database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
+            instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
             content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
@@ -324,6 +343,7 @@ impl LocalDb {
             database: database.clone(),
             retry,
             commit_signal: Arc::new(Notify::new()),
+            instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
             content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
@@ -375,6 +395,7 @@ impl LocalDb {
             database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
+            instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
             content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),
@@ -442,8 +463,17 @@ impl LocalDb {
 
     /// Current in-process mutation generation. Reading it never opens a database
     /// connection, so generation-driven consumers settle to atomic loads at idle.
+    ///
+    /// It is meaningful only alongside [`Self::instance`]: a handle reopened at
+    /// the same path starts again at zero.
     pub fn mutation_generation(&self) -> u64 {
         self.mutation_generation.load(Ordering::Relaxed)
+    }
+
+    /// This open's process-unique identity. See the field's documentation for
+    /// why a cache key needs it as well as the generation.
+    pub fn instance(&self) -> u64 {
+        self.instance
     }
 
     fn record_mutation(&self) {
@@ -2177,6 +2207,7 @@ mod tests {
             database: database.clone(),
             retry: RetryConfig::default(),
             commit_signal: Arc::new(Notify::new()),
+            instance: next_instance(),
             mutation_generation: AtomicU64::new(0),
             team: None,
             content_store: Arc::new(PrivateContentStore::new(database, gate.clone())),

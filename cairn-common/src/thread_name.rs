@@ -10,6 +10,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "chat",
     "check-observations",
     "check-results",
+    "codemap",
     "comments",
     "images",
     "issues",

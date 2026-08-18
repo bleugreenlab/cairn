@@ -15,7 +15,7 @@ use cairn_common::ids;
 use cairn_db::turso::params;
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::Orchestrator;
 
@@ -1238,26 +1238,50 @@ pub fn extract_session_id(event: &ClaudeEvent) -> Option<String> {
     }
 }
 
-/// Get the tmp directory for system prompt files
-fn get_prompt_tmp_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cairn")
-        .join("tmp")
+/// Subdirectory of a process residence holding assembled system prompts. Its own
+/// directory rather than the residence root, because the residence is also the
+/// agent's `$TMPDIR`: Cairn's own files should not be mixed in with whatever the
+/// agent's tooling scatters there.
+const PROMPT_DIR: &str = "prompts";
+
+/// Where a run's assembled system prompt is written: inside `residence`, the job
+/// scratch directory the agent process runs in.
+///
+/// The prompt reaches the CLI as a `--system-prompt-file` path, so it has to live
+/// somewhere the host can write and the spawned process can read. The residence
+/// is the one place Cairn already guarantees both: it provisions the directory
+/// per job, points the agent's `TMPDIR` at it, grants it to the sandbox by name
+/// (`cairn_sandbox::default_writable_extra`), and reclaims the whole tree at job
+/// teardown.
+///
+/// This used to be a hardcoded `~/.cairn/tmp`, a second answer to "where is
+/// Cairn's home" that was wrong twice over. It ignored `CAIRN_HOME`, so a dev
+/// instance wrote its prompts into the production home that
+/// [`cairn_common::scratch::scratch_root`] deliberately separates it from; and it
+/// sat outside every sanctioned writable root, so assembling a prompt failed
+/// outright with `EPERM` whenever the host itself ran under the fence — aborting
+/// the resume after its attention pushes had already been stamped delivered.
+fn system_prompt_file_path(residence: &Path, run_id: &str) -> PathBuf {
+    residence.join(PROMPT_DIR).join(format!("{run_id}.md"))
 }
 
-/// Write the fully assembled system prompt to a per-run temp file and return its
-/// path. Claude delivers the entire uniform stack (cairn + workspace + project +
-/// role + orientation) as one `--system-prompt-file`, fully replacing CC's
-/// default; the file bytes equal the persisted segment concatenation exactly.
-pub(crate) fn write_system_prompt_file(run_id: &str, content: &str) -> Result<PathBuf, String> {
-    let tmp_dir = get_prompt_tmp_dir();
-    fs::create_dir_all(&tmp_dir).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
-
-    let file_path = tmp_dir.join(format!("prompt-{}.md", run_id));
+/// Write the fully assembled system prompt to a per-run file in `residence` and
+/// return its path. Claude delivers the entire uniform stack (cairn + workspace +
+/// project + role + orientation) as one `--system-prompt-file`, fully replacing
+/// CC's default; the file bytes equal the persisted segment concatenation exactly.
+pub(crate) fn write_system_prompt_file(
+    residence: &Path,
+    run_id: &str,
+    content: &str,
+) -> Result<PathBuf, String> {
+    let file_path = system_prompt_file_path(residence, run_id);
+    if let Some(dir) = file_path.parent() {
+        fs::create_dir_all(dir)
+            .map_err(|e| format!("Failed to create system prompt directory {dir:?}: {e}"))?;
+    }
 
     fs::write(&file_path, content)
-        .map_err(|e| format!("Failed to write system prompt file: {}", e))?;
+        .map_err(|e| format!("Failed to write system prompt file {file_path:?}: {e}"))?;
 
     log::debug!(
         "Wrote system prompt to {:?} ({} bytes)",
@@ -1408,60 +1432,21 @@ pub(crate) fn developer_instructions_from_segments(segments: &[PromptSegment]) -
     }
 }
 
-/// Clean up a specific prompt file after a run completes
-pub(crate) fn cleanup_prompt_file(run_id: &str) {
-    let file_path = get_prompt_tmp_dir().join(format!("prompt-{}.md", run_id));
+/// Remove a finished run's system prompt file from its job's residence.
+///
+/// The scratch tree outlives any one run, so without this a long-lived node
+/// accumulates one assembled prompt per turn until teardown reclaims the whole
+/// directory. A run whose host died leaves its file behind for teardown, which is
+/// why there is no separate startup sweep: the residence has an owner, unlike the
+/// global temp directory this replaced.
+pub(crate) fn cleanup_prompt_file(residence: &Path, run_id: &str) {
+    let file_path = system_prompt_file_path(residence, run_id);
     if file_path.exists() {
         if let Err(e) = fs::remove_file(&file_path) {
             log::warn!("Failed to remove prompt file {:?}: {}", file_path, e);
         } else {
             log::debug!("Cleaned up prompt file {:?}", file_path);
         }
-    }
-}
-
-/// Clean up stale prompt files (older than 24 hours)
-/// Called on startup to remove orphaned files from crashed runs
-pub fn cleanup_stale_prompt_files() {
-    let tmp_dir = get_prompt_tmp_dir();
-    if !tmp_dir.exists() {
-        return;
-    }
-
-    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 60 * 60);
-
-    let entries = match fs::read_dir(&tmp_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            log::warn!("Failed to read tmp dir {:?}: {}", tmp_dir, e);
-            return;
-        }
-    };
-
-    let mut cleaned = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("prompt-") && n.ends_with(".md"))
-        {
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    if modified < cutoff {
-                        if let Err(e) = fs::remove_file(&path) {
-                            log::warn!("Failed to remove stale prompt file {:?}: {}", path, e);
-                        } else {
-                            cleaned += 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if cleaned > 0 {
-        log::info!("Cleaned up {} stale prompt files", cleaned);
     }
 }
 
@@ -2228,6 +2213,46 @@ mod tests {
     use crate::storage::{LocalDb, RowExt, SearchIndex};
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    /// The assembled prompt must land somewhere the sandbox grants writes.
+    ///
+    /// Not a style preference: a host that itself runs fenced — which is how
+    /// Cairn runs its own Rust suite — cannot start any agent at all if this
+    /// write is refused, and the refusal arrives after the resume has already
+    /// stamped its attention pushes delivered. The old `~/.cairn/tmp` failed this
+    /// and took every idle coordinator wake down with it.
+    #[test]
+    fn the_system_prompt_file_lands_inside_a_sandbox_granted_root() {
+        let residence = crate::scratch::job_scratch_dir("job-under-test");
+        let path = system_prompt_file_path(&residence, "run-under-test");
+
+        assert!(
+            cairn_sandbox::default_writable_extra()
+                .iter()
+                .any(|granted| path.starts_with(granted)),
+            "{path:?} is outside every writable root the fence grants: {:?}",
+            cairn_sandbox::default_writable_extra()
+        );
+    }
+
+    /// A prompt belongs to the run that spawned with it, so two runs of one job
+    /// never share a file and cleaning one up cannot strand the other.
+    #[test]
+    fn a_prompt_is_written_and_removed_per_run_within_one_residence() {
+        let residence = tempdir().unwrap();
+        let first = write_system_prompt_file(residence.path(), "run-1", "first").unwrap();
+        let second = write_system_prompt_file(residence.path(), "run-2", "second").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+
+        cleanup_prompt_file(residence.path(), "run-1");
+        assert!(!first.exists());
+        assert!(
+            second.exists(),
+            "one run's cleanup must not remove another's prompt"
+        );
+    }
 
     #[test]
     fn project_checks_section_lists_check_contract() {

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::Post;
+use crate::models::{Post, PostComment};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, PostScope, RowExt};
 use cairn_common::identity::display::PrincipalAliases;
@@ -61,7 +61,7 @@ fn options(params: &[QueryParam]) -> Result<(usize, Option<&str>, bool), String>
 /// keeps the `PrincipalRef` and the `projects` row id it was written with, and
 /// `format=json` still returns exactly those. Resolved once for a whole page
 /// rather than once per post, so a hundred posts read each registry once.
-pub(super) struct PostContext {
+pub(crate) struct PostContext {
     aliases: PrincipalAliases,
     /// `projects.id` → that project's key. Left empty when no post in the pass
     /// carries a scope, since there is then nothing to name.
@@ -69,7 +69,7 @@ pub(super) struct PostContext {
 }
 
 impl PostContext {
-    pub(super) async fn resolve(db: &LocalDb, posts: &[Post]) -> Self {
+    pub(crate) async fn resolve(db: &LocalDb, posts: &[Post]) -> Self {
         let project_keys = if posts.iter().any(|post| post.project_id.is_some()) {
             db.query_all("SELECT id, key FROM projects", (), |row| {
                 Ok((row.text(0)?, row.text(1)?))
@@ -115,18 +115,96 @@ impl PostContext {
     }
 }
 
+/// How much of a body the wake form carries before it stops and points at the
+/// canonical URI for the rest. Posts are short by nature; the bound is the
+/// ceiling that keeps one long one from crowding a resume prompt, not the
+/// expected length.
+const WAKE_BODY_CHARS: usize = 2000;
+
+/// What a surface asks of the one post renderer.
+///
+/// The two forms differ in what their reader already has. Someone reading
+/// `cairn://posts` went looking and wants the whole filing — the body entire,
+/// the scope it is filed under, when it was written. Someone woken by a post did
+/// not go looking: they were handed it, and owe it only enough attention to
+/// decide whether to go read it. So the wake form carries the writing, who wrote
+/// it, and its address, and leaves the rest to the read that address invites.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PostForm {
+    /// A surface read on purpose.
+    Read,
+    /// A post carried into a prompt by an attention push.
+    Wake,
+}
+
+impl PostForm {
+    fn bound(self) -> Option<usize> {
+        match self {
+            PostForm::Read => None,
+            PostForm::Wake => Some(WAKE_BODY_CHARS),
+        }
+    }
+}
+
+/// A body as a surface will print it: whole when `bound` is `None`, otherwise
+/// cut at `bound` characters with the canonical URI as the pointer to the rest.
+///
+/// Truncation never paraphrases. A bounded surface owes its reader the author's
+/// own opening words and an address for the remainder, not a summary nobody
+/// wrote.
+fn within(content: &str, bound: Option<usize>, uri: &str) -> String {
+    let Some(bound) = bound else {
+        return content.to_string();
+    };
+    if content.chars().count() <= bound {
+        return content.to_string();
+    }
+    let head: String = content.chars().take(bound).collect();
+    format!("{head}…\n\n[truncated at {bound} characters — read {uri} for the rest]")
+}
+
 /// One post, rendered the same way wherever it is read — the workspace corpus,
-/// a project projection, or a home's feed.
-pub(super) fn render_post(post: &Post, context: &PostContext) -> String {
-    format!(
-        "## [{}](cairn://posts/{})\n\n{}\n\n- Scope: {}\n- Author: {}\n- Created: {}\n",
+/// a project projection, a home's feed, or the wake that carries it to a
+/// subscriber. [`PostForm`] is the only thing a surface varies.
+pub(crate) fn render_post(post: &Post, context: &PostContext, form: PostForm) -> String {
+    let uri = format!("cairn://posts/{}", post.id);
+    let head = format!(
+        "## [{}]({uri})\n\n{}\n\n- Author: {}\n",
         post.title.as_deref().unwrap_or("Untitled"),
-        post.id,
-        post.content,
-        context.scope(post.project_id.as_deref()),
+        within(&post.content, form.bound(), &uri),
         context.author(&post.author, &post.appearance),
-        post.created_at
-    )
+    );
+    match form {
+        PostForm::Wake => head,
+        PostForm::Read => format!(
+            "{head}- Scope: {}\n- Created: {}\n",
+            context.scope(post.project_id.as_deref()),
+            crate::clock::age(post.created_at)
+        ),
+    }
+}
+
+/// One comment, rendered the same way wherever it is read — under its post, or
+/// in the wake that carries it to the author.
+pub(crate) fn render_comment(
+    comment: &PostComment,
+    context: &PostContext,
+    form: PostForm,
+) -> String {
+    let uri = format!("cairn://posts/{}", comment.post_id);
+    let head = format!(
+        "### Comment {}\n\n{}\n\n- Author: {}\n",
+        comment.id,
+        within(&comment.content, form.bound(), &uri),
+        context.author(&comment.author, &comment.appearance),
+    );
+    match form {
+        PostForm::Wake => head,
+        PostForm::Read => format!(
+            "{head}- Created: {}\n- Parent: {uri}\n",
+            crate::clock::age(comment.created_at)
+        ),
+    }
 }
 
 /// The project whose window a caller of `cairn://posts` reads the corpus
@@ -212,7 +290,7 @@ pub(super) async fn read_posts(
                 "# Posts\n\n{}",
                 posts
                     .iter()
-                    .map(|post| render_post(post, &context))
+                    .map(|post| render_post(post, &context, PostForm::Read))
                     .collect::<Vec<_>>()
                     .join("\n")
             )
@@ -245,18 +323,13 @@ pub(super) async fn read_post(db: &LocalDb, id: i64, params: &[QueryParam]) -> S
     let mut output = format!("# {}\n\n{}\n\n- Post: cairn://posts/{id}\n- Scope: {}\n- Author: {}\n- Created: {}\n\n## Comments\n",
         post.title.as_deref().unwrap_or("Untitled"), post.content,
         context.scope(post.project_id.as_deref()),
-        context.author(&post.author, &post.appearance), post.created_at);
+        context.author(&post.author, &post.appearance), crate::clock::age(post.created_at));
     if comments.is_empty() {
         output.push_str("\nNo comments.\n");
     }
     for comment in comments {
-        output.push_str(&format!(
-            "\n### Comment {}\n\n{}\n\n- Author: {}\n- Created: {}\n- Parent: cairn://posts/{id}\n",
-            comment.id,
-            comment.content,
-            context.author(&comment.author, &comment.appearance),
-            comment.created_at
-        ));
+        output.push('\n');
+        output.push_str(&render_comment(&comment, &context, PostForm::Read));
     }
     output
 }
@@ -358,6 +431,77 @@ mod tests {
         assert!(
             !rendered.contains(RUN) && !rendered.contains("\"kind\""),
             "the run that wrote a post is provenance, not identity: {rendered}"
+        );
+    }
+
+    /// Every posts surface used to print `Created: 1786996108`, so a reader
+    /// skimming a corpus could not tell an hour-old post from a month-old one
+    /// without arithmetic. There is one renderer, so the fix reaches the corpus,
+    /// the single post, its comments, and the feed at once — which is exactly
+    /// what this asserts, rather than trusting that it did.
+    #[tokio::test]
+    async fn every_rendered_posts_surface_states_an_age_and_never_a_bare_epoch() {
+        let db = fixture().await;
+        let id = post(&db, Some(PROJECT), "Aged").await;
+        db.create_post_comment(CreatePostComment {
+            post_id: id,
+            content: "a reply".into(),
+            author: agent().0,
+            appearance: agent().1,
+        })
+        .await
+        .unwrap();
+        let created_at = db.get_post(id).await.unwrap().unwrap().created_at;
+        let epoch = created_at.to_string();
+
+        for rendered in [
+            read_posts(&db, PostScope::Corpus, &[]).await,
+            read_post(&db, id, &[]).await,
+        ] {
+            // The relative age leads and the labelled absolute anchor follows it,
+            // so the surface is skimmable without becoming a second clock.
+            assert!(
+                rendered.contains("- Created: 0m ago ("),
+                "a rendered post states its age first: {rendered}"
+            );
+            assert!(
+                !rendered.contains(&epoch),
+                "no rendered posts surface may print the raw epoch {epoch}: {rendered}"
+            );
+        }
+
+        // The comment renderer is the same fix reaching a second surface.
+        let single = read_post(&db, id, &[]).await;
+        assert_eq!(
+            single.matches("- Created: 0m ago (").count(),
+            2,
+            "the post and its comment both state an age: {single}"
+        );
+    }
+
+    /// The epoch is what a machine consumer wants, so `format=json` keeps it
+    /// numeric. Rendering for a person and projecting for a program are
+    /// different jobs, and this change is only the first one.
+    #[tokio::test]
+    async fn the_json_projection_keeps_the_epoch_a_number() {
+        let db = fixture().await;
+        let id = post(&db, Some(PROJECT), "Machine").await;
+        let created_at = db.get_post(id).await.unwrap().unwrap().created_at;
+
+        let json = read_post(
+            &db,
+            id,
+            &[QueryParam {
+                key: "format".into(),
+                value: "json".into(),
+            }],
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["post"]["createdAt"], created_at);
+        assert!(
+            !json.contains(" ago ("),
+            "a machine projection carries the instant, not a reading of it: {json}"
         );
     }
 

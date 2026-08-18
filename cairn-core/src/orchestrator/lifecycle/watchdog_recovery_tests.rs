@@ -1,9 +1,9 @@
 use super::warm_completion_tests::{register_warm_process, test_orchestrator};
 use super::watchdog_recovery::{
-    current_recovery_target, finish_settled_recovery, recover_provider_watchdog,
-    require_fresh_successor_session, ProviderWatchdogRecovery, ALREADY_TERMINAL_RECONCILED_REASON,
+    current_recovery_target, finish_settled_recovery, has_pending_resume_trigger,
+    recover_provider_watchdog, require_fresh_successor_session, ProviderWatchdogRecovery,
+    ALREADY_TERMINAL_RECONCILED_REASON,
 };
-use crate::execution::jobs::continue_job_launch_locked_for_watchdog;
 use crate::runs::watchdog_ledger::{
     arm_watchdog, claim_watchdog_recovery, get_watchdog_lease, NewWatchdogLease, WatchdogIdentity,
     WatchdogLeaseState, WatchdogPhase,
@@ -47,6 +47,21 @@ async fn complete_turn_with_open_session_and_blocked_job_reconciles_once() {
     .await
     .unwrap();
     let orch = test_orchestrator(db);
+    assert!(!has_pending_resume_trigger(orch.db.local.clone(), "job").unwrap());
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO queued_messages (id, job_id, content, delivery, created_at) VALUES ('queued', 'job', 'resume me', 'queue', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    assert!(has_pending_resume_trigger(orch.db.local.clone(), "job").unwrap());
+    orch.db
+        .local
+        .execute("DELETE FROM queued_messages WHERE id = 'queued'", ())
+        .await
+        .unwrap();
     register_warm_process(&orch, "run", Some("job"));
     orch.process_state.set_current_turn_id("run", Some("turn"));
     let db = orch.db.local.clone();
@@ -178,13 +193,17 @@ async fn expired_terminal_turn_is_reconciled_through_watchdog_orchestration() {
     orch.process_state
         .set_current_turn_id("run-integration", Some("turn-integration"));
 
-    assert_eq!(
-        recover_provider_watchdog(&orch, &identity, 300).unwrap(),
-        ProviderWatchdogRecovery::Recovered {
-            reason: ALREADY_TERMINAL_RECONCILED_REASON.to_string(),
-            successor: None,
-        }
-    );
+    let recovery = recover_provider_watchdog(&orch, &identity, 300).unwrap();
+    let ProviderWatchdogRecovery::Recovered {
+        reason,
+        successor: Some((successor_run_id, successor_turn_id)),
+    } = recovery
+    else {
+        panic!("settled recovery without a pending trigger must launch a successor");
+    };
+    assert_eq!(reason, ALREADY_TERMINAL_RECONCILED_REASON);
+    assert!(!successor_run_id.is_empty());
+    assert!(!successor_turn_id.is_empty());
     let db = orch.db.local.clone();
     let lease = get_watchdog_lease(
         &db,
@@ -213,99 +232,6 @@ async fn expired_terminal_turn_is_reconciled_through_watchdog_orchestration() {
     );
     assert_eq!(
         db.query_opt(
-            "SELECT status FROM jobs WHERE id = 'job-integration'",
-            (),
-            |row| row.text(0),
-        )
-        .await
-        .unwrap()
-        .as_deref(),
-        Some("blocked")
-    );
-    assert_eq!(
-        db.query_opt(
-            "SELECT needs_fresh_session FROM jobs WHERE id = 'job-integration'",
-            (),
-            |row| Ok(row.get::<i64>(0)?),
-        )
-        .await
-        .unwrap(),
-        Some(1)
-    );
-    assert_eq!(
-        db.query_opt(
-            "SELECT state FROM turns WHERE id = 'turn-integration'",
-            (),
-            |row| row.text(0),
-        )
-        .await
-        .unwrap()
-        .as_deref(),
-        Some("complete")
-    );
-    assert!(!claim_watchdog_recovery(&db, &identity, 700).await.unwrap());
-
-    let closed_session = crate::sessions::queries::get(&db, "session-integration")
-        .await
-        .unwrap();
-    db.execute(
-        "UPDATE jobs SET current_session_id = 'raced-session' WHERE id = 'job-integration'",
-        (),
-    )
-    .await
-    .unwrap();
-    assert!(
-        crate::sessions::queries::rotate_watchdog_reconciled_job_session(
-            &db,
-            &closed_session,
-            "job-integration",
-            orch.services.emitter.as_ref(),
-        )
-        .await
-        .is_err()
-    );
-    assert_eq!(
-        db.query_opt(
-            "SELECT needs_fresh_session FROM jobs WHERE id = 'job-integration'",
-            (),
-            |row| Ok(row.get::<i64>(0)?),
-        )
-        .await
-        .unwrap(),
-        Some(1),
-        "failed rotation must preserve retry authorization"
-    );
-    db.execute(
-        "UPDATE jobs SET current_session_id = 'session-integration' WHERE id = 'job-integration'",
-        (),
-    )
-    .await
-    .unwrap();
-
-    let _ = continue_job_launch_locked_for_watchdog(&orch, "job-integration", None);
-    let successor_session_id = db
-        .query_opt(
-            "SELECT current_session_id FROM jobs WHERE id = 'job-integration'",
-            (),
-            |row| row.text(0),
-        )
-        .await
-        .unwrap()
-        .expect("normal continuation must rotate onto a successor session");
-    assert_ne!(successor_session_id, "session-integration");
-    assert_eq!(
-        db.query_opt(
-            "SELECT status FROM sessions WHERE id = ?1",
-            (successor_session_id,),
-            |row| row.text(0),
-        )
-        .await
-        .unwrap()
-        .as_deref(),
-        Some("open")
-    );
-    assert_eq!(
-        db.query_opt(
             "SELECT needs_fresh_session FROM jobs WHERE id = 'job-integration'",
             (),
             |row| Ok(row.get::<i64>(0)?),
@@ -314,4 +240,5 @@ async fn expired_terminal_turn_is_reconciled_through_watchdog_orchestration() {
         .unwrap(),
         Some(0)
     );
+    assert!(!claim_watchdog_recovery(&db, &identity, 700).await.unwrap());
 }

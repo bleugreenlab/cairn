@@ -17,7 +17,7 @@ use crate::routes::{ChannelSubmission, Presence, RouteContext, RouteFact};
 use crate::{
     mcp::handlers::permission::PermissionDecision,
     models::{ChannelInboundCapabilities, MessageClassPolicy},
-    orchestrator::Orchestrator,
+    orchestrator::{generation_cache::GenerationCache, Orchestrator},
     storage::{LocalDb, RowExt},
 };
 
@@ -33,6 +33,15 @@ const BACKLOG_SEAL_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 /// second with a newly raised ask could fill the window on every sweep and the
 /// live ask would never be offered at all. Admission is by identity instead.
 const SWEEP_LIMIT: usize = 100;
+/// The minimum rest between two sweeps, whatever woke them.
+///
+/// The timer alone cannot spin once its missed ticks coalesce, but a presence
+/// change is an external event: a beacon that flaps, or any future wake source,
+/// would otherwise be able to drive sweeps as fast as they complete. A floor
+/// well under the cadence costs a live wake almost nothing and makes "this loop
+/// cannot become a busy loop" a property of the schedule rather than a property
+/// of every caller that might one day notify it.
+const SWEEP_FLOOR: Duration = Duration::from_secs(1);
 const ATTENTION_GRACE: Duration = Duration::from_secs(3 * 60);
 const FOLLOW_POLL_LIMIT: usize = 10;
 /// How much of a target's title a poll option carries before it is elided. A
@@ -208,6 +217,78 @@ impl PollKind {
     }
 }
 
+/// Why a sweep is running. It rides in the sweep's log line because a
+/// recurrence has to be legible without a profiler: a loop running hot on the
+/// timer is a slow sweep, and one running hot on presence is a wake source that
+/// has started flapping, and those have different fixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepReason {
+    Timer,
+    Presence,
+}
+
+impl SweepReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Timer => "timer",
+            Self::Presence => "presence",
+        }
+    }
+}
+
+/// The sweep loop's clock.
+///
+/// A sweep polls everything there is, so its cadence is a floor on REST, not a
+/// schedule to catch up to. `tokio::time::interval` defaults to
+/// `MissedTickBehavior::Burst`, which means precisely the opposite: a sweep that
+/// overruns its period leaves a deadline ready for every period it covered, so a
+/// twenty-second sweep on a five-second cadence is followed by four more sweeps
+/// with no sleep between them. Under the load that made the sweep slow in the
+/// first place that condition never clears, and each provider's loop becomes a
+/// permanently ready worker — which is what a rebuilt runner sitting at 500% CPU
+/// across three enabled channels actually was (CAIRN-4208).
+///
+/// `Delay` coalesces those missed deadlines into ONE sweep and starts the next
+/// period when the overrunning sweep finishes. `Skip` also coalesces, but aligns
+/// to the original grid, so a sweep finishing just before a boundary is followed
+/// immediately by the next one; under overload that is the case that matters,
+/// and rest is what overload needs.
+struct SweepSchedule {
+    interval: tokio::time::Interval,
+    /// Tokio's clock, not the standard one, so the floor honors paused time and
+    /// the overload behavior is testable without sleeping through it.
+    finished: Option<tokio::time::Instant>,
+}
+
+impl SweepSchedule {
+    fn new() -> Self {
+        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            interval,
+            finished: None,
+        }
+    }
+
+    /// Waits for the next sweep and reports what woke it.
+    async fn next(&mut self) -> SweepReason {
+        let reason = tokio::select! {
+            _ = self.interval.tick() => SweepReason::Timer,
+            _ = super::wait_for_presence_change() => SweepReason::Presence,
+        };
+        if let Some(finished) = self.finished {
+            tokio::time::sleep_until(finished + SWEEP_FLOOR).await;
+        }
+        reason
+    }
+
+    /// Records that a sweep has finished, which is what the floor is measured
+    /// from. A sweep's own duration is never charged against the floor.
+    fn finished(&mut self) {
+        self.finished = Some(tokio::time::Instant::now());
+    }
+}
+
 /// One assistant event from a followed target, with everything the route fact
 /// built from it needs.
 struct FollowedEvent {
@@ -217,6 +298,83 @@ struct FollowedEvent {
     job_id: String,
     project_id: String,
     repo_path: String,
+}
+
+/// The jobs whose transcript a followed target streams, with the context every
+/// event of that target carries.
+///
+/// Resolving the TARGET first is the whole shape of the follow read. Both reads
+/// below used to drive from `events.rowid > cursor` — an open-ended range over
+/// the events primary key — and join outward to discover which target each event
+/// belonged to. So a sweep read every event the WORKSPACE had produced since the
+/// cursor, joined it four ways, and discarded nearly all of it at the project
+/// and issue predicates: the cost followed total event history rather than the
+/// followed target's own transcript. On an installation with 1.5M events that
+/// was 15-17 seconds per follow, repeated every five seconds by every enabled
+/// provider (CAIRN-4208).
+struct FollowSource {
+    /// Empty when the target has no session yet — a dormant thread, or an issue
+    /// that has never run. Both reads then answer without touching `events`.
+    job_ids: Vec<String>,
+    context: String,
+    project_id: String,
+    repo_path: String,
+}
+
+/// The jobs a followed THREAD streams. A thread's session is addressed by its
+/// SHAPE, never by "some job of this thread": the sub-agent tasks it spawns and
+/// the pre-cutover thread-issue's jobs carry its id too, and they are newer.
+///
+/// `CROSS JOIN` is the join ORDER, not a cross product: it pins projects as the
+/// outer loop so the thread is found by the `(project_id, name)` key and its
+/// jobs by `thread_id`. Left free, the planner drove from `jobs` and scanned it,
+/// because on a workspace with no gathered statistics the two orders look alike
+/// to it and only one of them is bounded by the followed target. Projects leads
+/// because `LOWER(p.key)` can use no index by construction, and a workspace's
+/// project list is the one table here that is small on purpose.
+fn follow_thread_jobs_sql() -> String {
+    format!(
+        "SELECT j.id, p.key, t.name, p.id, p.repo_path
+           FROM projects p
+           CROSS JOIN threads t ON t.project_id = p.id
+           CROSS JOIN jobs j ON j.thread_id = t.id
+          WHERE LOWER(p.key) = ?1 AND t.name = ?2 AND {}",
+        crate::threads::SESSION_JOB_SHAPE
+    )
+}
+
+/// The jobs a followed ISSUE streams: every node of every execution it has run.
+const FOLLOW_ISSUE_JOBS_SQL: &str = "SELECT j.id, p.key, i.number, i.title, p.id, p.repo_path
+   FROM projects p
+   CROSS JOIN issues i ON i.project_id = p.id
+   CROSS JOIN jobs j ON j.issue_id = i.id
+  WHERE LOWER(p.key) = ?1 AND i.number = ?2";
+
+/// The assistant events a resolved target's jobs have produced since the cursor.
+/// Built for a given job count so the regression test can plan the shape the
+/// sweep runs, at a cardinality that exposes a planner flip.
+fn followed_events_sql(jobs: usize) -> String {
+    format!(
+        "SELECT e.rowid, e.data, r.job_id
+           FROM runs r
+           JOIN events e ON e.run_id = r.id
+          WHERE r.job_id IN ({}) AND e.event_type = 'assistant' AND e.rowid > ?
+          ORDER BY e.rowid",
+        placeholders(jobs)
+    )
+}
+
+/// The newest rowid a resolved target's jobs have reached, over EVERY event type
+/// — a follow starts at the target's live edge, not at its last assistant turn,
+/// so a session mid-turn does not replay the rest of that turn onto the phone.
+fn follow_live_edge_sql(jobs: usize) -> String {
+    format!(
+        "SELECT COALESCE(MAX(e.rowid), 0)
+           FROM runs r
+           JOIN events e ON e.run_id = r.id
+          WHERE r.job_id IN ({})",
+        placeholders(jobs)
+    )
 }
 
 /// A candidate follow target, before labelling decides how much of its address
@@ -506,6 +664,132 @@ struct Gate {
     ask: OutboundAsk,
     conversation: Option<String>,
     target_uri: Option<String>,
+}
+
+/// The three gate loads that depend only on the DATABASE.
+///
+/// A sweep belongs to one provider, but most of what it reads does not: the open
+/// questions, the pending permissions, and the review backlog are facts about
+/// the workspace, and the provider only decides what to do with them. Every
+/// enabled provider nevertheless ran all three on its own five-second loop, so a
+/// workspace with three channels configured paid for the same expensive reads
+/// three times per tick, on three different threads (CAIRN-4208).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GateKind {
+    Question,
+    Permission,
+    Review,
+}
+
+impl GateKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Question => "question",
+            Self::Permission => "permission",
+            Self::Review => "review",
+        }
+    }
+}
+
+/// One kind's gates as of one database generation, plus the diagnostic counts
+/// the refresh log carries.
+#[derive(Clone)]
+struct GateSourceSnapshot {
+    /// The database's mutation generation when this load STARTED. A reader whose
+    /// database has moved past it asks for a recomputation; a reader that
+    /// arrives while one is in flight joins it instead.
+    generation: u64,
+    gates: Arc<Vec<Gate>>,
+    backlog: usize,
+    expired: usize,
+}
+
+/// Process-wide, so the sharing is between PROVIDERS and not merely between one
+/// provider's own sweeps.
+fn gate_sources() -> &'static GenerationCache<GateSourceSnapshot> {
+    static SOURCES: std::sync::OnceLock<GenerationCache<GateSourceSnapshot>> =
+        std::sync::OnceLock::new();
+    SOURCES.get_or_init(|| GenerationCache::new("channel gate source"))
+}
+
+async fn load_source_gates(
+    db: &LocalDb,
+    kind: GateKind,
+) -> Result<(Vec<Gate>, usize, usize), String> {
+    Ok(match kind {
+        GateKind::Question => (load_questions(db).await?, 0, 0),
+        GateKind::Permission => (load_permissions(db).await?, 0, 0),
+        GateKind::Review => {
+            let reviews = load_reviews(db).await?;
+            (reviews.gates, reviews.scanned, reviews.expired_dangling)
+        }
+    })
+}
+
+/// One kind's gates for one database, computed once per generation for the whole
+/// process however many providers ask for them.
+///
+/// The freshness rule is "no staler than when this reader asked", not "newer
+/// than anything": a reader that joins a flight already running accepts that
+/// flight's snapshot, and a reader whose database has advanced past what is
+/// published asks for a new one. Sharing therefore engages exactly when it is
+/// needed — under load, where sweeps are long and overlap, three providers
+/// collapse into one computation — and costs nothing at idle, where sweeps are
+/// short, never overlap, and each is a hit anyway.
+async fn shared_gates(db: &LocalDb, kind: GateKind) -> Result<GateSourceSnapshot, String> {
+    // The key carries the database's INSTANCE as well as its path: a handle
+    // reopened at the same path starts its generation again at zero, and a key
+    // that could not tell the two apart would hand the new database the old
+    // one's gates the moment its counter caught up.
+    let key = format!(
+        "{}|{}|{}",
+        db.instance(),
+        db.path().display(),
+        kind.as_str()
+    );
+    let observed = db.mutation_generation();
+    // Deciding and advancing under one lock is the point: N providers observing
+    // the same advance must produce ONE recomputation, where N unconditional
+    // invalidations would each reject the readers already computing.
+    gate_sources().invalidate_stale(&key, "database-advanced", |snapshot| {
+        snapshot.generation != observed
+    });
+    let failure = Mutex::new(None);
+    let snapshot = gate_sources()
+        .get_or_compute(&key, || async {
+            // Read the generation BEFORE the load, so a write racing this
+            // snapshot forces one follow-up refresh instead of being lost.
+            let generation = db.mutation_generation();
+            let started = Instant::now();
+            match load_source_gates(db, kind).await {
+                Ok((gates, backlog, expired)) => {
+                    log::info!(
+                        "channel gate source kind={} generation={generation} backlog={backlog} gates={} expired={expired} duration_ms={}",
+                        kind.as_str(),
+                        gates.len(),
+                        started.elapsed().as_millis()
+                    );
+                    Some(GateSourceSnapshot {
+                        generation,
+                        gates: Arc::new(gates),
+                        backlog,
+                        expired,
+                    })
+                }
+                Err(problem) => {
+                    *failure.lock().expect("gate source failure slot poisoned") = Some(problem);
+                    None
+                }
+            }
+        })
+        .await;
+    snapshot.ok_or_else(|| {
+        failure
+            .lock()
+            .expect("gate source failure slot poisoned")
+            .take()
+            .unwrap_or_else(|| format!("channel {} gate source load failed", kind.as_str()))
+    })
 }
 
 #[derive(Default)]
@@ -1249,33 +1533,84 @@ impl ChannelRouter {
         })
     }
 
-    /// The newest event a target's session has produced. A new follow starts here
-    /// so neither a restart nor a re-follow replays history.
-    async fn live_edge(&self, target: &FollowTarget) -> Result<i64, String> {
+    /// Resolve a followed target to the jobs that carry its transcript, once,
+    /// before either event read runs. See [`FollowSource`] for why the reads are
+    /// shaped this way.
+    async fn follow_source(&self, target: &FollowTarget) -> Result<FollowSource, String> {
         let db = self.orch.db.for_project(target.project()).await;
-        let edge = match target {
-            // A thread's session is addressed by its SHAPE, never by "some job of
-            // this thread": the sub-agent tasks it spawns and the pre-cutover
-            // thread-issue's jobs carry its id too, and they are newer.
+        let rows = match target {
             FollowTarget::Thread { project, name } => {
-                db.query_opt_i64(
-                    format!(
-                        "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2 AND {}",
-                        crate::threads::SESSION_JOB_SHAPE
-                    ),
+                db.query_all(
+                    follow_thread_jobs_sql(),
                     params![cairn_common::uri::canonical_project(project), name.clone()],
+                    |row| {
+                        Ok((
+                            row.text(0)?,
+                            // A thread's one identifier, written the way its URI
+                            // and its pane header write it. An issue, which has a
+                            // number AND a title, still reads "KEY-N Title".
+                            format!("{}/{}", row.text(1)?, row.text(2)?),
+                            row.text(3)?,
+                            row.text(4)?,
+                        ))
+                    },
                 )
                 .await
             }
             FollowTarget::Issue { project, number } => {
-                db.query_opt_i64(
-                    "SELECT COALESCE(MAX(e.rowid), 0) FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2",
+                db.query_all(
+                    FOLLOW_ISSUE_JOBS_SQL,
                     params![cairn_common::uri::canonical_project(project), *number],
+                    |row| {
+                        Ok((
+                            row.text(0)?,
+                            format!(
+                                "{}/{} {}",
+                                row.text(1)?.to_lowercase(),
+                                row.i64(2)?,
+                                row.text(3)?
+                            ),
+                            row.text(4)?,
+                            row.text(5)?,
+                        ))
+                    },
                 )
                 .await
             }
+        }
+        .map_err(|error| error.to_string())?;
+
+        // Every row of either statement describes the same target, so the
+        // context, project, and repository are read off the first one.
+        let Some((_, context, project_id, repo_path)) = rows.first().cloned() else {
+            return Ok(FollowSource {
+                job_ids: Vec::new(),
+                context: String::new(),
+                project_id: String::new(),
+                repo_path: String::new(),
+            });
         };
-        edge.map(|edge| edge.unwrap_or(0))
+        Ok(FollowSource {
+            job_ids: rows.into_iter().map(|(job_id, ..)| job_id).collect(),
+            context,
+            project_id,
+            repo_path,
+        })
+    }
+
+    /// The newest event a target's session has produced. A new follow starts here
+    /// so neither a restart nor a re-follow replays history.
+    async fn live_edge(&self, target: &FollowTarget) -> Result<i64, String> {
+        let source = self.follow_source(target).await?;
+        if source.job_ids.is_empty() {
+            return Ok(0);
+        }
+        let db = self.orch.db.for_project(target.project()).await;
+        let sql = follow_live_edge_sql(source.job_ids.len());
+        let binds: Vec<Value> = source.job_ids.into_iter().map(Value::Text).collect();
+        db.query_opt_i64(sql, binds)
+            .await
+            .map(|edge| edge.unwrap_or(0))
             .map_err(|error| error.to_string())
     }
 
@@ -1286,47 +1621,36 @@ impl ChannelRouter {
         target: &FollowTarget,
         cursor: i64,
     ) -> Result<Vec<FollowedEvent>, String> {
-        let db = self.orch.db.for_project(target.project()).await;
-        match target {
-            FollowTarget::Thread { project, name } => db
-                .query_all(
-                    format!(
-                        "SELECT e.rowid, e.data, p.key, t.name, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN threads t ON t.id = j.thread_id JOIN projects p ON p.id = t.project_id WHERE LOWER(p.key) = ?1 AND t.name = ?2 AND {} AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
-                        crate::threads::SESSION_JOB_SHAPE
-                    ),
-                    params![cairn_common::uri::canonical_project(project), name.clone(), cursor],
-                    |row| {
-                        Ok(FollowedEvent {
-                            rowid: row.i64(0)?,
-                            data: row.text(1)?,
-                            // A thread's one identifier, written the way its URI
-                            // and its pane header write it. An issue, which has
-                            // a number AND a title, still reads "KEY-N Title".
-                            context: format!("{}/{}", row.text(2)?, row.text(3)?),
-                            job_id: row.text(4)?,
-                            project_id: row.text(5)?,
-                            repo_path: row.text(6)?,
-                        })
-                    },
-                )
-                .await,
-            FollowTarget::Issue { project, number } => db
-                .query_all(
-                    "SELECT e.rowid, e.data, p.key, i.number, i.title, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
-                    params![cairn_common::uri::canonical_project(project), *number, cursor],
-                    |row| {
-                        Ok(FollowedEvent {
-                            rowid: row.i64(0)?,
-                            data: row.text(1)?,
-                            context: format!("{}/{} {}", row.text(2)?.to_lowercase(), row.i64(3)?, row.text(4)?),
-                            job_id: row.text(5)?,
-                            project_id: row.text(6)?,
-                            repo_path: row.text(7)?,
-                        })
-                    },
-                )
-                .await,
+        let source = self.follow_source(target).await?;
+        if source.job_ids.is_empty() {
+            return Ok(Vec::new());
         }
+        let db = self.orch.db.for_project(target.project()).await;
+        let sql = followed_events_sql(source.job_ids.len());
+        let mut binds: Vec<Value> = source
+            .job_ids
+            .iter()
+            .cloned()
+            .map(Value::Text)
+            .collect::<Vec<_>>();
+        binds.push(Value::Integer(cursor));
+        let FollowSource {
+            context,
+            project_id,
+            repo_path,
+            ..
+        } = source;
+        db.query_all(sql, binds, move |row| {
+            Ok(FollowedEvent {
+                rowid: row.i64(0)?,
+                data: row.text(1)?,
+                context: context.clone(),
+                job_id: row.text(2)?,
+                project_id: project_id.clone(),
+                repo_path: repo_path.clone(),
+            })
+        })
+        .await
         .map_err(|error| error.to_string())
     }
 
@@ -1793,23 +2117,34 @@ impl ChannelRouter {
         // Capture generation before querying and store that exact value. A write
         // racing this snapshot advances the database generation beyond the stored
         // value and therefore forces one follow-up refresh instead of being lost.
+        // A shared source computed a moment earlier carries an older generation,
+        // and taking the OLDER of the two is what keeps that reuse from pinning
+        // this router to a snapshot it would otherwise have refreshed.
         let started = Instant::now();
-        let mut gates = Vec::new();
+        let mut kinds = Vec::new();
         if self.route.question {
-            gates.extend(load_questions(db).await?);
+            kinds.push(GateKind::Question);
         }
         if self.route.permission {
-            gates.extend(load_permissions(db).await?);
+            kinds.push(GateKind::Permission);
         }
+        if self.route.notify {
+            kinds.push(GateKind::Review);
+        }
+        let mut gates = Vec::new();
         let mut review_pushes = 0;
         let mut review_backlog = 0;
         let mut expired = 0;
-        if self.route.notify {
-            let reviews = load_reviews(db).await?;
-            review_pushes = reviews.gates.len();
-            review_backlog = reviews.scanned;
-            expired = reviews.expired_dangling;
-            gates.extend(reviews.gates);
+        let mut generation = generation;
+        for kind in kinds {
+            let snapshot = shared_gates(db, kind).await?;
+            generation = generation.min(snapshot.generation);
+            review_backlog += snapshot.backlog;
+            expired += snapshot.expired;
+            if kind == GateKind::Review {
+                review_pushes = snapshot.gates.len();
+            }
+            gates.extend(snapshot.gates.iter().cloned());
         }
         let routed = self.route_gates(db, gates).await?;
         // `backlog` is the undelivered review rows this refresh read. It is here
@@ -2629,13 +2964,20 @@ pub fn spawn(
             tokio::time::sleep(BACKLOG_SEAL_RETRY_INTERVAL).await;
         }
         super::set_router_blocker(provider_id, None);
-        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+        let mut schedule = SweepSchedule::new();
         loop {
-            tokio::select! {
-                _ = interval.tick() => {},
-                _ = super::wait_for_presence_change() => {},
-            }
+            let reason = schedule.next().await;
+            let started = Instant::now();
             sweep.sweep().await;
+            schedule.finished();
+            // A sweep's duration next to what woke it is the pair that makes a
+            // recurrence diagnosable from the log alone: whether the cadence is
+            // being outrun, and by which provider.
+            log::info!(
+                "channel sweep provider={provider_id} reason={} duration_ms={}",
+                reason.as_str(),
+                started.elapsed().as_millis()
+            );
         }
     });
     let inbound = router.clone();
@@ -3051,6 +3393,406 @@ mod tests {
             titles.contains("idx_issues_number"),
             "the batched lookup is driven by the backlog's issue numbers \
              (migration 0195), not by a scan:\n{titles}"
+        );
+    }
+
+    /// The follow sweep re-reads every followed target every five seconds, so
+    /// what that read costs has to follow the TARGET. It used to follow the
+    /// workspace: both statements drove from `events.rowid > cursor`, an
+    /// open-ended range over the events primary key, and joined outward to
+    /// discover which target each event belonged to — so a sweep read every event
+    /// the workspace had produced since the cursor and discarded nearly all of it
+    /// at the project and issue predicates. On a 1.5M-row `events` table that was
+    /// 15-17 seconds per follow (CAIRN-4208).
+    ///
+    /// The plan is what pins this, for the same reason it pins the review backlog
+    /// next door: the old shape returned the same rows this one does, in the same
+    /// number of statements. Only its plan said that reading one thread's last
+    /// word meant reading the whole workspace's history.
+    ///
+    /// The job list is planned at a realistic width rather than at one, because
+    /// an `IN` list of a single value is exactly the cardinality at which a
+    /// planner will pick a different path than it picks in production.
+    #[tokio::test]
+    async fn followed_target_statements_never_walk_the_event_table() {
+        let db = migrated_test_db("channel-router-follow-plan.db").await;
+        const JOBS: usize = 8;
+        let job_ids: Vec<Value> = (0..JOBS).map(|n| Value::Text(format!("job-{n}"))).collect();
+
+        let issue_jobs = query_plan(
+            &db,
+            FOLLOW_ISSUE_JOBS_SQL,
+            vec![Value::Text("cairn".into()), Value::Integer(4208)],
+        )
+        .await;
+        assert!(
+            issue_jobs.contains("idx_issues_project_number")
+                && issue_jobs.contains("idx_jobs_issue_id"),
+            "a followed issue is found by its (project, number) key and reaches \
+             its jobs through issues(id):\n{issue_jobs}"
+        );
+        let thread_jobs = query_plan(
+            &db,
+            &follow_thread_jobs_sql(),
+            vec![
+                Value::Text("cairn".into()),
+                Value::Text("performance".into()),
+            ],
+        )
+        .await;
+        assert!(
+            thread_jobs.contains("SEARCH t USING INDEX")
+                && thread_jobs.contains("idx_jobs_thread_id"),
+            "a followed thread is found by its (project, name) key and reaches \
+             its session job through threads(id):\n{thread_jobs}"
+        );
+        for plan in [&issue_jobs, &thread_jobs] {
+            assert!(
+                !plan.contains("events"),
+                "resolving WHICH jobs a target owns must not touch the event \
+                 table at all:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN jobs")
+                    && !plan.contains("SCAN issues")
+                    && !plan.contains("SCAN threads"),
+                "only projects may be scanned here — it is the one table in this \
+                 join that a workspace keeps small, and LOWER(p.key) can use no \
+                 index by construction. Everything else is reached by key:\n{plan}"
+            );
+        }
+
+        let mut event_binds = job_ids.clone();
+        event_binds.push(Value::Integer(0));
+        let events = query_plan(&db, &followed_events_sql(JOBS), event_binds).await;
+        let edge = query_plan(&db, &follow_live_edge_sql(JOBS), job_ids).await;
+        for plan in [&events, &edge] {
+            assert!(
+                plan.contains("SEARCH r USING INDEX idx_runs_job_id"),
+                "the resolved jobs drive the read:\n{plan}"
+            );
+            assert!(
+                plan.contains("SEARCH e USING INDEX idx_events"),
+                "and each run seeks its own events:\n{plan}"
+            );
+            assert!(
+                !plan.contains("SCAN e") && !plan.contains("e USING INTEGER PRIMARY KEY"),
+                "driving from the events primary key is the workspace walk \
+                 coming back: it reads every event the workspace produced after \
+                 the cursor and joins outward to find out whose it was:\n{plan}"
+            );
+        }
+    }
+
+    /// The measurement behind the rewrite, kept runnable because a migrated
+    /// empty database cannot show it: every plan here is cheap at zero rows, and
+    /// what changed is which table's SIZE the read is proportional to.
+    ///
+    /// Ignored by default because it builds a live-sized `events` table (the
+    /// installation this was diagnosed on had 1,477,400 rows). Run it with
+    /// `cargo test -p cairn-core --lib measure_follow_read -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "measurement: seeds a live-sized events table"]
+    async fn measure_follow_read_at_live_scale() {
+        const RUNS: usize = 300;
+        const EVENTS_PER_RUN: usize = 5_000;
+        const BATCH: usize = 500;
+        // The followed target's own transcript. A follow is a TAP: the target
+        // says something occasionally, and the workspace goes on producing
+        // between its turns.
+        const TARGET_EVENTS: usize = 200;
+        const TARGET_NEW_EVENTS: usize = 5;
+
+        let db = migrated_test_db("channel-router-follow-scale.db").await;
+        db.execute_batch(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);",
+        )
+        .await
+        .unwrap();
+        for run in 0..RUNS {
+            db.execute_batch(&format!(
+                "INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+                   VALUES ('i-{run}', 'p', {run}, 'Issue {run}', 'active', 1, 1);
+                 INSERT INTO jobs (id, issue_id, project_id, status, uri_segment, created_at, updated_at)
+                   VALUES ('j-{run}', 'i-{run}', 'p', 'complete', 'builder', 1, 1);
+                 INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+                   VALUES ('r-{run}', 'p', 'j-{run}', 'complete', 1, 1);"
+            ))
+            .await
+            .unwrap();
+        }
+
+        let insert_events = |run: usize, from: usize, count: usize| {
+            let values: Vec<String> = (from..from + count)
+                .map(|n| {
+                    format!(
+                        "('e-{run}-{n}', 'r-{run}', {n}, {n}, 'assistant', '{{\"content\":\"turn {n}\",\"toolUses\":[]}}', {n})"
+                    )
+                })
+                .collect();
+            format!(
+                "INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at) VALUES {};",
+                values.join(", ")
+            )
+        };
+
+        // The target speaks first, and the follow cursor stops there.
+        db.execute_batch(&insert_events(0, 0, TARGET_EVENTS))
+            .await
+            .unwrap();
+        let cursor = db
+            .query_one("SELECT MAX(rowid) FROM events", (), |row| row.i64(0))
+            .await
+            .unwrap();
+
+        // Then the rest of the workspace produces, at length, while the followed
+        // target says nothing. Every one of these events sits between the follow
+        // cursor and the end of the primary key, and the old statement read all
+        // of them on every sweep to discover that none of them were the
+        // target's.
+        let seeding = Instant::now();
+        for run in 1..RUNS {
+            for chunk in (0..EVENTS_PER_RUN).step_by(BATCH) {
+                db.execute_batch(&insert_events(run, chunk, BATCH))
+                    .await
+                    .unwrap();
+            }
+        }
+        let total = TARGET_EVENTS + (RUNS - 1) * EVENTS_PER_RUN;
+        println!("seeded {total} events in {:?}", seeding.elapsed());
+
+        // And then the target speaks again: the sweep that has something to say.
+        db.execute_batch(&insert_events(0, TARGET_EVENTS, TARGET_NEW_EVENTS))
+            .await
+            .unwrap();
+
+        let old = Instant::now();
+        let old_rows = db
+            .query_all(
+                "SELECT e.rowid, e.data, p.key, i.number, i.title, j.id, p.id, p.repo_path FROM events e JOIN runs r ON r.id = e.run_id JOIN jobs j ON j.id = r.job_id JOIN issues i ON i.id = j.issue_id JOIN projects p ON p.id = i.project_id WHERE LOWER(p.key) = ?1 AND i.number = ?2 AND e.rowid > ?3 AND e.event_type = 'assistant' ORDER BY e.rowid",
+                params!["cairn", 0_i64, cursor],
+                |row| row.i64(0),
+            )
+            .await
+            .unwrap();
+        let old = old.elapsed();
+
+        let new = Instant::now();
+        let jobs: Vec<String> = db
+            .query_all(FOLLOW_ISSUE_JOBS_SQL, params!["cairn", 0_i64], |row| {
+                row.text(0)
+            })
+            .await
+            .unwrap();
+        let mut binds: Vec<Value> = jobs.iter().cloned().map(Value::Text).collect();
+        binds.push(Value::Integer(cursor));
+        let new_rows = db
+            .query_all(&followed_events_sql(jobs.len()), binds, |row| row.i64(0))
+            .await
+            .unwrap();
+        let new = new.elapsed();
+
+        println!(
+            "events={total} rows={} old={old:?} new={new:?}",
+            new_rows.len()
+        );
+        assert_eq!(old_rows, new_rows, "both shapes return the same events");
+        assert_eq!(new_rows.len(), TARGET_NEW_EVENTS);
+        assert!(
+            new * 20 < old,
+            "the target-driven read must not be within an order of magnitude of \
+             the workspace walk: old={old:?} new={new:?}"
+        );
+    }
+
+    /// A sweep that overruns its cadence is followed by ONE sweep, not by one
+    /// for every deadline it covered.
+    ///
+    /// This is the difference between a slow sweep and a saturated core. With
+    /// tokio's default `Burst`, a twenty-second sweep on a five-second cadence
+    /// leaves four deadlines ready at once, so the loop runs four more sweeps
+    /// back to back with no sleep at all — and while the condition that made the
+    /// sweep slow persists, it never sleeps again. Three enabled providers is
+    /// then three permanently ready workers, which is what a rebuilt runner
+    /// sitting at 500% CPU was (CAIRN-4208).
+    ///
+    /// Paused time is what makes this assertable: the property is about WHEN the
+    /// loop is allowed to run, so it is measured on the clock rather than
+    /// inferred from a duration.
+    /// The presence wake is process-global, so a permit some other test left
+    /// behind arrives here as a spurious wake. Draining it is part of arranging
+    /// a schedule test, not incidental cleanup.
+    async fn drain_presence_wakes() {
+        while tokio::time::timeout(
+            Duration::from_millis(1),
+            super::super::wait_for_presence_change(),
+        )
+        .await
+        .is_ok()
+        {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_sweep_that_overruns_its_cadence_is_followed_by_one_sweep() {
+        drain_presence_wakes().await;
+        let mut schedule = SweepSchedule::new();
+        assert_eq!(schedule.next().await, SweepReason::Timer);
+
+        // A sweep four cadences long.
+        tokio::time::advance(SWEEP_INTERVAL * 4).await;
+        let overran = tokio::time::Instant::now();
+        schedule.finished();
+
+        let mut starts = Vec::new();
+        for _ in 0..3 {
+            assert_eq!(schedule.next().await, SweepReason::Timer);
+            starts.push(overran.elapsed());
+            schedule.finished();
+        }
+
+        assert!(
+            starts[0] <= SWEEP_FLOOR,
+            "the missed deadlines coalesce into one sweep, which runs now: {starts:?}"
+        );
+        assert!(
+            starts[1] >= SWEEP_INTERVAL && starts[2] >= SWEEP_INTERVAL * 2,
+            "and the loop returns to its cadence rather than working off a \
+             backlog of deadlines: under Burst these are three sweeps with no \
+             sleep between them: {starts:?}"
+        );
+    }
+
+    /// A presence change is an external event, so the floor holds for it too: a
+    /// wake source that flaps can advance a sweep, but it cannot spin the loop.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial(operator_presence)]
+    async fn a_burst_of_presence_changes_buys_one_sweep_and_cannot_spin() {
+        use crate::channels::OperatorPresenceMode;
+
+        drain_presence_wakes().await;
+        let mut schedule = SweepSchedule::new();
+        assert_eq!(schedule.next().await, SweepReason::Timer);
+        schedule.finished();
+
+        for mode in [
+            OperatorPresenceMode::Idle,
+            OperatorPresenceMode::Active,
+            OperatorPresenceMode::Auto,
+            OperatorPresenceMode::Idle,
+        ] {
+            super::super::set_operator_presence_mode(mode);
+        }
+        let started = tokio::time::Instant::now();
+        assert_eq!(schedule.next().await, SweepReason::Presence);
+        assert!(
+            started.elapsed() >= SWEEP_FLOOR,
+            "a live wake still rests the floor"
+        );
+        schedule.finished();
+
+        // The changes that arrived while the first sweep ran are one wake, not
+        // four: what follows is the ordinary cadence.
+        let started = tokio::time::Instant::now();
+        assert_eq!(schedule.next().await, SweepReason::Timer);
+        assert!(started.elapsed() >= SWEEP_FLOOR);
+        super::super::set_operator_presence_mode(OperatorPresenceMode::Auto);
+    }
+
+    /// Every enabled provider sweeps on its own five-second loop, but what the
+    /// sweep READS is a fact about the workspace, not about the provider. Three
+    /// channels configured used to mean the same expensive backlog reads three
+    /// times per tick on three threads; they are now computed once per database
+    /// generation for the whole process, and a provider that arrives at an
+    /// unchanged generation performs no database work at all.
+    #[tokio::test]
+    async fn a_second_providers_gate_source_costs_no_database_reads() {
+        let db = migrated_test_db("channel-router-gate-source-sharing.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "prompt-1", 100).await;
+
+        let before = db.read_transaction_count();
+        let first = shared_gates(&db, GateKind::Question).await.unwrap();
+        assert!(
+            db.read_transaction_count() > before,
+            "the first provider to ask pays for the load"
+        );
+        assert_eq!(first.gates.len(), 1);
+
+        let shared = db.read_transaction_count();
+        let second = shared_gates(&db, GateKind::Question).await.unwrap();
+        assert_eq!(
+            db.read_transaction_count(),
+            shared,
+            "the next provider's sweep reads nothing: this is the multiplication \
+             by enabled providers that the profile showed"
+        );
+        assert_eq!(second.gates.len(), 1);
+        assert_eq!(second.generation, first.generation);
+
+        // A write is what makes a shared snapshot stale, and it costs exactly one
+        // recomputation however many providers observe it.
+        seed_prompt(&db, "prompt-2", 101).await;
+        let stale = db.read_transaction_count();
+        let refreshed = shared_gates(&db, GateKind::Question).await.unwrap();
+        assert!(db.read_transaction_count() > stale);
+        assert_eq!(refreshed.gates.len(), 2, "and it sees the new ask");
+        assert_ne!(refreshed.generation, first.generation);
+
+        let after = db.read_transaction_count();
+        assert_eq!(
+            shared_gates(&db, GateKind::Question)
+                .await
+                .unwrap()
+                .gates
+                .len(),
+            2
+        );
+        assert_eq!(db.read_transaction_count(), after);
+    }
+
+    /// A database reopened at the same path is a DIFFERENT database as far as
+    /// the shared snapshot is concerned.
+    ///
+    /// The mutation generation is per handle and starts at zero, while the cache
+    /// is a process-wide static that outlives any handle. Keyed by path and
+    /// generation alone, a reopened database would be served the previous
+    /// handle's gates the moment its counter reached the same number — delivering
+    /// asks that are already resolved, or silently withholding new ones, until
+    /// some unrelated write happened to move the counter off the collision.
+    #[tokio::test]
+    async fn a_reopened_database_does_not_inherit_the_previous_handles_gates() {
+        let seed = migrated_test_db("channel-router-gate-source-reopen.db").await;
+        seed_run(&seed).await;
+        seed_prompt(&seed, "prompt-1", 100).await;
+        let path = seed.path().to_path_buf();
+
+        // A fresh handle publishes at generation zero, which is exactly where
+        // every later handle at this path also begins.
+        let first = LocalDb::open(&path).await.unwrap();
+        assert_eq!(first.mutation_generation(), 0);
+        assert_eq!(
+            shared_gates(&first, GateKind::Question)
+                .await
+                .unwrap()
+                .gates
+                .len(),
+            1
+        );
+        drop(first);
+
+        seed.execute("DELETE FROM prompts", ()).await.unwrap();
+        let reopened = LocalDb::open(&path).await.unwrap();
+        assert_eq!(reopened.mutation_generation(), 0, "the collision");
+        assert!(
+            shared_gates(&reopened, GateKind::Question)
+                .await
+                .unwrap()
+                .gates
+                .is_empty(),
+            "the reopened database is read, not inherited"
         );
     }
 

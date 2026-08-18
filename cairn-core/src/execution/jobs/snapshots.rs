@@ -23,6 +23,7 @@ pub(crate) fn store_queued_user_event_with_turn(
         queued_user_transcript_event(session_id, queued_message_id, content),
         &[],
     )
+    .map(|_| ())
 }
 
 pub(crate) fn queued_user_transcript_event(
@@ -526,6 +527,9 @@ async fn write_execution_snapshot(
     .map_err(|e| db_error("Failed to persist host execution snapshot", e))
 }
 
+/// Returns the id of the event it inserted, which for a push-carrying event is
+/// also the delivery's identity: it is what the stamped rows point at, and
+/// therefore the one handle that can undo the delivery whole.
 fn store_transcript_event_with_turn(
     orch: &Orchestrator,
     run_id: &str,
@@ -534,7 +538,7 @@ fn store_transcript_event_with_turn(
     turn_id: Option<&str>,
     transcript_event: TranscriptEvent,
     push_ids: &[String],
-) -> Result<(), String> {
+) -> Result<String, String> {
     let event_id = ids::mint_child(run_id);
     let event_type = transcript_event.event_type.clone();
     let event_data = transcript_event.observed().to_event_json();
@@ -586,7 +590,7 @@ fn store_transcript_event_with_turn(
         ),
     );
 
-    Ok(())
+    Ok(event_id)
 }
 
 /// Store a user event in the transcript with an explicit turn_id.
@@ -732,6 +736,7 @@ fn store_user_like_event_with_turn(
         transcript_event,
         &[],
     )
+    .map(|_| ())
 }
 
 /// Store a synthetic `tool_result` event in the transcript, attached to an
@@ -803,12 +808,17 @@ pub fn store_tool_result_event_with_resolution(
         transcript_event,
         &[],
     )
+    .map(|_| ())
 }
 
 /// Persist a single carrying event for drained attention pushes and stamp each
 /// push delivered by it, atomically in the event-insert transaction
 /// (CAIRN-1881). The rendered push text rides in `content`; recovery redelivers
 /// only pushes whose carrying event never durably landed.
+///
+/// Returns the carrying event's id. The caller holds it until the launch reaches
+/// a process, because until then this delivery may still have to be undone — see
+/// [`crate::orchestrator::attention_push::revert_delivery`].
 pub(crate) fn store_attention_push_event(
     orch: &Orchestrator,
     run_id: &str,
@@ -817,7 +827,7 @@ pub(crate) fn store_attention_push_event(
     push_ids: &[String],
     now: i32,
     turn_id: Option<&str>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     // CAIRN-1891: the carrying event for a resumed-into wake renders through the
     // wake-card formatter; `content` is the structured `{active, catchup}` JSON.
     let transcript_event = TranscriptEvent {

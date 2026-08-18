@@ -137,6 +137,8 @@ fn finalize_pr(map: HashMap<String, PrAcc>) -> Vec<PrEconomicsRow> {
 }
 
 /// Per-model and per-role economics (tokens, cost, runs, efficiency ratios).
+/// Costs use the canonical [`exact_or_priced`] rule, like every other $-valued
+/// analytic.
 pub async fn model_role_economics(
     db: &LocalDb,
     scope: &Scope,
@@ -146,22 +148,18 @@ pub async fn model_role_economics(
     let mut by_model: HashMap<String, Acc> = HashMap::new();
     let mut by_role: HashMap<String, Acc> = HashMap::new();
     for row in &rows {
-        // Prefer the real metered cost when any event in the group reported one
-        // (matching `group_cost`), else fall back to the price-table estimate.
-        // Without this the table reads ~$0 for metered providers (OpenRouter,
-        // z-ai, deepseek) whose price table is empty.
-        let cost = if row.exact_cost_count > 0 {
-            row.exact_cost
-        } else {
-            pricing::cost_usd(
-                &row.backend,
-                row.model.as_deref(),
-                row.input,
-                row.cache_read,
-                row.cache_create,
-                row.output,
-            )
-        };
+        // Without the exact-cost preference the table reads ~$0 for metered
+        // providers (OpenRouter, z-ai, deepseek) whose price table is empty.
+        let cost = exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            row.output,
+            row.exact_cost,
+            row.exact_cost_count,
+        );
         let model_key = row
             .model
             .clone()

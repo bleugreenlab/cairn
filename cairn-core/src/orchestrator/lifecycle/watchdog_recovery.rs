@@ -6,7 +6,8 @@ use crate::execution::jobs::{continue_job_launch_locked_for_watchdog, ResumeCont
 use crate::orchestrator::Orchestrator;
 use crate::runs::watchdog_ledger::{
     append_watchdog_lifecycle, claim_watchdog_recovery, finish_watchdog_recovery,
-    owns_watchdog_recovery_claim, NewWatchdogLifecycle, WatchdogIdentity, WatchdogLifecycleKind,
+    owns_watchdog_recovery_claim, reserve_watchdog_successor, NewWatchdogLifecycle,
+    WatchdogIdentity, WatchdogLifecycleKind,
 };
 use crate::storage::{run_db_blocking, LocalDb, RowExt};
 
@@ -176,6 +177,68 @@ pub(super) struct CurrentRecoveryTarget {
 
 pub(crate) const ALREADY_TERMINAL_RECONCILED_REASON: &str =
     "provider_silence_already_terminal_reconciled";
+const RECOVERY_SUCCESSOR_BUDGET: i64 = 3;
+const RECOVERY_SUCCESSOR_WINDOW_SECS: i64 = 30 * 60;
+
+pub(crate) fn has_pending_resume_trigger(db: Arc<LocalDb>, job_id: &str) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.query_opt(
+            "SELECT 1 WHERE
+               EXISTS (SELECT 1 FROM queued_messages WHERE job_id = ?1 AND delivered_at IS NULL)
+               OR EXISTS (SELECT 1 FROM agent_waits WHERE job_id = ?1 AND state IN ('pending', 'resolving'))
+               OR EXISTS (SELECT 1 FROM jobs WHERE parent_job_id = ?1 AND status NOT IN ('complete', 'failed', 'cancelled'))
+               OR EXISTS (
+                 SELECT 1 FROM wake_subscriptions
+                 WHERE job_id = ?1 AND state IN ('active', 'muted')
+                   AND NOT (created_by = 'system' AND source_kind IN ('user', 'peer'))
+               )
+             LIMIT 1",
+            (job_id,),
+            |_| Ok(()),
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(|error| error.to_string())
+    })
+}
+
+fn job_needs_watchdog_successor(db: Arc<LocalDb>, job_id: &str) -> Result<bool, String> {
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        db.query_opt(
+            "SELECT 1 FROM jobs
+             WHERE id = ?1 AND status IN ('blocked', 'running') AND needs_fresh_session = 1",
+            (job_id,),
+            |_| Ok(()),
+        )
+        .await
+        .map(|row| row.is_some())
+        .map_err(|error| error.to_string())
+    })
+}
+
+fn reserve_recovery_successor(
+    db: Arc<LocalDb>,
+    identity: &WatchdogIdentity,
+    job_id: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let identity = identity.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        reserve_watchdog_successor(
+            &db,
+            &identity,
+            &job_id,
+            now.saturating_sub(RECOVERY_SUCCESSOR_WINDOW_SECS),
+            RECOVERY_SUCCESSOR_BUDGET,
+            now,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })
+}
 
 /// Recover one exact provider turn after its durable watchdog expires.
 ///
@@ -287,9 +350,63 @@ pub fn recover_provider_watchdog(
             })),
             now,
         );
+        if !job_needs_watchdog_successor(db.clone(), &target.job_id)?
+            || has_pending_resume_trigger(db.clone(), &target.job_id)?
+        {
+            return Ok(ProviderWatchdogRecovery::Recovered {
+                reason: ALREADY_TERMINAL_RECONCILED_REASON.to_string(),
+                successor: None,
+            });
+        }
+        if !reserve_recovery_successor(db.clone(), identity, &target.job_id, now)? {
+            report_recovery_launch_failure(orch, &identity.run_id);
+            record_lifecycle(
+                db,
+                identity,
+                WatchdogLifecycleKind::SuccessorFailed,
+                Some("provider_silence_recovery_budget_exhausted"),
+                Some(serde_json::json!({
+                    "budget": RECOVERY_SUCCESSOR_BUDGET,
+                    "window_seconds": RECOVERY_SUCCESSOR_WINDOW_SECS
+                })),
+                now,
+            );
+            return Err(format!(
+                "watchdog recovery budget exhausted for job {}",
+                target.job_id
+            ));
+        }
+        let successor_run = continue_job_launch_locked_for_watchdog(
+            orch,
+            &target.job_id,
+            Some(ResumeContext {
+                suppress_user_event: true,
+                suppress_self_suspend_note: true,
+                ..ResumeContext::default()
+            }),
+        )?;
+        let successor_turn_id = orch
+            .process_state
+            .get_current_turn_id(&successor_run.id)
+            .or(current_head_turn_id(db.clone(), &target.job_id)?)
+            .ok_or_else(|| {
+                format!(
+                    "watchdog successor run {} has no current turn",
+                    successor_run.id
+                )
+            })?;
+        let successor = (successor_run.id, successor_turn_id);
+        record_lifecycle(
+            db,
+            identity,
+            WatchdogLifecycleKind::SuccessorStarted,
+            Some(ALREADY_TERMINAL_RECONCILED_REASON),
+            Some(serde_json::json!({ "predecessor_turn_id": target.cairn_turn_id })),
+            now,
+        );
         return Ok(ProviderWatchdogRecovery::Recovered {
             reason: ALREADY_TERMINAL_RECONCILED_REASON.to_string(),
-            successor: None,
+            successor: Some(successor),
         });
     }
 
@@ -318,6 +435,22 @@ pub fn recover_provider_watchdog(
         now,
     );
 
+    if !reserve_recovery_successor(db.clone(), identity, &target.job_id, now)? {
+        report_recovery_launch_failure(orch, &identity.run_id);
+        finish_recovery(
+            db,
+            identity,
+            claimed_at,
+            false,
+            "provider_silence_recovery_budget_exhausted",
+            None,
+            now,
+        )?;
+        return Err(format!(
+            "watchdog recovery budget exhausted for job {}",
+            target.job_id
+        ));
+    }
     if !recovery_claim_is_owned(db.clone(), identity, claimed_at)? {
         return Ok(ProviderWatchdogRecovery::LostClaim);
     }
@@ -498,6 +631,124 @@ pub(super) fn current_recovery_target(
         .await
         .map_err(|e| e.to_string())
     })
+}
+
+pub(crate) fn sweep_stranded_watchdog_jobs(orch: &Orchestrator) -> usize {
+    const STRANDED_GRACE_SECS: i64 = 120;
+    let db = orch.db.local.clone();
+    let now = chrono::Utc::now().timestamp();
+    let candidates = match run_db_blocking({
+        let db = db.clone();
+        move || async move {
+            db.query_all(
+                "SELECT j.id, w.run_id, w.session_id, w.provider_turn_id, w.generation
+                 FROM jobs j
+                 JOIN runs r ON r.job_id = j.id
+                 JOIN codex_watchdog_leases w ON w.run_id = r.id
+                 WHERE j.status IN ('blocked', 'running') AND j.needs_fresh_session = 1
+                   AND j.current_session_id = w.session_id
+                   AND w.state = 'terminalized'
+                   AND w.terminal_reason = 'provider_silence_already_terminal_reconciled'
+                   AND EXISTS (
+                     SELECT 1 FROM sessions current_session
+                     WHERE current_session.id = j.current_session_id
+                       AND current_session.status = 'closed'
+                       AND current_session.terminal_reason = 'provider_silence_already_terminal_reconciled'
+                   )
+                   AND j.updated_at <= ?1
+                   AND NOT EXISTS (
+                     SELECT 1 FROM runs live
+                     WHERE live.job_id = j.id AND live.status IN ('starting', 'live')
+                   )
+                   AND w.rowid = (
+                     SELECT latest.rowid FROM codex_watchdog_leases latest
+                     JOIN runs latest_run ON latest_run.id = latest.run_id
+                     WHERE latest_run.job_id = j.id ORDER BY latest.updated_at DESC LIMIT 1
+                   )",
+                (now.saturating_sub(STRANDED_GRACE_SECS),),
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        WatchdogIdentity {
+                            run_id: row.text(1)?,
+                            session_id: row.text(2)?,
+                            provider_turn_id: row.text(3)?,
+                            generation: row.text(4)?,
+                        },
+                    ))
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+    }) {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            log::error!("stranded watchdog sweep failed to load candidates: {error}");
+            return 0;
+        }
+    };
+
+    let mut recovered = 0;
+    for (job_id, identity) in candidates {
+        let launch_lock = orch.job_launch_lock(&job_id);
+        let _guard = match launch_lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if has_pending_resume_trigger(db.clone(), &job_id).unwrap_or(true) {
+            continue;
+        }
+        if !reserve_recovery_successor(db.clone(), &identity, &job_id, now).unwrap_or(false) {
+            report_recovery_launch_failure(orch, &identity.run_id);
+            record_lifecycle(
+                db.clone(),
+                &identity,
+                WatchdogLifecycleKind::SuccessorFailed,
+                Some("stranded_recovery_budget_exhausted"),
+                Some(serde_json::json!({ "source": "periodic_sweep" })),
+                now,
+            );
+            continue;
+        }
+        match continue_job_launch_locked_for_watchdog(
+            orch,
+            &job_id,
+            Some(ResumeContext {
+                suppress_user_event: true,
+                suppress_self_suspend_note: true,
+                ..ResumeContext::default()
+            }),
+        ) {
+            Ok(run) => {
+                record_lifecycle(
+                    db.clone(),
+                    &identity,
+                    WatchdogLifecycleKind::SuccessorStarted,
+                    Some("stranded_watchdog_recovery"),
+                    Some(serde_json::json!({
+                        "source": "periodic_sweep",
+                        "successor_run_id": run.id
+                    })),
+                    now,
+                );
+                recovered += 1;
+            }
+            Err(error) => {
+                report_recovery_launch_failure(orch, &identity.run_id);
+                record_lifecycle(
+                    db.clone(),
+                    &identity,
+                    WatchdogLifecycleKind::SuccessorFailed,
+                    Some("stranded_watchdog_successor_failed"),
+                    Some(serde_json::json!({ "error": error, "source": "periodic_sweep" })),
+                    now,
+                );
+            }
+        }
+    }
+    recovered
 }
 
 fn current_head_turn_id(db: Arc<LocalDb>, job_id: &str) -> Result<Option<String>, String> {

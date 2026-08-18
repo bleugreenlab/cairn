@@ -13,12 +13,13 @@ use cairn_common::identity::{
 
 use super::posts::{
     post_push_source, record_new_post_attention, record_post_comment_attention,
-    NEW_POST_PUSH_PREFIX, POST_COMMENT_PUSH_PREFIX, POST_MENTION_PUSH_PREFIX,
+    render_post_push_body, NEW_POST_PUSH_PREFIX, POST_COMMENT_PUSH_PREFIX,
+    POST_MENTION_PUSH_PREFIX,
 };
 use super::store::{mute, subscribe, unsubscribe_matching};
 use super::types::SOURCE_KIND_POST;
-use crate::models::{Post, PostComment};
-use crate::orchestrator::attention_push::{list_pending, Wake};
+use crate::models::{CreatePost, CreatePostComment, Post, PostComment};
+use crate::orchestrator::attention_push::{list_pending, Push, Wake};
 use crate::storage::LocalDb;
 
 async fn migrated_db() -> LocalDb {
@@ -128,6 +129,49 @@ fn comment(id: i64, post_id: i64, author: &str, content: &str) -> PostComment {
         author_display: None,
         created_at: 2,
     }
+}
+
+/// A post that actually exists in the corpus.
+///
+/// The routing tests build `Post` values in memory because routing reads only
+/// the author; a wake BODY is rendered from the stored row, so the tests that
+/// assert what a subscriber reads persist one.
+async fn stored_post(
+    db: &LocalDb,
+    project_id: Option<&str>,
+    author: &str,
+    title: Option<&str>,
+    content: &str,
+) -> Post {
+    let author = agent(author);
+    db.create_post(CreatePost {
+        project_id: project_id.map(str::to_string),
+        title: title.map(str::to_string),
+        content: content.to_string(),
+        appearance: appearance(&author),
+        author,
+    })
+    .await
+    .unwrap()
+}
+
+async fn stored_comment(db: &LocalDb, post_id: i64, author: &str, content: &str) -> PostComment {
+    let author = agent(author);
+    db.create_post_comment(CreatePostComment {
+        post_id,
+        content: content.to_string(),
+        appearance: appearance(&author),
+        author,
+    })
+    .await
+    .unwrap()
+}
+
+/// The recipient's one pending push, asserting that it is exactly one.
+async fn only_pending(db: &LocalDb, job_id: &str) -> Push {
+    let mut pushes = list_pending(db, job_id).await.unwrap();
+    assert_eq!(pushes.len(), 1, "expected exactly one pending push");
+    pushes.remove(0)
 }
 
 async fn watch_posts(db: &LocalDb, job_id: &str) {
@@ -636,6 +680,157 @@ async fn a_repeat_comment_supersedes_rather_than_stacks() {
         vec![("post-comment:cairn://posts/1".to_string(), Wake::Wake)],
         "a second comment refreshes the pending row instead of stacking"
     );
+}
+
+/// A wake exists so its recipient can decide whether the thing is worth its
+/// attention, and a URI cannot be judged. The post arrives whole — title, body,
+/// resolved scope and author — with the canonical URI kept as provenance rather
+/// than standing in for the content.
+#[tokio::test(flavor = "current_thread")]
+async fn a_new_post_wake_carries_the_post_inline() {
+    let db = migrated_db().await;
+    seed(&db).await;
+    watch_posts(&db, "job-a").await;
+
+    let authored = stored_post(
+        &db,
+        Some("proj-a"),
+        "cairn://p/alpha/2/1/builder",
+        Some("Wake legibility"),
+        "Test post to see if the wake works",
+    )
+    .await;
+    record_new_post_attention(&db, &authored).await.unwrap();
+
+    let body = render_post_push_body(&db, &only_pending(&db, "job-a").await)
+        .await
+        .expect("a routed post renders its own body");
+
+    assert!(
+        body.contains("Test post to see if the wake works"),
+        "{body}"
+    );
+    assert!(body.contains("Wake legibility"), "{body}");
+    assert!(
+        body.contains("cairn://p/alpha/2/1/builder"),
+        "the author resolves to the home a reader can go read: {body}"
+    );
+    assert!(
+        body.contains("cairn://posts/1"),
+        "the canonical URI stays as provenance: {body}"
+    );
+    assert!(
+        !body.contains("- Scope:") && !body.contains("- Created:"),
+        "a handed-to-you post carries the writing, not its filing: {body}"
+    );
+}
+
+/// A post longer than the wake bound is cut, never summarized: the author's own
+/// opening words, then the canonical URI as the pointer to the rest.
+#[tokio::test(flavor = "current_thread")]
+async fn a_long_post_truncates_with_its_uri_as_the_continue_pointer() {
+    let db = migrated_db().await;
+    seed(&db).await;
+    watch_posts(&db, "job-a").await;
+
+    let long = format!("{}TAIL", "situation normal. ".repeat(200));
+    let authored = stored_post(
+        &db,
+        None,
+        "cairn://p/alpha/2/1/builder",
+        Some("Long"),
+        &long,
+    )
+    .await;
+    record_new_post_attention(&db, &authored).await.unwrap();
+
+    let body = render_post_push_body(&db, &only_pending(&db, "job-a").await)
+        .await
+        .unwrap();
+
+    assert!(body.contains("situation normal."), "{body}");
+    assert!(
+        !body.contains("TAIL"),
+        "the body is bounded rather than pasted whole: {}",
+        body.len()
+    );
+    assert!(body.contains("truncated at 2000 characters"), "{body}");
+    assert!(
+        body.contains("read cairn://posts/1 for the rest"),
+        "the bound hands over a pointer: {body}"
+    );
+}
+
+/// A comment wake inlines the comment and names the post it lands on. Two
+/// comments before a drain are still one wake — supersession carries the newest
+/// with the row, and the post URI holds the rest.
+#[tokio::test(flavor = "current_thread")]
+async fn a_comment_wake_carries_the_comment_and_names_its_post() {
+    let db = migrated_db().await;
+    seed(&db).await;
+
+    let authored = stored_post(
+        &db,
+        None,
+        "cairn://p/alpha/1/1/builder",
+        Some("Wake legibility"),
+        "mine",
+    )
+    .await;
+    for content in ["first reply", "second reply"] {
+        let comment = stored_comment(&db, authored.id, "cairn://p/beta/1/1/builder", content).await;
+        record_post_comment_attention(&db, &authored, &comment)
+            .await
+            .unwrap();
+    }
+
+    let push = only_pending(&db, "job-a").await;
+    assert_eq!(push.key, "post-comment:cairn://posts/1");
+    let body = render_post_push_body(&db, &push).await.unwrap();
+
+    assert!(body.contains("second reply"), "{body}");
+    assert!(
+        body.contains("On [Wake legibility](cairn://posts/1)"),
+        "a comment names the post it is on: {body}"
+    );
+    assert!(body.contains("### Comment 2"), "{body}");
+    assert!(
+        body.contains("cairn://p/beta/1/1/builder"),
+        "the commenter resolves: {body}"
+    );
+    assert!(
+        !body.contains("first reply"),
+        "the collapsed wake carries the newest comment, not a transcript: {body}"
+    );
+    assert!(
+        !body.contains("- Created:") && !body.contains("- Parent:"),
+        "the lead-in already named the post: {body}"
+    );
+}
+
+/// A push whose referent cannot be resolved renders nothing rather than a
+/// guess, so the caller keeps its reference-only header.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unresolvable_referent_renders_no_body() {
+    let db = migrated_db().await;
+    seed(&db).await;
+
+    for content_ref in ["cairn://posts/404", "cairn://p/alpha/1"] {
+        let push = Push {
+            id: "push".into(),
+            recipient: "job-a".into(),
+            content_ref: content_ref.into(),
+            wake: Wake::Wake,
+            boundary: crate::orchestrator::attention_push::Boundary::Event,
+            key: format!("post:{content_ref}"),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+        assert!(
+            render_post_push_body(&db, &push).await.is_none(),
+            "{content_ref} has no post to render"
+        );
+    }
 }
 
 /// A human-authored post has no session for a comment to wake, and saying so

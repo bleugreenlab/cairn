@@ -6,7 +6,8 @@ use crate::agent_process::stream::{TokenCounts, TranscriptEvent};
 use crate::db_records::{DbMessageStream, DbMessageStreamChunk};
 use crate::effects::outbox::{self, OutboxEntry};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{query_opt_text_conn, DbError, DbResult, LocalDb, RowExt};
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
+use crate::transcripts::file_activity;
 use cairn_db::turso::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -397,6 +398,42 @@ pub fn insert_event(db: Arc<LocalDb>, event: EventInsert) -> Result<bool, String
     })
 }
 
+/// Broadcast one `file-touched` frame per file a landed assistant event named.
+///
+/// The live half of [`file_activity`]: the durable rows are written inside the
+/// event's own insert transaction, and this announces the same touches to
+/// whoever is watching. Both read the SAME event data through
+/// [`file_activity::touches_from_event_data`], which is a pure function of it,
+/// so the row that lands and the frame that goes out cannot disagree.
+///
+/// Silent when the run has no owning job: an unattributable touch is not a fact
+/// a per-project surface can place.
+fn emit_file_touches(
+    emitter: &Arc<dyn crate::services::EventEmitter>,
+    scope: &crate::notify::EventRunScope,
+    run_id: &str,
+    data: &str,
+    created_at: i64,
+) {
+    let Some(job_id) = scope.job_id.as_deref() else {
+        return;
+    };
+    for touch in file_activity::touches_from_event_data(data) {
+        let _ = emitter.emit(
+            "file-touched",
+            serde_json::json!({
+                "projectId": scope.project_id,
+                "jobId": job_id,
+                "runId": run_id,
+                "toolUseId": touch.tool_use_id,
+                "filePath": touch.path,
+                "action": touch.action.as_str(),
+                "ts": created_at,
+            }),
+        );
+    }
+}
+
 /// Canonical durable-event insert: write the event and, as one atomic unit,
 /// emit a fully-scoped `events` db-change so the live chat transcript's delta
 /// cache always receives its invalidation. Every live/finalize insert path
@@ -405,25 +442,6 @@ pub fn insert_event(db: Arc<LocalDb>, event: EventInsert) -> Result<bool, String
 /// intermittently freezes the chat transcript (CAIRN-1916). Returns whether a
 /// new row landed (`false` = duplicate id); the emit fires only when a row
 /// actually lands, matching the resolver's append-only delta expectations.
-fn issue_id_for_run(db: Arc<LocalDb>, run_id: &str) -> Result<Option<String>, String> {
-    let run_id = run_id.to_string();
-    block_on_stream_db(async move {
-        db.read(|conn| {
-            let run_id = run_id.clone();
-            Box::pin(async move {
-                query_opt_text_conn(
-                    conn,
-                    "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
-                    params![run_id.as_str()],
-                )
-                .await
-            })
-        })
-        .await
-        .map_err(|e| e.to_string())
-    })
-}
-
 pub fn insert_event_emit(
     db: Arc<LocalDb>,
     emitter: &Arc<dyn crate::services::EventEmitter>,
@@ -431,18 +449,16 @@ pub fn insert_event_emit(
 ) -> Result<bool, String> {
     let run_id = event.run_id.clone();
     let session_id = event.session_id.clone();
-    let issue_id = issue_id_for_run(db.clone(), &run_id)?;
+    let data = event.data.clone();
+    let created_at = event.created_at as i64;
+    let scope = crate::notify::event_run_scope(db.clone(), &run_id);
     let inserted = insert_event(db, event)?;
     if inserted {
         let _ = emitter.emit(
             "db-change",
-            crate::notify::event_db_change_scoped(
-                &run_id,
-                session_id.as_deref(),
-                issue_id.as_deref(),
-                "insert",
-            ),
+            crate::notify::event_db_change_scoped(&run_id, session_id.as_deref(), &scope, "insert"),
         );
+        emit_file_touches(emitter, &scope, &run_id, &data, created_at);
     }
     Ok(inserted)
 }
@@ -471,15 +487,22 @@ pub fn finalize_stream_emit(
         final_event,
         counts,
     )?;
-    let issue_id = issue_id_for_run(db, &finalized.run_id)?;
+    let scope = crate::notify::event_run_scope(db, &finalized.run_id);
     let _ = emitter.emit(
         "db-change",
         crate::notify::event_db_change_scoped(
             &finalized.run_id,
             finalized.session_id.as_deref(),
-            issue_id.as_deref(),
+            &scope,
             "insert",
         ),
+    );
+    emit_file_touches(
+        emitter,
+        &scope,
+        &finalized.run_id,
+        &finalized.data_json,
+        finalized.created_at as i64,
     );
     Ok(finalized)
 }
@@ -664,6 +687,30 @@ async fn insert_event_at_conn(
                 "analytics rollup maintenance failed for event {}: {e}",
                 event.id
             );
+        }
+        // The per-job file-touch stream rides the same insert for the same
+        // reason, and is infallible for the same reason: a derived index must
+        // never be able to roll back the transcript event it describes. A miss
+        // reads as a quiet moment on the map rather than a wrong one, which is
+        // why this stream has no backfill.
+        if event.event_type == "assistant" {
+            let touches = file_activity::touches_from_event_data(&event.data);
+            if !touches.is_empty() {
+                if let Err(e) = file_activity::record_touches_conn(
+                    conn,
+                    &event.id,
+                    &event.run_id,
+                    event.created_at as i64,
+                    &touches,
+                )
+                .await
+                {
+                    log::warn!(
+                        "file-activity maintenance failed for event {}: {e}",
+                        event.id
+                    );
+                }
+            }
         }
     }
     Ok(count)

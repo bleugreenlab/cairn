@@ -29,8 +29,9 @@ use cairn_db::turso::params;
 
 use crate::messages::queued::DeliveryUrgency;
 use crate::models::{Post, PostComment};
-use crate::orchestrator::attention_push::{Boundary, Wake};
+use crate::orchestrator::attention_push::{latest_push_fingerprint, Boundary, Push, Wake};
 use crate::orchestrator::Orchestrator;
+use crate::resources::posts::{render_comment, render_post, PostContext, PostForm};
 use crate::storage::{LocalDb, RowExt};
 
 use super::child::watcher_jobs_for_issue;
@@ -150,6 +151,7 @@ pub(crate) async fn record_new_post_attention(
             (NEW_POST_PUSH_PREFIX, subscribers),
         ],
         author_home.as_deref(),
+        None,
     )
     .await)
 }
@@ -180,6 +182,7 @@ pub(crate) async fn record_post_comment_attention(
             (POST_COMMENT_PUSH_PREFIX, author),
         ],
         commenter_home.as_deref(),
+        Some(comment.id),
     )
     .await)
 }
@@ -197,12 +200,22 @@ pub(crate) async fn record_post_comment_attention(
 /// Each push is its own write, and a failure is contained to its recipient: the
 /// others still land, and the count of the ones that did not is reported rather
 /// than swallowed.
+///
+/// `comment` names the comment this event is, when it is one. A post push's
+/// `content_ref` is always the POST — the canonical, resolvable referent a wake
+/// card links and a reader addresses — so which comment refreshed the row rides
+/// in the row's `fingerprint` instead, the same lightweight content key the
+/// review creator stamps. Supersession overwrites it, which is exactly right:
+/// two comments before a drain are still one wake, and the one it carries is the
+/// newest.
 async fn record_post_attention(
     db: &LocalDb,
     uri: &str,
     routes: &[(&'static str, Vec<String>)],
     exclude: Option<&str>,
+    comment: Option<i64>,
 ) -> PostAttention {
+    let fingerprint = comment.map(|id| id.to_string());
     let mut attention = PostAttention::default();
     for (prefix, recipients) in routes {
         let key = format!("{prefix}:{uri}");
@@ -210,13 +223,14 @@ async fn record_post_attention(
             if Some(recipient.as_str()) == exclude || attention.recorded.contains(recipient) {
                 continue;
             }
-            match crate::orchestrator::attention_push::push(
+            match crate::orchestrator::attention_push::push_with_fingerprint(
                 db,
                 recipient,
                 uri,
                 Wake::Wake,
                 Boundary::Event,
                 &key,
+                fingerprint.as_deref(),
             )
             .await
             {
@@ -234,6 +248,59 @@ async fn record_post_attention(
         }
     }
     attention
+}
+
+/// The body a drained post push carries: the writing itself, not an errand.
+///
+/// A post is short and a wake exists to be classified — ignorable or not — so
+/// sending a subscriber somewhere else to read five words costs it a whole read
+/// to learn nothing. The post (or the comment the push stands for) is rendered
+/// here through the same renderer `cairn://posts/{id}` uses, bounded by
+/// [`WAKE_BODY_CHARS`], with the canonical URI kept as provenance and as the
+/// pointer past the bound.
+///
+/// `None` when the referent cannot be resolved — a `content_ref` that is not a
+/// post URI, or a post row that is gone — so the caller keeps its reference-only
+/// header rather than printing a lie. See [`PostForm`] for what the wake form
+/// carries and what it leaves to the read its URI invites.
+pub(crate) async fn render_post_push_body(db: &LocalDb, push: &Push) -> Option<String> {
+    let Some(CairnResource::Post { id }) = cairn_common::uri::parse_uri(&push.content_ref) else {
+        return None;
+    };
+    let post = db.get_post(id).await.ok()??;
+    let context = PostContext::resolve(db, std::slice::from_ref(&post)).await;
+    Some(match comment_named_by(db, push, id).await {
+        Some(comment) => format!(
+            "On [{}](cairn://posts/{id}):\n\n{}",
+            post.title.as_deref().unwrap_or("Untitled"),
+            render_comment(&comment, &context, PostForm::Wake)
+        ),
+        None => render_post(&post, &context, PostForm::Wake),
+    })
+}
+
+/// The comment a push's fingerprint names, when it names one.
+///
+/// Only the two routes a comment can produce are consulted: a `post:` push is a
+/// new post and never carries one, and asking would be a query per drained feed
+/// wake in resume assembly. A fingerprint that no longer resolves to a live
+/// comment degrades to the post itself rather than to nothing.
+async fn comment_named_by(db: &LocalDb, push: &Push, post_id: i64) -> Option<PostComment> {
+    let prefix = push.key.split_once(':').map(|(prefix, _)| prefix)?;
+    if !matches!(prefix, POST_COMMENT_PUSH_PREFIX | POST_MENTION_PUSH_PREFIX) {
+        return None;
+    }
+    let fingerprint = latest_push_fingerprint(db, &push.recipient, &push.key)
+        .await
+        .ok()
+        .flatten()
+        .flatten()?;
+    let comment_id: i64 = fingerprint.parse().ok()?;
+    db.list_post_comments(post_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|comment| comment.id == comment_id)
 }
 
 /// The jobs whose elective Posts watch admits a post of this scope.

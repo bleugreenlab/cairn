@@ -9,13 +9,14 @@ use super::conversation::{
     coalesce_roles, normalize_tool_groups, transcript_event_to_message, trim_conversation_to_budget,
 };
 use super::generation::into_generation;
-use super::http::{build_body, require_terminal_event, MessagesEndpoint};
+use super::http::{build_body, MessagesEndpoint, TERMINAL_EVENTS};
 use super::wire::{
     ContentBlock, MessagesMessage, MessagesResponse, StreamEvent, StreamingMessage, ASSISTANT_ROLE,
     USER_ROLE,
 };
 use crate::agent_process::stdin::MessageContent;
 use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
+use crate::backends::http_loop::require_terminal_event;
 use crate::backends::{SessionConfig, SessionStart};
 use serde_json::json;
 
@@ -713,18 +714,17 @@ fn a_stream_cut_off_before_message_stop_is_not_a_complete_message() {
 
 #[test]
 fn a_truncated_stream_is_refused_rather_than_stored_as_a_result() {
-    let error = require_terminal_event(PROVIDER, false, false)
+    let error = require_terminal_event(PROVIDER, TERMINAL_EVENTS, false, false)
         .expect_err("a stream that never finished is not a generation");
-    assert!(
-        error.contains("ended before the message completed"),
-        "{error}"
-    );
+    // The failure has to name the signal this family was waiting for, not just
+    // report that something ended.
+    assert!(error.contains("message_stop"), "{error}");
     assert!(error.contains("not being recorded as a result"), "{error}");
 
     // A completed stream passes, and a cancelled turn is the one legitimate
     // early ending: the user asked for it and the run lands idle, not failed.
-    assert!(require_terminal_event(PROVIDER, true, false).is_ok());
-    assert!(require_terminal_event(PROVIDER, false, true).is_ok());
+    assert!(require_terminal_event(PROVIDER, TERMINAL_EVENTS, true, false).is_ok());
+    assert!(require_terminal_event(PROVIDER, TERMINAL_EVENTS, false, true).is_ok());
 }
 
 #[test]
@@ -742,5 +742,5 @@ fn a_side_effecting_call_from_a_truncated_stream_never_reaches_dispatch() {
     assert!(generation.finish_reason.is_none());
 
     assert!(!saw_terminal);
-    assert!(require_terminal_event(PROVIDER, saw_terminal, false).is_err());
+    assert!(require_terminal_event(PROVIDER, TERMINAL_EVENTS, saw_terminal, false).is_err());
 }

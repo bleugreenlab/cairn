@@ -895,6 +895,16 @@ async fn reconcile_jj_downstream(
             base_branch.to_string(),
             Some(merged_job.id.clone()),
         );
+        // The code map projects the base tree, so this merge is exactly what
+        // makes the stored one describe a tree that is no longer the base.
+        crate::projects::codemap::note_base_advance(
+            orch,
+            db,
+            &merged_job.project_id,
+            repo_path,
+            base_branch,
+        )
+        .await;
     }
 
     // Anything cut FROM the branch that just merged loses its base the moment
@@ -1084,6 +1094,10 @@ async fn reconcile_default_advance(
         default_branch.to_string(),
         None,
     );
+    // Same reasoning as the Cairn-merge path: an advance the webhook observed
+    // moves the base the code map projects, whether or not Cairn drove it.
+    crate::projects::codemap::note_base_advance(orch, &db, project_id, &repo_path, default_branch)
+        .await;
     // Bring the advanced tip into the shared store and reconcile the default
     // bookmark onto it — BEFORE looking at siblings, because this is owed whether
     // or not anything downstream needs rebasing.

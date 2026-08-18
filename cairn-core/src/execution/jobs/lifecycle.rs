@@ -2220,17 +2220,25 @@ fn continue_job_launch_locked(
             Some(&turn_id),
         )?;
     }
+    // Armed the moment the stamp lands, disarmed once a process holds the prompt
+    // it stamped for; see `UndeliveredPushes`.
+    let mut stamped_pushes = UndeliveredPushes {
+        db: owning_db.clone(),
+        carrying_event_id: None,
+    };
     if let Some(text) = &push_summary {
         let push_ids: Vec<String> = drained_pushes.iter().map(|p| p.id.clone()).collect();
-        crate::execution::jobs::snapshots::store_attention_push_event(
-            orch,
-            &run_id,
-            &session_id,
-            text,
-            &push_ids,
-            now,
-            Some(&turn_id),
-        )?;
+        stamped_pushes.carrying_event_id = Some(
+            crate::execution::jobs::snapshots::store_attention_push_event(
+                orch,
+                &run_id,
+                &session_id,
+                text,
+                &push_ids,
+                now,
+                Some(&turn_id),
+            )?,
+        );
     }
     // Queued follow-ups — including passive "quiet" notes that rode along without
     // waking the agent — were authored before the immediate resume message, so
@@ -2331,6 +2339,8 @@ fn continue_job_launch_locked(
             None,
             Some(&process_residence),
         )?;
+        // The warm agent now holds the prompt these pushes rode in on.
+        stamped_pushes.delivered();
     } else {
         crate::orchestrator::session::start_agent_session(
             orch,
@@ -2349,6 +2359,10 @@ fn continue_job_launch_locked(
             job.execution_id.as_deref(),
             identity_override,
         )?;
+        // The spawn succeeded, so the prompt carrying these pushes reached a real
+        // process and the stamp is true. Everything below is turn bookkeeping on a
+        // live agent: a failure there is not a lost delivery.
+        stamped_pushes.delivered();
 
         // The new session's process handle now exists, so establish the turn on
         // it. `start_agent_session` spawns the CLI and returns before the MCP
@@ -2370,6 +2384,55 @@ fn continue_job_launch_locked(
         "Run not found after creation",
     ))?;
     Ok(run)
+}
+
+/// An attention delivery written by a launch that has not yet reached a process,
+/// reverted if it never does.
+///
+/// The carrying event and its stamps have to precede the spawn — the pushes ride
+/// in the prompt the spawn carries — so every launch opens a window in which a
+/// delivery is durably recorded and no agent has received it. Held across that
+/// window, this guard closes it: dropped still armed, by any `?` between the
+/// stamp and the spawn, it reverts the delivery so the next resume redelivers.
+/// Without it a refused launch spends the wake silently, and the node that was
+/// owed it simply never wakes.
+///
+/// A guard rather than an error branch because the window is long and every step
+/// in it can fail; `Drop` covers each one without asking a future edit to
+/// remember.
+struct UndeliveredPushes {
+    db: Arc<LocalDb>,
+    carrying_event_id: Option<String>,
+}
+
+impl UndeliveredPushes {
+    /// A process now holds the prompt this delivery was written for.
+    fn delivered(&mut self) {
+        self.carrying_event_id = None;
+    }
+}
+
+impl Drop for UndeliveredPushes {
+    fn drop(&mut self) {
+        let Some(event_id) = self.carrying_event_id.take() else {
+            return;
+        };
+        let db = self.db.clone();
+        match crate::storage::run_db_blocking(move || async move {
+            crate::orchestrator::attention_push::revert_delivery(&db, &event_id)
+                .await
+                .map_err(|error| error.to_string())
+        }) {
+            Ok(restored) => log::warn!(
+                "launch failed after recording an attention delivery; reverted it and returned {restored} push(es) to the pending queue for redelivery"
+            ),
+            // Nothing else will clear these rows, so say plainly that a wake was
+            // lost rather than leaving it to be inferred from silence.
+            Err(error) => log::error!(
+                "launch failed after recording an attention delivery, and reverting it failed ({error}); those wakes will not be redelivered"
+            ),
+        }
+    }
 }
 
 fn artifact_handoff_resume_note(

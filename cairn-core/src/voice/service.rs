@@ -24,6 +24,7 @@ struct VoiceServiceInner {
     enabled: AtomicBool,
     preferred_file_model: Mutex<VoiceModel>,
     dictation_mode: Mutex<DictationMode>,
+    input_device_id: Mutex<Option<String>>,
     loaded_model: Mutex<Option<VoiceModel>>,
     shutting_down: AtomicBool,
     process: Mutex<Option<VoiceProcess>>,
@@ -102,6 +103,7 @@ impl VoiceService {
                 enabled: AtomicBool::new(preferences.enabled),
                 preferred_file_model: Mutex::new(preferences.preferred_file_model),
                 dictation_mode: Mutex::new(preferences.dictation_mode),
+                input_device_id: Mutex::new(preferences.input_device_id),
                 loaded_model: Mutex::new(None),
                 shutting_down: AtomicBool::new(false),
                 process: Mutex::new(None),
@@ -138,6 +140,19 @@ impl VoiceServiceHandle {
         self.status().await
     }
 
+    /// Remember which microphone dictation should open. `None` is the system
+    /// default; capture itself falls back to the default when the remembered
+    /// device is gone, so nothing here has to verify that it still exists.
+    pub async fn set_input_device(&self, device_id: Option<String>) -> VoiceResult<VoiceStatus> {
+        let mut preferences = self
+            .preferences(self.0.enabled.load(Ordering::Acquire))
+            .await;
+        preferences.input_device_id = device_id.clone();
+        self.persist_preferences(preferences)?;
+        *self.0.input_device_id.lock().await = device_id;
+        self.status().await
+    }
+
     pub async fn preferred_file_model(&self) -> VoiceModel {
         *self.0.preferred_file_model.lock().await
     }
@@ -168,6 +183,7 @@ impl VoiceServiceHandle {
             accurate_model,
             preferred_file_model: *self.0.preferred_file_model.lock().await,
             dictation_mode: *self.0.dictation_mode.lock().await,
+            input_device_id: self.0.input_device_id.lock().await.clone(),
             detail: None,
         })
     }
@@ -322,6 +338,7 @@ impl VoiceServiceHandle {
             enabled,
             preferred_file_model: *self.0.preferred_file_model.lock().await,
             dictation_mode: *self.0.dictation_mode.lock().await,
+            input_device_id: self.0.input_device_id.lock().await.clone(),
         }
     }
 

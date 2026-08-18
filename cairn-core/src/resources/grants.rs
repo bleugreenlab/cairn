@@ -367,11 +367,13 @@ pub async fn read_grant(db: &LocalDb, id: &str) -> String {
         Some(approver) => out.push_str(&format!("- Approved by: {approver}\n")),
         None => out.push_str("- Approved by: not recorded\n"),
     }
+    // An expiry is the case that makes a bare epoch worst: it is the one
+    // timestamp a reader is deciding something against, and it reads forward.
     if let Some(expiry) = grant.expires_at {
-        out.push_str(&format!("- Expires at: {expiry}\n"));
+        out.push_str(&format!("- Expires: {}\n", crate::clock::age(expiry)));
     }
     if let Some(revoked) = grant.revoked_at {
-        out.push_str(&format!("- Revoked at: {revoked}\n"));
+        out.push_str(&format!("- Revoked: {}\n", crate::clock::age(revoked)));
     }
 
     match authorization::events_citing(db, id).await {

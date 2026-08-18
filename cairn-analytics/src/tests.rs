@@ -1208,6 +1208,80 @@ async fn model_role_economics_uses_real_metered_cost() {
 }
 
 #[tokio::test]
+async fn model_role_economics_costs_match_the_shared_rule() {
+    let db = cost_db().await;
+    // Exact recorded cost present: a metered model the price table prices at $0.
+    seed_run(&db, "z", "openrouter", "z-ai/glm").await;
+    add_event(&db, "z1", "z", "assistant", JAN_2025 + 10, 1000, 1000, None).await;
+    add_event(
+        &db,
+        "z2",
+        "z",
+        "result:success",
+        JAN_2025 + 11,
+        0,
+        0,
+        Some(0.33),
+    )
+    .await;
+    // No exact cost, priced model: the price table supplies the estimate.
+    seed_run(&db, "s", "claude", "sonnet").await;
+    add_event(&db, "s1", "s", "assistant", JAN_2025 + 20, 1000, 1000, None).await;
+    // Neither: no recorded cost and a model the price table does not know.
+    seed_run(&db, "u", "openrouter", "z-ai/glm-air").await;
+    add_event(&db, "u1", "u", "assistant", JAN_2025 + 30, 1000, 1000, None).await;
+
+    let rows = queries::economics_granular(&db, &Scope::default(), &TimeRange::default())
+        .await
+        .unwrap();
+    let out = model_role_economics(&db, &Scope::default(), &TimeRange::default())
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 3, "one group per seeded model");
+
+    // Every group's reported cost is the shared rule applied to that group.
+    let mut exact_branch = false;
+    let mut priced_branch = false;
+    let mut unpriced_branch = false;
+    let mut total = 0.0;
+    for row in &rows {
+        let expected = crate::cost::exact_or_priced(
+            &row.backend,
+            row.model.as_deref(),
+            row.input,
+            row.cache_read,
+            row.cache_create,
+            row.output,
+            row.exact_cost,
+            row.exact_cost_count,
+        );
+        let key = row.model.clone().unwrap_or_else(|| "unknown".to_string());
+        let actual = econ(&out.by_model, &key).cost_usd;
+        assert!(
+            (actual - expected).abs() < 1e-12,
+            "{key}: reported {actual}, shared rule {expected}"
+        );
+        total += expected;
+        if row.exact_cost_count > 0 {
+            exact_branch = true;
+        } else if expected > 0.0 {
+            priced_branch = true;
+        } else {
+            unpriced_branch = true;
+        }
+    }
+    // All three branches of the rule are actually exercised above, and the two
+    // sides of it disagree here (exact $0.33 vs priced $0, priced $0.018 vs
+    // exact $0), so a regression to either single branch fails the assertions.
+    assert!(
+        exact_branch && priced_branch && unpriced_branch,
+        "exact / priced / unpriced branches all covered"
+    );
+    // The by-role view accumulates the same per-group costs.
+    assert!((econ(&out.by_role, "Builder").cost_usd - total).abs() < 1e-12);
+}
+
+#[tokio::test]
 async fn effective_cost_buckets_by_calendar_month_and_flags_provisional() {
     use chrono::{Datelike, TimeZone, Utc};
     let db = cost_db().await;

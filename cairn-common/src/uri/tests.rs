@@ -1868,6 +1868,7 @@ fn project_parser_literals_are_reserved_thread_names() {
         "actions",
         "agents",
         "browser",
+        "codemap",
         "images",
         "issues",
         "messages",

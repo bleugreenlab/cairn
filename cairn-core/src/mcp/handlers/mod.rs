@@ -43,10 +43,8 @@ pub mod write;
 pub(crate) struct AttentionEvent<'a> {
     pub(crate) attention_type: &'a str,
     pub(crate) project_key: &'a str,
-    pub(crate) issue_number: Option<i32>,
-    pub(crate) issue_title: Option<&'a str>,
-    pub(crate) node_name: Option<&'a str>,
-    pub(crate) exec_seq: Option<i32>,
+    /// Canonical home URI for the job that needs attention.
+    pub(crate) home_uri: Option<&'a str>,
     pub(crate) tool_name: Option<&'a str>,
 }
 
@@ -59,10 +57,7 @@ pub(crate) fn emit_attention(emitter: &dyn crate::services::EventEmitter, event:
         serde_json::json!({
             "type": event.attention_type,
             "projectKey": event.project_key,
-            "issueNumber": event.issue_number,
-            "issueTitle": event.issue_title,
-            "nodeName": event.node_name,
-            "execSeq": event.exec_seq,
+            "homeUri": event.home_uri,
             "toolName": event.tool_name,
         }),
     );

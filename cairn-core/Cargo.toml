@@ -16,7 +16,21 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 regex = "1"
 pulldown-cmark = "0.13"
 evalexpr = "11"
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+# rustls over the platform's own root store, never native-tls: reqwest's
+# default-tls routes through openssl-sys, which refuses to cross-compile, and
+# cairn-core is in cairn-runner's graph so it decides the aarch64-linux sidecar
+# leg's TLS backend too. Native roots (not webpki) keep trust anchored in the
+# OS store, so user- and enterprise-installed CAs still resolve on the desktop.
+# charset/http2/macos-system-configuration are default features re-enabled by
+# hand; only default-tls is being dropped.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "blocking",
+    "charset",
+    "http2",
+    "macos-system-configuration",
+    "rustls-tls-native-roots",
+] }
 tokio = { version = "1", features = ["time", "rt", "macros", "sync", "net", "process", "io-util"] }
 portable-pty = "0.8"
 log = "0.4"
@@ -124,7 +138,7 @@ windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32
 # Linux: keyring (secret-service) for MCP secrets + landlock for the OS-level
 # worktree-fence sandbox (origin/main).
 [target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+keyring = { version = "3", features = ["async-secret-service", "crypto-rust", "async-io"] }
 
 # Process enumeration for the worktree process reaper (execution::teardown /
 # worktree_gc): resolve each pid's cwd to SIGKILL detached process trees rooted
@@ -142,6 +156,12 @@ mockall = "0.13"
 serde_json = "1.0"
 serial_test = "3"
 tempfile = "3"
+# `test-util` gives tests the pausable clock. A schedule whose whole job is to
+# decide WHEN work may run has to be asserted on a clock, not on a sleep.
+# `rt-multi-thread` is what lets a test stand up a runtime shaped like the one
+# the transport serves invokes on, which is where keychain reads actually run
+# (tests/main/keychain_runtime.rs).
+tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 cairn-core = { path = ".", features = ["test-utils"] }
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }

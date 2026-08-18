@@ -33,6 +33,10 @@ mod issue_outcome;
 mod issue_status_resolution;
 mod issues;
 mod job_continue_recovery;
+// Linux-only: it pins the feature choice behind the Linux Secret Service
+// backend, and no other platform's keychain has a runtime to nest inside.
+#[cfg(target_os = "linux")]
+mod keychain_runtime;
 mod lane_capabilities;
 mod lifecycle_stop;
 mod mcp_change_parity;

@@ -1207,8 +1207,17 @@ mod tests {
         init_git_repo(repo);
         std::fs::create_dir_all(repo.join("agents")).unwrap();
         std::fs::write(repo.join("agents").join("planner.md"), "agent").unwrap();
-        // Unrelated dirty state in the same repo must be left untouched.
-        std::fs::write(repo.join("unrelated.txt"), "dirty").unwrap();
+        // Unrelated user work in both states an app-authored commit could
+        // disturb: already staged, and merely present. Neither may enter the
+        // commit, and neither may change state because of it.
+        std::fs::write(repo.join("staged.txt"), "staged").unwrap();
+        assert!(crate::env::git()
+            .args(["add", "--", "staged.txt"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(repo.join("untracked.txt"), "dirty").unwrap();
 
         let shas = commit_config_paths(
             &[repo.join("agents").join("planner.md")],
@@ -1219,15 +1228,23 @@ mod tests {
 
         let status = git_status(repo);
         assert!(
-            status.contains("A  unrelated.txt"),
-            "unrelated file should remain staged: {status:?}"
+            status.contains("A  staged.txt"),
+            "pre-staged user work should stay staged: {status:?}"
+        );
+        assert!(
+            status.contains("?? untracked.txt"),
+            "untracked user work should stay untracked: {status:?}"
         );
         let committed_files = crate::env::git()
             .args(["show", "--pretty=", "--name-only", "HEAD"])
             .current_dir(repo)
             .output()
             .unwrap();
-        assert!(!String::from_utf8_lossy(&committed_files.stdout).contains("unrelated.txt"));
+        let committed = String::from_utf8_lossy(&committed_files.stdout);
+        assert!(
+            !committed.contains("staged.txt") && !committed.contains("untracked.txt"),
+            "only the named path belongs in the commit: {committed:?}"
+        );
         assert!(
             !status.contains("planner.md"),
             "planner.md should have been committed: {status:?}"

@@ -44,6 +44,7 @@ pub use stop::{
     RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
 };
 pub(crate) use stop::{PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON};
+pub(crate) use watchdog_recovery::sweep_stranded_watchdog_jobs;
 pub(crate) use watchdog_recovery::{
     recover_provider_watchdog, ProviderWatchdogRecovery, ALREADY_TERMINAL_RECONCILED_REASON,
 };

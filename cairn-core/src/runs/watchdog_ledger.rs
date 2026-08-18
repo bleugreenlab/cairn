@@ -130,6 +130,7 @@ pub enum WatchdogLifecycleKind {
     WorkerPanicked,
     WorkerExitedUnexpectedly,
     RecoveryClaimed,
+    SuccessorReserved,
     TerminalizationSucceeded,
     TerminalizationFailed,
     SuccessorStarted,
@@ -147,6 +148,7 @@ impl WatchdogLifecycleKind {
             Self::WorkerPanicked => "worker_panicked",
             Self::WorkerExitedUnexpectedly => "worker_exited_unexpectedly",
             Self::RecoveryClaimed => "recovery_claimed",
+            Self::SuccessorReserved => "successor_reserved",
             Self::TerminalizationSucceeded => "terminalization_succeeded",
             Self::TerminalizationFailed => "terminalization_failed",
             Self::SuccessorStarted => "successor_started",
@@ -164,6 +166,7 @@ impl WatchdogLifecycleKind {
             "worker_panicked" => Ok(Self::WorkerPanicked),
             "worker_exited_unexpectedly" => Ok(Self::WorkerExitedUnexpectedly),
             "recovery_claimed" => Ok(Self::RecoveryClaimed),
+            "successor_reserved" => Ok(Self::SuccessorReserved),
             "terminalization_succeeded" => Ok(Self::TerminalizationSucceeded),
             "terminalization_failed" => Ok(Self::TerminalizationFailed),
             "successor_started" => Ok(Self::SuccessorStarted),
@@ -545,6 +548,61 @@ async fn cas_update(
     Ok(changed == 1)
 }
 
+pub async fn reserve_watchdog_successor(
+    db: &LocalDb,
+    identity: &WatchdogIdentity,
+    job_id: &str,
+    since: i64,
+    limit: i64,
+    now: i64,
+) -> DbResult<bool> {
+    let identity = identity.clone();
+    let job_id = job_id.to_string();
+    db.write(move |conn| {
+        // Cloned per invocation because `write` may retry: the closure is
+        // `FnMut`, so an `async move` body that consumed the captures directly
+        // could only ever run once.
+        let identity = identity.clone();
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM codex_watchdog_lifecycle lifecycle
+                     JOIN runs ON runs.id = lifecycle.run_id
+                     WHERE runs.job_id = ?1 AND lifecycle.kind = 'successor_reserved'
+                       AND lifecycle.created_at >= ?2",
+                    params![job_id.as_str(), since],
+                )
+                .await?;
+            let count = rows
+                .next()
+                .await?
+                .ok_or_else(|| DbError::internal("watchdog reservation count missing"))?
+                .i64(0)?;
+            if count >= limit {
+                return Ok(false);
+            }
+            insert_lifecycle_conn(
+                conn,
+                NewWatchdogLifecycle {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    identity,
+                    kind: WatchdogLifecycleKind::SuccessorReserved,
+                    phase: None,
+                    reason: Some("automatic_recovery_budget".into()),
+                    details: Some(serde_json::json!({ "job_id": job_id })),
+                    successor_run_id: None,
+                    successor_turn_id: None,
+                    created_at: now,
+                },
+            )
+            .await?;
+            Ok(true)
+        })
+    })
+    .await
+}
+
 pub async fn append_watchdog_lifecycle(db: &LocalDb, event: NewWatchdogLifecycle) -> DbResult<()> {
     db.write(move |conn| {
         let event = event.clone();
@@ -656,6 +714,39 @@ mod tests {
             provider_turn_id: "provider-turn".into(),
             generation: "generation-a".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn successor_reservation_is_persisted_and_bounded() {
+        let db = migrated_db().await;
+        let identity = seed_identity(&db).await;
+        db.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             UPDATE runs SET job_id = 'job' WHERE id = 'run';
+             PRAGMA foreign_keys = ON;",
+        )
+        .await
+        .unwrap();
+
+        for now in 100..103 {
+            assert!(reserve_watchdog_successor(&db, &identity, "job", 0, 3, now)
+                .await
+                .unwrap());
+        }
+        assert!(
+            !reserve_watchdog_successor(&db, &identity, "job", 0, 3, 103)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            list_watchdog_lifecycle(&db, &identity)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.kind == WatchdogLifecycleKind::SuccessorReserved)
+                .count(),
+            3
+        );
     }
 
     #[tokio::test]

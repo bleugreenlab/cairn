@@ -26,6 +26,38 @@ where
     Ok(accepted)
 }
 
+/// One bounded, generation-aware transition in an enrolled remote's link.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteConnectionTransition {
+    pub occurred_at_unix_ms: u64,
+    pub phase: RemoteConnectionPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_exit_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_process_exit_status: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_stderr: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteConnectionPhase {
+    Attempting,
+    SshSpawned,
+    ProtocolReady,
+    ProtocolReadyTimedOut,
+    HeartbeatLost,
+    Disconnected,
+    SshExited,
+    RemoteProcessExited,
+    RetryScheduled,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandProcessHealth {
@@ -534,6 +566,14 @@ pub struct LearnedResourceEstimate {
     pub upper_disk_growth_bytes: Option<u64>,
 }
 
+/// Bumped to 59 for CAIRN-4217: `DiskHealth` gained `reclamation` and
+/// `accountingCadence`. Both are additive and defaulted, so an older peer's
+/// payload still decodes — as `None`, which reads as "this peer does not report
+/// it" rather than as a clean bill of health. The number moves anyway because
+/// the executor's behavior did: it now persists permanently obstructed
+/// reclamations across restarts and schedules its categorized walk from that
+/// walk's own cost, and a runner should roll the artifact that does so.
+///
 /// Bumped to 25 for CAIRN-3306: machine telemetry became a first-class,
 /// individually timestamped section on `ExecutorSubstrateReport`. The
 /// overlapping un-timestamped scalars are gone rather than deprecated —
@@ -710,7 +750,20 @@ pub struct LearnedResourceEstimate {
 /// in-memory owners holds its resident set, and the daemon bounds the callback
 /// queue and per-attempt output capture that could previously grow without
 /// limit behind a slow runner.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 57;
+///
+/// Bumped to 58 for linux/aarch64 remote executors: [`RemotePlatform`] gained a
+/// `LinuxArm64` variant, so the runner now builds install, launch, cleanup, and
+/// inspection scripts for a host whose artifact target is
+/// `aarch64-unknown-linux-gnu`. The distribution manifest a runner at 57 reads
+/// carries no such artifact, so an ARM host it enrolled would be sent an x86
+/// binary; moving the version is what keeps the manifest a peer reads and the
+/// platforms it can install onto describing one release.
+///
+/// Bumped to 61 for remote connection timelines on executor inspections and
+/// enrolled remotes. A peer at 60 never reports the transition history used to
+/// diagnose attach and link failures, so the handshake must not present the two
+/// wire contracts as equivalent.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 61;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -3692,6 +3745,86 @@ pub struct DiskCategoryAccounting {
     pub temporary_other_bytes: u64,
 }
 
+/// Whether a sweep in the executor's current process has actually retried an
+/// alarm, or whether it was restored from durable state and not yet re-observed.
+///
+/// The distinction is what stops a restart from laundering an alarm into either
+/// a fresh failure or a silent recovery. A restored alarm is outstanding — it
+/// degrades health from the moment the process comes up — but it is honestly
+/// marked as not yet retried until a sweep has tried the path again.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum StorageAlarmVerification {
+    Observed,
+    RestoredUnverified,
+}
+
+/// One reclamation the executor's janitor has permanently given up on.
+///
+/// "Permanently" is the janitor's own bounded-retry verdict rather than a guess:
+/// the tree survived every retry the sweep is willing to spend on it. It is
+/// carried as governance data rather than left in the log because the log is not
+/// a surface anyone watches — two of these sat unread for sixteen days while the
+/// executor resource rendered `Storage verdict: Ok` (CAIRN-4217).
+///
+/// Cairn never remediates one of these on its own. Deleting, chmod-ing, or
+/// chown-ing a path a human is holding as evidence is destructive and
+/// operator-owned, so every field here exists to let a person decide, and the
+/// decision stays theirs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReclamationAlarm {
+    pub path: String,
+    /// When bounded retries were first exhausted, which is the alarm's age.
+    pub first_permanent_unix_ms: u64,
+    pub attempts: u32,
+    pub bytes: u64,
+    pub last_error: String,
+    /// A bounded description of what is still inside the tree.
+    pub survivors: String,
+    pub verification: StorageAlarmVerification,
+}
+
+/// What the executor's janitor can say about permanently obstructed reclamation.
+///
+/// `None` on [`DiskHealth::reclamation`] is the absence of a claim: an older
+/// peer, or one that has not completed a sweep since starting. An `outstanding`
+/// of zero is a positive claim that nothing is outstanding. Collapsing the two
+/// would turn every silent peer into a healthy one, which is precisely the
+/// failure this type exists to prevent.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageReclamationHealth {
+    pub outstanding: usize,
+    /// Oldest alarm first, bounded: the wire never carries an unbounded array.
+    /// `outstanding` stays truthful when this is truncated.
+    pub alarms: Vec<StorageReclamationAlarm>,
+}
+
+impl StorageReclamationHealth {
+    pub fn is_outstanding(&self) -> bool {
+        self.outstanding > 0
+    }
+}
+
+/// Why the categorized storage accounting is as old as it is.
+///
+/// The categorized walk is a safety net priced from its own cost rather than a
+/// fixed tick, so its age is a policy outcome rather than a fault. Publishing
+/// the cadence is what keeps a deliberately long interval from reading as a
+/// stalled subsystem.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageAccountingCadence {
+    pub last_pass_duration_ms: Option<u64>,
+    /// Total category movement the last pass found against the totals it
+    /// inherited. Zero is what lets the interval grow.
+    pub last_drift_bytes: Option<u64>,
+    pub interval_ms: Option<u64>,
+    pub next_due_unix_ms: Option<u64>,
+    pub consecutive_failures: u32,
+}
+
 /// Storage governance: the budget, the derived pressure verdict, and the
 /// janitor's state.
 ///
@@ -3699,6 +3832,13 @@ pub struct DiskCategoryAccounting {
 /// [`MachineTelemetry::volume`] and [`MachineTelemetry::disk_accounting`], where
 /// each carries its own collection time. `status` is derived from the volume
 /// reading, so `Unknown` here means that reading is a gap.
+///
+/// `status` and [`Self::reclamation`] are deliberately separate verdicts. The
+/// first is physical — how much room is left on the volume — and the second is
+/// custodial: whether the executor still owns bytes it has admitted it cannot
+/// reclaim. A volume with plenty of room and an unreclaimable tree is `Ok` and
+/// degraded at once, and flattening that into one enum is what let the custodial
+/// half go unreported.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiskHealth {
@@ -3710,6 +3850,14 @@ pub struct DiskHealth {
     pub cleanup_last_error: Option<String>,
     pub cleanup_failing_path: Option<String>,
     pub cleanup_skipped_entries: Option<usize>,
+    /// Permanently obstructed reclamation, or `None` when this peer does not
+    /// report it at all. Absence is not a clean bill of health.
+    #[serde(default)]
+    pub reclamation: Option<StorageReclamationHealth>,
+    /// The schedule the categorized walk is running on, or `None` when this peer
+    /// does not report it.
+    #[serde(default)]
+    pub accounting_cadence: Option<StorageAccountingCadence>,
 }
 
 impl Default for DiskHealth {
@@ -3723,6 +3871,8 @@ impl Default for DiskHealth {
             cleanup_last_error: None,
             cleanup_failing_path: None,
             cleanup_skipped_entries: None,
+            reclamation: None,
+            accounting_cadence: None,
         }
     }
 }
@@ -4079,6 +4229,9 @@ pub struct ExecutorInspection {
     pub occupancy: FleetSnapshot,
     /// The one instant every age on this record is derived from.
     pub captured_at_unix_ms: u64,
+    /// Recent remote-link transitions. Empty for the colocated executor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_timeline: Vec<RemoteConnectionTransition>,
 }
 
 /// Why a machine this runner is enrolled with is not attached right now.
@@ -4105,14 +4258,81 @@ pub enum RemoteLinkState {
     Pending,
 }
 
+/// The longest a summary may run before it is elided.
+///
+/// A bound rather than a convention, because the headline is composed from
+/// captured output and nothing upstream promises a captured line is short.
+const ATTACH_SUMMARY_MAX_CHARS: usize = 200;
+
 /// The runner's most recent attempt on a machine, and what stopped it.
+///
+/// Two fields rather than one string because the halves have different readers.
+/// `summary` is the terminal cause standing alone, which is all a fleet overview
+/// shows; `detail` is the runner's complete account, and for a link that died
+/// mid-session that is a full bootstrap and command log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAttachAttempt {
     pub attempted_at_unix_ms: u64,
-    /// Why the attempt did not produce an attached executor, in the words the
-    /// runner would have logged. Already fit to show a person.
-    pub reason: String,
+    /// The terminal cause in one bounded line, already fit to show a person.
+    pub summary: String,
+    /// The runner's whole account of the attempt, present only when it said more
+    /// than the summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_for_ms: Option<u64>,
+}
+
+impl RemoteAttachAttempt {
+    /// An attempt that never brought a link up.
+    pub fn bootstrap_failure(attempted_at_unix_ms: u64, account: impl Into<String>) -> Self {
+        let (summary, detail) = split_account(account.into());
+        Self {
+            attempted_at_unix_ms,
+            summary,
+            detail,
+            held_for_ms: None,
+        }
+    }
+
+    /// A link that attached, held for `held_for_ms`, and then went away.
+    pub fn link_lost(
+        attempted_at_unix_ms: u64,
+        account: impl Into<String>,
+        held_for_ms: u64,
+    ) -> Self {
+        let (summary, detail) = split_account(account.into());
+        Self {
+            attempted_at_unix_ms,
+            summary,
+            detail,
+            held_for_ms: Some(held_for_ms),
+        }
+    }
+}
+
+/// Separate the line that leads from the account behind it.
+fn split_account(account: String) -> (String, Option<String>) {
+    let cut = [account.find("; "), account.find('\n')]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(account.len());
+    let headline = account[..cut].trim_end();
+    let elided = headline.chars().count() > ATTACH_SUMMARY_MAX_CHARS;
+    let summary = if elided {
+        let mut short: String = headline.chars().take(ATTACH_SUMMARY_MAX_CHARS).collect();
+        while short.ends_with(char::is_whitespace) {
+            short.pop();
+        }
+        short.push('…');
+        short
+    } else {
+        headline.to_string()
+    };
+    let detail = (elided || cut < account.len()).then_some(account);
+    (summary, detail)
 }
 
 /// A machine this runner is enrolled with that is NOT currently attached.
@@ -4145,6 +4365,8 @@ pub struct EnrolledRemote {
     /// When this machine's link was last up, or `None` if it has not attached
     /// since this runner started.
     pub last_seen_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_timeline: Vec<RemoteConnectionTransition>,
 }
 
 /// The complete, immutable account of one placement: what the caller stated,
@@ -4874,6 +5096,12 @@ pub struct PlacementRejection {
 pub enum PlacementRejectionReason {
     /// The link to this machine is gone.
     ConnectionClosed,
+    /// The transport remains attached, but no message has crossed it within the
+    /// executor progress liveness bound.
+    ConnectionStale {
+        silence_ms: u64,
+        stale_after_ms: u64,
+    },
     /// The caller asked for something this machine is not.
     SelectorMismatch { requested: String },
     /// The work already lives on another machine.
@@ -4921,6 +5149,12 @@ impl PlacementRejectionReason {
     pub fn describe(&self) -> String {
         match self {
             Self::ConnectionClosed => "connection closed".into(),
+            Self::ConnectionStale {
+                silence_ms,
+                stale_after_ms,
+            } => format!(
+                "connection published no progress for {silence_ms}ms, past the {stale_after_ms}ms liveness bound"
+            ),
             Self::SelectorMismatch { requested } => format!("does not match {requested}"),
             Self::PinMismatch { pinned_executor_id } => {
                 format!("the work's tree lives on {pinned_executor_id}")
@@ -5847,6 +6081,57 @@ pub enum RunnerCallbackResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_account_leads_with_its_headline_and_keeps_the_log_behind_it() {
+        let attempt = RemoteAttachAttempt::link_lost(
+            5_000,
+            "the SSH session carrying the link exited after 433s (exit status: 255); bootstrap PATH\nprobe ok\nfatal: Not a valid commit name abc",
+            433_000,
+        );
+        assert_eq!(
+            attempt.summary,
+            "the SSH session carrying the link exited after 433s (exit status: 255)"
+        );
+        let detail = attempt.detail.as_deref().expect("a log to drill into");
+        assert!(
+            detail.contains("fatal: Not a valid commit name abc"),
+            "{detail}"
+        );
+        assert!(detail.starts_with("the SSH session carrying"), "{detail}");
+        assert_eq!(attempt.held_for_ms, Some(433_000));
+    }
+
+    #[test]
+    fn a_parenthesized_multi_line_stderr_still_yields_one_line() {
+        let attempt = RemoteAttachAttempt::bootstrap_failure(
+            5_000,
+            "ssh authentication refused (Warning: Permanently added 'host'\nPermission denied (publickey).)",
+        );
+        assert!(!attempt.summary.contains('\n'), "{}", attempt.summary);
+        assert!(attempt.detail.is_some());
+    }
+
+    #[test]
+    fn a_single_line_account_has_no_detail() {
+        let attempt =
+            RemoteAttachAttempt::bootstrap_failure(5_000, "waiting for v48 artifact publish");
+        assert_eq!(attempt.summary, "waiting for v48 artifact publish");
+        assert_eq!(attempt.detail, None);
+        assert_eq!(attempt.held_for_ms, None);
+    }
+
+    #[test]
+    fn a_headline_too_long_to_lead_a_line_is_elided_and_kept_whole_behind_it() {
+        let long = "x".repeat(ATTACH_SUMMARY_MAX_CHARS + 50);
+        let attempt = RemoteAttachAttempt::bootstrap_failure(5_000, long.clone());
+        assert_eq!(
+            attempt.summary.chars().count(),
+            ATTACH_SUMMARY_MAX_CHARS + 1
+        );
+        assert!(attempt.summary.ends_with('\u{2026}'), "{}", attempt.summary);
+        assert_eq!(attempt.detail, Some(long));
+    }
 
     /// The two silence thresholds are a sequence, not independent numbers, and the
     /// invariant belongs beside the constants rather than at any one consumer: a
@@ -7341,6 +7626,8 @@ mod tests {
             cleanup_last_error: Some("blocked".into()),
             cleanup_failing_path: Some("/path".into()),
             cleanup_skipped_entries: Some(2),
+            reclamation: None,
+            accounting_cadence: None,
         };
         let command = ActiveCellRequest {
             executor_id: "executor-a".into(),
@@ -7503,22 +7790,24 @@ mod tests {
                     os: "macos".into(),
                     arch: "aarch64".into(),
                     link: RemoteLinkState::AttachFailed,
-                    last_attempt: Some(RemoteAttachAttempt {
-                        attempted_at_unix_ms: 1_785_124_850_000,
-                        reason: "executor protocol v28 has no published artifact".into(),
-                    }),
+                    last_attempt: Some(RemoteAttachAttempt::bootstrap_failure(
+                        1_785_124_850_000,
+                        "executor protocol v28 has no published artifact",
+                    )),
                     last_seen_unix_ms: Some(1_785_117_770_000),
+                    connection_timeline: Vec::new(),
                 },
                 EnrolledRemote {
                     name: "bglab-ub".into(),
                     os: "linux".into(),
                     arch: "x86_64".into(),
                     link: RemoteLinkState::Unreachable,
-                    last_attempt: Some(RemoteAttachAttempt {
-                        attempted_at_unix_ms: 1_785_124_925_000,
-                        reason: "ssh: connect to host bglab-ub port 22: No route to host".into(),
-                    }),
+                    last_attempt: Some(RemoteAttachAttempt::bootstrap_failure(
+                        1_785_124_925_000,
+                        "ssh: connect to host bglab-ub port 22: No route to host",
+                    )),
                     last_seen_unix_ms: Some(1_785_114_170_000),
+                    connection_timeline: Vec::new(),
                 },
                 EnrolledRemote {
                     name: "bglab-win".into(),
@@ -7527,6 +7816,7 @@ mod tests {
                     link: RemoteLinkState::Pending,
                     last_attempt: None,
                     last_seen_unix_ms: None,
+                    connection_timeline: Vec::new(),
                 },
             ],
             compile_cache: Some(CompileCacheHealth {
@@ -8179,6 +8469,7 @@ mod tests {
                 link: RemoteLinkState::Pending,
                 last_attempt: None,
                 last_seen_unix_ms: None,
+                connection_timeline: Vec::new(),
             }],
             status: SubstrateHealthStatus::Degraded,
             warming_up: false,
@@ -8329,6 +8620,75 @@ mod tests {
         assert_eq!(disk["status"], "unknown");
         assert!(disk.get("totalBytes").is_none());
         assert!(disk.get("categories").is_none());
+    }
+
+    /// Custodial storage health crosses the wire exactly, and a peer that
+    /// predates it is read as silent rather than as healthy. Collapsing those
+    /// two is the failure CAIRN-4217 is about, so it is asserted here at the
+    /// boundary where the collapse would be cheapest to make.
+    #[test]
+    fn reclamation_health_round_trips_and_an_older_peer_reads_as_unreported() {
+        let legacy = serde_json::json!({
+            "budgetBytes": null,
+            "status": "ok",
+            "sweepStatus": "completed",
+            "sweepGeneration": 3,
+            "cleanupBlocked": false,
+            "cleanupLastError": null,
+            "cleanupFailingPath": null,
+            "cleanupSkippedEntries": null
+        });
+        let decoded: DiskHealth = serde_json::from_value(legacy).unwrap();
+        assert!(
+            decoded.reclamation.is_none(),
+            "a peer that cannot speak about reclamation must not be heard saying it is fine"
+        );
+        assert!(decoded.accounting_cadence.is_none());
+
+        let health = DiskHealth {
+            status: DiskHealthStatus::Ok,
+            reclamation: Some(StorageReclamationHealth {
+                outstanding: 2,
+                alarms: vec![StorageReclamationAlarm {
+                    path: "/cairn/build-slots/acme/slot-3.quarantine-1750000000000".into(),
+                    first_permanent_unix_ms: 100_000,
+                    attempts: 7,
+                    bytes: 19_327_352_832,
+                    last_error: "Permission denied (os error 13)".into(),
+                    survivors: "target/debug/build".into(),
+                    verification: StorageAlarmVerification::RestoredUnverified,
+                }],
+            }),
+            accounting_cadence: Some(StorageAccountingCadence {
+                last_pass_duration_ms: Some(120_000),
+                last_drift_bytes: Some(0),
+                interval_ms: Some(6_000_000),
+                next_due_unix_ms: Some(1_700_000_000_000),
+                consecutive_failures: 0,
+            }),
+            ..DiskHealth::default()
+        };
+        let value = serde_json::to_value(&health).unwrap();
+        assert_eq!(value["reclamation"]["outstanding"], 2);
+        let alarm = &value["reclamation"]["alarms"][0];
+        assert_eq!(alarm["firstPermanentUnixMs"], 100_000);
+        assert_eq!(alarm["lastError"], "Permission denied (os error 13)");
+        assert_eq!(alarm["verification"], "restoredUnverified");
+        assert_eq!(
+            value["accountingCadence"]["nextDueUnixMs"],
+            1_700_000_000_000_u64
+        );
+        assert_eq!(value["accountingCadence"]["lastDriftBytes"], 0);
+        assert_eq!(serde_json::from_value::<DiskHealth>(value).unwrap(), health);
+
+        // Zero outstanding is a positive claim, and is not the same value as
+        // absence even though both are "nothing to act on right now".
+        let clean = DiskHealth {
+            reclamation: Some(StorageReclamationHealth::default()),
+            ..DiskHealth::default()
+        };
+        assert!(!clean.reclamation.as_ref().unwrap().is_outstanding());
+        assert_ne!(clean.reclamation, DiskHealth::default().reclamation);
     }
 
     /// A report that predates the machine section decodes as unsampled rather

@@ -147,7 +147,7 @@ async fn isolated_executor_materializes_and_returns_delta_through_cloud_only() {
     assert_eq!(fixture.state.fetches.load(Ordering::SeqCst), 1);
     assert_eq!(fixture.state.runner_object_bytes.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.state.cloud_gets.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.state.cloud_puts.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.cloud_puts.load(Ordering::SeqCst), 0);
     assert_eq!(fixture.state.github_operations.load(Ordering::SeqCst), 0);
 
     let mut sidecars = Vec::new();
@@ -962,8 +962,8 @@ async fn interrupted_fetch_publishes_nothing_and_retry_fetches_again() {
 }
 
 #[tokio::test]
-async fn managed_allow_delta_uploads_and_stages_a_receipt() {
-    if common::skip_if_fenced("managed_allow_delta_uploads_and_stages_a_receipt") {
+async fn managed_delta_upload_without_a_team_stages_a_receipt() {
+    if common::skip_if_fenced("managed_delta_upload_without_a_team_stages_a_receipt") {
         return;
     }
     let fixture = fixture().await;

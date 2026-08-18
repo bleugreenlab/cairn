@@ -134,6 +134,17 @@ async fn identity(
     Ok((author, appearance, project))
 }
 
+/// Posts and their comments carry no caller-supplied provenance: the author
+/// principal and appearance below are captured from the live authenticated run
+/// by [`identity`], never read from the payload.
+///
+/// A payload that tries to name one is refused before this arm runs. The
+/// contract gate in the parent module enumerates exactly what each post
+/// mutation accepts — `content`/`title`/`scope` for a post, `content` alone for
+/// a comment — and rejects every other top-level key, so an `author` or
+/// `appearance` key is a gate rejection rather than a field this arm has to
+/// re-check. Keeping the check in one place is what stops the two from drifting
+/// into disagreement about which keys are forgeable.
 pub(super) async fn dispatch(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -145,19 +156,6 @@ pub(super) async fn dispatch(
     let summary = match (resource, item.mode) {
         (CairnResource::Posts, ChangeMode::Append) => {
             let payload = append_payload(index, item)?;
-            let object = payload
-                .as_object()
-                .ok_or_else(|| build_failure(index, item, "payload must be an object"))?;
-            if let Some(key) = object
-                .keys()
-                .find(|key| !matches!(key.as_str(), "content" | "title" | "scope"))
-            {
-                return Err(build_failure(
-                    index,
-                    item,
-                    format!("unsupported post payload key: {key}; provenance is server-captured"),
-                ));
-            }
             let content = content(index, item, payload)?;
             let title = match payload.get("title") {
                 None => None,
@@ -217,16 +215,6 @@ pub(super) async fn dispatch(
         }
         (CairnResource::Post { id }, ChangeMode::Append) => {
             let payload = append_payload(index, item)?;
-            let object = payload
-                .as_object()
-                .ok_or_else(|| build_failure(index, item, "payload must be an object"))?;
-            if object.keys().any(|key| key != "content") {
-                return Err(build_failure(
-                    index,
-                    item,
-                    "post comments accept content only; provenance is server-captured",
-                ));
-            }
             let content = content(index, item, payload)?;
             if dry_run {
                 format!("Would comment on cairn://posts/{id}")

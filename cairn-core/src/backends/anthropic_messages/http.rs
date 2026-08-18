@@ -10,7 +10,7 @@ use super::wire::{
     ContentBlock, MessagesMessage, MessagesResponse, StreamEvent, StreamingMessage, SYSTEM_ROLE,
 };
 use crate::backends::http_loop::{
-    cairn_tool_definitions, upstream_error_detail, AssistantStreamState,
+    cairn_tool_definitions, require_terminal_event, upstream_error_detail, AssistantStreamState,
 };
 use crate::backends::SessionConfig;
 use crate::orchestrator::Orchestrator;
@@ -318,37 +318,15 @@ pub(crate) fn post_message_streaming(
     finalize_stream(&mut stream_state, orch, run_id, session_id, &aggregate)?;
     require_terminal_event(
         endpoint.provider_name,
+        TERMINAL_EVENTS,
         aggregate.saw_terminal(),
         cancel.load(Ordering::SeqCst),
     )?;
     Ok(aggregate.into_response(streamed_text))
 }
 
-/// Refuse a stream that ended without the protocol saying it was done.
-///
-/// A chunked response can be closed by a proxy or a dropped upstream without
-/// surfacing a read error, so reaching end-of-stream is not evidence that the
-/// message completed. Treating it as success would store truncated assistant
-/// text as a finished turn and — worse — hand the turn loop a tool call that
-/// merely happened to parse, with no stop reason to judge it by, which is
-/// exactly the signal the loop's truncation guard depends on.
-///
-/// A cancelled turn is the one legitimate way to end early: the user asked for
-/// it, the caller already knows, and the run lands idle rather than failed.
-pub(crate) fn require_terminal_event(
-    provider_name: &str,
-    saw_terminal: bool,
-    cancelled: bool,
-) -> Result<(), String> {
-    if cancelled || saw_terminal {
-        return Ok(());
-    }
-    Err(format!(
-        "{provider_name} stream ended before the message completed (no message_stop). The \
-         connection was closed mid-generation, so this turn's output is incomplete and is not \
-         being recorded as a result."
-    ))
-}
+/// What completion looks like on the Messages wire.
+pub(crate) const TERMINAL_EVENTS: &str = "message_stop";
 
 fn finalize_stream(
     stream_state: &mut Option<AssistantStreamState>,

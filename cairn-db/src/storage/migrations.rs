@@ -8,6 +8,32 @@ macro_rules! private_codex_watchdog_ledger {
     };
 }
 
+/// CAIRN-4225: the per-base-commit code map (source inventory + import graph)
+/// the workspace map surface reads. Private only -- it is derived wholly from a
+/// commit every replica already has, so replicating the projection would buy
+/// nothing and cost a payload per merge.
+macro_rules! private_codemap_cache {
+    () => {
+        Migration::new(
+            "0202",
+            "codemap_cache",
+            include_str!("../../../../turso_migrations/0202_codemap_cache.sql"),
+        )
+    };
+}
+
+/// Runner-local admission requests and fairness cursor. A private runner is the
+/// only authority for these rows; team admission is coordinated by Postgres.
+macro_rules! private_runtime_admission {
+    () => {
+        Migration::new(
+            "0203",
+            "runtime_admission",
+            include_str!("../../../../turso_migrations/0203_runtime_admission.sql"),
+        )
+    };
+}
+
 macro_rules! shared_tail_liveness_join_indexes {
     () => {
         Migration::new(
@@ -110,6 +136,20 @@ macro_rules! shared_tail_project_thread_number {
             "0199",
             "project_thread_number",
             include_str!("../../../../turso_migrations/0199_project_thread_number.sql"),
+        )
+    };
+}
+
+/// CAIRN-4226: the per-job file-touch stream a live workspace map renders.
+/// ProjectScoped like `file_changes` and `tool_invocations` beside it — which
+/// files a project's agents touched is collaboration data, not one install's
+/// telemetry — so the change is written once and composed into both lineages.
+macro_rules! shared_tail_job_file_activity {
+    () => {
+        Migration::new(
+            "0201",
+            "job_file_activity",
+            include_str!("../../../../turso_migrations/0201_job_file_activity.sql"),
         )
     };
 }
@@ -1240,6 +1280,7 @@ macro_rules! team_lineage {
             shared_tail_attention_push_retirement!(),
             shared_tail_thread_status_rollup_index!(),
             shared_tail_project_thread_number!(),
+            shared_tail_job_file_activity!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1542,6 +1583,9 @@ macro_rules! private_lineage {
             shared_tail_thread_status_rollup_index!(),
             shared_tail_project_thread_number!(),
             private_thread_read_positions!(),
+            shared_tail_job_file_activity!(),
+            private_codemap_cache!(),
+            private_runtime_admission!(),
         ]
     };
 }
@@ -2196,6 +2240,13 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("check_test_results", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
+    // A code map is a projection of a commit, not a fact about the work. Any
+    // replica holding that commit rebuilds it locally in one walk, so shipping
+    // the payload would be pure transfer for nothing.
+    (
+        "codemap_cache",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
     ("comments", TableScope::ProjectScoped),
     ("condition_evaluations", TableScope::ProjectScoped),
     // A disclosure response is this host's own record, and its inventory is a
@@ -2238,6 +2289,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("jj_reconcile_intents", TableScope::ProjectScoped),
     ("jj_reconcile_items", TableScope::ProjectScoped),
     ("jj_reconcile_quarantines", TableScope::ProjectScoped),
+    ("job_file_activity", TableScope::ProjectScoped),
     ("jobs", TableScope::ProjectScoped),
     ("labels", TableScope::ProjectScoped),
     ("memories", TableScope::ProjectScoped),
@@ -2416,6 +2468,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ),
     (
         "workflow_call",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "runtime_admission_requests",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "runtime_admission_cursors",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // Runner-local observability history (0151/0152): what THIS runner's
@@ -2726,6 +2786,13 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "jj_reconcile_quarantines",
         id_columns: &["project_id"],
+    },
+    // job_file_activity.id is the composite `{event_id}:{tool_use_id}:{ordinal}`
+    // (a non-uuid, so rekey_to_team leaves it as-is); job_id is the routable
+    // column that gets re-prefixed on a local->team promotion.
+    RekeyTableManifest {
+        table: "job_file_activity",
+        id_columns: &["id", "job_id"],
     },
     RekeyTableManifest {
         table: "job_browsers",
@@ -3267,6 +3334,9 @@ mod tests {
                 "0198_index_thread_status_rollup".to_string(),
                 "0199_project_thread_number".to_string(),
                 "0200_thread_read_positions".to_string(),
+                "0201_job_file_activity".to_string(),
+                "0202_codemap_cache".to_string(),
+                "0203_runtime_admission".to_string(),
             ]
         );
         Ok(db)
@@ -3854,23 +3924,37 @@ mod tests {
     /// the fix there was the query, not the schema. 0195 adds only what the set
     /// forms genuinely lack -- `issues(number)`, and a `merge_requests(issue_id)`
     /// the planner will use at all.
+    ///
+    /// These constants are the statements `attention_push::resolve_subjects`
+    /// issues, and they are kept that way on purpose: an arm asserted here in a
+    /// shape production has stopped running proves only that an index is
+    /// reachable by nobody. The plans of those statements at realistic batch
+    /// sizes are pinned next to the code, in
+    /// `attention_push::tests::subject_resolution_statements_stay_on_the_backlog`,
+    /// because two of them chose a different index once the bound list grew past
+    /// what a test like this one binds (CAIRN-4207).
     #[tokio::test]
     async fn migration_0195_indexes_attention_push_liveness_joins() {
-        // A `review:` artifact arm: reach artifacts through jobs, driving from
-        // the issue rather than scanning every artifact of a type. The two
-        // artifact arms stay separate statements deliberately -- folding them
-        // into one `artifact_type IN ('plan', 'create-pr')` query flips the
-        // planner back to idx_artifacts_type and undoes the whole point.
-        const ARTIFACT_ARM: &str = "SELECT j.issue_id FROM jobs j \
-             WHERE j.issue_id IN ('a', 'b') AND EXISTS \
-             (SELECT 1 FROM artifacts a WHERE a.job_id = j.id AND a.artifact_type = 'create-pr')";
+        // The `review:` artifact facts: reach artifacts through jobs, driving
+        // from the issue rather than scanning every artifact of a type. The
+        // statement names no `artifact_type` at all, which is what leaves the
+        // planner no second candidate index to prefer -- see
+        // `attention_push::review_artifact_facts_sql` for what mentioning one
+        // cost.
+        const ARTIFACT_ARM: &str = "SELECT j.issue_id, a.artifact_type, a.confirmed, a.created_at \
+             FROM jobs j JOIN artifacts a ON a.job_id = j.id \
+             WHERE j.issue_id IN ('a', 'b')";
         // Resolving a whole backlog's issue refs: one statement, one seek per
-        // number, with the project matched on the join.
+        // number. The project key is matched in Rust rather than named here,
+        // because a `p.key IN (...)` term gives the planner a second way in and
+        // it takes it once the number list grows past a few dozen entries.
         const ISSUE_ARM: &str = "SELECT p.key, i.number, i.id, i.status \
              FROM issues i JOIN projects p ON p.id = i.project_id \
-             WHERE i.number IN (1, 2) AND p.key IN ('k')";
-        // The first and cheapest `review:` arm: is there an open PR.
-        const MR_ARM: &str = "SELECT issue_id, status FROM merge_requests WHERE issue_id IN ('a')";
+             WHERE i.number IN (1, 2)";
+        // The first and cheapest `review:` arm: is there an open PR, and when
+        // did the newest one open.
+        const MR_ARM: &str =
+            "SELECT issue_id, status, opened_at FROM merge_requests WHERE issue_id IN ('a')";
 
         let (artifact_before, issue_before, mr_before) = {
             let temp = tempdir().unwrap();
@@ -3897,12 +3981,10 @@ mod tests {
              the query shape, not the schema. Got {artifact_before:?}"
         );
         assert!(
-            issue_before
-                .iter()
-                .any(|step| step.contains("idx_issues_project_id")),
+            issue_before.iter().any(|step| step.contains("SCAN issues")),
             "without 0195 the UNIQUE (project_id, number) index cannot serve \
-             `number IN (...)`, so the arm falls back to the project index and \
-             loads every issue in the project, got {issue_before:?}"
+             `number IN (...)` -- its leading column is the project -- so the \
+             arm has nothing to seek and reads every issue, got {issue_before:?}"
         );
         assert!(
             mr_before

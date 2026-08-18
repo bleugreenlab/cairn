@@ -342,19 +342,66 @@ pub(crate) async fn turn_db_change_for_job_id(db: &LocalDb, job_id: &str, action
 /// inserts (CAIRN-2558). Both camel- and snake-cased keys are emitted because the
 /// frontend `parseScopeIds` reads either.
 pub fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> Value {
-    event_db_change_scoped(run_id, session_id, None, action)
+    event_db_change_scoped(run_id, session_id, &EventRunScope::default(), action)
 }
 
-fn event_issue_id_for_run(db: Arc<LocalDb>, run_id: &str) -> Result<Option<String>, String> {
-    let run_id = run_id.to_string();
-    run_db_blocking(move || async move {
-        db.query_opt_text(
-            "SELECT issue_id FROM runs WHERE id = ?1 LIMIT 1",
-            cairn_db::turso::params![run_id.as_str()],
-        )
+/// Where a transcript event sits in the workspace: the issue it belongs to, the
+/// job that produced it, and the project that owns both.
+///
+/// Resolved in ONE query rather than one per field, because these facts are only
+/// useful together. A live surface that filters by project needs `project_id`
+/// on the same frame that carries `run_id`, and the per-job file-activity
+/// stream needs `job_id` beside it; reading them separately would let a run's
+/// rows change between lookups and describe a placement that never existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventRunScope {
+    pub issue_id: Option<String>,
+    pub job_id: Option<String>,
+    pub project_id: Option<String>,
+}
+
+/// Load a run's issue/job/project scope, degrading to an empty scope (which
+/// serializes as explicit nulls) rather than failing the emit it decorates.
+///
+/// `runs.project_id` and `runs.job_id` are nullable for runs recorded before a
+/// job was attached, so the owning job is the fallback for both — the same
+/// `COALESCE` shape the analytics token CTE uses.
+pub fn event_run_scope(db: Arc<LocalDb>, run_id: &str) -> EventRunScope {
+    let run_id_owned = run_id.to_string();
+    let loaded = run_db_blocking(move || async move {
+        db.read(|conn| {
+            let run_id = run_id_owned.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT r.issue_id, COALESCE(r.job_id, j.id),
+                                COALESCE(r.project_id, j.project_id)
+                         FROM runs r LEFT JOIN jobs j ON j.id = r.job_id
+                         WHERE r.id = ?1 LIMIT 1",
+                        (run_id.as_str(),),
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Ok(Some(EventRunScope {
+                        issue_id: row.opt_text(0)?,
+                        job_id: row.opt_text(1)?,
+                        project_id: row.opt_text(2)?,
+                    })),
+                    None => Ok(None),
+                }
+            })
+        })
         .await
-        .map_err(|e| format!("Failed to load issue id for event db-change: {e}"))
-    })
+        .map_err(|e| format!("Failed to load run scope for event db-change: {e}"))
+    });
+    match loaded {
+        Ok(Some(scope)) => scope,
+        Ok(None) => EventRunScope::default(),
+        Err(error) => {
+            log::warn!("{error}");
+            EventRunScope::default()
+        }
+    }
 }
 
 pub(crate) fn event_db_change_for_run(
@@ -363,20 +410,14 @@ pub(crate) fn event_db_change_for_run(
     session_id: Option<&str>,
     action: &str,
 ) -> Value {
-    let issue_id = match event_issue_id_for_run(db, run_id) {
-        Ok(issue_id) => issue_id,
-        Err(error) => {
-            log::warn!("{error}");
-            None
-        }
-    };
-    event_db_change_scoped(run_id, session_id, issue_id.as_deref(), action)
+    let scope = event_run_scope(db, run_id);
+    event_db_change_scoped(run_id, session_id, &scope, action)
 }
 
 pub(crate) fn event_db_change_scoped(
     run_id: &str,
     session_id: Option<&str>,
-    issue_id: Option<&str>,
+    scope: &EventRunScope,
     action: &str,
 ) -> Value {
     json!({
@@ -386,8 +427,12 @@ pub(crate) fn event_db_change_scoped(
         "run_id": run_id,
         "sessionId": session_id,
         "session_id": session_id,
-        "issueId": issue_id,
-        "issue_id": issue_id,
+        "issueId": scope.issue_id,
+        "issue_id": scope.issue_id,
+        "jobId": scope.job_id,
+        "job_id": scope.job_id,
+        "projectId": scope.project_id,
+        "project_id": scope.project_id,
     })
 }
 
@@ -677,10 +722,38 @@ mod tests {
     }
 
     #[test]
-    fn event_db_change_scoped_carries_issue_id() {
-        let payload = event_db_change_scoped("run-1", Some("session-1"), Some("issue-1"), "insert");
+    fn event_db_change_scoped_carries_the_whole_resolved_scope() {
+        let scope = EventRunScope {
+            issue_id: Some("issue-1".into()),
+            job_id: Some("job-1".into()),
+            project_id: Some("project-1".into()),
+        };
+        let payload = event_db_change_scoped("run-1", Some("session-1"), &scope, "insert");
         assert_eq!(payload["issueId"], "issue-1");
         assert_eq!(payload["issue_id"], "issue-1");
+        assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["job_id"], "job-1");
+        // The point of the whole change: a live surface can filter this frame
+        // by project without a follow-up query.
+        assert_eq!(payload["projectId"], "project-1");
+        assert_eq!(payload["project_id"], "project-1");
+    }
+
+    #[test]
+    fn event_db_change_scoped_serializes_an_unresolved_scope_as_explicit_nulls() {
+        let payload = event_db_change_scoped(
+            "run-1",
+            Some("session-1"),
+            &EventRunScope::default(),
+            "insert",
+        );
+        // Present-and-null, not absent: a subscriber filtering on projectId must
+        // be able to tell "this run has no project" from "this build predates
+        // the key".
+        for key in ["issueId", "jobId", "projectId"] {
+            assert!(payload.get(key).is_some(), "{key} must be present");
+            assert!(payload[key].is_null(), "{key} must be null");
+        }
     }
 
     #[test]

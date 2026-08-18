@@ -54,6 +54,9 @@ pub use normalize::WORKSPACE_ID;
 /// gate and the pre-persist re-check cannot disagree about who the actor is.
 #[derive(Debug, Clone)]
 pub struct AuthorityActor {
+    /// Who is asking. Journaling and authority prompts resolve run identity
+    /// through this principal; the grant matcher reads its own anchors from
+    /// `context` instead.
     pub principal: AuthorityPrincipal,
     pub audience: AuthorityAudience,
     pub context: AuthorityContext,
@@ -63,7 +66,6 @@ pub struct AuthorityActor {
     /// Routing this to a team replica the way run-owned rows are routed is what
     /// would make a grant enforceable but invisible and unrevocable.
     pub db: Arc<LocalDb>,
-    pub run_id: Option<String>,
 }
 
 fn now() -> i64 {
@@ -102,13 +104,12 @@ pub async fn resolve_actor(
         audience: AuthorityAudience::workspace(WORKSPACE_ID),
         context: AuthorityContext {
             audience: Some(AuthorityAudience::workspace(WORKSPACE_ID)),
-            run_id: Some(run_id.clone()),
+            run_id: Some(run_id),
             turn_id,
             session_id,
             request_id: None,
         },
         db: orch.db.local.clone(),
-        run_id: Some(run_id),
     })
 }
 
@@ -277,7 +278,7 @@ async fn journal(actor: &AuthorityActor, request: &AuthorityRequest, decision: &
         reason: reason.as_str().to_string(),
         principal: actor.principal.clone(),
         audience: actor.audience.clone(),
-        run_id: actor.run_id.clone(),
+        run_id: actor.principal.run_id.clone(),
         request_uri: actor.principal.node_uri.clone(),
         grant_id,
         decision_actor: None,
@@ -449,7 +450,6 @@ mod tests {
                 request_id: None,
             },
             db: std::sync::Arc::new(db),
-            run_id: Some("run-1".to_string()),
         }
     }
 

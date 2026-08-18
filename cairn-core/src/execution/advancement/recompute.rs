@@ -114,109 +114,56 @@ fn gate_for(
     }
 }
 
-/// The latest *work* turn state for a job, used to derive `live_turn` /
-/// The latest *work* turn state for a job, used to derive the terminal OUTCOME
-/// (`turn_complete` / `turn_failed`). The post-completion memory-review turn
-/// (`start_reason = 'memory_review'`) is excluded here so a failed review turn
-/// never fails the job, and a completed review turn never stands in for the work
-/// turn's outcome. Liveness is computed separately by [`latest_turn_is_live`],
-/// which *includes* the review turn so the job reads Running while the review
-/// agent is active. Confirmation is decoupled from run state — it keys off the
-/// unconfirmed artifact, not the job status — so a live review no longer hides
-/// the confirm affordance. CAIRN-1576.
-async fn latest_turn_state(
+/// The turn truths a job's status derives from, read from the `turns` table in
+/// a single query so both answers come from one snapshot.
+///
+/// The two facts are scoped differently on purpose. The terminal OUTCOME
+/// (`turn_complete` / `turn_failed`) derives from the latest *work* turn: the
+/// post-completion memory-review turn (`start_reason = 'memory_review'`) is
+/// excluded so a failed review turn never fails the job, and a completed review
+/// turn never stands in for the work turn's outcome. LIVENESS derives from the
+/// absolute latest turn, review *included*, so the job reads Running while the
+/// review agent is active. Confirmation is decoupled from run state — it keys
+/// off the unconfirmed artifact, not the job status — so a live review no longer
+/// hides the confirm affordance. CAIRN-1576.
+#[derive(Debug, Clone, Default)]
+pub(super) struct TurnFacts {
+    /// State of the latest work turn, or `None` when the job has run none.
+    pub work_state: Option<TurnState>,
+    /// Whether the absolute latest turn — memory review included — is live
+    /// (Running/Pending/Yielded).
+    pub live: bool,
+}
+
+pub(super) async fn turn_facts(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
-) -> DbResult<Option<TurnState>> {
+) -> DbResult<TurnFacts> {
     let mut rows = conn
         .query(
-            "SELECT state FROM turns
-             WHERE job_id = ?1 AND start_reason != 'memory_review'
-             ORDER BY created_at DESC, sequence DESC LIMIT 1",
+            "SELECT
+               (SELECT state FROM turns
+                WHERE job_id = ?1 AND start_reason != 'memory_review'
+                ORDER BY created_at DESC, sequence DESC LIMIT 1),
+               (SELECT state FROM turns
+                WHERE job_id = ?1
+                ORDER BY created_at DESC, sequence DESC LIMIT 1)",
             (job_id,),
         )
         .await?;
-    Ok(rows
-        .next()
-        .await?
-        .map(|r| r.text(0))
-        .transpose()?
-        .and_then(|s| s.parse::<TurnState>().ok()))
-}
-
-/// Whether the job's absolute latest turn is live (Running/Pending/Yielded),
-/// *including* a memory-review turn. Liveness includes the review so the job
-/// stays Running while the post-completion review agent is active; the terminal
-/// outcome still derives from the work turn via [`latest_turn_state`].
-pub(super) async fn latest_turn_is_live(
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT state FROM turns WHERE job_id = ?1 ORDER BY created_at DESC, sequence DESC LIMIT 1",
-            (job_id,),
-        )
-        .await?;
-    let state = rows
-        .next()
-        .await?
-        .map(|r| r.text(0))
-        .transpose()?
-        .and_then(|s| s.parse::<TurnState>().ok());
-    Ok(matches!(
-        state,
-        Some(TurnState::Running | TurnState::Pending | TurnState::Yielded)
-    ))
-}
-
-async fn latest_artifact_confirmed(
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
-            (job_id,),
-        )
-        .await?;
-    Ok(rows
-        .next()
-        .await?
-        .map(|r| r.i64(0))
-        .transpose()?
-        .map(|v| v != 0)
-        .unwrap_or(false))
-}
-
-/// The confirmation of the job's *terminal* artifact, scoped to its name. A
-/// `context-self` living doc writes under its own name and must never resolve the
-/// terminal gate, so the confirm flag is read from the terminal artifact chain
-/// only. Falls back to the job-scoped latest when the contract is unnamed (a
-/// command checkpoint, whose seeded artifact has a NULL `output_name`).
-async fn latest_artifact_confirmed_for(
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-    required_name: Option<&str>,
-) -> DbResult<bool> {
-    match required_name {
-        Some(name) => {
-            let mut rows = conn
-                .query(
-                    "SELECT confirmed FROM artifacts WHERE job_id = ?1 AND output_name = ?2 ORDER BY version DESC LIMIT 1",
-                    params![job_id, name],
-                )
-                .await?;
-            Ok(rows
-                .next()
-                .await?
-                .map(|r| r.i64(0))
-                .transpose()?
-                .map(|v| v != 0)
-                .unwrap_or(false))
-        }
-        None => latest_artifact_confirmed(conn, job_id).await,
-    }
+    let Some(row) = rows.next().await? else {
+        return Ok(TurnFacts::default());
+    };
+    let state = |raw: Option<String>| raw.and_then(|s| s.parse::<TurnState>().ok());
+    let work_state = state(row.opt_text(0)?);
+    let latest_state = state(row.opt_text(1)?);
+    Ok(TurnFacts {
+        work_state,
+        live: matches!(
+            latest_state,
+            Some(TurnState::Running | TurnState::Pending | TurnState::Yielded)
+        ),
+    })
 }
 
 /// Stored status of the latest run for a job (newest by `created_at`, `rowid`),
@@ -244,46 +191,50 @@ fn is_terminal_run_status_str(status: &str) -> bool {
     )
 }
 
-/// Whether any artifact row exists for the job — i.e. the node produced its
-/// declared output. Distinct from `latest_artifact_confirmed`, which conflates
-/// "no artifact" with "artifact awaiting confirmation."
-async fn latest_artifact_present(
-    conn: &cairn_db::turso::Connection,
-    job_id: &str,
-) -> DbResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM artifacts WHERE job_id = ?1 LIMIT 1",
-            (job_id,),
-        )
-        .await?;
-    Ok(rows.next().await?.is_some())
-}
-
-/// Whether the job has produced its *required* output artifact. When the output
-/// contract names a specific artifact, only that artifact counts — a stray
-/// checkpoint/other artifact for the same job must not satisfy the gate. The
-/// agent writes to `cairn:~/<name>`, which is stored as the artifact's
+/// The job's required output artifact as one fact: `None` when the job has
+/// produced no such artifact, `Some(confirmed)` when it has.
+///
+/// Presence and confirmation are the same row's two truths, so they are read
+/// together: a separate presence probe could answer from a different snapshot
+/// than the confirm flag it is paired with. Keeping "absent" distinct from
+/// "present but awaiting confirmation" is what the `Option` carries — a bare
+/// `confirmed` bool conflates the two.
+///
+/// When the output contract names an artifact, only that name counts: a stray
+/// checkpoint artifact for the same job must not satisfy the gate, and a
+/// `context-self` living doc writing under its own name must never resolve the
+/// terminal one. The agent writes to `cairn:~/<name>`, stored as the artifact's
 /// `output_name` (see `store_artifact`), so `output_name` is the contract's
-/// `artifact_name`. Falls back to any-artifact presence only when the contract
-/// is unnamed (no resolvable `artifact_name`).
-async fn artifact_present_for(
+/// `artifact_name`. Falls back to the job-scoped latest only when the contract
+/// is unnamed (a command checkpoint, whose seeded artifact has a NULL
+/// `output_name`).
+async fn artifact_fact(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
     required_name: Option<&str>,
-) -> DbResult<bool> {
-    match required_name {
+) -> DbResult<Option<bool>> {
+    let mut rows = match required_name {
         Some(name) => {
-            let mut rows = conn
-                .query(
-                    "SELECT 1 FROM artifacts WHERE job_id = ?1 AND output_name = ?2 LIMIT 1",
-                    params![job_id, name],
-                )
-                .await?;
-            Ok(rows.next().await?.is_some())
+            conn.query(
+                "SELECT confirmed FROM artifacts WHERE job_id = ?1 AND output_name = ?2 ORDER BY version DESC LIMIT 1",
+                params![job_id, name],
+            )
+            .await?
         }
-        None => latest_artifact_present(conn, job_id).await,
-    }
+        None => {
+            conn.query(
+                "SELECT confirmed FROM artifacts WHERE job_id = ?1 ORDER BY version DESC LIMIT 1",
+                (job_id,),
+            )
+            .await?
+        }
+    };
+    Ok(rows
+        .next()
+        .await?
+        .map(|r| r.i64(0))
+        .transpose()?
+        .map(|v| v != 0))
 }
 
 /// Record a job's failure as a turn fact so the projection derives `Failed`.
@@ -529,8 +480,7 @@ pub async fn recompute_job_status_conn(
         return Ok(JobStatus::Cancelled);
     }
 
-    let turn = latest_turn_state(conn, job_id).await?;
-    let live_turn = latest_turn_is_live(conn, job_id).await?;
+    let turn = turn_facts(conn, job_id).await?;
 
     let execution_id = execution_id
         .ok_or_else(|| DbError::internal(format!("job has no execution_id: {job_id}")))?;
@@ -574,32 +524,29 @@ pub async fn recompute_job_status_conn(
     let required_artifact_name = downstream_schema
         .as_ref()
         .and_then(|schema| schema.artifact_name.clone());
-    // Confirmation is scoped to the terminal artifact name: a ctx-self living
-    // doc's confirm flag must never resolve the job's gate.
-    let confirmed =
-        latest_artifact_confirmed_for(conn, job_id, required_artifact_name.as_deref()).await?;
-    let artifact_present =
-        artifact_present_for(conn, job_id, required_artifact_name.as_deref()).await?;
+    // The artifact fact is scoped to the terminal artifact name: a ctx-self
+    // living doc's confirm flag must never resolve the job's gate.
+    let artifact = artifact_fact(conn, job_id, required_artifact_name.as_deref()).await?;
     let facts = JobFacts {
         dag_ready,
         upstream_failed,
-        live_turn,
+        live_turn: turn.live,
         turn_failed: matches!(
-            turn,
+            turn.work_state,
             // Interrupt/cancel is a user-initiated pause, NOT a failure: the
             // job rests resumable (derives Pending) and never cascades to
             // downstream. Only a genuine agent/process failure terminalizes.
             Some(TurnState::Failed)
         ),
-        turn_complete: matches!(turn, Some(TurnState::Complete)),
+        turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
         checkpoint: gate_for(node, confirm_policy),
-        resolution: if confirmed {
+        resolution: if artifact.unwrap_or(false) {
             Resolution::Confirmed
         } else {
             Resolution::Pending
         },
         requires_output,
-        artifact_present,
+        artifact_present: artifact.is_some(),
         long_running: crate::execution::jobs::is_long_running_node(
             &snapshot,
             &recipe_node_id,
@@ -725,7 +672,7 @@ pub async fn recompute_execution_jobs_conn(
                 &node_map_db,
             )
             .await?;
-            let turn = latest_turn_state(conn, &j.id).await?;
+            let turn = turn_facts(conn, &j.id).await?;
             // A node "requires output" when it has an effective output contract:
             // the schema of its single context-out edge target (an ArtifactNode,
             // or a downstream `pr`/action input port). This reuses the exact
@@ -743,34 +690,30 @@ pub async fn recompute_execution_jobs_conn(
             let required_artifact_name = downstream_schema
                 .as_ref()
                 .and_then(|schema| schema.artifact_name.clone());
-            // Confirmation is scoped to the terminal artifact name so a ctx-self
-            // living doc never resolves this gate.
-            let confirmed =
-                latest_artifact_confirmed_for(conn, &j.id, required_artifact_name.as_deref())
-                    .await?;
-            let artifact_present =
-                artifact_present_for(conn, &j.id, required_artifact_name.as_deref()).await?;
+            // The artifact fact is scoped to the terminal artifact name so a
+            // ctx-self living doc never resolves this gate.
+            let artifact = artifact_fact(conn, &j.id, required_artifact_name.as_deref()).await?;
 
             let facts = JobFacts {
                 dag_ready,
                 upstream_failed,
-                live_turn: latest_turn_is_live(conn, &j.id).await?,
+                live_turn: turn.live,
                 turn_failed: matches!(
-                    turn,
+                    turn.work_state,
                     // Interrupt/cancel is a user-initiated pause, NOT a failure: the
                     // job rests resumable (derives Pending) and never cascades to
                     // downstream. Only a genuine agent/process failure terminalizes.
                     Some(TurnState::Failed)
                 ),
-                turn_complete: matches!(turn, Some(TurnState::Complete)),
+                turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
                 checkpoint: gate_for(node, confirm_policy),
-                resolution: if confirmed {
+                resolution: if artifact.unwrap_or(false) {
                     Resolution::Confirmed
                 } else {
                     Resolution::Pending
                 },
                 requires_output,
-                artifact_present,
+                artifact_present: artifact.is_some(),
                 long_running: crate::execution::jobs::is_long_running_node(
                     &snapshot,
                     node_id,
@@ -984,8 +927,10 @@ async fn reduce_delegated_child_job_conn(
         packet.output_contract.artifact_name()
     };
     let requires_output = true;
-    let artifact_present = artifact_present_for(conn, job_id, Some(&required_name)).await?;
-    let turn = latest_turn_state(conn, job_id).await?;
+    let artifact_present = artifact_fact(conn, job_id, Some(&required_name))
+        .await?
+        .is_some();
+    let turn = turn_facts(conn, job_id).await?;
     // A node-less ephemeral CALL establishes no DB turn (unlike a workflow or a
     // task, which both run a real turn), so its completion cannot be read from
     // turn facts — the job would spin `running` forever after its run finalizes,
@@ -997,7 +942,7 @@ async fn reduce_delegated_child_job_conn(
     // never formally exited (CAIRN-2677 bug 1, applied to the job projection).
     // Only a turn-less child that reached a terminal RUN with no artifact is a
     // Failure; one whose latest run is still live is left running.
-    let facts = if turn.is_none() {
+    let facts = if turn.work_state.is_none() {
         let run_terminal = latest_run_status_conn(conn, job_id)
             .await?
             .map(|s| is_terminal_run_status_str(&s))
@@ -1018,9 +963,9 @@ async fn reduce_delegated_child_job_conn(
         JobFacts {
             dag_ready: true,
             upstream_failed: false,
-            live_turn: latest_turn_is_live(conn, job_id).await?,
-            turn_failed: matches!(turn, Some(TurnState::Failed)),
-            turn_complete: matches!(turn, Some(TurnState::Complete)),
+            live_turn: turn.live,
+            turn_failed: matches!(turn.work_state, Some(TurnState::Failed)),
+            turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
             checkpoint: CheckpointGate::None,
             resolution: Resolution::Pending,
             requires_output,
@@ -1612,7 +1557,7 @@ mod gate_tests {
 
 #[cfg(test)]
 mod artifact_present_tests {
-    use super::{artifact_present_for, recompute_job, recompute_job_status_conn};
+    use super::{artifact_fact, recompute_job, recompute_job_status_conn};
     use crate::db::DbState;
     use crate::models::{
         AgentNodeConfig, ConfirmPolicy, ExecutionSnapshot, JobStatus, NodePosition, RecipeFile,
@@ -2211,21 +2156,25 @@ mod artifact_present_tests {
 
         let required = db
             .read(|conn| {
-                Box::pin(async move { artifact_present_for(conn, "j-1", Some("create-pr")).await })
+                Box::pin(async move { artifact_fact(conn, "j-1", Some("create-pr")).await })
             })
             .await
             .unwrap();
         assert!(
-            !required,
+            required.is_none(),
             "a stray checkpoint artifact must not satisfy a missing create-pr output"
         );
 
         // The unnamed-contract fallback still sees any artifact.
         let any = db
-            .read(|conn| Box::pin(async move { artifact_present_for(conn, "j-1", None).await }))
+            .read(|conn| Box::pin(async move { artifact_fact(conn, "j-1", None).await }))
             .await
             .unwrap();
-        assert!(any, "unnamed contract falls back to any-artifact presence");
+        assert_eq!(
+            any,
+            Some(false),
+            "unnamed contract falls back to any-artifact presence, unconfirmed"
+        );
     }
 
     #[tokio::test]
@@ -2243,11 +2192,15 @@ mod artifact_present_tests {
 
         let present = db
             .read(|conn| {
-                Box::pin(async move { artifact_present_for(conn, "j-1", Some("create-pr")).await })
+                Box::pin(async move { artifact_fact(conn, "j-1", Some("create-pr")).await })
             })
             .await
             .unwrap();
-        assert!(present, "the required create-pr artifact is present");
+        assert_eq!(
+            present,
+            Some(false),
+            "the required create-pr artifact is present and unconfirmed"
+        );
     }
 }
 

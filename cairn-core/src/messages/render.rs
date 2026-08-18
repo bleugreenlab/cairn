@@ -9,9 +9,9 @@
 //!
 //! The reply-to target is the sender's `/messages` collection — the canonical
 //! messaging-append target made authoritative by CAIRN-1329. `sender_name` is
-//! the sender's bare node/task base URI (`cairn://p/PROJECT/N/EXEC/NODE` or
-//! `.../task/NAME`); appending `/messages` yields the canonical address for
-//! both node and task senders. Before CAIRN-1363 these sites echoed the bare
+//! the sender's canonical home URI: a node, a task, or a thread. Appending
+//! `/messages` yields the canonical address for every addressable sender.
+//! Before CAIRN-1363 these sites echoed the bare
 //! `sender_name` as the reply-to, so recipients were pointed at the raw node
 //! URI even though `/messages` is the documented form.
 //!
@@ -58,6 +58,19 @@ pub(crate) fn render_direct_message(msg: &Message) -> String {
     if msg.sender_name == EXTERNAL_SENDER {
         return format!("{head}\n{EXTERNAL_REPLY_HINT}");
     }
+
+    #[test]
+    fn thread_senders_reply_to_their_messages_collections() {
+        assert_eq!(
+            reply_to_uri("cairn://p/cairn/general").unwrap(),
+            "cairn://p/cairn/general/messages"
+        );
+        assert_eq!(
+            reply_to_uri("cairn://p/cairn/general/task/explore").unwrap(),
+            "cairn://p/cairn/general/task/explore/messages"
+        );
+    }
+
     match reply_to_uri(&msg.sender_name) {
         Some(reply_to) => {
             format!("{head}\nTo reply, use the message tool with to: \"{reply_to}\"")

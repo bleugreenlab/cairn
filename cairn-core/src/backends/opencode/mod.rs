@@ -534,6 +534,15 @@ impl AgentBackend for OpenCodeBackend {
         false
     }
 
+    fn runtime_launch_capability(
+        &self,
+        _launch: &crate::backends::RuntimeLaunch,
+    ) -> Result<crate::backends::RuntimeLaunchCapability, String> {
+        Ok(crate::backends::stateless_http_runtime_capability(
+            "opencode-http",
+        ))
+    }
+
     fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
         // Like OpenRouter, the whole agentic loop runs in-process over async
         // HTTP; a call spawns no child process.

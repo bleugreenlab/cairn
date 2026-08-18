@@ -87,22 +87,44 @@ impl TokenMeter for O200kTokenMeter {
     }
 }
 
-/// Select a meter from durable or explicitly supplied backend/model metadata.
-/// Missing and unrecognized backends retain Cairn's Claude-default semantics.
-pub fn meter_for_backend_model(
-    backend: Option<&str>,
-    model: Option<&str>,
-) -> &'static dyn TokenMeter {
+/// Which tokenizer a backend/model pair routes to.
+///
+/// The routing decision is a value rather than only the `&'static dyn
+/// TokenMeter` it selects, because a trait object cannot answer "which meter is
+/// this". Both meters are zero-sized statics, so every `&dyn TokenMeter` here
+/// shares one data address; and the vtable half of the pointer is no identity
+/// either, since the compiler may emit a separate vtable per codegen unit, so
+/// two coercions of the same static can compare unequal. Comparing the returned
+/// references is therefore meaningless in both directions, and naming the
+/// decision is what makes the routing table assertable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MeterKind {
+    Claude,
+    O200k,
+}
+
+impl MeterKind {
+    fn meter(self) -> &'static dyn TokenMeter {
+        match self {
+            MeterKind::Claude => &CLAUDE_TOKEN_METER,
+            MeterKind::O200k => &O200K_TOKEN_METER,
+        }
+    }
+}
+
+/// The routing table. Missing and unrecognized backends retain Cairn's
+/// Claude-default semantics.
+fn meter_kind_for_backend_model(backend: Option<&str>, model: Option<&str>) -> MeterKind {
     if let Some(model) = model.map(str::to_ascii_lowercase) {
         if model.contains("claude") {
-            return &CLAUDE_TOKEN_METER;
+            return MeterKind::Claude;
         }
         let model_name = model.rsplit('/').next().unwrap_or(&model);
         let reasoning_family = ["o1", "o3", "o4"]
             .iter()
             .any(|family| model_name == *family || model_name.starts_with(&format!("{family}-")));
         if model.contains("gpt-") || model.contains("codex") || reasoning_family {
-            return &O200K_TOKEN_METER;
+            return MeterKind::O200k;
         }
     }
 
@@ -111,9 +133,17 @@ pub fn meter_for_backend_model(
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("codex" | "openai") => &O200K_TOKEN_METER,
-        _ => &CLAUDE_TOKEN_METER,
+        Some("codex" | "openai") => MeterKind::O200k,
+        _ => MeterKind::Claude,
     }
+}
+
+/// Select a meter from durable or explicitly supplied backend/model metadata.
+pub fn meter_for_backend_model(
+    backend: Option<&str>,
+    model: Option<&str>,
+) -> &'static dyn TokenMeter {
+    meter_kind_for_backend_model(backend, model).meter()
 }
 
 /// Select the meter for a live process. The run id is the registry boundary:
@@ -160,46 +190,79 @@ pub(crate) async fn meter_for_run_conn(
 mod tests {
     use super::*;
 
+    /// Text the two tokenizers disagree about, so a meter can be identified by
+    /// what it does. The disagreement is asserted before it is relied on.
+    const DIVERGENT: &str =
+        "Tokenizer divergence probe: \u{2726} \u{3b1}\u{3b2}\u{3b3} 1234567890, \
+         snake_case::path/to/thing, \u{65e5}\u{672c}\u{8a9e}";
+
     #[test]
     fn backend_selection_defaults_unknown_to_claude() {
-        assert!(std::ptr::eq(
-            meter_for_backend_model(None, None),
-            &CLAUDE_TOKEN_METER as &dyn TokenMeter
-        ));
+        assert_eq!(meter_kind_for_backend_model(None, None), MeterKind::Claude);
         for backend in ["openrouter", "ollama"] {
-            assert!(std::ptr::eq(
-                meter_for_backend_model(Some(backend), Some("auto")),
-                &CLAUDE_TOKEN_METER as &dyn TokenMeter
-            ));
+            assert_eq!(
+                meter_kind_for_backend_model(Some(backend), Some("auto")),
+                MeterKind::Claude
+            );
         }
-        assert!(std::ptr::eq(
-            meter_for_backend_model(Some("future-backend"), None),
-            &CLAUDE_TOKEN_METER as &dyn TokenMeter
-        ));
+        assert_eq!(
+            meter_kind_for_backend_model(Some("future-backend"), None),
+            MeterKind::Claude
+        );
     }
 
     #[test]
     fn compatible_backends_use_o200k_unless_model_is_claude() {
         for backend in ["codex", "openai"] {
-            assert!(std::ptr::eq(
-                meter_for_backend_model(Some(backend), None),
-                &O200K_TOKEN_METER as &dyn TokenMeter
-            ));
+            assert_eq!(
+                meter_kind_for_backend_model(Some(backend), None),
+                MeterKind::O200k
+            );
         }
-        assert!(std::ptr::eq(
-            meter_for_backend_model(Some("openrouter"), Some("anthropic/claude-sonnet-4-5")),
-            &CLAUDE_TOKEN_METER as &dyn TokenMeter
-        ));
+        assert_eq!(
+            meter_kind_for_backend_model(Some("openrouter"), Some("anthropic/claude-sonnet-4-5")),
+            MeterKind::Claude
+        );
         for model in [
             "openai/o3-mini",
             "openai/o4-mini",
             "openai/o1-preview",
             "o3",
         ] {
-            assert!(std::ptr::eq(
-                meter_for_backend_model(Some("openrouter"), Some(model)),
-                &O200K_TOKEN_METER as &dyn TokenMeter
-            ));
+            assert_eq!(
+                meter_kind_for_backend_model(Some("openrouter"), Some(model)),
+                MeterKind::O200k
+            );
+        }
+    }
+
+    /// The routing table above is only worth pinning if the public selector
+    /// hands back the meter its decision names, so this crosses the two by
+    /// behavior — the one identity a trait object here can actually carry.
+    #[test]
+    fn the_public_selector_returns_the_meter_its_decision_names() {
+        let claude = CLAUDE_TOKEN_METER.count(DIVERGENT);
+        let o200k = O200K_TOKEN_METER.count(DIVERGENT);
+        assert_ne!(
+            claude, o200k,
+            "the probe text must tell the two tokenizers apart"
+        );
+
+        for (backend, model) in [
+            (None, None),
+            (Some("openrouter"), Some("anthropic/claude-sonnet-4-5")),
+            (Some("codex"), None),
+            (Some("openrouter"), Some("openai/o3-mini")),
+        ] {
+            let expected = match meter_kind_for_backend_model(backend, model) {
+                MeterKind::Claude => claude,
+                MeterKind::O200k => o200k,
+            };
+            assert_eq!(
+                meter_for_backend_model(backend, model).count(DIVERGENT),
+                expected,
+                "backend {backend:?} model {model:?}"
+            );
         }
     }
 

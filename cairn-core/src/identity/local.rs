@@ -12,8 +12,8 @@ use std::path::Path;
 
 use super::crypto::{decrypt_credential, encrypt_credential, get_machine_id};
 use super::{
-    AccountOverrides, AccountSource, ApiProvider, ClaudeAuth, CodexAuth, GitIdentity,
-    IdentityStore, ProviderAccount, ProviderAuth, RetiredLogin, UserIdentity,
+    AccountOverrides, AccountSource, ActualTargetKind, ApiProvider, ClaudeAuth, CodexAuth,
+    GitIdentity, IdentityStore, ProviderAccount, ProviderAuth, RetiredLogin, UserIdentity,
 };
 
 const IDENTITY_FILENAME: &str = "identity.yaml";
@@ -127,6 +127,22 @@ enum AuthFile {
     OAuthToken { encrypted: String },
     #[serde(rename = "base_url")]
     BaseUrl { url: String },
+    /// One Actual target. The endpoint and the cluster pin are plain connection
+    /// metadata; the relay credential is encrypted at rest exactly like any
+    /// other secret, so a target that gains a key does not become a plaintext
+    /// credential on disk.
+    // The rest of `identity.yaml` is camelCase, so these multi-word fields say
+    // so explicitly; without it they would be the only snake_case keys in the
+    // file.
+    #[serde(rename = "actual_target", rename_all = "camelCase")]
+    ActualTarget {
+        kind: ActualTargetKind,
+        base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_api_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cluster_id: Option<String>,
+    },
     #[serde(rename = "local_cli")]
     LocalCli,
     #[serde(rename = "claude_profile")]
@@ -514,6 +530,19 @@ fn store_from_v2_file(
                 value: decrypt_credential(&encrypted, machine_id)?,
             },
             AuthFile::BaseUrl { url } => ProviderAuth::BaseUrl { url },
+            AuthFile::ActualTarget {
+                kind,
+                base_url,
+                encrypted_api_key,
+                cluster_id,
+            } => ProviderAuth::ActualTarget {
+                kind,
+                base_url,
+                api_key: encrypted_api_key
+                    .map(|encrypted| decrypt_credential(&encrypted, machine_id))
+                    .transpose()?,
+                cluster_id,
+            },
             AuthFile::ClaudeProfile => ProviderAuth::ClaudeProfile,
             // Both retired shapes are handled above; a `local_cli` row never
             // reaches here.
@@ -577,6 +606,20 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
                 encrypted: encrypt_credential(value, machine_id)?,
             },
             ProviderAuth::BaseUrl { url } => AuthFile::BaseUrl { url: url.clone() },
+            ProviderAuth::ActualTarget {
+                kind,
+                base_url,
+                api_key,
+                cluster_id,
+            } => AuthFile::ActualTarget {
+                kind: *kind,
+                base_url: base_url.clone(),
+                encrypted_api_key: api_key
+                    .as_deref()
+                    .map(|value| encrypt_credential(value, machine_id))
+                    .transpose()?,
+                cluster_id: cluster_id.clone(),
+            },
             ProviderAuth::ClaudeProfile => AuthFile::ClaudeProfile,
         };
 
@@ -850,6 +893,109 @@ mod tests {
         assert!(raw.contains("type: base_url"), "got: {raw}");
         assert!(raw.contains("url: http://localhost:11434"), "got: {raw}");
         assert!(!raw.contains("encrypted:"), "got: {raw}");
+    }
+
+    /// The endpoint and cluster pin stay readable (they are connection
+    /// metadata), while the relay credential is encrypted like any other
+    /// secret. Both halves are asserted against the bytes on disk, because a
+    /// round-trip alone would pass just as happily if the key were plaintext.
+    #[test]
+    fn an_actual_relay_target_encrypts_only_its_credential_on_disk() {
+        let dir = TempDir::new().unwrap();
+        let store = identity_store(
+            "local-actual",
+            vec![configured_account(
+                "acc_actual",
+                "Actual Relay",
+                ApiProvider::Actual,
+                ProviderAuth::ActualTarget {
+                    kind: ActualTargetKind::Relay,
+                    base_url: "https://api.actual.inc".to_string(),
+                    api_key: Some("ac_live_supersecret".to_string()),
+                    cluster_id: Some("cluster-7".to_string()),
+                },
+                0,
+                1000,
+                None,
+            )],
+            vec![],
+        );
+
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
+        let ProviderAuth::ActualTarget {
+            kind,
+            base_url,
+            api_key,
+            cluster_id,
+        } = &loaded.accounts[0].auth
+        else {
+            panic!(
+                "expected an Actual target, got {:?}",
+                loaded.accounts[0].auth
+            );
+        };
+        assert_eq!(*kind, ActualTargetKind::Relay);
+        assert_eq!(base_url, "https://api.actual.inc");
+        assert_eq!(api_key.as_deref(), Some("ac_live_supersecret"));
+        assert_eq!(cluster_id.as_deref(), Some("cluster-7"));
+
+        let raw = std::fs::read_to_string(dir.path().join(IDENTITY_FILENAME)).unwrap();
+        assert!(raw.contains("type: actual_target"), "got: {raw}");
+        assert!(
+            !raw.contains("ac_live_supersecret"),
+            "the relay credential must not be written in plaintext: {raw}"
+        );
+        assert!(raw.contains("encryptedApiKey:"), "got: {raw}");
+        assert!(raw.contains("clusterId: cluster-7"), "got: {raw}");
+        // Endpoint and pin are not secrets, and hiding them would make a
+        // misconfigured target impossible to diagnose from the file.
+        assert!(raw.contains("https://api.actual.inc"), "got: {raw}");
+        assert!(raw.contains("cluster-7"), "got: {raw}");
+    }
+
+    #[test]
+    fn an_actual_local_target_stores_no_credential_field_at_all() {
+        let dir = TempDir::new().unwrap();
+        let store = identity_store(
+            "local-actual-loopback",
+            vec![configured_account(
+                "acc_actual_local",
+                "Studio",
+                ApiProvider::Actual,
+                ProviderAuth::ActualTarget {
+                    kind: ActualTargetKind::Local,
+                    base_url: "http://127.0.0.1:8080".to_string(),
+                    api_key: None,
+                    cluster_id: None,
+                },
+                0,
+                1000,
+                None,
+            )],
+            vec![],
+        );
+
+        let loaded = roundtrip_saved(
+            &dir,
+            |path| save_identity_store(path, &store),
+            load_identity_store,
+        );
+        assert!(matches!(
+            &loaded.accounts[0].auth,
+            ProviderAuth::ActualTarget {
+                kind: ActualTargetKind::Local,
+                api_key: None,
+                cluster_id: None,
+                ..
+            }
+        ));
+        let raw = std::fs::read_to_string(dir.path().join(IDENTITY_FILENAME)).unwrap();
+        assert!(!raw.contains("encryptedApiKey"), "got: {raw}");
+        assert!(!raw.contains("clusterId"), "got: {raw}");
     }
 
     #[test]

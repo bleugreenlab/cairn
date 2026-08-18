@@ -29,7 +29,10 @@ use cairn_common::executor_protocol::{
 // list is edited by whoever touches the reservation rendering; keeping the
 // fleet-visibility types on a separate line means two branches working on this
 // file do not collide on one line neither of them cares about.
-use cairn_common::executor_protocol::{EnrolledRemote, ExecutorCapabilities, RemoteLinkState};
+use cairn_common::executor_protocol::{
+    EnrolledRemote, ExecutorCapabilities, RemoteConnectionPhase, RemoteConnectionTransition,
+    RemoteLinkState,
+};
 
 use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
 
@@ -66,6 +69,81 @@ fn runner_restart_section(exit: Option<&AbnormalExit>, captured_at_unix_ms: u64)
     }
 
     out
+}
+
+pub(crate) fn render_attach_log(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
+    let mut out = format!("# Executor {} attach log\n\n", remote.name);
+    let Some(attempt) = &remote.last_attempt else {
+        out.push_str("No attach attempt has completed since the runner started.\n");
+        return out;
+    };
+    out.push_str(&format!(
+        "- Attempted: {}\n",
+        age(captured_at_unix_ms.saturating_sub(attempt.attempted_at_unix_ms))
+    ));
+    if let Some(held) = attempt.held_for_ms {
+        out.push_str(&format!("- Link held: {}\n", duration_ms(held)));
+    }
+    out.push_str(&format!("- Cause: {}\n\n", attempt.summary));
+    match &attempt.detail {
+        Some(detail) => out.push_str(&format!("```text\n{detail}\n```\n")),
+        None => out.push_str("The runner recorded no session output beyond the cause above.\n"),
+    }
+    out
+}
+
+fn render_connection_timeline(
+    transitions: &[RemoteConnectionTransition],
+    captured_at_unix_ms: u64,
+) -> String {
+    if transitions.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n## Recent connection transitions\n");
+    for transition in transitions {
+        let mut evidence = Vec::new();
+        if let Some(generation) = transition.generation {
+            evidence.push(format!("generation {generation}"));
+        }
+        if let Some(status) = &transition.ssh_exit_status {
+            evidence.push(format!("SSH carrier {status}"));
+        }
+        if let Some(status) = transition.remote_process_exit_status {
+            evidence.push(format!("remote process exit {status}"));
+        }
+        if let Some(reason) = &transition.reason {
+            evidence.push(reason.clone());
+        }
+        if let Some(stderr) = &transition.last_stderr {
+            evidence.push(format!("stderr: {}", stderr.trim()));
+        }
+        out.push_str(&format!(
+            "- {}: {}{}\n",
+            age(captured_at_unix_ms.saturating_sub(transition.occurred_at_unix_ms)),
+            connection_phase_label(transition.phase),
+            if evidence.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", evidence.join("; "))
+            }
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+fn connection_phase_label(phase: RemoteConnectionPhase) -> &'static str {
+    match phase {
+        RemoteConnectionPhase::Attempting => "attempting connection",
+        RemoteConnectionPhase::SshSpawned => "SSH carrier started",
+        RemoteConnectionPhase::ProtocolReady => "protocol ready",
+        RemoteConnectionPhase::ProtocolReadyTimedOut => "protocol Ready timed out",
+        RemoteConnectionPhase::HeartbeatLost => "heartbeat lost",
+        RemoteConnectionPhase::Disconnected => "protocol disconnected",
+        RemoteConnectionPhase::SshExited => "SSH carrier exited",
+        RemoteConnectionPhase::RemoteProcessExited => "remote executor exited",
+        RemoteConnectionPhase::RetryScheduled => "retry scheduled",
+    }
 }
 
 fn is_artifact_publish_wait(reason: &str) -> bool {
@@ -154,11 +232,22 @@ pub(crate) fn render_executors(
             ));
             out.push_str(&format!(
                 "- Last attempt: {}\n",
-                last_attempt(remote, captured_at_unix_ms)
+                last_attempt_age(remote, captured_at_unix_ms)
             ));
+            if remote
+                .last_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.detail.is_some())
+            {
+                out.push_str(&format!(
+                    "- Full attach log: cairn://executors/{}?view=attach-log\n",
+                    remote.name
+                ));
+            }
             out.push_str(&format!("- Read: cairn://executors/{}\n\n", remote.name));
         }
     }
+
     if !enrolling.is_empty() {
         out.push_str(&format!(
             "## Enrolling now ({})\n\nThese machines are being brought up. They are not targetable until they report ready.\n\n",
@@ -236,9 +325,24 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
         last_seen(remote, captured_at_unix_ms)
     ));
     out.push_str(&format!(
-        "- Last attempt: {}\n\n",
-        last_attempt(remote, captured_at_unix_ms)
+        "- Last attempt: {}\n",
+        last_attempt_age(remote, captured_at_unix_ms)
     ));
+    out.push_str(&render_connection_timeline(
+        &remote.connection_timeline,
+        captured_at_unix_ms,
+    ));
+    if remote
+        .last_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.detail.is_some())
+    {
+        out.push_str(&format!(
+            "- Full attach log: cairn://executors/{}?view=attach-log\n",
+            remote.name
+        ));
+    }
+    out.push('\n');
 
     out.push_str(match remote.link {
         RemoteLinkState::Unreachable => {
@@ -248,9 +352,17 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
             if remote
                 .last_attempt
                 .as_ref()
-                .is_some_and(|attempt| is_artifact_publish_wait(&attempt.reason)) =>
+                .is_some_and(|attempt| is_artifact_publish_wait(&attempt.summary)) =>
         {
             "This machine is enrolled and waiting for the runner's checksummed CLI sidecar release. Retries continue on a backoff and attachment resumes without intervention when publication completes.\n"
+        }
+        RemoteLinkState::AttachFailed
+            if remote
+                .last_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.held_for_ms.is_some()) =>
+        {
+            "This machine attached and its link later went away, so what failed is the session rather than the bootstrap. Whatever the executor was doing at the time was interrupted; the runner retries on a backoff and the machine will come back on its own if the cause was transient.\n"
         }
         RemoteLinkState::AttachFailed => {
             "This machine answered and the runner could not bring an executor up on it. The reason above is the runner's own account of the last attempt; retries continue on a backoff but will keep failing the same way until the cause is fixed.\n"
@@ -266,27 +378,41 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
     out
 }
 
+/// One machine's link condition in a single line.
 fn enrolled_link_summary(remote: &EnrolledRemote) -> String {
-    let attempt = remote
-        .last_attempt
-        .as_ref()
-        .map(|attempt| attempt.reason.as_str());
+    let attempt = remote.last_attempt.as_ref();
+    let summary = attempt.map(|attempt| attempt.summary.as_str());
     match remote.link {
-        RemoteLinkState::Unreachable => attempt
-            .map(|reason| format!("unreachable — {reason}"))
+        RemoteLinkState::Unreachable => summary
+            .map(|summary| format!("unreachable — {summary}"))
             .unwrap_or_else(|| "unreachable — the host did not answer".to_string()),
-        RemoteLinkState::AttachFailed if attempt.is_some_and(is_artifact_publish_wait) => {
-            attempt.unwrap().to_string()
+        RemoteLinkState::AttachFailed if summary.is_some_and(is_artifact_publish_wait) => {
+            summary.unwrap().to_string()
         }
-        RemoteLinkState::AttachFailed => attempt
-            .map(|reason| format!("attach failed — {reason}"))
-            .unwrap_or_else(|| {
-                "attach failed — the host answered and the executor could not be started"
-                    .to_string()
-            }),
-        RemoteLinkState::Pending => attempt
+        RemoteLinkState::AttachFailed => match attempt
+            .and_then(|attempt| Some((attempt.held_for_ms?, attempt.summary.as_str())))
+        {
+            Some((held, summary)) => format!("{} — {summary}", link_loss_phrase(held)),
+            None => summary
+                .map(|summary| format!("attach failed — {summary}"))
+                .unwrap_or_else(|| {
+                    "attach failed — the host answered and the executor could not be started"
+                        .to_string()
+                }),
+        },
+        RemoteLinkState::Pending => summary
             .map(str::to_string)
             .unwrap_or_else(|| "not yet attempted since the runner started".to_string()),
+    }
+}
+
+const LINK_STABILITY_MS: u64 = 60_000;
+
+fn link_loss_phrase(held_for_ms: u64) -> String {
+    if held_for_ms >= LINK_STABILITY_MS {
+        format!("link lost after {} of healthy operation", held(held_for_ms))
+    } else {
+        format!("link lost {} after attaching", held(held_for_ms))
     }
 }
 
@@ -297,15 +423,15 @@ fn last_seen(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
     }
 }
 
-fn last_attempt(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
+fn last_attempt_age(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
     match &remote.last_attempt {
-        Some(attempt) => format!(
-            "{} — {}",
-            age(captured_at_unix_ms.saturating_sub(attempt.attempted_at_unix_ms)),
-            attempt.reason
-        ),
+        Some(attempt) => age(captured_at_unix_ms.saturating_sub(attempt.attempted_at_unix_ms)),
         None => "none completed yet".to_string(),
     }
+}
+
+fn held(ms: u64) -> String {
+    age(ms).trim_end_matches(" ago").to_string()
 }
 
 /// Render one machine's compact operational status.
@@ -370,6 +496,10 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         "- Connection generation: {}\n",
         health.connection_generation
     ));
+    out.push_str(&render_connection_timeline(
+        &executor.connection_timeline,
+        executor.captured_at_unix_ms,
+    ));
     out.push_str(&format!(
         "- Draining: {}\n",
         if health.drain_mode {
@@ -423,10 +553,65 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             )
         })
     ));
+    // Two verdicts, never one. The physical half is how much room is left; the
+    // custodial half is whether the executor still owns bytes it has admitted it
+    // cannot reclaim. Flattening them is what let an `Ok` volume hide two
+    // unreclaimable trees for sixteen days (CAIRN-4217).
+    let reclamation = health.disk.reclamation.as_ref();
+    let custodial = match reclamation {
+        Some(reclamation) if reclamation.is_outstanding() => "Degraded",
+        Some(_) => "Ok",
+        None => "Unreported",
+    };
     out.push_str(&format!(
-        "- Storage verdict: {:?} (sweep {:?})\n\n",
+        "- Storage verdict: {custodial} (volume {:?}, sweep {:?})\n",
         health.disk.status, health.disk.sweep_status
     ));
+    if let Some(reclamation) = reclamation.filter(|reclamation| reclamation.is_outstanding()) {
+        out.push_str(&format!(
+            "- Reclamation alarms: {} outstanding\n",
+            reclamation.outstanding
+        ));
+        for alarm in &reclamation.alarms {
+            let age = executor
+                .captured_at_unix_ms
+                .saturating_sub(alarm.first_permanent_unix_ms);
+            out.push_str(&format!(
+                "  - `{}` — stuck {}, {} after {} attempts, {:?}; last error: {}\n",
+                alarm.path,
+                duration_ms(age),
+                bytes(alarm.bytes),
+                alarm.attempts,
+                alarm.verification,
+                alarm.last_error
+            ));
+            if !alarm.survivors.is_empty() {
+                out.push_str(&format!("    survivors: {}\n", alarm.survivors));
+            }
+        }
+        // Stated every time, because the one thing an operator must not assume
+        // is that Cairn has already tried something destructive on their behalf.
+        out.push_str(
+            "  - Cairn has not modified these paths. Reclaiming them is destructive and requires operator confirmation.\n",
+        );
+    } else if reclamation.is_none() {
+        out.push_str(
+            "- Reclamation alarms: not reported by this executor (absence is not a clean bill of health)\n",
+        );
+    }
+    if let Some(cadence) = health.disk.accounting_cadence.as_ref() {
+        if let Some(interval_ms) = cadence.interval_ms {
+            out.push_str(&format!(
+                "- Storage accounting cadence: every {}{}\n",
+                duration_ms(interval_ms),
+                cadence
+                    .last_pass_duration_ms
+                    .map(|pass| format!(", last pass {}", duration_ms(pass)))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    out.push('\n');
 
     out.push_str("## Admission\n");
     let admission = &health.admission;
@@ -1165,6 +1350,120 @@ fn render_toolchain_probes(capabilities: &ExecutorCapabilities) -> String {
     out
 }
 
+#[cfg(test)]
+mod storage_verdict_tests {
+    use super::render_executor;
+    use super::tests::inspection;
+    use cairn_common::executor_protocol::{
+        DiskHealthStatus, StorageAlarmVerification, StorageReclamationAlarm,
+        StorageReclamationHealth,
+    };
+
+    fn alarm(verification: StorageAlarmVerification) -> StorageReclamationAlarm {
+        StorageReclamationAlarm {
+            path: "/cairn/build-slots/acme/slot-3.quarantine-1750000000000".into(),
+            first_permanent_unix_ms: 100_000,
+            attempts: 7,
+            bytes: 18 * 1024 * 1024 * 1024,
+            last_error: "Permission denied (os error 13)".into(),
+            survivors: "target/debug/build, .cargo-lock".into(),
+            verification,
+        }
+    }
+
+    /// The CAIRN-4217 regression, stated as a test: a volume with room to spare
+    /// and a janitor that has permanently given up is not `Ok`. Two such trees
+    /// sat unreclaimable for sixteen days behind a verdict derived only from
+    /// free space.
+    #[test]
+    fn an_outstanding_alarm_degrades_an_otherwise_healthy_volume() {
+        let mut executor = inspection("local", true);
+        executor.health.disk.status = DiskHealthStatus::Ok;
+        executor.health.disk.reclamation = Some(StorageReclamationHealth {
+            outstanding: 2,
+            alarms: vec![alarm(StorageAlarmVerification::Observed)],
+        });
+
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Storage verdict: Degraded"),
+            "an unreclaimable tree is a degraded executor: {rendered}"
+        );
+        assert!(
+            rendered.contains("volume Ok"),
+            "the physical verdict stays visible and separate: {rendered}"
+        );
+        assert!(rendered.contains("2 outstanding"), "{rendered}");
+        assert!(
+            rendered.contains("slot-3.quarantine-1750000000000"),
+            "the operator needs the path to act on: {rendered}"
+        );
+        assert!(rendered.contains("7 attempts"), "{rendered}");
+        assert!(
+            rendered.contains("Permission denied (os error 13)"),
+            "the last error is what says why it is stuck: {rendered}"
+        );
+        assert!(rendered.contains("target/debug/build"), "{rendered}");
+        assert!(
+            rendered.contains("Cairn has not modified these paths")
+                && rendered.contains("requires operator confirmation"),
+            "reclaiming is destructive and operator-owned, and must say so: {rendered}"
+        );
+    }
+
+    /// A restart must not launder an alarm into a clean slate: health is
+    /// degraded from the instant the process comes up, before any sweep has had
+    /// a chance to retry the path.
+    #[test]
+    fn a_restored_alarm_degrades_before_any_sweep_has_verified_it() {
+        let mut executor = inspection("local", true);
+        executor.health.disk.status = DiskHealthStatus::Ok;
+        executor.health.disk.reclamation = Some(StorageReclamationHealth {
+            outstanding: 1,
+            alarms: vec![alarm(StorageAlarmVerification::RestoredUnverified)],
+        });
+
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Storage verdict: Degraded"), "{rendered}");
+        assert!(
+            rendered.contains("RestoredUnverified"),
+            "the reader is told this has not been retried yet: {rendered}"
+        );
+    }
+
+    /// Silence is not evidence. A peer that does not report reclamation at all
+    /// must not be rendered as one that reported nothing wrong.
+    #[test]
+    fn an_executor_that_does_not_report_reclamation_is_not_rendered_as_clean() {
+        let mut executor = inspection("local", true);
+        executor.health.disk.status = DiskHealthStatus::Ok;
+        executor.health.disk.reclamation = None;
+
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("Storage verdict: Unreported"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("absence is not a clean bill of health"),
+            "{rendered}"
+        );
+    }
+
+    /// A completed sweep that found nothing is a positive claim, and reads as
+    /// one.
+    #[test]
+    fn a_sweep_that_found_nothing_reads_as_ok_rather_than_unreported() {
+        let mut executor = inspection("local", true);
+        executor.health.disk.status = DiskHealthStatus::Ok;
+        executor.health.disk.reclamation = Some(StorageReclamationHealth::default());
+
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Storage verdict: Ok"), "{rendered}");
+        assert!(!rendered.contains("Reclamation alarms"), "{rendered}");
+    }
+}
+
 fn list_or(values: &[String], empty: &str) -> String {
     if values.is_empty() {
         empty.to_string()
@@ -1196,7 +1495,7 @@ mod tests {
 
     const CAPTURED_AT: u64 = 1_000_000;
 
-    fn inspection(name: &str, colocated: bool) -> ExecutorInspection {
+    pub(super) fn inspection(name: &str, colocated: bool) -> ExecutorInspection {
         let identity = ExecutorIdentity {
             device_id: "device-9f3c1a".into(),
             executor_id: "executor-7b21ce".into(),
@@ -1249,6 +1548,7 @@ mod tests {
             executor_build_id: Some("build-abc".into()),
             occupancy: FleetSnapshot::default(),
             captured_at_unix_ms: CAPTURED_AT,
+            connection_timeline: Vec::new(),
         }
     }
 
@@ -1704,13 +2004,74 @@ mod tests {
             os: "linux".into(),
             arch: "x86_64".into(),
             link,
-            last_attempt: Some(RemoteAttachAttempt {
-                attempted_at_unix_ms: REMOTE_CAPTURED_AT - 120_000,
-                reason: "ssh unreachable (ssh: connect to host bglab-ub port 22: No route to host)"
-                    .into(),
-            }),
+            last_attempt: Some(RemoteAttachAttempt::bootstrap_failure(
+                REMOTE_CAPTURED_AT - 120_000,
+                "ssh unreachable (ssh: connect to host bglab-ub port 22: No route to host)",
+            )),
             last_seen_unix_ms: Some(REMOTE_CAPTURED_AT - 7_200_000),
+            connection_timeline: Vec::new(),
         }
+    }
+
+    fn enrolled_after(name: &str, link: RemoteLinkState, account: &str) -> EnrolledRemote {
+        let mut remote = enrolled(name, link);
+        remote.last_attempt = Some(RemoteAttachAttempt::bootstrap_failure(
+            REMOTE_CAPTURED_AT - 120_000,
+            account,
+        ));
+        remote
+    }
+
+    fn lost_link_specimen(held_for_ms: u64) -> EnrolledRemote {
+        let account = "the SSH session carrying the link exited after 433s (exit status: 255); composing bootstrap PATH\nprobe 7: toolchain present\nfatal: Not a valid commit name";
+        let mut remote = enrolled("bglab-mac", RemoteLinkState::AttachFailed);
+        remote.last_attempt = Some(RemoteAttachAttempt::link_lost(
+            REMOTE_CAPTURED_AT - 120_000,
+            account,
+            held_for_ms,
+        ));
+        remote
+    }
+
+    #[test]
+    fn lost_link_summary_is_bounded_and_full_log_remains_reachable() {
+        let remote = lost_link_specimen(433_000);
+        let overview = render_executors(
+            &[],
+            std::slice::from_ref(&remote),
+            &[],
+            None,
+            REMOTE_CAPTURED_AT,
+            false,
+        );
+        assert!(!overview.contains("probe 7"), "{overview}");
+        assert!(overview.contains("view=attach-log"), "{overview}");
+        let machine = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(
+            machine.contains("link lost after 7m of healthy operation"),
+            "{machine}"
+        );
+        assert!(!machine.contains("attach failed"), "{machine}");
+        let log = render_attach_log(&remote, REMOTE_CAPTURED_AT);
+        assert!(log.contains("probe 7"), "{log}");
+        assert!(log.contains("fatal: Not a valid commit name"), "{log}");
+        assert!(log.contains("Link held: 7m"), "{log}");
+    }
+
+    #[test]
+    fn bootstrap_failure_remains_distinct_and_has_no_empty_log_link() {
+        let remote = enrolled_after(
+            "bglab-mac",
+            RemoteLinkState::AttachFailed,
+            "ssh authentication refused (root@host: Permission denied (publickey).)",
+        );
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(
+            rendered.contains("attach failed — ssh authentication"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("link lost"), "{rendered}");
+        assert!(!rendered.contains("view=attach-log"), "{rendered}");
     }
 
     /// The defect this whole record exists for: three enrolled machines stopped
@@ -1781,8 +2142,10 @@ mod tests {
         );
 
         let mut refused = enrolled("bglab-mac", RemoteLinkState::AttachFailed);
-        refused.last_attempt.as_mut().unwrap().reason =
-            "ssh authentication refused (root@host: Permission denied (publickey).)".into();
+        refused.last_attempt = Some(RemoteAttachAttempt::bootstrap_failure(
+            REMOTE_CAPTURED_AT - 120_000,
+            "ssh authentication refused (root@host: Permission denied (publickey).)",
+        ));
         let failed = render_enrolled_remote(&refused, REMOTE_CAPTURED_AT);
         assert!(
             failed.contains("attach failed — ssh authentication refused ("),
@@ -1796,7 +2159,10 @@ mod tests {
     #[test]
     fn an_expected_artifact_publish_wait_uses_the_calm_register() {
         let mut waiting = enrolled("bglab-mac", RemoteLinkState::AttachFailed);
-        waiting.last_attempt.as_mut().unwrap().reason = "waiting for v48 artifact publish".into();
+        waiting.last_attempt = Some(RemoteAttachAttempt::bootstrap_failure(
+            REMOTE_CAPTURED_AT - 120_000,
+            "waiting for v48 artifact publish",
+        ));
         let rendered = render_enrolled_remote(&waiting, REMOTE_CAPTURED_AT);
 
         assert!(

@@ -108,6 +108,11 @@ pub fn build_project_posts_uri(project: &str) -> String {
     format!("{}/posts", build_project_uri(project))
 }
 
+/// One project's code map — the data source the workspace map surface lays out.
+pub fn build_project_codemap_uri(project: &str) -> String {
+    format!("{}/codemap", build_project_uri(project))
+}
+
 pub fn build_issue_uri(project: &str, number: i32) -> String {
     format!("{}/{}", build_project_uri(project), number)
 }
@@ -863,6 +868,7 @@ impl CairnResource {
             Self::Posts => "cairn://posts".to_string(),
             Self::Post { id } => format!("cairn://posts/{id}"),
             Self::ProjectPosts { project } => build_project_posts_uri(project),
+            Self::ProjectCodemap { project } => build_project_codemap_uri(project),
             Self::ProjectCheckResults { project, revision } => {
                 build_project_check_results_uri(project, revision)
             }

@@ -4,7 +4,6 @@
 
 use serde::Deserialize;
 
-use crate::jobs::queries::{node_uri_segment_for_job, parent_uri_segment_for_job};
 use crate::mcp::types::McpCallbackRequest;
 use crate::messages::{db as msg_db, delivery};
 use crate::models::ChannelType;
@@ -16,27 +15,13 @@ use cairn_common::uri::{build_job_base_uri, build_node_uri};
 use cairn_db::turso::params;
 
 async fn sender_name_for_run(db: &LocalDb, run_ctx: &super::RunContext) -> Result<String, String> {
-    let node_name = run_ctx.job_name.as_deref().unwrap_or("unknown");
-    if let Some(issue_number) = run_ctx.issue_number {
-        let node_segment = node_uri_segment_for_job(db, &run_ctx.job_id)
-            .await
-            .unwrap_or_else(|| node_name.to_string());
-        // Sub-task senders nest under their parent node as
-        // `.../{seq}/{parent}/task/{segment}`. Without the parent join the
-        // recorded sender_name was the broken top-level shape, which the
-        // reply-to hint on a DM then echoed back — every reply to a sub-task
-        // hit "No agent found" because the addressed URI was unreachable.
-        let parent_segment = parent_uri_segment_for_job(db, &run_ctx.job_id).await;
-        Ok(build_job_base_uri(
-            &run_ctx.project_key,
-            issue_number,
-            run_ctx.exec_seq.unwrap_or(1),
-            &node_segment,
-            parent_segment.as_deref(),
-        ))
-    } else {
-        Ok(node_name.to_string())
-    }
+    // The canonical resolver covers issue nodes, their tasks, thread sessions,
+    // and thread-spawned tasks. Legacy jobs without a stored URI segment have no
+    // canonical address, so preserve their historical bare-name identity.
+    Ok(crate::jobs::queries::home_uri_for_job(db, &run_ctx.job_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .unwrap_or_else(|| run_ctx.job_name.as_deref().unwrap_or("unknown").to_string()))
 }
 
 /// The recipient job behind a thread coordinate: the thread's own session, or a

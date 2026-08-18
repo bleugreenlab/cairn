@@ -31,6 +31,7 @@
 
 mod persist;
 pub(in crate::backends) mod repair;
+mod stream_end;
 mod tool_defs;
 mod tools;
 pub(in crate::backends) mod transcript;
@@ -46,6 +47,7 @@ use persist::{
     store_assistant_message, store_assistant_tool_call, store_success_result, store_tool_result,
     tool_call_usage,
 };
+pub(crate) use stream_end::require_terminal_event;
 use tools::execute_tool_call;
 
 use crate::agent_process::process::{BackendStdin, RunHandle, SuspendKind};

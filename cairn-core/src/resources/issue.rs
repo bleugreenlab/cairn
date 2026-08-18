@@ -356,12 +356,10 @@ pub(super) async fn read_issue(
                 "Closed"
             };
             output.push_str(&format!(
-                "{verb} by {actor} at {}\n",
+                "{verb} by {actor} {}\n",
                 resolved_at
-                    .map(|at| chrono::DateTime::from_timestamp(at, 0)
-                        .map(|v| v.to_rfc3339())
-                        .unwrap_or_else(|| at.to_string()))
-                    .unwrap_or_else(|| "unknown time".to_string())
+                    .map(crate::clock::age)
+                    .unwrap_or_else(|| "at an unknown time".to_string())
             ));
         }
     }

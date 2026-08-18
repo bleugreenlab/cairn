@@ -13,8 +13,10 @@
 //!    [`push_to_issue_watchers`].
 //! 2. **Render pushes at resume time.** [`render_pushes_resolved`] gives every
 //!    drained push a compact reference-first summary. Cheap, targeted database
-//!    details are retained for direct messages, catch-up digests, and terminal
-//!    resolutions; full resources are read by the agent only when needed.
+//!    details are retained for direct messages, catch-up digests, terminal
+//!    resolutions, check verdicts, and posts — the referents whose point is lost
+//!    when only their address arrives; full resources are read by the agent only
+//!    when needed.
 
 use cairn_db::turso::params;
 
@@ -668,9 +670,9 @@ async fn resolved_issue_confirmation(orch: &Orchestrator, issue_uri: &str) -> Op
 
 /// Render a drained attention push as a compact, reference-first update.
 ///
-/// Direct messages, catch-up digests, terminal resolutions, and check verdicts
-/// have bounded, targeted database lookups because their essential detail is not
-/// represented by the resource URI alone. Other push kinds deliberately do not
+/// Direct messages, catch-up digests, terminal resolutions, check verdicts, and
+/// posts have bounded, targeted database lookups because their essential detail
+/// is not represented by the resource URI alone. Other push kinds deliberately do not
 /// render their full resource here: resume prompt assembly holds the launch lock,
 /// and making a resource read per pending push made user messages wait tens of
 /// seconds. The URI remains the canonical route to the live content through the
@@ -745,6 +747,25 @@ pub(crate) async fn render_push_resolved(
         .split_once(':')
         .map(|(prefix, _)| prefix)
         .unwrap_or(&push.key);
+
+    // A post push's referent is a short piece of writing whose whole purpose is
+    // to be classified — worth reading further, or not — and a subscriber cannot
+    // classify a URI. The post (or the comment) is carried inline from the
+    // workspace-local corpus, two indexed lookups, the same cheap-and-targeted
+    // bargain the direct-message and check-verdict branches above make.
+    if crate::orchestrator::wakes::post_push_source(prefix).is_some() {
+        if let Some(body) =
+            crate::orchestrator::wakes::render_post_push_body(&orch.db.local, push).await
+        {
+            // The headline is kept in front of the content because it carries
+            // the one thing the post itself cannot: why this recipient is being
+            // told. Being referenced by a post is not the same event as one
+            // landing in a feed you elected to watch.
+            let (_, headline) = super::attention_push::push_kind_headline(prefix);
+            return format!("{header}\n\n{headline}.\n\n{body}");
+        }
+    }
+
     let (_, headline) = super::attention_push::push_kind_headline(prefix);
     format!(
         "{header}\n\n{headline}. Read {} for the current content.",
@@ -856,6 +877,90 @@ mod tests {
         let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
         let services = Arc::new(TestServicesBuilder::new().build());
         OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// One post in the corpus, authored by an agent home.
+    async fn seed_post(db: &LocalDb, title: &str, content: &str) -> crate::models::Post {
+        use cairn_common::identity::{
+            Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+            VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+        };
+        let node = "cairn://p/proj/2/1/builder".to_string();
+        let author = PrincipalRef::Agent {
+            node: node.clone(),
+            run_id: Some("run-1".to_string()),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::NodeSession,
+            VerificationStatus::Verified,
+            None,
+            None,
+            Some("run-1".to_string()),
+            None,
+            VerificationStrength::new("session-bound").unwrap(),
+            1,
+        )
+        .unwrap();
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::ResourcePatch,
+            Address::Resource { node },
+            verification,
+            1,
+            None,
+        )
+        .unwrap();
+        db.create_post(crate::models::CreatePost {
+            project_id: None,
+            title: Some(title.to_string()),
+            content: content.to_string(),
+            appearance: AppearanceSnapshot::new(author.clone(), evidence, vec![], None).unwrap(),
+            author,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A post push is the one referent short enough to carry whole, and its
+    /// recipient was woken to judge whether the writing deserves more attention
+    /// — a judgement no URI supports. The delivery path inlines it instead of
+    /// falling through to the generic "read the URI" line.
+    #[tokio::test]
+    async fn post_push_carries_the_post_instead_of_an_errand() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        let post = seed_post(&db, "Wake legibility", "Test post to see if the wake works").await;
+        let orch = test_orchestrator(db);
+        let uri = format!("cairn://posts/{}", post.id);
+        let push = crate::orchestrator::attention_push::Push {
+            id: "push-post".into(),
+            recipient: "watcher".into(),
+            content_ref: uri.clone(),
+            wake: Wake::Wake,
+            boundary: Boundary::Event,
+            key: format!("post:{uri}"),
+            created_at: 1,
+            delivered_event_id: None,
+        };
+
+        let rendered = render_push_resolved(&orch, &push).await;
+
+        assert!(
+            rendered.contains("Test post to see if the wake works"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Wake legibility"), "{rendered}");
+        assert!(
+            rendered.contains("New post."),
+            "the reason for the wake survives in front of the content: {rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("Attention update (wake): {uri}")),
+            "the canonical URI stays as provenance: {rendered}"
+        );
+        assert!(
+            !rendered.contains("for the current content"),
+            "a post wake never sends its reader somewhere else to read five words: {rendered}"
+        );
     }
 
     #[tokio::test]

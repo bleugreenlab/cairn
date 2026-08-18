@@ -99,7 +99,15 @@ pub(crate) struct ServiceIdentity<'a> {
     pub label: &'a str,
 }
 
-pub(crate) struct ServiceLease {
+/// Everything a placed service residency is, minus the right to keep it alive.
+///
+/// Renewal holds this and never the handle below, and the split is not
+/// bookkeeping. Recovery legitimately waits forever for a machine that may never
+/// come back, so a renewal task that held the lease across that wait would be
+/// its last owner for the whole outage — precisely the window in which an
+/// abandoned lease must stop contending for its holder rather than keep
+/// reacquiring on behalf of a caller that is gone.
+pub(crate) struct LeaseCore {
     orch: Orchestrator,
     fence: Arc<RwLock<ResidencyFence>>,
     acquire_request: ResidencyAcquireRequest,
@@ -111,6 +119,40 @@ pub(crate) struct ServiceLease {
     release_notify: tokio::sync::Notify,
     health: Arc<StdMutex<ServicePlacementHealth>>,
     routes: ProcessRoutes,
+}
+
+/// An owner's handle on a placed service residency.
+///
+/// Lifetime is the whole meaning of this type. Dropping the last handle ends the
+/// residency's renewal; every other capability is reached through [`LeaseCore`].
+pub(crate) struct ServiceLease {
+    core: Arc<LeaseCore>,
+}
+
+impl Drop for ServiceLease {
+    /// Raise the same signal an explicit release raises.
+    ///
+    /// A lease nobody holds must stop renewing, and a renewal task parked in
+    /// recovery has to be woken to notice — [`wait_for_recovery_or_release`]
+    /// already races that park against this notification, so an orphaned lease
+    /// and a released one leave by one path rather than two.
+    ///
+    /// What `Drop` cannot do is hand the cell back, because that is an await.
+    /// The executor reclaims it under the death policy the lease was acquired
+    /// with, which is the mechanism that already covers a runner exiting without
+    /// releasing.
+    fn drop(&mut self) {
+        self.core.released.store(true, Ordering::Release);
+        self.core.release_notify.notify_waiters();
+    }
+}
+
+impl std::ops::Deref for ServiceLease {
+    type Target = LeaseCore;
+
+    fn deref(&self) -> &LeaseCore {
+        &self.core
+    }
 }
 
 pub(crate) async fn acquire_service_lease(
@@ -138,17 +180,19 @@ pub(crate) async fn acquire_service_lease(
     let routes = ProcessRoutes::default();
     subscribe_lease_events(orch, &fence, &routes);
     Ok(ServiceLease {
-        orch: orch.clone(),
-        fence,
-        acquire_request,
-        executor_name: executor_name.to_string(),
-        service_label: service.label.trim().to_string(),
-        one_shot: Mutex::new(()),
-        recovery: Mutex::new(()),
-        released: AtomicBool::new(false),
-        release_notify: tokio::sync::Notify::new(),
-        health: Arc::new(StdMutex::new(ServicePlacementHealth::Ready)),
-        routes,
+        core: Arc::new(LeaseCore {
+            orch: orch.clone(),
+            fence,
+            acquire_request,
+            executor_name: executor_name.to_string(),
+            service_label: service.label.trim().to_string(),
+            one_shot: Mutex::new(()),
+            recovery: Mutex::new(()),
+            released: AtomicBool::new(false),
+            release_notify: tokio::sync::Notify::new(),
+            health: Arc::new(StdMutex::new(ServicePlacementHealth::Ready)),
+            routes,
+        }),
     })
 }
 
@@ -218,6 +262,54 @@ fn service_acquire_request(
 }
 
 impl ServiceLease {
+    /// Keep this lease's residency alive for as long as an owner holds it.
+    ///
+    /// The task is handed the core and never a handle, so it cannot become the
+    /// lease's last owner. A renewal loop that cloned the lease kept it alive
+    /// forever, and because a service holder is a single name, an orphan did not
+    /// merely linger: it recovered by reacquiring a holder someone else now
+    /// owned, whose own loop recovered by reacquiring in turn. Orphans
+    /// accumulated into a herd that filled the executor's admission queue with
+    /// `AgentInteractive` residency traffic which never settled (CAIRN-4205).
+    ///
+    /// Dropping the last handle therefore stops renewal from two directions at
+    /// once: the `released` flag this loop checks before every step, and the
+    /// notification that wakes it out of an otherwise unbounded recovery wait.
+    pub(crate) fn spawn_renewal(&self) {
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RENEW_INTERVAL);
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if core.released.load(Ordering::Acquire) {
+                    return;
+                }
+                let fence = core.current_fence();
+                let Err(error) = super::residency::renew(&core.orch, &fence).await else {
+                    continue;
+                };
+                tracing::warn!(%error, holder = %fence.holder, "service residency renewal failed; waiting to reacquire");
+                *core.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
+                loop {
+                    if core.released.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Err(error) = core.recover().await else {
+                        break;
+                    };
+                    if core.released.load(Ordering::Acquire) {
+                        return;
+                    }
+                    tracing::warn!(%error, executor = %core.executor_name, "service residency reacquisition failed");
+                    tokio::time::sleep(RENEW_INTERVAL).await;
+                }
+            }
+        });
+    }
+}
+
+impl LeaseCore {
     pub(crate) fn executor_name(&self) -> &str {
         &self.executor_name
     }
@@ -274,32 +366,6 @@ impl ServiceLease {
         *self.fence.write().unwrap() = fence.clone();
         *self.health.lock().unwrap() = ServicePlacementHealth::Ready;
         Ok(fence)
-    }
-
-    pub(crate) fn spawn_renewal(self: &Arc<Self>) {
-        let lease = self.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(RENEW_INTERVAL);
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                if lease.released.load(Ordering::Acquire) {
-                    return;
-                }
-                let fence = lease.current_fence();
-                if let Err(error) = super::residency::renew(&lease.orch, &fence).await {
-                    tracing::warn!(%error, holder = %fence.holder, "service residency renewal failed; waiting to reacquire");
-                    *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
-                    while let Err(error) = lease.recover().await {
-                        if lease.released.load(Ordering::Acquire) {
-                            return;
-                        }
-                        tracing::warn!(%error, executor = %lease.executor_name, "service residency reacquisition failed");
-                        tokio::time::sleep(RENEW_INTERVAL).await;
-                    }
-                }
-            }
-        });
     }
 
     pub(crate) async fn release(&self) -> Result<(), ServicePlacementError> {
@@ -647,6 +713,15 @@ pub(crate) mod tests {
     /// reproduce is the skew between an executor's two streams: in process,
     /// every callback is synchronous and in order.
     pub(crate) async fn attached_orchestrator() -> (Orchestrator, tempfile::TempDir) {
+        let (orch, config, _link) = attached_orchestrator_with_link().await;
+        (orch, config)
+    }
+
+    /// The same orchestrator, plus the connection generation its colocated link
+    /// attached at — the fence `disconnect_advertised_executor` matches on, and
+    /// therefore what a test needs to take the machine away.
+    pub(crate) async fn attached_orchestrator_with_link() -> (Orchestrator, tempfile::TempDir, u64)
+    {
         let config = tempfile::tempdir().unwrap();
         let db = LocalDb::open(config.path().join("cairn.turso.db"))
             .await
@@ -659,11 +734,11 @@ pub(crate) mod tests {
         let db_state = Arc::new(DbState::new(Arc::new(db), Arc::new(index)));
         let services = Arc::new(TestServicesBuilder::new().build());
         let orch = Orchestrator::builder(db_state, services, config.path().to_path_buf()).build();
-        attach_executor_runtime(&orch, config.path().join("executor-home"));
-        (orch, config)
+        let link = attach_executor_runtime(&orch, config.path().join("executor-home"));
+        (orch, config, link)
     }
 
-    fn attach_executor_runtime(orch: &Orchestrator, home: PathBuf) {
+    fn attach_executor_runtime(orch: &Orchestrator, home: PathBuf) -> u64 {
         const EXECUTOR_ID: &str = super::super::COLOCATED_EXECUTOR_ID;
         let fleet = orch.fleet.clone();
         let generation = Arc::new(AtomicU64::new(0));
@@ -720,6 +795,7 @@ pub(crate) mod tests {
                 }
             }
         });
+        attached
     }
 
     /// A one-shot returns what its command printed and the status it exited
@@ -854,6 +930,81 @@ pub(crate) mod tests {
                 status: ResidentProcessStatus::Starting,
             },
         }
+    }
+
+    /// A renewal task must not keep its own lease alive — least of all while it
+    /// is parked waiting for a machine that is gone.
+    ///
+    /// This is the whole of CAIRN-4205 in one test, and it is deliberately
+    /// staged in the hard state rather than the easy one. Asserting only that a
+    /// freshly spawned renewal does not own its lease passes against a task that
+    /// borrows weakly and then upgrades across `recover()`, because such a task
+    /// owns the lease for the entire duration of an outage — which is exactly
+    /// when an abandoned lease must stop reacquiring a holder that someone else
+    /// now owns. So the executor is taken away first, recovery is left parked in
+    /// `wait_for_named_executor` on a machine that never returns, and only then
+    /// is the last handle dropped.
+    #[tokio::test]
+    async fn a_lease_dropped_while_recovery_is_parked_dies_at_once() {
+        let (orch, _config, link) = attached_orchestrator_with_link().await;
+        let lease = Arc::new(
+            acquire_service_lease(
+                &orch,
+                ServiceIdentity {
+                    id: "desktop-automation",
+                    label: "desktop automation",
+                },
+                LOCAL_EXECUTOR_NAME,
+                ResidencyFootprint {
+                    memory_bytes: 0,
+                    disk_growth_bytes: 0,
+                },
+                OwnerDeathPolicy {
+                    heartbeat_timeout_ms: 30_000,
+                    reclaim_grace_ms: 10_000,
+                },
+            )
+            .await
+            .expect("a named colocated executor must place a service residency"),
+        );
+
+        lease.spawn_renewal();
+        assert_eq!(
+            Arc::strong_count(&lease),
+            1,
+            "renewal must be handed the lease's state, never a handle to the lease"
+        );
+
+        // Take the machine away, so recovery parks for a link that never
+        // reattaches instead of completing.
+        assert!(
+            orch.fleet
+                .disconnect_advertised_executor(super::super::COLOCATED_EXECUTOR_ID, link),
+            "the test link must be disconnectable at the generation it attached with"
+        );
+        *lease.health.lock().unwrap() = ServicePlacementHealth::ExecutorOffline;
+
+        let core = Arc::clone(&lease.core);
+        let parked = tokio::spawn(async move { core.recover().await });
+        // Let recovery reach its wait. Nothing else can advance it: the executor
+        // is gone and only the lease's own release signal is racing that park.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let orphaned = Arc::downgrade(&lease);
+        drop(lease);
+
+        assert!(
+            orphaned.upgrade().is_none(),
+            "a parked renewal must not be its lease's last owner"
+        );
+        let recovered = tokio::time::timeout(Duration::from_secs(5), parked)
+            .await
+            .expect("dropping the lease must wake a recovery parked on a machine that is gone")
+            .expect("the recovery task must not panic");
+        assert!(
+            recovered.is_err(),
+            "an orphaned lease must abandon recovery rather than reacquire its holder"
+        );
     }
 
     #[tokio::test]

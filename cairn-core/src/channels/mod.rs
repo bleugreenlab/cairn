@@ -338,18 +338,34 @@ fn desktop_activity_state() -> &'static Mutex<DesktopActivityState> {
 
 /// Records activity observed by the desktop app. The runner owns the timestamp
 /// so callers cannot forge freshness with a client clock.
+///
+/// The wake is emitted for a CHANGE in inferred presence, not for the report.
+/// The desktop beacon reports every five seconds for as long as the app is open,
+/// and almost every one of those samples says exactly what the last one said;
+/// waking every channel sweep on each of them made the sweep loops' presence arm
+/// permanently ready, which doubles the sweep rate at idle and removes the sleep
+/// entirely once a sweep runs longer than its own cadence (CAIRN-4208).
 pub fn report_desktop_presence(idle_seconds: u64, locked: bool) {
-    desktop_activity_state()
-        .lock()
-        .expect("desktop activity state lock poisoned")
-        .last_sample = Some(DesktopPresenceSample {
-        sampled_at: Instant::now(),
-        idle_seconds,
-        locked,
-    });
-    OPERATOR_PRESENCE_CHANGED
-        .get_or_init(tokio::sync::Notify::new)
-        .notify_one();
+    let now = Instant::now();
+    let changed = {
+        let mut state = desktop_activity_state()
+            .lock()
+            .expect("desktop activity state lock poisoned");
+        // Both sides are inferred at the same instant, so this compares the
+        // sample rather than the ageing of the previous one.
+        let before = desktop_inferred_presence(state.last_sample, now);
+        state.last_sample = Some(DesktopPresenceSample {
+            sampled_at: now,
+            idle_seconds,
+            locked,
+        });
+        before != desktop_inferred_presence(state.last_sample, now)
+    };
+    if changed {
+        OPERATOR_PRESENCE_CHANGED
+            .get_or_init(tokio::sync::Notify::new)
+            .notify_one();
+    }
 }
 
 fn desktop_inferred_presence(

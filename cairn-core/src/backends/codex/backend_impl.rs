@@ -905,6 +905,47 @@ impl AgentBackend for CodexBackend {
         true // app-server stays alive after turn completion and accepts more user_input
     }
 
+    fn runtime_launch_capability(
+        &self,
+        launch: &crate::backends::RuntimeLaunch,
+    ) -> Result<crate::backends::RuntimeLaunchCapability, String> {
+        use crate::backends::{
+            RuntimeClass, RuntimeHostKind, RuntimeHostRequirement, RuntimeLane,
+            RuntimeLaunchCapability, RuntimeResourceClaim,
+        };
+        if launch.is_ephemeral_call {
+            return Ok(RuntimeLaunchCapability {
+                class: RuntimeClass::MultiplexedServer,
+                lane: RuntimeLane::new("codex-app-server"),
+                host_requirement: RuntimeHostRequirement::ResidentOn(RuntimeHostKind::Runner),
+                claim: RuntimeResourceClaim {
+                    resident_process_units: 1,
+                    // The call funnel classifies runtime cost before Codex auth is
+                    // resolved. Durable admission must replace this provisional
+                    // claim with the exact pool_key_for_auth identity before
+                    // leasing; the synchronous local backstop may classify it
+                    // without turning existing Codex calls into launch failures.
+                    server_instance_key: launch.server_instance_key.clone(),
+                    logical_stream_units: 1,
+                    estimated_memory_bytes: None,
+                },
+                supports_warm_reuse: true,
+            });
+        }
+        Ok(RuntimeLaunchCapability {
+            class: RuntimeClass::DedicatedProcess,
+            lane: RuntimeLane::new("codex-session-process"),
+            host_requirement: RuntimeHostRequirement::ResidentOn(RuntimeHostKind::Runner),
+            claim: RuntimeResourceClaim {
+                resident_process_units: 1,
+                server_instance_key: None,
+                logical_stream_units: 1,
+                estimated_memory_bytes: None,
+            },
+            supports_warm_reuse: true,
+        })
+    }
+
     fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
         // Codex app-server is one long-lived pooled process; each call is a
         // lightweight `thread/start` session on it. Unbounded today.

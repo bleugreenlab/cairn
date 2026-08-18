@@ -12,6 +12,7 @@ pub(crate) mod placement;
 pub(crate) mod residency;
 mod resource_profiles;
 pub(crate) mod service_placement;
+pub mod telemetry;
 
 use crate::mcp::handlers::run::{ResolvedRunBatch, RunSpec};
 use crate::orchestrator::Orchestrator;
@@ -29,12 +30,12 @@ use cairn_common::executor_protocol::{
     PlacementSyncCost, PlacementTieBreak, PreparationForecast, ProcessBatch, ProcessBatchExecution,
     ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
     QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget, RemoteAttachAttempt,
-    RemoteLinkState, RepositoryLocator, ReservationFallback, ReservationRationale,
-    ResidencyAcquireRequest, ResidencyFailureKind, ResidencyFence, ResidencyHolder,
-    ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig, ResidentProcessEvent,
-    ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult, WarmthUnknownReason,
-    CPU_ADMISSION_SAMPLE_INTERVAL_MS, EXECUTOR_PROGRESS_FRESHNESS_MS, LOCAL_EXECUTOR_NAME,
-    MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    RemoteConnectionPhase, RemoteConnectionTransition, RemoteLinkState, RepositoryLocator,
+    ReservationFallback, ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind,
+    ResidencyFence, ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
+    ResidentProcessEvent, ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult,
+    WarmthUnknownReason, CPU_ADMISSION_SAMPLE_INTERVAL_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
+    LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
@@ -474,11 +475,17 @@ impl DesktopAutomationConfig {
     }
 }
 
+/// A machine the runner can enroll, identified by the executor artifact it can
+/// run. Every variant names one published target triple: a platform with no
+/// artifact is not a platform this fleet can reach, so the enum and
+/// `PUBLISHED_TARGETS` in `scripts/build-executor-manifest.ts` describe the same
+/// set from the two ends of the distribution.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum RemotePlatform {
     #[default]
     LinuxX86_64,
+    LinuxArm64,
     WindowsX86_64,
     DarwinArm64,
 }
@@ -486,22 +493,31 @@ pub enum RemotePlatform {
 impl RemotePlatform {
     pub fn os(self) -> &'static str {
         match self {
-            Self::LinuxX86_64 => "linux",
+            Self::LinuxX86_64 | Self::LinuxArm64 => "linux",
             Self::WindowsX86_64 => "windows",
             Self::DarwinArm64 => "macos",
         }
     }
 
+    /// The architecture this machine will report once it is attached.
+    ///
+    /// Spelled the way `std::env::consts::ARCH` spells it, because that is what
+    /// the executor itself advertises in [`ExecutorCapabilities`]. These two
+    /// descriptions of one machine meet in the fleet projection —
+    /// `unattached_enrolled_remotes` hands over to the executor projection the
+    /// moment a link comes up — and a machine that changed architecture on
+    /// attach would be reporting a fact about the enum rather than the host.
     pub fn arch(self) -> &'static str {
         match self {
             Self::LinuxX86_64 | Self::WindowsX86_64 => "x86_64",
-            Self::DarwinArm64 => "arm64",
+            Self::LinuxArm64 | Self::DarwinArm64 => "aarch64",
         }
     }
 
     pub fn target(self) -> &'static str {
         match self {
             Self::LinuxX86_64 => "x86_64-unknown-linux-gnu",
+            Self::LinuxArm64 => "aarch64-unknown-linux-gnu",
             Self::WindowsX86_64 => "x86_64-pc-windows-msvc",
             Self::DarwinArm64 => "aarch64-apple-darwin",
         }
@@ -509,7 +525,7 @@ impl RemotePlatform {
 
     fn is_absolute(self, path: &str) -> bool {
         match self {
-            Self::LinuxX86_64 | Self::DarwinArm64 => path.starts_with('/'),
+            Self::LinuxX86_64 | Self::LinuxArm64 | Self::DarwinArm64 => path.starts_with('/'),
             Self::WindowsX86_64 => {
                 let bytes = path.as_bytes();
                 (bytes.len() >= 3
@@ -1232,7 +1248,10 @@ struct EnrolledRemoteRecord {
     link: RemoteLinkState,
     last_attempt: Option<RemoteAttachAttempt>,
     last_seen_unix_ms: Option<u64>,
+    connection_timeline: VecDeque<RemoteConnectionTransition>,
 }
+
+const REMOTE_CONNECTION_TIMELINE_LIMIT: usize = 32;
 
 const EXPLORATION_INTERVAL: usize = 4;
 
@@ -1325,6 +1344,11 @@ pub struct Fleet {
     /// placement must consume its exploration slot before concurrent ranking can
     /// spend the same slot.
     exploration_by_work_class: Arc<Mutex<HashMap<PlacementWorkClass, ExplorationState>>>,
+    /// Rate limit for the pushed telemetry frame. One per runner rather than
+    /// one per connection: an N-machine fleet beating independently would
+    /// otherwise emit at N times the intended cadence, each connection
+    /// believing it was within its own budget.
+    telemetry_cadence: Arc<telemetry::TelemetryCadence>,
     colocated_substrate_state: Arc<Mutex<Option<ExecutorSubstrateEvidence>>>,
     /// Every machine this runner is enrolled with, keyed by executor id and
     /// kept whether or not the machine is attached. Always locked AFTER
@@ -2346,6 +2370,7 @@ impl Fleet {
                     link: RemoteLinkState::Pending,
                     last_attempt: None,
                     last_seen_unix_ms: None,
+                    connection_timeline: VecDeque::new(),
                 });
         record.name = name.to_string();
         record.os = os.to_string();
@@ -2361,15 +2386,24 @@ impl Fleet {
         &self,
         executor_id: &str,
         link: RemoteLinkState,
-        reason: impl Into<String>,
-        attempted_at_unix_ms: u64,
+        attempt: RemoteAttachAttempt,
     ) {
         if let Some(record) = self.enrolled_remotes.lock().unwrap().get_mut(executor_id) {
             record.link = link;
-            record.last_attempt = Some(RemoteAttachAttempt {
-                attempted_at_unix_ms,
-                reason: reason.into(),
-            });
+            record.last_attempt = Some(attempt);
+        }
+    }
+
+    pub fn record_remote_connection_transition(
+        &self,
+        executor_id: &str,
+        transition: RemoteConnectionTransition,
+    ) {
+        if let Some(record) = self.enrolled_remotes.lock().unwrap().get_mut(executor_id) {
+            record.connection_timeline.push_back(transition);
+            while record.connection_timeline.len() > REMOTE_CONNECTION_TIMELINE_LIMIT {
+                record.connection_timeline.pop_front();
+            }
         }
     }
 
@@ -2407,6 +2441,7 @@ impl Fleet {
                 link: record.link,
                 last_attempt: record.last_attempt.clone(),
                 last_seen_unix_ms: record.last_seen_unix_ms,
+                connection_timeline: record.connection_timeline.iter().rev().cloned().collect(),
             })
             .collect();
         values.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2512,6 +2547,21 @@ impl Fleet {
             .get(executor_id)
             .filter(|entry| entry.generation == generation)
             .map(|entry| entry.pump_tick.clone())
+    }
+
+    /// Runner-observed silence for one exact managed connection generation.
+    pub fn managed_link_silence_ms(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+    ) -> Option<u64> {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| now_unix_ms.saturating_sub(entry.last_progress_unix_ms))
     }
 
     /// Whether the colocated link has gone silent long enough that continuing to
@@ -3621,7 +3671,7 @@ impl Fleet {
         let connections = self.connections.lock().unwrap();
         connections
             .values()
-            .filter(|connection| candidate_rejection(connection, scope).is_none())
+            .filter(|connection| candidate_rejection(connection, scope, now_unix_ms).is_none())
             .map(|connection| {
                 occupancy::MachineOccupancy::read(
                     &connection.snapshot.executing_requests,
@@ -3779,6 +3829,7 @@ impl Fleet {
     pub fn inspect_executors(&self, captured_at_unix_ms: u64) -> Vec<ExecutorInspection> {
         let connections = self.connections.lock().unwrap();
         let expected_build_ids = self.expected_executor_build_ids.lock().unwrap();
+        let enrolled_remotes = self.enrolled_remotes.lock().unwrap();
         let mut values: Vec<_> = connections
             .values()
             .map(|entry| ExecutorInspection {
@@ -3789,10 +3840,52 @@ impl Fleet {
                 executor_build_id: entry.executor_build_id.clone(),
                 occupancy: entry.snapshot.clone(),
                 captured_at_unix_ms,
+                connection_timeline: enrolled_remotes
+                    .get(&entry.identity.executor_id)
+                    .map(|record| record.connection_timeline.iter().rev().cloned().collect())
+                    .unwrap_or_default(),
             })
             .collect();
         values.sort_by(|a, b| a.name.cmp(&b.name));
         values
+    }
+
+    /// The coarse frame a live surface subscribes to instead of polling
+    /// `cairn://executors`.
+    ///
+    /// Built from [`Self::inspect_executors`] rather than from its own pass over
+    /// the connection table, so the pushed frame and the read resource are two
+    /// renderings of one projection and cannot come to disagree.
+    pub fn telemetry_frame(&self, captured_at_unix_ms: u64) -> telemetry::FleetTelemetryFrame {
+        telemetry::FleetTelemetryFrame::from_inspections(
+            &self.inspect_executors(captured_at_unix_ms),
+            captured_at_unix_ms,
+        )
+    }
+
+    /// [`Self::telemetry_frame`] stamped with the current instant.
+    pub fn telemetry_frame_now(&self) -> telemetry::FleetTelemetryFrame {
+        self.telemetry_frame(unix_time_ms())
+    }
+
+    /// Admit one fleet-state change and learn when its frame may go out.
+    ///
+    /// The clock stays inside the fleet rather than being passed in, so no
+    /// caller can rate-limit against a different notion of now than the frame
+    /// it ends up sending was stamped with.
+    pub fn admit_telemetry(&self) -> telemetry::TelemetryEmit {
+        self.telemetry_cadence.admit(unix_time_ms())
+    }
+
+    /// The deferred trailing frame a [`telemetry::TelemetryEmit::After`] asked
+    /// for, with the cadence reopened before the fleet is read.
+    ///
+    /// Producing the frame and reopening the cadence are one operation because
+    /// their order is load-bearing; see [`telemetry::TelemetryCadence::capture_trailing`].
+    pub fn trailing_telemetry_frame(&self) -> telemetry::FleetTelemetryFrame {
+        let now = unix_time_ms();
+        self.telemetry_cadence
+            .capture_trailing(now, || self.telemetry_frame(now))
     }
 
     /// Keep one placement decision, evicting the oldest past the bound.
@@ -4434,6 +4527,21 @@ impl Fleet {
                 }
             }
         };
+        let dispatch_error = {
+            let connections = self.connections.lock().unwrap();
+            selected_link_dispatch_error(&connections, &selected, unix_time_ms())
+        };
+        if let Some(diagnostic) = dispatch_error {
+            if let (Some(request), Some(object_plane)) = (&object_request, &object_plane) {
+                object_plane.revoke_request(
+                    &request.request_id,
+                    &request.attempt_id,
+                    &selected.executor_id,
+                    selected.generation,
+                );
+            }
+            return residency_core_failure(ResidencyFailureKind::Admission, diagnostic, None);
+        }
         if let Some(route) = pending_acquire_route.as_ref() {
             if let Err(error) = self.reserve_pending_residency_route(route.clone()) {
                 return residency_core_failure(
@@ -6028,7 +6136,7 @@ impl Fleet {
             diagnostic,
         };
         // Stage one: which machines could structurally take this at all.
-        let survey = survey_candidates(&connections, request).map_err(refuse)?;
+        let survey = survey_candidates(&connections, request, now).map_err(refuse)?;
         // Stage two: what it would cost on each of them. Resource profiles are
         // executor-context keyed, so this is a per-candidate question -- and it
         // is asked only of candidates, so a request waiting for an executor to
@@ -6296,7 +6404,21 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         request_id: residency_queue_entry_id(&acquisition.holder),
         attempt_id: RESIDENCY_ACQUIRE_ATTEMPT_ID.into(),
         project_id: acquisition.repository.project_id().to_string(),
-        repository: acquisition.repository.clone(),
+        repository: if matches!(acquisition.holder, ResidencyHolder::DevInstance { .. }) {
+            acquisition.repository.clone()
+        } else {
+            match &acquisition.repository {
+                RepositoryLocator::ColocatedPath { .. } => {
+                    let identity = acquisition.repository.identity();
+                    RepositoryLocator::ManagedObjects {
+                        project_id: identity.project_id,
+                        repository_id: identity.repository_id,
+                        object_format: identity.object_format,
+                    }
+                }
+                repository => repository.clone(),
+            }
+        },
         base_commit: acquisition.initial_base_commit.clone(),
         command: acquisition.holder.storage_key(),
         command_class: cairn_common::executor_protocol::CellCommandClass::Other,
@@ -6331,9 +6453,14 @@ fn residency_placement_request(acquisition: &ResidencyAcquireRequest) -> CellReq
         // browser, its localhost. It has to run where they are.
         pinned_executor_id: matches!(acquisition.holder, ResidencyHolder::DevInstance { .. })
             .then(|| COLOCATED_EXECUTOR_ID.to_string()),
-        // A residency is an environment that outlives any one batch. Where it is
-        // acquired is where it stays, so policy never gets to choose for it.
-        placement_mobility: PlacementMobility::PinnedOrColocated,
+        // A residency stays on the executor that acquires it, but an unpinned
+        // acquisition may choose any compatible live executor. Dev instances are
+        // pinned above because their localhost surface is inherently colocated.
+        placement_mobility: if matches!(acquisition.holder, ResidencyHolder::DevInstance { .. }) {
+            PlacementMobility::PinnedOrColocated
+        } else {
+            PlacementMobility::SpillEligible
+        },
         verdict_platforms: Vec::new(),
         command_resource_identity: None,
         resource_reservation: acquisition.footprint.reservation(),
@@ -6596,7 +6723,7 @@ fn choose_executor_with_policy(
     estimate: impl Fn(&CellRequest, &ExecutorConnectionState) -> SyncCost,
     now_unix_ms: u64,
 ) -> Result<PlacementDraft, String> {
-    let survey = survey_candidates(connections, request)?;
+    let survey = survey_candidates(connections, request, now_unix_ms)?;
     let (predictions, sync_costs) =
         prior_predictions(&survey.usable, request, &estimate, now_unix_ms);
     rank_survey(
@@ -6677,6 +6804,41 @@ impl<'a> PlacementScope<'a> {
     }
 }
 
+fn selected_link_dispatch_error(
+    connections: &HashMap<String, ExecutorConnectionState>,
+    selected: &SelectedExecutor,
+    now_unix_ms: u64,
+) -> Option<String> {
+    let Some(current) = connections.get(&selected.executor_id) else {
+        return Some(format!(
+            "selected executor {} disconnected before residency dispatch (selected connection generation {})",
+            selected.executor_id, selected.generation
+        ));
+    };
+    if current.generation != selected.generation {
+        return Some(format!(
+            "selected executor {} reconnected before residency dispatch (selected connection generation {}, current generation {}); the old generation is fenced",
+            selected.executor_id, selected.generation, current.generation
+        ));
+    }
+    if current.sender.is_closed() {
+        return Some(format!(
+            "selected executor {} closed connection generation {} before residency dispatch",
+            selected.executor_id, selected.generation
+        ));
+    }
+    let silence_ms = now_unix_ms.saturating_sub(current.last_progress_unix_ms);
+    (silence_ms > EXECUTOR_PROGRESS_FRESHNESS_MS).then(|| {
+        format!(
+            "selected executor {} connection generation {} became stale before residency dispatch: no progress for {}ms (liveness bound {}ms)",
+            selected.executor_id,
+            selected.generation,
+            silence_ms,
+            EXECUTOR_PROGRESS_FRESHNESS_MS
+        )
+    })
+}
+
 /// Why one machine cannot structurally take this work, or `None` if it could.
 ///
 /// The filters that are facts rather than judgement: a closed link, a pin that
@@ -6697,9 +6859,17 @@ impl<'a> PlacementScope<'a> {
 fn candidate_rejection(
     entry: &ExecutorConnectionState,
     scope: PlacementScope<'_>,
+    now_unix_ms: u64,
 ) -> Option<PlacementRejectionReason> {
     if entry.sender.is_closed() {
         Some(PlacementRejectionReason::ConnectionClosed)
+    } else if now_unix_ms.saturating_sub(entry.last_progress_unix_ms)
+        > EXECUTOR_PROGRESS_FRESHNESS_MS
+    {
+        Some(PlacementRejectionReason::ConnectionStale {
+            silence_ms: now_unix_ms.saturating_sub(entry.last_progress_unix_ms),
+            stale_after_ms: EXECUTOR_PROGRESS_FRESHNESS_MS,
+        })
     } else if scope
         .pinned_executor_id
         .is_some_and(|id| id != entry.identity.executor_id)
@@ -6756,6 +6926,7 @@ fn candidate_rejection(
 fn survey_candidates<'a>(
     connections: &'a HashMap<String, ExecutorConnectionState>,
     request: &CellRequest,
+    now_unix_ms: u64,
 ) -> Result<CandidateSurvey<'a>, String> {
     let scope = PlacementScope::of(request);
     let targeted = scope.targeted();
@@ -6768,7 +6939,7 @@ fn survey_candidates<'a>(
     let mut usable = Vec::new();
     let mut rejected = Vec::new();
     for entry in ordered {
-        match candidate_rejection(entry, scope) {
+        match candidate_rejection(entry, scope, now_unix_ms) {
             Some(reason) => rejected.push(PlacementRejection {
                 prediction: None,
                 executor_name: executor_public_name(entry),
@@ -7327,11 +7498,11 @@ fn rank_candidates<'a, 'b>(
         let exploration_age_decided = scored
             .iter()
             .filter(bootstrap_eligible)
-            .any(|candidate| last_explored(&&exploration) != last_explored(&candidate));
+            .any(|candidate| last_explored(&exploration) != last_explored(&candidate));
         let tied_forecasts = scored
             .iter()
             .filter(bootstrap_eligible)
-            .filter(|candidate| forecast_order(&&exploration, candidate).is_eq())
+            .filter(|candidate| forecast_order(&exploration, candidate).is_eq())
             .count();
         let deciding_reason =
             exploration_age_decided
@@ -7339,7 +7510,7 @@ fn rank_candidates<'a, 'b>(
                 .or_else(|| {
                     (tied_forecasts > 1).then(|| {
                         if scored.iter().filter(bootstrap_eligible).any(|candidate| {
-                            recent_selection_order(&&exploration, &candidate).is_ne()
+                            recent_selection_order(&exploration, &candidate).is_ne()
                         }) {
                             "least recently selected among equal bootstrap candidates"
                         } else {
@@ -7409,21 +7580,21 @@ fn rank_candidates<'a, 'b>(
             .iter()
             .copied()
             .filter(|candidate| {
-                hard_order(&&winner, candidate).is_eq()
-                    && forecast_order(&&winner, candidate).is_eq()
+                hard_order(&winner, candidate).is_eq()
+                    && forecast_order(&winner, candidate).is_eq()
                     && same_hard_group(candidate)
-                    && preference(&&winner) == preference(candidate)
-                    && priority(&&winner) == priority(candidate)
+                    && preference(&winner) == preference(candidate)
+                    && priority(&winner) == priority(candidate)
             })
             .map(|candidate| executor_public_name(candidate.entry))
             .collect::<Vec<_>>();
         let recent_selection_decided = ranked.iter().copied().any(|candidate| {
-            hard_order(&&winner, &candidate).is_eq()
-                && forecast_order(&&winner, &candidate).is_eq()
+            hard_order(&winner, &candidate).is_eq()
+                && forecast_order(&winner, &candidate).is_eq()
                 && same_hard_group(&candidate)
-                && preference(&&winner) == preference(&candidate)
-                && priority(&&winner) == priority(&candidate)
-                && recent_selection_order(&&winner, &candidate).is_ne()
+                && preference(&winner) == preference(&candidate)
+                && priority(&winner) == priority(&candidate)
+                && recent_selection_order(&winner, &candidate).is_ne()
         });
         (tied.len() > 1).then(|| PlacementTieBreak {
             candidates: tied,
@@ -11165,7 +11336,7 @@ mod tests {
                 generation: 1,
                 sender,
                 snapshot: FleetSnapshot::default(),
-                last_progress_unix_ms: 1,
+                last_progress_unix_ms: NOW,
                 health: ExecutorSubstrateReport {
                     applied_policy: cairn_common::executor_protocol::ExecutorRuntimePolicy {
                         maximum_queue_depth: 64,
@@ -11660,8 +11831,10 @@ mod tests {
         ];
         let request = spillable_request();
         let policy = ActivePlacementPolicy::default_profile();
-        let mut history = ExplorationState::default();
-        history.decisions_since_exploration = 0;
+        let mut history = ExplorationState {
+            decisions_since_exploration: 0,
+            ..Default::default()
+        };
 
         let (winner, _, _, _, tie_break) =
             rank_candidates(&scored, false, true, &request, &policy, &history);
@@ -12106,6 +12279,97 @@ mod tests {
                 pinned_executor_id: COLOCATED_EXECUTOR_ID.into()
             }
         );
+    }
+
+    #[test]
+    fn unpinned_job_residency_uses_transferable_placement_identity() {
+        let acquisition = fleet_residency_request(ResidencyHolder::Job {
+            job_id: "job".into(),
+        });
+        let placement = residency_placement_request(&acquisition);
+        assert!(matches!(
+            placement.repository,
+            RepositoryLocator::ManagedObjects { .. }
+        ));
+        assert_eq!(
+            placement.placement_mobility,
+            PlacementMobility::SpillEligible
+        );
+        assert!(matches!(
+            acquisition.repository,
+            RepositoryLocator::ColocatedPath { .. }
+        ));
+    }
+
+    #[test]
+    fn dev_instance_residency_remains_colocated_and_nontransferable() {
+        let placement = residency_placement_request(&dev_instance_request("dev"));
+        assert!(matches!(
+            placement.repository,
+            RepositoryLocator::ColocatedPath { .. }
+        ));
+        assert_eq!(
+            placement.pinned_executor_id.as_deref(),
+            Some(COLOCATED_EXECUTOR_ID)
+        );
+        assert_eq!(
+            placement.placement_mobility,
+            PlacementMobility::PinnedOrColocated
+        );
+    }
+
+    #[test]
+    fn residency_dispatch_fences_the_selected_connection_generation() {
+        let (id, entry) = fleet_entry("fedora", "linux", 0, &[]);
+        let selected = SelectedExecutor {
+            executor_id: id.clone(),
+            device_id: entry.identity.device_id.clone(),
+            generation: entry.generation,
+            sender: entry.sender.clone(),
+            colocated: false,
+            capabilities: entry.advertisement.capabilities.clone(),
+        };
+        let mut reconnected = entry;
+        reconnected.generation += 1;
+        let error =
+            selected_link_dispatch_error(&HashMap::from([(id, reconnected)]), &selected, NOW)
+                .unwrap();
+        assert!(error.contains("old generation is fenced"), "{error}");
+    }
+
+    #[test]
+    fn stale_colocated_link_is_rejected_before_blind_ranking_and_healthy_remote_wins() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        local.last_progress_unix_ms = NOW - EXECUTOR_PROGRESS_FRESHNESS_MS - 1;
+        let (remote_id, mut remote) = fleet_entry("fedora", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.87,
+            8 * 1024 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+
+        let draft = place(&connections, &spillable_request()).unwrap();
+        assert_eq!(chosen(&draft).executor_id, "fedora");
+        assert!(matches!(
+            rejection_for(&draft, COLOCATED_EXECUTOR_ID),
+            PlacementRejectionReason::ConnectionStale { .. }
+        ));
+    }
+
+    #[test]
+    fn pinned_stale_executor_reports_link_unavailability_instead_of_rehoming() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        local.last_progress_unix_ms = NOW - EXECUTOR_PROGRESS_FRESHNESS_MS - 1;
+        let (remote_id, remote) = fleet_entry("fedora", "linux", 0, &[]);
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let mut request = spillable_request();
+        request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+
+        let error = place(&connections, &request).unwrap_err();
+        assert!(error.contains("local"), "{error}");
+        assert!(error.contains("published no progress"), "{error}");
     }
 
     /// A machine whose load cannot be seen is not a machine to ship a tree to.
@@ -12746,8 +13010,7 @@ mod tests {
         fleet.record_remote_attach_attempt(
             "bglab-ub",
             RemoteLinkState::Unreachable,
-            "no route to host",
-            4_000,
+            RemoteAttachAttempt::bootstrap_failure(4_000, "no route to host"),
         );
         let unreachable = fleet.unattached_enrolled_remotes();
         assert_eq!(unreachable[0].link, RemoteLinkState::Unreachable);
@@ -12755,14 +13018,65 @@ mod tests {
         fleet.record_remote_attach_attempt(
             "bglab-ub",
             RemoteLinkState::AttachFailed,
-            "executor protocol v28 has no published artifact",
-            5_000,
+            RemoteAttachAttempt::bootstrap_failure(
+                5_000,
+                "executor protocol v28 has no published artifact",
+            ),
         );
         let failed = fleet.unattached_enrolled_remotes();
         let attempt = failed[0].last_attempt.as_ref().unwrap();
         assert_eq!(failed[0].link, RemoteLinkState::AttachFailed);
         assert_eq!(attempt.attempted_at_unix_ms, 5_000);
-        assert!(attempt.reason.contains("no published artifact"));
+        assert!(attempt.summary.contains("no published artifact"));
+    }
+
+    #[test]
+    fn removing_a_remote_generation_leaves_the_colocated_generation_stable() {
+        let fleet = Fleet::default();
+        let (remote_id, remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        let (local_id, local) = fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]);
+        fleet.connections.lock().unwrap().insert(remote_id, remote);
+        fleet.connections.lock().unwrap().insert(local_id, local);
+
+        assert_eq!(
+            fleet.managed_link_silence_ms("bglab-ub", 1, NOW + 10),
+            Some(10)
+        );
+        assert!(fleet.disconnect_advertised_executor("bglab-ub", 1));
+        assert_eq!(fleet.managed_link_silence_ms("bglab-ub", 1, NOW + 10), None);
+        assert_eq!(fleet.executor_generation(), Some(1));
+    }
+
+    #[test]
+    fn remote_connection_history_is_bounded_and_newest_first() {
+        let fleet = Fleet::default();
+        fleet.declare_enrolled_remote("bglab-ub", "bglab-ub", "linux", "x86_64");
+
+        for generation in 1..=REMOTE_CONNECTION_TIMELINE_LIMIT as u64 + 3 {
+            fleet.record_remote_connection_transition(
+                "bglab-ub",
+                RemoteConnectionTransition {
+                    occurred_at_unix_ms: generation,
+                    phase: RemoteConnectionPhase::ProtocolReady,
+                    generation: Some(generation),
+                    reason: None,
+                    ssh_exit_status: None,
+                    remote_process_exit_status: None,
+                    last_stderr: None,
+                },
+            );
+        }
+
+        let remote = &fleet.unattached_enrolled_remotes()[0];
+        assert_eq!(
+            remote.connection_timeline.len(),
+            REMOTE_CONNECTION_TIMELINE_LIMIT
+        );
+        assert_eq!(remote.connection_timeline[0].generation, Some(35));
+        assert_eq!(
+            remote.connection_timeline.last().unwrap().generation,
+            Some(4)
+        );
     }
 
     /// An attached machine is described in full by the executor projections, so
@@ -12787,8 +13101,7 @@ mod tests {
         fleet.record_remote_attach_attempt(
             "bglab-ub",
             RemoteLinkState::Unreachable,
-            "no route to host",
-            4_000,
+            RemoteAttachAttempt::bootstrap_failure(4_000, "no route to host"),
         );
 
         fleet.forget_enrolled_remote("bglab-ub");
@@ -12798,8 +13111,7 @@ mod tests {
         fleet.record_remote_attach_attempt(
             "bglab-ub",
             RemoteLinkState::AttachFailed,
-            "stale supervisor",
-            6_000,
+            RemoteAttachAttempt::bootstrap_failure(6_000, "stale supervisor"),
         );
         assert!(fleet.unattached_enrolled_remotes().is_empty());
     }
@@ -15574,12 +15886,89 @@ mod tests {
     #[test]
     fn darwin_arm64_reports_macos_identity_and_the_apple_silicon_target() {
         assert_eq!(RemotePlatform::DarwinArm64.os(), "macos");
-        assert_eq!(RemotePlatform::DarwinArm64.arch(), "arm64");
+        assert_eq!(RemotePlatform::DarwinArm64.arch(), "aarch64");
         assert_eq!(RemotePlatform::DarwinArm64.target(), "aarch64-apple-darwin");
         // `arch()` was a constant "x86_64" before Darwin existed; the other two
         // platforms must be unaffected by its promotion to a match.
         assert_eq!(RemotePlatform::LinuxX86_64.arch(), "x86_64");
         assert_eq!(RemotePlatform::WindowsX86_64.arch(), "x86_64");
+    }
+
+    #[test]
+    fn linux_arm64_reports_linux_identity_and_the_gnu_arm_target() {
+        assert_eq!(RemotePlatform::LinuxArm64.os(), "linux");
+        assert_eq!(RemotePlatform::LinuxArm64.arch(), "aarch64");
+        assert_eq!(
+            RemotePlatform::LinuxArm64.target(),
+            "aarch64-unknown-linux-gnu"
+        );
+    }
+
+    /// Every enrolled machine is described twice: by this enum before it
+    /// attaches, and by its own advertisement after. `std::env::consts::ARCH` is
+    /// what the executor advertises, so a variant whose `arch()` disagreed with
+    /// it would make one machine appear to change architecture on attach.
+    #[test]
+    fn arch_agrees_with_what_an_attached_executor_advertises() {
+        for platform in [
+            RemotePlatform::LinuxX86_64,
+            RemotePlatform::LinuxArm64,
+            RemotePlatform::WindowsX86_64,
+            RemotePlatform::DarwinArm64,
+        ] {
+            // Rust spells these the same way on every host it supports, so the
+            // triple each variant names carries the arch it must report.
+            assert!(
+                platform.target().starts_with(platform.arch()),
+                "{platform:?} reports arch {} but targets {}",
+                platform.arch(),
+                platform.target()
+            );
+        }
+
+        // And concretely, against the machine running this test: whichever
+        // variant describes this host must report what this host reports.
+        let host = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            Some(RemotePlatform::DarwinArm64)
+        } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            Some(RemotePlatform::LinuxX86_64)
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            Some(RemotePlatform::LinuxArm64)
+        } else if cfg!(all(target_os = "windows", target_arch = "x86_64")) {
+            Some(RemotePlatform::WindowsX86_64)
+        } else {
+            None
+        };
+        if let Some(host) = host {
+            assert_eq!(std::env::consts::ARCH, host.arch());
+            assert_eq!(std::env::consts::OS, host.os());
+        }
+    }
+
+    #[test]
+    fn linux_arm64_paths_validate_by_the_posix_absolute_rule() {
+        let config = RemoteExecutorConfig {
+            platform: RemotePlatform::LinuxArm64,
+            binary_path: "/home/dev/.local/bin/cairn-executor".into(),
+            cairn_home: "/home/dev/.cairn-executor".into(),
+            ..darwin_remote_config()
+        };
+        config.validate().unwrap();
+
+        let windows_shaped = RemoteExecutorConfig {
+            binary_path: r"C:\cairn\cairn-executor".into(),
+            ..config.clone()
+        };
+        assert!(windows_shaped.validate().is_err());
+
+        // The wire spelling settings files carry, and the one
+        // `packages/ui/src/api/fleet.ts` mirrors.
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["platform"], serde_json::json!("linux-arm64"));
+        assert_eq!(
+            serde_json::from_value::<RemoteExecutorConfig>(encoded).unwrap(),
+            config
+        );
     }
 
     #[test]

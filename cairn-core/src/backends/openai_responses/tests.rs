@@ -9,13 +9,14 @@ use super::conversation::{
     normalize_call_pairs, transcript_event_to_items, trim_conversation_to_budget, user_item,
 };
 use super::generation::into_generation;
-use super::http::{apply_output_schema, build_body, require_terminal_event, tool_schemas};
+use super::http::{apply_output_schema, build_body, tool_schemas, TERMINAL_EVENTS};
 use super::wire::{
     ContentPart, ResponseEnvelope, ResponseStreamEvent, ResponsesItem, ResponsesResponse,
     ResponsesTurn, StreamingResponse,
 };
 use crate::agent_process::stdin::{MessageContent, MessageImage};
 use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
+use crate::backends::http_loop::require_terminal_event;
 use crate::backends::{SessionConfig, SessionStart};
 use serde_json::json;
 
@@ -618,17 +619,18 @@ fn a_stream_cut_off_before_a_terminal_event_is_not_a_complete_response() {
 
 #[test]
 fn a_truncated_stream_is_refused_rather_than_stored_as_a_result() {
-    let error = require_terminal_event(PROVIDER, false, false)
+    let error = require_terminal_event(PROVIDER, TERMINAL_EVENTS, false, false)
         .expect_err("a stream that never finished is not a generation");
+    // The failure has to name the signals this family was waiting for.
     assert!(
-        error.contains("ended before the response reported an outcome"),
+        error.contains("response.completed") && error.contains("response.incomplete"),
         "{error}"
     );
     assert!(error.contains("not being recorded as a result"), "{error}");
 
-    assert!(require_terminal_event(PROVIDER, true, false).is_ok());
+    assert!(require_terminal_event(PROVIDER, TERMINAL_EVENTS, true, false).is_ok());
     // A cancelled turn is the one legitimate early ending.
-    assert!(require_terminal_event(PROVIDER, false, true).is_ok());
+    assert!(require_terminal_event(PROVIDER, TERMINAL_EVENTS, false, true).is_ok());
 }
 
 #[test]
@@ -645,5 +647,5 @@ fn a_side_effecting_call_from_a_truncated_stream_never_reaches_dispatch() {
     assert!(serde_json::from_str::<serde_json::Value>(&generation.tool_calls[0].arguments).is_ok());
 
     assert!(!saw_terminal);
-    assert!(require_terminal_event(PROVIDER, saw_terminal, false).is_err());
+    assert!(require_terminal_event(PROVIDER, TERMINAL_EVENTS, saw_terminal, false).is_err());
 }

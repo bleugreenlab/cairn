@@ -984,7 +984,10 @@ fn format_resolution_receipt(receipt: &cairn_db::models::ResolutionReceipt) -> S
     if let Some(actor) = receipt.actor.as_deref() {
         origin.push_str(&format!(" by {actor}"));
     }
-    format!("Resolved {origin} at {}", receipt.resolved_at)
+    format!(
+        "Resolved {origin} {}",
+        crate::clock::age(receipt.resolved_at)
+    )
 }
 
 async fn load_node_permissions(

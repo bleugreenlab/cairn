@@ -327,6 +327,13 @@ fn append_reasoning_field(slot: &mut Option<String>, value: &Value) {
 }
 
 impl StreamingAggregate {
+    /// The terminal `finish_reason` this generation reported, if it reported
+    /// one. Its absence once the connection has closed is what distinguishes a
+    /// stream that finished from one that was cut off mid-generation.
+    pub(crate) fn finish_reason(&self) -> Option<&str> {
+        self.finish_reason.as_deref()
+    }
+
     pub(crate) fn apply_chunk(&mut self, chunk: &ChatStreamChunk) {
         if self.id.is_none() {
             self.id = chunk.id.clone();

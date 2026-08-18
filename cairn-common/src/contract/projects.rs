@@ -40,6 +40,20 @@ pub(crate) const PROJECT_IMAGES_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const PROJECT_CODEMAP_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectCodemap,
+    uri_template: "cairn://p/{project}/codemap",
+    name: "Project code map",
+    description: "The base-branch tree's source inventory, import graph, and per-file churn over the last 60 days of merged work. Cached per base commit and recomputed in the background when the base advances, so a read never walks the tree. The default rendering summarizes; format=json returns the full payload the map surface lays out",
+    read_projections: &[ProjectionSpec {
+        key: "format",
+        values: "json for the full {base_commit_sha, computed_at, files[], imports[]} payload",
+    }],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PROJECT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Project,
     uri_template: "cairn://p/{project}",
