@@ -403,6 +403,12 @@ async fn run_scheduler_loop(orch: Orchestrator) {
         // timezone changes and DST transitions.
         let timezone = get_timezone();
         let recipes = load_scheduled_recipes(&orch).await;
+        let wake_schedules = crate::orchestrator::wakes::load_active_wake_schedules(&orch.db.local)
+            .await
+            .unwrap_or_else(|error| {
+                log::error!("Failed to load wake schedules: {error}");
+                Vec::new()
+            });
         let now = Utc::now();
 
         // Compute every recipe's next fire time up front and keep the WHOLE
@@ -416,7 +422,22 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             }
         }
 
-        let soonest = next_fires.iter().map(|(_, fire)| *fire).min();
+        let next_wake_due = wake_schedules
+            .iter()
+            .filter_map(|schedule| {
+                if schedule.due_at(now.timestamp()).is_some() {
+                    Some(now.timestamp())
+                } else {
+                    schedule.next_due_at(now.timestamp())
+                }
+            })
+            .filter_map(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
+            .min();
+        let soonest = next_fires
+            .iter()
+            .map(|(_, fire)| *fire)
+            .chain(next_wake_due)
+            .min();
         let sleep_dur = match soonest {
             Some(fire) => (fire - now)
                 .to_std()
@@ -439,6 +460,18 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             );
             if let Err(error) = fire_scheduled_recipe(&orch, recipe).await {
                 log::error!("Failed to fire scheduled recipe '{}': {}", recipe.id, error);
+                fire_error = true;
+            }
+        }
+        for schedule in wake_schedules {
+            if schedule.due_at(wake.timestamp()).is_none() {
+                continue;
+            }
+            if let Err(error) =
+                crate::orchestrator::wakes::fire_wake_schedule(&orch, &schedule, wake.timestamp())
+                    .await
+            {
+                log::error!("Failed to fire wake schedule '{}': {}", schedule.id, error);
                 fire_error = true;
             }
         }

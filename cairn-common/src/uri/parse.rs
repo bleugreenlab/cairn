@@ -338,6 +338,9 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "codemap"] => Some(CairnResource::ProjectCodemap {
             project: canonical_project(project),
         }),
+        [PROJECT_SCOPE, project, "map"] => Some(CairnResource::ProjectMap {
+            project: canonical_project(project),
+        }),
         [PROJECT_SCOPE, project, "issues"] => Some(CairnResource::ProjectIssues {
             project: canonical_project(project),
         }),

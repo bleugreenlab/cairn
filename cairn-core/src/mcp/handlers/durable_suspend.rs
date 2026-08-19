@@ -20,7 +20,7 @@ use super::run::TerminalWaitEvent;
 use crate::execution::jobs::{continue_job_impl, ResumeContext};
 use crate::models::{TurnState, TurnYieldReason};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{DbError, LocalDb, RowExt};
+use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
 use std::{sync::Arc, time::Duration};
 
@@ -87,24 +87,43 @@ pub(crate) enum Condition {
 /// durable suspension on the same tool call. No result or successor is created:
 /// the new owner is solely responsible for both. The pending-state CAS makes the
 /// transfer idempotent and refuses to steal from a resolver already in flight.
-pub(crate) async fn relinquish_to_inner_wait(db: &LocalDb, r: &Record) -> Result<bool, String> {
-    let id = r.id.clone();
+#[derive(Debug, PartialEq)]
+pub(crate) enum RelinquishOutcome {
+    Absent,
+    Transferred,
+    AlreadyClaimed,
+}
+
+pub(crate) async fn relinquish_to_inner_wait(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+    tool_use_id: &str,
+) -> DbResult<RelinquishOutcome> {
     let now = chrono::Utc::now().timestamp_millis();
     let resolution = serde_json::json!({"outcome":"transferred_to_inner_wait"}).to_string();
-    db.write(|c| {
-        let (id, resolution) = (id.clone(), resolution.clone());
-        Box::pin(async move {
-            let changed = c
-                .execute(
-                    "UPDATE agent_waits SET state='resolved',resolution_json=?2,resolved_at=?3 WHERE id=?1 AND state='pending' AND successor_turn_id IS NULL AND result_stored_at IS NULL",
-                    params![id, resolution, now],
-                )
-                .await?;
-            Ok(changed > 0)
-        })
-    })
-    .await
-    .map_err(|error| error.to_string())
+    let changed = conn
+        .execute(
+            "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
+             WHERE run_id=?1 AND tool_use_id=?2 AND state='pending' \
+             AND successor_turn_id IS NULL AND result_stored_at IS NULL",
+            params![run_id, tool_use_id, resolution, now],
+        )
+        .await?;
+    if changed > 0 {
+        return Ok(RelinquishOutcome::Transferred);
+    }
+
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM agent_waits WHERE run_id=?1 AND tool_use_id=?2 LIMIT 1",
+            params![run_id, tool_use_id],
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        Ok(RelinquishOutcome::AlreadyClaimed)
+    } else {
+        Ok(RelinquishOutcome::Absent)
+    }
 }
 
 impl Condition {
@@ -1551,30 +1570,134 @@ mod tests {
         assert_eq!(active_wait_count_for_call(&orch.db.local, &record).await, 0);
     }
 
+    #[derive(Debug, PartialEq)]
+    struct OwnershipSnapshot {
+        state: String,
+        resolution: Option<String>,
+        resolved_at: Option<i64>,
+        successor_turn_id: Option<String>,
+        result_stored_at: Option<i64>,
+    }
+
+    async fn ownership_snapshot(db: &LocalDb, id: &str) -> OwnershipSnapshot {
+        let id = id.to_string();
+        db.query_one(
+            "SELECT state,resolution_json,resolved_at,successor_turn_id,result_stored_at \
+             FROM agent_waits WHERE id=?1",
+            params![id],
+            |row| {
+                Ok(OwnershipSnapshot {
+                    state: row.text(0)?,
+                    resolution: row.opt_text(1)?,
+                    resolved_at: row.opt_i64(2)?,
+                    successor_turn_id: row.opt_text(3)?,
+                    result_stored_at: row.opt_i64(4)?,
+                })
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn relinquish(db: &LocalDb, record: &Record) -> DbResult<RelinquishOutcome> {
+        let (run_id, tool_use_id) = (record.run_id.clone(), record.tool_use_id.clone());
+        db.write(|conn| {
+            let (run_id, tool_use_id) = (run_id.clone(), tool_use_id.clone());
+            Box::pin(async move { relinquish_to_inner_wait(conn, &run_id, &tool_use_id).await })
+        })
+        .await
+    }
+
     #[tokio::test]
-    async fn outer_first_permission_transaction_retires_the_outer_owner() {
+    async fn relinquish_resolves_one_pending_owner_once_without_result_or_successor() {
         let (orch, record, _) = durable_env().await;
         let record = ownership_test_run_batch_record(record);
         insert(&orch.db.local, &record).await.unwrap();
 
-        let (run_id, tool_use_id) = (record.run_id.clone(), record.tool_use_id.clone());
-        orch.db
-            .local
+        assert_eq!(
+            relinquish(&orch.db.local, &record).await.unwrap(),
+            RelinquishOutcome::Transferred
+        );
+        let transferred = ownership_snapshot(&orch.db.local, &record.id).await;
+        assert_eq!(transferred.state, "resolved");
+        assert_eq!(
+            transferred.resolution.as_deref(),
+            Some(r#"{"outcome":"transferred_to_inner_wait"}"#)
+        );
+        assert!(transferred.resolved_at.is_some());
+        assert!(transferred.successor_turn_id.is_none());
+        assert!(transferred.result_stored_at.is_none());
+
+        assert_eq!(
+            relinquish(&orch.db.local, &record).await.unwrap(),
+            RelinquishOutcome::AlreadyClaimed
+        );
+        assert_eq!(
+            ownership_snapshot(&orch.db.local, &record.id).await,
+            transferred,
+            "an idempotent retry must not rewrite the resolution timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn relinquish_refuses_claimed_or_result_bearing_owners() {
+        for (state, successor, result_stored_at) in [
+            ("resolving", None, None),
+            ("pending", Some("pred-turn"), None),
+            ("pending", None, Some(123_i64)),
+        ] {
+            let (orch, mut record, _) = durable_env().await;
+            record.id = format!(
+                "wait-{state}-{}-{}",
+                successor.is_some(),
+                result_stored_at.is_some()
+            );
+            let record = ownership_test_run_batch_record(record);
+            insert(&orch.db.local, &record).await.unwrap();
+            orch.db
+                .local
+                .execute(
+                    "UPDATE agent_waits SET state=?2,successor_turn_id=?3,result_stored_at=?4 \
+                     WHERE id=?1",
+                    params![record.id.as_str(), state, successor, result_stored_at],
+                )
+                .await
+                .unwrap();
+            let before = ownership_snapshot(&orch.db.local, &record.id).await;
+
+            assert_eq!(
+                relinquish(&orch.db.local, &record).await.unwrap(),
+                RelinquishOutcome::AlreadyClaimed
+            );
+            assert_eq!(ownership_snapshot(&orch.db.local, &record.id).await, before);
+        }
+    }
+
+    #[tokio::test]
+    async fn relinquish_reports_an_absent_outer_owner() {
+        let (orch, record, _) = durable_env().await;
+        assert_eq!(
+            relinquish(&orch.db.local, &record).await.unwrap(),
+            RelinquishOutcome::Absent
+        );
+    }
+
+    #[tokio::test]
+    async fn relinquish_propagates_database_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let db = LocalDb::open(root.path().join("unmigrated.db"))
+            .await
+            .unwrap();
+        let error = db
             .write(|conn| {
-                let (run_id, tool_use_id) = (run_id.clone(), tool_use_id.clone());
                 Box::pin(async move {
-                    super::super::permission::retire_outer_run_batch_waits(
-                        conn,
-                        &run_id,
-                        &tool_use_id,
-                    )
-                    .await
+                    relinquish_to_inner_wait(conn, "missing-run", "missing-tool").await
                 })
             })
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(active_wait_count_for_call(&orch.db.local, &record).await, 0);
+        assert!(error.to_string().contains("agent_waits"), "{error}");
     }
 
     /// A second call parked by the SAME turn: its own row and its own provider

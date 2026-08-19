@@ -1,6 +1,9 @@
 use super::feed::ack_token;
 use super::todos::parse_todo_write_items;
-use super::wakes::{normalize_posts_filter, parse_wake_filter, terminal_slug_from_ref};
+use super::wakes::{
+    normalize_posts_filter, parse_schedule_create, parse_schedule_reference, parse_wake_filter,
+    terminal_slug_from_ref,
+};
 use super::*;
 
 fn item(target: &str, mode: ChangeMode, payload: Option<serde_json::Value>) -> ChangeItem {
@@ -382,6 +385,51 @@ fn return_content_flag_parses_off_the_target_query() {
         "cairn:~/browser?return_content=false"
     ));
     assert!(!wants_return_content("cairn:~/browser?other=true"));
+}
+
+#[test]
+fn parses_schedule_creation_payload() {
+    let it = item(
+        "cairn://p/cairn/1/1/builder/wakes",
+        ChangeMode::Append,
+        None,
+    );
+    let schedule = parse_schedule_create(
+        0,
+        &it,
+        &serde_json::json!({ "every": "6h", "reason": "Review progress" }),
+    )
+    .unwrap();
+    assert_eq!(schedule.every_ms, 21_600_000);
+    assert_eq!(schedule.reason, "Review progress");
+}
+
+#[test]
+fn schedule_lifecycle_is_intercepted_only_for_schedule_kind() {
+    let it = item("cairn://p/cairn/1/1/builder/wakes", ChangeMode::Patch, None);
+    assert_eq!(
+        parse_schedule_reference(
+            0,
+            &it,
+            &serde_json::json!({ "kind": "schedule", "ref": "schedule-id" }),
+            "unmute",
+        )
+        .unwrap()
+        .as_deref(),
+        Some("schedule-id")
+    );
+    assert!(parse_schedule_reference(
+        0,
+        &it,
+        &serde_json::json!({ "kind": "terminal", "ref": "dev" }),
+        "unmute",
+    )
+    .unwrap()
+    .is_none());
+    assert!(
+        parse_schedule_reference(0, &it, &serde_json::json!({ "kind": "schedule" }), "unmute",)
+            .is_err()
+    );
 }
 
 #[test]

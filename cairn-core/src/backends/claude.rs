@@ -3207,8 +3207,7 @@ mod launch_contract_tests {
     use crate::backends::SessionStart;
     use crate::identity::{ClaudeAuth, UserIdentity};
 
-    const MCP_CONFIG: &str =
-        r#"{"mcpServers":{"cairn":{"command":"cairn-cmd","args":["mcp-serve"]}}}"#;
+    const MCP_CONFIG: &str = r#"{"mcpServers":{"cairn":{"command":"cairn-cmd","args":["mcp"]}}}"#;
 
     fn identity(auth: ClaudeAuth) -> UserIdentity {
         UserIdentity {

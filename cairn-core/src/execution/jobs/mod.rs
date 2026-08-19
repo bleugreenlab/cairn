@@ -36,7 +36,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod call_admission;
 mod calls;
 mod child_tasks;
 mod config_loading;
@@ -49,7 +48,6 @@ mod status;
 mod turns;
 mod workflow;
 
-pub(crate) use call_admission::CallAdmission;
 pub(crate) use calls::{on_call_run_finalized, prepare_call_run, start_call_run};
 // The per-call Restart action reaches this via
 // `cairn_core::internal::execution::jobs::restart_call`.
@@ -191,7 +189,7 @@ pub(crate) struct CreateCallRunInput {
 ///
 /// `Clone` because the admission seam clones a queued call onto its VecDeque
 /// while the spawn path still reads the borrowed original after `start_call_run`.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PreparedCallRun {
     pub(crate) job_id: String,
     pub(crate) run_id: String,

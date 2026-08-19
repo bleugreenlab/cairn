@@ -44,7 +44,7 @@ cairn-codec = { path = "../cairn-codec" }
 # Mints and matches the feed acknowledgement token. Agents copy that token out of
 # a rendered page and back into a mutation, so its form is a cost and a
 # transcription-fidelity question, not merely a uniqueness one.
-unigram = { path = "../unigram" }
+unigram = "0.2"
 
 [dev-dependencies]
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }

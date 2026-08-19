@@ -16,10 +16,7 @@ use rmcp::{
     tool, tool_router, RoleServer, ServerHandler,
 };
 use serde::Deserialize;
-use std::{
-    future::Future,
-    sync::{Arc, Mutex},
-};
+use std::{future::Future, sync::Arc};
 
 use cairn_common::protocol::{CallbackRequest, CallbackResponse};
 use cairn_common::read::{ReadBatchEnvelope, RunBatchEnvelope};
@@ -42,10 +39,6 @@ pub(crate) struct CairnCmd {
     pub(crate) run_id: Option<Arc<String>>,
     /// Shared secret (base64-encoded string from env var, sent directly as bearer token)
     mcp_secret: Option<Arc<String>>,
-    /// Stable shorthand root for `cairn:~/...` resolution.
-    pub(crate) home_uri: Option<Arc<String>>,
-    /// Last successful resource read URI (navigation context).
-    pub(crate) base_uri: Arc<Mutex<Option<String>>>,
     tool_router: ToolRouter<Self>,
     /// Available agents for task tool description
     available_agents: Vec<AgentInfo>,
@@ -77,18 +70,13 @@ impl CairnCmd {
         run_id: Option<String>,
         mcp_secret: Option<String>,
         available_agents: Vec<AgentInfo>,
-        home_uri: Option<String>,
+        _home_uri: Option<String>,
     ) -> Self {
-        let home_uri = home_uri.map(Arc::new);
-        let base_uri = Arc::new(Mutex::new(home_uri.as_ref().map(|uri| uri.to_string())));
-
         Self {
             callback_url: Arc::new(callback_url),
             cwd: Arc::new(cwd),
             run_id: run_id.map(Arc::new),
             mcp_secret: mcp_secret.map(Arc::new),
-            home_uri,
-            base_uri,
             tool_router: Self::tool_router(),
             available_agents,
         }
@@ -241,6 +229,41 @@ For lossless automation, consume the `read_batch` envelope metadata and opt-in b
         }
         tracing::info!("read called: {} paths", input.paths.len());
 
+        let outcome = self.read_batch(&input, thread_id, standalone_cli).await;
+
+        // The handler content is the bare envelope JSON — augmentation reminders
+        // ride separately, so this parses cleanly with no trailing-text split.
+        let envelope = match serde_json::from_str::<ReadBatchEnvelope>(&outcome.result) {
+            Ok(envelope) => envelope,
+            Err(_) => {
+                // Transport/parse failure: surface the raw result as text.
+                return Ok(CallToolResult::success(vec![ContentBlock::text(
+                    outcome.result,
+                )]));
+            }
+        };
+        let text = assemble_reminders(envelope.text, &outcome.reminders);
+
+        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
+        blocks.push(ContentBlock::text(text));
+        for image in envelope.images {
+            blocks.push(ContentBlock::image(image.data, image.mime_type));
+        }
+        Ok(CallToolResult::success(blocks))
+    }
+
+    /// Issue one `read_batch` callback for `input`.
+    ///
+    /// The single request builder behind every read: the MCP tool, the `cairn
+    /// read` subcommand, and the shell all reach the backend through here, so
+    /// they cannot resolve targets or frame the call differently from one
+    /// another.
+    async fn read_batch(
+        &self,
+        input: &ReadFileInput,
+        thread_id: Option<String>,
+        standalone_cli: bool,
+    ) -> CallbackOutcome {
         // Resolve each target client-side (home-URI + base-URI shorthand). Web
         // URLs pass through unresolved — the backend classifies and fetches them.
         // A target that fails resolution is forwarded as-is so the backend emits
@@ -270,29 +293,25 @@ For lossless automation, consume the `read_batch` envelope metadata and opt-in b
             tool_use_id: None,
             thread_id,
         };
+        self.call_tauri_full(&request).await
+    }
 
-        let outcome = self.call_tauri_full(&request).await;
-
-        // The handler content is the bare envelope JSON — augmentation reminders
-        // ride separately, so this parses cleanly with no trailing-text split.
-        let envelope = match serde_json::from_str::<ReadBatchEnvelope>(&outcome.result) {
-            Ok(envelope) => envelope,
-            Err(_) => {
-                // Transport/parse failure: surface the raw result as text.
-                return Ok(CallToolResult::success(vec![ContentBlock::text(
-                    self.relativize_cairn_uris_in_text(&outcome.result),
-                )]));
-            }
+    /// Read one target and hand back the envelope itself.
+    ///
+    /// The shell needs both halves of a read: the composed text to print, which
+    /// is byte-identical to what `cairn read` prints, and the structured
+    /// affordances, which are its command set at that location. A tool result
+    /// carries only the first, so the shell takes the envelope directly rather
+    /// than parsing the rendered markdown back apart.
+    pub(crate) async fn read_envelope(&self, target: &str) -> Result<ReadBatchEnvelope, String> {
+        let input = ReadFileInput {
+            paths: vec![target.to_string()],
         };
-        let text = self.relativize_cairn_uris_in_text(&envelope.text);
-        let text = assemble_reminders(text, &outcome.reminders);
-
-        let mut blocks: Vec<ContentBlock> = Vec::with_capacity(1 + envelope.images.len());
-        blocks.push(ContentBlock::text(text));
-        for image in envelope.images {
-            blocks.push(ContentBlock::image(image.data, image.mime_type));
+        let outcome = self.read_batch(&input, None, true).await;
+        match serde_json::from_str::<ReadBatchEnvelope>(&outcome.result) {
+            Ok(envelope) => Ok(envelope),
+            Err(_) => Err(outcome.result),
         }
-        Ok(CallToolResult::success(blocks))
     }
 
     /// Execute an ordered batch of shell commands, inline code, and skill-script
@@ -586,16 +605,11 @@ impl ServerHandler for CairnCmd {
         };
 
         let response = self.call_tauri_full(&callback_request).await;
-        if self.should_update_base_uri_after_read(tool_name, &response) {
-            self.note_successful_resource_read(uri);
-        }
-
         // For terminal resources, parse the structured response
         if tool_name == "read_resource" {
             match serde_json::from_str::<TerminalReadResult>(&response.result) {
                 Ok(terminal_result) => {
-                    let rendered = self.relativize_cairn_uris_in_text(&terminal_result.output);
-                    let rendered = assemble_reminders(rendered, &response.reminders);
+                    let rendered = assemble_reminders(terminal_result.output, &response.reminders);
                     let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
                     return Ok(ReadResourceResult::new(contents).into());
                 }
@@ -609,10 +623,8 @@ impl ServerHandler for CairnCmd {
             }
         }
 
-        // For issue resources (or fallback), return the result directly
-        // The backend returns canonical content; display rendering can relativize URIs.
-        let rendered = self.relativize_cairn_uris_in_text(&response.result);
-        let rendered = assemble_reminders(rendered, &response.reminders);
+        // For issue resources (or fallback), return the backend result directly.
+        let rendered = assemble_reminders(response.result, &response.reminders);
         let contents = vec![ResourceContents::text(cap_text_result(&rendered, 0), uri)];
         Ok(ReadResourceResult::new(contents).into())
     }
@@ -627,7 +639,9 @@ pub(crate) struct TerminalReadResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{create_test_mcp_with_home_uri, get_text};
+    use crate::test_support::{
+        create_test_mcp_with_callback_url, create_test_mcp_with_home_uri, get_text,
+    };
     use rmcp::{
         model::ClientInfo, ClientHandler, ClientLifecycleMode, ClientServiceExt, ServiceExt,
     };
@@ -949,5 +963,55 @@ mod tests {
             .unwrap();
         assert!(result.is_error.unwrap_or(false));
         assert!(get_text(&result).contains("non-empty"));
+    }
+
+    #[tokio::test]
+    async fn read_returns_callback_text_byte_exact() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind callback listener");
+        let address = listener.local_addr().expect("callback address");
+        let canonical = "cairn://p/CAIRN/4297/1/builder";
+        let envelope = serde_json::json!({
+            "text": canonical,
+            "images": [],
+            "segments": []
+        })
+        .to_string();
+        let response_body = serde_json::json!({"result": envelope}).to_string();
+        let callback = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept callback");
+            let mut request = vec![0; 8192];
+            let _ = socket
+                .read(&mut request)
+                .await
+                .expect("read callback request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write callback response");
+        });
+
+        let mcp = create_test_mcp_with_callback_url(&format!("http://{address}"), Some(canonical));
+        let result = mcp
+            .read(
+                Parameters(ReadFileInput {
+                    paths: vec!["cairn:~/arc?format=json".to_string()],
+                }),
+                rmcp::model::RequestMetaObject::default(),
+            )
+            .await
+            .expect("read result");
+
+        assert_eq!(get_text(&result), canonical);
+        assert!(!get_text(&result).contains("cairn:~/"));
+        callback.await.expect("callback task");
     }
 }

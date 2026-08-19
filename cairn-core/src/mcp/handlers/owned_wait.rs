@@ -323,21 +323,7 @@ fn checks_suite(on: &ChecksWaitEvent, suite: Option<&str>) -> Result<Option<Stri
 fn parse_duration(v: &WaitDuration) -> Result<u64, String> {
     let ms = match v {
         WaitDuration::Milliseconds(v) => *v,
-        WaitDuration::Human(v) => {
-            let p = v
-                .find(|c: char| !c.is_ascii_digit())
-                .ok_or("duration needs ms, s, m, h, or d")?;
-            let n: u64 = v[..p].parse().map_err(|_| "invalid duration")?;
-            let f = match &v[p..] {
-                "ms" => 1,
-                "s" => 1000,
-                "m" => 60000,
-                "h" => 3600000,
-                "d" => 86400000,
-                _ => return Err("duration needs ms, s, m, h, or d".into()),
-            };
-            n.checked_mul(f).ok_or("duration too large")?
-        }
+        WaitDuration::Human(v) => crate::duration::parse_duration_ms(v)?,
     };
     if ms == 0 || ms > MAX_MS {
         return Err("duration must be between 1ms and 7d".into());

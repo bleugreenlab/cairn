@@ -7,7 +7,7 @@
 //! `test_support` (shared `#[cfg(test)]` helpers).
 use anyhow::Result;
 use clap::Parser;
-use std::env;
+use std::{env, io::IsTerminal};
 
 use rmcp::ServiceExt;
 
@@ -19,6 +19,7 @@ mod output;
 mod resolve;
 mod schemas;
 mod server;
+mod shell;
 #[cfg(test)]
 mod test_support;
 mod timeouts;
@@ -33,14 +34,18 @@ cairn_common::sidecar_version_stamp!();
 #[derive(Parser)]
 #[command(name = "cairn-cmd", version)]
 struct Args {
-    /// Subcommand. When omitted (or `mcp`), runs the stdio MCP server.
+    /// Subcommand. When omitted, opens the interactive Cairn shell.
     #[command(subcommand)]
     command: Option<Command>,
 
     /// JSON-encoded list of available agents [{name, description}, ...]
-    #[arg(long)]
+    #[arg(long, global = true)]
     agents: Option<String>,
 }
+
+const BARE_NON_TTY_ERROR: &str = "cairn: the MCP server has moved to `cairn mcp`.\n\
+Update your MCP client's command to add the `mcp` argument, or re-run Cairn's\n\
+external MCP setup to rewrite the registration.";
 
 #[cfg(test)]
 mod cli_parse_tests {
@@ -88,6 +93,27 @@ mod cli_parse_tests {
         assert_eq!(suites, ["rust-tests", "lint"]);
         assert_eq!(branch.as_deref(), Some("main"));
         assert!(!retry);
+    }
+
+    #[test]
+    fn mcp_accepts_global_agents_after_the_subcommand() {
+        let args = Args::try_parse_from([
+            "cairn",
+            "mcp",
+            "--agents",
+            "[{\"name\":\"Explore\",\"description\":\"x\"}]",
+        ])
+        .unwrap();
+        assert!(matches!(args.command, Some(Command::Mcp)));
+        assert!(args.agents.is_some());
+    }
+
+    #[test]
+    fn bare_non_tty_error_explains_the_mcp_migration() {
+        assert_eq!(
+            BARE_NON_TTY_ERROR,
+            "cairn: the MCP server has moved to `cairn mcp`.\nUpdate your MCP client's command to add the `mcp` argument, or re-run Cairn's\nexternal MCP setup to rewrite the registration."
+        );
     }
 
     #[test]
@@ -149,7 +175,7 @@ mod cli_parse_tests {
 /// sole owner). If the app is unreachable, we autostart it and retry once.
 #[derive(clap::Subcommand)]
 enum Command {
-    /// Run the stdio MCP server (default when no subcommand is given).
+    /// Run the stdio MCP server.
     Mcp,
     /// Read one or more files or Cairn resources and print them to stdout (pipeable).
     Read {
@@ -231,6 +257,8 @@ async fn async_main() -> Result<()> {
 
     // CLI subcommands (read/write) keep stderr clean for piping — logs go to
     // the file only. The MCP server path also logs to stderr.
+    // The shell shares this: a log line written to stderr lands in the middle of
+    // the prompt.
     let is_cli = matches!(
         args.command,
         Some(Command::Read { .. })
@@ -238,6 +266,7 @@ async fn async_main() -> Result<()> {
             | Some(Command::Watch { .. })
             | Some(Command::Check { .. })
             | Some(Command::Executor { .. })
+            | None
     );
     // `None` level: the spawning app injects `CAIRN_LOG_LEVEL`, which the filter
     // resolution picks up; a directly-launched cairn-cmd falls back to Standard.
@@ -285,7 +314,16 @@ async fn async_main() -> Result<()> {
             let ok = run_cli_watch(issue_uri.clone(), *since).await;
             std::process::exit(if ok { 0 } else { 1 });
         }
-        Some(Command::Mcp) | None => {}
+        Some(Command::Mcp) => {}
+        None => {
+            // A terminal gets the shell; anything else is an MCP client that has
+            // not been told the server moved.
+            if std::io::stdin().is_terminal() {
+                let ok = shell::run().await;
+                std::process::exit(if ok { 0 } else { 1 });
+            }
+            anyhow::bail!(BARE_NON_TTY_ERROR);
+        }
     }
 
     // Callback URL - passed from main app via MCP config env var.

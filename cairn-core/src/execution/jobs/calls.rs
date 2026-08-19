@@ -1,4 +1,3 @@
-use super::call_admission::Admission;
 use super::*;
 use crate::models::{ConfirmPolicy, OutputSchemaInfo};
 
@@ -278,40 +277,187 @@ pub(crate) fn start_call_run(
         is_ephemeral_call: true,
         server_instance_key: None,
     })?;
-    // A launch that adds no resident process is not constrained by the legacy
-    // process-slot ledger. In particular this prevents stateless HTTP fan-out and
-    // pooled-server stream reuse from competing with dedicated CLI processes.
-    let ceiling = (capability.claim.resident_process_units > 0)
-        .then(|| backend.call_batch_capability().max_concurrency)
-        .flatten();
-
-    match orch
-        .call_admission
-        .admit(&capability.lane.0, ceiling, prepared)?
-    {
-        Admission::StartNow => {
-            if let Err(e) = start_call_run_now(orch, prepared) {
-                // Fail-closed: an admitted call that fails to start must finalize
-                // its run — so the parked workflow await resolves instead of
-                // hanging on `starting` — and release its slot. `finalize_run`
-                // drives `on_call_run_finalized`, which frees the slot and starts
-                // the next queued call; without this a capped-backend start
-                // failure would leak the slot permanently. Then surface the error.
-                log::error!("call {} failed to start: {e}", prepared.run_id);
-                crate::orchestrator::lifecycle::fail_run(
-                    orch,
-                    &prepared.run_id,
-                    &format!("call start failed: {e}"),
-                );
-                return Err(e);
-            }
-            Ok(())
-        }
-        // Queued: the run stays `starting`, its packet is already persisted, and
-        // the workflow await stays parked on the non-terminal status. `release`
-        // (driven by a finalize of an in-flight call) starts it when a slot frees.
-        Admission::Queued => Ok(()),
+    // Stateless HTTP has no resident runtime to reconstruct and must not acquire
+    // a durable-DB failure mode merely because its independent API stream claim
+    // is non-zero.
+    if capability.class == crate::backends::RuntimeClass::StatelessHttp {
+        return start_call_run_now(orch, prepared);
     }
+    // Codex classification is provisional until authentication resolves the
+    // exact app-server pool key. Persisting the provisional `None` key would
+    // charge every logical stream as a separate resident process.
+    if capability.class == crate::backends::RuntimeClass::MultiplexedServer
+        && capability.claim.server_instance_key.is_none()
+    {
+        return start_call_run_now(orch, prepared);
+    }
+
+    let ceiling = backend
+        .call_batch_capability()
+        .max_concurrency
+        .unwrap_or(usize::MAX);
+    if ceiling == 0 {
+        return Err(format!(
+            "runtime admission capacity for {} is zero",
+            capability.lane.0
+        ));
+    }
+    let now = chrono::Utc::now().timestamp();
+    let request_id = format!("call-admission:{}", prepared.run_id);
+    let prepared_json = serde_json::to_string(prepared)
+        .map_err(|e| format!("failed to persist prepared call identity: {e}"))?;
+    run_db({
+        let db = orch.db.local.clone();
+        let request_id = request_id.clone();
+        let run_id = prepared.run_id.clone();
+        let lane = capability.lane.0.clone();
+        let claim = capability.claim.clone();
+        async move {
+            let request = crate::storage::enqueue_admission_request(
+                &db,
+                crate::storage::NewAdmissionRequest {
+                    request_id,
+                    workspace_key: "local-runtime".into(),
+                    resource_lane: lane,
+                    launch_key: format!("call:{run_id}"),
+                    resource_claim: crate::storage::RuntimeResourceClaim {
+                        resident_process_units: claim.resident_process_units,
+                        server_instance_key: claim.server_instance_key,
+                        logical_stream_units: claim.logical_stream_units,
+                        estimated_memory_bytes: claim.estimated_memory_bytes,
+                    },
+                    urgent: false,
+                    now,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            crate::storage::persist_prepared_runtime_call(
+                &db,
+                crate::storage::PreparedRuntimeCall {
+                    request_id: request.request_id.clone(),
+                    run_id,
+                    prepared_json,
+                },
+                now,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Ok::<_, String>(request)
+        }
+    })?;
+    // Promotion consumes whichever request durable fairness selects. It may be
+    // an older request, so tying handoff to this enqueue's request id would drop
+    // a valid lease and leave an otherwise idle lane stuck until expiry.
+    promote_next_call(orch, &capability.lane.0, ceiling);
+    Ok(())
+}
+
+const CALL_ADMISSION_OWNER: &str = "local-call-promoter";
+
+fn lease_next_call(
+    orch: &Orchestrator,
+    lane: &str,
+    ceiling: usize,
+) -> Result<Option<crate::storage::AdmissionRequest>, String> {
+    let db = orch.db.local.clone();
+    let lane = lane.to_string();
+    let now = chrono::Utc::now().timestamp();
+    run_db(async move {
+        crate::storage::lease_next_admission_with_capacity(
+            &db,
+            "local-runtime",
+            &lane,
+            CALL_ADMISSION_OWNER,
+            now,
+            now + 300,
+            crate::storage::RuntimeResourceCapacity {
+                resident_process_units: u32::try_from(ceiling).unwrap_or(u32::MAX),
+                logical_stream_units: u32::MAX,
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+fn start_leased_call(
+    orch: &Orchestrator,
+    lease: crate::storage::AdmissionRequest,
+    prepared: PreparedCallRun,
+) -> Result<(), String> {
+    let transition = |from: &'static str, to: &'static str| {
+        let db = orch.db.local.clone();
+        let id = lease.request_id.clone();
+        let generation = lease.lease_generation;
+        run_db(async move {
+            crate::storage::transition_admission(
+                &db,
+                &id,
+                CALL_ADMISSION_OWNER,
+                generation,
+                from,
+                to,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        })
+    };
+    if !transition("leased", "starting")? {
+        return Err("runtime admission lease was replaced before call start".into());
+    }
+    if let Err(error) = start_call_run_now(orch, &prepared) {
+        let _ = transition("starting", "failed");
+        crate::orchestrator::lifecycle::fail_run(
+            orch,
+            &prepared.run_id,
+            &format!("call start failed: {error}"),
+        );
+        return Err(error);
+    }
+    if !transition("starting", "active")? {
+        orch.process_state.stop_and_remove(&prepared.run_id);
+        return Err("runtime admission lease was replaced during call start".into());
+    }
+    start_call_admission_heartbeat(orch, &lease);
+    Ok(())
+}
+
+fn start_call_admission_heartbeat(orch: &Orchestrator, lease: &crate::storage::AdmissionRequest) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::warn!("active call admission lease has no Tokio runtime for heartbeat");
+        return;
+    };
+    let db = orch.db.local.clone();
+    let request_id = lease.request_id.clone();
+    let generation = lease.lease_generation;
+    handle.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            let now = chrono::Utc::now().timestamp();
+            match crate::storage::heartbeat_admission(
+                &db,
+                &request_id,
+                CALL_ADMISSION_OWNER,
+                generation,
+                now,
+                now + 300,
+            )
+            .await
+            {
+                Ok(true) => {}
+                // Terminal release or generation replacement ends ownership and
+                // therefore this task. A stale heartbeat cannot revive the lease.
+                Ok(false) => break,
+                Err(error) => {
+                    log::warn!("call admission heartbeat failed for {request_id}: {error}");
+                }
+            }
+        }
+    });
 }
 
 /// Resolve the backend name for admission through the SAME resolution
@@ -418,9 +564,53 @@ fn start_call_run_now(orch: &Orchestrator, prepared: &PreparedCallRun) -> Result
 /// uncapped/non-call runs; idempotent, so hooking it from more than one terminal
 /// path (finalize + the stop reconcile early-return) never double-counts.
 pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
-    let released = orch.call_admission.release(run_id);
+    let request = run_db({
+        let db = orch.db.local.clone();
+        let key = format!("call:{run_id}");
+        async move {
+            crate::storage::get_admission_request_by_launch_key(&db, "local-runtime", &key)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .ok()
+    .flatten();
+    let Some(request) = request else {
+        return;
+    };
+    let held_slot = matches!(request.state.as_str(), "leased" | "starting" | "active");
+    let db = orch.db.local.clone();
+    let id = request.request_id.clone();
+    let launch_key = request.launch_key.clone();
+    let state = request.state.clone();
+    let generation = request.lease_generation;
+    let _ = run_db(async move {
+        if state == "queued" {
+            crate::storage::cancel_queued_admission(
+                &db,
+                &id,
+                Some("call finalized before launch"),
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        } else {
+            crate::storage::finish_admission_by_launch_key(
+                &db,
+                "local-runtime",
+                &launch_key,
+                CALL_ADMISSION_OWNER,
+                generation,
+                "released",
+                None,
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        }
+    });
 
-    if released.held_slot {
+    if held_slot {
         // The freed slot must correspond to a DEAD process, not a warm one still
         // holding ~450 MB of `claude` RSS — otherwise the ceiling bounds slot
         // count while real memory keeps climbing (a paper cap). A finalized
@@ -432,17 +622,58 @@ pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
         orch.process_state.stop_and_remove(run_id);
     }
 
-    if let Some(next) = released.next {
-        if let Err(e) = start_call_run_now(orch, &next) {
-            // Fail-closed: an admitted-but-unstartable call must fail its run via
-            // the normal error path so the workflow await resolves — never leave
-            // it silently queued/starting.
-            log::error!("admitted call {} failed to start: {e}", next.run_id);
-            crate::orchestrator::lifecycle::fail_run(
-                orch,
-                &next.run_id,
-                &format!("call admission start failed: {e}"),
-            );
+    let finalized_prepared = run_db({
+        let db = orch.db.local.clone();
+        let id = request.request_id.clone();
+        async move {
+            crate::storage::get_prepared_runtime_call(&db, &id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })
+    .ok()
+    .flatten()
+    .and_then(|p| serde_json::from_str::<PreparedCallRun>(&p.prepared_json).ok());
+    let backend_name = finalized_prepared.as_ref().and_then(admission_backend_name);
+    let backend = crate::backends::backend_for_name(backend_name.as_deref());
+    let ceiling = backend
+        .call_batch_capability()
+        .max_concurrency
+        .unwrap_or(usize::MAX);
+    promote_next_call(orch, &request.resource_lane, ceiling);
+}
+
+/// Promote exactly the lease returned by the durable repository. Promotion is
+/// lane-driven rather than tied to the request which happened to trigger it:
+/// fairness may select a different queued request, and dropping that lease would
+/// strand it until expiry.
+fn promote_next_call(orch: &Orchestrator, lane: &str, ceiling: usize) {
+    if let Ok(Some(next_lease)) = lease_next_call(orch, lane, ceiling) {
+        let next = run_db({
+            let db = orch.db.local.clone();
+            let id = next_lease.request_id.clone();
+            async move {
+                crate::storage::get_prepared_runtime_call(&db, &id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .ok()
+        .flatten();
+        if let Some(next) =
+            next.and_then(|p| serde_json::from_str::<PreparedCallRun>(&p.prepared_json).ok())
+        {
+            if let Err(e) = start_leased_call(orch, next_lease, next.clone()) {
+                // Fail-closed: an admitted-but-unstartable call must fail its run via
+                // the normal error path so the workflow await resolves — never leave
+                // it silently queued/starting.
+                log::error!("admitted call {} failed to start: {e}", next.run_id);
+                crate::orchestrator::lifecycle::fail_run(
+                    orch,
+                    &next.run_id,
+                    &format!("call admission start failed: {e}"),
+                );
+            }
         }
     }
 }
@@ -466,6 +697,21 @@ pub(crate) fn on_call_run_finalized(orch: &Orchestrator, run_id: &str) {
 /// workflow scripts, so it only ever touches stale pre-crash runs, never a
 /// freshly re-issued call.
 pub(crate) async fn fail_orphaned_calls_on_startup(orch: &Orchestrator) {
+    if let Err(error) = crate::storage::requeue_orphaned_admissions(
+        &orch.db.local,
+        "local-runtime",
+        chrono::Utc::now().timestamp(),
+    )
+    .await
+    {
+        log::warn!("startup call recovery: failed to reclaim orphaned leases: {error}");
+    }
+    if let Err(error) =
+        crate::storage::reap_expired_admissions(&orch.db.local, chrono::Utc::now().timestamp())
+            .await
+    {
+        log::warn!("startup call recovery: failed to reap expired leases: {error}");
+    }
     let run_ids = match crate::workflow_journal::list_undelivered_call_run_ids(&orch.db.local).await
     {
         Ok(ids) => ids,
@@ -477,6 +723,37 @@ pub(crate) async fn fail_orphaned_calls_on_startup(orch: &Orchestrator) {
 
     let mut failed = 0usize;
     for run_id in run_ids {
+        let launch_key = format!("call:{run_id}");
+        if let Ok(Some(request)) = crate::storage::get_admission_request_by_launch_key(
+            &orch.db.local,
+            "local-runtime",
+            &launch_key,
+        )
+        .await
+        {
+            if request.state == "queued" {
+                if let Ok(Some(stored)) =
+                    crate::storage::get_prepared_runtime_call(&orch.db.local, &request.request_id)
+                        .await
+                {
+                    if let Ok(prepared) =
+                        serde_json::from_str::<PreparedCallRun>(&stored.prepared_json)
+                    {
+                        let backend_name = admission_backend_name(&prepared);
+                        let backend = crate::backends::backend_for_name(backend_name.as_deref());
+                        let ceiling = backend
+                            .call_batch_capability()
+                            .max_concurrency
+                            .unwrap_or(usize::MAX);
+                        promote_next_call(orch, &request.resource_lane, ceiling);
+                        // This request may remain queued because bounded priority
+                        // selected another request. Queued is recoverable state,
+                        // never evidence that this run should be crashed.
+                        continue;
+                    }
+                }
+            }
+        }
         let owning = crate::execution::routing::owning_db_for_run(&orch.db, &run_id)
             .await
             .unwrap_or_else(|_| orch.db.local.clone());

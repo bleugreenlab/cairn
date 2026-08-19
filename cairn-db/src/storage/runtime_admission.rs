@@ -14,6 +14,72 @@ pub struct RuntimeResourceClaim {
     pub estimated_memory_bytes: Option<u64>,
 }
 
+/// Requeue leases owned by a runner process which is being reconstructed after
+/// restart. The old process and heartbeat tasks are gone, so retaining an
+/// apparently unexpired generation would make recovery timing-dependent.
+pub async fn requeue_orphaned_admissions(db: &LocalDb, workspace: &str, now: i64) -> DbResult<u64> {
+    let workspace = workspace.to_string();
+    db.write(move |conn| {
+        let workspace = workspace.clone();
+        Box::pin(async move {
+            Ok(conn.execute(
+                "UPDATE runtime_admission_requests SET state='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=?2 WHERE workspace_key=?1 AND state IN ('leased','starting','active')",
+                params![workspace, now],
+            ).await?)
+        })
+    }).await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedRuntimeCall {
+    pub request_id: String,
+    pub run_id: String,
+    pub prepared_json: String,
+}
+
+pub async fn persist_prepared_runtime_call(
+    db: &LocalDb,
+    call: PreparedRuntimeCall,
+    now: i64,
+) -> DbResult<()> {
+    db.execute(
+        "INSERT INTO prepared_runtime_calls(request_id,run_id,prepared_json,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT(request_id) DO UPDATE SET run_id=excluded.run_id,prepared_json=excluded.prepared_json",
+        params![call.request_id, call.run_id, call.prepared_json, now],
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn get_prepared_runtime_call(
+    db: &LocalDb,
+    request_id: &str,
+) -> DbResult<Option<PreparedRuntimeCall>> {
+    db.query_opt(
+        "SELECT request_id,run_id,prepared_json FROM prepared_runtime_calls WHERE request_id=?1",
+        (request_id.to_string(),),
+        |row| {
+            Ok(PreparedRuntimeCall {
+                request_id: row.text(0)?,
+                run_id: row.text(1)?,
+                prepared_json: row.text(2)?,
+            })
+        },
+    )
+    .await
+}
+
+pub async fn get_admission_request_by_launch_key(
+    db: &LocalDb,
+    workspace: &str,
+    launch_key: &str,
+) -> DbResult<Option<AdmissionRequest>> {
+    db.query_opt(
+        format!("SELECT {COLUMNS} FROM runtime_admission_requests WHERE workspace_key=?1 AND launch_key=?2"),
+        params![workspace.to_string(), launch_key.to_string()],
+        from_row,
+    ).await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeResourceCapacity {
     pub resident_process_units: u32,
@@ -47,6 +113,14 @@ pub struct AdmissionRequest {
     pub failure_detail: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionStatus {
+    pub request: AdmissionRequest,
+    pub position: Option<i64>,
+    pub behind_count: Option<i64>,
+    pub enqueue_age_ms: i64,
 }
 
 fn from_row(row: &crate::turso::Row) -> DbResult<AdmissionRequest> {
@@ -212,6 +286,92 @@ pub async fn transition_admission(
     Ok(changed == 1)
 }
 
+pub async fn heartbeat_admission(
+    db: &LocalDb,
+    request_id: &str,
+    owner: &str,
+    generation: i64,
+    now: i64,
+    expires_at: i64,
+) -> DbResult<bool> {
+    let (request_id, owner) = (request_id.to_string(), owner.to_string());
+    let changed = db.write(move |conn| { let (request_id, owner) = (request_id.clone(), owner.clone()); Box::pin(async move {
+        Ok(conn.execute("UPDATE runtime_admission_requests SET lease_expires_at=?4,updated_at=?5 WHERE request_id=?1 AND lease_owner=?2 AND lease_generation=?3 AND state IN ('leased','starting','active')", params![request_id,owner,generation,expires_at,now]).await?)
+    })}).await?;
+    Ok(changed == 1)
+}
+
+pub async fn cancel_queued_admission(
+    db: &LocalDb,
+    request_id: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> DbResult<bool> {
+    let (request_id, reason) = (request_id.to_string(), reason.map(str::to_string));
+    let changed = db.write(move |conn| { let (request_id, reason) = (request_id.clone(), reason.clone()); Box::pin(async move {
+        Ok(conn.execute("UPDATE runtime_admission_requests SET state='cancelled',failure_detail=?2,updated_at=?3 WHERE request_id=?1 AND state='queued'", params![request_id,reason,now]).await?)
+    })}).await?;
+    Ok(changed == 1)
+}
+
+pub async fn finish_admission_by_launch_key(
+    db: &LocalDb,
+    workspace: &str,
+    launch_key: &str,
+    owner: &str,
+    generation: i64,
+    terminal_state: &str,
+    detail: Option<&str>,
+    now: i64,
+) -> DbResult<bool> {
+    if !matches!(terminal_state, "released" | "cancelled" | "failed") {
+        return Err(DbError::internal(format!(
+            "invalid terminal admission state: {terminal_state}"
+        )));
+    }
+    let values = (
+        workspace.to_string(),
+        launch_key.to_string(),
+        owner.to_string(),
+        terminal_state.to_string(),
+        detail.map(str::to_string),
+    );
+    let changed = db.write(move |conn| { let (workspace,launch_key,owner,state,detail)=values.clone(); Box::pin(async move {
+        Ok(conn.execute("UPDATE runtime_admission_requests SET state=?5,failure_detail=?6,updated_at=?7 WHERE workspace_key=?1 AND launch_key=?2 AND lease_owner=?3 AND lease_generation=?4 AND state IN ('leased','starting','active')", params![workspace,launch_key,owner,generation,state,detail,now]).await?)
+    })}).await?;
+    Ok(changed == 1)
+}
+
+pub async fn reap_expired_admissions(db: &LocalDb, now: i64) -> DbResult<u64> {
+    db.write(move |conn| Box::pin(async move {
+        Ok(conn.execute("UPDATE runtime_admission_requests SET state='queued',lease_owner=NULL,lease_expires_at=NULL,updated_at=?1 WHERE state IN ('leased','starting','active') AND lease_expires_at < ?1", (now,)).await?)
+    })).await
+}
+
+pub async fn admission_status(
+    db: &LocalDb,
+    request_id: &str,
+    now: i64,
+) -> DbResult<Option<AdmissionStatus>> {
+    let Some(request) = get_admission_request(db, request_id).await? else {
+        return Ok(None);
+    };
+    let (position, behind_count) = if request.state == "queued" {
+        let ahead = db.query_one("SELECT COUNT(*) FROM runtime_admission_requests WHERE workspace_key=?1 AND resource_lane=?2 AND state='queued' AND enqueue_seq < ?3", params![request.workspace_key.clone(),request.resource_lane.clone(),request.enqueue_seq], |row| row.i64(0)).await?;
+        let behind = db.query_one("SELECT COUNT(*) FROM runtime_admission_requests WHERE workspace_key=?1 AND resource_lane=?2 AND state='queued' AND enqueue_seq > ?3", params![request.workspace_key.clone(),request.resource_lane.clone(),request.enqueue_seq], |row| row.i64(0)).await?;
+        (Some(ahead + 1), Some(behind))
+    } else {
+        (None, None)
+    };
+    let enqueue_age_ms = now.saturating_sub(request.created_at).saturating_mul(1_000);
+    Ok(Some(AdmissionStatus {
+        request,
+        position,
+        behind_count,
+        enqueue_age_ms,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +402,159 @@ mod tests {
             urgent,
             now,
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_call_payload_survives_reopen_and_is_reconstructable() {
+        let db = crate::storage::migrated_test_db("prepared-runtime-call.db").await;
+        let admission = enqueue_admission_request(&db, request("one", false, 1))
+            .await
+            .unwrap();
+        let prepared = PreparedRuntimeCall {
+            request_id: admission.request_id.clone(),
+            run_id: "run-one".into(),
+            prepared_json: r#"{"prompt":"persisted"}"#.into(),
+        };
+        persist_prepared_runtime_call(&db, prepared.clone(), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_prepared_runtime_call(&db, &admission.request_id)
+                .await
+                .unwrap(),
+            Some(prepared)
+        );
+        assert_eq!(
+            get_admission_request_by_launch_key(&db, "w", "one")
+                .await
+                .unwrap()
+                .unwrap()
+                .request_id,
+            admission.request_id
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_generation_is_reaped_and_stale_callbacks_are_fenced() {
+        let db = crate::storage::migrated_test_db("admission-reaping.db").await;
+        enqueue_admission_request(&db, request("one", false, 1))
+            .await
+            .unwrap();
+        let first = lease_next_admission(&db, "w", "process", "old", 2, 10)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reap_expired_admissions(&db, 11).await.unwrap(), 1);
+        let second = lease_next_admission(&db, "w", "process", "new", 12, 20)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.lease_generation, first.lease_generation + 1);
+        assert!(
+            !heartbeat_admission(&db, "one", "old", first.lease_generation, 13, 30)
+                .await
+                .unwrap()
+        );
+        assert!(
+            heartbeat_admission(&db, "one", "new", second.lease_generation, 13, 30)
+                .await
+                .unwrap()
+        );
+        assert!(finish_admission_by_launch_key(
+            &db,
+            "w",
+            "one",
+            "new",
+            second.lease_generation,
+            "released",
+            None,
+            14
+        )
+        .await
+        .unwrap());
+        assert!(!finish_admission_by_launch_key(
+            &db,
+            "w",
+            "one",
+            "old",
+            first.lease_generation,
+            "failed",
+            None,
+            15
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn runner_restart_requeues_nonexpired_active_generation() {
+        let db = crate::storage::migrated_test_db("admission-restart-reclaim.db").await;
+        enqueue_admission_request(&db, request("one", false, 1))
+            .await
+            .unwrap();
+        let first = lease_next_admission(&db, "w", "process", "old", 2, 10_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(transition_admission(
+            &db,
+            "one",
+            "old",
+            first.lease_generation,
+            "leased",
+            "active",
+            3
+        )
+        .await
+        .unwrap());
+
+        assert_eq!(requeue_orphaned_admissions(&db, "w", 4).await.unwrap(), 1);
+        let replacement = lease_next_admission(&db, "w", "process", "new", 5, 20_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.lease_generation, first.lease_generation + 1);
+        assert!(
+            !heartbeat_admission(&db, "one", "old", first.lease_generation, 6, 30_000)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_cancellation_prevents_promotion_and_status_is_one_based() {
+        let db = crate::storage::migrated_test_db("admission-cancel.db").await;
+        enqueue_admission_request(&db, request("first", false, 1))
+            .await
+            .unwrap();
+        enqueue_admission_request(&db, request("cancelled", false, 2))
+            .await
+            .unwrap();
+        let status = admission_status(&db, "cancelled", 12)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (status.position, status.behind_count, status.enqueue_age_ms),
+            (Some(2), Some(0), 10_000)
+        );
+        assert!(
+            cancel_queued_admission(&db, "cancelled", Some("job stopped"), 13)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            lease_next_admission(&db, "w", "process", "runner", 15, 20)
+                .await
+                .unwrap()
+                .unwrap()
+                .request_id,
+            "first"
+        );
+        assert!(lease_next_admission(&db, "w", "process", "runner", 15, 20)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

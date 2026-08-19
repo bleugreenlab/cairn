@@ -26,6 +26,7 @@ pub mod packs;
 pub(crate) mod posts;
 mod progress;
 mod project;
+mod project_map;
 mod read;
 mod rebase;
 mod recipes;

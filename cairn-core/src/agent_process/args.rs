@@ -194,7 +194,8 @@ mod tests {
     #[test]
     fn new_resume_and_fork_use_identical_strict_mcp_policy() {
         let mut new_config = base_config();
-        new_config.mcp_config = r#"{"mcpServers":{"cairn":{"command":"cairn-cmd"}}}"#.to_string();
+        new_config.mcp_config =
+            r#"{"mcpServers":{"cairn":{"command":"cairn-cmd","args":["mcp"]}}}"#.to_string();
         new_config.allowed_tools = vec![
             "mcp__cairn__read".to_string(),
             "mcp__cairn__write".to_string(),

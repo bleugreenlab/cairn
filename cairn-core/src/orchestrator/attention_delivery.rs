@@ -692,6 +692,20 @@ pub(crate) async fn render_push_resolved(
             _ => header,
         };
     }
+    // A schedule's key must remain stable across occurrences so its undelivered
+    // push coalesces. Its changing content_ref therefore names the newest frozen
+    // direct message rather than a conversation URI.
+    if push.key.starts_with("schedule:") {
+        return match crate::messages::db::get_message_by_id_async(&orch.db.local, &push.content_ref)
+            .await
+        {
+            Ok(Some(msg)) => {
+                let body = crate::messages::render::render_direct_message(&msg);
+                format!("{header}\n\n{body}")
+            }
+            _ => header,
+        };
+    }
     if push.key.starts_with("resolved:") {
         return match resolved_issue_confirmation(orch, &push.content_ref).await {
             Some(body) => format!("{header}\n\n{body}"),
@@ -1100,6 +1114,53 @@ mod tests {
 
         assert!(rendered.contains("frozen direct content"), "{rendered}");
         assert!(rendered.contains("sender/messages"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn superseded_schedule_push_carries_the_newest_reason_inline() {
+        let db = migrated_db().await;
+        seed(&db, "active", None, None).await;
+        db.execute_script(
+            "INSERT INTO runs(id, project_id, job_id, issue_id, created_at, updated_at)
+             VALUES('run-watcher','p','watcher','parent',1,1);",
+        )
+        .await
+        .unwrap();
+        db.write(|conn| {
+            Box::pin(async move {
+                crate::messages::delivery::insert_system_direct_push_with_key_conn(
+                    conn,
+                    "watcher",
+                    "run-watcher",
+                    "old scheduled reason",
+                    crate::messages::queued::DeliveryUrgency::Steer,
+                    Some("schedule:rule-1"),
+                )
+                .await?;
+                crate::messages::delivery::insert_system_direct_push_with_key_conn(
+                    conn,
+                    "watcher",
+                    "run-watcher",
+                    "newest scheduled reason",
+                    crate::messages::queued::DeliveryUrgency::Steer,
+                    Some("schedule:rule-1"),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+        let pushes = crate::orchestrator::attention_push::list_pending(&db, "watcher")
+            .await
+            .unwrap();
+        assert_eq!(pushes.len(), 1, "stable schedule key must coalesce");
+        let orch = test_orchestrator(db);
+        let rendered = render_push_resolved(&orch, &pushes[0]).await;
+        assert!(rendered.contains("newest scheduled reason"), "{rendered}");
+        assert!(!rendered.contains("old scheduled reason"), "{rendered}");
+        assert!(!rendered.contains("for the current content"), "{rendered}");
     }
 
     #[tokio::test]

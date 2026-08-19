@@ -332,6 +332,10 @@ mod tests {
             "expected exactly one mcp_servers block (cairn), got {:?}",
             server_blocks
         );
+        assert!(
+            config.lines().any(|line| line.trim() == "args = [\"mcp\"]"),
+            "cairn MCP argv must start with the explicit `mcp` subcommand: {config}"
+        );
     }
 
     #[test]

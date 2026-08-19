@@ -63,6 +63,7 @@ pub enum ResourceKind {
     Post,
     ProjectPosts,
     ProjectCodemap,
+    ProjectMap,
     ProjectCheckResults,
     ProjectCheckObservation,
     ProjectImages,
@@ -192,6 +193,7 @@ impl ResourceKind {
         ResourceKind::Post,
         ResourceKind::ProjectPosts,
         ResourceKind::ProjectCodemap,
+        ResourceKind::ProjectMap,
         ResourceKind::ProjectCheckResults,
         ResourceKind::ProjectCheckObservation,
         ResourceKind::ProjectImages,
@@ -407,6 +409,10 @@ pub struct KeySpec {
 }
 
 impl KeySpec {
+    pub fn note(&self) -> &'static str {
+        self.note
+    }
+
     pub(crate) const fn new(key: &'static str, ty: KeyType, note: &'static str) -> Self {
         Self {
             key,

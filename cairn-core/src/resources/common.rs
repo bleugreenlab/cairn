@@ -8,6 +8,8 @@ use cairn_common::contract::{
     contract_for, ChangeMode, KeyType, MutationSpec, ResourceContract, ResourceKind,
 };
 use cairn_common::query::QueryParam;
+use cairn_common::read::{ActionSpec, AffordanceSpec, FilterSpec, KeyInfo, LinkSpec};
+use cairn_common::uri::CairnResource;
 
 #[derive(Debug)]
 pub(super) struct ProjectContext {
@@ -273,57 +275,217 @@ pub(super) async fn visible_job_node_segment(
 /// `-A`/`-B`/`-C` documentation gap).
 const UNIVERSAL_GREP_FILTER: &str = "- `grep=REGEX` (universal) · `-i` · `-A`/`-B`/`-C`/`context=N` · `head_limit=N` — line-number-prefixed matches over the rendered body; `offset` not allowed with grep; `files_with_matches`/`count` need a tree\n";
 
-pub(super) fn affordance_for_kind(kind: ResourceKind) -> String {
-    let Some(contract) = contract_for(kind) else {
-        return String::new();
-    };
-
-    let mut sections = String::new();
-
-    push_links_section(&mut sections, contract);
-    push_filters_section(&mut sections, contract);
-
-    let mut action_lines: Vec<String> = Vec::new();
-    push_mutation_actions(&mut action_lines, contract);
-    for spec in contract.related {
-        if spec.actions {
-            if let Some(related) = contract_for(spec.kind) {
-                push_mutation_actions(&mut action_lines, related);
+pub(super) fn affordance_spec_for_kind(
+    kind: ResourceKind,
+    current: Option<&CairnResource>,
+) -> Option<AffordanceSpec> {
+    let contract = contract_for(kind)?;
+    let links = link_specs(contract, current);
+    let filters = filter_specs(contract);
+    let mut actions = Vec::new();
+    push_mutation_specs(&mut actions, contract, current);
+    for related in contract.related {
+        if related.actions {
+            if let Some(target) = contract_for(related.kind) {
+                push_mutation_specs(&mut actions, target, current);
             }
         }
     }
-    // Cross-resource actions: mutations owned by another resource that take this
-    // one as input. Rendered from the target's `uri_template` + example, but
-    // labeled from this resource's perspective (e.g. a recipe "starts an
-    // execution" via the executions resource). Restores a workflow hint the
-    // contract-derived affordances would otherwise drop.
     for cross in contract.cross_actions {
         if let Some(target) = contract_for(cross.kind) {
-            if let Some(spec) = target.mutation(cross.mode) {
-                action_lines.push(format!(
-                    "- [{}]({}): {}",
-                    cross.label,
-                    target.uri_template,
-                    action_summary(spec)
-                ));
+            if let Some(mutation) = target.mutation(cross.mode) {
+                actions.push(action_spec(cross.label, target, mutation, current));
             }
         }
     }
+    Some(AffordanceSpec {
+        kind: kind.slug().to_string(),
+        name: contract.name.to_string(),
+        links,
+        filters,
+        actions,
+    })
+}
 
-    if !action_lines.is_empty() {
-        sections.push_str("### actions\n");
-        for line in action_lines {
-            sections.push_str(&line);
-            sections.push('\n');
+pub(super) fn affordance_for_kind(kind: ResourceKind) -> String {
+    affordance_spec_for_kind(kind, None)
+        .map(|spec| render_affordance(&spec))
+        .unwrap_or_default()
+}
+
+pub(super) fn render_affordance(spec: &AffordanceSpec) -> String {
+    let mut sections = String::new();
+    if !spec.links.is_empty() {
+        sections.push_str("### links\n");
+        for link in &spec.links {
+            sections.push_str(&format!("- [{}]({})\n", link.label, link.uri_template));
         }
         sections.push('\n');
     }
-
-    if sections.is_empty() {
-        return String::new();
+    sections.push_str("### filters\n");
+    for filter in &spec.filters {
+        sections.push_str(&format!("- `{}={}`\n", filter.key, filter.values));
     }
+    sections.push_str(UNIVERSAL_GREP_FILTER);
+    sections.push('\n');
+    if !spec.actions.is_empty() {
+        sections.push_str("### actions\n");
+        for action in &spec.actions {
+            sections.push_str(&format!(
+                "- [{}]({}): {}\n",
+                action.label,
+                action.uri_template,
+                action_summary_from_spec(action)
+            ));
+        }
+        sections.push('\n');
+    }
+    format!("## {}\n\n{}", spec.name, sections)
+}
 
-    format!("## {}\n\n{}", contract.name, sections)
+fn link_specs(contract: &ResourceContract, current: Option<&CairnResource>) -> Vec<LinkSpec> {
+    contract
+        .related
+        .iter()
+        .filter_map(|related| {
+            let target = contract_for(related.kind)?;
+            Some(LinkSpec {
+                label: related.label.to_string(),
+                uri_template: target.uri_template.to_string(),
+                uri: current.and_then(|resource| bind_uri_template(resource, target.uri_template)),
+            })
+        })
+        .collect()
+}
+
+fn filter_specs(contract: &ResourceContract) -> Vec<FilterSpec> {
+    contract
+        .read_projections
+        .iter()
+        .map(|projection| FilterSpec {
+            key: projection.key.to_string(),
+            values: projection.values.to_string(),
+        })
+        .collect()
+}
+
+fn key_info(key: &cairn_common::contract::KeySpec) -> KeyInfo {
+    KeyInfo {
+        key: key.key.to_string(),
+        ty: key.ty.as_str().to_string(),
+        note: key.note().to_string(),
+        aliases: key
+            .aliases
+            .iter()
+            .map(|alias| (*alias).to_string())
+            .collect(),
+    }
+}
+
+fn action_spec(
+    label: &str,
+    contract: &ResourceContract,
+    mutation: &MutationSpec,
+    current: Option<&CairnResource>,
+) -> ActionSpec {
+    ActionSpec {
+        label: label.to_string(),
+        mode: mutation.mode.as_str().to_string(),
+        uri_template: contract.uri_template.to_string(),
+        uri: current.and_then(|resource| bind_uri_template(resource, contract.uri_template)),
+        required: mutation.required.iter().map(key_info).collect(),
+        optional: mutation.optional.iter().map(key_info).collect(),
+        example: mutation.example.to_string(),
+        guidance: None,
+    }
+}
+
+fn push_mutation_specs(
+    actions: &mut Vec<ActionSpec>,
+    contract: &ResourceContract,
+    current: Option<&CairnResource>,
+) {
+    actions.extend(
+        contract
+            .mutations
+            .iter()
+            .map(|mutation| action_spec(mutation.label, contract, mutation, current)),
+    );
+}
+
+/// `` `key(type)` `` / `` `key(type, note)` `` — the backticked key display the
+/// write gate's unknown-key rejection also renders (`KeySpec::display`), so an
+/// advertised key reads identically wherever it appears.
+fn key_display(key: &KeyInfo) -> String {
+    if key.note.is_empty() {
+        format!("`{}({})`", key.key, key.ty)
+    } else {
+        format!("`{}({}, {})`", key.key, key.ty, key.note)
+    }
+}
+
+fn action_summary_from_spec(spec: &ActionSpec) -> String {
+    let mut parts = Vec::new();
+    if !spec.required.is_empty() {
+        parts.push(format!(
+            "required {}",
+            spec.required
+                .iter()
+                .map(key_display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !spec.optional.is_empty() {
+        parts.push(format!(
+            "optional {}",
+            spec.optional
+                .iter()
+                .map(key_display)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let head = if parts.is_empty() {
+        "no payload".to_string()
+    } else {
+        parts.join("; ")
+    };
+    format!(
+        "{}{}. e.g. {}",
+        head,
+        spec.guidance.as_deref().unwrap_or_default(),
+        spec.example
+    )
+}
+
+fn bind_uri_template(current: &CairnResource, target_template: &str) -> Option<String> {
+    let current_contract = contract_for(current.kind())?;
+    let current_uri = current.to_uri();
+    let template_segments = current_contract
+        .uri_template
+        .strip_prefix("cairn://")?
+        .split('/');
+    let concrete_segments = current_uri.strip_prefix("cairn://")?.split('/');
+    let mut bindings = std::collections::HashMap::new();
+    for (template, concrete) in template_segments.zip(concrete_segments) {
+        if let Some(name) = template
+            .strip_prefix('{')
+            .and_then(|part| part.strip_suffix('}'))
+        {
+            bindings.insert(name, concrete);
+        }
+    }
+    let mut bound = target_template.to_string();
+    let mut rest = target_template;
+    while let Some(open) = rest.find('{') {
+        let after_open = &rest[open + 1..];
+        let close = after_open.find('}')?;
+        let name = &after_open[..close];
+        bound = bound.replace(&format!("{{{name}}}"), bindings.get(name)?);
+        rest = &after_open[close + 1..];
+    }
+    Some(bound)
 }
 
 /// Collapse an already-shown affordance block to a one-line session pointer,
@@ -366,66 +528,23 @@ pub(crate) fn pointer_affordance_block(block: &str) -> Option<String> {
     Some(format!("\u{2014} ref: cairn://help?kind={}", kind.slug()))
 }
 
-fn push_links_section(sections: &mut String, contract: &ResourceContract) {
-    if contract.related.is_empty() {
-        return;
-    }
-    sections.push_str("### links\n");
-    for spec in contract.related {
-        let target = contract_for(spec.kind)
-            .map(|related| related.uri_template)
-            .unwrap_or("");
-        sections.push_str(&format!("- [{}]({})\n", spec.label, target));
-    }
-    sections.push('\n');
-}
-
-// grep is a universal read filter over any rendered body, so every resource
-// advertises it once here alongside its own pushdown projections (if any). The
-// note dedupes per `(kind, block)` like the rest of the affordance.
-fn push_filters_section(sections: &mut String, contract: &ResourceContract) {
-    sections.push_str("### filters\n");
-    for proj in contract.read_projections {
-        sections.push_str(&format!("- `{}={}`\n", proj.key, proj.values));
-    }
-    sections.push_str(UNIVERSAL_GREP_FILTER);
-    sections.push('\n');
-}
-
-fn push_mutation_actions(action_lines: &mut Vec<String>, contract: &ResourceContract) {
-    for spec in contract.mutations {
-        action_lines.push(format!(
-            "- [{}]({}): {}",
-            spec.label,
-            contract.uri_template,
-            action_summary(spec)
-        ));
-    }
-}
-
-/// One-line payload guidance for an action: required/optional keys + example.
-///
-/// The key list comes from `MutationSpec::accepted_keys_display`, the same
-/// formatter the write gate's unknown-key rejection uses, so what a resource
-/// advertises here is exactly what it enforces there.
-fn action_summary(spec: &MutationSpec) -> String {
-    let head = spec
-        .accepted_keys_display()
-        .unwrap_or_else(|| "no payload".to_string());
-    format!("{}. e.g. {}", head, spec.example)
-}
-
-/// Render a node/task artifact's affordance block, deriving the `create`
-/// example's payload keys from the artifact's resolved JSON Schema. The static
+/// Build a node/task artifact's affordance spec, deriving the `create` action's
+/// payload keys and example from the artifact's resolved JSON Schema. The static
 /// contract example uses generic placeholder keys (`{title, content}`) that don't
 /// match a custom artifact's real schema, so copying it bounces (CAIRN #170).
 /// Returns `None` when the schema has no usable top-level `properties`, leaving
-/// the caller to fall back to the contract-derived `affordance_for_kind` block.
-pub(super) fn artifact_affordance_with_schema(
+/// the caller to fall back to the contract-derived spec.
+///
+/// Schema-derived keys are exactly what a static per-kind table cannot describe,
+/// which is why the *spec* has to come from here and not just the rendered
+/// markdown: a consumer assembling a write from `ActionSpec.required` would
+/// otherwise be handed `{title, content}` for an artifact that declares neither.
+pub(super) fn artifact_affordance_spec_with_schema(
     kind: ResourceKind,
     addressed_name: Option<&str>,
     schema: &serde_json::Value,
-) -> Option<String> {
+    current: Option<&CairnResource>,
+) -> Option<AffordanceSpec> {
     let contract = contract_for(kind)?;
     let props = schema.get("properties").and_then(|p| p.as_object())?;
     if props.is_empty() {
@@ -451,75 +570,120 @@ pub(super) fn artifact_affordance_with_schema(
         }
     }
 
-    let key_display = |name: &str| -> String {
-        let ty = props
+    let schema_key = |name: &str| KeyInfo {
+        key: name.to_string(),
+        ty: props
             .get(name)
             .and_then(|p| p.get("type"))
             .and_then(|t| t.as_str())
             .map(schema_type_label)
-            .unwrap_or(KeyType::Str.as_str());
-        format!("`{name}({ty})`")
+            .unwrap_or(KeyType::Str.as_str())
+            .to_string(),
+        note: String::new(),
+        aliases: Vec::new(),
     };
-    let required_display: Vec<String> = ordered
-        .iter()
-        .filter(|k| required.contains(*k))
-        .map(|k| key_display(k))
-        .collect();
-    let optional_display: Vec<String> = ordered
-        .iter()
-        .filter(|k| !required.contains(*k))
-        .map(|k| key_display(k))
-        .collect();
 
     let example_uri = match addressed_name {
         Some(name) => format!("cairn:~/{name}"),
         None => "cairn:~/<name>".to_string(),
     };
+    // Every artifact action targets the artifact being read, so the concrete
+    // binding is simply its own URI — no template to bind.
+    let target_uri = current.map(|resource| resource.to_uri());
     let payload = schema_example_payload(props, &ordered);
-    let create_example = format!(
-        "write({{changes:[{{target:\"{example_uri}\",mode:\"create\",payload:{payload}}}]}})"
-    );
-
-    let mut head_parts: Vec<String> = Vec::new();
-    if !required_display.is_empty() {
-        head_parts.push(format!("required {}", required_display.join(", ")));
-    }
-    if !optional_display.is_empty() {
-        head_parts.push(format!("optional {}", optional_display.join(", ")));
-    }
-    let head = if head_parts.is_empty() {
-        "no payload".to_string()
-    } else {
-        head_parts.join("; ")
-    };
-
-    let mut sections = String::new();
-    push_links_section(&mut sections, contract);
-    push_filters_section(&mut sections, contract);
-    sections.push_str("### actions\n");
     let create_label = contract
         .mutation(ChangeMode::Create)
         .map(|spec| spec.label)
         .unwrap_or("write artifact");
-    sections.push_str(&format!(
-        "- [{create_label}]({example_uri}): {head}. e.g. {create_example}\n"
-    ));
+    let mut actions = vec![ActionSpec {
+        label: create_label.to_string(),
+        mode: ChangeMode::Create.as_str().to_string(),
+        uri_template: example_uri.clone(),
+        uri: target_uri.clone(),
+        required: ordered
+            .iter()
+            .filter(|key| required.contains(*key))
+            .map(|key| schema_key(key))
+            .collect(),
+        optional: ordered
+            .iter()
+            .filter(|key| !required.contains(*key))
+            .map(|key| schema_key(key))
+            .collect(),
+        example: format!(
+            "write({{changes:[{{target:\"{example_uri}\",mode:\"create\",payload:{payload}}}]}})"
+        ),
+        guidance: None,
+    }];
+
+    // The arc's item-level actions come first: they append or amend one ruling,
+    // where the generic field merge would replace the whole set.
     if addressed_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
-        sections.push_str("- [append one ruling](cairn:~/arc): required `ruling(object)` with text, status, rationale, and canonical provenance; Cairn mints its stable slug. This does not resend or replace any other ruling. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling:{text:\"...\",status:\"accepted\",rationale:\"...\",provenance:[\"cairn://p/PROJECT/NUMBER\"]}}}]})\n");
-        sections.push_str("- [patch one ruling by slug](cairn:~/arc): required `ruling_slug(str)`, `patch(object)`; the slug is immutable. This does not resend or replace any other ruling. e.g. write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling_slug:\"no-budget-kills\",patch:{status:\"superseded\",rationale:\"...\"}}}]})\n");
+        actions.push(ActionSpec {
+            label: "append one ruling".to_string(),
+            mode: ChangeMode::Patch.as_str().to_string(),
+            uri_template: example_uri.clone(),
+            uri: target_uri.clone(),
+            required: vec![KeyInfo {
+                key: "ruling".to_string(),
+                ty: KeyType::Object.as_str().to_string(),
+                note: String::new(),
+                aliases: Vec::new(),
+            }],
+            optional: Vec::new(),
+            example: "write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling:{text:\"...\",status:\"accepted\",rationale:\"...\",provenance:[\"cairn://p/PROJECT/NUMBER\"]}}}]})".to_string(),
+            guidance: Some(" with text, status, rationale, and canonical provenance; Cairn mints its stable slug. This does not resend or replace any other ruling".to_string()),
+        });
+        actions.push(ActionSpec {
+            label: "patch one ruling by slug".to_string(),
+            mode: ChangeMode::Patch.as_str().to_string(),
+            uri_template: example_uri.clone(),
+            uri: target_uri.clone(),
+            required: vec![
+                KeyInfo {
+                    key: "ruling_slug".to_string(),
+                    ty: KeyType::Str.as_str().to_string(),
+                    note: String::new(),
+                    aliases: Vec::new(),
+                },
+                KeyInfo {
+                    key: "patch".to_string(),
+                    ty: KeyType::Object.as_str().to_string(),
+                    note: String::new(),
+                    aliases: Vec::new(),
+                },
+            ],
+            optional: Vec::new(),
+            example: "write({changes:[{target:\"cairn:~/arc\",mode:\"patch\",payload:{ruling_slug:\"no-budget-kills\",patch:{status:\"superseded\",rationale:\"...\"}}}]})".to_string(),
+            guidance: Some("; the slug is immutable. This does not resend or replace any other ruling".to_string()),
+        });
     }
+
     // Ordinary field merge remains available after the safer arc item actions.
     if let Some(patch) = contract.mutation(ChangeMode::Patch) {
-        sections.push_str(&format!(
-            "- [{}]({}): {}\n",
-            patch.label,
-            example_uri,
-            action_summary(patch)
-        ));
+        let mut spec = action_spec(patch.label, contract, patch, current);
+        spec.uri_template = example_uri.clone();
+        spec.uri = target_uri.clone();
+        actions.push(spec);
     }
-    sections.push('\n');
 
-    Some(format!("## {}\n\n{}", contract.name, sections))
+    Some(AffordanceSpec {
+        kind: kind.slug().to_string(),
+        name: contract.name.to_string(),
+        links: link_specs(contract, current),
+        filters: filter_specs(contract),
+        actions,
+    })
+}
+
+#[cfg(test)]
+fn artifact_affordance_with_schema(
+    kind: ResourceKind,
+    addressed_name: Option<&str>,
+    schema: &serde_json::Value,
+) -> Option<String> {
+    artifact_affordance_spec_with_schema(kind, addressed_name, schema, None)
+        .map(|spec| render_affordance(&spec))
 }
 
 /// Map a JSON Schema `type` to the `KeyType` label used in affordance key specs.

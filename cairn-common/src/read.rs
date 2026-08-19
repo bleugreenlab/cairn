@@ -101,6 +101,56 @@ impl ImageBlock {
 pub struct Affordance {
     pub kind: SegmentKind,
     pub block: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<AffordanceSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AffordanceSpec {
+    pub kind: String,
+    pub name: String,
+    pub links: Vec<LinkSpec>,
+    pub filters: Vec<FilterSpec>,
+    pub actions: Vec<ActionSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkSpec {
+    pub label: String,
+    pub uri_template: String,
+    pub uri: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterSpec {
+    pub key: String,
+    pub values: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionSpec {
+    pub label: String,
+    pub mode: String,
+    pub uri_template: String,
+    pub uri: Option<String>,
+    pub required: Vec<KeyInfo>,
+    pub optional: Vec<KeyInfo>,
+    pub example: String,
+    /// Prose an action carries beyond its key list, appended verbatim after the
+    /// rendered keys and before the example. Carries its own leading separator
+    /// because the guidance is a continuation of the key sentence, not a new
+    /// one (`\" with text, status, ...\"`, `\"; the slug is immutable\"`).
+    /// A consumer that only builds a payload ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeyInfo {
+    pub key: String,
+    pub ty: String,
+    pub note: String,
+    pub aliases: Vec<String>,
 }
 
 /// Per-segment metadata. Lossless: the composed header suffix is a terse
@@ -190,6 +240,10 @@ pub struct ReadBatchEnvelope {
     pub images: Vec<ImageBlock>,
     /// Lossless per-segment metadata; never surfaced as its own content block.
     pub segments: Vec<SegmentMeta>,
+    /// Structured affordances in segment order. Unlike the rendered blocks,
+    /// these are never deduplicated or replaced by session pointers.
+    #[serde(default)]
+    pub affordances: Vec<Affordance>,
     /// Final per-segment bodies, in the same order as `segments`. Present only
     /// when the `read_batch` caller opts in with `include_bodies: true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

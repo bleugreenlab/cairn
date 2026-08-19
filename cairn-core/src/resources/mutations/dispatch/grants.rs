@@ -19,6 +19,7 @@ pub(super) async fn dispatch(
 ) -> ResourceMutationResult<Option<String>> {
     let summary = match (resource, item.mode) {
         (CairnResource::Grant { id }, ChangeMode::Patch) => {
+            let stored_id = crate::resources::grants::stored_grant_id(id);
             let payload = item
                 .payload
                 .as_ref()
@@ -37,9 +38,10 @@ pub(super) async fn dispatch(
                 format!("Would revoke authority grant '{id}'")
             } else {
                 let revoked_by = payload_str(payload, "revokedBy", &["revoked_by"]);
-                let revoked = crate::authorization::revoke_grant(&orch.db.local, id, revoked_by)
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?;
+                let revoked =
+                    crate::authorization::revoke_grant(&orch.db.local, &stored_id, revoked_by)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
                 if revoked {
                     format!(
                         "Revoked authority grant '{id}'; it stops authorizing on the next check"

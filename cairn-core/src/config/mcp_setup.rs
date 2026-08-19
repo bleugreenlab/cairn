@@ -30,7 +30,7 @@ fn build_mcp_config_json(
     cairn_home: Option<&str>,
     log_level: &str,
 ) -> serde_json::Value {
-    let mut args: Vec<&str> = Vec::new();
+    let mut args: Vec<&str> = vec!["mcp"];
     if let Some(agents_json) = available_agents {
         args.push("--agents");
         args.push(agents_json);
@@ -116,6 +116,7 @@ mod tests {
             cairn.get("command").unwrap().as_str().unwrap(),
             "/usr/bin/cairn-cmd"
         );
+        assert_eq!(cairn["args"], serde_json::json!(["mcp"]));
         let env = cairn.get("env").unwrap();
         assert_eq!(
             env.get("CAIRN_CALLBACK_URL").unwrap().as_str().unwrap(),
@@ -217,6 +218,7 @@ mod tests {
         );
 
         let args = config["mcpServers"]["cairn"]["args"].as_array().unwrap();
-        assert!(args.contains(&serde_json::json!("--agents")));
+        assert_eq!(args[0], serde_json::json!("mcp"));
+        assert_eq!(args[1], serde_json::json!("--agents"));
     }
 }

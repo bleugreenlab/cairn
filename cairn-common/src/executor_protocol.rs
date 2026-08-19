@@ -763,7 +763,7 @@ pub struct LearnedResourceEstimate {
 /// enrolled remotes. A peer at 60 never reports the transition history used to
 /// diagnose attach and link failures, so the handshake must not present the two
 /// wire contracts as equivalent.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 61;
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 62;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //

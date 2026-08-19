@@ -5,11 +5,12 @@ use super::{
 };
 use crate::services::EventEmitter;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use uuid::Uuid;
 
 const RELEASE_BASE: &str = "https://github.com/bleugreenlab/cairn/releases/download";
@@ -28,6 +29,7 @@ struct VoiceServiceInner {
     loaded_model: Mutex<Option<VoiceModel>>,
     shutting_down: AtomicBool,
     process: Mutex<Option<VoiceProcess>>,
+    file_transcription_cancellations: Mutex<HashMap<String, Arc<Notify>>>,
     stream_feed_admission: Arc<Semaphore>,
     engine_state: Mutex<EngineState>,
     restart_attempts: AtomicU32,
@@ -107,6 +109,7 @@ impl VoiceService {
                 loaded_model: Mutex::new(None),
                 shutting_down: AtomicBool::new(false),
                 process: Mutex::new(None),
+                file_transcription_cancellations: Mutex::new(HashMap::new()),
                 stream_feed_admission: Arc::new(Semaphore::new(8)),
                 engine_state: Mutex::new(EngineState::Stopped),
                 restart_attempts: AtomicU32::new(0),
@@ -244,22 +247,91 @@ impl VoiceServiceHandle {
         self.status().await
     }
 
-    pub async fn transcribe_file(&self, path: &Path, model: VoiceModel) -> VoiceResult<Transcript> {
-        let request_id = Uuid::new_v4().to_string();
-        let process = self.process_for(model).await?;
-        let result = process
-            .request(
-                &ProtocolCommand::TranscribeFile {
-                    request_id: request_id.clone(),
-                    path: path.to_string_lossy().into_owned(),
-                    options: Value::Object(Default::default()),
-                },
-                &request_id,
-            )
-            .await;
-        drop(process);
+    pub async fn transcribe_file(
+        &self,
+        path: &Path,
+        model: VoiceModel,
+        request_id: Option<String>,
+    ) -> VoiceResult<Transcript> {
+        let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let cancellation = Arc::new(Notify::new());
+        self.0
+            .file_transcription_cancellations
+            .lock()
+            .await
+            .insert(request_id.clone(), cancellation.clone());
+        let active = Arc::new(AtomicBool::new(false));
+        let active_request = active.clone();
+        *self.0.engine_state.lock().await = EngineState::Busy;
+        emit_voice_event(
+            self.0.emitter.as_ref(),
+            VoiceEvent::EngineChanged {
+                state: EngineState::Busy,
+                detail: None,
+            },
+        );
+        let request = async {
+            let process = self.process_for(model).await?;
+            active_request.store(true, Ordering::Release);
+            process
+                .request(
+                    &ProtocolCommand::TranscribeFile {
+                        request_id: request_id.clone(),
+                        path: path.to_string_lossy().into_owned(),
+                        options: Value::Object(Default::default()),
+                    },
+                    &request_id,
+                )
+                .await
+        };
+        let result = tokio::select! {
+            result = request => result,
+            () = cancellation.notified() => {
+                if active.load(Ordering::Acquire) {
+                    self.0.process.lock().await.take();
+                    *self.0.loaded_model.lock().await = None;
+                }
+                Err(VoiceError::Request {
+                    code: "cancelled".into(),
+                    message: "file transcription was cancelled".into(),
+                })
+            }
+        };
+        self.0
+            .file_transcription_cancellations
+            .lock()
+            .await
+            .remove(&request_id);
         self.invalidate_on_transport(&result).await;
+        let process_restarts = matches!(result, Err(VoiceError::Transport(_)))
+            || matches!(result, Err(VoiceError::Request { ref code, .. }) if code == "cancelled");
+        let final_state = if process_restarts {
+            EngineState::Restarting
+        } else {
+            EngineState::Ready
+        };
+        *self.0.engine_state.lock().await = final_state.clone();
+        emit_voice_event(
+            self.0.emitter.as_ref(),
+            VoiceEvent::EngineChanged {
+                state: final_state,
+                detail: None,
+            },
+        );
         result
+    }
+
+    pub async fn cancel_file_transcription(&self, request_id: &str) {
+        if let Some(cancellation) = self
+            .0
+            .file_transcription_cancellations
+            .lock()
+            .await
+            .get(request_id)
+            .cloned()
+        {
+            cancellation.notify_one();
+        }
     }
 
     pub async fn stream_start(&self) -> VoiceResult<String> {

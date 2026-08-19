@@ -5,7 +5,8 @@
 
 use super::check_results::read_project_check_results;
 use super::common::{
-    affordance_for_kind, find_query_value, reject_query_params, resolve_home_relative_resource_uri,
+    affordance_for_kind, affordance_spec_for_kind, find_query_value, reject_query_params,
+    render_affordance, resolve_home_relative_resource_uri,
 };
 use super::diff::read_node_diff;
 use super::files::{read_issue_changed, read_issue_changed_projection};
@@ -1108,25 +1109,26 @@ pub(crate) async fn produce_cairn_resource(
         // addressed name actually validates against, so a copied example is a
         // valid write even for a custom schema (CAIRN #170). Fall back to the
         // static contract block when no schema resolves.
-        let block = match &resource {
+        let schema_spec = match &resource {
             CairnResource::NodeArtifact {
                 project,
                 number,
                 exec_seq,
                 node_id,
                 name,
-            } => super::node::artifact_affordance_block(
-                orch,
-                project,
-                *number,
-                *exec_seq,
-                node_id,
-                None,
-                name.as_deref(),
-                resource.kind(),
-            )
-            .await
-            .unwrap_or_else(|| affordance_for_kind(resource.kind())),
+            } => {
+                super::node::artifact_affordance_spec(
+                    orch,
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                    None,
+                    name.as_deref(),
+                    &resource,
+                )
+                .await
+            }
             CairnResource::TaskArtifact {
                 project,
                 number,
@@ -1134,23 +1136,32 @@ pub(crate) async fn produce_cairn_resource(
                 node_id,
                 task_name,
                 name,
-            } => super::node::artifact_affordance_block(
-                orch,
-                project,
-                *number,
-                *exec_seq,
-                node_id,
-                Some(task_name),
-                name.as_deref(),
-                resource.kind(),
-            )
-            .await
-            .unwrap_or_else(|| affordance_for_kind(resource.kind())),
-            _ => affordance_for_kind(resource.kind()),
+            } => {
+                super::node::artifact_affordance_spec(
+                    orch,
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                    Some(task_name),
+                    name.as_deref(),
+                    &resource,
+                )
+                .await
+            }
+            _ => None,
         };
+        // One source for both projections: the rendered markdown is the spec
+        // rendered, so a schema-derived artifact and a contract-derived resource
+        // cannot advertise different things to a reader and to a client that
+        // builds writes from the structure.
+        let spec =
+            schema_spec.or_else(|| affordance_spec_for_kind(resource.kind(), Some(&resource)));
+        let block = spec.as_ref().map(render_affordance).unwrap_or_default();
         (!block.is_empty()).then_some(Affordance {
             kind: SegmentKind::Resource,
             block,
+            spec,
         })
     };
 
@@ -1632,6 +1643,9 @@ async fn render_resource_body(
         }
         CairnResource::ProjectCodemap { project } => {
             super::codemap::read_codemap(orch, db, &project, &params).await
+        }
+        CairnResource::ProjectMap { project } => {
+            super::project_map::read_project_map(orch, db, &project, &params).await
         }
         CairnResource::ProjectThreads { project } => {
             if let Some(error) = reject_query_params("project threads", &params) {

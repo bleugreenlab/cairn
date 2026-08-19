@@ -54,6 +54,20 @@ pub(crate) const PROJECT_CODEMAP_CONTRACT: ResourceContract = ResourceContract {
     mutations: NO_MUTATIONS,
 };
 
+pub(crate) const PROJECT_MAP_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::ProjectMap,
+    uri_template: "cairn://p/{project}/map",
+    name: "Project map",
+    description: "A bounded plain-text projection of code shape, recent file activity, and every fleet machine. This is a pure view over the cached code map, job file activity, and fleet snapshot; reads create no state",
+    read_projections: &[ProjectionSpec {
+        key: "path",
+        values: "repository-relative directory for file-level drilldown",
+    }],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const PROJECT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Project,
     uri_template: "cairn://p/{project}",

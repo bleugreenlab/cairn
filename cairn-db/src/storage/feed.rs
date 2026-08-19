@@ -98,12 +98,44 @@ pub enum FeedAck {
 ///
 /// `mint` is a parameter so the exclusion can be tested directly instead of
 /// waiting on one-in-four-billion odds to arrive.
-fn issuance_nonce(acknowledged: Option<&str>, mut mint: impl FnMut() -> String) -> String {
+fn issuance_nonce<E>(
+    acknowledged: Option<&str>,
+    mut mint: impl FnMut() -> Result<String, E>,
+) -> Result<String, E> {
     loop {
-        let candidate = mint();
-        if !acknowledged.is_some_and(|prior| unigram::matches(prior, &candidate)) {
-            return candidate;
+        let candidate = mint()?;
+        if !acknowledged.is_some_and(|prior| nonce_matches(prior, &candidate)) {
+            return Ok(candidate);
         }
+    }
+}
+
+/// Compare a nonce this server issued against one a caller presented.
+///
+/// The comparison is driven by what the ISSUED side is, which this server minted
+/// and therefore knows, rather than by what either string happens to look like.
+/// Guessing a format from syntax is how a legacy value that reads as alphabet
+/// words gets silently reinterpreted as a word nonce.
+///
+/// A nonce issued as words is compared on the bytes it decodes to, reading the
+/// presented side forgivingly: it has been through a model, so case, separators,
+/// and line wrapping are all damage worth surviving. What is not forgiven is a
+/// value that decodes to different bytes, so forgiveness never widens what is
+/// accepted beyond the value actually issued.
+///
+/// A nonce issued in the older opaque format predates the word form and is not a
+/// unigram value at all. It compares as text, trimmed and case-folded, which is
+/// what a hex token tolerates and all it needs — and is why swapping the minted
+/// form needed no migration.
+fn nonce_matches(issued: &str, presented: &str) -> bool {
+    // An absent or blank issuance matches nothing. Without this, two empty
+    // strings compare equal and an unissued token acknowledges a page.
+    if issued.trim().is_empty() {
+        return false;
+    }
+    match unigram::decode(issued) {
+        Ok(bytes) => unigram::decode_recovered(presented).is_ok_and(|shown| shown == bytes),
+        Err(_) => issued.trim().eq_ignore_ascii_case(presented.trim()),
     }
 }
 
@@ -191,7 +223,11 @@ impl LocalDb {
                 // width. Minted here rather than before the transaction so the
                 // exclusion below sees this home's committed acknowledged nonce,
                 // and so an empty page mints nothing at all.
-                let nonce = issuance_nonce(acknowledged_nonce.as_deref(), || unigram::mint(4));
+                let nonce = issuance_nonce(acknowledged_nonce.as_deref(), || {
+                    unigram::try_mint(4).map_err(|error| {
+                        DbError::internal(format!("no OS entropy for a feed nonce: {error}"))
+                    })
+                })?;
 
                 // The issuance supersedes any earlier outstanding one, which is
                 // what makes an unacknowledged token from a previous read stale.
@@ -267,21 +303,16 @@ impl LocalDb {
                 let issued_nonce = issued_nonce.filter(|issued| {
                     !acknowledged_nonce
                         .as_deref()
-                        .is_some_and(|prior| unigram::matches(prior, issued))
+                        .is_some_and(|prior| nonce_matches(prior, issued))
                 });
 
-                // Comparisons go through `unigram::matches`, which forgives the
-                // damage a round trip through a model does to a token — case,
-                // surrounding and interior whitespace, a separator swapped for a
-                // hyphen or a newline. What it does not forgive is a token that
-                // decodes to different bytes, so forgiveness never widens what is
-                // accepted beyond the value actually issued. A token issued in the
-                // older opaque format matches itself under the same call, which is
-                // why swapping the minted form needs no migration.
+                // Comparisons go through `nonce_matches`, which forgives the damage
+                // a round trip through a model does to a token, and forgives nothing
+                // that changes the bytes it stands for.
                 if let Some((outstanding, through)) = issued_nonce
                     .as_deref()
                     .zip(issued_through)
-                    .filter(|(nonce, _)| unigram::matches(nonce, &token))
+                    .filter(|(nonce, _)| nonce_matches(nonce, &token))
                 {
                     // Monotonic, and bounded by what this token actually showed:
                     // posts that arrived after the issuance stay unread.
@@ -314,7 +345,7 @@ impl LocalDb {
                 // superseded the issuance. Reported as the success it already was.
                 if acknowledged_nonce
                     .as_deref()
-                    .is_some_and(|nonce| unigram::matches(nonce, &token))
+                    .is_some_and(|nonce| nonce_matches(nonce, &token))
                 {
                     return Ok(FeedAck::AlreadyAcknowledged { at: position });
                 }
@@ -634,6 +665,42 @@ mod tests {
     /// repeats the token that last advanced the position, so the state in which a
     /// presented token could belong to either of two histories is never created.
     /// Driven with a scripted mint rather than waiting on one-in-four-billion odds.
+    /// `nonce_matches` decides by what the ISSUED side is, because that is the
+    /// side this server minted and therefore knows. These are the cases where
+    /// deciding by what the strings look like instead would get it wrong.
+    #[test]
+    fn nonce_comparison_is_driven_by_the_issued_form_not_by_syntax() {
+        let issued = unigram::encode(&[1, 2, 3, 4]);
+
+        // A word nonce forgives the damage a round trip does...
+        assert!(nonce_matches(&issued, &issued));
+        assert!(nonce_matches(&issued, &issued.to_uppercase()));
+        assert!(nonce_matches(
+            &issued,
+            &format!("  {}  ", issued.replace(' ', " - "))
+        ));
+        // ...and forgives nothing that changes the bytes.
+        assert!(!nonce_matches(&issued, &unigram::encode(&[1, 2, 3, 5])));
+        assert!(!nonce_matches(&issued, &unigram::encode(&[1, 2, 3])));
+
+        // A token issued in the older opaque format keeps matching itself, which
+        // is what let the minted form change without a migration.
+        let legacy = "3925ca9a0065442496cc231d6ae48870";
+        assert!(nonce_matches(legacy, legacy));
+        assert!(nonce_matches(
+            legacy,
+            &format!("  {}  ", legacy.to_uppercase())
+        ));
+        assert!(!nonce_matches(legacy, "3925ca9a0065442496cc231d6ae48871"));
+        assert!(!nonce_matches(legacy, &issued));
+
+        // An absent issuance matches nothing at all. Compared as text these are
+        // equal, which would let a caller acknowledge a page with no token.
+        assert!(!nonce_matches("", ""));
+        assert!(!nonce_matches("   ", ""));
+        assert!(!nonce_matches("", &issued));
+    }
+
     #[test]
     fn an_issuance_never_repeats_the_token_that_last_advanced_the_position() {
         let prior = unigram::encode(&[1, 2, 3, 4]);
@@ -642,15 +709,18 @@ mod tests {
         // restatement of it, then a genuinely different one.
         let mut scripted = vec![fresh.clone(), prior.to_uppercase(), prior.clone()];
         assert_eq!(
-            issuance_nonce(Some(&prior), || scripted.pop().unwrap()),
-            fresh,
+            issuance_nonce(Some(&prior), || Ok::<_, ()>(scripted.pop().unwrap())),
+            Ok(fresh),
             "a candidate equal to the acknowledged nonce must be discarded, and so \
              must one that merely matches it after normalization"
         );
 
         // With nothing acknowledged there is nothing to collide with.
         let mut once = vec![prior.clone()];
-        assert_eq!(issuance_nonce(None, || once.pop().unwrap()), prior);
+        assert_eq!(
+            issuance_nonce(None, || Ok::<_, ()>(once.pop().unwrap())),
+            Ok(prior)
+        );
     }
 
     /// A retry of an acknowledgement must never acknowledge a page its caller

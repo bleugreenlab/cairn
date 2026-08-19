@@ -30,27 +30,6 @@ use super::context::{
 };
 use super::resolution::resolve_pr_node;
 
-/// Mergeability override for a jj PR read path: `Conflicting` only when the source
-/// bookmark's TIP carries a recorded conflict (a hard block), else `None` (keep
-/// the GitHub value). A clean-tip / conflicted-intermediate branch is
-/// auto-recoverable via the merge-time flatten, so it is NOT surfaced as a hard
-/// `Conflicting` that disables the merge button.
-fn source_tip_is_conflicted(
-    orch: &Orchestrator,
-    repo_path: &str,
-    source_branch: &str,
-    target_branch: &str,
-) -> bool {
-    source_conflict_report(
-        &orch.jj_binary_path,
-        &orch.config_dir,
-        repo_path,
-        source_branch,
-        Some(target_branch),
-    )
-    .is_some_and(|report| report.tip_conflicted)
-}
-
 /// The mergeability an artifact may publish for a live pull request.
 ///
 /// The precedence here is the whole point, because the three inputs do not all
@@ -482,13 +461,7 @@ pub(crate) async fn pr_snapshot_for_job(
     live: bool,
 ) -> Result<Arc<PrSnapshot>, String> {
     let cache = &orch.pr_refresh_cache;
-    if live {
-        // Replace what is published, or join the refresh already in flight — a
-        // burst of refresh presses is one refresh. Invalidating unconditionally
-        // would advance once per caller, and every advance rejects the readers
-        // already computing, running the GitHub fetch and `jj` probes N times.
-        cache.invalidate_published(job_id, "explicit-refresh");
-    } else {
+    if !live {
         // Every mounted reader observes the same expired snapshot at the moment
         // a freshness window elapses, so the decision to advance has to be made
         // under the same lock as the advance itself.
@@ -503,19 +476,24 @@ pub(crate) async fn pr_snapshot_for_job(
     // reader that merely joined someone else's failed flight gets the generic
     // message, because the specific one belongs to the reader that produced it.
     let failure: Mutex<Option<String>> = Mutex::new(None);
-    let snapshot = cache
-        .get_or_compute(job_id, || async {
-            match compute_pr_snapshot(orch, job_id).await {
-                Ok(snapshot) => Some(Arc::new(snapshot)),
-                Err(error) => {
-                    if let Ok(mut slot) = failure.lock() {
-                        *slot = Some(error);
-                    }
-                    None
+    let compute = || async {
+        match compute_pr_snapshot(orch, job_id).await {
+            Ok(snapshot) => Some(Arc::new(snapshot)),
+            Err(error) => {
+                if let Ok(mut slot) = failure.lock() {
+                    *slot = Some(error);
                 }
+                None
             }
-        })
-        .await;
+        }
+    };
+    // An explicit demand chooses and reserves the replacement generation in one
+    // cache operation. Ordinary reads simply join or consume that generation.
+    let snapshot = if live {
+        cache.refresh_or_compute(job_id, compute).await
+    } else {
+        cache.get_or_compute(job_id, compute).await
+    };
 
     match snapshot {
         Some(snapshot) => Ok(snapshot),
@@ -1870,7 +1848,8 @@ mod tests {
 
         // Warm it first, so the burst is a demand to replace a published value.
         refresh_pr_for_job(&orch, "job-c").await.unwrap();
-        let warm = orch.pr_refresh_cache.counters().misses;
+        let warm_counters = orch.pr_refresh_cache.counters();
+        let warm_generation = orch.pr_refresh_cache.generation("job-c");
 
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
         let mut readers = Vec::new();
@@ -1886,10 +1865,25 @@ mod tests {
             assert_eq!(reader.await.unwrap(), PrState::Open);
         }
 
+        let counters = orch.pr_refresh_cache.counters();
         assert_eq!(
-            orch.pr_refresh_cache.counters().misses,
-            warm + 1,
+            counters.misses,
+            warm_counters.misses + 1,
             "sixteen simultaneous refresh demands must produce one refresh"
+        );
+        assert_eq!(
+            orch.pr_refresh_cache.generation("job-c"),
+            warm_generation + 1,
+            "the burst must choose exactly one replacement generation"
+        );
+        assert_eq!(
+            counters.invalidated_during_compute, warm_counters.invalidated_during_compute,
+            "burst coalescing is not an invalidation-during-compute retry"
+        );
+        assert_eq!(
+            counters.coalesced + counters.hits,
+            warm_counters.coalesced + warm_counters.hits + 15,
+            "every other explicit caller must join or consume the burst's flight"
         );
     }
 

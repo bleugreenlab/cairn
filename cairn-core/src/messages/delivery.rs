@@ -360,6 +360,25 @@ pub(crate) async fn insert_system_direct_push_conn(
     content: &str,
     urgency: DeliveryUrgency,
 ) -> Result<(String, crate::orchestrator::attention_push::Wake), DbError> {
+    insert_system_direct_push_with_key_conn(
+        conn,
+        recipient_job_id,
+        recipient_run_id,
+        content,
+        urgency,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn insert_system_direct_push_with_key_conn(
+    conn: &cairn_db::turso::Connection,
+    recipient_job_id: &str,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    push_key: Option<&str>,
+) -> Result<(String, crate::orchestrator::attention_push::Wake), DbError> {
     use crate::orchestrator::attention_push::Boundary;
 
     let now = chrono::Utc::now().timestamp();
@@ -374,26 +393,56 @@ pub(crate) async fn insert_system_direct_push_conn(
     .await?;
 
     let wake = direct_wake_for_urgency(urgency);
-    let content_ref = node_uri_for_job_conn(conn, recipient_job_id)
-        .await?
-        .unwrap_or_else(|| recipient_job_id.to_string());
+    // Stable-key schedule pushes supersede in place, so their changing referent
+    // is the frozen message for the newest occurrence. Ordinary directs retain
+    // the recipient home as their card link and identify the message in the key.
+    let content_ref = if push_key.is_some_and(|key| key.starts_with("schedule:")) {
+        message_id.clone()
+    } else {
+        node_uri_for_job_conn(conn, recipient_job_id)
+            .await?
+            .unwrap_or_else(|| recipient_job_id.to_string())
+    };
     let push_id = uuid::Uuid::new_v4().to_string();
-    let key = format!("direct:{message_id}");
-    conn.execute(
-        "INSERT INTO attention_pushes
-           (id, recipient, content_ref, wake, boundary, key, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            push_id.as_str(),
-            recipient_job_id,
-            content_ref.as_str(),
-            wake.as_str(),
-            Boundary::Event.as_str(),
-            key.as_str(),
-            now
-        ],
-    )
-    .await?;
+    let key = push_key
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("direct:{message_id}"));
+    let updated = if push_key.is_some() {
+        conn.execute(
+            "UPDATE attention_pushes
+                SET content_ref=?1, wake=?2, boundary=?3, created_at=?4
+              WHERE recipient=?5 AND key=?6
+                AND delivered_event_id IS NULL AND retired_at IS NULL",
+            params![
+                content_ref.as_str(),
+                wake.as_str(),
+                Boundary::Event.as_str(),
+                now,
+                recipient_job_id,
+                key.as_str(),
+            ],
+        )
+        .await?
+    } else {
+        0
+    };
+    if updated == 0 {
+        conn.execute(
+            "INSERT INTO attention_pushes
+               (id, recipient, content_ref, wake, boundary, key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                push_id.as_str(),
+                recipient_job_id,
+                content_ref.as_str(),
+                wake.as_str(),
+                Boundary::Event.as_str(),
+                key.as_str(),
+                now
+            ],
+        )
+        .await?;
+    }
 
     Ok((message_id, wake))
 }

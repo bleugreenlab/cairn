@@ -78,9 +78,8 @@ fn header_matches_target(inner: &str, target: &str) -> bool {
 
 /// Whether a header's (suffix-stripped) inner looks like a read target URI. Used
 /// to tell a real section frame from a content line that merely looks like
-/// `=== something ===`. Notably, the CLI relativizes cairn URIs in result text
-/// (`cairn://p/X/…` → `cairn:~/…`), so a resource header can disagree with the
-/// canonical input path while still being a genuine frame.
+/// `=== something ===`. Callers may supply home-relative resource targets, so
+/// `cairn:~` remains a valid header scheme alongside canonical Cairn URIs.
 fn is_uri_shaped(inner: &str) -> bool {
     const SCHEMES: [&str; 5] = ["cairn://", "cairn:~", "file:", "http://", "https://"];
     let stripped = strip_header_suffix(inner);
@@ -200,9 +199,8 @@ fn extract_output(result: &str) -> String {
 /// Split a composed read result into per-target token segments. `expected` is
 /// the read's input `paths`. The batch is assembled in input order with one
 /// frame per target, so when the framed-section count matches the input count,
-/// **position** decides each segment's target — which survives the CLI
-/// relativizing cairn URIs in headers (a resource header can read `cairn:~/…`
-/// while the input path is canonical `cairn://p/X/…`). When the counts disagree
+/// **position** decides each segment's target. This remains correct when a
+/// producer's header spelling differs from the caller's input path. When the counts disagree
 /// (a stray content frame, say), fall back to matching each header against the
 /// input paths. A single unframed read yields one whole-body segment.
 pub(crate) fn read_segment_tokens(
@@ -292,9 +290,9 @@ mod tests {
     }
 
     #[test]
-    fn single_relativized_resource_read_counts_body_only() {
-        // The CLI relativizes cairn URIs in result text, so the header reads
-        // `cairn:~/issues` while the input path is canonical. A single read must
+    fn single_home_relative_resource_header_counts_body_only() {
+        // A producer may emit a home-relative header while the recorded input is
+        // canonical. A single read must
         // still attach a count, and tokenize the body only (not the header line).
         let segs = read_segment_tokens(
             "=== cairn:~/issues?limit=3 [3 of 3 issues] ===\nissue body here",
@@ -307,9 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn relativized_resource_header_maps_to_input_path_positionally() {
+    fn divergent_resource_header_maps_to_input_path_positionally() {
         // A file read + a resource read in one batch, where the resource header
-        // was relativized away from the canonical input path. Positional mapping
+        // differs from the canonical input path. Positional mapping
         // must still give the resource row its own segment keyed to the input.
         let body = "=== file:a.rs [lines 1\u{2013}2 of 2] ===\nfn a() {}\n=== cairn:~/issues?limit=2 [2 of 9 issues] ===\nissue list here";
         let segs = read_segment_tokens(

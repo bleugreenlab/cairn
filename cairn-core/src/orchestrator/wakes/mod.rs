@@ -12,6 +12,7 @@ mod posts;
 #[cfg(test)]
 mod posts_tests;
 mod routing;
+mod schedules;
 mod side_channel;
 mod store;
 mod terminal;
@@ -25,6 +26,7 @@ pub use child::*;
 pub use matching::*;
 pub use posts::*;
 pub use routing::*;
+pub use schedules::*;
 pub use side_channel::*;
 pub use store::*;
 pub use terminal::*;

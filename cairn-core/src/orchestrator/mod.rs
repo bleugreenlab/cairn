@@ -364,7 +364,6 @@ impl OrchestratorBuilder {
             project_overlays: Arc::new(
                 crate::mcp::handlers::read::overlay::ProjectOverlayRegistry::default(),
             ),
-            call_admission: Arc::new(crate::execution::jobs::CallAdmission::default()),
             park_slots: Arc::new(crate::orchestrator::lifecycle::ParkSlots::default()),
             fleet,
             object_plane: Arc::new(crate::orchestrator::object_plane::ObjectPlaneState::default()),
@@ -925,12 +924,6 @@ pub struct Orchestrator {
     /// Runner-owned immutable base tables and SHA-keyed corrections for
     /// store-native branch tree projections.
     pub(crate) project_overlays: Arc<crate::mcp::handlers::read::overlay::ProjectOverlayRegistry>,
-
-    /// Generic bounded-admission ledger for ephemeral (call) fan-out. The calls
-    /// path (only) consults it; every real backend reports an unbounded ceiling
-    /// today, so `admit` is a pure passthrough in production. Shared across
-    /// clones behind the `Arc`.
-    pub(crate) call_admission: Arc<crate::execution::jobs::CallAdmission>,
 
     /// Per-run debounce for the deferred durable-wait park, so a turn suspending
     /// several of its calls at once is interrupted once, after the last of them

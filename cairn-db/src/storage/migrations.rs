@@ -8,6 +8,28 @@ macro_rules! private_codex_watchdog_ledger {
     };
 }
 
+/// Reconstructable launch payloads for ephemeral calls waiting in local runtime admission.
+macro_rules! private_prepared_runtime_calls {
+    () => {
+        Migration::new(
+            "0204",
+            "prepared_runtime_calls",
+            include_str!("../../../../turso_migrations/0204_prepared_runtime_calls.sql"),
+        )
+    };
+}
+
+/// Anchored recurrence rules owned by a durable local thread home.
+macro_rules! private_wake_schedules {
+    () => {
+        Migration::new(
+            "0205",
+            "wake_schedules",
+            include_str!("../../../../turso_migrations/0205_wake_schedules.sql"),
+        )
+    };
+}
+
 /// CAIRN-4225: the per-base-commit code map (source inventory + import graph)
 /// the workspace map surface reads. Private only -- it is derived wholly from a
 /// commit every replica already has, so replicating the projection would buy
@@ -1586,6 +1608,8 @@ macro_rules! private_lineage {
             shared_tail_job_file_activity!(),
             private_codemap_cache!(),
             private_runtime_admission!(),
+            private_prepared_runtime_calls!(),
+            private_wake_schedules!(),
         ]
     };
 }
@@ -2478,6 +2502,17 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "runtime_admission_cursors",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
+    (
+        "prepared_runtime_calls",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "wake_schedules",
+        TableScope::Private(PrivateReason::DeferredShared {
+            issue: "CAIRN-4107",
+            target: ScopeTarget::ProjectScoped,
+        }),
+    ),
     // Runner-local observability history (0151/0152): what THIS runner's
     // Response invocations and route firings did. Intentionally not
     // team-replicated, same category as the workflow journal above.
@@ -3337,6 +3372,8 @@ mod tests {
                 "0201_job_file_activity".to_string(),
                 "0202_codemap_cache".to_string(),
                 "0203_runtime_admission".to_string(),
+                "0204_prepared_runtime_calls".to_string(),
+                "0205_wake_schedules".to_string(),
             ]
         );
         Ok(db)

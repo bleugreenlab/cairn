@@ -5,8 +5,15 @@ use crate::schemas::RunInput;
 use crate::server::CairnCmd;
 
 pub(crate) fn create_test_mcp_with_home_uri(home_uri: Option<&str>) -> CairnCmd {
+    create_test_mcp_with_callback_url("http://localhost:3847", home_uri)
+}
+
+pub(crate) fn create_test_mcp_with_callback_url(
+    callback_url: &str,
+    home_uri: Option<&str>,
+) -> CairnCmd {
     CairnCmd::new_with_home_uri(
-        "http://localhost:3847".to_string(),
+        callback_url.to_string(),
         "/test/path".to_string(),
         None,
         None,

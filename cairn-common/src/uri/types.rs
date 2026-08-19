@@ -117,6 +117,10 @@ pub enum CairnResource {
     ProjectCodemap {
         project: String,
     },
+    /// A bounded textual projection of code shape, activity, and fleet.
+    ProjectMap {
+        project: String,
+    },
     /// Immutable check observations addressed by a revision coordinate.
     ProjectCheckResults {
         project: String,
@@ -788,6 +792,7 @@ impl CairnResource {
             Self::Post { .. } => ResourceKind::Post,
             Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
+            Self::ProjectMap { .. } => ResourceKind::ProjectMap,
             Self::ProjectCheckResults { .. } => ResourceKind::ProjectCheckResults,
             Self::ProjectCheckObservation { .. } => ResourceKind::ProjectCheckObservation,
             Self::ProjectImage { .. } => ResourceKind::ProjectImage,

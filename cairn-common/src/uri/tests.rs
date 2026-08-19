@@ -1869,6 +1869,7 @@ fn project_parser_literals_are_reserved_thread_names() {
         "agents",
         "browser",
         "codemap",
+        "map",
         "images",
         "issues",
         "messages",
@@ -1887,4 +1888,17 @@ fn project_parser_literals_are_reserved_thread_names() {
             "project parser literal must be reserved for thread names: {literal}"
         );
     }
+}
+
+#[test]
+fn project_map_uri_parses_builds_and_reports_its_kind() {
+    let resource = parse_uri("cairn://p/CAIRN/map").unwrap();
+    assert_eq!(
+        resource,
+        CairnResource::ProjectMap {
+            project: "cairn".into(),
+        }
+    );
+    assert_eq!(resource.to_uri(), "cairn://p/cairn/map");
+    assert_eq!(resource.kind(), ResourceKind::ProjectMap);
 }

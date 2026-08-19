@@ -42,7 +42,32 @@ pub(super) async fn dispatch(
             } else {
                 "user"
             };
-            if let Some(value) = payload.get("subscribe") {
+            if let Some(value) = payload.get("schedule") {
+                let schedule = parse_schedule_create(index, item, value)?;
+                let thread_id = crate::orchestrator::wakes::thread_home_for_job(
+                    orch.db.for_project(project).await.as_ref(),
+                    &job_id,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                if dry_run {
+                    format!(
+                        "Would schedule wake every {}ms: {}",
+                        schedule.every_ms, schedule.reason
+                    )
+                } else {
+                    let created = crate::orchestrator::wakes::create_wake_schedule(
+                        orch.db.for_project(project).await.as_ref(),
+                        &thread_id,
+                        schedule.every_ms,
+                        &schedule.reason,
+                        created_by,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    format!("Scheduled wake {} every {}ms", created.id, created.every_ms)
+                }
+            } else if let Some(value) = payload.get("subscribe") {
                 let filter = normalize_posts_filter(
                     index,
                     item,
@@ -83,60 +108,81 @@ pub(super) async fn dispatch(
                     )
                 }
             } else if let Some(value) = payload.get("mute") {
-                let filter = normalize_checks_filter(
-                    orch,
-                    index,
-                    item,
-                    normalize_posts_filter(
-                        index,
-                        item,
-                        parse_wake_filter(index, item, value, "mute")?,
-                    )?,
-                    project,
-                    *number,
-                    *exec_seq,
-                    node_id,
-                )
-                .await?;
-                let until = payload
-                    .get("until")
-                    .map(|value| {
-                        normalize_posts_filter(
-                            index,
-                            item,
-                            parse_wake_filter(index, item, value, "until")?,
-                        )
-                    })
-                    .transpose()?;
-                let until = match until {
-                    Some(filter) => Some(
-                        normalize_checks_filter(
-                            orch, index, item, filter, project, *number, *exec_seq, node_id,
-                        )
-                        .await?,
-                    ),
-                    None => None,
-                };
-                if dry_run {
-                    format!("Would mute wake: {} {:?}", filter.kind, filter.reference)
-                } else {
-                    let sub = crate::orchestrator::wakes::mute(
+                if let Some(schedule_id) = parse_schedule_reference(index, item, value, "mute")? {
+                    let thread_id = crate::orchestrator::wakes::thread_home_for_job(
                         orch.db.for_project(project).await.as_ref(),
                         &job_id,
-                        &filter.kind,
-                        filter.reference.as_deref(),
-                        filter.fact_kinds.as_deref(),
-                        until.as_ref().map(|until| until.kind.as_str()),
-                        until.as_ref().and_then(|until| until.reference.as_deref()),
-                        created_by,
                     )
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
-                    format!(
-                        "Muted wake {} {}",
-                        sub.source_kind,
-                        sub.source_ref.unwrap_or_else(|| "*".to_string())
+                    if dry_run {
+                        format!("Would mute schedule {schedule_id}")
+                    } else {
+                        let changed = crate::orchestrator::wakes::mute_wake_schedule(
+                            orch.db.for_project(project).await.as_ref(),
+                            &thread_id,
+                            &schedule_id,
+                        )
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                        format!("Muted {} wake schedule(s)", usize::from(changed))
+                    }
+                } else {
+                    let filter = normalize_checks_filter(
+                        orch,
+                        index,
+                        item,
+                        normalize_posts_filter(
+                            index,
+                            item,
+                            parse_wake_filter(index, item, value, "mute")?,
+                        )?,
+                        project,
+                        *number,
+                        *exec_seq,
+                        node_id,
                     )
+                    .await?;
+                    let until = payload
+                        .get("until")
+                        .map(|value| {
+                            normalize_posts_filter(
+                                index,
+                                item,
+                                parse_wake_filter(index, item, value, "until")?,
+                            )
+                        })
+                        .transpose()?;
+                    let until = match until {
+                        Some(filter) => Some(
+                            normalize_checks_filter(
+                                orch, index, item, filter, project, *number, *exec_seq, node_id,
+                            )
+                            .await?,
+                        ),
+                        None => None,
+                    };
+                    if dry_run {
+                        format!("Would mute wake: {} {:?}", filter.kind, filter.reference)
+                    } else {
+                        let sub = crate::orchestrator::wakes::mute(
+                            orch.db.for_project(project).await.as_ref(),
+                            &job_id,
+                            &filter.kind,
+                            filter.reference.as_deref(),
+                            filter.fact_kinds.as_deref(),
+                            until.as_ref().map(|until| until.kind.as_str()),
+                            until.as_ref().and_then(|until| until.reference.as_deref()),
+                            created_by,
+                        )
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                        format!(
+                            "Muted wake {} {}",
+                            sub.source_kind,
+                            sub.source_ref.unwrap_or_else(|| "*".to_string())
+                        )
+                    }
                 }
             } else {
                 return Err(build_failure(
@@ -162,21 +208,6 @@ pub(super) async fn dispatch(
             let value = payload
                 .get("unmute")
                 .ok_or_else(|| build_failure(index, item, "payload.unmute is required"))?;
-            let filter = normalize_checks_filter(
-                orch,
-                index,
-                item,
-                normalize_posts_filter(
-                    index,
-                    item,
-                    parse_wake_filter(index, item, value, "unmute")?,
-                )?,
-                project,
-                *number,
-                *exec_seq,
-                node_id,
-            )
-            .await?;
             let job_id = crate::resources::node::resolve_node_or_task_job_id(
                 orch.db.for_project(project).await.as_ref(),
                 project,
@@ -187,18 +218,54 @@ pub(super) async fn dispatch(
             )
             .await
             .map_err(|error| build_failure(index, item, error))?;
-            if dry_run {
-                format!("Would unmute wake: {} {:?}", filter.kind, filter.reference)
-            } else {
-                let count = crate::orchestrator::wakes::unmute_matching(
+            if let Some(schedule_id) = parse_schedule_reference(index, item, value, "unmute")? {
+                let thread_id = crate::orchestrator::wakes::thread_home_for_job(
                     orch.db.for_project(project).await.as_ref(),
                     &job_id,
-                    &filter.kind,
-                    filter.reference.as_deref(),
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                format!("Unmuted {count} wake subscription(s)")
+                if dry_run {
+                    format!("Would unmute schedule {schedule_id}")
+                } else {
+                    let changed = crate::orchestrator::wakes::unmute_wake_schedule(
+                        orch.db.for_project(project).await.as_ref(),
+                        &thread_id,
+                        &schedule_id,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    format!("Unmuted {} wake schedule(s)", usize::from(changed))
+                }
+            } else {
+                let filter = normalize_checks_filter(
+                    orch,
+                    index,
+                    item,
+                    normalize_posts_filter(
+                        index,
+                        item,
+                        parse_wake_filter(index, item, value, "unmute")?,
+                    )?,
+                    project,
+                    *number,
+                    *exec_seq,
+                    node_id,
+                )
+                .await?;
+                if dry_run {
+                    format!("Would unmute wake: {} {:?}", filter.kind, filter.reference)
+                } else {
+                    let count = crate::orchestrator::wakes::unmute_matching(
+                        orch.db.for_project(project).await.as_ref(),
+                        &job_id,
+                        &filter.kind,
+                        filter.reference.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    format!("Unmuted {count} wake subscription(s)")
+                }
             }
         }
         (
@@ -217,11 +284,6 @@ pub(super) async fn dispatch(
             let value = payload
                 .get("unsubscribe")
                 .ok_or_else(|| build_failure(index, item, "payload.unsubscribe is required"))?;
-            let filter = normalize_posts_filter(
-                index,
-                item,
-                parse_wake_filter(index, item, value, "unsubscribe")?,
-            )?;
             let created_by = if request.run_id.is_some() {
                 "agent"
             } else {
@@ -237,22 +299,49 @@ pub(super) async fn dispatch(
             )
             .await
             .map_err(|error| build_failure(index, item, error))?;
-            if dry_run {
-                format!(
-                    "Would unsubscribe wake: {} {:?}",
-                    filter.kind, filter.reference
-                )
-            } else {
-                let count = crate::orchestrator::wakes::unsubscribe_matching(
+            if let Some(schedule_id) = parse_schedule_reference(index, item, value, "unsubscribe")?
+            {
+                let thread_id = crate::orchestrator::wakes::thread_home_for_job(
                     orch.db.for_project(project).await.as_ref(),
                     &job_id,
-                    &filter.kind,
-                    filter.reference.as_deref(),
-                    created_by,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                format!("Unsubscribed {count} wake subscription(s)")
+                if dry_run {
+                    format!("Would unsubscribe schedule {schedule_id}")
+                } else {
+                    let changed = crate::orchestrator::wakes::delete_wake_schedule(
+                        orch.db.for_project(project).await.as_ref(),
+                        &thread_id,
+                        &schedule_id,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    format!("Unsubscribed {} wake schedule(s)", usize::from(changed))
+                }
+            } else {
+                let filter = normalize_posts_filter(
+                    index,
+                    item,
+                    parse_wake_filter(index, item, value, "unsubscribe")?,
+                )?;
+                if dry_run {
+                    format!(
+                        "Would unsubscribe wake: {} {:?}",
+                        filter.kind, filter.reference
+                    )
+                } else {
+                    let count = crate::orchestrator::wakes::unsubscribe_matching(
+                        orch.db.for_project(project).await.as_ref(),
+                        &job_id,
+                        &filter.kind,
+                        filter.reference.as_deref(),
+                        created_by,
+                    )
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                    format!("Unsubscribed {count} wake subscription(s)")
+                }
             }
         }
         _ => return Ok(None),
@@ -334,6 +423,64 @@ pub(super) struct WakeFilterPayload {
     /// accepting a suite silently would subscribe to something other than what
     /// was asked for.
     pub(super) suite: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ScheduleCreatePayload {
+    pub(super) every_ms: i64,
+    pub(super) reason: String,
+}
+
+pub(super) fn parse_schedule_create(
+    index: usize,
+    item: &ChangeItem,
+    value: &serde_json::Value,
+) -> ResourceMutationResult<ScheduleCreatePayload> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| build_failure(index, item, "payload.schedule must be an object"))?;
+    let every = obj
+        .get("every")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| build_failure(index, item, "payload.schedule.every is required"))?;
+    let every_ms = crate::duration::parse_duration_ms(every)
+        .and_then(|value| i64::try_from(value).map_err(|_| "duration too large".to_string()))
+        .map_err(|error| build_failure(index, item, format!("invalid schedule every: {error}")))?;
+    let reason = obj
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| build_failure(index, item, "payload.schedule.reason is required"))?
+        .trim()
+        .to_string();
+    Ok(ScheduleCreatePayload { every_ms, reason })
+}
+
+pub(super) fn parse_schedule_reference(
+    index: usize,
+    item: &ChangeItem,
+    value: &serde_json::Value,
+    field: &str,
+) -> ResourceMutationResult<Option<String>> {
+    let Some(obj) = value.as_object() else {
+        return Ok(None);
+    };
+    if obj.get("kind").and_then(serde_json::Value::as_str) != Some("schedule") {
+        return Ok(None);
+    }
+    let id = obj
+        .get("ref")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            build_failure(
+                index,
+                item,
+                format!("payload.{field}.ref is required for kind schedule"),
+            )
+        })?;
+    Ok(Some(id.trim().to_string()))
 }
 
 pub(super) fn parse_wake_filter(

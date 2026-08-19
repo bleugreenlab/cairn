@@ -66,7 +66,7 @@ fn check_run_status_request(client: &CairnCmd, observation_handle: &str) -> Call
 
 /// Callback URL for CLI use: explicit env var (set by the runner or a remote
 /// executor relay for in-run invocations), else the local runner transport port.
-fn cli_callback_url() -> String {
+pub(crate) fn cli_callback_url() -> String {
     select_callback_url(env::var("CAIRN_CALLBACK_URL").ok())
 }
 
@@ -82,7 +82,7 @@ fn select_mcp_secret(
 }
 
 /// Build a thin `CairnCmd` client from the environment for CLI forwarding.
-fn build_cli_client(callback_url: String) -> CairnCmd {
+pub(crate) fn build_cli_client(callback_url: String) -> CairnCmd {
     let cwd = env::current_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
@@ -159,11 +159,11 @@ fn probe_callback(callback_url: &str) -> bool {
 }
 
 /// Ensure the local MCP callback endpoint is reachable.
-async fn ensure_callback_reachable(callback_url: &str) -> bool {
+pub(crate) async fn ensure_callback_reachable(callback_url: &str) -> bool {
     probe_callback(callback_url)
 }
 
-fn print_unreachable_callback(callback_url: &str) {
+pub(crate) fn print_unreachable_callback(callback_url: &str) {
     eprintln!(
         "cairn: requires a running Cairn runner or server at {callback_url} (set CAIRN_CALLBACK_URL to override)."
     );

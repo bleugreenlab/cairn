@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const TRANSCRIPTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const AUDIO_FEED_CAPACITY: usize = 8;
@@ -253,7 +254,7 @@ impl VoiceProcess {
             request_id: request_id.clone(),
             path: model.to_string_lossy().into_owned(),
         };
-        self.wait(&command, &request_id, |e| {
+        self.wait(&command, &request_id, REQUEST_TIMEOUT, |e| {
             matches!(e, ProtocolEvent::Ready { .. })
         })
         .await
@@ -284,7 +285,7 @@ impl VoiceProcess {
         request_id: &str,
     ) -> VoiceResult<Transcript> {
         match self
-            .wait(command, request_id, |e| {
+            .wait(command, request_id, TRANSCRIPTION_IDLE_TIMEOUT, |e| {
                 matches!(e, ProtocolEvent::Done { .. })
             })
             .await?
@@ -304,7 +305,7 @@ impl VoiceProcess {
     }
 
     pub async fn command(&self, command: &ProtocolCommand, request_id: &str) -> VoiceResult<()> {
-        self.wait(command, request_id, |e| {
+        self.wait(command, request_id, REQUEST_TIMEOUT, |e| {
             matches!(e, ProtocolEvent::Accepted { .. })
         })
         .await
@@ -320,29 +321,29 @@ impl VoiceProcess {
         &self,
         command: &ProtocolCommand,
         request_id: &str,
+        timeout: Duration,
         done: impl Fn(&ProtocolEvent) -> bool,
     ) -> VoiceResult<ProtocolEvent> {
         let mut receiver = self.events_tx.subscribe();
         self.write(command).await?;
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
-            loop {
-                let event = receiver.recv().await.map_err(|e| {
+        loop {
+            let event = tokio::time::timeout(timeout, receiver.recv())
+                .await
+                .map_err(|_| VoiceError::Transport("engine request timed out".into()))?
+                .map_err(|e| {
                     VoiceError::Transport(format!("engine event dispatcher stopped: {e}"))
                 })?;
-                if event_request_id(&event) != Some(request_id) {
-                    continue;
-                }
-                match event {
-                    ProtocolEvent::Error { code, message, .. } => {
-                        return Err(VoiceError::Request { code, message })
-                    }
-                    event if done(&event) => return Ok(event),
-                    _ => {}
-                }
+            if event_request_id(&event) != Some(request_id) {
+                continue;
             }
-        })
-        .await
-        .map_err(|_| VoiceError::Transport("engine request timed out".into()))?
+            match event {
+                ProtocolEvent::Error { code, message, .. } => {
+                    return Err(VoiceError::Request { code, message })
+                }
+                event if done(&event) => return Ok(event),
+                _ => {}
+            }
+        }
     }
 
     async fn write(&self, command: &ProtocolCommand) -> VoiceResult<()> {

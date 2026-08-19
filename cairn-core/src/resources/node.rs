@@ -494,6 +494,41 @@ pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_i
             Err(error) => return error,
         };
     let mut out = format!("# Wakes — {label}\n\n`{uri}`\n\n");
+    if let Ok(thread_id) = crate::orchestrator::wakes::thread_home_for_job(db, job_id).await {
+        match crate::orchestrator::wakes::list_wake_schedules(db, &thread_id).await {
+            Ok(schedules) if !schedules.is_empty() => {
+                out.push_str("## Schedules\n\n");
+                let now = chrono::Utc::now().timestamp();
+                for schedule in schedules {
+                    let next = schedule
+                        .next_due_at(now)
+                        .map(|at| crate::clock::stamp(at).unwrap_or_else(|| at.to_string()))
+                        .unwrap_or_else(|| "unavailable".into());
+                    let evaluated = schedule
+                        .last_evaluated_at
+                        .map(|at| crate::clock::stamp(at).unwrap_or_else(|| at.to_string()))
+                        .unwrap_or_else(|| "never".into());
+                    let fired = schedule
+                        .last_fired_occurrence_at
+                        .map(|at| crate::clock::stamp(at).unwrap_or_else(|| at.to_string()))
+                        .unwrap_or_else(|| "never".into());
+                    out.push_str(&format!(
+                        "- `{}` {} every={}ms next={} last_evaluated={} last_fired={} reason={}\n",
+                        schedule.id,
+                        schedule.state,
+                        schedule.every_ms,
+                        next,
+                        evaluated,
+                        fired,
+                        schedule.reason
+                    ));
+                }
+                out.push('\n');
+            }
+            Ok(_) => {}
+            Err(error) => return error,
+        }
+    }
     if subscriptions.is_empty() {
         out.push_str("No wake subscriptions.\n");
     } else {
@@ -532,7 +567,7 @@ pub(super) async fn render_job_wakes(db: &LocalDb, label: &str, uri: &str, job_i
         ));
         out.push('\n');
     }
-    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- append `{mute:{kind:\"checks\",ref?}}` — mute this node's checks by default, or the referenced node's checks; verdicts become passive ride-alongs rather than being discarded\n- patch `{unmute:{kind,ref?}}` (including `kind:\"checks\"`)\n- delete `{unsubscribe:{kind,ref?}}`\n");
+    out.push_str("\n## Mutations\n\n- append `{subscribe:{kind,ref?,factKinds?}}`\n- append `{schedule:{every:\"6h\",reason:\"…\"}}` (thread homes only)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"exit\"}}` — end your turn and resume when the terminal exits (fires immediately if it already exited)\n- append `{subscribe:{kind:\"terminal\", ref:\"cairn:~/terminal/<slug>\", on:\"output\", phrase:\"ready\"}}` — resume when a literal phrase appears in the running terminal's output (case-sensitive, one-shot; also wakes if the terminal exits first; survives terminal restarts)\n- append `{mute:{kind,ref?,factKinds?}, until?:{kind,ref?}}`\n- append `{mute:{kind:\"checks\",ref?}}` — mute this node's checks by default, or the referenced node's checks; verdicts become passive ride-alongs rather than being discarded\n- patch `{unmute:{kind,ref?}}` (including `kind:\"checks\"`)\n- delete `{unsubscribe:{kind,ref?}}`\n");
     out
 }
 
@@ -2052,14 +2087,14 @@ fn fenced_json(value: &serde_json::Value) -> String {
     format!("```json\n{pretty}\n```")
 }
 
-/// Build the schema-aware affordance block for a node/task artifact, deriving
-/// the `create` example from the schema the addressed name actually validates
-/// against (shared with the write path via `resolve_artifact_contract`). Returns
-/// `None` when no schema resolves, leaving the caller to fall back to the static
-/// contract block. This is what makes a copied artifact example a valid write
-/// even for a custom schema (CAIRN #170).
+/// Build the schema-aware affordance spec for a node/task artifact, deriving the
+/// `create` payload keys and example from the schema the addressed name actually
+/// validates against (shared with the write path via `resolve_artifact_contract`).
+/// Returns `None` when no schema resolves, leaving the caller to fall back to the
+/// static contract spec. This is what makes a copied artifact example a valid
+/// write even for a custom schema (CAIRN #170).
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn artifact_affordance_block(
+pub(super) async fn artifact_affordance_spec(
     orch: &crate::orchestrator::Orchestrator,
     project_key: &str,
     number: i32,
@@ -2067,8 +2102,8 @@ pub(super) async fn artifact_affordance_block(
     node_name: &str,
     task_name: Option<&str>,
     artifact_name: Option<&str>,
-    kind: cairn_common::contract::ResourceKind,
-) -> Option<String> {
+    current: &cairn_common::uri::CairnResource,
+) -> Option<cairn_common::read::AffordanceSpec> {
     let db = orch.db.for_project(project_key).await;
     let job_id = resolve_node_or_task_job_id_for_read(
         &db,
@@ -2080,20 +2115,20 @@ pub(super) async fn artifact_affordance_block(
     )
     .await
     .ok()?;
-    job_artifact_affordance_block(orch, &job_id, task_name, artifact_name, kind).await
+    job_artifact_affordance_spec(orch, &job_id, task_name, artifact_name, current).await
 }
 
-/// [`artifact_affordance_block`] for a job that is already resolved — a thread's
+/// [`artifact_affordance_spec`] for a job that is already resolved — a thread's
 /// session job, which is addressed by thread name rather than by node
 /// coordinates. Same contract, same schema, so the arc advertises on read what
 /// it enforces on write.
-pub(super) async fn job_artifact_affordance_block(
+pub(super) async fn job_artifact_affordance_spec(
     orch: &crate::orchestrator::Orchestrator,
     job_id: &str,
     task_name: Option<&str>,
     artifact_name: Option<&str>,
-    kind: cairn_common::contract::ResourceKind,
-) -> Option<String> {
+    current: &cairn_common::uri::CairnResource,
+) -> Option<cairn_common::read::AffordanceSpec> {
     let contract = crate::mcp::handlers::comments_artifacts::resolve_artifact_contract(
         orch,
         job_id,
@@ -2104,7 +2139,12 @@ pub(super) async fn job_artifact_affordance_block(
     let schema = contract.validation_schema?;
     let schema_value =
         crate::output_schemas::resolve_output_schema(orch.schema_dir.as_deref(), &schema).ok()?;
-    super::common::artifact_affordance_with_schema(kind, artifact_name, &schema_value)
+    super::common::artifact_affordance_spec_with_schema(
+        current.kind(),
+        artifact_name,
+        &schema_value,
+        Some(current),
+    )
 }
 
 fn render_gated_artifact_actions(

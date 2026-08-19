@@ -688,6 +688,7 @@ mod tests {
         let affordance = Affordance {
             kind: SegmentKind::Resource,
             block: "--- actions ---".to_string(),
+            spec: None,
         };
         let mut a = file_segment("cairn://p/X/1", 2);
         a.meta.kind = SegmentKind::Resource;
@@ -699,6 +700,9 @@ mod tests {
         // The identical affordance appears exactly once, at the very end.
         assert_eq!(envelope.text.matches("--- actions ---").count(), 1);
         assert!(envelope.text.trim_end().ends_with("--- actions ---"));
+        assert_eq!(envelope.affordances.len(), 2);
+        assert_eq!(envelope.affordances[0], affordance);
+        assert_eq!(envelope.affordances[1], affordance);
     }
 
     #[test]

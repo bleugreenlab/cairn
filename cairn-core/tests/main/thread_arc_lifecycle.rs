@@ -43,6 +43,71 @@ async fn seed(db: &LocalDb) {
     .unwrap();
 }
 
+#[tokio::test]
+async fn self_referential_provenance_is_stored_byte_exact() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let created = common::change_resource(
+        &orch,
+        write_to(
+            "create",
+            json!({
+                "current_intent": "Preserve authored provenance.",
+                "rulings": [],
+                "open_questions": []
+            }),
+        ),
+    )
+    .await;
+    assert!(created.contains("version 1"), "got: {created}");
+
+    let appended = common::change_resource(
+        &orch,
+        write_to(
+            "patch",
+            json!({"ruling": {
+                "text": "canonical provenance remains canonical",
+                "status": "accepted",
+                "rationale": "stored artifact data is authored data",
+                "provenance": ["cairn://p/thr/library"]
+            }}),
+        ),
+    )
+    .await;
+    assert!(appended.contains("version 2"), "got: {appended}");
+
+    let raw = latest_arc_raw(&db).await;
+    assert!(
+        raw.contains(r#""provenance":["cairn://p/thr/library"]"#),
+        "canonical self-reference missing from raw stored data: {raw}"
+    );
+    assert!(
+        !raw.contains("cairn:~/"),
+        "storage must never rewrite canonical provenance: {raw}"
+    );
+}
+
+/// The byte-exact stored data of the thread's latest arc version.
+async fn latest_arc_raw(db: &LocalDb) -> String {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM artifacts WHERE output_name = 'arc' ORDER BY version DESC LIMIT 1",
+                    (),
+                )
+                .await?;
+            rows.next().await?.map(|row| row.text(0)).transpose()
+        })
+    })
+    .await
+    .unwrap()
+    .expect("an arc version is stored")
+}
+
 fn write_to(mode: &str, payload: Value) -> Value {
     json!([{ "target": ARC_URI, "mode": mode, "payload": payload }])
 }

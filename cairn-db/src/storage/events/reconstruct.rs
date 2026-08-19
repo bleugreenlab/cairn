@@ -17,7 +17,9 @@
 //! - `GitcoordRead`: for each target in `tool_input.paths`, resolve the file's
 //!   blob at `content_commit` through the layered [`ObjectStore`], render it
 //!   through the live `render_*_from_bytes` pipeline (no frozen copy), and
-//!   reassemble the batch under `=== <uri> ===` headers.
+//!   reassemble the batch under the live renderer's enriched headers. If a target
+//!   degrades to a stub, its header is `=== <uri> [error] ===`; degraded stubs are
+//!   explicitly exempt from the byte-exact drift comparison.
 //! - `GitcoordWrite`: decompress the payload-stripped assistant remainder from
 //!   `data_blob`, regenerate the batch's unified diff from `content_commit` vs
 //!   its parent ([`super::diff`]), and re-inject each file's section into the
@@ -974,9 +976,11 @@ fn split_diff_by_path(diff: &str) -> HashMap<String, String> {
 /// once a byte-exact compare succeeds, so this shared path is the only thing that
 /// can reproduce them — enriched headers, continue footers, fair-share budgets,
 /// and the empty-body header collapse all fall out of the one assembler. A target
-/// that cannot be resolved or rendered degrades to an `Error` segment (bare
-/// `=== uri ===` header + a `STUB_PREFIX` body), so reconstruction never errors
-/// out of the batch and `crate::archival::rewrite::try_read`'s stub contract still holds.
+/// that cannot be resolved or rendered degrades to an `Error` segment
+/// (`=== uri [error] ===` header + a `STUB_PREFIX` body), so reconstruction never
+/// errors out of the batch. This degraded output is not byte-exact history: the
+/// `STUB_PREFIX` guard in [`reconstruct_gitcoord_read`] explicitly exempts it from
+/// the recorded-render SHA comparison (as does the equivalent hybrid-read guard).
 pub fn reconstruct_read(commit_hex: &str, paths: &[String], store: Option<&ObjectStore>) -> String {
     let renderer = crate::storage::render::archived_file_renderer();
     let segments: Vec<ReadSegment> = paths
@@ -1192,8 +1196,8 @@ mod tests {
             body.contains(STUB_PREFIX),
             "expected coordinate stub, got: {body}"
         );
-        // The header is still emitted around the stub body.
-        assert!(body.contains("=== file:a.txt ==="));
+        // The live renderer labels the degraded section as non-content.
+        assert!(body.contains("=== file:a.txt [error] ==="));
     }
 
     /// A gitcoord-write assistant event (payload-stripped remainder in data_blob,

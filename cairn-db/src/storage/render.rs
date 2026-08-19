@@ -432,7 +432,6 @@ pub struct RenderedSegment {
     pub text: String,
     meta: SegmentMeta,
     images: Vec<ImageBlock>,
-    affordance: Option<Affordance>,
 }
 
 fn safe_char_boundary(text: &str, mut byte: usize) -> usize {
@@ -527,7 +526,7 @@ pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> 
     }
     let ReadSegment {
         body,
-        affordance,
+        affordance: _,
         images,
         history,
         mut meta,
@@ -615,7 +614,6 @@ pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> 
                 text: candidate,
                 meta,
                 images,
-                affordance,
             };
         }
         content_budget = content_budget.saturating_sub(candidate_tokens - budget + 1);
@@ -641,7 +639,7 @@ pub(crate) fn render_section_text(seg: ReadSegment, meter: &dyn TokenMeter) -> S
 fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> RenderedSegment {
     let ReadSegment {
         body,
-        affordance,
+        affordance: _,
         images,
         history,
         mut meta,
@@ -708,12 +706,7 @@ fn render_record_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) 
     text.push_str(&history_suffix);
 
     meta.truncated = truncated;
-    RenderedSegment {
-        text,
-        meta,
-        images,
-        affordance,
-    }
+    RenderedSegment { text, meta, images }
 }
 
 // ---------------------------------------------------------------------------
@@ -777,6 +770,10 @@ fn assemble_inner(
         .map(|segment| estimate_len(segment, meter))
         .collect();
     let separator_budget = meter.count(&"\n".repeat(segments.len().saturating_sub(1)));
+    let structured_affordances: Vec<Affordance> = segments
+        .iter()
+        .filter_map(|segment| segment.affordance.clone())
+        .collect();
     let mut affordances: Vec<Affordance> = Vec::new();
     for segment in &segments {
         if let Some(affordance) = &segment.affordance {
@@ -827,6 +824,7 @@ fn assemble_inner(
         text,
         images,
         segments: metas,
+        affordances: structured_affordances,
         bodies,
     }
 }
@@ -1375,6 +1373,7 @@ mod tests {
         segment.affordance = Some(Affordance {
             kind: SegmentKind::File,
             block: "## File affordance\nUse `offset` to continue.".to_string(),
+            spec: None,
         });
 
         let envelope = assemble(vec![segment], &BYTE_METER);

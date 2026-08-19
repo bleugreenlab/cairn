@@ -11,6 +11,63 @@ use cairn_db::storage::authority::AuthorizationEventRecord;
 use crate::authorization;
 use crate::storage::LocalDb;
 
+fn render_uuid_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| unigram::UnigramId::from_bytes(*uuid.as_bytes()).to_string())
+        .unwrap_or_else(|_| id.to_string())
+}
+
+fn grant_uri_id(id: &str) -> String {
+    render_uuid_id(id).replace(' ', "-")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grant_uri_id, render_uuid_id, stored_grant_id};
+
+    const UUID: &str = "123e4567-e89b-12d3-a456-426614174000";
+
+    #[test]
+    fn grant_uuid_renders_as_sixteen_unigram_words() {
+        let rendered = render_uuid_id(UUID);
+        assert_eq!(rendered.split_whitespace().count(), 16);
+        assert_eq!(stored_grant_id(&rendered), UUID);
+    }
+
+    #[test]
+    fn grant_member_segment_is_uri_safe_and_resolves_to_storage_id() {
+        let segment = grant_uri_id(UUID);
+        assert!(!segment.contains(char::is_whitespace));
+        assert_eq!(segment.split('-').count(), 16);
+        assert_eq!(stored_grant_id(&segment), UUID);
+    }
+
+    #[test]
+    fn grant_lookup_accepts_recovered_words_and_legacy_uuid() {
+        let rendered = render_uuid_id(UUID);
+        assert_eq!(
+            stored_grant_id(&rendered.to_uppercase().replace(' ', "-")),
+            UUID
+        );
+        assert_eq!(stored_grant_id(UUID), UUID);
+    }
+
+    #[test]
+    fn historical_non_uuid_ids_remain_addressable() {
+        assert_eq!(render_uuid_id("legacy-grant"), "legacy-grant");
+        assert_eq!(stored_grant_id("legacy-grant"), "legacy-grant");
+    }
+}
+
+pub(crate) fn stored_grant_id(id: &str) -> String {
+    if uuid::Uuid::parse_str(id).is_ok() {
+        return id.to_string();
+    }
+    unigram::UnigramId::<16>::recover(id)
+        .map(|words| uuid::Uuid::from_bytes(words.into_bytes()).to_string())
+        .unwrap_or_else(|_| id.to_string())
+}
+
 fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -57,19 +114,21 @@ fn constraint_labels(grant: &AuthorityGrant) -> String {
 }
 
 fn render_grant_row(grant: &AuthorityGrant, at: i64) -> String {
+    let id = render_uuid_id(&grant.id);
+    let uri_id = grant_uri_id(&grant.id);
     format!(
         "- `{}` — {} ({}) · [{}](cairn://grants/{})",
         grant.scope.shorthand(),
         grant.status(at),
         lifetime_label(&grant.lifetime),
-        grant.id,
-        grant.id
+        id,
+        uri_id
     )
 }
 
 fn render_decision(event: &AuthorizationEventRecord) -> String {
     let cited = match event.grant_id.as_deref() {
-        Some(id) => format!(" · grant `{id}`"),
+        Some(id) => format!(" · grant `{}`", render_uuid_id(id)),
         None => String::new(),
     };
     format!(
@@ -245,7 +304,7 @@ pub async fn read_incidents(db: &LocalDb) -> String {
     for incident in &incidents {
         out.push_str(&format!(
             "| `{}` | `{}` | {} | {} | {} lease(s), {} grant(s) | {} |\n",
-            incident.id,
+            render_uuid_id(&incident.id),
             incident.secret_id,
             incident.discovered_via.as_str(),
             if incident.status == crate::security::remediation::IncidentStatus::ActionRequired {
@@ -264,7 +323,10 @@ pub async fn read_incidents(db: &LocalDb) -> String {
     }
 
     for incident in &incidents {
-        out.push_str(&format!("\n## Incident `{}`\n\n", incident.id));
+        out.push_str(&format!(
+            "\n## Incident `{}`\n\n",
+            render_uuid_id(&incident.id)
+        ));
         if let Some(crossing) = &incident.crossing {
             out.push_str(&format!("- Caught at the {crossing} crossing\n"));
         }
@@ -334,13 +396,15 @@ pub async fn read_incidents(db: &LocalDb) -> String {
 /// `cairn://grants/{id}` — one grant and everything it authorized.
 pub async fn read_grant(db: &LocalDb, id: &str) -> String {
     let at = now();
-    let grant = match authorization::get_grant(db, id).await {
+    let stored_id = stored_grant_id(id);
+    let grant = match authorization::get_grant(db, &stored_id).await {
         Ok(Some(grant)) => grant,
         Ok(None) => return format!("# Authority grant\n\nNo grant with id `{id}`."),
         Err(error) => return format!("# Authority grant\n\nCould not read grant: {error}"),
     };
 
-    let mut out = format!("# Authority grant `{id}`\n\n");
+    let display_id = render_uuid_id(&grant.id);
+    let mut out = format!("# Authority grant `{display_id}`\n\n");
     out.push_str(&format!("- Scope: `{}`\n", grant.scope.shorthand()));
     out.push_str(&format!("- Status: {}\n", grant.status(at)));
     out.push_str(&format!(
@@ -376,7 +440,7 @@ pub async fn read_grant(db: &LocalDb, id: &str) -> String {
         out.push_str(&format!("- Revoked: {}\n", crate::clock::age(revoked)));
     }
 
-    match authorization::events_citing(db, id).await {
+    match authorization::events_citing(db, &stored_id).await {
         Ok(events) if !events.is_empty() => {
             out.push_str(&format!(
                 "\n## Decisions citing this grant ({})\n\n",

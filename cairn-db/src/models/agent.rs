@@ -18,7 +18,7 @@ pub enum OutputSchema {
 
 /// Output schema with optional custom tool name and description.
 /// Bundles the schema definition with metadata for the output tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputSchemaInfo {
     /// The schema defining the output structure
     pub schema: OutputSchema,

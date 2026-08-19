@@ -61,9 +61,13 @@ pub use row::{
     FromDbRow, RowExt,
 };
 pub use runtime_admission::{
-    enqueue_admission_request, get_admission_request, lease_next_admission,
-    lease_next_admission_with_capacity, transition_admission, AdmissionRequest,
-    NewAdmissionRequest, RuntimeResourceCapacity, RuntimeResourceClaim, DEFAULT_URGENT_BURST,
+    admission_status, cancel_queued_admission, enqueue_admission_request,
+    finish_admission_by_launch_key, get_admission_request, get_admission_request_by_launch_key,
+    get_prepared_runtime_call, heartbeat_admission, lease_next_admission,
+    lease_next_admission_with_capacity, persist_prepared_runtime_call, reap_expired_admissions,
+    requeue_orphaned_admissions, transition_admission, AdmissionRequest, AdmissionStatus,
+    NewAdmissionRequest, PreparedRuntimeCall, RuntimeResourceCapacity, RuntimeResourceClaim,
+    DEFAULT_URGENT_BURST,
 };
 pub use search_index::{SearchIndex, SearchIndexHit};
 

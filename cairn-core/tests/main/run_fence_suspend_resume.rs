@@ -21,7 +21,9 @@ use crate::common;
 use std::sync::{Arc, Mutex};
 
 use crate::common::orchestrator;
-use cairn_core::internal::mcp::handlers::permission::record_permission_response;
+use cairn_core::internal::mcp::handlers::permission::{
+    await_permission_for_test, record_permission_response,
+};
 use cairn_core::internal::orchestrator::lifecycle::{stop_session, suspend_run_for_durable_wait};
 use cairn_core::internal::services::testing::MockChildProcess;
 use cairn_core::internal::services::ChildProcess;
@@ -108,6 +110,172 @@ async fn insert_fixture(db: &LocalDb, opts: &Fixture) {
     })
     .await
     .unwrap();
+}
+
+/// The production permission suspension establishes the inner owner and retires
+/// the correlated outer run-batch owner without manufacturing a continuation or
+/// model-facing result. The eventual answer remains the sole continuation owner.
+#[tokio::test(start_paused = true)]
+async fn permission_suspension_atomically_takes_ownership_without_a_result() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_fixture(
+        &db,
+        &Fixture {
+            job_owned: true,
+            job_has_current_turn: true,
+        },
+    )
+    .await;
+    db.execute("DELETE FROM permission_requests", ())
+        .await
+        .unwrap();
+    db.execute(
+        "INSERT INTO agent_waits(
+            id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,
+            condition_json,state,created_at
+         ) VALUES(
+            'outer-wait','job-1','run-1','session-1','turn-pred','toolu-perm',
+            '{\"kind\":\"run_batch\",\"request_id\":\"request-1\",\"commits\":false}',
+            'pending',1
+         )",
+        (),
+    )
+    .await
+    .unwrap();
+    let orch = orchestrator(&temp, db.clone());
+
+    assert_eq!(
+        await_permission_for_test(
+            &orch,
+            "run-1",
+            "toolu-perm",
+            "run",
+            &serde_json::json!({"command":"echo guarded"}),
+        )
+        .await,
+        "suspended"
+    );
+
+    let (request_id, status) = db
+        .query_one(
+            "SELECT id,status FROM permission_requests WHERE run_id='run-1'",
+            (),
+            |row| Ok((row.text(0)?, row.text(1)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, "pending");
+
+    let (state, resolution, resolved_at, successor, result_stored_at) = db
+        .query_one(
+            "SELECT state,resolution_json,resolved_at,successor_turn_id,result_stored_at
+             FROM agent_waits WHERE id='outer-wait'",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.opt_text(1)?,
+                    row.opt_i64(2)?,
+                    row.opt_text(3)?,
+                    row.opt_i64(4)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(state, "resolved");
+    assert_eq!(
+        resolution.as_deref(),
+        Some(r#"{"outcome":"transferred_to_inner_wait"}"#)
+    );
+    assert!(resolved_at.is_some());
+    assert!(successor.is_none());
+    assert!(result_stored_at.is_none());
+    let tool_results = db
+        .query_one(
+            "SELECT COUNT(*) FROM events WHERE event_type='tool_result'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        tool_results, 0,
+        "suspension is control flow, not a tool result"
+    );
+
+    let resume =
+        record_permission_response(&db, &request_id, "allowed", r#"{"behavior":"allow"}"#, 100)
+            .await
+            .unwrap();
+    assert!(!resume.duplicate);
+    assert_eq!(resume.predecessor_turn_id.as_deref(), Some("turn-pred"));
+    assert!(resume.successor_turn_id.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn permission_handoff_refuses_an_outer_resolver_and_rolls_back_insertion() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_fixture(
+        &db,
+        &Fixture {
+            job_owned: true,
+            job_has_current_turn: true,
+        },
+    )
+    .await;
+    db.execute("DELETE FROM permission_requests", ())
+        .await
+        .unwrap();
+    db.execute(
+        "INSERT INTO agent_waits(
+            id,job_id,run_id,session_id,predecessor_turn_id,tool_use_id,
+            condition_json,state,created_at
+         ) VALUES(
+            'outer-wait','job-1','run-1','session-1','turn-pred','toolu-perm',
+            '{\"kind\":\"run_batch\",\"request_id\":\"request-1\",\"commits\":false}',
+            'resolving',1
+         )",
+        (),
+    )
+    .await
+    .unwrap();
+    let orch = orchestrator(&temp, db.clone());
+
+    assert_eq!(
+        await_permission_for_test(
+            &orch,
+            "run-1",
+            "toolu-perm",
+            "run",
+            &serde_json::json!({"command":"echo guarded"}),
+        )
+        .await,
+        "unavailable"
+    );
+    let permission_count = db
+        .query_one(
+            "SELECT COUNT(*) FROM permission_requests WHERE run_id='run-1'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        permission_count, 0,
+        "the permission insert must roll back when the outer resolver owns continuation"
+    );
+    let state = db
+        .query_one(
+            "SELECT state FROM agent_waits WHERE id='outer-wait'",
+            (),
+            |row| row.text(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state, "resolving");
 }
 
 /// State of the turn whose predecessor is `predecessor`, if a successor exists.

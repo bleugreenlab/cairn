@@ -44,26 +44,6 @@ pub(crate) enum PermissionWait {
     Unavailable(String),
 }
 
-pub(super) async fn retire_outer_run_batch_waits(
-    conn: &cairn_db::turso::Connection,
-    run_id: &str,
-    tool_use_id: &str,
-) -> DbResult<()> {
-    conn.execute(
-        "UPDATE agent_waits SET state='resolved',resolution_json=?3,resolved_at=?4 \
-         WHERE run_id=?1 AND tool_use_id=?2 AND state IN ('pending','resolving') \
-         AND successor_turn_id IS NULL AND result_stored_at IS NULL",
-        params![
-            run_id,
-            tool_use_id,
-            r#"{"outcome":"transferred_to_permission"}"#,
-            chrono::Utc::now().timestamp_millis()
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
 pub(crate) fn recovered_permission_answer(
     decision: PermissionDecision,
     provenance: &crate::channels::ledger::AskResolution,
@@ -225,7 +205,17 @@ pub(crate) async fn await_permission_decision(
                 // The permission row is now the durable owner of this exact tool
                 // call. Retire an outer run-batch wait in the same transaction so
                 // no serialization order can leave two continuation owners.
-                retire_outer_run_batch_waits(conn, &run_id, &tool_use_id).await?;
+                match super::durable_suspend::relinquish_to_inner_wait(conn, &run_id, &tool_use_id)
+                    .await?
+                {
+                    super::durable_suspend::RelinquishOutcome::Absent
+                    | super::durable_suspend::RelinquishOutcome::Transferred => {}
+                    super::durable_suspend::RelinquishOutcome::AlreadyClaimed => {
+                        return Err(DbError::internal(
+                            "outer wait already owns permission continuation",
+                        ));
+                    }
+                }
 
                 let yielded_turn = if let Some(ref turn_id) = current_turn_id {
                     match yield_turn_for_host(conn, turn_id, TurnYieldReason::Permission).await {
@@ -374,6 +364,21 @@ pub(crate) async fn await_permission_decision(
             );
             PermissionWait::Suspended
         }
+    }
+}
+
+#[cfg(feature = "test-utils")]
+pub async fn await_permission_for_test(
+    orch: &Orchestrator,
+    run_id: &str,
+    tool_use_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+) -> &'static str {
+    match await_permission_decision(orch, run_id, tool_use_id, tool_name, tool_input).await {
+        PermissionWait::Decided(_) => "decided",
+        PermissionWait::Suspended => "suspended",
+        PermissionWait::Unavailable(_) => "unavailable",
     }
 }
 
