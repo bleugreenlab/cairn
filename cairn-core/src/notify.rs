@@ -27,21 +27,45 @@ pub(crate) fn issue_db_change_ids(action: &str, issue_id: &str, project_id: Opti
     })
 }
 
+/// Build a fully-scoped `threads` db-change payload.
+///
+/// LOAD-BEARING INVARIANT: every row-specific thread change carries its current
+/// name and an explicit `previousName`. Name-addressed panes can only re-point
+/// after a remote rename when this payload supplies the old address; there is no
+/// rename-history lookup on the client or in thread resolution.
 pub(crate) fn thread_db_change_ids(
     action: &str,
     thread_id: &str,
-    project_id: Option<&str>,
+    project_id: &str,
+    name: &str,
+    previous_name: Option<&str>,
 ) -> Value {
     json!({
         "table": "threads",
         "action": action,
         "threadId": thread_id,
         "projectId": project_id,
+        "name": name,
+        "previousName": previous_name,
     })
 }
 
-pub(crate) fn thread_db_change(thread: &models::Thread, action: &str) -> Value {
-    thread_db_change_ids(action, &thread.id, Some(&thread.project_id))
+pub fn thread_db_change(thread: &models::Thread, action: &str) -> Value {
+    thread_db_change_ids(action, &thread.id, &thread.project_id, &thread.name, None)
+}
+
+/// The `update` payload: `previousName` is set only when this write actually
+/// moved the thread's name, so a status or definition edit is not mistaken for
+/// a rename by the pane re-pointer.
+pub fn thread_update_db_change(previous: &models::Thread, updated: &models::Thread) -> Value {
+    let previous_name = (previous.name != updated.name).then_some(previous.name.as_str());
+    thread_db_change_ids(
+        "update",
+        &updated.id,
+        &updated.project_id,
+        &updated.name,
+        previous_name,
+    )
 }
 
 pub(crate) fn issue_db_change(issue: &models::Issue, action: &str) -> Value {
@@ -356,6 +380,11 @@ pub fn event_db_change(run_id: &str, session_id: Option<&str>, action: &str) -> 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventRunScope {
     pub issue_id: Option<String>,
+    /// The thread that owns this event's job, when the job belongs to a thread's
+    /// descent rather than an issue's execution. Exactly one of `issue_id` and
+    /// `thread_id` is set for a canonical job, so a live surface scoped to one
+    /// owner is never invalidated by the other's traffic.
+    pub thread_id: Option<String>,
     pub job_id: Option<String>,
     pub project_id: Option<String>,
 }
@@ -374,7 +403,7 @@ pub fn event_run_scope(db: Arc<LocalDb>, run_id: &str) -> EventRunScope {
             Box::pin(async move {
                 let mut rows = conn
                     .query(
-                        "SELECT r.issue_id, COALESCE(r.job_id, j.id),
+                        "SELECT r.issue_id, j.thread_id, COALESCE(r.job_id, j.id),
                                 COALESCE(r.project_id, j.project_id)
                          FROM runs r LEFT JOIN jobs j ON j.id = r.job_id
                          WHERE r.id = ?1 LIMIT 1",
@@ -384,8 +413,9 @@ pub fn event_run_scope(db: Arc<LocalDb>, run_id: &str) -> EventRunScope {
                 match rows.next().await? {
                     Some(row) => Ok(Some(EventRunScope {
                         issue_id: row.opt_text(0)?,
-                        job_id: row.opt_text(1)?,
-                        project_id: row.opt_text(2)?,
+                        thread_id: row.opt_text(1)?,
+                        job_id: row.opt_text(2)?,
+                        project_id: row.opt_text(3)?,
                     })),
                     None => Ok(None),
                 }
@@ -429,6 +459,19 @@ pub(crate) fn event_db_change_scoped(
         "session_id": session_id,
         "issueId": scope.issue_id,
         "issue_id": scope.issue_id,
+        "threadId": scope.thread_id,
+        "thread_id": scope.thread_id,
+        "jobId": scope.job_id,
+        "job_id": scope.job_id,
+        "projectId": scope.project_id,
+        "project_id": scope.project_id,
+    })
+}
+
+pub(crate) fn job_presence_db_change(scope: &EventRunScope) -> Value {
+    json!({
+        "table": "job_presence",
+        "action": "upsert",
         "jobId": scope.job_id,
         "job_id": scope.job_id,
         "projectId": scope.project_id,
@@ -513,6 +556,46 @@ mod tests {
     use super::*;
     use crate::models::IssueStatus;
     use crate::services::testing::CapturingEmitter;
+
+    fn test_thread(name: &str) -> models::Thread {
+        models::Thread {
+            id: "thread-1".into(),
+            project_id: "project-1".into(),
+            name: name.into(),
+            jurisdiction: None,
+            status: models::ThreadStatus::Active,
+            attention: "none".into(),
+            definition: None,
+            migrated_from_number: None,
+            created_at: 1000,
+            updated_at: 2000,
+        }
+    }
+
+    #[test]
+    fn thread_db_change_carries_complete_scope_and_null_previous_name() {
+        let thread = test_thread("roadmap");
+        let payload = thread_db_change(&thread, "insert");
+        assert_eq!(payload["table"], "threads");
+        assert_eq!(payload["action"], "insert");
+        assert_eq!(payload["threadId"], "thread-1");
+        assert_eq!(payload["projectId"], "project-1");
+        assert_eq!(payload["name"], "roadmap");
+        assert!(payload.get("previousName").is_some());
+        assert!(payload["previousName"].is_null());
+    }
+
+    #[test]
+    fn thread_update_db_change_only_names_a_previous_name_for_a_rename() {
+        let previous = test_thread("roadmap");
+        let unchanged = thread_update_db_change(&previous, &previous);
+        assert!(unchanged["previousName"].is_null());
+
+        let updated = test_thread("north-star");
+        let renamed = thread_update_db_change(&previous, &updated);
+        assert_eq!(renamed["name"], "north-star");
+        assert_eq!(renamed["previousName"], "roadmap");
+    }
 
     fn test_notifier() -> (Notifier, Arc<CapturingEmitter>) {
         let emitter = Arc::new(CapturingEmitter::new());
@@ -725,6 +808,7 @@ mod tests {
     fn event_db_change_scoped_carries_the_whole_resolved_scope() {
         let scope = EventRunScope {
             issue_id: Some("issue-1".into()),
+            thread_id: None,
             job_id: Some("job-1".into()),
             project_id: Some("project-1".into()),
         };
@@ -733,10 +817,34 @@ mod tests {
         assert_eq!(payload["issue_id"], "issue-1");
         assert_eq!(payload["jobId"], "job-1");
         assert_eq!(payload["job_id"], "job-1");
+        // An issue-owned event names no thread, so a thread-scoped surface is
+        // never invalidated by an issue execution's traffic.
+        assert!(payload["threadId"].is_null());
+        assert!(payload["thread_id"].is_null());
         // The point of the whole change: a live surface can filter this frame
         // by project without a follow-up query.
         assert_eq!(payload["projectId"], "project-1");
         assert_eq!(payload["project_id"], "project-1");
+    }
+
+    /// The thread-owned mirror of the issue-owned case above: a thread session's
+    /// event names its thread and no issue, so `parseScopeIds` can route the
+    /// frame to the thread pane's skyline key on either casing.
+    #[test]
+    fn event_db_change_scoped_carries_the_owning_thread() {
+        let scope = EventRunScope {
+            issue_id: None,
+            thread_id: Some("thread-1".into()),
+            job_id: Some("job-1".into()),
+            project_id: Some("project-1".into()),
+        };
+        let payload = event_db_change_scoped("run-1", Some("session-1"), &scope, "insert");
+        assert_eq!(payload["threadId"], "thread-1");
+        assert_eq!(payload["thread_id"], "thread-1");
+        assert!(payload["issueId"].is_null());
+        assert!(payload["issue_id"].is_null());
+        assert_eq!(payload["jobId"], "job-1");
+        assert_eq!(payload["projectId"], "project-1");
     }
 
     #[test]
@@ -750,7 +858,7 @@ mod tests {
         // Present-and-null, not absent: a subscriber filtering on projectId must
         // be able to tell "this run has no project" from "this build predates
         // the key".
-        for key in ["issueId", "jobId", "projectId"] {
+        for key in ["issueId", "threadId", "jobId", "projectId"] {
             assert!(payload.get(key).is_some(), "{key} must be present");
             assert!(payload[key].is_null(), "{key} must be null");
         }

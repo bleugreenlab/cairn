@@ -274,7 +274,9 @@ fn usage() -> String {
      (absent op = overview: definition site + signature + reference count). \
      Scope with `?in=<glob>`. Add `-C=N` (or `-A`/`-B`/`context`) for context \
      lines and `head_limit=N` (alias `limit=N`) to cap rows, with the same \
-     semantics as `?grep=`. This resource navigates a name you already have \
+     semantics as `?grep=`: the cap counts location rows, context does not \
+     count against it, and a capped list ends with a line naming the true \
+     total. This resource navigates a name you already have \
      — to discover one, read a file or directory with `?ast=<pattern>` or \
      `?grep=<regex>` first."
         .to_string()

@@ -849,6 +849,8 @@ pub fn resolve_agent_snapshot(
         selection: Some(resolved.selection),
         disallowed_tools: file_agent.disallowed_tools.clone(),
         skills: file_agent.skills.clone(),
+        seed_budget_tokens: file_agent.seed_budget_tokens,
+        seed_eras: file_agent.seed_eras,
         fence: file_agent.fence,
         sandbox: None,
         on_escape: None,
@@ -1093,11 +1095,15 @@ mod tests {
         let mut file_agent = make_test_agent(Some("md"));
         file_agent.skills = Some(vec!["testing".to_string()]);
         file_agent.disallowed_tools = Some(vec!["Bash".to_string()]);
+        file_agent.seed_budget_tokens = Some(20_000);
+        file_agent.seed_eras = Some(5);
 
         let snapshot = resolve_agent_snapshot(&file_agent, None, &config).unwrap();
         assert_eq!(snapshot.id, "test");
         assert_eq!(snapshot.name, "Test");
         assert_eq!(snapshot.description, "Test agent");
+        assert_eq!(snapshot.seed_budget_tokens, Some(20_000));
+        assert_eq!(snapshot.seed_eras, Some(5));
         assert_eq!(snapshot.tools, vec!["Read".to_string()]);
         assert_eq!(snapshot.skills, Some(vec!["testing".to_string()]));
         assert_eq!(snapshot.disallowed_tools, Some(vec!["Bash".to_string()]));
@@ -1795,6 +1801,8 @@ mod tests {
             bundles: Vec::new(),
             is_project_scoped: false,
             file_path: std::path::PathBuf::new(),
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 }

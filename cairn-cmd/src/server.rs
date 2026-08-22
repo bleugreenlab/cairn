@@ -26,7 +26,7 @@ use crate::output::{
     assemble_reminders, cap_run_result, cap_text_result, change_callback_result,
     http_status_error_message, redact_command, truncate_chars, CallbackOutcome,
 };
-use crate::schemas::{validate_run_input, AgentInfo, ChangeInput, ReadFileInput, RunInput};
+use crate::schemas::{validate_run_input, ChangeInput, ReadFileInput, RunInput};
 use crate::timeouts::callback_timeout;
 
 /// Cairn MCP Server - tools for Claude to interact with Cairn during planning
@@ -40,8 +40,6 @@ pub(crate) struct CairnCmd {
     /// Shared secret (base64-encoded string from env var, sent directly as bearer token)
     mcp_secret: Option<Arc<String>>,
     tool_router: ToolRouter<Self>,
-    /// Available agents for task tool description
-    available_agents: Vec<AgentInfo>,
 }
 
 #[tool_router]
@@ -52,16 +50,8 @@ impl CairnCmd {
         cwd: String,
         run_id: Option<String>,
         mcp_secret: Option<String>,
-        available_agents: Vec<AgentInfo>,
     ) -> Self {
-        Self::new_with_home_uri(
-            callback_url,
-            cwd,
-            run_id,
-            mcp_secret,
-            available_agents,
-            None,
-        )
+        Self::new_with_home_uri(callback_url, cwd, run_id, mcp_secret, None)
     }
 
     pub(crate) fn new_with_home_uri(
@@ -69,7 +59,6 @@ impl CairnCmd {
         cwd: String,
         run_id: Option<String>,
         mcp_secret: Option<String>,
-        available_agents: Vec<AgentInfo>,
         _home_uri: Option<String>,
     ) -> Self {
         Self {
@@ -78,7 +67,6 @@ impl CairnCmd {
             run_id: run_id.map(Arc::new),
             mcp_secret: mcp_secret.map(Arc::new),
             tool_router: Self::tool_router(),
-            available_agents,
         }
     }
     /// Apply ordered file and resource mutations through the canonical change carrier.
@@ -87,11 +75,11 @@ impl CairnCmd {
 
 Targets:
 - File: `file:path/to/file` (worktree-relative; bare `file:` is the worktree root, `file:/abs` is absolute). Every item carries its keys under `payload`: create/replace/append take `payload:{content}`; patch takes `payload:{diff}` OR `payload:{old_string, new_string}` (optional `replace_all`); unified_patch takes `payload:{patch}` containing a native `*** Begin Patch` envelope with add/update/delete sections; delete needs no payload; `rename` takes `payload:{new_name, and exactly one of old_name | symbol_at}` and performs an ast-grep-backed structural rename of an identifier across the worktree, applying every edit site (and any module file move) as one commit. A bare `rename` returns a preview by default; land it with the `apply` round-trip. For a structural gap in a patch, put `~~*~~` in `old_string` between a head and tail anchor to replace everything in between — span by default, balanced only with the contiguous delimiter-pair token (`{~~*~~}`, delimiters immediately adjacent to the marker; the own-line `{\n~~*~~\n}` form spans). Multiple `~~*~~` markers span non-contiguous regions; escape a literal marker with a leading backslash. Example: `payload:{old_string: "fn validate(t) {~~*~~}", new_string: "fn validate(t) { verify(t); }"}`.
-- Resource: canonical `cairn://p/PROJECT/...` or home-relative `cairn:~/...`. Modes: create, append, patch, replace, delete.
+- Resource: canonical `cairn://p/PROJECT/...`, node-relative `cairn:~/...`, or project-relative `cairn:@/...`. Modes: create, append, patch, replace, delete.
 
 Don't guess a resource's payload: `read` the target URI first — its affordance block lists the exact actions (mode + required/optional payload keys + a copy-paste example) and read filters. If a mutation is unsupported or missing a required key, the rejection enumerates what the resource accepts.
 
-Notes: `atomic` defaults to false: matching items apply, failed items are reported in `failures`, and `commit_msg` commits only files that applied; set `atomic:true` for fail-fast apply behavior. `cairn:~/...` resolves against your running node; `preview:true` returns an `apply_uri` to re-submit with `mode=apply`; `commit_msg` is REQUIRED whenever the batch touches a file target (`\"^\"` amends the previous commit; without a commit_msg the worktree is restored to HEAD) — uncommitted worktree edits are lost if the worktree is cleaned up; task/question appends to `cairn:~/tasks` and `cairn:~/questions` block until results return. Change reports list per-item `applied` and `failures`."#
+Notes: `atomic` defaults to false: matching items apply, failed items are reported in `failures`, and `commit_msg` commits only files that applied; set `atomic:true` for fail-fast apply behavior. `cairn:~/...` resolves against your running node and `cairn:@/...` against its project; `preview:true` returns an `apply_uri` to re-submit with `mode=apply`; `commit_msg` is REQUIRED whenever the batch touches a file target (`\"^\"` commits with the previous commit's description; on an agent branch this always creates a new commit and never rewrites the previous commit in place; without a commit_msg the worktree is restored to HEAD) — uncommitted worktree edits are lost if the worktree is cleaned up; task/question appends to `cairn:~/tasks` and `cairn:~/questions` block until results return. Change reports list per-item `applied` and `failures`."#
     )]
     pub(crate) async fn write(
         &self,
@@ -117,8 +105,8 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let input = params.0;
         // Pooled Codex calls inject the originating thread as `_meta.threadId` so
-        // the host can select the run. Home-relative targets are always forwarded
-        // raw and the host expands them from that run.
+        // the host can select the run. Deictic targets are always forwarded raw
+        // and the host expands them from that run.
         let thread_id = Self::thread_id_from_meta(&meta);
 
         // Validate the raw input ourselves, in one pass, before any rewrite or
@@ -175,29 +163,17 @@ Notes: `atomic` defaults to false: matching items apply, failed items are report
 
 Targets (mix freely within one call):
 - File: `file:` (worktree root), `file:src/lib.rs` (worktree-relative), `file:/abs/path` (absolute / global)
-- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` plus collections `/issues`, `/messages`, issue `/changed`, node `/diff`, `/references`, and `/references/NAME`. `cairn:~/...` resolves against the run home.
-- Web/PDF: `http(s)://...` URLs and local `.pdf` paths return markdown via the active web-fetch provider (the built-in default is a plain HTTP fetch; PDF extraction needs a configured provider such as `bmd`).
-- Web search: `cairn://websearch?q=QUERY` runs the query through the active web-search provider and returns ranked results as markdown; everything after `q=` is the literal query, so spaces are fine.
-- Fleet: `cairn://executors` lists every machine enrolled with this runner by the public name that addresses it, and `cairn://executors/{name}` shows compact machine status — platform, toolchains, link and build state, timestamped telemetry, admission and queues, and occupancy. Drill into placement history with `?view=placements`, then read one complete decision (including passed-over candidate predictions) with `?view=placement&request=<request-id>`. These names are exactly what the run tool's `executor` selector accepts, so what you can read is what you can target. Served from cached fleet state; a read never probes a machine.
-- Channel conversations: `cairn://channels/conversations` lists every configured and enabled external-channel destination by canonical conversation address, with current deliverability and its latest outbound error.
-- Posts: `cairn://posts` is the workspace post corpus — what agents noticed but did not owe anyone — rendered newest first and cursor-neutral (`?limit=N` default 50 max 100, `?search=TEXT` over title and content, `?format=json`). `cairn://posts/{id}` is one post with its comments in creation order, and `cairn://p/PROJECT/posts` is the same corpus restricted to one project. Writing is append-only: `write cairn://posts {content, title?, scope?}` posts (omit `scope` for workspace-wide, `scope:"project"` for your own project) and `write cairn://posts/{id} {content}` comments. Authorship is captured from your authenticated run, so provenance keys are refused. `cairn:~/feed` is your own home's unread slice of that corpus, oldest first (`?limit=N` default 20 max 100, `?format=json`), carrying how many unread posts are still behind the page and an acknowledgement token; `write cairn:~/feed {ack:"TOKEN"}` advances your reading position to exactly what that token showed, and an unacknowledged page is never passed over — the next read still leads with those posts under a fresh token. Posts never wake you unless you elect it with `write cairn:~/wakes {subscribe:{kind:"posts"}}`.
-- Images: reading an image (an image file, `cairn:~/browser?screenshot`, a stored image URI) shows it to BOTH of you in one step — you see the image, and a durable `![label](cairn://p/PROJECT/ISSUE/images/N)` reference renders in the transcript; paste that reference into a message, issue, or artifact to carry the image forward. Image addresses are ordinal and scoped, so `images/4` addresses a sibling directly and reading `cairn://p/PROJECT/ISSUE/images` lists an issue's images.
+- Resource: canonical `cairn://p/PROJECT[/NUMBER[/EXEC/NODE[/sub]]]` and the other `cairn://` families (posts, feed, executors, channels, help); `cairn:~/...` resolves against the run home. Every resource read returns an affordance block listing its filters, links, and actions.
+- Web: `http(s)://...` URLs and local `.pdf` paths return markdown; `cairn://websearch?q=QUERY` runs a web search (everything after `q=` is the literal query, so spaces are fine).
+- Images: reading an image (an image file, `cairn:~/browser?screenshot`, a stored image URI) shows it to BOTH you and the user, and a durable `![label](cairn://p/PROJECT/ISSUE/images/N)` reference renders in the transcript to carry the image forward.
 
 Per-target scoping rides in each URI's query string — append `?key=value&...`:
-- Files: `offset=N` skips N leading lines (0-based — line N is at `offset N−1`); `limit=N` returns N lines; `offset=-N` returns the last N lines (tail). `branch=REF` reads file content from a jj-resolved bookmark, commit/change id, or node URI without checking out that branch; it is per-target only and applies only to `file:` targets. `glob=PATTERN` selects matched files (`output_mode=files_with_matches|content|count`; a directory grep defaults to `files_with_matches`, a single-file grep to `content`). `issue_history=true|verbose` appends issues that touched the file.
-- Grep is universal: `grep=REGEX` matches over ANY target's rendered text. A file tree greps with ripgrep and labels each line `path:N:text`; a single file or any rendered resource/web body greps in memory and drops the path prefix (`N:text`). Modifiers: `-i` (case-insensitive), `-A=N`/`-B=N`/`-C=N`/`context=N` (context lines), `head_limit=N` to cap matches (`limit=N` aliases it under grep). `offset` is NOT allowed with grep — paginate matches with `head_limit`.
-- Structural code: `ast=PATTERN` runs an ast-grep pattern over any file/dir target and renders the same `path:N:line` rows as grep (composes with `glob`). A pattern is real code with metavariables — `$VAR` matches one node, `$$$` a run — e.g. `ast=fn $NAME($$$) { $$$ }` (Rust) or `ast=console.log($$$)` (TS); it is NOT a tree-sitter node-kind name like `function_declaration`. `outline` (bare flag) renders a file/dir signature skeleton. Symbol navigation lives on the `symbols` resource: `cairn://p/PROJECT/NUMBER/EXEC/NODE/symbols/{name}?op=definition|references|callers|implementations` (node-scoped) or `cairn://p/PROJECT/symbols/{name}` (project-checkout fallback); absent `op` is an overview (definition site + signature + reference count), `in=GLOB` scopes it.
-- Escaping: `&` and `+` are literal inside a value (so `grep=&mut self` and `grep=\d+` work as written); use `%26` for a literal `&` that immediately precedes a recognized key token
-- Resources: `offset=N` skips rendered resource lines client-side; `limit=N` is resource-specific unless reading a single transcript event, where it is a client-side line count
-- Raw transcripts: append `format=json` to node or task `/chat/raw` for JSONL with one canonically reconstructed event per line (`runId`, `sequence`, `turnId`, `eventType`, `createdAt`, `payload`); `offset`/`limit` then page events, and an oversized event resumes through the emitted cumulative `char_offset` continuation
-- `/issues`: `status=backlog,active,...` (comma-separated), `limit=N`, `sort=updated_desc|created_asc|...`, `ready=true|false`
-- `/messages`: `before=`, `after=`, `since=EPOCH`, `limit=N`
-- `/channels/conversations`: `provider=imessage|telegram|discord`, `deliverability=ready|degraded|stopped`
-- Project search: `cairn://p/PROJECT?search=QUERY&limit=N&since=EPOCH`
+- Files: `offset=N` skips N leading lines; `limit=N` returns N lines; `offset=-N` tails. `branch=REF` reads content as of another revision (a branch name, commit, or node URI) without switching branches. `glob=PATTERN` selects matched files. `issue_history=true|verbose` appends issues that touched the file.
+- Grep is universal: `grep=REGEX` matches over ANY target's rendered text. Results group by file the way `rg --heading` does: the path on its own line, then its matches beneath it as `N:text` (context lines as `N-text`), a blank line before the next file. Modifiers: `-i`, `-A=N`/`-B=N`/`-C=N`, `output_mode=files_with_matches|content|count`, `head_limit=N` to cap matches (matches, not rendered lines — context does not count against it). A capped grep reports the FULL result's counts and marks itself partial (`[23 matches in 6 files; 8 of 23 matches shown]`) with a `continue:` footer that widens the cap, so a windowed enumeration is never mistaken for a complete one. `offset` is not allowed with grep — page with `head_limit`. `&` and `+` are literal inside a value; use `%26` for a literal `&` that immediately precedes a recognized key token.
+- Structural code: `ast=PATTERN` runs an ast-grep pattern (real code with `$VAR`/`$$$` metavariables, e.g. `ast=console.log($$$)`) over any file/dir target; `outline` (bare flag) renders a signature skeleton. Symbol navigation lives on `cairn:~/symbols/{name}?op=definition|references|callers|implementations` (`in=GLOB` scopes it).
+- Resources: `offset`/`limit` page rendered lines, and each collection takes its own keys (e.g. `/issues?status=active&limit=20`, `/messages?since=EPOCH`, project search `cairn://p/PROJECT?search=QUERY`); the affordance block lists them. Raw transcripts (`/chat/raw?format=json`) return JSONL, one event per line.
 
-Partial failures never abort: every failed target remains in place under an `[error]` header. An unchanged unwindowed repeat suppressed as flailing remains in place under `[duplicate]`; explicit windows carrying `offset`, `limit`, `head_limit`, or `char_offset` are deliberate navigation and are never suppressed. A multi-target read shares a single ~45k-char total budget across targets (water-filled so small targets render whole and large ones fair-share).
-
-For lossless automation, consume the `read_batch` envelope metadata and opt-in bodies: `kind: error|duplicate` is non-content and never completion. Successful completion is derived from `offset`, `shown_units`, `total_units`, `truncated`, and `char_continuation`. In composed text, every requested window must carry its valid paging footer; never accept a footerless `[error]` or `[duplicate]` block as a final page. Successful windowed or truncated segments carry an always-valid `continue:` footer — `[lines A–B of T — output truncated to fit budget; continue: ...]`, advancing `offset`/`head_limit`, or a `char_offset=` resume when a single line is itself larger than the budget."#
+Partial failures never abort: a failed target stays in place under an `[error]` header, and an unchanged unwindowed repeat is suppressed as `[duplicate]` (explicit windows are deliberate navigation and never suppressed). A multi-target read shares a single ~45k-char budget, water-filled so small targets render whole; every truncated or windowed segment ends with a valid `continue:` footer — follow it rather than re-reading."#
     )]
     pub(crate) async fn read(
         &self,
@@ -318,7 +294,13 @@ For lossless automation, consume the `read_batch` envelope metadata and opt-in b
     /// invocations, synchronously. Parallel by default; `sequential: true` runs
     /// in order. Long-running terminals are managed by `write` on terminals.
     #[tool(
-        description = "Suspend this turn without polling with a sole wait item: `{waitFor:{duration:\"3m\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/tests\",on:\"exit\"}}`, `{waitFor:{kind:\"terminal\",ref:\"cairn:~/terminal/dev\",on:\"output\",phrase:\"ready\"}}`, or `{waitFor:{kind:\"checks\",ref:\"cairn://p/CAIRN/3427/1/builder/checks\",on:\"settled\"}}` (add `on:\"verdict\",suite:\"rust-tests\"` for one suite) — the checks wait is how you learn that ANOTHER node's project check lanes have stopped moving, e.g. before merging a child's PR, instead of sleeping a blind duration and re-reading. It resumes with each lane's verdict and a one-word `verdict` of passed/failed/incomplete, where incomplete means a lane stopped without ever producing one. You cannot wait on your OWN lanes (the turn-end wave is armed by this turn ENDING); for that, end your turn on `write cairn:~/wakes {subscribe:{kind:\"checks\"}}`. The pending run call resumes when the condition fires. Otherwise, execute an ordered batch of synchronous invocations. `commands` is a non-empty array; each item is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with its named arguments in `payload.args_json` (e.g. `{target:\"cairn://mcp/axon/look\", payload:{args_json:{app:\"Finder\"}}}` — read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (e.g. `{code:\"console.log(1)\", interpreter:\"typescript\"}`). Inline `code` is the default way to run code that isn't a CLI invocation: the interpreter execs the source directly, so there is no shell and no quoting. `typescript`/`ts` and `javascript`/`js` run via bun with the worktree `node_modules` importable and `@cairn/sdk` provided by Cairn in every project, whether or not it depends on the SDK (a project's own copy still wins); `python`/`py` runs through the bundled `uv` (a PEP 723 `# /// script` dependency block resolves into a cached environment, and a worktree `pyproject.toml`/`uv.lock` project env is picked up automatically); `matlab` runs via `matlab -batch`. Add `repl:<slug>` to an inline `code` item to evaluate it in a stateful REPL session — create it first with `write cairn:~/repl/<slug> {interpreter:\"python\", deps:[\"pandas\"]}` — so variables, imports, and defs persist across `run` calls (its state is lost if the REPL dies). Prefer inline code over wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`. Keep inline code synchronous and run-to-completion; long-running or background code belongs to terminal resources (and durable workflow scripts). Items run in PARALLEL by default; set `sequential: true` for ordered execution (fail-fast unless `stop_on_error: false`). Output is composed under `=== <header> ===` headers in input order. If a successful worktree-bound batch dirties the tree, `commit_msg` is required and commits all worktree changes ONCE after the batch succeeds; `^` amends. Without a commit_msg, a batch that dirties the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — instead of your own, which is how you tell a real regression from a failure already on the base (`run({commands:[{command:\"bun run test\"}], branch:\"main\"})`); it is verdict-only, so tracked writes are discarded, and `commit_msg`, MCP, and REPL items are rejected. `executor` states which machine runs the batch — `{name:\"bglab-ub\"}` for one machine by its public name or `{os:\"linux\"}` for any machine on that platform, either optionally refined by `requiredToolchains`; `name` and `os` are mutually exclusive, and read `cairn://executors` for the names, platforms, and toolchains available. In an agent job, an incompatible explicit selector runs in a fresh checkout at the branch head rather than the job's warm working tree. Omit it and the batch runs in its normal execution home. Not for long-lived/background processes — use a terminal resource via `write` for those. One call in, one final result out: a batch runs to completion, and if it takes longer than 120 seconds this call suspends and resumes with the finished result rather than reporting progress. An item's `timeout` (ms) is a kill bound, not a call bound: the item terminates at the bound and its result block reports the timeout with whatever output it produced — the batch is never aborted with no output. Omitting it lets a shell, code, or skill-script item run to completion, capped only by the 6-hour ceiling on a batch (a command meant to keep running belongs in a terminal); an MCP-tool or REPL item is capped at the 120-second synchronous window."
+        description = r#"Execute an ordered batch of synchronous invocations, or suspend this turn on a sole `waitFor` item. Each item in `commands` is exactly one of: a shell `command`; a `target` skill-script URI (cairn://skills/<id>/scripts/<name>) with optional `payload.args`; a `target` external MCP tool (cairn://mcp/<server>/<tool>) with named arguments in `payload.args_json` (read cairn://mcp/<server> for each tool's arg shape); or inline `code` with a required `interpreter` (`typescript`/`javascript` via bun, `python` via uv, `matlab`). Inline code is the default way to run code that isn't a CLI invocation — the interpreter execs the source directly, so there is no shell and no quoting; keep it synchronous and run-to-completion, and put long-running or background processes in a terminal resource via `write`. Add `repl:<slug>` to an inline item to evaluate it in a stateful REPL session created at `cairn:~/repl/<slug>`. A batch may not mix tree-bound items (shell, inline code, skill scripts) with MCP or REPL items.
+
+Items run in PARALLEL by default; `sequential:true` runs in order (fail-fast unless `stop_on_error:false`). Output composes under `=== <header> ===` headers in input order. One call in, one final result out: a batch that outlives the 120-second synchronous window suspends and resumes with the finished result. An item's `timeout` (ms) kills that item at the bound and reports whatever output it produced rather than terminating the call. For a tree-bound batch in which every item declares a timeout, those bounds also limit how long the batch waits for a busy machine (the parallel maximum or sequential sum, capped at the 6-hour batch ceiling) and tell a remote executor how long to hold its queue place; if any item omits one, the batch may wait up to that ceiling. An omitted timeout also lets a tree-bound item run to completion under the ceiling, while MCP-tool and REPL items execute on the host inside the 120-second window.
+
+If a successful batch dirties the tree, `commit_msg` is required and commits all worktree changes once after success (`^` amends); without it the worktree is restored to HEAD. `branch` runs the batch against another revision — a branch name, a commit, or a node URI — to tell a regression from a failure already on the base; it is verdict-only: tracked writes are discarded, and commit_msg, MCP, and REPL items are rejected. `executor` places the batch on a specific machine (`{name:"..."}`) or platform (`{os:"linux"}`), optionally refined by `requiredToolchains`; read cairn://executors for what is available, and omit it otherwise.
+
+A sole `{waitFor:...}` item suspends until a duration elapses (`{duration:"3m"}`), a terminal exits or prints a phrase (`{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}`), or ANOTHER node's project check lanes settle (`{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}`, or `on:"verdict",suite:"..."` for one suite), resuming with the lanes' verdicts. You cannot wait on your own lanes; for those, end the turn on `write cairn:~/wakes {subscribe:{kind:"checks"}}` instead."#
     )]
     async fn run(
         &self,
@@ -489,23 +471,13 @@ impl ServerHandler for CairnCmd {
     }
 
     fn get_info(&self) -> ServerInfo {
-        let mut instructions = "Cairn MCP server for agent orchestration. Three batch verbs: \
+        let instructions = "Cairn MCP server for agent orchestration. Three batch verbs: \
              `read` (files, directories, cairn:// resources, and web targets, with per-target \
              `?query` scoping), `write` (ordered file and cairn:// resource mutations; \
              `commit_msg` commits file edits), and `run` (shell commands, inline code, and \
              skill scripts). Each tool's description carries its full contract; reading a \
              cairn:// resource returns its affordances inline."
             .to_string();
-
-        // Add available agents to instructions
-        if !self.available_agents.is_empty() {
-            instructions.push_str(
-                "\n\nAvailable agents (use as subagentType when appending to a node's tasks collection):\n",
-            );
-            for agent in &self.available_agents {
-                instructions.push_str(&format!("- {}: {}\n", agent.name, agent.description));
-            }
-        }
 
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder()
@@ -522,30 +494,7 @@ impl ServerHandler for CairnCmd {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, rmcp::ErrorData> {
-        // Get static tools from the router
-        let mut tools = self.tool_router.list_all();
-
-        // Append available agents to the write tool description so task
-        // appends know which subagentType values are valid.
-        if !self.available_agents.is_empty() {
-            for tool in &mut tools {
-                if tool.name == "write" {
-                    let mut desc = tool
-                        .description
-                        .as_ref()
-                        .map(|d| d.to_string())
-                        .unwrap_or_default();
-                    desc.push_str("\n\nAvailable agents for task appends (subagentType):\n");
-                    for agent in &self.available_agents {
-                        desc.push_str(&format!("- {}: {}\n", agent.name, agent.description));
-                    }
-                    tool.description = Some(std::borrow::Cow::Owned(desc));
-                    break;
-                }
-            }
-        }
-
-        Ok(ListToolsResult::with_all_items(tools))
+        Ok(ListToolsResult::with_all_items(self.tool_router.list_all()))
     }
 
     async fn call_tool(
@@ -724,90 +673,6 @@ mod tests {
         server.await.expect("server task");
     }
 
-    #[test]
-    fn test_available_agents_stored_for_change_description() {
-        let agents = vec![
-            AgentInfo {
-                name: "Explore".to_string(),
-                description: "Search and explore the codebase".to_string(),
-            },
-            AgentInfo {
-                name: "Research".to_string(),
-                description: "Research a topic in depth".to_string(),
-            },
-        ];
-
-        let mcp = CairnCmd::new(
-            "http://localhost:3847".to_string(),
-            "/test/path".to_string(),
-            None, // run_id
-            None, // mcp_secret
-            agents,
-        );
-
-        let tools = mcp.tool_router.list_all();
-        assert!(
-            tools.iter().any(|t| t.name == "write"),
-            "write tool should exist"
-        );
-
-        // Agent-list injection into the change description happens in list_tools();
-        // here we verify the agents are stored for that step.
-        assert_eq!(mcp.available_agents.len(), 2);
-        assert_eq!(mcp.available_agents[0].name, "Explore");
-        assert_eq!(mcp.available_agents[1].name, "Research");
-    }
-
-    #[test]
-    fn test_server_info_includes_agents_in_instructions() {
-        let agents = vec![AgentInfo {
-            name: "Explore".to_string(),
-            description: "Search the codebase".to_string(),
-        }];
-
-        let mcp = CairnCmd::new(
-            "http://localhost:3847".to_string(),
-            "/test/path".to_string(),
-            None, // run_id
-            None, // mcp_secret
-            agents,
-        );
-
-        let info = mcp.get_info();
-        let instructions = info.instructions.unwrap();
-
-        assert!(
-            instructions.contains("Available agents"),
-            "Instructions should mention available agents"
-        );
-        assert!(
-            instructions.contains("Explore"),
-            "Instructions should include agent name"
-        );
-        assert!(
-            instructions.contains("Search the codebase"),
-            "Instructions should include agent description"
-        );
-    }
-
-    #[test]
-    fn test_server_info_excludes_agents_when_empty() {
-        let mcp = CairnCmd::new(
-            "http://localhost:3847".to_string(),
-            "/test/path".to_string(),
-            None,   // run_id
-            None,   // mcp_secret
-            vec![], // No agents
-        );
-
-        let info = mcp.get_info();
-        let instructions = info.instructions.unwrap();
-
-        assert!(
-            !instructions.contains("Available agents"),
-            "Instructions should not mention agents when none available"
-        );
-    }
     /// The `run` tool's advertised timeout contract is prose in two places — the
     /// tool description and the `RunItemInput.timeout` schema description — while
     /// the bound is enforced in cairn-core. They drifted once already: both
@@ -823,7 +688,6 @@ mod tests {
             "/test/path".to_string(),
             None,
             None,
-            vec![],
         );
         let run = mcp
             .tool_router
@@ -908,7 +772,6 @@ mod tests {
             "/test/path".to_string(),
             None,
             None,
-            vec![],
         );
 
         let all_tools = mcp.tool_router.list_all();

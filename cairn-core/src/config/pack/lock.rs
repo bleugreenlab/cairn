@@ -299,7 +299,7 @@ fn pack_supplies_mcp(config_dir: &Path, pack_id: &str, server: &str) -> bool {
     let path = mcp_path(config_dir, pack_id);
     path.is_file()
         && super::mcp::parse_pack_mcp_file(&path)
-            .map(|servers| servers.contains_key(server))
+            .map(|file| file.servers.contains_key(server))
             .unwrap_or(false)
 }
 
@@ -317,8 +317,9 @@ pub fn restore_removed_items(
         return Ok(Vec::new());
     }
     let restored = lock.removed.clone();
-    let installed_mcp =
-        super::mcp::parse_pack_mcp_file(&mcp_path(config_dir, pack_id)).unwrap_or_default();
+    let installed_mcp = super::mcp::parse_pack_mcp_file(&mcp_path(config_dir, pack_id))
+        .unwrap_or_default()
+        .servers;
     lock.items
         .extend(std::mem::take(&mut lock.removed).into_iter().map(|item| {
             let mut restored = PackLockItem::legacy(item);

@@ -34,6 +34,8 @@ const PROD_CALLBACK_PORT: u16 = 3847;
 /// Dev callback port (the `tauri dev` desktop app).
 const DEV_CALLBACK_PORT: u16 = 3857;
 
+/// Published SDK spelling (`CAIRN_RUNNER_PORT` / `DEFAULT_RUNNER_PORT`) is
+/// frozen until cairn/4377 gives it an independent deprecation path.
 /// Fixed production runner transport port. The desktop and runner both address
 /// the local execution daemon by this convention instead of a discovery file.
 pub const DEFAULT_RUNNER_PORT: u16 = 3849;

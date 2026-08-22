@@ -356,6 +356,8 @@ mod tests {
             bundles: Vec::new(),
             is_project_scoped: true,
             file_path: std::path::PathBuf::new(),
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 

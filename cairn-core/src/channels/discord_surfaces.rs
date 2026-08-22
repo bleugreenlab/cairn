@@ -310,7 +310,7 @@ mod tests {
         )
         .await
         .unwrap_err()
-        .contains("home-relative"));
+        .contains("deictic"));
     }
 
     #[tokio::test]
@@ -803,8 +803,8 @@ pub async fn ensure_surface(
 
 fn canonical_target(uri: &str) -> Result<String, String> {
     let uri = cairn_common::uri::canonicalize_uri_identity(uri);
-    if uri == "cairn:~" || uri.starts_with("cairn:~/") {
-        Err("home-relative Discord target must be resolved before persistence".into())
+    if uri == "cairn:~" || uri.starts_with("cairn:~/") || uri.starts_with("cairn:@") {
+        Err("deictic Discord target must be resolved before persistence".into())
     } else {
         Ok(uri)
     }

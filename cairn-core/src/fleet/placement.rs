@@ -111,6 +111,7 @@ pub(crate) fn substrate_is_working(state: ExecutorSubstrateState) -> bool {
         | ExecutorSubstrateState::SlotAdoption
         | ExecutorSubstrateState::CapacityBusy => true,
         ExecutorSubstrateState::ExecutionRunning
+        | ExecutorSubstrateState::PermanentRefusal
         | ExecutorSubstrateState::ConnectedStalled
         | ExecutorSubstrateState::Draining => false,
     }
@@ -140,7 +141,12 @@ pub(crate) fn pressure_relieves_itself(evidence: &HostPressureEvidence) -> bool 
         && evidence.conditions.iter().all(|condition| match condition {
             HostPressureCondition::MemoryAvailable { .. }
             | HostPressureCondition::ResidentOccupancy { .. }
-            | HostPressureCondition::CpuUtilization { .. } => true,
+            | HostPressureCondition::CpuUtilization { .. }
+            // Telemetry goes blind when the machine is too loaded to sample
+            // itself, so the work already running is what clears it: the
+            // sampler gets its turn back as that work drains. Waiting is the
+            // right response, and it is the same wait measured pressure gets.
+            | HostPressureCondition::TelemetryBlind { .. } => true,
             HostPressureCondition::DiskFree { .. } => false,
         })
 }
@@ -442,7 +448,8 @@ mod tests {
         };
         assert!(settled(&held(vec![HostPressureCondition::MemoryAvailable {
             available_bytes: 1,
-            floor_bytes: 2
+            floor_bytes: 2,
+            unmeasured_hold_bytes: 0
         }]))
         .is_capacity());
         assert!(!settled(&held(vec![HostPressureCondition::DiskFree {
@@ -457,7 +464,8 @@ mod tests {
         assert!(!settled(&held(vec![
             HostPressureCondition::MemoryAvailable {
                 available_bytes: 1,
-                floor_bytes: 2
+                floor_bytes: 2,
+                unmeasured_hold_bytes: 0
             },
             HostPressureCondition::DiskFree {
                 free_bytes: 1,

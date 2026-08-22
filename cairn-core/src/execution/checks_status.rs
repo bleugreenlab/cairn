@@ -17,6 +17,7 @@ use crate::orchestrator::generation_cache::GenerationCache;
 use crate::orchestrator::Orchestrator;
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
 /// In-process materialization of the exact settled check planner projection.
@@ -34,6 +35,8 @@ use std::sync::Mutex;
 pub(crate) struct NodeCheckStatusCache {
     cache: GenerationCache<Vec<NodeCheckStatus>>,
     projects: Mutex<HashMap<String, String>>,
+    settled_projection_reads: AtomicU64,
+    in_flight_bypasses: AtomicU64,
 }
 
 impl Default for NodeCheckStatusCache {
@@ -41,11 +44,30 @@ impl Default for NodeCheckStatusCache {
         Self {
             cache: GenerationCache::new("node check projection"),
             projects: Mutex::new(HashMap::new()),
+            settled_projection_reads: AtomicU64::new(0),
+            in_flight_bypasses: AtomicU64::new(0),
         }
     }
 }
 
 impl NodeCheckStatusCache {
+    fn record_read_branch(&self, bypassed_for_in_flight_checks: bool) {
+        let counter = if bypassed_for_in_flight_checks {
+            &self.in_flight_bypasses
+        } else {
+            &self.settled_projection_reads
+        };
+        let count = counter.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+        log::debug!(
+            "node check projection branch={} count={count}",
+            if bypassed_for_in_flight_checks {
+                "in-flight-bypass"
+            } else {
+                "settled-projection"
+            }
+        );
+    }
+
     fn bind_project(&self, job_id: &str, project_id: &str) {
         if let Ok(mut projects) = self.projects.lock() {
             projects.insert(job_id.to_string(), project_id.to_string());
@@ -137,8 +159,10 @@ pub async fn node_check_statuses(
     // disk, so each read remains current without rebuilding the settled jj/diff
     // projection.
     if orch.turn_end_checks_in_flight(job_id) || orch.write_checks_in_flight(job_id) {
+        orch.node_check_status_cache.record_read_branch(true);
         return compute_node_check_statuses(orch, job_id).await;
     }
+    orch.node_check_status_cache.record_read_branch(false);
     orch.node_check_status_cache
         .get_or_compute(job_id, || compute_node_check_statuses(orch, job_id))
         .await
@@ -793,6 +817,20 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn node_check_read_branches_are_counted_independently() {
+        let cache = NodeCheckStatusCache::default();
+        cache.record_read_branch(false);
+        cache.record_read_branch(false);
+        cache.record_read_branch(true);
+
+        assert_eq!(
+            cache.settled_projection_reads.load(AtomicOrdering::Relaxed),
+            2
+        );
+        assert_eq!(cache.in_flight_bypasses.load(AtomicOrdering::Relaxed), 1);
+    }
 
     #[tokio::test]
     async fn settled_projection_coalesces_concurrent_misses_and_reuses_warm_value() {

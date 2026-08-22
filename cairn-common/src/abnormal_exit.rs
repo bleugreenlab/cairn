@@ -176,7 +176,7 @@ fn crash_report_in(reports: &Path, exit: &AbnormalExit) -> Option<PathBuf> {
         let names_a_runner = path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("cairn-runner-") && name.ends_with(".ips"));
+            .is_some_and(|name| name.starts_with("cairn-orch-") && name.ends_with(".ips"));
         if !names_a_runner {
             continue;
         }
@@ -274,7 +274,9 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(
             &path,
-            format!("{{\"app_name\":\"cairn-runner\"}}\n{{\"pid\":{pid},\"procName\":\"cairn-runner\"}}"),
+            format!(
+                "{{\"app_name\":\"cairn-orch\"}}\n{{\"pid\":{pid},\"procName\":\"cairn-orch\"}}"
+            ),
         )
         .unwrap();
         path
@@ -291,9 +293,9 @@ mod tests {
 
         // An unrelated runner crash lands FIRST, so only the pid can tell them
         // apart: an earliest-wins rule would choose this one.
-        write_report(dir.path(), "cairn-runner-2026-08-01-153830.ips", 99999);
+        write_report(dir.path(), "cairn-orch-2026-08-01-153830.ips", 99999);
         std::thread::sleep(Duration::from_millis(20));
-        let ours = write_report(dir.path(), "cairn-runner-2026-08-01-153834.ips", 74402);
+        let ours = write_report(dir.path(), "cairn-orch-2026-08-01-153834.ips", 74402);
 
         assert_eq!(crash_report_in(dir.path(), &exit), Some(ours));
     }
@@ -303,13 +305,9 @@ mod tests {
     fn an_unattributable_report_is_not_offered_as_this_abort() {
         let dir = tempfile::tempdir().unwrap();
         let exit = AbnormalExit::new(74402, "aborted".to_string());
-        write_report(dir.path(), "cairn-runner-2026-08-01-153834.ips", 12345);
+        write_report(dir.path(), "cairn-orch-2026-08-01-153834.ips", 12345);
         // A report whose body cannot be parsed is skipped rather than guessed at.
-        std::fs::write(
-            dir.path().join("cairn-runner-2026-08-01-153835.ips"),
-            b"junk",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("cairn-orch-2026-08-01-153835.ips"), b"junk").unwrap();
         assert_eq!(crash_report_in(dir.path(), &exit), None);
     }
 
@@ -319,7 +317,7 @@ mod tests {
     fn a_report_outside_the_window_is_not_attributed_to_an_old_abort() {
         let dir = tempfile::tempdir().unwrap();
         let mut exit = AbnormalExit::new(74402, "aborted".to_string());
-        let report = write_report(dir.path(), "cairn-runner-2026-08-01-153834.ips", 74402);
+        let report = write_report(dir.path(), "cairn-orch-2026-08-01-153834.ips", 74402);
         exit.at_unix_ms = report
             .metadata()
             .unwrap()

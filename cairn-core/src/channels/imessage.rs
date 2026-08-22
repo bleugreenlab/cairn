@@ -1936,6 +1936,10 @@ mod tests {
                 provider_guid: "message-guid".into(),
                 caption_guid: None,
                 sent_at: chrono::Utc::now().timestamp() - 30,
+                original_text: "Ship it?".into(),
+                answer: Some("Ship it".into()),
+                answering_surface: None,
+                multi_select: false,
                 receipt: "✓ answered: Ship it".into(),
             })
             .await
@@ -1958,6 +1962,10 @@ mod tests {
                 provider_guid: "poll-guid".into(),
                 caption_guid: Some("caption-guid".into()),
                 sent_at: chrono::Utc::now().timestamp(),
+                original_text: "Ship it?".into(),
+                answer: Some("Ship it".into()),
+                answering_surface: None,
+                multi_select: false,
                 receipt: "✓ answered: Ship it".into(),
             })
             .await

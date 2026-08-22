@@ -15,11 +15,8 @@
 //! - [`Delivery::Steer`] (Cmd+Enter): delivered at the next tool boundary,
 //!   mid-turn, as soon as possible.
 //!
-//! A row is pending while `delivered_at` is NULL. The one row that is never
-//! pending is [`record_direct_delivery`]'s: an idle job takes the operator's
-//! text straight into its resume, so that send is recorded already delivered,
-//! and every pending-only surface — both claim paths, the composer's pending
-//! strip, edit and delete — passes over it.
+//! A row is pending while `delivered_at` is NULL. Idle and active sends use the
+//! same durable row; only a claim records delivery.
 //!
 //! Two claim paths consume a pending row:
 //! the tool-boundary claim ([`claim_steer_for_job_async`], from `dispatch`)
@@ -50,6 +47,34 @@ pub struct QueuedMessage {
     pub(crate) delivery: Delivery,
     pub(crate) created_at: i64,
     pub(crate) delivered_at: Option<i64>,
+}
+
+impl ClaimFilter {
+    fn select_sql(self) -> String {
+        let delivery_filter = match self {
+            Self::All => "",
+            Self::ToolBoundary => " AND delivery IN ('passive', 'steer', 'interrupt')",
+        };
+        format!(
+            "SELECT {SELECT_COLUMNS} FROM queued_messages
+             WHERE job_id = ?1 AND delivered_at IS NULL{delivery_filter}
+             ORDER BY created_at ASC, rowid ASC"
+        )
+    }
+
+    fn update_sql(self) -> &'static str {
+        match self {
+            Self::All => {
+                "UPDATE queued_messages SET delivered_at = ?1
+                 WHERE job_id = ?2 AND delivered_at IS NULL"
+            }
+            Self::ToolBoundary => {
+                "UPDATE queued_messages SET delivered_at = ?1
+                 WHERE job_id = ?2 AND delivered_at IS NULL
+                   AND delivery IN ('passive', 'steer', 'interrupt')"
+            }
+        }
+    }
 }
 
 fn message_from_row(row: &cairn_db::turso::Row) -> DbResult<QueuedMessage> {
@@ -103,42 +128,6 @@ pub fn enqueue_idempotent(
     run_db_blocking(move || async move {
         record_operator_message(db, &job_id, &content, delivery, None, Some(request_id)).await
     })
-}
-
-/// Record operator text that reached an **idle** job directly: the resume it
-/// triggered carries the text to the agent itself, so the row is stamped
-/// delivered at insert and no claim path can pick it up (CAIRN-3390).
-///
-/// The row is bookkeeping rather than delivery, and it earns its place because
-/// this table is the durable record of *what the operator said to a job* — the
-/// record the watcher catch-up digest reads. Without it the idle branch leaves
-/// an operator message with no trace of its authorship: the child's transcript
-/// holds a `user` event, and that slot also holds the job's launch prompt, a
-/// delegated artifact payload, and every machinery resume, so no reader can tell
-/// which of them a human typed.
-///
-/// The [`Delivery`] tag is inert here — it records when a *pending* row wants to
-/// be claimed, and this one is already delivered — so it carries the composer
-/// default the operator's keystroke means.
-pub fn record_direct_delivery(
-    db: &LocalDb,
-    job_id: &str,
-    content: &str,
-) -> Result<QueuedMessage, String> {
-    let job_id = job_id.to_string();
-    let content = content.to_string();
-    run_db_blocking(
-        move || async move { record_direct_delivery_async(db, &job_id, &content).await },
-    )
-}
-
-pub(crate) async fn record_direct_delivery_async(
-    db: &LocalDb,
-    job_id: &str,
-    content: &str,
-) -> Result<QueuedMessage, String> {
-    let now = chrono::Utc::now().timestamp();
-    record_operator_message(db, job_id, content, Delivery::Queue, Some(now), None).await
 }
 
 /// Insert one operator message for a job — pending, or already delivered — and
@@ -389,6 +378,29 @@ pub(crate) async fn claim_all_for_job_async(
     claim_for_job_inner(db, job_id, ClaimFilter::All).await
 }
 
+/// Return exact rows claimed by a resume to the pending queue when launch
+/// preparation fails before their canonical transcript events are stored.
+pub(crate) fn restore_claimed(db: &LocalDb, ids: &[String]) -> Result<(), String> {
+    let ids = ids.to_vec();
+    run_db_blocking(move || async move {
+        db.write(|conn| {
+            let ids = ids.clone();
+            Box::pin(async move {
+                for id in ids {
+                    conn.execute(
+                        "UPDATE queued_messages SET delivered_at = NULL WHERE id = ?1",
+                        params![id.as_str()],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| format!("Failed to restore claimed queued messages: {error}"))
+    })
+}
+
 #[derive(Clone, Copy)]
 enum ClaimFilter {
     All,
@@ -411,33 +423,29 @@ async fn claim_for_job_inner(
     event.emit();
     let job_id = job_id.to_string();
     let now = chrono::Utc::now().timestamp();
+    let pending = db
+        .query_all(
+            filter.select_sql(),
+            params![job_id.as_str()],
+            message_from_row,
+        )
+        .await
+        .map_err(|error| format!("Failed to inspect queued messages: {error}"))?;
+    if pending.is_empty() {
+        let mut event =
+            crate::resume_timing::ResumeTimingEvent::new("queue_claim_end").elapsed(timing_started);
+        event.job_id = Some(&job_id);
+        event.mode = Some(mode);
+        event.count = Some(0);
+        event.bytes = Some(0);
+        event.emit();
+        return Ok(Vec::new());
+    }
     db.write(|conn| {
         let job_id = job_id.clone();
         Box::pin(async move {
-            let (select_sql, update_sql) = match filter {
-                ClaimFilter::ToolBoundary => (
-                    format!(
-                        "SELECT {SELECT_COLUMNS} FROM queued_messages
-                         WHERE job_id = ?1 AND delivered_at IS NULL
-                           AND delivery IN ('passive', 'steer', 'interrupt')
-                         ORDER BY created_at ASC, rowid ASC"
-                    ),
-                    "UPDATE queued_messages SET delivered_at = ?1
-                     WHERE job_id = ?2 AND delivered_at IS NULL
-                       AND delivery IN ('passive', 'steer', 'interrupt')"
-                        .to_string(),
-                ),
-                ClaimFilter::All => (
-                    format!(
-                        "SELECT {SELECT_COLUMNS} FROM queued_messages
-                         WHERE job_id = ?1 AND delivered_at IS NULL
-                         ORDER BY created_at ASC, rowid ASC"
-                    ),
-                    "UPDATE queued_messages SET delivered_at = ?1
-                     WHERE job_id = ?2 AND delivered_at IS NULL"
-                        .to_string(),
-                ),
-            };
+            let select_sql = filter.select_sql();
+            let update_sql = filter.update_sql();
             let mut rows = conn.query(&select_sql, params![job_id.as_str()]).await?;
             let mut messages = Vec::new();
             while let Some(row) = rows.next().await? {
@@ -515,6 +523,34 @@ mod tests {
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("queued-messages.db").await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_tool_boundary_claim_does_not_open_a_write_transaction() {
+        let db = migrated_db().await;
+        let writes_before = db.write_transaction_count();
+
+        let claimed = claim_tool_boundary_for_job_async(&db, "job-a")
+            .await
+            .unwrap();
+
+        assert!(claimed.is_empty());
+        assert_eq!(db.write_transaction_count(), writes_before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_launch_can_restore_exact_claimed_rows() {
+        let db = migrated_db().await;
+        let claimed = enqueue_async(&db, "job-a", "retry me", Delivery::Queue)
+            .await
+            .unwrap();
+        claim_all_for_job_async(&db, "job-a").await.unwrap();
+
+        restore_claimed(&db, std::slice::from_ref(&claimed.id)).unwrap();
+
+        let retried = claim_all_for_job_async(&db, "job-a").await.unwrap();
+        assert_eq!(retried.len(), 1);
+        assert_eq!(retried[0].id, claimed.id);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -23,6 +23,8 @@ fn valid_content_hash(value: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// The `cairn://executors` family is a public user surface, not a crate name;
+/// it is intentionally outside cairn/4377's process-local rename.
 /// The public executor name a `cairn://executors/{name}` segment addresses.
 ///
 /// One helper shared with placement and enrollment: a URI that normalizes
@@ -201,6 +203,23 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
                 exec_seq: parse_positive_i32(exec_seq)?,
                 node_id: (*node_id).to_string(),
                 memory_seq: parse_positive_i32(memory_seq)?,
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "eras"] => {
+            Some(CairnResource::NodeEras {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+            })
+        }
+        [PROJECT_SCOPE, project, number, exec_seq, node_id, "eras", era_seq] => {
+            Some(CairnResource::NodeEra {
+                project: canonical_project(project),
+                number: parse_positive_i32(number)?,
+                exec_seq: parse_positive_i32(exec_seq)?,
+                node_id: (*node_id).to_string(),
+                era_seq: parse_positive_i32(era_seq)?,
             })
         }
         ["recipes"] => Some(CairnResource::Recipes),

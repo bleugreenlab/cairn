@@ -26,6 +26,51 @@ async fn migrated_db() -> LocalDb {
     crate::storage::migrated_test_db("wake-posts.db").await
 }
 
+/// Thread names overlap ordinary prose too often to be implicit mentions. The
+/// project-qualified readable name is the shortest form that identifies one.
+#[tokio::test(flavor = "current_thread")]
+async fn a_thread_mention_requires_its_project_qualified_name() {
+    let db = migrated_db().await;
+    seed(&db).await;
+    db.execute_script(
+        "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+           VALUES('thread-execution','proj-a','execution','active','none',1,1);
+         INSERT INTO jobs(id, thread_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+           VALUES('session','thread-execution','proj-a','running','thread','thread',10,10);",
+    )
+    .await
+    .unwrap();
+
+    let bare = record_new_post_attention(
+        &db,
+        &post(
+            1,
+            None,
+            "cairn://p/beta/1/1/builder",
+            "execution should not address a thread",
+        ),
+    )
+    .await
+    .unwrap();
+    assert!(
+        bare.recorded.is_empty(),
+        "a bare thread name is prose: {bare:?}"
+    );
+
+    let qualified = record_new_post_attention(
+        &db,
+        &post(
+            2,
+            None,
+            "cairn://p/beta/1/1/builder",
+            "alpha/execution should see this",
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(qualified.recorded, vec!["session".to_string()]);
+}
+
 /// Two projects, each with a node home, plus a second home in the first and a
 /// thread there.
 ///

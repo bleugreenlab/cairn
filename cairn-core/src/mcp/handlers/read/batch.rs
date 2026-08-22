@@ -316,15 +316,15 @@ async fn produce_web_segment(
     match crate::mcp::handlers::web::read_web_markdown(orch, &web_request).await {
         Ok(markdown) => {
             if let Some(payload) = grep_payload {
-                let (content, match_count) =
+                let window =
                     match crate::mcp::handlers::search::grep_materialized_body(&markdown, &payload)
                     {
                         Ok(result) => result,
                         Err(error) => return error_segment(target, error),
                     };
                 let mut meta = SegmentMeta::new(target, SegmentKind::Grep, NaturalUnit::Match);
-                meta.match_count = Some(match_count);
-                return ReadSegment::text(content, meta);
+                window.write_meta(&mut meta, false);
+                return ReadSegment::text(window.body, meta);
             }
             let window = view::window_text_lines(&markdown, offset, limit);
             let mut meta = SegmentMeta::new(target, SegmentKind::Web, NaturalUnit::Line);
@@ -409,6 +409,11 @@ async fn produce_resource_segment(
             let mut meta = SegmentMeta::new(target, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = rendered.match_count;
             meta.file_count = None;
+            // What the window elided, so a capped grep over a resource body is
+            // as self-evidently partial as one over a file.
+            meta.total_units = rendered.total_units;
+            meta.unit_noun = rendered.unit_noun.map(str::to_string);
+            meta.grep_shown = rendered.grep_shown;
             ReadSegment {
                 body: rendered.content,
                 affordance,
@@ -549,15 +554,14 @@ async fn produce_terminal_segment(
     let (banner, rendered) = peel_terminal_banner(rendered);
 
     if let Some(payload) = grep_payload {
-        let (content, match_count) =
-            match crate::mcp::handlers::search::grep_materialized_body(&rendered, &payload) {
-                Ok(result) => result,
-                Err(error) => return error_segment(target, error),
-            };
-        let content = prepend_terminal_banner(banner.as_deref(), content);
+        let window = match crate::mcp::handlers::search::grep_materialized_body(&rendered, &payload)
+        {
+            Ok(result) => result,
+            Err(error) => return error_segment(target, error),
+        };
+        let content = prepend_terminal_banner(banner.as_deref(), window.body.clone());
         let mut meta = SegmentMeta::new(target, SegmentKind::Grep, NaturalUnit::Match);
-        meta.match_count = Some(match_count);
-        meta.file_count = None;
+        window.write_meta(&mut meta, false);
         return ReadSegment::text(content, meta);
     }
 
@@ -1656,6 +1660,94 @@ mod tests {
         assert_eq!(seg.match_count, Some(1), "{}", envelope.text);
         // Path-less, line-number-prefixed match line.
         assert!(envelope.text.contains("2:line2"), "{}", envelope.text);
+    }
+
+    /// A `cairn://` resource grep is where this defect bites hardest: a
+    /// materialized body cannot be re-queried with `output_mode=count`, so the
+    /// header count is the only number on offer and there is no second query to
+    /// check it against. With `-C=1` a match costs three rendered lines, so the
+    /// old line-counting window kept one match per three of the limit and
+    /// reported that fragment as the total.
+    ///
+    /// The assertions are on the composed text, not just the metadata: a
+    /// truncated read and a complete one must be different documents to the
+    /// agent reading them.
+    #[tokio::test]
+    async fn grep_over_a_resource_body_marks_its_head_limit_window() {
+        let orch = seeded_orch().await;
+        seed_project(&orch).await;
+        exec(
+            &orch,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('issue-rb-1', 'proj-rb', 1, 'First', 'active', 1, 1)",
+        )
+        .await;
+        exec(
+            &orch,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+             VALUES ('exec-rb', 'recipe', 'issue-rb-1', 'proj-rb', 'running', 1, 1)",
+        )
+        .await;
+        exec(
+            &orch,
+            "INSERT INTO jobs(id, execution_id, issue_id, project_id, node_name, status, created_at, updated_at, uri_segment, branch)
+             VALUES ('job-rb', 'exec-rb', 'issue-rb-1', 'proj-rb', 'Planner', 'complete', 1, 1, 'planner', 'agent/planner')",
+        )
+        .await;
+        // Eight matches, each padded so rendered lines and match count diverge:
+        // with -C=1 the complete body runs 24 lines for 8 matches.
+        exec(
+            &orch,
+            "INSERT INTO artifacts(id, job_id, artifact_type, schema_version, data, version, output_name, created_at, updated_at)
+             VALUES ('art-rb', 'job-rb', 'result', 1, '{\"content\":\"pad 1a\\nNEEDLE 1\\npad 1b\\npad 2a\\nNEEDLE 2\\npad 2b\\npad 3a\\nNEEDLE 3\\npad 3b\\npad 4a\\nNEEDLE 4\\npad 4b\\npad 5a\\nNEEDLE 5\\npad 5b\\npad 6a\\nNEEDLE 6\\npad 6b\\npad 7a\\nNEEDLE 7\\npad 7b\\npad 8a\\nNEEDLE 8\\npad 8b\"}', 1, 'result', 1, 1)",
+        )
+        .await;
+
+        let capped = read_batch_envelope(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1/1/planner/result?grep=NEEDLE&-C=1&head_limit=3"]),
+        )
+        .await;
+        let seg = &capped.segments[0];
+        assert_eq!(seg.kind, SegmentKind::Grep);
+        // The count answers "how many are there", not "how many did I print".
+        assert_eq!(seg.match_count, Some(8), "{}", capped.text);
+        assert_eq!(seg.grep_shown, Some(3), "{}", capped.text);
+        assert!(seg.truncated, "{}", capped.text);
+        // Three matches with their context, not three rendered lines.
+        for index in 1..=3 {
+            assert!(
+                capped.text.contains(&format!("NEEDLE {index}")),
+                "{}",
+                capped.text
+            );
+        }
+        assert!(!capped.text.contains("NEEDLE 4"), "{}", capped.text);
+        // Visible at the surface it is read from: header and continue footer.
+        assert!(
+            capped.text.contains("[8 matches; 3 of 8 matches shown]"),
+            "{}",
+            capped.text
+        );
+        assert!(
+            capped
+                .text
+                .contains("[matches 1\u{2013}3 of 8 \u{2014} continue:"),
+            "{}",
+            capped.text
+        );
+
+        // The complete read of the same body is a different document.
+        let complete = read_batch_envelope(
+            &orch,
+            serde_json::json!(["cairn://p/RB/1/1/planner/result?grep=NEEDLE&-C=1"]),
+        )
+        .await;
+        assert_eq!(complete.segments[0].match_count, Some(8));
+        assert_eq!(complete.segments[0].grep_shown, None);
+        assert!(complete.text.contains("[8 matches]"), "{}", complete.text);
+        assert!(!complete.text.contains("shown]"), "{}", complete.text);
+        assert!(complete.text.contains("NEEDLE 8"), "{}", complete.text);
     }
 
     #[tokio::test]

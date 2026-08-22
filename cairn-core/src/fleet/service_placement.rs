@@ -700,7 +700,7 @@ pub(crate) mod tests {
     use cairn_common::executor_protocol::{
         ExecutorMessage, ResidencyRuntimeConfig, LOCAL_EXECUTOR_NAME,
     };
-    use cairn_executor::{ExecutorRuntime, Fleet as ExecutorPool};
+    use cairn_exec::{ExecutorRuntime, Fleet as ExecutorPool};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
 
@@ -790,7 +790,7 @@ pub(crate) mod tests {
                             );
                         });
                     }
-                    ExecutorMessage::Shutdown => break,
+                    ExecutorMessage::Shutdown { .. } => break,
                     _ => {}
                 }
             }

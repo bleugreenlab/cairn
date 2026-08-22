@@ -2,7 +2,7 @@ use cairn_db::turso::{params, Row};
 
 use crate::storage::{DbResult, LocalDb, RowExt};
 
-const OUTBOUND_COLUMNS: &str = "id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, options_json, status, provider_guid, caption_guid, created_at, sent_at, resolved_at, last_error";
+const OUTBOUND_COLUMNS: &str = "id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, options_json, status, provider_guid, caption_guid, created_at, sent_at, resolved_at, last_error, attempts, next_attempt_at";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewOutbound<'a> {
@@ -15,6 +15,33 @@ pub struct NewOutbound<'a> {
     pub rendered_text: &'a str,
     pub rendering: &'a str,
     pub created_at: i64,
+}
+
+pub async fn get_by_id(db: &LocalDb, id: &str) -> Result<Option<OutboundRecord>, String> {
+    db.query_opt(
+        &format!("SELECT {OUTBOUND_COLUMNS} FROM channel_outbound WHERE id = ?1"),
+        (id.to_string(),),
+        OutboundRecord::from_row,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Atomically takes one scheduled retry. Clearing `next_attempt_at` is the
+/// retry-side claim, so concurrent sweeps cannot both cross the provider boundary.
+pub async fn begin_retry_delivery(
+    db: &LocalDb,
+    id: &str,
+    now: i64,
+    max_attempts: i64,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE channel_outbound SET last_error = 'delivery outcome unknown', next_attempt_at = NULL WHERE id = ?1 AND status = 'failed' AND attempts < ?3 AND next_attempt_at IS NOT NULL AND next_attempt_at <= ?2",
+        params![id.to_string(), now, max_attempts],
+    )
+    .await
+    .map(|changed| changed == 1)
+    .map_err(|error| error.to_string())
 }
 
 /// Loads question choices staged by one channel conversation. Staged choices are
@@ -126,9 +153,15 @@ pub async fn record_cleanup_failure(db: &LocalDb, id: &str, error: &str) -> Resu
     .map_err(|error| error.to_string())
 }
 
+/// The domain effects a cadence sweep is allowed to attempt.
+///
+/// A parked action is deliberately absent: its refusal is waiting on an
+/// operator, not on time, so re-attempting it on a timer can only produce the
+/// same refusal and the same log line (CAIRN-4364). It comes back the moment
+/// something leases it, which is what an operator answering does.
 pub async fn pending_ask_actions(db: &LocalDb) -> Result<Vec<(String, String)>, String> {
     db.query_all(
-        "SELECT action_ref, kind FROM channel_ask_action WHERE domain_resolved_at IS NULL ORDER BY action_ref",
+        "SELECT action_ref, kind FROM channel_ask_action WHERE domain_resolved_at IS NULL AND parked_at IS NULL ORDER BY action_ref",
         (),
         |row| Ok((row.text(0)?, row.text(1)?)),
     ).await.map_err(|error| error.to_string())
@@ -145,6 +178,17 @@ pub async fn answers_for_action(
     ).await.map_err(|error| error.to_string())
 }
 
+/// Takes the right to run one domain effect.
+///
+/// A parked action is unleasable, and that is the whole guarantee: parking is
+/// worth nothing if a caller holding a snapshot from before the park can still
+/// take the lease. Two routers sweep concurrently and both list the same action;
+/// the one that loses the race arrives with a lease attempt that is already
+/// stale, and letting it through would clear the park, re-attempt the same
+/// refusal, and put the action back in the loop it was parked to leave.
+///
+/// Only a new answer lifts a park, in [`claim_ask_resolution`] -- an event
+/// nobody can produce by racing.
 pub async fn try_lease_ask_action(
     db: &LocalDb,
     action_ref: &str,
@@ -153,7 +197,7 @@ pub async fn try_lease_ask_action(
 ) -> Result<Option<DomainActionLease>, String> {
     let token = uuid::Uuid::new_v4().to_string();
     let changed = db.execute(
-        "UPDATE channel_ask_action SET lease_token = ?2, lease_until = ?3, attempt_count = attempt_count + 1, last_error = NULL WHERE action_ref = ?1 AND domain_resolved_at IS NULL AND (lease_until IS NULL OR lease_until <= ?4)",
+        "UPDATE channel_ask_action SET lease_token = ?2, lease_until = ?3, attempt_count = attempt_count + 1, last_error = NULL WHERE action_ref = ?1 AND domain_resolved_at IS NULL AND parked_at IS NULL AND (lease_until IS NULL OR lease_until <= ?4)",
         params![action_ref.to_string(), token.clone(), now + lease_ms, now],
     ).await.map_err(|error| error.to_string())?;
     if changed == 0 {
@@ -167,7 +211,68 @@ pub async fn try_lease_ask_action(
     ).await.map_err(|error| error.to_string())
 }
 
-pub async fn release_ask_action(
+/// Marks a refusal that is TERMINAL for the answer which earned it: nothing but
+/// an operator acting can change the outcome, so no amount of retrying will.
+///
+/// Every resolver failure reaches this ledger as `Err(String)`, which is why the
+/// retry machinery could not tell "the disk was full, try again" from "this
+/// answer is not allowed to approve this prompt". It retried both, and a single
+/// unapprovable answer produced ~29,000 identical log lines in a day
+/// (CAIRN-4364). The vocabulary lives here, next to the machinery that acts on
+/// it, and the resolver that mints such a refusal speaks it -- so what a failure
+/// means travels with the failure instead of being re-derived from prose by
+/// every caller that has to decide what to do about it.
+pub const OPERATOR_PENDING_REFUSAL: &str = "Refused (pending operator):";
+
+/// Whether a failure is a refusal only an operator event can lift.
+///
+/// Matched anywhere in the message rather than at its start, because a refusal
+/// is routinely wrapped by the layer that reports it.
+pub fn is_operator_pending_refusal(error: &str) -> bool {
+    error.contains(OPERATOR_PENDING_REFUSAL)
+}
+
+/// What became of a domain action whose effect failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskActionFailure {
+    /// Parked by this call: no cadence attempt follows, and the answer that
+    /// earned the refusal has been withdrawn from the gate.
+    Parked,
+    /// Released for a later attempt, because time can plausibly change it.
+    Retryable,
+    /// The lease was already gone, so this attempt speaks for nothing.
+    Stale,
+}
+
+/// Records the outcome of a failed domain effect, and decides here — once —
+/// whether it is worth attempting again.
+///
+/// The park-or-retry choice is deliberately NOT the caller's. Three surfaces now
+/// drive domain effects through this ledger, and a single one of them mistaking
+/// "this surface may not decide that" for "try again shortly" restores the whole
+/// defect: an unapprovable answer sitting on the gate, retried forever, with the
+/// operator locked out by their own replayed answer. One door, one rule.
+pub async fn record_ask_action_failure(
+    db: &LocalDb,
+    lease: &DomainActionLease,
+    error: &str,
+    now: i64,
+) -> Result<AskActionFailure, String> {
+    if is_operator_pending_refusal(error) {
+        return Ok(if park_ask_action(db, lease, error, now).await? {
+            AskActionFailure::Parked
+        } else {
+            AskActionFailure::Stale
+        });
+    }
+    Ok(if release_ask_action(db, lease, error).await? {
+        AskActionFailure::Retryable
+    } else {
+        AskActionFailure::Stale
+    })
+}
+
+async fn release_ask_action(
     db: &LocalDb,
     lease: &DomainActionLease,
     error: &str,
@@ -176,6 +281,52 @@ pub async fn release_ask_action(
         "UPDATE channel_ask_action SET lease_token = NULL, lease_until = NULL, last_error = ?3 WHERE action_ref = ?1 AND lease_token = ?2 AND domain_resolved_at IS NULL",
         params![lease.action_ref.clone(), lease.token.clone(), error.to_string()],
     ).await.map(|n| n == 1).map_err(|error| error.to_string())
+}
+
+/// Parks a domain action whose refusal only an operator can lift, and withdraws
+/// the answer that earned it.
+///
+/// The withdrawal is the half that keeps "still pending for the operator" true.
+/// A channel reply claims the first-answer-wins resolution BEFORE anything asks
+/// whether that surface may make this decision, so an answer the domain then
+/// refuses would otherwise sit on the gate forever: an operator answering the
+/// same request afterwards replays the stored winner, is refused for the same
+/// reason, and cannot get their own decision recorded. A refused answer resolved
+/// nothing, minted nothing, and woke nothing, so it holds no claim either --
+/// deleting it leaves the gate genuinely open for whoever can answer it.
+///
+/// The refusal survives as `parked_reason`, which names the surface that
+/// answered and why it could not.
+async fn park_ask_action(
+    db: &LocalDb,
+    lease: &DomainActionLease,
+    reason: &str,
+    parked_at: i64,
+) -> Result<bool, String> {
+    let action_ref = lease.action_ref.clone();
+    let token = lease.token.clone();
+    let reason = reason.to_string();
+    db.write(move |conn| {
+        let action_ref = action_ref.clone();
+        let token = token.clone();
+        let reason = reason.clone();
+        Box::pin(async move {
+            let parked = conn.execute(
+                "UPDATE channel_ask_action SET lease_token = NULL, lease_until = NULL, parked_at = ?3, parked_reason = ?4, last_error = ?4 WHERE action_ref = ?1 AND lease_token = ?2 AND domain_resolved_at IS NULL",
+                params![action_ref.clone(), token, parked_at, reason],
+            ).await?;
+            if parked == 1 {
+                conn.execute(
+                    "DELETE FROM channel_ask_resolution WHERE action_ref = ?1 AND domain_resolved_at IS NULL",
+                    params![action_ref],
+                ).await?;
+            }
+            Ok(parked)
+        })
+    })
+    .await
+    .map(|parked| parked == 1)
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,9 +391,9 @@ pub async fn set_message_classes(
 
 fn canonical_persisted_target(uri: &str) -> Result<String, String> {
     let uri = cairn_common::uri::canonicalize_uri_identity(uri);
-    if uri == "cairn:~" || uri.starts_with("cairn:~/") {
+    if uri == "cairn:~" || uri.starts_with("cairn:~/") || uri.starts_with("cairn:@") {
         return Err(format!(
-            "home-relative channel target must be resolved before persistence: {uri}"
+            "deictic channel target must be resolved before persistence: {uri}"
         ));
     }
 
@@ -252,7 +403,7 @@ fn canonical_persisted_target(uri: &str) -> Result<String, String> {
 
 pub async fn latest_send_error(db: &LocalDb, channel: &str) -> Result<Option<String>, String> {
     db.query_opt(
-        "SELECT last_error FROM channel_outbound WHERE channel = ?1 AND status = 'failed' AND rowid = (SELECT rowid FROM channel_outbound WHERE channel = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1)",
+        "SELECT last_error FROM channel_outbound WHERE channel = ?1 AND status = 'failed' AND last_error IS NOT NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
         (channel.to_string(),),
         |row| row.text(0),
     )
@@ -804,6 +955,8 @@ pub struct OutboundRecord {
     pub sent_at: Option<i64>,
     pub resolved_at: Option<i64>,
     pub last_error: Option<String>,
+    pub attempts: i64,
+    pub next_attempt_at: Option<i64>,
 }
 
 impl OutboundRecord {
@@ -825,6 +978,8 @@ impl OutboundRecord {
             sent_at: row.opt_i64(13)?,
             resolved_at: row.opt_i64(14)?,
             last_error: row.opt_text(15)?,
+            attempts: row.i64(16)?,
+            next_attempt_at: row.opt_i64(17)?,
         })
     }
 }
@@ -832,6 +987,21 @@ impl OutboundRecord {
 /// Insert a pending delivery intent. Returns `false` when the channel/kind/binding
 /// uniqueness fence proves the gate was already observed by an earlier sweep.
 pub async fn insert_intent(db: &LocalDb, intent: &NewOutbound<'_>) -> Result<bool, String> {
+    insert_intent_with_status(db, intent, "pending").await
+}
+
+/// Insert a delivery intent either as owed work (`pending`) or as a gate sealed
+/// at a genuine session boundary (`expired`).
+pub async fn insert_intent_with_status(
+    db: &LocalDb,
+    intent: &NewOutbound<'_>,
+    status: &str,
+) -> Result<bool, String> {
+    if !matches!(status, "pending" | "expired") {
+        return Err(format!(
+            "outbound intent insert status must be pending or expired, got {status:?}"
+        ));
+    }
     let binding_ref = cairn_common::uri::canonicalize_uri_identity(intent.binding_ref);
     let intent = NewOutbound {
         id: intent.id,
@@ -845,8 +1015,8 @@ pub async fn insert_intent(db: &LocalDb, intent: &NewOutbound<'_>) -> Result<boo
         created_at: intent.created_at,
     };
     db.execute(
-        "INSERT OR IGNORE INTO channel_outbound (id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)",
-        params![intent.id, intent.channel, intent.kind, binding_ref, intent.conversation, intent.job_id, intent.rendered_text, intent.rendering, intent.created_at],
+        "INSERT OR IGNORE INTO channel_outbound (id, channel, kind, binding_ref, conversation, job_id, rendered_text, rendering, status, created_at, resolved_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CASE WHEN ?9 = 'expired' THEN ?10 END)",
+        params![intent.id, intent.channel, intent.kind, binding_ref, intent.conversation, intent.job_id, intent.rendered_text, intent.rendering, status, intent.created_at],
     )
     .await
     .map(|changed| changed == 1)
@@ -1018,10 +1188,21 @@ pub async fn claim_ask_resolution(
         let kind = kind.to_string();
         Box::pin(async move {
             conn.execute("INSERT OR IGNORE INTO channel_ask_action (action_ref, kind) VALUES (?1, ?2)", params![action_ref.clone(), kind.clone()]).await?;
-            Ok(conn.execute(
+            let inserted = conn.execute(
                 "INSERT OR IGNORE INTO channel_ask_resolution (binding_ref, action_ref, kind, answer, winner_provider, winner_conversation, resolved_at, resolution_id, winner_surface, winner_actor) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![binding_ref, action_ref, kind, answer, provider, conversation, resolved_at, resolution_id, surface, actor],
-            ).await?)
+                params![binding_ref, action_ref.clone(), kind, answer, provider, conversation, resolved_at, resolution_id, surface, actor],
+            ).await?;
+            if inserted == 1 {
+                // Winning the gate is the event a parked action was waiting for.
+                // Parking vacated the gate precisely so a new answer could take
+                // it, and this claim is that answer -- so the park lifts here,
+                // where a decision was actually made, and nowhere else.
+                conn.execute(
+                    "UPDATE channel_ask_action SET parked_at = NULL, parked_reason = NULL, last_error = NULL WHERE action_ref = ?1 AND domain_resolved_at IS NULL",
+                    params![action_ref],
+                ).await?;
+            }
+            Ok(inserted)
         })
     }).await.map_err(|error| error.to_string())? == 1;
     let resolution = db.query_opt(
@@ -1063,7 +1244,7 @@ pub async fn finalize_ask_resolution(
         let options = options.clone();
         Box::pin(async move {
             conn.execute(
-                "UPDATE channel_ask_action SET domain_resolved_at = COALESCE(domain_resolved_at, ?2), lease_token = NULL, lease_until = NULL, last_error = NULL WHERE action_ref = ?1",
+                "UPDATE channel_ask_action SET domain_resolved_at = COALESCE(domain_resolved_at, ?2), lease_token = NULL, lease_until = NULL, last_error = NULL, parked_at = NULL, parked_reason = NULL WHERE action_ref = ?1",
                 params![action_ref.clone(), resolved_at],
             ).await?;
             conn.execute("UPDATE channel_ask_resolution SET domain_resolved_at = COALESCE(domain_resolved_at, ?2) WHERE action_ref = ?1", params![action_ref.clone(), resolved_at]).await?;
@@ -1147,28 +1328,31 @@ pub async fn mark_resolved(db: &LocalDb, id: &str, resolved_at: i64) -> Result<b
         .await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
-/// Abandons every intent this channel never delivered. The channel is a live tap
-/// on the ask event, so an intent that had not reached the provider by the time
-/// the session ended is dead rather than owed: re-sending it after a restart
-/// texts the operator prompts their agents have long since moved past. `sent`
-/// rows are deliberately left alone, because a reply to an ask that DID go out
-/// still binds to its provider GUID however long the operator takes.
-pub async fn expire_undelivered(
+pub async fn mark_failed(
     db: &LocalDb,
-    channel: &str,
-    expired_at: i64,
-) -> Result<u64, String> {
-    db.execute(
-        "UPDATE channel_outbound SET status = 'expired', resolved_at = ?2 WHERE channel = ?1 AND status IN ('pending', 'failed')",
-        params![channel.to_string(), expired_at],
+    id: &str,
+    error: &str,
+    next_attempt_at: i64,
+    increment_attempts: bool,
+) -> Result<bool, String> {
+    db.execute("UPDATE channel_outbound SET status = 'failed', last_error = ?2, next_attempt_at = ?3, attempts = attempts + CASE WHEN ?4 THEN 1 ELSE 0 END WHERE id = ?1 AND status = 'failed'", params![id.to_string(), error.to_string(), next_attempt_at, increment_attempts])
+        .await.map(|changed| changed == 1).map_err(|error| error.to_string())
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UndeliveredCounts {
+    pub pending: i64,
+    pub failed: i64,
+}
+
+pub async fn undelivered_counts(db: &LocalDb, channel: &str) -> Result<UndeliveredCounts, String> {
+    db.query_one(
+        "SELECT COUNT(*) FILTER (WHERE status = 'pending'), COUNT(*) FILTER (WHERE status = 'failed') FROM channel_outbound WHERE channel = ?1 AND status IN ('pending', 'failed')",
+        (channel.to_string(),),
+        |row| Ok(UndeliveredCounts { pending: row.i64(0)?, failed: row.i64(1)? }),
     )
     .await
     .map_err(|error| error.to_string())
-}
-
-pub async fn mark_failed(db: &LocalDb, id: &str, error: &str) -> Result<bool, String> {
-    db.execute("UPDATE channel_outbound SET status = 'failed', last_error = ?2 WHERE id = ?1 AND status != 'resolved'", params![id.to_string(), error.to_string()])
-        .await.map(|changed| changed == 1).map_err(|error| error.to_string())
 }
 
 pub async fn get_cursor(db: &LocalDb, channel: &str) -> Result<Option<i64>, String> {
@@ -1426,7 +1610,10 @@ mod tests {
         let mut failed = intent("failed");
         failed.created_at = 10;
         assert!(insert_intent(&db, &failed).await.unwrap());
-        assert!(mark_failed(&db, "failed", "send failure").await.unwrap());
+        assert!(begin_delivery(&db, "failed").await.unwrap());
+        assert!(mark_failed(&db, "failed", "send failure", 20, true)
+            .await
+            .unwrap());
         assert_eq!(
             latest_send_error(&db, "imessage").await.unwrap().as_deref(),
             Some("send failure")
@@ -1439,7 +1626,10 @@ mod tests {
         assert!(mark_sent(&db, "sent", "guid", None, None, 21)
             .await
             .unwrap());
-        assert_eq!(latest_send_error(&db, "imessage").await.unwrap(), None);
+        assert_eq!(
+            latest_send_error(&db, "imessage").await.unwrap().as_deref(),
+            Some("send failure")
+        );
         assert_eq!(latest_send_error(&db, "telegram").await.unwrap(), None);
     }
 
@@ -1767,6 +1957,186 @@ mod tests {
             .is_none());
     }
 
+    /// A refusal in the shape the resolver mints when only an operator may
+    /// decide, quoted through the ledger's own constant so a reworded refusal
+    /// cannot leave these tests asserting about a shape nothing produces.
+    fn operator_pending() -> String {
+        format!("{OPERATOR_PENDING_REFUSAL} only an operator can approve that")
+    }
+
+    /// Parking takes an action out of the cadence sweep's reach AND takes the
+    /// answer that earned the refusal off the gate, which is what lets the
+    /// operator it is waiting for actually answer it.
+    #[tokio::test]
+    async fn a_parked_domain_action_leaves_both_the_sweep_and_the_gate() {
+        let db = migrated_test_db("channel-ledger-domain-park.db").await;
+        claim_ask_resolution(
+            &db,
+            "permission",
+            "allow",
+            cairn_common::identity::AppearanceTransport::ChannelReply,
+            Some("imessage"),
+            Some("phone"),
+            Some("sender:first"),
+            "permission",
+            "permission",
+            10,
+        )
+        .await
+        .unwrap();
+        let lease = try_lease_ask_action(&db, "permission", 11, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record_ask_action_failure(&db, &lease, &operator_pending(), 12)
+                .await
+                .unwrap(),
+            AskActionFailure::Parked
+        );
+
+        assert!(
+            pending_ask_actions(&db).await.unwrap().is_empty(),
+            "a cadence sweep never sees a parked action"
+        );
+        assert!(
+            answers_for_action(&db, "permission")
+                .await
+                .unwrap()
+                .is_empty(),
+            "an answer the domain refused does not go on holding the gate"
+        );
+
+        // The operator answering is the event that resumes it: their claim takes
+        // the vacated gate, which lifts the park and makes the action leasable.
+        let claim = claim_ask_resolution(
+            &db,
+            "permission",
+            "deny",
+            cairn_common::identity::AppearanceTransport::AuthenticatedOperator,
+            None,
+            None,
+            Some("operator:desk"),
+            "permission",
+            "permission",
+            13,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(claim, AskClaim::Won(_)));
+        assert!(try_lease_ask_action(&db, "permission", 14, 100)
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            pending_ask_actions(&db).await.unwrap(),
+            vec![("permission".to_string(), "permission".to_string())]
+        );
+    }
+
+    /// Parking is worth nothing if a caller that listed the action BEFORE the
+    /// park can still lease it afterwards.
+    ///
+    /// Every provider sweeps on its own cadence, so two routers routinely hold
+    /// the same pending action. One of them leases it, gets the refusal, and
+    /// parks; the other's lease attempt is by then answering a question that has
+    /// already been settled. Honoring it would clear the park, re-attempt the
+    /// same refusal against an answer that parking withdrew, and land the action
+    /// back in the loop -- now failing for missing provenance instead, once per
+    /// lease expiry, which is the same spin wearing a different message.
+    #[tokio::test]
+    async fn a_stale_sweep_cannot_resurrect_a_parked_domain_action() {
+        let db = migrated_test_db("channel-ledger-domain-park-race.db").await;
+        claim_ask_resolution(
+            &db,
+            "permission",
+            "allow",
+            cairn_common::identity::AppearanceTransport::ChannelReply,
+            Some("imessage"),
+            Some("phone"),
+            Some("sender:first"),
+            "permission",
+            "permission",
+            10,
+        )
+        .await
+        .unwrap();
+
+        // Two routers list the same action before either has leased it.
+        let first = pending_ask_actions(&db).await.unwrap();
+        let second = pending_ask_actions(&db).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 1);
+
+        let lease = try_lease_ask_action(&db, "permission", 11, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            record_ask_action_failure(&db, &lease, &operator_pending(), 12)
+                .await
+                .unwrap(),
+            AskActionFailure::Parked
+        );
+
+        // The second router acts on its snapshot after the park, and again after
+        // the lease it would have taken would have expired.
+        for now in [13, 200] {
+            assert!(
+                try_lease_ask_action(&db, "permission", now, 100)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a parked action is unleasable, however stale the caller's view"
+            );
+        }
+        assert_eq!(
+            db.query_one(
+                "SELECT attempt_count FROM channel_ask_action WHERE action_ref = 'permission'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            1,
+            "the refusal was attempted once and stayed attempted once"
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT parked_at IS NOT NULL FROM channel_ask_action WHERE action_ref = 'permission'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            1,
+            "no sweep may clear a park it did not earn"
+        );
+
+        // A real answer still resumes it.
+        assert!(matches!(
+            claim_ask_resolution(
+                &db,
+                "permission",
+                "deny",
+                cairn_common::identity::AppearanceTransport::AuthenticatedOperator,
+                None,
+                None,
+                Some("operator:desk"),
+                "permission",
+                "permission",
+                201,
+            )
+            .await
+            .unwrap(),
+            AskClaim::Won(_)
+        ));
+        assert!(try_lease_ask_action(&db, "permission", 202, 100)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn failed_or_abandoned_domain_lease_is_recoverable_after_restart() {
         let db = migrated_test_db("channel-ledger-domain-retry.db").await;
@@ -1788,9 +2158,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(release_ask_action(&db, &lease, "temporary failure")
-            .await
-            .unwrap());
+        assert_eq!(
+            record_ask_action_failure(&db, &lease, "tempdir: no storage space", 11)
+                .await
+                .unwrap(),
+            AskActionFailure::Retryable,
+            "a failure time can change stays in the retry loop"
+        );
         assert!(try_lease_ask_action(&db, "permission", 12, 100)
             .await
             .unwrap()
@@ -1861,7 +2235,10 @@ mod tests {
         assert!(mark_sent(&db, sent.id, "message", None, None, 11)
             .await
             .unwrap());
-        assert!(mark_failed(&db, failed.id, "offline").await.unwrap());
+        assert!(begin_delivery(&db, failed.id).await.unwrap());
+        assert!(mark_failed(&db, failed.id, "offline", 20, true)
+            .await
+            .unwrap());
 
         assert_eq!(
             finalize_ask_resolution(&db, "prompt", "✓ answered: Ship", 12)
@@ -1902,50 +2279,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expiry_abandons_undelivered_intents_and_spares_delivered_ones() {
-        let db = migrated_test_db("channel-ledger-expiry.db").await;
-        for (id, binding) in [
-            ("never-sent", "prompt-1:0"),
-            ("send-errored", "prompt-2:0"),
-            ("on-the-phone", "prompt-3:0"),
-            ("answered", "prompt-4:0"),
-        ] {
-            let mut intent = intent(id);
-            intent.binding_ref = binding;
-            assert!(insert_intent(&db, &intent).await.unwrap());
-        }
-        assert!(mark_failed(&db, "send-errored", "executor offline")
+    async fn sealed_intent_is_expired_at_insert_without_an_error() {
+        let db = migrated_test_db("channel-ledger-sealed-intent.db").await;
+        assert!(insert_intent_with_status(&db, &intent("sealed"), "expired")
             .await
             .unwrap());
-        assert!(mark_sent(&db, "on-the-phone", "guid-a", None, None, 11)
-            .await
-            .unwrap());
-        assert!(mark_sent(&db, "answered", "guid-b", None, None, 11)
-            .await
-            .unwrap());
-        assert!(mark_resolved(&db, "answered", 12).await.unwrap());
 
-        assert_eq!(expire_undelivered(&db, "imessage", 20).await.unwrap(), 2);
+        let sealed = get_by_id(&db, "sealed").await.unwrap().unwrap();
+        assert_eq!(sealed.status, "expired");
+        assert_eq!(sealed.resolved_at, Some(10));
+        assert_eq!(sealed.last_error, None);
+        assert_eq!(sealed.attempts, 0);
+        assert_eq!(sealed.next_attempt_at, None);
+        assert!(!insert_intent(&db, &intent("duplicate")).await.unwrap());
+    }
 
-        let unresolved = list_unresolved(&db, "imessage").await.unwrap();
+    #[tokio::test]
+    async fn failed_attempts_schedule_retry_without_changing_ambiguous_delivery() {
+        let db = migrated_test_db("channel-ledger-retry-state.db").await;
+        let mut counted = intent("counted");
+        counted.binding_ref = "prompt-2:0";
+        assert!(insert_intent(&db, &intent("ambiguous")).await.unwrap());
+        assert!(insert_intent(&db, &counted).await.unwrap());
+        assert!(begin_delivery(&db, "ambiguous").await.unwrap());
+        assert!(begin_delivery(&db, "counted").await.unwrap());
+
+        let ambiguous = get_by_id(&db, "ambiguous").await.unwrap().unwrap();
+        assert_eq!(ambiguous.attempts, 0);
+        assert_eq!(ambiguous.next_attempt_at, None);
         assert_eq!(
-            unresolved
-                .iter()
-                .map(|row| row.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["on-the-phone"],
-            "only an ask that actually reached the phone stays live"
+            ambiguous.last_error.as_deref(),
+            Some("delivery outcome unknown")
         );
-        // An expired intent keeps its fence, so the sweep can never resurrect it.
-        assert!(!insert_intent(&db, &intent("replay")).await.unwrap());
-        // A reply to an ask that did go out still binds after the session ends.
+
+        assert!(mark_failed(&db, "counted", "offline", 25, true)
+            .await
+            .unwrap());
+        let counted = get_by_id(&db, "counted").await.unwrap().unwrap();
+        assert_eq!(counted.attempts, 1);
+        assert_eq!(counted.next_attempt_at, Some(25));
+        assert_eq!(counted.last_error.as_deref(), Some("offline"));
+
+        assert!(mark_failed(&db, "counted", "still degraded", 30, false)
+            .await
+            .unwrap());
+        let degraded = get_by_id(&db, "counted").await.unwrap().unwrap();
+        assert_eq!(degraded.attempts, 1);
+        assert_eq!(degraded.next_attempt_at, Some(30));
+    }
+
+    #[tokio::test]
+    async fn retry_claim_requires_a_schedule_and_is_atomic_even_with_zero_attempts() {
+        let db = migrated_test_db("channel-ledger-retry-claim.db").await;
+        let mut scheduled = intent("scheduled");
+        scheduled.binding_ref = "prompt-2:0";
+        assert!(insert_intent(&db, &intent("ambiguous")).await.unwrap());
+        assert!(insert_intent(&db, &scheduled).await.unwrap());
+        assert!(begin_delivery(&db, "ambiguous").await.unwrap());
+        assert!(begin_delivery(&db, "scheduled").await.unwrap());
+        assert!(mark_failed(&db, "scheduled", "bridge degraded", 25, false)
+            .await
+            .unwrap());
+
+        assert!(
+            !begin_retry_delivery(&db, "ambiguous", 25, 6).await.unwrap(),
+            "an ambiguous failed delivery without next_attempt_at must never be retried"
+        );
+        let (first, second) = tokio::join!(
+            begin_retry_delivery(&db, "scheduled", 25, 6),
+            begin_retry_delivery(&db, "scheduled", 25, 6),
+        );
         assert_eq!(
-            get_by_provider_guid(&db, "imessage", "guid-a")
-                .await
-                .unwrap()
-                .unwrap()
-                .id,
-            "on-the-phone"
+            [first.unwrap(), second.unwrap()]
+                .into_iter()
+                .filter(|claimed| *claimed)
+                .count(),
+            1,
+            "clearing next_attempt_at must atomically admit exactly one retry"
+        );
+
+        let claimed = get_by_id(&db, "scheduled").await.unwrap().unwrap();
+        assert_eq!(
+            claimed.attempts, 0,
+            "degraded failures do not consume attempts"
+        );
+        assert_eq!(claimed.next_attempt_at, None);
+        assert_eq!(
+            claimed.last_error.as_deref(),
+            Some("delivery outcome unknown")
+        );
+    }
+
+    #[tokio::test]
+    async fn undelivered_counts_separate_queued_and_failed_rows() {
+        let db = migrated_test_db("channel-ledger-undelivered-counts.db").await;
+        let mut failed = intent("failed-count");
+        failed.binding_ref = "prompt-2:0";
+        assert!(insert_intent(&db, &intent("pending-count")).await.unwrap());
+        assert!(insert_intent(&db, &failed).await.unwrap());
+        assert!(begin_delivery(&db, failed.id).await.unwrap());
+
+        assert_eq!(
+            undelivered_counts(&db, "imessage").await.unwrap(),
+            UndeliveredCounts {
+                pending: 1,
+                failed: 1,
+            }
+        );
+        assert_eq!(
+            undelivered_counts(&db, "telegram").await.unwrap(),
+            UndeliveredCounts::default()
         );
     }
 

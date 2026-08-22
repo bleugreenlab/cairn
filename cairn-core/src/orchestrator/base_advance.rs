@@ -74,6 +74,23 @@ pub(crate) async fn publish_managed_branch(
         .map_err(|error| format!("stale publication retry failed: {error}"))
 }
 
+const ROLLED_BACK_CONFLICT: &str = "rolled_back_conflict";
+
+fn replay_is_explicit(label: &str) -> bool {
+    label.starts_with("replay requested for ")
+        || label.starts_with("resolved replay requested for ")
+}
+
+fn quarantine_blocks_automatic_replay(
+    quarantine: &ReconcileQuarantine,
+    current_tip: Option<&str>,
+    label: &str,
+) -> bool {
+    quarantine.failure_kind != "ambiguous_divergence"
+        && quarantine.fingerprint == current_tip.unwrap_or("missing")
+        && (quarantine.failure_kind != ROLLED_BACK_CONFLICT || !replay_is_explicit(label))
+}
+
 /// Invalidate every cached GitHub verdict for a branch that moved locally but
 /// did not reach origin. The live artifact compares GitHub's head with the store
 /// and names both commits; this cache downgrade closes the window before anyone
@@ -2443,12 +2460,8 @@ async fn execute_reconcile_claim(
         };
         let mut quarantine =
             load_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
-        if let Some(existing) = quarantine
-            .as_ref()
-            .filter(|existing| existing.failure_kind != "ambiguous_divergence")
-        {
-            let current_fingerprint = current_tip.as_deref().unwrap_or("missing");
-            if existing.fingerprint == current_fingerprint {
+        if let Some(existing) = quarantine.as_ref() {
+            if quarantine_blocks_automatic_replay(existing, current_tip.as_deref(), label) {
                 let diagnostic = format!(
                     "quarantined: {}",
                     existing
@@ -2475,8 +2488,12 @@ async fn execute_reconcile_claim(
                 );
                 continue;
             }
-            release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
-            quarantine = None;
+            if existing.failure_kind != "ambiguous_divergence"
+                && existing.fingerprint != current_tip.as_deref().unwrap_or("missing")
+            {
+                release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
+                quarantine = None;
+            }
         }
         if let Some(progress) = progress.as_ref() {
             if progress.status == "suppressed" && progress.notification_sent {
@@ -2695,6 +2712,25 @@ async fn execute_reconcile_claim(
             continue;
         }
 
+        if item_report.conflicted.contains(branch) {
+            let fingerprint = after
+                .get(branch)
+                .or_else(|| before.get(branch))
+                .map_or("missing", String::as_str);
+            upsert_reconcile_quarantine(
+                db,
+                &claim.project_id,
+                &store,
+                branch,
+                ROLLED_BACK_CONFLICT,
+                fingerprint,
+                Some(
+                    "automatic base-advance replay conflicted and was rolled back; unchanged tips are parked until an explicit replay is requested or the branch tip changes",
+                ),
+            )
+            .await?;
+        }
+
         // Origin transfer and durable lineage persistence are deliberately
         // outside the jj mutex.
         let publish =
@@ -2835,6 +2871,12 @@ async fn execute_reconcile_claim(
             // commit resolves CONTENT, but a branch is not reconciled until its
             // ancestry actually moves, which is exactly what just happened.
             close_open_sessions_for_branch(db, branch).await?;
+            if quarantine
+                .as_ref()
+                .is_some_and(|existing| existing.failure_kind == ROLLED_BACK_CONFLICT)
+            {
+                release_reconcile_quarantine(db, &claim.project_id, &store, branch).await?;
+            }
         }
 
         report.rebased_clean.append(&mut item_report.rebased_clean);
@@ -3121,7 +3163,7 @@ fn build_jj_conflict_note(
         .map(|issue| format!(" (cairn://p/{}/{})", issue.project_key, issue.number))
         .unwrap_or_default();
     format!(
-        "⛔ BLOCKING [Base branch update] Your base branch `{base_branch}` advanced — {pr_fragment}{issue_fragment}. The automatic rebase could not be applied cleanly, so it was rolled back: your branch is untouched, on its own content, and nothing was lost. Your work cannot merge until it carries the new base."
+        "⛔ BLOCKING [Base branch update] Your base branch `{base_branch}` advanced — {pr_fragment}{issue_fragment}. The automatic rebase could not be applied cleanly and did not land the new base. Your branch remains on its pre-advance content, but replay machinery may rewrite its store commit identity; use the current coordinates in `cairn:~/rebase`. Your work cannot merge until it carries the new base."
     )
 }
 
@@ -3283,7 +3325,7 @@ async fn refresh_advanced_branch_cells(
 /// carries no PR number — there is no Cairn-tracked owner for the advance.
 fn build_external_advance_conflict_note(default_branch: &str) -> String {
     format!(
-        "⛔ BLOCKING [Base branch update] Your base branch `{default_branch}` advanced (changes landed outside Cairn). The automatic rebase could not be applied cleanly, so it was rolled back: your branch is untouched, on its own content, and nothing was lost. Your work cannot merge until it carries the new base."
+        "⛔ BLOCKING [Base branch update] Your base branch `{default_branch}` advanced (changes landed outside Cairn). The automatic rebase could not be applied cleanly and did not land the new base. Your branch remains on its pre-advance content, but replay machinery may rewrite its store commit identity; use the current coordinates in `cairn:~/rebase`. Your work cannot merge until it carries the new base."
     )
 }
 
@@ -5421,6 +5463,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rolled_back_conflict_parks_only_automatic_replays_of_the_same_tip() {
+        let quarantine = ReconcileQuarantine {
+            failure_kind: ROLLED_BACK_CONFLICT.to_string(),
+            fingerprint: "tip-a".to_string(),
+            last_diagnostic: Some("rolled back".to_string()),
+        };
+
+        for advance in 0..5 {
+            assert!(
+                quarantine_blocks_automatic_replay(
+                    &quarantine,
+                    Some("tip-a"),
+                    &format!("base advance {advance}")
+                ),
+                "every later automatic base advance stays parked"
+            );
+        }
+        assert!(
+            !quarantine_blocks_automatic_replay(
+                &quarantine,
+                Some("tip-a"),
+                "replay requested for agent/test"
+            ),
+            "an explicit plain replay bypasses the automatic circuit breaker"
+        );
+        assert!(
+            !quarantine_blocks_automatic_replay(
+                &quarantine,
+                Some("tip-a"),
+                "resolved replay requested for agent/test"
+            ),
+            "an explicit resolved replay bypasses the automatic circuit breaker"
+        );
+        assert!(
+            !quarantine_blocks_automatic_replay(
+                &quarantine,
+                Some("tip-with-resolution"),
+                "base advance after resolution"
+            ),
+            "a new clean resolution commit changes the tip and resets eligibility"
+        );
+    }
+
+    #[test]
+    fn permanent_failure_quarantine_keeps_existing_automatic_behavior() {
+        let quarantine = ReconcileQuarantine {
+            failure_kind: "immutable_commit".to_string(),
+            fingerprint: "tip-a".to_string(),
+            last_diagnostic: None,
+        };
+
+        assert!(quarantine_blocks_automatic_replay(
+            &quarantine,
+            Some("tip-a"),
+            "base advance"
+        ));
+        assert!(!quarantine_blocks_automatic_replay(
+            &quarantine,
+            Some("tip-b"),
+            "base advance"
+        ));
+        assert!(
+            quarantine_blocks_automatic_replay(
+                &quarantine,
+                Some("tip-a"),
+                "replay requested for agent/test"
+            ),
+            "explicit replay authority is limited to rolled-back content conflicts"
+        );
+    }
+
     #[tokio::test]
     async fn failed_notification_does_not_activate_quarantine_and_retry_can_activate_once() {
         let db = migrated_db().await;
@@ -6072,11 +6186,11 @@ mod tests {
         assert!(note.contains("cairn://p/proj/7"));
         // Stop-the-line: the note names the conflict as blocking, not optional.
         assert!(note.contains("BLOCKING"));
-        // The rebase was ROLLED BACK, and saying so is what makes the note
-        // actionable — the agent is being asked to merge into an untouched
-        // branch, not to repair a rewritten one.
-        assert!(note.contains("rolled back"), "{note}");
-        assert!(note.contains("untouched"), "{note}");
+        // Content remains on the pre-advance side, but replay machinery may
+        // rewrite the store identity even when the new base does not land.
+        assert!(note.contains("pre-advance content"), "{note}");
+        assert!(note.contains("store commit identity"), "{note}");
+        assert!(note.contains("cairn:~/rebase"), "{note}");
         // Agents hold detached git worktrees, so conflict markers are never
         // materialized anywhere. A note that points at them is unanswerable.
         assert!(!note.to_lowercase().contains("marker"), "{note}");
@@ -6249,10 +6363,11 @@ mod tests {
         assert!(note.contains("outside Cairn"));
         // Stop-the-line: the note names the conflict as blocking, not optional.
         assert!(note.contains("BLOCKING"));
-        // Same contract as the Cairn-owned advance: rolled back, untouched, and
-        // no markers to point at.
-        assert!(note.contains("rolled back"), "{note}");
-        assert!(note.contains("untouched"), "{note}");
+        // Same contract as the Cairn-owned advance: content remains while the
+        // store identity may move, and there are no markers to point at.
+        assert!(note.contains("pre-advance content"), "{note}");
+        assert!(note.contains("store commit identity"), "{note}");
+        assert!(note.contains("cairn:~/rebase"), "{note}");
         assert!(!note.to_lowercase().contains("marker"), "{note}");
         // No Cairn-tracked owner: the note must not reference a PR number.
         assert!(!note.contains("PR #"));

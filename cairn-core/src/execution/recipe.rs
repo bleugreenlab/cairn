@@ -305,6 +305,8 @@ pub fn start_recipe_execution_impl(
                             bundles: Vec::new(),
                             is_project_scoped: true,
                             file_path: std::path::PathBuf::new(),
+                            seed_budget_tokens: None,
+                            seed_eras: None,
                         },
                         routing.selection.as_ref(),
                         &effective_presets,
@@ -1164,6 +1166,8 @@ mod tests {
             bundles: Vec::new(),
             is_project_scoped: true,
             file_path: std::path::PathBuf::new(),
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 

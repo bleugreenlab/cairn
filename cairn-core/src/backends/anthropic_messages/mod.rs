@@ -59,11 +59,11 @@ impl AnthropicMessagesAdapter {
 impl WireAdapter for AnthropicMessagesAdapter {
     type Message = MessagesMessage;
 
-    fn backend_key(&self) -> &'static str {
+    fn backend_key(&self) -> &str {
         self.backend_key
     }
 
-    fn backend_name(&self) -> &'static str {
+    fn backend_name(&self) -> &str {
         self.backend_name
     }
 

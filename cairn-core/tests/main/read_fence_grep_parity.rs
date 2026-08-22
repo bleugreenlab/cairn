@@ -48,7 +48,7 @@ async fn grep_absolute_out_of_worktree_path_matches_plain_read_fence() {
         ),
     )
     .await;
-    assert!(grep.contains("source.txt:2:needle-parity"), "grep: {grep}");
+    assert!(grep.contains("source.txt\n2:needle-parity"), "grep: {grep}");
     assert!(
         !grep.contains("outside allowed directories"),
         "grep hit old allow-list: {grep}"
@@ -91,7 +91,7 @@ async fn grep_prunes_denylisted_descendants_from_broad_directory_walk() {
     .await;
 
     assert!(
-        grep.contains("public/visible.txt:1:needle-prune visible"),
+        grep.contains("public/visible.txt\n1:needle-prune visible"),
         "grep should include sibling match: {grep}"
     );
     assert!(

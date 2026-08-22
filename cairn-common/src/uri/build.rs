@@ -728,6 +728,27 @@ pub fn build_node_memory_uri(
     )
 }
 
+/// Build a node eras collection URI (`.../{node}/eras`). Public: the resource
+/// renderer builds member links from the same coordinate the parser accepts,
+/// rather than hand-formatting a duplicate of this string.
+pub fn build_node_eras_uri(project: &str, number: i32, exec_seq: i32, node_id: &str) -> String {
+    build_node_subresource_uri(project, number, exec_seq, node_id, "eras")
+}
+
+pub fn build_node_era_uri(
+    project: &str,
+    number: i32,
+    exec_seq: i32,
+    node_id: &str,
+    era_seq: i32,
+) -> String {
+    format!(
+        "{}/{}",
+        build_node_eras_uri(project, number, exec_seq, node_id),
+        era_seq
+    )
+}
+
 fn build_recipes_uri() -> String {
     "cairn://recipes".to_string()
 }
@@ -1277,6 +1298,19 @@ impl CairnResource {
                 node_id,
                 memory_seq,
             } => build_node_memory_uri(project, *number, *exec_seq, node_id, *memory_seq),
+            Self::NodeEras {
+                project,
+                number,
+                exec_seq,
+                node_id,
+            } => build_node_eras_uri(project, *number, *exec_seq, node_id),
+            Self::NodeEra {
+                project,
+                number,
+                exec_seq,
+                node_id,
+                era_seq,
+            } => build_node_era_uri(project, *number, *exec_seq, node_id, *era_seq),
             Self::Recipes => build_recipes_uri(),
             Self::Recipe { recipe_id } => build_recipe_uri(recipe_id),
             Self::ProjectRecipes { project } => build_project_recipes_uri(project),

@@ -18,19 +18,21 @@ pub enum StreamChunkKind {
     Thinking,
 }
 
-/// Record the first live delta handed to the frontend for a run. This boundary
+/// Record the first live delta handed to the frontend for a stream. This boundary
 /// belongs with stream delivery rather than any one backend, and deliberately
 /// records only aggregate sizes.
 pub(crate) fn trace_first_frontend_delta_emit(
     run_id: &str,
     session_id: Option<&str>,
+    turn_id: Option<&str>,
     stream_id: &str,
     delta: &EmitDelta,
 ) {
-    if crate::resume_timing::mark_first(format!("frontend:{run_id}")) {
+    if crate::resume_timing::mark_first(format!("frontend:{stream_id}")) {
         let mut event = crate::resume_timing::ResumeTimingEvent::new("first_frontend_delta_emit");
         event.run_id = Some(run_id);
         event.session_id = session_id;
+        event.turn_id = turn_id;
         event.stream_id = Some(stream_id);
         event.bytes = Some(
             delta.content_delta.as_ref().map_or(0, String::len)
@@ -398,42 +400,6 @@ pub fn insert_event(db: Arc<LocalDb>, event: EventInsert) -> Result<bool, String
     })
 }
 
-/// Broadcast one `file-touched` frame per file a landed assistant event named.
-///
-/// The live half of [`file_activity`]: the durable rows are written inside the
-/// event's own insert transaction, and this announces the same touches to
-/// whoever is watching. Both read the SAME event data through
-/// [`file_activity::touches_from_event_data`], which is a pure function of it,
-/// so the row that lands and the frame that goes out cannot disagree.
-///
-/// Silent when the run has no owning job: an unattributable touch is not a fact
-/// a per-project surface can place.
-fn emit_file_touches(
-    emitter: &Arc<dyn crate::services::EventEmitter>,
-    scope: &crate::notify::EventRunScope,
-    run_id: &str,
-    data: &str,
-    created_at: i64,
-) {
-    let Some(job_id) = scope.job_id.as_deref() else {
-        return;
-    };
-    for touch in file_activity::touches_from_event_data(data) {
-        let _ = emitter.emit(
-            "file-touched",
-            serde_json::json!({
-                "projectId": scope.project_id,
-                "jobId": job_id,
-                "runId": run_id,
-                "toolUseId": touch.tool_use_id,
-                "filePath": touch.path,
-                "action": touch.action.as_str(),
-                "ts": created_at,
-            }),
-        );
-    }
-}
-
 /// Canonical durable-event insert: write the event and, as one atomic unit,
 /// emit a fully-scoped `events` db-change so the live chat transcript's delta
 /// cache always receives its invalidation. Every live/finalize insert path
@@ -450,7 +416,8 @@ pub fn insert_event_emit(
     let run_id = event.run_id.clone();
     let session_id = event.session_id.clone();
     let data = event.data.clone();
-    let created_at = event.created_at as i64;
+    let projects_presence =
+        event.event_type == "assistant" && file_activity::batch_from_event_data(&data).is_some();
     let scope = crate::notify::event_run_scope(db.clone(), &run_id);
     let inserted = insert_event(db, event)?;
     if inserted {
@@ -458,7 +425,9 @@ pub fn insert_event_emit(
             "db-change",
             crate::notify::event_db_change_scoped(&run_id, session_id.as_deref(), &scope, "insert"),
         );
-        emit_file_touches(emitter, &scope, &run_id, &data, created_at);
+        if projects_presence && scope.job_id.is_some() {
+            let _ = emitter.emit("db-change", crate::notify::job_presence_db_change(&scope));
+        }
     }
     Ok(inserted)
 }
@@ -497,13 +466,11 @@ pub fn finalize_stream_emit(
             "insert",
         ),
     );
-    emit_file_touches(
-        emitter,
-        &scope,
-        &finalized.run_id,
-        &finalized.data_json,
-        finalized.created_at as i64,
-    );
+    if file_activity::batch_from_event_data(&finalized.data_json).is_some()
+        && scope.job_id.is_some()
+    {
+        let _ = emitter.emit("db-change", crate::notify::job_presence_db_change(&scope));
+    }
     Ok(finalized)
 }
 
@@ -694,6 +661,18 @@ async fn insert_event_at_conn(
         // reads as a quiet moment on the map rather than a wrong one, which is
         // why this stream has no backfill.
         if event.event_type == "assistant" {
+            if let Some(batch) = file_activity::batch_from_event_data(&event.data) {
+                if let Err(e) = file_activity::record_presence_conn(
+                    conn,
+                    &event.run_id,
+                    &batch,
+                    presence_ts_ms(event.created_at as i64),
+                )
+                .await
+                {
+                    log::warn!("presence maintenance failed for event {}: {e}", event.id);
+                }
+            }
             let touches = file_activity::touches_from_event_data(&event.data);
             if !touches.is_empty() {
                 if let Err(e) = file_activity::record_touches_conn(
@@ -714,6 +693,10 @@ async fn insert_event_at_conn(
         }
     }
     Ok(count)
+}
+
+fn presence_ts_ms(created_at_secs: i64) -> i64 {
+    created_at_secs * 1_000
 }
 
 /// Open a streaming message row, reserving its transcript `sequence` now.
@@ -1848,6 +1831,12 @@ mod tests {
 
         assert!(insert_event(db.clone(), test_event("after-abort", "run-1")).unwrap());
         assert_eq!(sequences(&db, "run-1").await, vec![0]);
+    }
+
+    /// The presence producer is the one seconds-to-milliseconds boundary.
+    #[test]
+    fn presence_projection_stamps_in_milliseconds() {
+        assert_eq!(presence_ts_ms(1_760_000_000), 1_760_000_000_000);
     }
 
     /// CAIRN-3290: concurrent writers on one run each get their own slot.

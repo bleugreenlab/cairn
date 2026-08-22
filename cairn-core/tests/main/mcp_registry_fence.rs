@@ -50,6 +50,8 @@ fn agent_snapshot(sandbox: LegacySandbox, on_escape: LegacyOnEscape) -> AgentSna
         on_escape: None,
         resolved_backend: None,
         extras: None,
+        seed_budget_tokens: None,
+        seed_eras: None,
     }
 }
 

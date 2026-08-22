@@ -71,6 +71,7 @@ pub struct RunContext {
     pub exec_seq: Option<i32>, // Monotonic execution sequence number (for URIs)
     pub issue_id: Option<String>, // Null for project-level runs
     pub issue_number: Option<i32>, // Issue number for building issue keys (e.g., 123 for CAIRN-123)
+    pub thread_id: Option<String>, // Authoritative owner for thread-session runs
     pub project_id: String,
     pub project_key: String,
     pub job_name: Option<String>, // Human-readable job name from execution snapshot (e.g., "builder-1")

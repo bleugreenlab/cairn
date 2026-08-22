@@ -2,7 +2,7 @@
 //!
 //! The `run` verb's commands execute in a Cairn-owned host process: ordinary
 //! workspace commands are spawned by the runner/server, while build-slot batches
-//! are spawned by the supervised `cairn-executor`. Neither path inherits the
+//! are spawned by the supervised `cairn-exec`. Neither path inherits the
 //! agent CLI's own sandbox. A worktree boundary therefore has to be enforced by
 //! wrapping each command at its actual spawn seam. This module builds
 //! a per-spawn [`SandboxPolicy`] and applies it to the spawned `Command`:

@@ -16,6 +16,59 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::time::sleep;
 use turso::{params::IntoParams, Builder, Connection, Row};
 
+const CONTENTION_ATTEMPT_THRESHOLD: usize = 1;
+const CONTENTION_BACKOFF_THRESHOLD: Duration = Duration::from_millis(10);
+
+#[derive(serde::Serialize)]
+struct TransactionContentionEvent<'a> {
+    event: &'static str,
+    duration_us: u128,
+    attempts: usize,
+    backoff_us: u128,
+    mode: &'a str,
+}
+
+fn transaction_contention_event(
+    attempts: usize,
+    backoff_slept: Duration,
+    elapsed: Duration,
+    begin_sql: &str,
+) -> Option<TransactionContentionEvent<'_>> {
+    if attempts <= CONTENTION_ATTEMPT_THRESHOLD && backoff_slept < CONTENTION_BACKOFF_THRESHOLD {
+        return None;
+    }
+
+    Some(TransactionContentionEvent {
+        event: "db_transaction_contention",
+        duration_us: elapsed.as_micros(),
+        attempts,
+        backoff_us: backoff_slept.as_micros(),
+        mode: if begin_sql == "BEGIN CONCURRENT" {
+            "concurrent"
+        } else {
+            "exclusive"
+        },
+    })
+}
+
+fn emit_transaction_contention(
+    attempts: usize,
+    backoff_slept: Duration,
+    elapsed: Duration,
+    begin_sql: &str,
+) {
+    let Some(event) = transaction_contention_event(attempts, backoff_slept, elapsed, begin_sql)
+    else {
+        return;
+    };
+    match serde_json::to_string(&event) {
+        Ok(encoded) => log::info!(target: "cairn.resume_timing", "{encoded}"),
+        Err(error) => {
+            log::warn!(target: "cairn.resume_timing", "timing event serialization failed: {error}")
+        }
+    }
+}
+
 use super::blocking::panic_message;
 use super::content_store::{ContentStore, PrivateContentStore, TeamReplicaContext};
 use super::{DbError, DbResult, RowExt};
@@ -242,6 +295,10 @@ pub struct LocalDb {
     /// because the drains that most need that guard live in cairn-core.
     #[cfg(any(test, feature = "test-utils"))]
     read_transaction_count: AtomicUsize,
+    /// Write transactions requested over this handle's life. Test-only evidence
+    /// that read-only empty paths do not enter the contended writer pool.
+    #[cfg(any(test, feature = "test-utils"))]
+    write_transaction_count: AtomicUsize,
     /// Connections handed out by [`LocalDb::connect`] over this handle's life.
     /// Lets tests assert that a run of sequential operations reuses one
     /// connection rather than creating one per call — a load-independent guard
@@ -296,6 +353,8 @@ impl LocalDb {
             checkpoint_lock: AsyncMutex::new(()),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
         };
@@ -352,6 +411,8 @@ impl LocalDb {
             checkpoint_lock: AsyncMutex::new(()),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
         };
@@ -404,6 +465,8 @@ impl LocalDb {
             checkpoint_lock: AsyncMutex::new(()),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
         };
@@ -634,6 +697,11 @@ impl LocalDb {
         self.read_transaction_count.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn write_transaction_count(&self) -> usize {
+        self.write_transaction_count.load(Ordering::Relaxed)
+    }
+
     pub async fn read<T>(
         &self,
         f: impl for<'a> FnOnce(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
@@ -652,6 +720,8 @@ impl LocalDb {
         &self,
         mut f: impl for<'a> FnMut(&'a Connection) -> BoxFuture<'a, DbResult<T>>,
     ) -> DbResult<T> {
+        #[cfg(any(test, feature = "test-utils"))]
+        self.write_transaction_count.fetch_add(1, Ordering::Relaxed);
         self.transaction_with_begin(self.concurrent_begin(), &mut f)
             .await
     }
@@ -846,6 +916,7 @@ impl LocalDb {
         let started_at = Instant::now();
         let mut backoff = self.retry.initial_backoff;
         let mut last_retryable = None;
+        let mut backoff_slept = Duration::ZERO;
 
         for attempt in 1..=self.retry.max_attempts {
             let conn = self.checkout().await?;
@@ -858,6 +929,12 @@ impl LocalDb {
             }
             match outcome.result {
                 Ok(value) => {
+                    emit_transaction_contention(
+                        attempt,
+                        backoff_slept,
+                        started_at.elapsed(),
+                        begin_sql,
+                    );
                     // Signal the push task that a synced replica committed. Gated
                     // on `is_synced()` so a local database stays zero-cost (the
                     // Notify is allocated but never fired). This is the ONLY fire
@@ -874,10 +951,18 @@ impl LocalDb {
                 Err(error) if error.is_retryable() && attempt < self.retry.max_attempts => {
                     last_retryable = Some(error);
                     let jitter = Duration::from_millis(rand::random::<u64>() % 5);
+                    let sleep_started = Instant::now();
                     sleep(backoff + jitter).await;
+                    backoff_slept += sleep_started.elapsed();
                     backoff = (backoff * 2).min(self.retry.max_backoff);
                 }
                 Err(error) if error.is_retryable() => {
+                    emit_transaction_contention(
+                        attempt,
+                        backoff_slept,
+                        started_at.elapsed(),
+                        begin_sql,
+                    );
                     return Err(DbError::RetryExhausted {
                         attempts: attempt,
                         elapsed: started_at.elapsed(),
@@ -1623,6 +1708,31 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn contention_timing_reports_retries_and_total_backoff() {
+        assert!(transaction_contention_event(
+            1,
+            Duration::from_millis(9),
+            Duration::from_millis(20),
+            "BEGIN CONCURRENT",
+        )
+        .is_none());
+
+        let event = transaction_contention_event(
+            2,
+            Duration::from_millis(7),
+            Duration::from_millis(25),
+            "BEGIN CONCURRENT",
+        )
+        .expect("a retried transaction is contention");
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["event"], "db_transaction_contention");
+        assert_eq!(value["attempts"], 2);
+        assert_eq!(value["backoff_us"], 7_000);
+        assert_eq!(value["duration_us"], 25_000);
+        assert_eq!(value["mode"], "concurrent");
+    }
     use crate::storage::{Migration, MigrationRunner, RowExt};
 
     /// The drain budget these tests hold the gate open for.
@@ -2216,6 +2326,8 @@ mod tests {
             checkpoint_lock: AsyncMutex::new(()),
             #[cfg(any(test, feature = "test-utils"))]
             read_transaction_count: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-utils"))]
+            write_transaction_count: AtomicUsize::new(0),
             #[cfg(test)]
             connections_created: AtomicUsize::new(0),
         };

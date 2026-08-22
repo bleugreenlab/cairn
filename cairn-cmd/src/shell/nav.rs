@@ -79,14 +79,6 @@ impl Shell {
         format!("{} > ", self.cwd)
     }
 
-    pub(crate) fn spec(&self) -> Option<&AffordanceSpec> {
-        self.spec.as_ref()
-    }
-
-    pub(crate) fn last_text(&self) -> &str {
-        &self.last_text
-    }
-
     /// The target a read at the root actually resolves to.
     ///
     /// No resource lives at `cairn://`; the workspace's projects are what is
@@ -289,7 +281,11 @@ impl Shell {
                         .join("; ");
                         out.push_str(&format!(
                             "  :{:<24} {}{}\n",
-                            actions::verb_slug(&action.label),
+                            actions::preferred_verb(
+                                spec,
+                                action,
+                                &["help", "ls", "pwd", "quit", "exit", "read", "watch"],
+                            ),
                             action.mode,
                             if keys.is_empty() {
                                 String::new()
@@ -426,8 +422,29 @@ mod tests {
     fn an_unresolvable_line_prints_and_leaves_the_cursor_alone() {
         let mut shell = Shell::new();
         navigate(&mut shell, "p/cairn");
+        navigate(&mut shell, "4279");
+        // The line has to be one the grammar actually closes off: a bare name
+        // directly under a project is a thread address, so an unresolvable
+        // example belongs one level deeper.
         assert!(matches!(shell.dispatch("zz/builder"), Intent::Print(_)));
-        assert_eq!(shell.cwd(), "cairn://p/cairn");
+        assert_eq!(shell.cwd(), "cairn://p/cairn/4279");
+    }
+
+    #[test]
+    fn a_bare_name_under_a_project_is_a_thread_address() {
+        // Threads live at cairn://p/PROJECT/NAME, so the grammar cannot tell a
+        // thread from a typo here and resolution is deliberately generous. The
+        // read is what reports a name nothing is stored under, and the cursor
+        // moves only once that read succeeds.
+        let mut shell = Shell::new();
+        navigate(&mut shell, "p/cairn");
+        assert_eq!(
+            shell.dispatch("general"),
+            Intent::Navigate {
+                target: "cairn://p/cairn/general".to_string(),
+                remember: true,
+            }
+        );
     }
 
     #[test]
@@ -476,6 +493,17 @@ mod tests {
                 target: "cairn://p/cairn/4279".to_string(),
                 mode: "append".to_string(),
                 payload: serde_json::json!({"content": "ship it"}),
+                confirm: None,
+            }
+        );
+        // An apostrophe is prose, not a quote. Nothing between the typed line
+        // and the payload reads a comment body as a value to be delimited.
+        assert_eq!(
+            shell.dispatch(":comment it's green now"),
+            Intent::Mutate {
+                target: "cairn://p/cairn/4279".to_string(),
+                mode: "append".to_string(),
+                payload: serde_json::json!({"content": "it's green now"}),
                 confirm: None,
             }
         );

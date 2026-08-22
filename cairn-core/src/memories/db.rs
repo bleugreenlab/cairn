@@ -161,6 +161,7 @@ pub(crate) async fn claim_and_link_pending_batch(
     if memory_ids.is_empty() {
         return Ok(false);
     }
+
     let issue_id = issue_id.to_string();
     let memory_ids = memory_ids.to_vec();
     let now = chrono::Utc::now().timestamp();
@@ -999,30 +1000,10 @@ pub async fn build_node_memory_uri_for_memory(db: &LocalDb, memory: &Memory) -> 
     let node_seq = memory
         .node_seq
         .ok_or_else(|| DbError::Row(format!("Memory {} has no node_seq", memory.id)))?;
-    db.query_one(
-        "SELECT p.key, i.number, e.seq, j.uri_segment
-         FROM jobs j
-         JOIN executions e ON e.id = j.execution_id
-         JOIN issues i ON i.id = j.issue_id
-         JOIN projects p ON p.id = j.project_id
-         WHERE j.id = ?1
-         LIMIT 1",
-        params![job_id.as_str()],
-        move |row| {
-            let project_key = row.text(0)?;
-            let number = row.i64(1)? as i32;
-            let exec_seq = row.i64(2)? as i32;
-            let node_id = row.text(3)?;
-            Ok(cairn_common::uri::build_node_memory_uri(
-                &project_key,
-                number,
-                exec_seq,
-                &node_id,
-                node_seq as i32,
-            ))
-        },
-    )
-    .await
+    let home = crate::jobs::queries::home_uri_for_job(db, &job_id)
+        .await?
+        .ok_or_else(|| DbError::Row(format!("Memory {} has no addressable job", memory.id)))?;
+    Ok(format!("{home}/memories/{node_seq}"))
 }
 
 /// The memory a `.../{node}/memories/{seq}` URI addresses.
@@ -1400,6 +1381,33 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// A thread session job owns its memories through `jobs.thread_id`, not
+    /// `jobs.issue_id` (which is NULL for every thread session). The URI must
+    /// name the thread's canonical home rather than falling back to a
+    /// project-level or empty path.
+    #[tokio::test]
+    async fn thread_memory_uses_the_canonical_thread_home() {
+        let db = test_db().await;
+        let fixture = crate::test_support::seed_thread_session(&db).await;
+        insert_memory_with_status_and_job(
+            &db,
+            "thread-memory",
+            Some(fixture.project_id),
+            "draft",
+            fixture.session_job_id,
+            4,
+        )
+        .await;
+        let memory = load_memory(&db, "thread-memory").await.unwrap();
+
+        assert_eq!(
+            build_node_memory_uri_for_memory(&db, &memory)
+                .await
+                .unwrap(),
+            "cairn://p/thread-project/design/memories/4"
+        );
     }
 
     #[tokio::test]

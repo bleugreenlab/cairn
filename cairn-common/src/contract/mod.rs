@@ -141,6 +141,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     workspace::PROJECT_SYMBOLS_CONTRACT,
     workspace::NODE_MEMORIES_CONTRACT,
     workspace::NODE_MEMORY_CONTRACT,
+    workspace::NODE_ERAS_CONTRACT,
+    workspace::NODE_ERA_CONTRACT,
     registry::RECIPES_CONTRACT,
     registry::RECIPE_CONTRACT,
     registry::PROJECT_RECIPES_CONTRACT,
@@ -245,15 +247,47 @@ mod tests {
         }
     }
 
-    /// Removal has no force key and the description says why: an operator drains
-    /// first and removes an empty machine, so the flow is discoverable from the
-    /// affordance alone.
+    /// Removal teaches the careful path first — drain, watch the counts fall,
+    /// remove — and then names the way past a machine whose counts will never
+    /// fall, because a machine that has stopped answering never empties and an
+    /// affordance with no way out of that is a permanently unremovable
+    /// enrollment (CAIRN-4360).
     #[test]
-    fn removal_advertises_drain_first_rather_than_a_force_option() {
+    fn removal_teaches_drain_first_and_still_names_the_acknowledged_override() {
         let machine = contract_for(ResourceKind::Executor).expect("registered");
         assert!(machine.description.contains("drain first"));
         let remove = mutation_spec(ResourceKind::Executor, ChangeMode::Delete).expect("registered");
-        assert!(remove.required.is_empty() && remove.optional.is_empty());
+        assert!(remove.required.is_empty());
+        assert_eq!(
+            remove.optional.iter().map(|key| key.key).collect::<Vec<_>>(),
+            ["confirm"],
+            "the override is the only thing a removal takes, and it is deliberate rather than a force flag"
+        );
+    }
+
+    /// Draining is the one machine control that is not generation-fenced, and
+    /// the affordance has to say so: an agent told to send an expectedGeneration
+    /// with a drain will send one, read the refusal it gets on an unreachable
+    /// machine, and conclude the machine cannot be drained at all.
+    #[test]
+    fn draining_is_advertised_as_durable_and_unfenced() {
+        let configure =
+            mutation_spec(ResourceKind::Executor, ChangeMode::Patch).expect("registered");
+        let draining = configure
+            .optional
+            .iter()
+            .find(|key| key.key == "draining")
+            .expect("draining is configurable");
+        assert!(draining.note().contains("durable"), "{draining:?}");
+        let generation = configure
+            .optional
+            .iter()
+            .find(|key| key.key == "expectedGeneration")
+            .expect("the fence is still advertised for what it fences");
+        assert!(
+            !generation.note().contains("draining"),
+            "the fence must not claim draining: {generation:?}"
+        );
     }
 
     #[test]

@@ -75,26 +75,67 @@ pub(super) fn storage_error(context: &str, error: DbError) -> String {
     format!("{context}: {error}")
 }
 
+/// The part of a `cairn:~` shorthand that hangs beneath the run's home, or
+/// `None` when the URI is not home-relative at all. `cairn:~` itself yields an
+/// empty suffix — the home resource, not something under it.
+pub(crate) fn home_relative_suffix(uri: &str) -> Option<&str> {
+    uri.strip_prefix("cairn:~/")
+        .or_else(|| (uri == "cairn:~").then_some(""))
+}
+
+/// The part of a `cairn:@` shorthand that hangs beneath the run's project.
+/// Both the documented slash form and the forgiving slashless form are accepted.
+pub(crate) fn project_relative_suffix(uri: &str) -> Option<&str> {
+    let suffix = uri.strip_prefix("cairn:@")?;
+    Some(suffix.strip_prefix('/').unwrap_or(suffix))
+}
+
+/// Join a home-relative URI onto a home URI that has ALREADY been resolved.
+///
+/// The pure half of [`resolve_home_relative_resource_uri`]: everything after the
+/// database lookup. A caller that resolves the home once for a whole batch — and
+/// may have to move it, as the write handler does when the batch renames the
+/// run's own thread — needs the join without the lookup.
+pub(crate) fn resolve_home_relative_against(home_uri: &str, uri: &str) -> Option<String> {
+    if let Some(suffix) = home_relative_suffix(uri) {
+        return Some(if suffix.is_empty() {
+            home_uri.to_string()
+        } else {
+            resolve_home_suffix(home_uri, suffix)
+        });
+    }
+
+    let suffix = project_relative_suffix(uri)?;
+    let project_uri = project_uri_from_home(home_uri)?;
+    Some(if suffix.is_empty() {
+        project_uri.to_string()
+    } else if suffix.starts_with('?') {
+        format!("{project_uri}{suffix}")
+    } else {
+        format!("{project_uri}/{suffix}")
+    })
+}
+
+fn project_uri_from_home(home_uri: &str) -> Option<&str> {
+    let rest = home_uri.strip_prefix("cairn://p/")?;
+    let project_len = rest.find('/').unwrap_or(rest.len());
+    Some(&home_uri[.."cairn://p/".len() + project_len])
+}
+
 pub(crate) async fn resolve_home_relative_resource_uri(
     dbs: &crate::db::DbState,
     request: &McpCallbackRequest,
     uri: &str,
 ) -> Result<String, String> {
-    let Some(suffix) = uri
-        .strip_prefix("cairn:~/")
-        .or_else(|| (uri == "cairn:~").then_some(""))
-    else {
+    if home_relative_suffix(uri).is_none() && project_relative_suffix(uri).is_none() {
         return Ok(uri.to_string());
-    };
-
-    // Route the run lookup across every open database so a `cairn:~/` target
-    // resolves to the home URI in whichever DB the run lives (CAIRN-2132).
-    let home_uri = crate::mcp::handlers::run_context::lookup_home_uri_routed(dbs, request).await?;
-    if suffix.is_empty() {
-        Ok(home_uri)
-    } else {
-        Ok(resolve_home_suffix(&home_uri, suffix))
     }
+
+    // Route the run lookup across every open database so deictic targets resolve
+    // from the live job row in whichever DB the run lives (CAIRN-2132).
+    let home_uri = crate::mcp::handlers::run_context::lookup_home_uri_routed(dbs, request).await?;
+    Ok(resolve_home_relative_against(&home_uri, uri)
+        .expect("a deictic URI resolves from a canonical home URI"))
 }
 
 /// Home-relative suffixes that a delegated task resolves against its OWNING
@@ -273,7 +314,7 @@ pub(super) async fn visible_job_node_segment(
 /// per-resource feature. Documents the modifiers, the line-number-prefixed match
 /// contract, and the tree-only limits in one place (resolving the prior
 /// `-A`/`-B`/`-C` documentation gap).
-const UNIVERSAL_GREP_FILTER: &str = "- `grep=REGEX` (universal) · `-i` · `-A`/`-B`/`-C`/`context=N` · `head_limit=N` — line-number-prefixed matches over the rendered body; `offset` not allowed with grep; `files_with_matches`/`count` need a tree\n";
+const UNIVERSAL_GREP_FILTER: &str = "- `grep=REGEX` (universal) · `-i` · `-A`/`-B`/`-C`/`context=N` · `head_limit=N` (caps MATCHES, not lines; a capped read reports the full total and marks itself partial) — line-number-prefixed matches over the rendered body; `offset` not allowed with grep; `files_with_matches`/`count` need a tree\n";
 
 pub(super) fn affordance_spec_for_kind(
     kind: ResourceKind,
@@ -1265,6 +1306,40 @@ pub(super) fn parse_optional_bool_param(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_relative_targets_resolve_from_any_run_home() {
+        for home in [
+            "cairn://p/cairn/4488/2/builder",
+            "cairn://p/cairn/thread-ux/task/probe",
+            "cairn://p/cairn",
+        ] {
+            assert_eq!(
+                resolve_home_relative_against(home, "cairn:@"),
+                Some("cairn://p/cairn".to_string())
+            );
+            assert_eq!(
+                resolve_home_relative_against(home, "cairn:@/issues?status=active"),
+                Some("cairn://p/cairn/issues?status=active".to_string())
+            );
+            assert_eq!(
+                resolve_home_relative_against(home, "cairn:@4321"),
+                Some("cairn://p/cairn/4321".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn project_relative_resolution_requires_a_canonical_project_home() {
+        assert_eq!(
+            resolve_home_relative_against("cairn://posts", "cairn:@"),
+            None
+        );
+        assert_eq!(
+            resolve_home_relative_against("not-a-uri", "cairn:@/issues"),
+            None
+        );
+    }
 
     #[test]
     fn task_home_diff_projects_to_the_owning_node() {

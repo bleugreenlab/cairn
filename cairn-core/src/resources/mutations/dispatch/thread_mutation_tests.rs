@@ -6,11 +6,76 @@ use super::*;
 use crate::db::DbState;
 use crate::models::CreateThread;
 use crate::orchestrator::OrchestratorBuilder;
-use crate::services::testing::TestServicesBuilder;
+use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
 use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
 use std::sync::Arc;
 
 async fn seeded_orch() -> Orchestrator {
+    seeded_orch_with_emitter().await.0
+}
+
+async fn apply_dry_run(orch: &Orchestrator, item: &ChangeItem) -> ResourceMutationResult<String> {
+    dispatch_resource_change(orch, &request(), 0, item, true)
+        .await
+        .map(|change| change.summary)
+}
+
+#[tokio::test]
+async fn agent_thread_mutations_emit_scoped_db_changes_and_dry_runs_stay_silent() {
+    let (orch, emitter) = seeded_orch_with_emitter().await;
+    let thread_id = seed_thread(&orch).await;
+
+    apply_dry_run(&orch, &patch(serde_json::json!({ "name": "preview" })))
+        .await
+        .unwrap();
+    assert!(emitter.events_named("db-change").is_empty());
+
+    apply(&orch, &patch(serde_json::json!({ "name": "north-star" })))
+        .await
+        .unwrap();
+    let events = emitter.events_named("db-change");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["table"], "threads");
+    assert_eq!(events[0]["action"], "update");
+    assert_eq!(events[0]["threadId"], thread_id);
+    assert_eq!(events[0]["projectId"], "p");
+    assert_eq!(events[0]["name"], "north-star");
+    assert_eq!(events[0]["previousName"], "roadmap");
+
+    let second = ChangeItem {
+        target: "cairn://p/prj/north-star".into(),
+        mode: ChangeMode::Patch,
+        payload: Some(serde_json::json!({ "name": "planning-board" })),
+    };
+    apply(&orch, &second).await.unwrap();
+    let transitions = emitter.events_named("db-change");
+    assert_eq!(transitions[1]["previousName"], "north-star");
+    assert_eq!(transitions[1]["name"], "planning-board");
+
+    let create = ChangeItem {
+        target: "cairn://p/prj/threads".into(),
+        mode: ChangeMode::Append,
+        payload: Some(serde_json::json!({ "name": "planning" })),
+    };
+    apply(&orch, &create).await.unwrap();
+    let created = emitter.events_named("db-change");
+    assert_eq!(created.len(), 3);
+    assert_eq!(created[2]["action"], "insert");
+    assert_eq!(created[2]["name"], "planning");
+
+    let delete = ChangeItem {
+        target: "cairn://p/prj/planning".into(),
+        mode: ChangeMode::Delete,
+        payload: None,
+    };
+    apply(&orch, &delete).await.unwrap();
+    let deleted = emitter.events_named("db-change");
+    assert_eq!(deleted.len(), 4);
+    assert_eq!(deleted[3]["action"], "delete");
+    assert_eq!(deleted[3]["name"], "planning");
+}
+
+async fn seeded_orch_with_emitter() -> (Orchestrator, Arc<CapturingEmitter>) {
     let local = LocalDb::open(tempfile::tempdir().unwrap().keep().join("t.db"))
         .await
         .unwrap();
@@ -29,12 +94,18 @@ async fn seeded_orch() -> Orchestrator {
     let search =
         Arc::new(SearchIndex::open_or_create(tempfile::tempdir().unwrap().keep()).unwrap());
     let db = Arc::new(DbState::new(Arc::new(local), search));
-    OrchestratorBuilder::new(
+    let emitter = Arc::new(CapturingEmitter::new());
+    let orch = OrchestratorBuilder::new(
         db,
-        Arc::new(TestServicesBuilder::new().build()),
+        Arc::new(
+            TestServicesBuilder::new()
+                .with_emitter(emitter.clone())
+                .build(),
+        ),
         tempfile::tempdir().unwrap().keep(),
     )
-    .build()
+    .build();
+    (orch, emitter)
 }
 
 fn request() -> McpCallbackRequest {
@@ -251,9 +322,9 @@ async fn closing_and_reopening_through_the_resource_matches_the_desktop_update()
 
     assert_eq!(
         (
-            via_command.status,
-            via_command.name,
-            via_command.jurisdiction
+            via_command.thread.status,
+            via_command.thread.name,
+            via_command.thread.jurisdiction
         ),
         (
             via_resource.status,

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use cairn_common::uri::build_pack_uri;
 
 use crate::config::mcp_servers::{workspace_mcp_entries, NotReady, WorkspaceMcpEntry};
+use crate::config::pack::mcp::McpVarRequirement;
 use crate::config::pack::{self, PackItem, PackItemKind, PackLock, PackManifest};
 
 /// One pack as the catalog sees it: what the app ships, what the workspace
@@ -145,6 +146,11 @@ pub struct PackCatalogItem {
     /// decides it. The UI renders this verdict; it never re-derives one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_ready: Option<NotReady>,
+    /// What to ask the user for, one entry per variable [`Self::not_ready`]
+    /// names. This is what the pack detail screen turns into a labelled field
+    /// with a file picker instead of a variable name and no way to act on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup: Vec<McpVarRequirement>,
 }
 
 /// How many live items of one kind a pack carries, for the compact
@@ -203,6 +209,31 @@ pub struct PackCatalogEntry {
     pub items: Vec<PackCatalogItem>,
     /// Live (non-removed) item counts by kind.
     pub counts: Vec<PackContentCount>,
+    /// The catalog section this entry belongs in: [`PACK_ENTRY_KIND`] for a
+    /// bundle, or the kind of the one item it ships. See [`entry_kind`].
+    pub entry_kind: String,
+}
+
+/// The section an entry that bundles several items belongs in.
+pub const PACK_ENTRY_KIND: &str = "pack";
+
+/// Which section an entry belongs in.
+///
+/// A manifest that ships exactly one item *is* that item: the Linear connector
+/// is an MCP server, not a pack of one, and a pack is a set of related things
+/// that travel together. Deriving this from content rather than declaring it in
+/// the manifest is what lets an entry move between the two without ceremony —
+/// the day the Linear channel item joins that manifest, the same id becomes a
+/// pack with its lock, install state, and destination paths untouched.
+///
+/// Every item counts, tombstoned ones included, because the grouping follows
+/// what the manifest ships rather than what this workspace currently holds:
+/// removing one skill from a two-item pack must not reclassify it.
+fn entry_kind(items: &[PackCatalogItem]) -> String {
+    match items {
+        [only] => only.kind.clone(),
+        _ => PACK_ENTRY_KIND.to_string(),
+    }
 }
 
 impl PackCatalogEntry {
@@ -363,6 +394,7 @@ fn project(
                 count,
             })
             .collect(),
+        entry_kind: entry_kind(&items),
         items,
     }
 }
@@ -425,15 +457,16 @@ fn catalog_item(
     state: PackItemState,
     mcp_entries: &BTreeMap<String, WorkspaceMcpEntry>,
 ) -> PackCatalogItem {
-    let not_ready = (item.kind == PackItemKind::Mcp)
-        .then(|| mcp_entries.get(&item.id).and_then(|e| e.not_ready.clone()))
+    let entry = (item.kind == PackItemKind::Mcp)
+        .then(|| mcp_entries.get(&item.id))
         .flatten();
     PackCatalogItem {
         kind: item.kind.as_str().to_string(),
         id: item.id,
         path: item.path,
         state,
-        not_ready,
+        not_ready: entry.and_then(|e| e.not_ready.clone()),
+        setup: entry.map(|e| e.setup.clone()).unwrap_or_default(),
     }
 }
 
@@ -481,12 +514,75 @@ pub(crate) fn read_packs(config_dir: &Path, state_filter: Option<&str>) -> Strin
     render_packs(&pack_catalog(config_dir), state_filter)
 }
 
+/// The library's sections, in the order they read, each paired with its heading
+/// and the singular noun one of its entries is called.
+///
+/// A kind missing from this table still gets a section — appended after these,
+/// with a heading derived from the kind itself — so shipping a new item kind is
+/// a manifest change and not a surfacing change.
+const SECTIONS: &[(&str, &str, &str)] = &[
+    (PACK_ENTRY_KIND, "Packs", "pack"),
+    ("mcp", "MCP servers", "MCP server"),
+    ("skill", "Skills", "skill"),
+    ("agent", "Agents", "agent"),
+    ("recipe", "Recipes", "recipe"),
+    ("workflow", "Workflows", "workflow"),
+    ("response", "Responses", "response"),
+];
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The heading a section of entries sits under.
+fn section_title(kind: &str) -> String {
+    match SECTIONS.iter().find(|(k, _, _)| *k == kind) {
+        Some((_, title, _)) => (*title).to_string(),
+        None => format!("{}s", capitalize(kind)),
+    }
+}
+
+/// What one entry of this kind is called, mid-sentence.
+fn entry_noun(kind: &str) -> String {
+    match SECTIONS.iter().find(|(k, _, _)| *k == kind) {
+        Some((_, _, noun)) => (*noun).to_string(),
+        None => kind.to_string(),
+    }
+}
+
+/// The library's sections for these entries: the known kinds in presentation
+/// order, then any unrecognized kind in catalog order. Empty sections are
+/// dropped, so the shape of the output is the shape of what is actually here.
+fn sections<'a>(entries: &[&'a PackCatalogEntry]) -> Vec<(&'a str, Vec<&'a PackCatalogEntry>)> {
+    let mut order: Vec<&str> = SECTIONS.iter().map(|(kind, _, _)| *kind).collect();
+    for entry in entries {
+        if !order.contains(&entry.entry_kind.as_str()) {
+            order.push(entry.entry_kind.as_str());
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|kind| {
+            let members: Vec<&PackCatalogEntry> = entries
+                .iter()
+                .copied()
+                .filter(|entry| entry.entry_kind == kind)
+                .collect();
+            (!members.is_empty()).then_some((kind, members))
+        })
+        .collect()
+}
+
 fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
-    let mut out = "# Resource packs\n\n".to_string();
+    let mut out = "# Library\n\n".to_string();
     if !catalog.source_recorded {
         out.push_str(
             "> This workspace has no recorded app resource directory yet, so only \
-             already-installed packs are listed. It is recorded on the next startup sync.\n\n",
+             already-installed entries are listed. It is recorded on the next startup sync.\n\n",
         );
     }
 
@@ -497,32 +593,39 @@ fn render_packs(catalog: &PackCatalog, state_filter: Option<&str>) -> String {
         .collect();
 
     if filtered.is_empty() {
-        out.push_str("No packs.\n");
+        out.push_str("Nothing in the library.\n");
         return out;
     }
 
-    for entry in filtered {
-        let update = if entry.update_available {
-            " — update available"
-        } else {
-            ""
-        };
+    for (kind, members) in sections(&filtered) {
         out.push_str(&format!(
-            "## [{}]({}) `{}`\n\n",
-            entry.name,
-            build_pack_uri(&entry.id),
-            entry.id
+            "## {} ({})\n\n",
+            section_title(kind),
+            members.len()
         ));
-        out.push_str(&format!(
-            "State: {}{} · Version: {}\n\n",
-            entry.state.as_str(),
-            update,
-            display_version(entry)
-        ));
-        if !entry.description.is_empty() {
-            out.push_str(&format!("{}\n\n", entry.description));
+        for entry in members {
+            let update = if entry.update_available {
+                " — update available"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "### [{}]({}) `{}`\n\n",
+                entry.name,
+                build_pack_uri(&entry.id),
+                entry.id
+            ));
+            out.push_str(&format!(
+                "State: {}{} · Version: {}\n\n",
+                entry.state.as_str(),
+                update,
+                display_version(entry)
+            ));
+            if !entry.description.is_empty() {
+                out.push_str(&format!("{}\n\n", entry.description));
+            }
+            render_items(&mut out, entry);
         }
-        render_items(&mut out, entry);
     }
 
     out
@@ -547,10 +650,18 @@ pub(crate) fn read_pack(config_dir: &Path, pack_id: &str) -> String {
 }
 
 fn render_pack(entry: &PackCatalogEntry) -> String {
-    let mut out = format!("# Pack `{}` — {}\n\n", entry.id, entry.name);
+    let noun = entry_noun(&entry.entry_kind);
+    let mut out = format!(
+        "# {} `{}` — {}\n\n",
+        capitalize(&noun),
+        entry.id,
+        entry.name
+    );
     out.push_str(&format!("State: {}\n", entry.state.as_str()));
     if entry.uninstalled_by_user {
-        out.push_str("You uninstalled this pack. Install it again to bring it back.\n");
+        out.push_str(&format!(
+            "You uninstalled this {noun}. Install it again to bring it back.\n"
+        ));
     }
     out.push_str(&format!("Version: {}\n", display_version(entry)));
     if entry.update_available {
@@ -642,6 +753,7 @@ mod tests {
             path: (kind != "mcp").then(|| format!("{kind}s/{id}")),
             state,
             not_ready: None,
+            setup: Vec::new(),
         }
     }
 
@@ -673,6 +785,29 @@ mod tests {
                 kind: "skill".into(),
                 count: 1,
             }],
+            entry_kind: PACK_ENTRY_KIND.into(),
+        }
+    }
+
+    /// A manifest carrying exactly one item, classified the way the projection
+    /// classifies it.
+    fn single(id: &str, kind: &str) -> PackCatalogEntry {
+        let items = vec![item(kind, id, PackItemState::PackOwned)];
+        PackCatalogEntry {
+            id: id.into(),
+            name: capitalize(id),
+            description: String::new(),
+            state: PackState::Available,
+            installed_version: None,
+            installed_at: None,
+            update_available: false,
+            entry_kind: entry_kind(&items),
+            items,
+            counts: vec![PackContentCount {
+                kind: kind.into(),
+                count: 1,
+            }],
+            ..entry()
         }
     }
 
@@ -732,6 +867,44 @@ mod tests {
             page.contains("no recorded app resource directory"),
             "{page}"
         );
-        assert!(page.contains("No packs."), "{page}");
+        assert!(page.contains("Nothing in the library."), "{page}");
+    }
+
+    /// The taxonomy the whole library reads by: a manifest that ships one item
+    /// IS that item, and only a bundle is a pack.
+    #[test]
+    fn a_one_item_manifest_is_that_item_and_a_bundle_is_a_pack() {
+        let bundle = entry();
+        assert_eq!(bundle.entry_kind, PACK_ENTRY_KIND);
+        assert_eq!(single("linear", "mcp").entry_kind, "mcp");
+
+        // The detail page calls an entry what it is, not what its URI family is.
+        let page = render_pack(&single("linear", "mcp"));
+        assert!(page.starts_with("# MCP server `linear`"), "{page}");
+        assert!(render_pack(&bundle).starts_with("# Pack `matlab`"));
+    }
+
+    /// Sections carry the catalog's shape: known kinds in presentation order,
+    /// an unrecognized kind in its own section rather than swept into `Packs`,
+    /// and no heading for a kind nothing here has.
+    #[test]
+    fn the_catalog_reads_as_kind_sections_that_an_unknown_kind_extends() {
+        let catalog = PackCatalog {
+            source_recorded: true,
+            packs: vec![
+                entry(),
+                single("linear", "mcp"),
+                single("deepwiki", "mcp"),
+                single("triage", "channel"),
+            ],
+        };
+        let page = render_packs(&catalog, None);
+
+        let packs = page.find("## Packs (1)").expect(&page);
+        let mcp = page.find("## MCP servers (2)").expect(&page);
+        let channels = page.find("## Channels (1)").expect(&page);
+        assert!(packs < mcp && mcp < channels, "{page}");
+        assert!(!page.contains("## Skills"), "{page}");
+        assert!(page.contains("### [Linear]"), "{page}");
     }
 }

@@ -107,6 +107,8 @@ fn agent_snapshot() -> AgentSnapshot {
         on_escape: None,
         resolved_backend: None,
         extras: None,
+        seed_budget_tokens: None,
+        seed_eras: None,
     }
 }
 

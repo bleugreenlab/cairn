@@ -319,6 +319,10 @@ pub struct Settings {
     /// live it is done only because the window is running out — never because it
     /// would be cheaper.
     pub thread_compact_threshold: f64,
+    /// Approximate token budget for non-arc thread seed context.
+    pub seed_budget_tokens: i32,
+    /// Number of recent era summaries rendered into a thread seed.
+    pub seed_eras: i32,
     /// Behavior for replies to the documented `to: "external"` target.
     pub external_replies: ExternalReplyMode,
     /// File-log verbosity level (default `standard`; `verbose` opts into full
@@ -395,6 +399,10 @@ pub struct UpdateSettings {
     pub pending_memory_threshold: Option<i32>,
     /// Fraction of the model's context window at which a warm thread session rebuilds.
     pub thread_compact_threshold: Option<f64>,
+    /// Approximate token budget for non-arc thread seed context.
+    pub seed_budget_tokens: Option<i32>,
+    /// Number of recent era summaries rendered into a thread seed.
+    pub seed_eras: Option<i32>,
     /// Behavior for replies to the documented `to: "external"` target.
     pub external_replies: Option<ExternalReplyMode>,
     /// File-log verbosity level.

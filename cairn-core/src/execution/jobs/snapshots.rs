@@ -49,6 +49,33 @@ pub(crate) fn queued_user_transcript_event(
     }
 }
 
+pub(super) async fn load_thread_seed_policy(
+    db: Arc<LocalDb>,
+    execution_id: String,
+    agent_config_id: String,
+) -> Option<(i32, i32)> {
+    db.read(|conn| {
+        let execution_id = execution_id.clone();
+        let agent_config_id = agent_config_id.clone();
+        Box::pin(async move {
+            let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
+            Ok(snapshot.and_then(|snapshot| {
+                snapshot.agents.get(&agent_config_id).and_then(|agent| {
+                    agent.seed_budget_tokens.or(agent.seed_eras).map(|_| {
+                        (
+                            agent.seed_budget_tokens.unwrap_or(0),
+                            agent.seed_eras.unwrap_or(-1),
+                        )
+                    })
+                })
+            }))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 pub(super) async fn load_agent_snapshot_data(
     db: Arc<LocalDb>,
     execution_id: String,

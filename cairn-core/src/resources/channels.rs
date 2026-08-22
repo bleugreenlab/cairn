@@ -49,6 +49,7 @@ pub struct ConversationRow {
     pub capabilities: ConversationCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    pub failed_count: i64,
 }
 
 fn row_for_status(
@@ -57,6 +58,7 @@ fn row_for_status(
     message_classes: i64,
     state: &str,
     last_error: Option<String>,
+    failed_count: i64,
 ) -> ConversationRow {
     let deliverability = if state == "bridgeUp" {
         if last_error.is_some() {
@@ -86,6 +88,7 @@ fn row_for_status(
         classes: message_class_names(message_classes),
         capabilities: conversation_capabilities(address.provider()),
         last_error,
+        failed_count,
     }
 }
 
@@ -119,6 +122,7 @@ pub async fn configured_conversations(orch: &Orchestrator) -> Vec<ConversationRo
                 binding.message_classes,
                 status.state,
                 status.last_send_error,
+                status.failed_count,
             )),
             Err(error) => rows.push(ConversationRow {
                 address: binding.conversation,
@@ -129,6 +133,7 @@ pub async fn configured_conversations(orch: &Orchestrator) -> Vec<ConversationRo
                 classes: message_class_names(binding.message_classes),
                 capabilities: conversation_capabilities(provider),
                 last_error: Some(status.detail.unwrap_or_else(|| error.to_string())),
+                failed_count: status.failed_count,
             }),
         }
     }
@@ -178,7 +183,7 @@ mod tests {
     fn runtime_and_outbound_failure_combine_into_deliverability() {
         let ready = ConversationAddress::telegram("123").unwrap();
         assert_eq!(
-            row_for_status(ready.clone(), "target".into(), 1, "bridgeUp", None).deliverability,
+            row_for_status(ready.clone(), "target".into(), 1, "bridgeUp", None, 0).deliverability,
             ConversationDeliverability::Ready
         );
         assert_eq!(
@@ -187,17 +192,18 @@ mod tests {
                 "target".into(),
                 1,
                 "bridgeUp",
-                Some("send failed".into())
+                Some("send failed".into()),
+                1
             )
             .deliverability,
             ConversationDeliverability::Degraded
         );
         assert_eq!(
-            row_for_status(ready.clone(), "target".into(), 1, "degraded", None).deliverability,
+            row_for_status(ready.clone(), "target".into(), 1, "degraded", None, 0).deliverability,
             ConversationDeliverability::Degraded
         );
         assert_eq!(
-            row_for_status(ready, "target".into(), 1, "stopped", None).deliverability,
+            row_for_status(ready, "target".into(), 1, "stopped", None, 0).deliverability,
             ConversationDeliverability::Stopped
         );
     }
@@ -210,6 +216,7 @@ mod tests {
             MESSAGE_CLASS_QUESTION | MESSAGE_CLASS_NOTIFY,
             "bridgeUp",
             None,
+            0,
         );
         assert_eq!(
             serde_json::to_value(row).unwrap(),
@@ -223,7 +230,8 @@ mod tests {
                 "capabilities": {
                     "append_to_conversation": true,
                     "create_into_container": true
-                }
+                },
+                "failed_count": 0
             })
         );
     }

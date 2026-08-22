@@ -63,6 +63,11 @@ pub(super) async fn read_settings(orch: &Orchestrator) -> String {
         settings.thread_compact_threshold
     ));
     out.push_str(&format!(
+        "- seedBudgetTokens: {}\n",
+        settings.seed_budget_tokens
+    ));
+    out.push_str(&format!("- seedEras: {}\n", settings.seed_eras));
+    out.push_str(&format!(
         "- externalReplies: {:?}\n\n",
         settings.external_replies
     ));

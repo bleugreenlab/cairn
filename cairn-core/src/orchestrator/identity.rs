@@ -639,7 +639,7 @@ impl Orchestrator {
 
     // === Helper ===
 
-    fn emit_config_changed(&self) {
+    pub(super) fn emit_config_changed(&self) {
         let _ = self.services.emitter.emit(
             "config-changed",
             serde_json::json!({"entity_type": "identity"}),

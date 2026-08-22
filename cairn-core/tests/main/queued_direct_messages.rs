@@ -589,7 +589,8 @@ async fn flush_pending_directs_on_idle_is_noop_without_pending() {
     insert_dm_recipient(&orch.db.local, "proj", "running").await;
 
     let before = turn_count(&orch.db.local, "job-1").await;
-    cairn_core::messages::delivery::flush_pending_directs_on_idle(&orch, "run-1");
+    cairn_core::messages::delivery::flush_pending_directs_on_idle(&orch, "run-1")
+        .expect("empty flush should succeed");
     assert_eq!(
         turn_count(&orch.db.local, "job-1").await,
         before,

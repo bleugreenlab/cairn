@@ -6,7 +6,10 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::SearchContentType;
 use crate::orchestrator::Orchestrator;
 use cairn_common::query::QueryParam;
-use cairn_symbols::search_util::{build_glob_matcher, render_grep_lines, GrepLine};
+use cairn_common::read::SegmentMeta;
+use cairn_symbols::search_util::{
+    build_glob_matcher, order_grep_lines, render_grep_lines, GrepLine,
+};
 use grep_searcher::SinkError;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read};
@@ -43,7 +46,7 @@ pub struct SearchPayload {
 pub fn render_tree_grep(
     files: &[(String, Vec<u8>)],
     payload: &GrepPayload,
-) -> Result<String, String> {
+) -> Result<GrepWindow, String> {
     let output_mode = payload
         .output_mode
         .as_deref()
@@ -100,19 +103,15 @@ pub fn render_tree_grep(
             &mut collected,
         )?;
     }
-    let (before, after) = grep_context_window(payload);
-
-    Ok(finalize_grep_output(
-        render_grep_lines(
-            collected,
-            output_mode,
-            show_line_numbers,
-            false,
-            before > 0 || after > 0,
-        ),
+    Ok(window_grep_lines(
+        collected,
         &payload.pattern,
+        output_mode,
+        show_line_numbers,
+        false,
         payload.offset.unwrap_or(0) as usize,
         payload.head_limit,
+        grep_context_window(payload),
     ))
 }
 
@@ -456,14 +455,14 @@ pub(crate) fn glob_no_matches_body(pattern: &str, location: impl std::fmt::Displ
     format!("No files matched pattern '{pattern}' in {location}")
 }
 
-/// Handle grep tool call — in-process ripgrep search over the host filesystem.
+/// Grep a filesystem tree — in-process ripgrep over the host filesystem.
 ///
 /// `Err` is a failed search (unusable payload/pattern/mode, a timeout, a worker
 /// failure), never a body — see [`render_tree_grep`].
 pub(crate) async fn handle_grep(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
-) -> Result<String, String> {
+) -> Result<GrepWindow, String> {
     let payload: GrepPayload = super::parse_payload(request)?;
 
     let search_path = resolve_search_dir(&request.cwd, payload.path.as_deref());
@@ -497,24 +496,33 @@ pub(crate) async fn handle_grep(
     let offset = payload.offset.unwrap_or(0) as usize;
     let head_limit = payload.head_limit;
     let pattern = payload.pattern.clone();
+    let context = grep_context_window(&payload);
     let deny_read = orch.sandbox_deny_read();
 
+    let walk_mode = output_mode.clone();
+    // Collect structurally and window before rendering: the cap counts matches,
+    // and only `GrepLine::is_match` can tell a match from its context once line
+    // numbers are off.
     let result = tokio::time::timeout(
         GREP_TIMEOUT,
         tokio::task::spawn_blocking(move || {
-            grep_search(
-                payload,
-                &search_path,
-                &output_mode,
-                show_line_numbers,
-                deny_read,
-            )
+            let limits = GrepWalkLimits::for_payload(&payload);
+            grep_collect_tree(payload, &search_path, &walk_mode, deny_read, limits)
         }),
     )
     .await;
 
     match result {
-        Ok(Ok(Ok(output))) => Ok(finalize_grep_output(output, &pattern, offset, head_limit)),
+        Ok(Ok(Ok(collected))) => Ok(window_grep_lines(
+            collected,
+            &pattern,
+            &output_mode,
+            show_line_numbers,
+            false,
+            offset,
+            head_limit,
+            context,
+        )),
         Ok(Ok(Err(e))) => Err(e),
         Ok(Err(e)) => Err(format!("grep task failed: {}", e)),
         Err(_) => Err(format!("grep timed out after {:?}", GREP_TIMEOUT)),
@@ -794,34 +802,224 @@ pub(crate) fn grep_no_matches_body(pattern: &str) -> String {
     format!("No matches found for pattern '{}'", pattern)
 }
 
-/// Apply the post-search finalization shared by the directory grep and the
-/// single-file bytes renderer: the empty-result message, then the
-/// `offset`/`head_limit` match-window slice.
-fn finalize_grep_output(
-    output: String,
+/// A rendered grep body together with the counts of the COMPLETE result.
+///
+/// The counts are taken before the `offset`/`head_limit` window is applied.
+/// Counting the printed body instead answers "how many did I print", while
+/// every caller of an enumeration is asking "how many are there" — and a
+/// truncated enumeration that reports its own size is indistinguishable from a
+/// complete one, which is how a windowed grep talked a planner into a signature
+/// change that missed three call sites.
+///
+/// [`Self::shown`] is the window's confession: `Some(n)` means the body carries
+/// only `n` of [`Self::total_units`] results, and no reader may treat it as the
+/// whole set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepWindow {
+    pub body: String,
+    /// Matches in the complete result. `None` under `files_with_matches`, whose
+    /// body carries no match dimension at all.
+    pub match_count: Option<usize>,
+    /// Files in the complete result.
+    pub file_count: usize,
+    /// Results rendered when the window elided some, counted in
+    /// [`Self::unit_noun`]'s unit. `None` when the body is the whole result.
+    pub shown: Option<usize>,
+    /// The unit `head_limit` counts in this output mode.
+    pub unit_noun: &'static str,
+    /// Results in the complete set, in the window's own unit.
+    pub total_units: usize,
+}
+
+impl GrepWindow {
+    /// Write these counts onto a grep segment's metadata, so the header suffix
+    /// and the continue footer describe the complete result and say plainly how
+    /// much of it the body carries.
+    ///
+    /// `file_dimension` is whether this target has a file count worth reporting:
+    /// a grep over one named file (or one materialized body) does not — the
+    /// caller already named it.
+    pub(crate) fn write_meta(&self, meta: &mut SegmentMeta, file_dimension: bool) {
+        meta.match_count = self.match_count;
+        meta.file_count = file_dimension.then_some(self.file_count);
+        meta.total_units = Some(self.total_units);
+        meta.unit_noun = Some(self.unit_noun.to_string());
+        meta.grep_shown = self.shown;
+    }
+}
+
+/// The unit a `head_limit` window counts in each output mode: a `content` body
+/// is match lines plus their context, while a `files_with_matches` or `count`
+/// body is exactly one row per file.
+fn grep_window_unit(output_mode: &str) -> &'static str {
+    match output_mode {
+        "content" => "matches",
+        _ => "files",
+    }
+}
+
+/// Window collected grep lines and render them: the empty-result message, the
+/// counts of the WHOLE result, and the `offset`/`head_limit` window — the one
+/// finalization every grep entry point shares.
+///
+/// The window counts MATCHES, not rendered lines. Under `-C=3` one match costs
+/// four or more lines plus a separator, so a line-based cap stopped an
+/// enumeration at roughly an eighth of the limit the caller asked for while the
+/// header reported the fragment as the total. Under
+/// `files_with_matches`/`count`, whose bodies carry one row per file, the unit
+/// is the file.
+///
+/// Selection happens on the structured lines, before rendering, because the
+/// rendered text cannot be classified: with `-n=false` a content row is bare
+/// text with no `path:N:` prefix, so nothing in the bytes distinguishes a match
+/// from its context. `is_match` is the ground truth and is always available
+/// here.
+fn window_grep_lines(
+    mut lines: Vec<GrepLine>,
     pattern: &str,
+    output_mode: &str,
+    show_line_numbers: bool,
+    native_output: bool,
     offset: usize,
     head_limit: Option<u32>,
-) -> String {
-    if output.is_empty() {
-        return grep_no_matches_body(pattern);
-    }
+    context: (usize, usize),
+) -> GrepWindow {
+    let unit_noun = grep_window_unit(output_mode);
+    let content = output_mode == "content";
+    let (before, after) = context;
 
-    let lines: Vec<&str> = output.lines().collect();
-    let sliced = if offset >= lines.len() {
-        Vec::new()
+    // Select over the order and deduplication the reader will see.
+    order_grep_lines(&mut lines);
+
+    // Counted over the whole result, before any window: this is the answer to
+    // "how many are there", which is the entire value of an enumeration.
+    let match_count = lines.iter().filter(|line| line.is_match).count();
+    let matched_paths: Vec<&str> = {
+        let mut paths: Vec<&str> = lines
+            .iter()
+            .filter(|line| line.is_match && !line.path.is_empty())
+            .map(|line| line.path.as_str())
+            .collect();
+        paths.dedup();
+        paths
+    };
+    let file_count = matched_paths.len();
+    let total_units = if content { match_count } else { file_count };
+    // A `files_with_matches` body carries no match dimension at all; its honest
+    // count is the file count.
+    let match_count = (output_mode != "files_with_matches").then_some(match_count);
+
+    let kept = select_grep_window(lines, content, offset, head_limit, before, after);
+    let shown = if content {
+        kept.iter().filter(|line| line.is_match).count()
     } else {
-        match head_limit {
-            Some(limit) => lines[offset..]
-                .iter()
-                .take(limit as usize)
-                .copied()
-                .collect(),
-            None => lines[offset..].to_vec(),
-        }
+        let mut paths: Vec<&str> = kept
+            .iter()
+            .filter(|line| line.is_match)
+            .map(|line| line.path.as_str())
+            .collect();
+        paths.dedup();
+        paths.len()
     };
 
-    sliced.join("\n")
+    let body = render_grep_lines(
+        kept,
+        output_mode,
+        show_line_numbers,
+        native_output,
+        before > 0 || after > 0,
+    );
+    let body = if body.is_empty() {
+        grep_no_matches_body(pattern)
+    } else {
+        body
+    };
+
+    GrepWindow {
+        body,
+        match_count,
+        file_count,
+        // Anything elided — by the cap or by an offset that skipped past
+        // results — makes this body a sample rather than the set.
+        shown: (shown < total_units).then_some(shown),
+        unit_noun,
+        total_units,
+    }
+}
+
+/// Keep the lines inside the `[offset, offset + head_limit)` window, counted in
+/// whole units.
+///
+/// In `content` mode a unit is one match together with the context lines that
+/// render with it, so the result reads as if only the selected matches had
+/// matched. A line that falls inside a selected match's context window is kept
+/// whatever it is: dropping a matched line from the middle of a context run
+/// would leave a hole the reader cannot see, and rendering it as context would
+/// misdescribe it. This mirrors ripgrep's own `-m N`, where a match inside the
+/// capped match's window still prints as a match (see [`GrepCap`]).
+///
+/// In the row modes a unit is a file, so the window keeps whole files.
+fn select_grep_window(
+    lines: Vec<GrepLine>,
+    content: bool,
+    offset: usize,
+    head_limit: Option<u32>,
+    before: usize,
+    after: usize,
+) -> Vec<GrepLine> {
+    let limit = head_limit.map(|limit| limit as usize);
+    let take = |total: usize| -> std::ops::Range<usize> {
+        let start = offset.min(total);
+        let end = limit.map_or(total, |limit| (start + limit).min(total));
+        start..end
+    };
+
+    if !content {
+        let mut paths: Vec<&str> = lines
+            .iter()
+            .filter(|line| line.is_match)
+            .map(|line| line.path.as_str())
+            .collect();
+        paths.dedup();
+        let kept: std::collections::HashSet<&str> =
+            paths[take(paths.len())].iter().copied().collect();
+        let kept: std::collections::HashSet<String> =
+            kept.into_iter().map(ToOwned::to_owned).collect();
+        return lines
+            .into_iter()
+            .filter(|line| kept.contains(&line.path))
+            .collect();
+    }
+
+    // The selected matches, and the line span each one's context covers.
+    let selected: Vec<(String, u64)> = {
+        let matches: Vec<(String, u64)> = lines
+            .iter()
+            .filter(|line| line.is_match)
+            .map(|line| (line.path.clone(), line.line_number))
+            .collect();
+        let window = take(matches.len());
+        matches[window].to_vec()
+    };
+    let mut spans: std::collections::HashMap<&str, Vec<u64>> = std::collections::HashMap::new();
+    for (path, line_number) in &selected {
+        spans.entry(path.as_str()).or_default().push(*line_number);
+    }
+
+    lines
+        .iter()
+        .filter(|line| {
+            spans.get(line.path.as_str()).is_some_and(|matched| {
+                // Ascending by construction: any selected match whose context
+                // window covers this line keeps it.
+                let low = line.line_number.saturating_sub(after as u64);
+                let high = line.line_number.saturating_add(before as u64);
+                let start = matched.partition_point(|number| *number < low);
+                matched.get(start).is_some_and(|number| *number <= high)
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Render a grep over a single file's bytes, reproducing the live single-file
@@ -837,7 +1035,7 @@ pub(crate) fn render_single_file_grep(
     bytes: &[u8],
     label: &str,
     payload: &GrepPayload,
-) -> Result<String, String> {
+) -> Result<GrepWindow, String> {
     let output_mode = payload.output_mode.as_deref().unwrap_or("content");
     if !matches!(output_mode, "files_with_matches" | "count" | "content") {
         return Err(format!(
@@ -864,18 +1062,15 @@ pub(crate) fn render_single_file_grep(
         &mut collected,
     )?;
 
-    let (before, after) = grep_context_window(payload);
-    Ok(finalize_grep_output(
-        render_grep_lines(
-            collected,
-            output_mode,
-            show_line_numbers,
-            false,
-            before > 0 || after > 0,
-        ),
+    Ok(window_grep_lines(
+        collected,
         &payload.pattern,
+        output_mode,
+        show_line_numbers,
+        false,
         offset,
         head_limit,
+        grep_context_window(payload),
     ))
 }
 
@@ -972,7 +1167,7 @@ pub(crate) fn body_grep_payload(
         );
     }
     if grep_query_value(params, "offset").is_some() {
-        return Err("'offset' is a line-window and does not combine with 'grep'; use 'head_limit' or 'limit' to cap the number of matches".to_string());
+        return Err("'offset' is a line-window and does not combine with 'grep'; use 'head_limit' or 'limit' to cap the number of matches (the cap counts matches, and a capped read says how many it elided)".to_string());
     }
     if !allow_glob && grep_query_value(params, "glob").is_some() {
         return Err("'glob' selects files within a tree and does not apply to a single rendered body; grep filters the produced text directly".to_string());
@@ -1013,17 +1208,15 @@ pub(crate) fn body_grep_payload(
     Ok(Some(payload))
 }
 
-/// Run the universal post-render grep over an already-materialized body: grep
-/// the produced text with the same matcher/searcher/finalizer the single-file
-/// path uses (path-less output), then count real matches. Returns the rendered
-/// grep body and its match count.
+/// Run the universal post-render grep over an already-materialized body (a
+/// rendered resource, web markdown, artifact, or transcript): grep the produced
+/// text through the same matcher, searcher, and window the single-file path
+/// uses, with path-less output. The window's counts are the body's own.
 pub(crate) fn grep_materialized_body(
     body: &str,
     payload: &GrepPayload,
-) -> Result<(String, usize), String> {
-    let rendered = render_single_file_grep(body.as_bytes(), "", payload)?;
-    let (matches, _files) = crate::mcp::handlers::read::grep_counts(&rendered);
-    Ok((rendered, matches))
+) -> Result<GrepWindow, String> {
+    render_single_file_grep(body.as_bytes(), "", payload)
 }
 
 /// Engine-level bounds for one filesystem grep walk that the agent-facing
@@ -1213,6 +1406,29 @@ fn grep_search_with_format(
     native_output: bool,
     limits: GrepWalkLimits,
 ) -> Result<String, String> {
+    let (before, after) = grep_context_window(&payload);
+    let collected = grep_collect_tree(payload, search_path, output_mode, deny_read, limits)?;
+    Ok(render_grep_lines(
+        collected,
+        output_mode,
+        show_line_numbers,
+        native_output,
+        before > 0 || after > 0,
+    ))
+}
+
+/// Walk a filesystem tree and collect its grep hits as structured lines.
+///
+/// Collection and rendering are separate so a caller can window the lines
+/// before they become bytes — a `head_limit` that caps matches has to select on
+/// `is_match`, which only exists here.
+fn grep_collect_tree(
+    payload: GrepPayload,
+    search_path: &Path,
+    output_mode: &str,
+    deny_read: Vec<PathBuf>,
+    limits: GrepWalkLimits,
+) -> Result<Vec<GrepLine>, String> {
     use ignore::WalkBuilder;
 
     let matcher = build_grep_matcher(&payload)?;
@@ -1242,7 +1458,7 @@ fn grep_search_with_format(
     }
 
     let mut searcher = build_grep_searcher(&payload);
-    let (before, after) = grep_context_window(&payload);
+    let (_, after) = grep_context_window(&payload);
     let cap = GrepCap::new(limits.max_per_file, after);
 
     let base_path = if is_file {
@@ -1304,13 +1520,7 @@ fn grep_search_with_format(
         }
     }
 
-    Ok(render_grep_lines(
-        collected,
-        output_mode,
-        show_line_numbers,
-        native_output,
-        before > 0 || after > 0,
-    ))
+    Ok(collected)
 }
 
 #[cfg(test)]
@@ -1544,8 +1754,9 @@ mod tests {
         .unwrap();
         assert_eq!(native, "a.txt-1-before\na.txt:2:match\na.txt-3-after");
 
+        // The read surface renders the same walk in heading form instead.
         let cairn = grep_search(payload, dir.path(), "content", true, Vec::new()).unwrap();
-        assert_eq!(cairn, "a.txt:1-before\na.txt:2:match\na.txt:3-after");
+        assert_eq!(cairn, "a.txt\n1-before\n2:match\n3-after");
     }
 
     #[test]
@@ -1584,7 +1795,8 @@ mod tests {
     #[test]
     fn grep_search_emits_context_lines() {
         // Locks in the context-line feature reachable via `?grep=foo&-C=N`: the
-        // matched line uses a `:` separator, surrounding context lines use `-`.
+        // matched row uses a `:` separator, surrounding context rows use `-`,
+        // and the path is carried once by the heading above them.
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ctx.txt");
         std::fs::write(&file, "alpha\nbeta\nNEEDLE\ngamma\ndelta\n").unwrap();
@@ -1607,16 +1819,8 @@ mod tests {
         };
 
         let output = grep_search(payload, &file, "content", true, Vec::new()).unwrap();
-        // Match line, plus one context line on each side, in the expected format.
-        assert!(output.contains("ctx.txt:3:NEEDLE"), "match line: {output}");
-        assert!(
-            output.contains("ctx.txt:2-beta"),
-            "before-context: {output}"
-        );
-        assert!(
-            output.contains("ctx.txt:4-gamma"),
-            "after-context: {output}"
-        );
+        // Match row, plus one context row on each side, in the expected format.
+        assert_eq!(output, "ctx.txt\n2-beta\n3:NEEDLE\n4-gamma");
         // Out-of-window lines are not surfaced with a single line of context.
         assert!(!output.contains("alpha"), "alpha outside context: {output}");
         assert!(!output.contains("delta"), "delta outside context: {output}");
@@ -1682,8 +1886,11 @@ mod tests {
         let payload = body_grep_payload(&[qp("grep", "needle")], false)
             .unwrap()
             .unwrap();
-        let (rendered, matches) = grep_materialized_body(body, &payload).unwrap();
-        assert_eq!(matches, 2);
+        let window = grep_materialized_body(body, &payload).unwrap();
+        let rendered = window.body;
+        assert_eq!(window.match_count, Some(2));
+        // A complete result confesses nothing, because nothing was elided.
+        assert_eq!(window.shown, None);
         // Path-less, line-number-prefixed match lines.
         assert!(rendered.contains("2:needle one"), "{rendered}");
         assert!(rendered.contains("4:needle two"), "{rendered}");
@@ -1693,9 +1900,9 @@ mod tests {
         let payload = body_grep_payload(&[qp("grep", "zzz")], false)
             .unwrap()
             .unwrap();
-        let (rendered, matches) = grep_materialized_body(body, &payload).unwrap();
-        assert_eq!(matches, 0);
-        assert_eq!(rendered, "No matches found for pattern 'zzz'");
+        let window = grep_materialized_body(body, &payload).unwrap();
+        assert_eq!(window.match_count, Some(0));
+        assert_eq!(window.body, "No matches found for pattern 'zzz'");
 
         // An unusable pattern is a failed search, not a body: it must never
         // reach a caller as text that a header would then count.
@@ -1760,15 +1967,7 @@ mod tests {
         };
 
         let output = grep_search(payload, dir.path(), mode, true, Vec::new()).unwrap();
-        assert!(output.contains("ctx.txt:3:NEEDLE"), "match line: {output}");
-        assert!(
-            output.contains("ctx.txt:2-beta"),
-            "before-context: {output}"
-        );
-        assert!(
-            output.contains("ctx.txt:4-gamma"),
-            "after-context: {output}"
-        );
+        assert_eq!(output, "ctx.txt\n2-beta\n3:NEEDLE\n4-gamma");
     }
 
     fn grep_payload(pattern: &str) -> GrepPayload {
@@ -1798,7 +1997,7 @@ mod tests {
         content: &str,
         label: &str,
         payload: &GrepPayload,
-    ) -> Result<String, String> {
+    ) -> Result<GrepWindow, String> {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join(label);
         std::fs::write(&file, content).unwrap();
@@ -1815,12 +2014,17 @@ mod tests {
         .to_string();
         let show = payload.line_numbers.unwrap_or(true);
         let offset = payload.offset.unwrap_or(0) as usize;
-        let raw = grep_search(payload.clone(), &file, &mode, show, Vec::new())?;
-        Ok(finalize_grep_output(
-            raw,
+        let limits = GrepWalkLimits::for_payload(payload);
+        let collected = grep_collect_tree(payload.clone(), &file, &mode, Vec::new(), limits)?;
+        Ok(window_grep_lines(
+            collected,
             &payload.pattern,
+            &mode,
+            show,
+            false,
             offset,
             payload.head_limit,
+            grep_context_window(payload),
         ))
     }
 
@@ -1830,8 +2034,12 @@ mod tests {
         assert_eq!(actual, expected, "payload: {payload:?}");
     }
 
+    /// `head_limit = 3` over a fixture with two matches: the cap counts
+    /// MATCHES, so both matches and all their context render and nothing is
+    /// reported as elided. Under the old line-based cap the same read kept three
+    /// rendered lines and dropped the second match entirely.
     #[test]
-    fn render_tree_grep_preserves_context_glob_binary_and_slicing() {
+    fn render_tree_grep_preserves_context_glob_binary_and_match_window() {
         let files = vec![
             (
                 "src/a.rs".to_string(),
@@ -1845,12 +2053,120 @@ mod tests {
         payload.context_alias = Some(1);
         payload.glob = Some("*.rs".to_string());
         payload.head_limit = Some(3);
-        let output = render_tree_grep(&files, &payload).unwrap();
-        assert!(output.contains("src/a.rs:3:NEEDLE"), "{output}");
-        assert!(output.contains("src/a.rs:2-context"), "{output}");
-        assert!(output.contains("src/a.rs:4-after"), "{output}");
+        let window = render_tree_grep(&files, &payload).unwrap();
+        let output = &window.body;
+        assert_eq!(
+            output, "src/a.rs\n2-context\n3:NEEDLE\n4-after\n5:NEEDLE again",
+            "{output}"
+        );
         assert!(!output.contains("skip.txt"), "{output}");
         assert!(!output.contains("binary.rs"), "{output}");
+        assert_eq!(window.match_count, Some(2));
+        assert_eq!(window.total_units, 2);
+        assert_eq!(window.shown, None, "nothing was elided: {output}");
+    }
+
+    /// The reported defect. With `-C=3` one match costs at least four rendered
+    /// lines, so a line-counting cap stopped an enumeration far short of the
+    /// limit the caller asked for — and reported the fragment's size as the
+    /// answer, which is how a planner concluded there were four call sites when
+    /// there were six.
+    ///
+    /// Break either half and this fails: slice by line and the third match
+    /// vanishes; count the printed body and `match_count` drops to 3.
+    #[test]
+    fn head_limit_counts_matches_not_rendered_lines() {
+        // Six matches, each carrying six context lines under -C=3.
+        let mut source = String::new();
+        for index in 0..6 {
+            source.push_str(&format!(
+                "pad {i}a\npad {i}b\npad {i}c\nNEEDLE {i}\npad {i}d\npad {i}e\npad {i}f\n",
+                i = index
+            ));
+        }
+        let files = vec![("src/wide.rs".to_string(), source.into_bytes())];
+
+        let mut payload = grep_payload("NEEDLE");
+        payload.output_mode = Some("content".to_string());
+        payload.context_alias = Some(3);
+        payload.head_limit = Some(3);
+        let window = render_tree_grep(&files, &payload).unwrap();
+        let body = &window.body;
+
+        // Exactly three matches, each with its context — not three lines.
+        for index in 0..3 {
+            assert!(body.contains(&format!("NEEDLE {index}")), "{body}");
+        }
+        for index in 3..6 {
+            assert!(!body.contains(&format!("NEEDLE {index}")), "{body}");
+        }
+        assert!(body.contains("pad 0a"), "before-context: {body}");
+        assert!(body.contains("pad 2f"), "after-context: {body}");
+        assert!(!body.contains("pad 3"), "next match's group: {body}");
+
+        // The counts answer "how many are there", and the window says plainly
+        // how much of that the body carries.
+        assert_eq!(window.match_count, Some(6));
+        assert_eq!(window.file_count, 1);
+        assert_eq!(window.total_units, 6);
+        assert_eq!(window.unit_noun, "matches");
+        assert_eq!(window.shown, Some(3));
+    }
+
+    /// A complete read and a capped one must not look alike. The only difference
+    /// between these two calls is the cap, and it has to be visible.
+    #[test]
+    fn a_capped_grep_is_distinguishable_from_a_complete_one() {
+        let files = vec![(
+            "src/a.rs".to_string(),
+            b"NEEDLE one\nNEEDLE two\nNEEDLE three\n".to_vec(),
+        )];
+        let mut payload = grep_payload("NEEDLE");
+        payload.output_mode = Some("content".to_string());
+
+        let complete = render_tree_grep(&files, &payload).unwrap();
+        assert_eq!(complete.match_count, Some(3));
+        assert_eq!(complete.shown, None);
+
+        payload.head_limit = Some(2);
+        let capped = render_tree_grep(&files, &payload).unwrap();
+        assert_eq!(capped.match_count, Some(3), "the total is still the total");
+        assert_eq!(capped.shown, Some(2));
+        assert_ne!(capped.body, complete.body);
+
+        // A cap at or above the total elides nothing and says so.
+        payload.head_limit = Some(3);
+        let exact = render_tree_grep(&files, &payload).unwrap();
+        assert_eq!(exact.shown, None);
+        assert_eq!(exact.body, complete.body);
+    }
+
+    /// In `files_with_matches` and `count` a rendered row IS one file, so the
+    /// window's unit is the file and the totals still describe the whole result.
+    #[test]
+    fn head_limit_windows_row_modes_by_file() {
+        let files = vec![
+            ("src/a.rs".to_string(), b"NEEDLE\nNEEDLE\n".to_vec()),
+            ("src/b.rs".to_string(), b"NEEDLE\n".to_vec()),
+            ("src/c.rs".to_string(), b"NEEDLE\n".to_vec()),
+        ];
+        let mut payload = grep_payload("NEEDLE");
+        payload.output_mode = Some("files_with_matches".to_string());
+        payload.head_limit = Some(2);
+        let window = render_tree_grep(&files, &payload).unwrap();
+        assert_eq!(window.body.lines().count(), 2);
+        assert_eq!(window.match_count, None);
+        assert_eq!(window.file_count, 3);
+        assert_eq!(window.unit_noun, "files");
+        assert_eq!(window.shown, Some(2));
+
+        payload.output_mode = Some("count".to_string());
+        let window = render_tree_grep(&files, &payload).unwrap();
+        assert_eq!(window.body.lines().count(), 2);
+        // Four matches across three files exist, whatever two rows we printed.
+        assert_eq!(window.match_count, Some(4));
+        assert_eq!(window.file_count, 3);
+        assert_eq!(window.shown, Some(2));
     }
 
     #[test]
@@ -2078,7 +2394,9 @@ mod tests {
     fn render_single_file_grep_no_matches_reports_no_matches() {
         let payload = grep_payload("absent");
         let rendered = render_single_file_grep(b"alpha\nbeta\n", "f.txt", &payload).unwrap();
-        assert_eq!(rendered, "No matches found for pattern 'absent'");
+        assert_eq!(rendered.body, "No matches found for pattern 'absent'");
+        // An absence is complete: there is nothing elided to confess.
+        assert_eq!(rendered.shown, None);
         assert_eq!(
             rendered,
             fs_single_file_grep("alpha\nbeta\n", "f.txt", &payload).unwrap()

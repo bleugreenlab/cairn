@@ -38,11 +38,7 @@ pub(crate) fn openrouter_api_key(orch: &Orchestrator) -> Option<String> {
         store
             .accounts_for_provider(ApiProvider::OpenRouter, None)
             .into_iter()
-            .find(|account| {
-                account
-                    .compatible_backends()
-                    .contains(&OPENROUTER_BACKEND_KEY)
-            })
+            .find(|account| account.serves_backend(OPENROUTER_BACKEND_KEY))
             .and_then(|account| match &account.auth {
                 ProviderAuth::ApiKey { value } => Some(value.clone()),
                 _ => None,
@@ -109,8 +105,8 @@ impl AgentBackend for OpenRouterBackend {
         }
         http::apply_output_schema(&mut body, request.output_schema.as_ref());
         let endpoint = Endpoint {
-            provider_name: OPENROUTER_BACKEND_NAME,
-            backend_key: OPENROUTER_BACKEND_KEY,
+            provider_name: OPENROUTER_BACKEND_NAME.to_string(),
+            backend_key: OPENROUTER_BACKEND_KEY.to_string(),
             chat_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
             headers: http::openrouter_headers(&api_key).map_err(CompletionError::InvalidRequest)?,
             extra_body: None,

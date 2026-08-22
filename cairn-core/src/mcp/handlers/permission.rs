@@ -30,6 +30,14 @@ use super::{emit_attention, AttentionEvent};
 /// and is answerable whenever via the UI or the `permissions` resource.
 const INLINE_PERMISSION_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
 
+/// The two refusals below are terminal until an operator acts, so they are
+/// minted in the vocabulary the ask ledger's retry machinery reads
+/// ([`crate::channels::ledger::OPERATOR_PENDING_REFUSAL`]). A refusal that says
+/// what kind of failure it is spares every caller from deciding by re-reading
+/// prose — which is how a sweep came to retry a settled decision forever
+/// (CAIRN-4364).
+use crate::channels::ledger::OPERATOR_PENDING_REFUSAL;
+
 /// Outcome of [`await_permission_decision`].
 pub(crate) enum PermissionWait {
     /// Answered within the inline budget; carries the response JSON verbatim
@@ -1423,10 +1431,10 @@ async fn resolve_permission_request_impl(
         if matches!(decision, PermissionDecision::Allow) && answer.operator_approval().is_none() {
             journal_permission_authority_refusal(orch, &record, detail, &answer).await;
             return Err(format!(
-                "Refused: allowing this request mints a workspace authority grant, which only an \
-                 authenticated operator can do. This answer came from '{}', which may deny or \
-                 cancel the request but cannot approve it. The request is still pending for the \
-                 operator (scope: {}).",
+                "{OPERATOR_PENDING_REFUSAL} allowing this request mints a workspace authority \
+                 grant, which only an authenticated operator can do. This answer came from '{}', \
+                 which may deny or cancel the request but cannot approve it. The request is still \
+                 pending for the operator (scope: {}).",
                 answer.issuer(),
                 detail.scope_shorthand(),
             ));
@@ -1451,8 +1459,9 @@ async fn resolve_permission_request_impl(
             && answer.operator_approval().is_none()
         {
             return Err(format!(
-                "Refused: this prompt names no host path to widen -- either the sandbox blocked a \
-                 command without reporting which path it touched, or the prompt was recorded by a \
+                "{OPERATOR_PENDING_REFUSAL} this prompt names no host path to widen -- either the \
+                 sandbox blocked a command without reporting which path it touched, or the \
+                 prompt was recorded by a \
                  build whose crossing kind ('{}') this one does not recognize. Either way the only \
                  way to let it proceed is to re-run the command with no sandbox at all, which is \
                  an escape rather than one crossing, and only an operator can approve that. This \
@@ -1551,8 +1560,19 @@ async fn resolve_permission_request_impl(
                 .await?;
                 Ok(outcome)
             }
+            // The ledger decides whether this is worth attempting again. A
+            // recovered winner may be an answer that is not allowed to approve
+            // this prompt, and leaving that on the gate is what blocks the
+            // operator whose approval it is waiting for; parking withdraws it,
+            // so the caller who just hit this refusal can answer it themselves.
             Err(error) => {
-                crate::channels::ledger::release_ask_action(&owning_db, &lease, &error).await?;
+                crate::channels::ledger::record_ask_action_failure(
+                    &owning_db,
+                    &lease,
+                    &error,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
                 Err(error)
             }
         };
@@ -1785,7 +1805,7 @@ async fn lookup_permission_request_for_node(
                         params![project_key.as_str()],
                     )
                     .await?;
-                let project_id = project_rows
+                let _project_id = project_rows
                     .next()
                     .await?
                     .map(|row| row.text(0))
@@ -1799,6 +1819,18 @@ async fn lookup_permission_request_for_node(
                     )));
                 }
 
+                let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
+                    conn,
+                    &project_key,
+                    number,
+                    exec_seq,
+                    &node_segment,
+                    None,
+                )
+                .await?
+                .ok_or_else(|| DbError::Row(format!(
+                    "node {project_key}/{number}/{exec_seq}/{node_segment} not found"
+                )))?;
                 let mut rows = conn
                     .query(
                         "
@@ -1806,20 +1838,12 @@ async fn lookup_permission_request_for_node(
                         FROM permission_requests pr
                         JOIN runs r ON pr.run_id = r.id
                         JOIN jobs j ON COALESCE(pr.job_id, r.job_id) = j.id
-                        JOIN executions e ON j.execution_id = e.id
-                        JOIN issues i ON j.issue_id = i.id
-                        WHERE i.project_id = ?1
-                          AND i.number = ?2
-                          AND e.seq = ?3
-                          AND j.uri_segment = ?4
-                          AND pr.uri_segment = ?5
+                        WHERE j.id = ?1
+                          AND pr.uri_segment = ?2
                         LIMIT 1
                         ",
                         params![
-                            project_id.as_str(),
-                            number as i64,
-                            exec_seq as i64,
-                            node_segment.as_str(),
+                            job_id.as_str(),
                             perm_segment.as_str()
                         ],
                     )
@@ -2554,24 +2578,6 @@ pub(super) async fn emit_successor_turn_events(
     }
 }
 
-pub(super) async fn get_issue_title(db: &LocalDb, issue_id: &str) -> Option<String> {
-    let issue_id = issue_id.to_string();
-    db.read(|conn| {
-        Box::pin(async move {
-            let mut rows = conn
-                .query(
-                    "SELECT title FROM issues WHERE id = ?1 LIMIT 1",
-                    params![issue_id.as_str()],
-                )
-                .await?;
-            crate::storage::next_text(&mut rows, 0).await
-        })
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
 pub(super) async fn issue_id_for_run(db: &LocalDb, run_id: &str) -> DbResult<Option<String>> {
     let run_id = run_id.to_string();
     db.read(|conn| Box::pin(async move { issue_id_for_run_conn(conn, &run_id).await }))
@@ -3150,7 +3156,13 @@ mod tests {
     async fn migrated_telegram_winner_is_executed_by_a_desktop_retry() {
         let root = tempfile::tempdir().unwrap().keep();
         let local = LocalDb::open(root.join("test.db")).await.unwrap();
-        const CANONICALIZE_CHANNEL_ANSWERS: &str = "0190_canonicalize_channel_permission_answers";
+        // A migration's identity is its file stem, `0190_canonicalize_channel_permission_answers`,
+        // and the two surfaces below speak different halves of it: `Migration::name()` reports the
+        // name after the version, while `MigrationRunner::run` reports what it applied by the whole
+        // stem.
+        const CANONICALIZE_CHANNEL_ANSWERS: &str = "canonicalize_channel_permission_answers";
+        const CANONICALIZE_CHANNEL_ANSWERS_STEM: &str =
+            "0190_canonicalize_channel_permission_answers";
         let cut = TURSO_MIGRATIONS
             .iter()
             .position(|migration| migration.name() == CANONICALIZE_CHANNEL_ANSWERS)
@@ -3184,7 +3196,7 @@ mod tests {
                 .run(&orch.db.local)
                 .await
                 .unwrap(),
-            vec![CANONICALIZE_CHANNEL_ANSWERS.to_string()]
+            vec![CANONICALIZE_CHANNEL_ANSWERS_STEM.to_string()]
         );
         assert_eq!(
             crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")
@@ -3194,6 +3206,14 @@ mod tests {
                 .answer,
             "allow"
         );
+
+        // The canonicalization has been witnessed against the schema it shipped
+        // for; what follows is the CURRENT runtime, which reads columns later
+        // migrations added, so bring the schema the rest of the way forward.
+        MigrationRunner::new(TURSO_MIGRATIONS[cut + 1..].to_vec())
+            .run(&orch.db.local)
+            .await
+            .unwrap();
 
         resolve_permission_request(
             &orch,
@@ -3470,6 +3490,106 @@ mod tests {
                 "a refused escape must not leave a session grant behind"
             );
         }
+    }
+
+    /// "The request is still pending for the operator" has to be true of the
+    /// GATE, not just of the row.
+    ///
+    /// A channel reply claims the first-answer-wins resolution before anything
+    /// asks whether that surface may make this decision. So an answer the domain
+    /// then refuses used to keep winning the gate forever: the operator's own
+    /// approval replayed the stored channel answer, hit the same refusal, and
+    /// never got recorded — while the sweep re-derived that refusal every few
+    /// seconds (CAIRN-4364). Parking withdraws the refused answer, which is what
+    /// makes the operator's approval land.
+    #[tokio::test]
+    async fn an_operator_can_approve_after_a_channel_answer_was_refused() {
+        let orch = test_orchestrator().await;
+        seed_allow_all_permission(&orch).await;
+        store_crossing(
+            &orch,
+            super::super::fence::Crossing::shell_command(
+                "command blocked by the executor sandbox".to_string(),
+                "cat ~/.cairn/operator_auth_secret",
+            ),
+        )
+        .await;
+
+        crate::channels::ledger::claim_ask_resolution(
+            &orch.db.local,
+            "perm-request-1",
+            "allow",
+            AppearanceTransport::ChannelReply,
+            Some("imessage"),
+            Some("imessage:+15551234567"),
+            Some("+15551234567"),
+            "permission",
+            "perm-request-1",
+            10,
+        )
+        .await
+        .unwrap();
+        let winner =
+            crate::channels::ledger::resolution_for_action(&orch.db.local, "perm-request-1")
+                .await
+                .unwrap()
+                .unwrap();
+        let lease = crate::channels::ledger::try_lease_ask_action(
+            &orch.db.local,
+            "perm-request-1",
+            11,
+            100,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let refusal = resolve_permission_request_domain(
+            &orch,
+            "perm-request-1",
+            recovered_permission_answer(PermissionDecision::Allow, &winner).unwrap(),
+        )
+        .await
+        .expect_err("a channel reply cannot approve an unsandboxed escape");
+        assert!(
+            crate::channels::ledger::is_operator_pending_refusal(&refusal),
+            "the refusal has to say it is waiting on a person: {refusal}"
+        );
+        assert_eq!(
+            crate::channels::ledger::record_ask_action_failure(
+                &orch.db.local,
+                &lease,
+                &refusal,
+                12
+            )
+            .await
+            .unwrap(),
+            crate::channels::ledger::AskActionFailure::Parked,
+            "the ledger recognizes this refusal without being told"
+        );
+
+        resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::from_operator(PermissionDecision::Allow, desktop_approval()),
+        )
+        .await
+        .expect("the operator the prompt was waiting for may answer it");
+
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
+        assert_eq!(
+            orch.db
+                .local
+                .query_opt_text(
+                    "SELECT winner_surface FROM channel_ask_resolution WHERE action_ref = 'perm-request-1'",
+                    (),
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("authenticated_desktop"),
+            "the decision that executed is the one the gate records"
+        );
     }
 
     /// The operator can still allow it — through the desktop proxy or an

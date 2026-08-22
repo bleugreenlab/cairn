@@ -191,19 +191,37 @@ async fn upsert_event_vibe_conn(
     Ok(())
 }
 
-pub(crate) async fn issue_id_for_event_async(
+/// Resolve which skyline owner an event belongs to, as `(issue_id, thread_id)`.
+///
+/// Both are read in one query because a vibe emit must scope to exactly one
+/// owner: an issue job carries `issue_id`, a thread's session or spawned task
+/// carries `thread_id`, and reading them separately could describe a job that
+/// never existed. Resolving neither is normal for a run recorded before its job
+/// was attached, and degrades to the broad invalidation roots.
+pub(crate) async fn skyline_scope_for_event_async(
     db: &LocalDb,
     event_id: &str,
-) -> DbResult<Option<String>> {
+) -> DbResult<(Option<String>, Option<String>)> {
     let event_id = event_id.to_string();
-    db.query_opt_text(
-        "SELECT r.issue_id
-         FROM events e
-         INNER JOIN runs r ON r.id = e.run_id
-         WHERE e.id = ?1
-         LIMIT 1",
-        params![event_id.as_str()],
-    )
+    db.read(move |conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT r.issue_id, j.thread_id
+                     FROM events e
+                     INNER JOIN runs r ON r.id = e.run_id
+                     LEFT JOIN jobs j ON j.id = r.job_id
+                     WHERE e.id = ?1
+                     LIMIT 1",
+                    params![event_id.as_str()],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok((row.opt_text(0)?, row.opt_text(1)?)),
+                None => Ok((None, None)),
+            }
+        })
+    })
     .await
 }
 

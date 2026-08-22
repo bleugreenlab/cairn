@@ -392,6 +392,8 @@ mod snapshot_edit_guard_tests {
             model: None,
             resolved_backend: None,
             extras: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 

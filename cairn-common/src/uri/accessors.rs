@@ -74,6 +74,8 @@ impl CairnResource {
             | ProjectSkill { project, .. }
             | NodeMemories { project, .. }
             | NodeMemory { project, .. }
+            | NodeEras { project, .. }
+            | NodeEra { project, .. }
             | ProjectRecipes { project, .. }
             | ProjectRecipe { project, .. }
             | ProjectRoutes { project, .. }
@@ -310,6 +312,8 @@ impl CairnResource {
             | Self::ProjectAction { .. }
             | Self::NodeSymbols { .. }
             | Self::ProjectSymbols { .. }
+            | Self::NodeEras { .. }
+            | Self::NodeEra { .. }
             | Self::Db
             | Self::Dev
             | Self::DevDb
@@ -412,6 +416,8 @@ impl CairnResource {
             | Self::ProjectReference { project, .. }
             | Self::NodeMemories { project, .. }
             | Self::NodeMemory { project, .. }
+            | Self::NodeEras { project, .. }
+            | Self::NodeEra { project, .. }
             | Self::ProjectRecipes { project }
             | Self::ProjectRecipe { project, .. }
             | Self::ProjectWorkflows { project }
@@ -521,6 +527,8 @@ impl CairnResource {
             | Self::NodeRebase { number, .. }
             | Self::NodeMemories { number, .. }
             | Self::NodeMemory { number, .. }
+            | Self::NodeEras { number, .. }
+            | Self::NodeEra { number, .. }
             | Self::NodeSymbols { number, .. } => Some(*number),
             Self::ProjectThreads { .. }
             | Self::Thread { .. }
@@ -638,6 +646,8 @@ impl CairnResource {
             | Self::NodeRebase { node_id, .. }
             | Self::NodeMemories { node_id, .. }
             | Self::NodeMemory { node_id, .. }
+            | Self::NodeEras { node_id, .. }
+            | Self::NodeEra { node_id, .. }
             | Self::NodeSymbols { node_id, .. } => Some(node_id),
             _ => None,
         }

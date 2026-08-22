@@ -94,7 +94,11 @@ pub fn transition_to_warm_state(
             // Flush any directs/side-channel notices queued mid-turn for this
             // run. If this turn was the run's last, no further prompt boundary
             // fires, so without this they would sit unclaimed (CAIRN-1297).
-            crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
+            if let Err(error) =
+                crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id)
+            {
+                log::warn!("turn-end queued delivery flush failed: {error}");
+            }
         }
 
         // CAIRN-1576 routes terminal-tool completion (e.g. a child's `return`)
@@ -635,7 +639,9 @@ fn finalize_run_inner(
         // The run settled via the `return` tool before this process-exit
         // re-entry; still flush any direct queued against it so a parent that
         // finalized that way isn't left unaware of a stuck child (CAIRN-1297).
-        crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
+        if let Err(error) = crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id) {
+            log::warn!("already-finalized queued delivery flush failed: {error}");
+        }
         return first_error.map_or(Ok(()), Err);
     }
 
@@ -697,7 +703,11 @@ fn finalize_run_inner(
             // Run-terminal idle: flush any directs/side-channel notices still
             // pending for this run so a queued child-attention update is not
             // stranded when the run never takes another turn (CAIRN-1297).
-            crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id);
+            if let Err(error) =
+                crate::messages::delivery::flush_pending_directs_on_idle(orch, run_id)
+            {
+                log::warn!("run-terminal queued delivery flush failed: {error}");
+            }
         }
     } else if let Some(ref job_id) = job_id {
         // A node-less ephemeral CALL establishes no DB turn, so `had_active_turn`

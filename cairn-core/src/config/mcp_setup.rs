@@ -7,7 +7,6 @@
 ///
 /// This is the pure function for generating the config content.
 ///
-/// If `available_agents` is provided, adds `--agents <json>`.
 /// If `home_uri` is provided, sets `CAIRN_HOME_URI` in the MCP server env.
 /// If `cairn_home` is provided, sets `CAIRN_HOME` in the MCP server env so the
 /// child resolves the instance's home directory (and its on-disk MCP secret) on
@@ -24,17 +23,12 @@
 fn build_mcp_config_json(
     cairn_cmd_path: &str,
     callback_url: &str,
-    available_agents: Option<&str>,
     home_uri: Option<&str>,
     cairn_env: &str,
     cairn_home: Option<&str>,
     log_level: &str,
 ) -> serde_json::Value {
-    let mut args: Vec<&str> = vec!["mcp"];
-    if let Some(agents_json) = available_agents {
-        args.push("--agents");
-        args.push(agents_json);
-    }
+    let args: Vec<&str> = vec!["mcp"];
     let mut env = serde_json::json!({
         "CAIRN_CALLBACK_URL": callback_url,
         "CAIRN_ENV": cairn_env,
@@ -64,10 +58,10 @@ fn build_mcp_config_json(
 /// Claude CLI's `--mcp-config` accepts the config inline as a string, so each
 /// run passes its own config directly rather than sharing a file on disk.
 /// Sharing a single `mcp-config.json` raced under concurrent session starts:
-/// the run-specific `CAIRN_HOME_URI` and the project-scoped `--agents` payload
-/// were overwritten by the last writer, so parallel agents (e.g. sibling
-/// delegated tasks) all resolved `cairn:~` to the same node. Passing the config
-/// inline removes the shared mutable file entirely.
+/// the run-specific `CAIRN_HOME_URI` was overwritten by the last writer, so
+/// parallel agents (e.g. sibling delegated tasks) all resolved `cairn:~` to the
+/// same node. Passing the config inline removes the shared mutable file
+/// entirely.
 ///
 /// `mcp_binary_path` is the path to the cairn-cmd binary.
 /// `callback_port` is the host HTTP port serving `/api/mcp` (the runner
@@ -75,7 +69,6 @@ fn build_mcp_config_json(
 pub(crate) fn build_mcp_config_string(
     mcp_binary_path: &str,
     callback_port: u16,
-    available_agents: Option<&str>,
     home_uri: Option<&str>,
     cairn_env: &str,
     cairn_home: Option<&str>,
@@ -85,7 +78,6 @@ pub(crate) fn build_mcp_config_string(
     let config = build_mcp_config_json(
         mcp_binary_path,
         &callback_url,
-        available_agents,
         home_uri,
         cairn_env,
         cairn_home,
@@ -103,7 +95,6 @@ mod tests {
         let config = build_mcp_config_json(
             "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3849/api/mcp",
-            None,
             None,
             "prod",
             None,
@@ -140,7 +131,6 @@ mod tests {
             "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3861/api/mcp",
             None,
-            None,
             "dev",
             Some("/Users/me/.cairn-dev-feature-x"),
             "standard",
@@ -158,7 +148,6 @@ mod tests {
         let config = build_mcp_config_json(
             "/usr/bin/cairn-cmd",
             "http://127.0.0.1:3849/api/mcp",
-            None,
             Some("cairn://p/cairn/42/1/builder"),
             "dev",
             None,
@@ -178,7 +167,6 @@ mod tests {
         let a = build_mcp_config_string(
             "/usr/bin/cairn-cmd",
             3849,
-            None,
             Some("cairn://p/cairn/1/1/planner/task/agent-spawn"),
             "prod",
             None,
@@ -187,7 +175,6 @@ mod tests {
         let b = build_mcp_config_string(
             "/usr/bin/cairn-cmd",
             3849,
-            None,
             Some("cairn://p/cairn/1/1/planner/task/planbuild-recipe"),
             "prod",
             None,
@@ -203,22 +190,5 @@ mod tests {
             "cairn://p/cairn/1/1/planner/task/agent-spawn"
         );
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn test_build_mcp_config_json_with_agents() {
-        let config = build_mcp_config_json(
-            "/usr/bin/cairn-cmd",
-            "http://127.0.0.1:3849/api/mcp",
-            Some("[{\"name\":\"Explore\",\"description\":\"x\"}]"),
-            None,
-            "prod",
-            None,
-            "standard",
-        );
-
-        let args = config["mcpServers"]["cairn"]["args"].as_array().unwrap();
-        assert_eq!(args[0], serde_json::json!("mcp"));
-        assert_eq!(args[1], serde_json::json!("--agents"));
     }
 }

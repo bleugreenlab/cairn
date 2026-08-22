@@ -45,6 +45,10 @@ pub(crate) struct ResumeTimingEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_us: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_us: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub run_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<&'a str>,
@@ -68,6 +72,12 @@ pub(crate) struct ResumeTimingEvent<'a> {
     pub parse_failures: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u64>,
 }
 
 pub(crate) fn mark_first(key: String) -> bool {
@@ -114,10 +124,18 @@ mod tests {
     fn event_schema_cannot_carry_sensitive_content() {
         let mut event = ResumeTimingEvent::new("queue_claim_end");
         event.job_id = Some("job-1");
+        event.resume_id = Some("resume-1");
+        event.step_us = Some(3);
         event.count = Some(2);
         event.bytes = Some(17);
+        event.input_tokens = Some(100);
+        event.cache_read_tokens = Some(80);
+        event.cache_creation_tokens = Some(20);
         let value = serde_json::to_value(event).unwrap();
         assert_eq!(value["count"], 2);
+        assert_eq!(value["input_tokens"], 100);
+        assert_eq!(value["cache_read_tokens"], 80);
+        assert_eq!(value["cache_creation_tokens"], 20);
         assert!(value.get("content").is_none());
         assert!(value.get("prompt").is_none());
     }

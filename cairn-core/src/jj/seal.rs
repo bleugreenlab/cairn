@@ -14,6 +14,25 @@ pub fn is_working_copy_dirty(jj: &JjEnv, ws: &Path) -> Result<bool, String> {
         .is_empty())
 }
 
+pub(crate) fn amend_description(read: Result<String, String>) -> (String, Option<String>) {
+    match read {
+        Ok(description) => {
+            let description = description.trim().to_string();
+            if description.is_empty() {
+                ("amend".to_string(), None)
+            } else {
+                (description, None)
+            }
+        }
+        Err(error) => (
+            "amend".to_string(),
+            Some(format!(
+                "the previous description could not be read, so `amend` was used: {error}"
+            )),
+        ),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn sealed_commit_is_lost(
     jj: &JjEnv,
@@ -171,7 +190,7 @@ pub(crate) fn seal_paths(
     branch: Option<&str>,
 ) -> Result<CommitResult, String> {
     let mut args: Vec<String> = JjEnv::author_args(author);
-    // Set when a `^` amend is CONVERTED to a child commit because `@-` is shared.
+    // Narrates either outcome of a `^` amend.
     let mut amend_note: Option<String> = None;
     if msg == "^" {
         // A `^` amend rewrites `@-` in place. If `@-` carries a bookmark OTHER than
@@ -182,15 +201,23 @@ pub(crate) fn seal_paths(
         // child commit reusing `@-`'s description; the post-seal `bookmark set
         // <own-branch> -r @-` then advances only THIS branch and the shared commit
         // is never rewritten.
-        let foreign: Vec<String> = local_bookmarks_at(jj, ws, "@-")
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|b| branch != Some(b.as_str()))
-            .collect();
-        if foreign.is_empty() {
+        let bookmarks = local_bookmarks_at(jj, ws, "@-");
+        let foreign = bookmarks.as_ref().ok().map(|bookmarks| {
+            bookmarks
+                .iter()
+                .filter(|b| branch != Some(b.as_str()))
+                .cloned()
+                .collect::<Vec<_>>()
+        });
+        // A managed workspace's bookmark view may be stale, so even a successful
+        // empty `foreign` set cannot prove an in-place rewrite is safe. Managed
+        // branches therefore always take the cheap child-commit path. An ambient
+        // unmanaged checkout can still amend when the lookup positively shows
+        // that no bookmark points at the target.
+        let may_rewrite = branch.is_none() && foreign.as_ref().is_some_and(Vec::is_empty);
+        if may_rewrite {
             args.extend(["squash".into(), "--use-destination-message".into()]);
-        } else {
-            let desc = jj
+            let target = jj
                 .run(
                     ws,
                     &[
@@ -199,23 +226,47 @@ pub(crate) fn seal_paths(
                         "@-",
                         "--no-graph",
                         "-T",
-                        "description",
+                        "commit_id",
                         "--ignore-working-copy",
                     ],
-                    "jj amend-convert description",
+                    "jj amend target",
                 )
-                .map(|s| s.trim().to_string())
+                .map(|id| id.trim().to_string())
                 .unwrap_or_default();
-            let desc = if desc.is_empty() {
-                "amend".to_string()
+            amend_note = Some(if target.is_empty() {
+                "amend rewrote the previous commit in place".to_string()
             } else {
-                desc
-            };
-            args.extend(["commit".into(), "-m".into(), desc]);
-            amend_note = Some(format!(
-                "amend converted to a new commit: the previous commit is shared with {}",
-                foreign.join(", ")
+                format!("amend rewrote commit {target} in place")
+            });
+        } else {
+            let (desc, description_note) = amend_description(jj.run(
+                ws,
+                &[
+                    "log",
+                    "-r",
+                    "@-",
+                    "--no-graph",
+                    "-T",
+                    "description",
+                    "--ignore-working-copy",
+                ],
+                "jj amend-convert description",
             ));
+            args.extend(["commit".into(), "-m".into(), desc]);
+            let conversion_note = match (bookmarks.as_ref(), foreign.as_ref()) {
+                (Err(error), _) => format!(
+                    "amend converted to a new commit because sharing could not be checked: {error}"
+                ),
+                (_, Some(foreign)) if !foreign.is_empty() => format!(
+                    "amend converted to a new commit: the previous commit is shared with {}",
+                    foreign.join(", ")
+                ),
+                _ => "amend converted to a new commit because the previous commit was not proven to be owned by this branch".to_string(),
+            };
+            amend_note = Some(match description_note {
+                Some(note) => format!("{conversion_note}; {note}"),
+                None => conversion_note,
+            });
         }
     } else {
         args.extend(["commit".into(), "-m".into(), msg.into()]);

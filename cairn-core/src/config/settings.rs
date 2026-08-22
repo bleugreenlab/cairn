@@ -22,6 +22,16 @@ use crate::models::{
 /// enough to leave room for the turn that discovers it — the seed, the reply,
 /// and the tool results it pulls in all land after the reading that triggered.
 pub(crate) const DEFAULT_THREAD_COMPACT_THRESHOLD: f64 = 0.8;
+pub const DEFAULT_SEED_BUDGET_TOKENS: i32 = 12_000;
+pub const DEFAULT_SEED_ERAS: i32 = 3;
+
+pub fn clamp_seed_budget_tokens(value: i32) -> i32 {
+    value.max(1)
+}
+
+pub fn clamp_seed_eras(value: i32) -> i32 {
+    value.max(0)
+}
 
 /// Keep the threshold inside the range where it means something.
 ///
@@ -206,6 +216,12 @@ pub struct SettingsFile {
     /// Fraction of the model's context window at which a warm thread session rebuilds.
     #[serde(default)]
     thread_compact_threshold: Option<f64>,
+    /// Approximate token budget for non-arc thread seed context.
+    #[serde(default)]
+    seed_budget_tokens: Option<i32>,
+    /// Number of recent era summaries rendered into a thread seed.
+    #[serde(default)]
+    seed_eras: Option<i32>,
     /// How replies to the special `to: "external"` target are handled.
     #[serde(default)]
     external_replies: Option<ExternalReplyMode>,
@@ -504,6 +520,11 @@ impl SettingsFile {
                 self.thread_compact_threshold
                     .unwrap_or(DEFAULT_THREAD_COMPACT_THRESHOLD),
             ),
+            seed_budget_tokens: clamp_seed_budget_tokens(
+                self.seed_budget_tokens
+                    .unwrap_or(DEFAULT_SEED_BUDGET_TOKENS),
+            ),
+            seed_eras: clamp_seed_eras(self.seed_eras.unwrap_or(DEFAULT_SEED_ERAS)),
             external_replies: self
                 .external_replies
                 .clone()
@@ -552,6 +573,8 @@ impl SettingsFile {
             thread_compact_threshold: Some(clamp_compact_threshold(
                 settings.thread_compact_threshold,
             )),
+            seed_budget_tokens: Some(clamp_seed_budget_tokens(settings.seed_budget_tokens)),
+            seed_eras: Some(clamp_seed_eras(settings.seed_eras)),
             external_replies: Some(settings.external_replies.clone()),
             subscription_fees: if settings.subscription_fees.is_empty() {
                 None
@@ -948,6 +971,7 @@ pub fn save_settings(config_dir: &std::path::Path, settings: &Settings) -> Resul
 pub fn update_settings(
     config_dir: &std::path::Path,
     input: UpdateSettings,
+    provider_names: &ProviderNames,
 ) -> Result<Settings, String> {
     mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
         let file: SettingsFile =
@@ -956,7 +980,7 @@ pub fn update_settings(
         let mut current = file.to_settings();
         let enablement_changed = input.enabled_providers.is_some();
         apply_settings_update(&mut current, input);
-        validate_enabled_providers(&current, enablement_changed)?;
+        validate_enabled_providers(&current, enablement_changed, provider_names)?;
         merge_settings_keys(root, &current)?;
         Ok(current)
     })
@@ -999,7 +1023,42 @@ pub fn migrate_enabled_providers(
 /// that would clear it, so the caller can offer a replacement in the same
 /// update. Credentials are never consulted here: removing a provider from a
 /// workspace does not touch its stored accounts.
-fn validate_enabled_providers(settings: &Settings, enablement_changed: bool) -> Result<(), String> {
+/// The names this workspace's providers go by, for the messages a settings
+/// refusal produces.
+///
+/// A shipped provider's name is in the catalog, which this module can read. A
+/// custom provider's name is in the identity store, which it cannot — so the
+/// caller that has one supplies the names, and a caller without one (a test, a
+/// path where no custom provider can be involved) supplies none and gets keys.
+#[derive(Debug, Default, Clone)]
+pub struct ProviderNames(std::collections::HashMap<String, String>);
+
+impl ProviderNames {
+    pub fn new(names: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self(names.into_iter().collect())
+    }
+
+    /// What to call `key` in prose: the operator's name for a custom provider,
+    /// the product name for a shipped one, and the raw key when neither is
+    /// known — which is still better than saying nothing about which provider
+    /// the message is about.
+    fn label(&self, key: &str) -> String {
+        self.0
+            .get(key)
+            .cloned()
+            .or_else(|| {
+                crate::backends::catalog::descriptor(key)
+                    .map(|entry| entry.display_name.to_string())
+            })
+            .unwrap_or_else(|| key.to_string())
+    }
+}
+
+fn validate_enabled_providers(
+    settings: &Settings,
+    enablement_changed: bool,
+    provider_names: &ProviderNames,
+) -> Result<(), String> {
     use crate::backends::catalog;
     if settings.enabled_providers.is_empty() {
         return Err(
@@ -1018,11 +1077,7 @@ fn validate_enabled_providers(settings: &Settings, enablement_changed: bool) -> 
         ));
     }
 
-    let label = |key: &str| {
-        catalog::descriptor(key)
-            .map(|entry| entry.display_name.to_string())
-            .unwrap_or_else(|| key.to_string())
-    };
+    let label = |key: &str| provider_names.label(key);
     let enabled = |key: &str| settings.enabled_providers.iter().any(|entry| entry == key);
 
     let mut stranded: Vec<(String, Vec<String>)> = Vec::new();
@@ -1138,6 +1193,12 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
     if let Some(value) = input.thread_compact_threshold {
         current.thread_compact_threshold = clamp_compact_threshold(value);
     }
+    if let Some(value) = input.seed_budget_tokens {
+        current.seed_budget_tokens = clamp_seed_budget_tokens(value);
+    }
+    if let Some(value) = input.seed_eras {
+        current.seed_eras = clamp_seed_eras(value);
+    }
     if let Some(value) = input.external_replies {
         current.external_replies = value;
     }
@@ -1172,6 +1233,19 @@ mod tests {
     /// Build a default Settings for test use (avoids repeating all fields).
     fn test_settings() -> Settings {
         SettingsFile::default().to_settings()
+    }
+
+    #[test]
+    fn seed_policy_defaults_and_clamps_on_read() {
+        let defaults = SettingsFile::default().to_settings();
+        assert_eq!(defaults.seed_budget_tokens, DEFAULT_SEED_BUDGET_TOKENS);
+        assert_eq!(defaults.seed_eras, DEFAULT_SEED_ERAS);
+
+        let file: SettingsFile =
+            serde_yaml::from_str("seedBudgetTokens: 0\nseedEras: -2\n").unwrap();
+        let settings = file.to_settings();
+        assert_eq!(settings.seed_budget_tokens, 1);
+        assert_eq!(settings.seed_eras, 0);
     }
 
     fn with_temp_home<F>(f: F)
@@ -1924,6 +1998,7 @@ futureUserKey:
                 UpdateSettings {
                     ..UpdateSettings::default()
                 },
+                &Default::default(),
             )
             .unwrap();
         });
@@ -1938,6 +2013,7 @@ futureUserKey:
                     bug_reports: Some(false),
                     ..UpdateSettings::default()
                 },
+                &Default::default(),
             )
             .unwrap();
         });
@@ -2582,7 +2658,7 @@ buildSlots:
     linux-builder:
       host: bglab-ub.local
       sshUser: dev
-      binaryPath: /opt/cairn/cairn-executor
+      binaryPath: /opt/cairn/cairn-exec
       cairnHome: /home/dev/.cairn
       executorId: linux-builder
       deviceId: linux-builder-device
@@ -2868,6 +2944,7 @@ tierDefaults:
                 enabled_providers: Some(vec!["claude".to_string()]),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap_err();
 
@@ -2912,6 +2989,7 @@ backends:
                 ])),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
 
@@ -2948,6 +3026,7 @@ routeCallsViaOpenRouter: true
                 enabled_providers: Some(vec!["claude".to_string()]),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap_err();
         assert!(error.contains("OpenRouter"), "{error}");
@@ -2960,6 +3039,7 @@ routeCallsViaOpenRouter: true
                 route_calls_via_openrouter: Some(false),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
         assert_eq!(settings.enabled_providers, vec!["claude"]);
@@ -2979,6 +3059,7 @@ routeCallsViaOpenRouter: true
                 enabled_providers: Some(vec!["claude".to_string(), "gemini".to_string()]),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap_err();
         assert!(unknown.contains("gemini"), "{unknown}");
@@ -2989,6 +3070,7 @@ routeCallsViaOpenRouter: true
                 enabled_providers: Some(Vec::new()),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap_err();
         assert!(empty.contains("at least one provider"), "{empty}");
@@ -3012,6 +3094,7 @@ routeCallsViaOpenRouter: true
                 ]),
                 ..Default::default()
             },
+            &Default::default(),
         )
         .unwrap();
 

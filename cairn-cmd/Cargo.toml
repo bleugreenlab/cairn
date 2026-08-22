@@ -28,6 +28,8 @@ cairn-common = { path = "../cairn-common" }
 regex = "1"
 url = "2"
 base64 = "0.22"
+unicode-width = "0.2"
+crossterm = "0.28"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

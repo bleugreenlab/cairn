@@ -33,6 +33,103 @@ pub enum ResponseCaller {
     },
 }
 
+/// Invoke a built-in response definition without requiring a config file.
+///
+/// Built-ins use the same completion and response-history path as named
+/// responses. The caller supplies a stable reserved id so their invocations
+/// remain inspectable alongside user-authored responses.
+pub async fn invoke_definition(
+    orch: &Orchestrator,
+    definition: &ResponseDefinition,
+    args: &Value,
+    response_id: &str,
+    caller: ResponseCaller,
+) -> Result<ResponseOutcome, ResponseError> {
+    definition.validate().map_err(ResponseError::Upstream)?;
+    let (caller_kind, caller_label, caller_run_id, project_id, project_path) = caller.fields();
+    validate_runnable_model(orch, definition, project_id, project_path)
+        .map_err(ResponseError::BackendUnavailable)?;
+    let attempt = complete_definition(orch, definition, args, project_id, project_path).await?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let args_json = serde_json::to_string(args).ok();
+    let scope_key = project_id
+        .map(|id| format!("project:{id}"))
+        .unwrap_or_else(|| "workspace".into());
+
+    match attempt.result {
+        Ok(outcome) => {
+            let record = crate::storage::insert_response_invocation(
+                &orch.db.local,
+                NewResponseInvocation {
+                    response_id: response_id.to_string(),
+                    scope_key,
+                    project_id: project_id.map(str::to_owned),
+                    caller_kind: caller_kind.into(),
+                    caller_label: caller_label.map(str::to_owned),
+                    caller_run_id: caller_run_id.map(str::to_owned),
+                    rendered_prompt: attempt.rendered,
+                    args_json,
+                    status: "ok".into(),
+                    output_text: Some(outcome.text.clone()),
+                    error: None,
+                    model: Some(outcome.model.clone()),
+                    backend: Some(outcome.backend.clone()),
+                    latency_ms: Some(outcome.latency_ms as i64),
+                    input_tokens: outcome.input_tokens.map(|value| value as i64),
+                    output_tokens: outcome.output_tokens.map(|value| value as i64),
+                    cost: outcome.cost,
+                    created_at: now,
+                },
+            )
+            .await
+            .map_err(|error| {
+                ResponseError::Upstream(format!("failed to persist response history: {error}"))
+            })?;
+            Ok(ResponseOutcome {
+                seq: record.seq,
+                text: outcome.text,
+                parsed: outcome.parsed,
+                model: outcome.model,
+                backend: outcome.backend,
+                latency_ms: outcome.latency_ms,
+                cost: outcome.cost,
+            })
+        }
+        Err(error) => {
+            crate::storage::insert_response_invocation(
+                &orch.db.local,
+                NewResponseInvocation {
+                    response_id: response_id.to_string(),
+                    scope_key,
+                    project_id: project_id.map(str::to_owned),
+                    caller_kind: caller_kind.into(),
+                    caller_label: caller_label.map(str::to_owned),
+                    caller_run_id: caller_run_id.map(str::to_owned),
+                    rendered_prompt: attempt.rendered,
+                    args_json,
+                    status: "failed".into(),
+                    output_text: None,
+                    error: Some(error.to_string()),
+                    model: Some(attempt.model.to_string()),
+                    backend: Some(attempt.backend),
+                    latency_ms: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cost: None,
+                    created_at: now,
+                },
+            )
+            .await
+            .map_err(|storage_error| {
+                ResponseError::Upstream(format!(
+                    "{error}; additionally failed to persist response history: {storage_error}"
+                ))
+            })?;
+            Err(error)
+        }
+    }
+}
+
 fn saved_discovery_selection(
     backend: &str,
     model: &str,
@@ -93,6 +190,10 @@ pub fn model_capabilities(
     // Enabled, not supported: a response is authored to run next, so it may
     // only offer providers this workspace installed.
     let enabled = orch.enabled_providers();
+    // Names come from the workspace's provider inventory rather than from the
+    // backend adapter, which is the one place that knows what an operator
+    // called a provider they defined themselves.
+    let inventory = orch.provider_catalog();
     for backend_name in enabled.iter().map(String::as_str) {
         let backend = backend_for_name(Some(backend_name));
         let availability = backend.response_completion_availability(orch, project_id);
@@ -163,7 +264,11 @@ pub fn model_capabilities(
         }
         backends.push(ResponseBackendCapability {
             backend: backend_name.into(),
-            label: backend.name().into(),
+            label: inventory
+                .iter()
+                .find(|entry| entry.key == backend_name)
+                .map(|entry| entry.display_name.to_string())
+                .unwrap_or_else(|| backend.name().to_string()),
             runnable: availability.is_ok(),
             unavailable_reason: availability.err(),
             selections,

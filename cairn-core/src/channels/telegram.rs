@@ -34,6 +34,22 @@ pub struct TelegramLiveness {
     pub last_update_at: Option<i64>,
 }
 
+const TELEGRAM_DELETE_WINDOW_MS: i64 = 48 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AskCleanupAction {
+    Delete,
+    StopAndReceipt,
+}
+
+fn ask_cleanup_action(sent_at: i64, now: i64) -> AskCleanupAction {
+    if now.saturating_sub(sent_at) <= TELEGRAM_DELETE_WINDOW_MS {
+        AskCleanupAction::Delete
+    } else {
+        AskCleanupAction::StopAndReceipt
+    }
+}
+
 fn telegram_commands() -> Vec<BotCommand> {
     super::commands::CHANNEL_COMMANDS
         .iter()
@@ -240,7 +256,17 @@ impl TelegramProvider {
     }
 
     fn configured_chat(&self, conversation: &str) -> Result<ChatId, String> {
-        let requested = parse_chat(conversation)?;
+        let requested = if conversation.contains(':') {
+            let address = conversation
+                .parse::<super::address::ConversationAddress>()
+                .map_err(|error| error.to_string())?;
+            match address.destination() {
+                super::address::ConversationDestination::Telegram { chat_id } => ChatId(*chat_id),
+                _ => return Err("conversation is not a Telegram address".into()),
+            }
+        } else {
+            parse_chat(conversation)?
+        };
         (requested == self.chat_id)
             .then_some(requested)
             .ok_or_else(|| {
@@ -323,15 +349,44 @@ impl ChannelProvider for TelegramProvider {
         }
     }
     async fn cleanup_question(&self, message: &ResolvedQuestionMessage) -> Result<(), String> {
+        if message.multi_select {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+        let chat = self.configured_chat(&message.conversation)?;
+        let message_id = parse_message(&message.provider_guid, self.chat_id)?;
+        if ask_cleanup_action(message.sent_at, chrono::Utc::now().timestamp_millis())
+            == AskCleanupAction::Delete
+        {
+            return self
+                .bot
+                .delete_message(chat, message_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    let error = format!("could not delete resolved Telegram ask: {error}");
+                    log::warn!("{error}");
+                    error
+                });
+        }
+        if let Err(stop_error) = self.bot.stop_poll(chat, message_id).await {
+            log::warn!(
+                "could not stop expired Telegram ask as a native poll; clearing its keyboard instead: {stop_error}"
+            );
+            self.bot
+                .edit_message_reply_markup(chat, message_id)
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await
+                .map_err(|clear_error| {
+                    format!(
+                        "could not stop expired Telegram ask ({stop_error}) or clear its keyboard ({clear_error})"
+                    )
+                })?;
+        }
         self.bot
-            .edit_message_reply_markup(
-                self.configured_chat(&message.conversation)?,
-                parse_message(&message.provider_guid, self.chat_id)?,
-            )
-            .reply_markup(InlineKeyboardMarkup::default())
+            .send_message(chat, message.receipt.clone())
             .await
             .map(|_| ())
-            .map_err(|e| format!("could not clear Telegram keyboard: {e}"))
+            .map_err(|error| format!("could not send expired Telegram ask receipt: {error}"))
     }
 }
 
@@ -741,6 +796,19 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[test]
+    fn resolved_ask_cleanup_falls_back_after_telegram_delete_window() {
+        let now = 200_000_000;
+        assert_eq!(
+            ask_cleanup_action(now - TELEGRAM_DELETE_WINDOW_MS, now),
+            AskCleanupAction::Delete
+        );
+        assert_eq!(
+            ask_cleanup_action(now - TELEGRAM_DELETE_WINDOW_MS - 1, now),
+            AskCleanupAction::StopAndReceipt
+        );
+    }
+
     async fn mock_bot(success: bool) -> (Bot, tokio::sync::oneshot::Receiver<String>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -791,6 +859,104 @@ mod tests {
         });
         let url = reqwest::Url::parse(&format!("http://{address}/")).unwrap();
         (Bot::new("123:test").set_api_url(url), request_rx)
+    }
+
+    async fn mock_bot_sequence(
+        bodies: Vec<&'static str>,
+    ) -> (Bot, tokio::sync::oneshot::Receiver<Vec<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests_tx, requests_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    request.extend_from_slice(&chunk[..count]);
+                    let complete = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|header| {
+                            let header = header + 4;
+                            let length = String::from_utf8_lossy(&request[..header])
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            request.len() >= header + length
+                        })
+                        .unwrap_or(false);
+                    if count == 0 || complete {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            let _ = requests_tx.send(requests);
+        });
+        let url = reqwest::Url::parse(&format!("http://{address}/")).unwrap();
+        (Bot::new("123:test").set_api_url(url), requests_rx)
+    }
+
+    #[tokio::test]
+    async fn expired_inline_ask_clears_keyboard_and_sends_receipt_when_stop_poll_fails() {
+        let telegram_message = r#"{"message_id":15,"date":1,"chat":{"id":42,"type":"private"}}"#;
+        let (bot, requests) = mock_bot_sequence(vec![
+            r#"{"ok":false,"error_code":400,"description":"message is not a poll"}"#,
+            Box::leak(format!(r#"{{"ok":true,"result":{telegram_message}}}"#).into_boxed_str()),
+            Box::leak(format!(r#"{{"ok":true,"result":{telegram_message}}}"#).into_boxed_str()),
+        ])
+        .await;
+        let (tx, rx) = mpsc::channel(1);
+        let provider = TelegramProvider {
+            bot,
+            chat_id: ChatId(42),
+            allowed_users: HashSet::new(),
+            tx,
+            rx: Mutex::new(Some(rx)),
+            active: AtomicBool::new(false),
+            started_at: AtomicI64::new(0),
+            last_update_at: AtomicI64::new(0),
+            last_error: Mutex::new(None),
+        };
+
+        provider
+            .cleanup_question(&ResolvedQuestionMessage {
+                conversation: "telegram:42".into(),
+                provider_guid: "42:15".into(),
+                caption_guid: None,
+                sent_at: 1,
+                original_text: "Choose".into(),
+                answer: Some("One".into()),
+                answering_surface: Some("app".into()),
+                multi_select: false,
+                receipt: "Expired receipt".into(),
+            })
+            .await
+            .unwrap();
+
+        let requests = requests.await.unwrap();
+        assert!(requests[0].to_ascii_lowercase().contains("/stoppoll"));
+        assert!(requests[1]
+            .to_ascii_lowercase()
+            .contains("/editmessagereplymarkup"));
+        assert!(requests[1].contains(r#""inline_keyboard":[]"#));
+        assert!(requests[2].to_ascii_lowercase().contains("/sendmessage"));
+        assert!(requests[2].contains("Expired receipt"));
     }
     fn update(mut value: serde_json::Value) -> Update {
         let object = value.as_object_mut().unwrap();

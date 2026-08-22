@@ -55,6 +55,10 @@ pub struct AgentFrontmatter {
     icon: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     bundles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_budget_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    seed_eras: Option<i32>,
 }
 
 /// Custom deserializer that handles both comma-separated string and YAML array
@@ -100,7 +104,6 @@ where
             Ok(String::new())
         }
     }
-
     deserializer.deserialize_any(ToolsVisitor)
 }
 
@@ -121,6 +124,8 @@ pub struct ParsedAgent {
     pub backend_preference: Option<String>,
     pub icon: Option<String>,
     pub bundles: Vec<String>,
+    pub seed_budget_tokens: Option<i32>,
+    pub seed_eras: Option<i32>,
 }
 
 /// Generate a slug from a name (for ID generation)
@@ -210,6 +215,8 @@ pub fn parse_agent_markdown(content: &str) -> Result<ParsedAgent, String> {
         backend_preference: frontmatter.backend_preference,
         icon: frontmatter.icon,
         bundles: frontmatter.bundles,
+        seed_budget_tokens: frontmatter.seed_budget_tokens,
+        seed_eras: frontmatter.seed_eras,
     })
 }
 
@@ -230,6 +237,8 @@ pub struct AgentExportData<'a> {
     /// Optional lucide icon name; an `icon:` line is emitted only when set.
     pub icon: Option<&'a str>,
     pub bundles: &'a [String],
+    pub seed_budget_tokens: Option<i32>,
+    pub seed_eras: Option<i32>,
 }
 
 /// Convert agent to Claude Code-compatible markdown format for export
@@ -248,6 +257,8 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
         backend_preference,
         icon,
         bundles,
+        seed_budget_tokens,
+        seed_eras,
     } = data;
 
     let mut frontmatter = format!("---\nname: {}\ndescription: {}\n", name, description);
@@ -270,6 +281,12 @@ pub fn agent_to_markdown(data: AgentExportData) -> String {
 
     if let Some(b) = backend_preference {
         frontmatter.push_str(&format!("backend: {}\n", b));
+    }
+    if let Some(value) = seed_budget_tokens {
+        frontmatter.push_str(&format!("seedBudgetTokens: {value}\n"));
+    }
+    if let Some(value) = seed_eras {
+        frontmatter.push_str(&format!("seedEras: {value}\n"));
     }
 
     // Only emit an `icon:` line when set, so agents without an icon round-trip
@@ -354,6 +371,8 @@ mod tests {
             backend_preference: None,
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
         assert!(
             !markdown.contains("tools:"),
@@ -499,6 +518,8 @@ Prompt
             backend_preference: None,
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(markdown.contains("name: Test Agent"));
@@ -528,6 +549,8 @@ Prompt
             backend_preference: None,
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(markdown.contains("disallowedTools:"));
@@ -686,6 +709,8 @@ Build stuff.
             backend_preference: None,
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(markdown.contains("hooks:"));
@@ -722,6 +747,8 @@ Build with Codex.
             backend_preference: agent.backend_preference.as_deref(),
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(markdown.contains("backend: codex"));
@@ -743,6 +770,8 @@ Build with Codex.
             backend_preference: None,
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(!markdown.contains("backendPreference"));
@@ -779,6 +808,8 @@ Build stuff.
             backend_preference: None,
             icon: agent.icon.as_deref(),
             bundles: &agent.bundles,
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(markdown.contains("icon: hammer"));
@@ -804,6 +835,8 @@ Build stuff.
             backend_preference: None,
             icon: None,
             bundles: &[],
+            seed_budget_tokens: None,
+            seed_eras: None,
         });
 
         assert!(!markdown.contains("icon:"));

@@ -90,6 +90,23 @@ impl EventEmitter for CapturingEmitter {
     }
 }
 
+/// A shared capturing emitter is itself an emitter.
+///
+/// A test that wants to assert on emitted events has to keep a handle to the
+/// emitter after handing one to the orchestrator, which means an `Arc`. Without
+/// this, each test module writes its own newtype to bridge the two, and several
+/// already had.
+#[cfg(any(test, feature = "test-utils"))]
+impl EventEmitter for std::sync::Arc<CapturingEmitter> {
+    fn emit(&self, event: &str, payload: Value) -> Result<(), String> {
+        (**self).emit(event, payload)
+    }
+
+    fn emit_empty(&self, event: &str) -> Result<(), String> {
+        (**self).emit_empty(event)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

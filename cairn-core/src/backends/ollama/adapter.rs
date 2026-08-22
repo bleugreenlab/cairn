@@ -5,9 +5,7 @@ use crate::backends::openai_compat::http::{post_chat_completion_streaming, Endpo
 use crate::backends::openai_compat::wire::{ChatContent, ChatMessage};
 use crate::backends::openai_compat::{context, conversation};
 use crate::backends::SessionConfig;
-use crate::backends::{
-    CompletionError, CompletionOutcome, CompletionRequest, CompletionRole, CompletionTokens,
-};
+use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
 use crate::dispatch::DispatchOutput;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
@@ -34,8 +32,8 @@ impl OllamaAdapter {
             })?;
         Ok(Self {
             endpoint: Endpoint {
-                provider_name: OLLAMA_BACKEND_NAME,
-                backend_key: OLLAMA_BACKEND_KEY,
+                provider_name: OLLAMA_BACKEND_NAME.to_string(),
+                backend_key: OLLAMA_BACKEND_KEY.to_string(),
                 chat_url: format!("{}/v1/chat/completions", base_url.trim_end_matches('/')),
                 headers: vec![("content-type".into(), "application/json".into())],
                 extra_body: None,
@@ -75,51 +73,13 @@ impl OllamaAdapter {
     }
 }
 
-fn completion_body(request: &CompletionRequest) -> Result<serde_json::Value, CompletionError> {
-    if request.messages.is_empty() {
-        return Err(CompletionError::InvalidRequest(
-            "at least one message is required".to_string(),
-        ));
-    }
-    let mut messages = Vec::with_capacity(request.messages.len() + 1);
-    if let Some(system) = &request.system {
-        messages.push(json!({"role": "system", "content": system}));
-    }
-    messages.extend(request.messages.iter().map(|message| {
-        let role = match message.role {
-            CompletionRole::User => "user",
-            CompletionRole::Assistant => "assistant",
-        };
-        json!({"role": role, "content": message.content})
-    }));
-    let mut body = json!({
-        "model": request.model,
-        "messages": messages,
-        "stream": false,
-    });
-    if let Some(extras) = request.extras.as_object() {
-        body.as_object_mut()
-            .expect("completion body is an object")
-            .extend(extras.clone());
-    } else if !request.extras.is_null() {
-        return Err(CompletionError::InvalidRequest(
-            "extras must be an object or null".to_string(),
-        ));
-    }
-    if let Some(schema) = &request.output_schema {
-        body["response_format"] = json!({
-            "type": "json_schema",
-            "json_schema": {"name": "response", "strict": true, "schema": schema},
-        });
-    }
-    Ok(body)
-}
+use crate::backends::openai_compat::completion_body;
 impl WireAdapter for OllamaAdapter {
     type Message = ChatMessage;
-    fn backend_key(&self) -> &'static str {
+    fn backend_key(&self) -> &str {
         OLLAMA_BACKEND_KEY
     }
-    fn backend_name(&self) -> &'static str {
+    fn backend_name(&self) -> &str {
         OLLAMA_BACKEND_NAME
     }
     fn default_model(&self) -> &'static str {
@@ -182,7 +142,7 @@ impl WireAdapter for OllamaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::CompletionMessage;
+    use crate::backends::{CompletionMessage, CompletionRole};
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -225,8 +185,8 @@ mod tests {
         });
         OllamaAdapter {
             endpoint: Endpoint {
-                provider_name: OLLAMA_BACKEND_NAME,
-                backend_key: OLLAMA_BACKEND_KEY,
+                provider_name: OLLAMA_BACKEND_NAME.to_string(),
+                backend_key: OLLAMA_BACKEND_KEY.to_string(),
                 chat_url: format!("http://{address}/v1/chat/completions"),
                 headers: vec![("content-type".into(), "application/json".into())],
                 extra_body: None,

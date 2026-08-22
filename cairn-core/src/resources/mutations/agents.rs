@@ -124,6 +124,8 @@ fn validate_roundtrip(agent: &FileAgent) -> Result<(), String> {
         backend_preference: agent.backend_preference.as_deref(),
         icon: agent.icon.as_deref(),
         bundles: &agent.bundles,
+        seed_budget_tokens: None,
+        seed_eras: None,
     });
     parse_agent_markdown(&markdown).map(|_| ())
 }
@@ -183,6 +185,8 @@ pub(super) async fn apply_agent_create(
         bundles: Vec::new(),
         is_project_scoped,
         file_path: PathBuf::new(),
+        seed_budget_tokens: None,
+        seed_eras: None,
     };
     apply_fields(&mut agent, payload)?;
     validate_roundtrip(&agent)?;

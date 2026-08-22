@@ -1347,7 +1347,7 @@ mod publication_mode_tests {
     }
 
     #[test]
-    fn an_amend_on_an_unmoved_branch_still_amends() {
+    fn an_unmoved_amend_selects_managed_amend_publication() {
         let (mode, converted) = publication_mode("^", None);
         assert_eq!(mode, cairn_vcs::PublicationMode::Amend);
         assert!(!converted);
@@ -2745,16 +2745,11 @@ impl CapacityWait {
 /// presented again rather than refused, and the waiting happens here instead of
 /// in an agent that would answer a refusal by retrying into the same congestion.
 ///
-/// Re-presenting is not free, and it is the known weakness of this design. A
-/// request that reached the queue keeps its place while the executor reports
-/// `CapacityBusy`, because that pauses its deadline — but the pause has a
-/// ceiling, and past it the entry is evicted. What we send next is a NEW
-/// request: it takes a fresh sequence at the tail of the queue and loses the
-/// priority aging its wait had accrued, so under sustained arrivals a batch can
-/// be starved even while capacity repeatedly frees. A `QueueFull` refusal never
-/// held a place to begin with. Fixing that needs the executor to hold a position
-/// across an elapsed deadline rather than us re-submitting; until then this is
-/// strictly better than refusing and strictly worse than queueing once.
+/// A re-presented request gets a fresh enqueue sequence, but it keeps the
+/// requester's original waiting time. The executor ranks by aged priority, then
+/// that waiting time, and uses the sequence only to break an otherwise exact
+/// tie, so re-presentation preserves the seniority the batch already earned. A
+/// `QueueFull` refusal never held a place to begin with.
 ///
 /// A structural failure is returned at once,
 /// because waiting on an unsatisfiable constraint or a missing executor strands
@@ -3221,6 +3216,27 @@ async fn settle_routed_run_batch(
     .await
 }
 
+/// What the agent reads when its execution environment was rebuilt under it.
+///
+/// An environment is a lease against a live executor session, and losing one
+/// between batches is legal and ordinary. What is not ordinary is the machine
+/// itself going away: the rebuilt environment is a fresh checkout of the branch,
+/// so committed work is intact and everything only the old one held is gone.
+/// Saying so is the whole point — an agent that finds its scratch file missing
+/// and is told nothing debugs the wrong thing, and both nodes that hit this
+/// discovered the workaround by themselves (CAIRN-4332).
+fn environment_rebuild_note(orch: &Orchestrator, s: &RunBatchSettlement) -> Option<String> {
+    let context = s.run_context.as_ref()?;
+    let holder = cairn_common::executor_protocol::ResidencyHolder::Job {
+        job_id: context.job_id.clone(),
+    };
+    let eviction = orch.fleet.take_environment_eviction(&holder)?;
+    Some(format!(
+        "Note: this job's execution environment was rebuilt. The machine holding the previous one (**{}**) is no longer connected, so a fresh checkout of your branch was materialized. Committed work is intact; uncommitted files, installed packages, and terminals or REPLs from earlier batches did not survive.",
+        eviction.executor
+    ))
+}
+
 /// The batch tail: the verdict-only modification report, the commit barrier and
 /// logical-head publication, the synchronous when:write checks, and the composed
 /// output with its advisories.
@@ -3271,6 +3287,12 @@ async fn settle_run_batch(
                 modified_paths.len(),
                 modified_paths.into_iter().collect::<Vec<_>>().join(", ")
             ));
+        }
+        if let Some(note) = environment_rebuild_note(orch, s) {
+            if !result.is_empty() {
+                result.push_str("\n\n");
+            }
+            result.push_str(&note);
         }
         if let Some(note) = &s.residence_note {
             if !result.is_empty() {
@@ -3595,6 +3617,12 @@ async fn settle_run_batch(
         result.push_str(note);
     }
 
+    if let Some(note) = environment_rebuild_note(orch, s) {
+        if !result.is_empty() {
+            result.push_str("\n\n");
+        }
+        result.push_str(&note);
+    }
     if let Some(note) = &s.residence_note {
         if !result.is_empty() {
             result.push_str("\n\n");

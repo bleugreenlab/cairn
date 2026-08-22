@@ -174,6 +174,8 @@ fn agent_snapshot() -> AgentSnapshot {
         on_escape: None,
         resolved_backend: None,
         extras: None,
+        seed_budget_tokens: None,
+        seed_eras: None,
     }
 }
 
@@ -1095,6 +1097,144 @@ async fn a_thread_cannot_commit_from_a_run_and_an_ordinary_issue_still_can() {
         scratch.contains("no commit_msg"),
         "and the thread is told why its dirt did not survive: {scratch}"
     );
+}
+
+/// `issue_history` is issue-only BY DESIGN, so a thread must be refused rather
+/// than handed a read that quietly drops the annotation it asked for.
+///
+/// This is the honest-refusal half of the CAIRN-4306 sweep. The silent failure
+/// it forecloses is the family's whole signature: a thread session's job carries
+/// `issue_id = NULL`, so every history query keyed off that column returns zero
+/// rows, and the read renders successfully with the history simply absent. The
+/// agent cannot tell an empty history from a surface that never looked.
+///
+/// The ordinary-issue arm is what gives this teeth: the identical target and
+/// query on an issue-owned run must NOT hit the refusal, proving the guard reads
+/// job ownership rather than rejecting `issue_history` outright.
+#[tokio::test]
+async fn a_thread_is_refused_issue_history_and_an_ordinary_issue_still_gets_it() {
+    const REFUSAL: &str = "this run is thread-owned and has no issue history";
+
+    let (issue_temp, _issue_db, issue_orch, issue_cwd) =
+        setup_without_jj("run-history-issue").await;
+    let target = issue_temp.path().join("history.txt");
+    std::fs::write(&target, "history-probe\n").unwrap();
+    let issue_target = format!("file:{}?issue_history=true", target.display());
+    let issue_read = read_text(
+        &issue_orch,
+        &issue_cwd,
+        Some("run-history-issue"),
+        &issue_target,
+    )
+    .await;
+    assert!(
+        !issue_read.contains(REFUSAL),
+        "an issue-owned run must still be served issue_history: {issue_read}"
+    );
+    // The control is only a control if it actually READ. Asserting merely that
+    // the refusal is absent would pass just as well for a read that failed for
+    // some unrelated reason, which would leave the ownership comparison vacuous.
+    assert!(
+        issue_read.contains("history-probe"),
+        "the issue-owned arm must reach a real read, or it proves nothing: {issue_read}"
+    );
+
+    let (thread_temp, thread_db, thread_orch, thread_cwd) =
+        setup_without_jj("run-history-thread").await;
+    let thread_target = thread_temp.path().join("history.txt");
+    std::fs::write(&thread_target, "history-probe\n").unwrap();
+    convert_run_to_thread_session(&thread_db, "run-history-thread", "history-thread").await;
+
+    let thread_read = read_text(
+        &thread_orch,
+        &thread_cwd,
+        Some("run-history-thread"),
+        &format!("file:{}?issue_history=true", thread_target.display()),
+    )
+    .await;
+    assert!(
+        thread_read.contains(REFUSAL),
+        "the thread must be told why it gets no history, not handed a silent omission: {thread_read}"
+    );
+}
+
+/// `setup` without the jj workspace, because this pair never seals anything.
+///
+/// The refusal under test is taken before any path or VCS work, and the control
+/// arm is a plain read; provisioning a jj workspace would only couple the test to
+/// a toolchain it does not exercise and make it skip where it could have run.
+async fn setup_without_jj(run_id: &str) -> (TempDir, Arc<LocalDb>, Orchestrator, String) {
+    let (temp, db) = common::migrated_db().await;
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
+    let db = Arc::new(db);
+    let project_id = common::insert_project_with_repo(&db, "rhg", &project_repo).await;
+    let worktree = temp.path().join("worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let base_commit = common::head_sha(&project_repo);
+    seed_run(
+        &db,
+        &project_id,
+        &worktree,
+        "agent/RHG-1-builder-0",
+        &base_commit,
+        run_id,
+    )
+    .await;
+    let orch = orchestrator_without_executor(&temp, db.clone());
+    let cwd = worktree.display().to_string();
+    (temp, db, orch, cwd)
+}
+
+/// Rewrite a seeded issue-owned run into the PRODUCTION shape of a thread
+/// session: `jobs.issue_id` NULL with `jobs.thread_id` set, the run detached from
+/// the issue, and no issue row left anywhere in the chain.
+///
+/// `execute_script`, not `execute`: this is several statements and `execute`
+/// runs only the first, which would leave an ordinary issue-owned job that every
+/// thread guard then correctly declines to refuse. The conversion is asserted
+/// rather than assumed for the same reason — an issue-shaped fixture asserting
+/// thread behavior is the exact false confidence this sweep exists to remove.
+async fn convert_run_to_thread_session(db: &LocalDb, run_id: &str, thread_name: &str) {
+    let issue_id = format!("issue-{run_id}");
+    db.execute_script(&format!(
+        "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) \
+         SELECT id,project_id,'{thread_name}','active','none',created_at,updated_at \
+         FROM issues WHERE id='{issue_id}'; \
+         UPDATE jobs SET thread_id='{issue_id}',issue_id=NULL,execution_id=NULL \
+         WHERE issue_id='{issue_id}'; \
+         UPDATE runs SET issue_id=NULL WHERE issue_id='{issue_id}'; \
+         DELETE FROM executions WHERE issue_id='{issue_id}'; \
+         DELETE FROM issues WHERE id='{issue_id}'"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(
+        common::scalar_text_by_id(
+            db,
+            "SELECT thread_id FROM jobs WHERE id = ?1",
+            &format!("job-{run_id}")
+        )
+        .await
+        .as_deref(),
+        Some(issue_id.as_str()),
+        "the job under test must actually belong to the thread"
+    );
+}
+
+async fn read_text(orch: &Orchestrator, cwd: &str, run_id: Option<&str>, path: &str) -> String {
+    cairn_core::internal::mcp::handlers::read::handle_read_file(
+        orch,
+        &McpCallbackRequest {
+            thread_id: None,
+            cwd: cwd.to_string(),
+            run_id: run_id.map(ToOwned::to_owned),
+            tool: "read".to_string(),
+            payload: json!({ "path": path }),
+            tool_use_id: None,
+        },
+    )
+    .await
 }
 
 /// Fail-closed means ahead of every branch that can act, not merely early in
@@ -2370,6 +2510,7 @@ async fn repl_state_persists_across_handle_run_calls() {
         exec_seq: Some(1),
         issue_id: Some(format!("issue-{run_id}")),
         issue_number: Some(1),
+        thread_id: None,
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
@@ -2447,6 +2588,7 @@ async fn repl_typescript_rejects_deps() {
         exec_seq: Some(1),
         issue_id: Some(format!("issue-{run_id}")),
         issue_number: Some(1),
+        thread_id: None,
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
@@ -2489,6 +2631,7 @@ async fn repl_typescript_state_persists_across_handle_run_calls() {
         exec_seq: Some(1),
         issue_id: Some(format!("issue-{run_id}")),
         issue_number: Some(1),
+        thread_id: None,
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),
@@ -2576,6 +2719,7 @@ fn repl_ctx(run_id: &str, _cwd: &str) -> cairn_core::internal::mcp::handlers::Ru
         exec_seq: Some(1),
         issue_id: Some(format!("issue-{run_id}")),
         issue_number: Some(1),
+        thread_id: None,
         project_id: String::new(),
         project_key: "RHG".to_string(),
         job_name: Some("builder".to_string()),

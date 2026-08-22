@@ -2,7 +2,7 @@
 //! or cell is handed as `$TMPDIR`.
 //!
 //! Two layers provision one: `cairn_core::scratch` names and registers the
-//! host-local job scratch dir, and `cairn_executor` derives a cell's own. Which
+//! host-local job scratch dir, and `cairn_exec` derives a cell's own. Which
 //! of them served a given execution is not something an agent can see or should
 //! have to care about, so the parts of a scratch dir's shape that decide whether
 //! ordinary tooling behaves normally live here, once, and both delegate.

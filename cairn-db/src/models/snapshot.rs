@@ -172,6 +172,12 @@ pub struct AgentSnapshot {
     pub disallowed_tools: Option<Vec<String>>,
     /// Skill IDs attached to this agent (None = inherit all available skills)
     pub skills: Option<Vec<String>>,
+    /// Per-agent override for the thread seed token budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_budget_tokens: Option<i32>,
+    /// Per-agent override for the number of visible era summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_eras: Option<i32>,
     /// Worktree fence behavior for sandbox escapes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fence: Option<Fence>,
@@ -519,6 +525,8 @@ mod tests {
                     on_escape: None,
                     resolved_backend: None,
                     extras: None,
+                    seed_budget_tokens: None,
+                    seed_eras: None,
                 },
             )]),
             skills: HashMap::from([(
@@ -660,6 +668,26 @@ mod tests {
         let snap: AgentSnapshot = serde_json::from_str(json).unwrap();
         assert_eq!(snap.id, "build");
         assert!(snap.extras.is_none());
+        assert!(snap.seed_budget_tokens.is_none());
+        assert!(snap.seed_eras.is_none());
+    }
+
+    #[test]
+    fn agent_patch_merges_seed_policy_overrides() {
+        let mut base: AgentSnapshot = serde_json::from_value(serde_json::json!({
+            "id": "build",
+            "name": "Build",
+            "description": "",
+            "prompt": "",
+            "tools": []
+        }))
+        .unwrap();
+        base.seed_budget_tokens = Some(12_000);
+
+        let patch = serde_json::json!({"seedBudgetTokens": 24_000, "seedEras": 6});
+        let merged = merge_agent_patch(None.or(Some(&base)), patch.as_object().unwrap()).unwrap();
+        assert_eq!(merged.seed_budget_tokens, Some(24_000));
+        assert_eq!(merged.seed_eras, Some(6));
     }
 
     /// AgentSnapshot with extras round-trips correctly.
@@ -687,6 +715,8 @@ mod tests {
                 reasoning_effort: Some("high".to_string()),
                 service_tier: Some("priority".to_string()),
             }),
+            seed_budget_tokens: None,
+            seed_eras: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("reasoningEffort"));
@@ -718,6 +748,8 @@ mod tests {
             on_escape: None,
             resolved_backend: None,
             extras: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
         };
         let json = serde_json::to_string(&snap).unwrap();
         assert!(!json.contains("extras"));

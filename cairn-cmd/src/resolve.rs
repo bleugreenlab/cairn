@@ -8,6 +8,7 @@ use crate::server::CairnCmd;
 
 const CAIRN_URI_PREFIX: &str = "cairn://";
 const CAIRN_HOME_PREFIX: &str = "cairn:~/";
+const CAIRN_PROJECT_PREFIX: &str = "cairn:@";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedTarget {
@@ -39,7 +40,10 @@ impl CairnCmd {
     /// the shorthand raw keeps that resolution current when a thread is renamed and
     /// also lets one pooled `cairn-cmd` serve call threads with different homes.
     fn resolve_target_with(&self, target: &str) -> Result<ResolvedTarget, String> {
-        if target == "cairn:~" || target.starts_with(CAIRN_HOME_PREFIX) {
+        if target == "cairn:~"
+            || target.starts_with(CAIRN_HOME_PREFIX)
+            || target.starts_with(CAIRN_PROJECT_PREFIX)
+        {
             return Ok(ResolvedTarget::CairnUri(target.to_string()));
         }
         if target.starts_with(CAIRN_URI_PREFIX) {
@@ -114,6 +118,14 @@ mod tests {
             mcp.resolve_read_target("cairn:~/diff?limit=5").unwrap(),
             "cairn:~/diff?limit=5"
         );
+    }
+
+    #[test]
+    fn project_relative_targets_pass_through_for_host_resolution() {
+        let mcp = create_test_mcp_with_home_uri(Some("cairn://p/CAIRN/1086/1/builder"));
+        for target in ["cairn:@", "cairn:@/issues?status=active", "cairn:@1086"] {
+            assert_eq!(mcp.resolve_read_target(target).unwrap(), target);
+        }
     }
 
     #[test]

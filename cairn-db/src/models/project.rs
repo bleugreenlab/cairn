@@ -125,7 +125,7 @@ pub struct MoveProject {
     pub team_id: String,
 }
 
-pub use cairn_worktree::PopulateConfig;
+pub use cairn_cell::PopulateConfig;
 
 /// One project check: a single command run at one cadence. Selectivity is
 /// expressed by a `{changedFiles}` or `{targets}` placeholder inside the

@@ -109,14 +109,22 @@ pub(crate) async fn submit_bug_report(
 
 async fn lookup_agent_type(db: &LocalDb, request: &McpCallbackRequest) -> DbResult<Option<String>> {
     if let Some(run_id) = request.run_id.as_deref() {
-        let run_id = run_id.to_string();
-        db.read(|conn| {
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "
+        lookup_agent_type_for_run(db, run_id).await
+    } else {
+        Ok(None)
+    }
+}
+
+async fn lookup_agent_type_for_run(db: &LocalDb, run_id: &str) -> DbResult<Option<String>> {
+    let run_id = run_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "
                         SELECT j.node_name,
                                CASE
+                                   WHEN j.thread_id IS NOT NULL THEN 'thread'
                                    WHEN j.issue_id IS NULL THEN 'project'
                                    ELSE 'implementation'
                                END
@@ -125,23 +133,53 @@ async fn lookup_agent_type(db: &LocalDb, request: &McpCallbackRequest) -> DbResu
                         WHERE r.id = ?1
                         LIMIT 1
                         ",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
+                    (run_id.as_str(),),
+                )
+                .await?;
 
-                rows.next()
-                    .await?
-                    .map(|row| {
-                        let job_name = row.opt_text(0)?;
-                        let job_type = row.text(1)?;
-                        Ok(job_name.or(Some(job_type)))
-                    })
-                    .transpose()
-                    .map(|value| value.flatten())
-            })
+            rows.next()
+                .await?
+                .map(|row| {
+                    let job_name = row.opt_text(0)?;
+                    let job_type = row.text(1)?;
+                    Ok(job_name.or(Some(job_type)))
+                })
+                .transpose()
+                .map(|value| value.flatten())
         })
+    })
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{storage::migrated_test_db, test_support::seed_thread_session};
+
+    #[tokio::test]
+    async fn thread_run_uses_thread_agent_label() {
+        let db = migrated_test_db("bug-report-thread-label.db").await;
+        let fixture = seed_thread_session(&db).await;
+        db.execute(
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at) VALUES ('thread-run', ?1, ?2, 'running', 1, 1)",
+            (fixture.project_id, fixture.session_job_id),
+        )
         .await
-    } else {
-        Ok(None)
+        .unwrap();
+
+        assert_eq!(
+            lookup_agent_type_for_run(&db, "thread-run").await.unwrap(),
+            Some("Thread".to_string())
+        );
+        db.execute(
+            "UPDATE jobs SET node_name=NULL WHERE id=?1",
+            (fixture.session_job_id,),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            lookup_agent_type_for_run(&db, "thread-run").await.unwrap(),
+            Some("thread".to_string())
+        );
     }
 }

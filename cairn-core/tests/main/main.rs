@@ -76,3 +76,4 @@ mod todos;
 mod transitions;
 mod turso_sync_roundtrip;
 mod watch_attention;
+mod write_home_relative_batch;

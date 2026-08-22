@@ -1,7 +1,7 @@
 use super::{
     current_target, model_catalog, ComponentInstaller, ComponentState, DictationMode, EngineState,
-    InstallEvent, ProtocolCommand, ProtocolEvent, Transcript, VoiceError, VoiceEvent, VoiceModel,
-    VoiceProcess, VoiceResult, VoiceStatus,
+    InstallEvent, ModelPurpose, ProtocolCommand, ProtocolEvent, Transcript, VoiceError, VoiceEvent,
+    VoiceModel, VoiceProcess, VoiceResult, VoiceStatus,
 };
 use crate::services::EventEmitter;
 use serde_json::Value;
@@ -17,6 +17,37 @@ const RELEASE_BASE: &str = "https://github.com/bleugreenlab/cairn/releases/downl
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 pub const VOICE_EVENT_NAME: &str = "voice-event";
 
+/// The engine's single live session, as far as this service knows.
+///
+/// The distinction that earns the third variant is between a session that is
+/// merely open and one that is being closed. An open session may be closed and
+/// replaced by a new dictation — a caller that lost its handle must not be able
+/// to wedge dictation for the life of the process. A closing one may not be
+/// treated as absent: the engine has not yet said it is done with it, so anyone
+/// admitted on the strength of a cleared handle would meet an engine that is
+/// still busy. Only `Idle` means the engine is free.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum StreamState {
+    #[default]
+    Idle,
+    Open(String),
+    Closing(String),
+}
+
+impl StreamState {
+    fn is_idle(&self) -> bool {
+        matches!(self, StreamState::Idle)
+    }
+
+    /// Whether this state is about `stream_id`, in either phase.
+    fn names(&self, stream_id: &str) -> bool {
+        match self {
+            StreamState::Open(id) | StreamState::Closing(id) => id == stream_id,
+            StreamState::Idle => false,
+        }
+    }
+}
+
 struct VoiceServiceInner {
     installer: ComponentInstaller,
     config_dir: PathBuf,
@@ -24,9 +55,13 @@ struct VoiceServiceInner {
     engine_override: Option<PathBuf>,
     enabled: AtomicBool,
     preferred_file_model: Mutex<VoiceModel>,
+    preferred_dictation_model: Mutex<VoiceModel>,
     dictation_mode: Mutex<DictationMode>,
     input_device_id: Mutex<Option<String>>,
     loaded_model: Mutex<Option<VoiceModel>>,
+    /// What the engine's single live session is doing, as far as this service
+    /// knows. See [`StreamState`].
+    stream_state: Mutex<StreamState>,
     shutting_down: AtomicBool,
     process: Mutex<Option<VoiceProcess>>,
     file_transcription_cancellations: Mutex<HashMap<String, Arc<Notify>>>,
@@ -51,12 +86,26 @@ impl VoiceService {
         app_version: impl Into<String>,
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
-        let app_version = app_version.into();
         // This escape hatch exists only in development/test builds. Production
         // always executes a checksum-pinned managed release artifact.
         let engine_override = cfg!(debug_assertions)
             .then(|| std::env::var_os("CAIRN_VOICE_ENGINE_PATH").map(PathBuf::from))
             .flatten();
+        Self::with_engine(data_dir, app_version, emitter, engine_override)
+    }
+
+    /// The same service with its engine binary named directly.
+    ///
+    /// A test drives a scripted engine through this rather than through the
+    /// environment variable, which is shared by every test in the binary and so
+    /// cannot describe one service's engine without describing them all.
+    fn with_engine(
+        data_dir: PathBuf,
+        app_version: impl Into<String>,
+        emitter: Arc<dyn EventEmitter>,
+        engine_override: Option<PathBuf>,
+    ) -> Self {
+        let app_version = app_version.into();
         let preferences = crate::config::settings::load_voice_preferences(&data_dir);
         let install_emitter = emitter.clone();
         let installer = ComponentInstaller::new(
@@ -104,9 +153,11 @@ impl VoiceService {
                 engine_override,
                 enabled: AtomicBool::new(preferences.enabled),
                 preferred_file_model: Mutex::new(preferences.preferred_file_model),
+                preferred_dictation_model: Mutex::new(preferences.preferred_dictation_model),
                 dictation_mode: Mutex::new(preferences.dictation_mode),
                 input_device_id: Mutex::new(preferences.input_device_id),
                 loaded_model: Mutex::new(None),
+                stream_state: Mutex::new(StreamState::Idle),
                 shutting_down: AtomicBool::new(false),
                 process: Mutex::new(None),
                 file_transcription_cancellations: Mutex::new(HashMap::new()),
@@ -159,6 +210,10 @@ impl VoiceServiceHandle {
     pub async fn preferred_file_model(&self) -> VoiceModel {
         *self.0.preferred_file_model.lock().await
     }
+
+    pub async fn preferred_dictation_model(&self) -> VoiceModel {
+        *self.0.preferred_dictation_model.lock().await
+    }
     pub fn begin_shutdown(&self) {
         self.0.shutting_down.store(true, Ordering::Release);
     }
@@ -185,6 +240,7 @@ impl VoiceServiceHandle {
             fast_model,
             accurate_model,
             preferred_file_model: *self.0.preferred_file_model.lock().await,
+            preferred_dictation_model: *self.0.preferred_dictation_model.lock().await,
             dictation_mode: *self.0.dictation_mode.lock().await,
             input_device_id: self.0.input_device_id.lock().await.clone(),
             detail: None,
@@ -205,22 +261,30 @@ impl VoiceServiceHandle {
         self.status().await
     }
 
-    pub async fn set_preferred_file_model(&self, model: VoiceModel) -> VoiceResult<VoiceStatus> {
+    /// Choose the model one kind of work uses, refusing a model that is not
+    /// installed and verified rather than remembering an unusable choice.
+    pub async fn set_preferred_model(
+        &self,
+        purpose: ModelPurpose,
+        model: VoiceModel,
+    ) -> VoiceResult<VoiceStatus> {
         let manifest = self.0.installer.manifest().await?;
-        let kind = match model {
-            VoiceModel::Fast => "model:fast",
-            VoiceModel::Accurate => "model:accurate",
-        };
         self.0
             .installer
-            .verify(find_component(&manifest.components, kind)?)
+            .verify(find_component(&manifest.components, model_kind(model))?)
             .await?;
         let mut preferences = self
             .preferences(self.0.enabled.load(Ordering::Acquire))
             .await;
-        preferences.preferred_file_model = model;
+        match purpose {
+            ModelPurpose::File => preferences.preferred_file_model = model,
+            ModelPurpose::Dictation => preferences.preferred_dictation_model = model,
+        }
         self.persist_preferences(preferences)?;
-        *self.0.preferred_file_model.lock().await = model;
+        match purpose {
+            ModelPurpose::File => *self.0.preferred_file_model.lock().await = model,
+            ModelPurpose::Dictation => *self.0.preferred_dictation_model.lock().await = model,
+        }
         self.status().await
     }
 
@@ -255,11 +319,21 @@ impl VoiceServiceHandle {
     ) -> VoiceResult<Transcript> {
         let request_id = request_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let cancellation = Arc::new(Notify::new());
-        self.0
-            .file_transcription_cancellations
-            .lock()
-            .await
-            .insert(request_id.clone(), cancellation.clone());
+        {
+            // Declined rather than queued. The engine services one thing at a
+            // time, so parking here would hold the process away from a live
+            // session's audio for the length of a file — and a dictation UI
+            // buffers only seconds of capture before it starts discarding the
+            // front of the user's sentence to stay bounded. Both claims are
+            // taken under this same pair of locks, in this order, so a file job
+            // and a dictation start racing each other cannot both see the
+            // engine free.
+            let mut cancellations = self.0.file_transcription_cancellations.lock().await;
+            if !self.0.stream_state.lock().await.is_idle() {
+                return Err(VoiceError::Busy);
+            }
+            cancellations.insert(request_id.clone(), cancellation.clone());
+        }
         let active = Arc::new(AtomicBool::new(false));
         let active_request = active.clone();
         *self.0.engine_state.lock().await = EngineState::Busy;
@@ -336,21 +410,77 @@ impl VoiceServiceHandle {
 
     pub async fn stream_start(&self) -> VoiceResult<String> {
         let stream_id = Uuid::new_v4().to_string();
+        let stale = {
+            let cancellations = self.0.file_transcription_cancellations.lock().await;
+            if !cancellations.is_empty() {
+                return Err(VoiceError::Busy);
+            }
+            let mut state = self.0.stream_state.lock().await;
+            match &*state {
+                // A close is in flight. The engine has not said it is done with
+                // the previous session, so this one cannot be opened on the
+                // assumption that it is — and unlike a stale handle, this
+                // resolves on its own in a moment.
+                StreamState::Closing(_) => return Err(VoiceError::Busy),
+                StreamState::Open(open) => {
+                    let stale = open.clone();
+                    *state = StreamState::Open(stream_id.clone());
+                    Some(stale)
+                }
+                StreamState::Idle => {
+                    *state = StreamState::Open(stream_id.clone());
+                    None
+                }
+            }
+        };
+        // A session whose owner lost its handle would refuse every dictation
+        // that follows with `stream_already_active`, for the life of the
+        // process. This service minted that id, so it can always close what the
+        // caller can no longer name.
+        if let Some(stale) = stale {
+            let _ = self.end_stream(stale).await;
+        }
+
+        let model = self.preferred_dictation_model().await;
         let request_id = Uuid::new_v4().to_string();
-        let process = self.process_for(VoiceModel::Fast).await?;
-        let result = process
-            .command(
-                &ProtocolCommand::BeginStream {
-                    request_id: request_id.clone(),
-                    stream_id: stream_id.clone(),
-                    options: Value::Object(Default::default()),
-                },
-                &request_id,
-            )
-            .await;
-        drop(process);
+        let result = async {
+            let process = self.process_for(model).await?;
+            let outcome = process
+                .command(
+                    &ProtocolCommand::BeginStream {
+                        request_id: request_id.clone(),
+                        stream_id: stream_id.clone(),
+                        // The engine's defaults, for every model. A slower
+                        // model needs no slower cadence: a caller keeps one
+                        // chunk in flight at a time and an `audioChunk` is only
+                        // acknowledged once the partial it made due has been
+                        // decoded, so the feed already paces itself against
+                        // whatever the model can do. Measured on an M4 Max over
+                        // 30 s of speech, raising the interval to 8 s for the
+                        // Accurate model cut partials from eight to three and
+                        // left the lag where it was — fewer updates, no fresher.
+                        options: Value::Object(Default::default()),
+                    },
+                    &request_id,
+                )
+                .await;
+            drop(process);
+            outcome
+        }
+        .await;
         self.invalidate_on_transport(&result).await;
-        result?;
+        if let Err(error) = result {
+            self.forget_stream(&stream_id).await;
+            if matches!(&error, VoiceError::Request { code, .. } if code == "stream_already_active")
+            {
+                // The engine is holding a session this service does not know
+                // about, so the two have diverged and only a fresh process
+                // reconciles them. A recoverable `Request` error must never be
+                // able to strand dictation permanently.
+                self.recycle_process().await;
+            }
+            return Err(error);
+        }
         Ok(stream_id)
     }
 
@@ -379,21 +509,62 @@ impl VoiceServiceHandle {
     }
 
     async fn end_stream(&self, stream_id: String) -> VoiceResult<Transcript> {
+        // Marked closing rather than cleared. Between here and the engine's
+        // answer the session is neither open nor gone, and admitting a file
+        // transcription on the strength of a cleared handle would park it on
+        // the process mutex this close is about to hold — the exact behaviour
+        // the decline exists to prevent.
+        {
+            let mut state = self.0.stream_state.lock().await;
+            if matches!(&*state, StreamState::Open(open) if open == &stream_id) {
+                *state = StreamState::Closing(stream_id.clone());
+            }
+        }
+
         let request_id = Uuid::new_v4().to_string();
         let mut guard = self.0.process.lock().await;
-        let process = guard.as_mut().ok_or(VoiceError::NotInstalled)?;
-        let result = process
-            .request(
-                &ProtocolCommand::EndStream {
-                    request_id: request_id.clone(),
-                    stream_id,
-                },
-                &request_id,
-            )
-            .await;
+        let result = match guard.as_mut() {
+            Some(process) => {
+                process
+                    .request(
+                        &ProtocolCommand::EndStream {
+                            request_id: request_id.clone(),
+                            stream_id: stream_id.clone(),
+                        },
+                        &request_id,
+                    )
+                    .await
+            }
+            None => Err(VoiceError::NotInstalled),
+        };
         drop(guard);
         self.invalidate_on_transport(&result).await;
+        if result.is_err() {
+            // The engine may still be holding this session, so merely forgetting
+            // it would advertise an engine that is not actually free. Recycling
+            // the process is what makes it free in fact; only then is the handle
+            // safe to drop, so the two become idle together.
+            self.recycle_process().await;
+        }
+        self.forget_stream(&stream_id).await;
         result
+    }
+
+    /// Give up a stream handle, leaving a newer session's handle alone.
+    async fn forget_stream(&self, stream_id: &str) {
+        let mut state = self.0.stream_state.lock().await;
+        if state.names(stream_id) {
+            *state = StreamState::Idle;
+        }
+    }
+
+    /// Drop the engine process so the next request builds a fresh one, and
+    /// forget the state that only described the process that is going away.
+    async fn recycle_process(&self) {
+        self.0.process.lock().await.take();
+        *self.0.loaded_model.lock().await = None;
+        *self.0.stream_state.lock().await = StreamState::Idle;
+        *self.0.engine_state.lock().await = EngineState::Restarting;
     }
 
     fn ensure_available(&self) -> VoiceResult<()> {
@@ -409,6 +580,7 @@ impl VoiceServiceHandle {
         super::VoicePreferences {
             enabled,
             preferred_file_model: *self.0.preferred_file_model.lock().await,
+            preferred_dictation_model: *self.0.preferred_dictation_model.lock().await,
             dictation_mode: *self.0.dictation_mode.lock().await,
             input_device_id: self.0.input_device_id.lock().await.clone(),
         }
@@ -435,6 +607,7 @@ impl VoiceServiceHandle {
         if process_crashed {
             guard.take();
             *self.0.loaded_model.lock().await = None;
+            *self.0.stream_state.lock().await = StreamState::Idle;
             *self.0.engine_state.lock().await = EngineState::Restarting;
             let attempt = self
                 .0
@@ -453,11 +626,7 @@ impl VoiceServiceHandle {
                 self.0.installer.verify(engine).await?;
                 engine.path.clone()
             };
-            let model_kind = match model {
-                VoiceModel::Fast => "model:fast",
-                VoiceModel::Accurate => "model:accurate",
-            };
-            let model_component = find_component(&manifest.components, model_kind)?;
+            let model_component = find_component(&manifest.components, model_kind(model))?;
             self.0.installer.verify(model_component).await?;
             *self.0.engine_state.lock().await = EngineState::Starting;
             let emitter = self.0.emitter.clone();
@@ -500,11 +669,7 @@ impl VoiceServiceHandle {
             *self.0.loaded_model.lock().await = Some(model);
         } else if *self.0.loaded_model.lock().await != Some(model) {
             let manifest = self.0.installer.manifest().await?;
-            let model_kind = match model {
-                VoiceModel::Fast => "model:fast",
-                VoiceModel::Accurate => "model:accurate",
-            };
-            let component = find_component(&manifest.components, model_kind)?;
+            let component = find_component(&manifest.components, model_kind(model))?;
             self.0.installer.verify(component).await?;
             guard
                 .as_mut()
@@ -520,9 +685,7 @@ impl VoiceServiceHandle {
 
     async fn invalidate_on_transport<T>(&self, result: &VoiceResult<T>) {
         if matches!(result, Err(VoiceError::Transport(_))) {
-            self.0.process.lock().await.take();
-            *self.0.loaded_model.lock().await = None;
-            *self.0.engine_state.lock().await = EngineState::Restarting;
+            self.recycle_process().await;
         }
     }
 
@@ -537,6 +700,9 @@ impl VoiceServiceHandle {
         if let Ok(mut loaded_model) = self.0.loaded_model.try_lock() {
             *loaded_model = None;
         }
+        if let Ok(mut stream_state) = self.0.stream_state.try_lock() {
+            *stream_state = StreamState::Idle;
+        }
         if let Some(process) = process {
             process.shutdown_until(deadline).await?;
         }
@@ -544,6 +710,14 @@ impl VoiceServiceHandle {
             *engine_state = EngineState::Stopped;
         }
         Ok(())
+    }
+}
+
+/// The manifest kind a model is installed under.
+fn model_kind(model: VoiceModel) -> &'static str {
+    match model {
+        VoiceModel::Fast => "model:fast",
+        VoiceModel::Accurate => "model:accurate",
     }
 }
 
@@ -628,5 +802,404 @@ fn forward_protocol_event(emitter: &dyn EventEmitter, event: ProtocolEvent) {
             }),
         ),
         _ => {}
+    }
+}
+
+/// Service-level tests against a scripted engine.
+///
+/// These are about who is allowed to use the engine and when — the questions
+/// that only exist above the protocol, where a lost stream handle or a file job
+/// arriving mid-dictation decides whether the next dictation works at all.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::internal::services::testing::CapturingEmitter;
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    const APP_VERSION: &str = "0.0.0-test";
+
+    /// The engine every script starts from: it identifies itself, greets, logs
+    /// each command to `$LOG`, and answers `loadModel`.
+    ///
+    /// `$id` is the request's own correlation id, lifted out of the command.
+    /// Answers carry it back because the supervisor discards any event that is
+    /// not about the request it is waiting on — a fixed id would simply never
+    /// arrive.
+    const PREAMBLE: &str = r#"#!/bin/sh
+LOG='@LOG@'
+if [ "$1" = '--distribution-info' ]; then
+  printf '{"name":"cairn-voice","version":"@VERSION@","protocolVersion":@PROTOCOL@}\n'
+  exit 0
+fi
+printf '{"type":"hello","protocolVersion":@PROTOCOL@,"engineVersion":"@VERSION@"}\n'
+while IFS= read -r command; do
+  printf '%s\n' "$command" >> "$LOG"
+  id=$(printf '%s' "$command" | sed -n 's/.*"requestId":"\([^"]*\)".*/\1/p')
+  case "$command" in
+    *'"type":"loadModel"'*)
+      printf '{"type":"ready","requestId":"%s","model":{"path":"m","sizeBytes":1,"multilingual":true,"modelType":"test"}}\n' "$id" ;;
+@SCRIPT@
+  esac
+done
+"#;
+
+    /// Opens and closes sessions, and transcribes files, all without complaint.
+    const COOPERATIVE: &str = r#"    *'"type":"beginStream"'*)
+      printf '{"type":"accepted","requestId":"%s"}\n' "$id" ;;
+    *'"type":"endStream"'*)
+      printf '{"type":"done","requestId":"%s","text":"","segments":[],"audioDurationMs":0}\n' "$id" ;;
+    *'"type":"transcribeFile"'*)
+      printf '{"type":"done","requestId":"%s","text":"a file","segments":[],"audioDurationMs":1}\n' "$id" ;;"#;
+
+    fn scripted_engine(root: &Path, script: &str) -> PathBuf {
+        let executable = root.join("fake-voice-engine");
+        let body = PREAMBLE
+            .replace("@LOG@", &root.join("commands.log").display().to_string())
+            .replace("@VERSION@", APP_VERSION)
+            .replace("@PROTOCOL@", &crate::voice::PROTOCOL_VERSION.to_string())
+            .replace("@SCRIPT@", script);
+        std::fs::write(&executable, body).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        executable
+    }
+
+    /// Managed model components the installer will actually verify: real files
+    /// under the managed root, with real sizes and digests.
+    fn manifest(root: &Path) -> Value {
+        std::fs::create_dir_all(root.join("models")).unwrap();
+        let components: Vec<Value> = ["model:fast", "model:accurate"]
+            .iter()
+            .map(|kind| {
+                let id = kind.replace(':', "-");
+                let path = root.join("models").join(&id);
+                std::fs::write(&path, kind.as_bytes()).unwrap();
+                serde_json::json!({
+                    "kind": kind,
+                    "id": id,
+                    "target": Value::Null,
+                    "sizeBytes": kind.len(),
+                    "sha256": format!("{:x}", Sha256::digest(kind.as_bytes())),
+                    "path": path,
+                })
+            })
+            .collect();
+        serde_json::json!({ "components": components })
+    }
+
+    struct Harness {
+        directory: tempfile::TempDir,
+        service: VoiceService,
+    }
+
+    impl Harness {
+        fn new(script: &str) -> Harness {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().to_path_buf();
+            let engine = scripted_engine(&root, script);
+            std::fs::write(
+                root.join("voice-components.json"),
+                serde_json::to_vec(&manifest(&root)).unwrap(),
+            )
+            .unwrap();
+            // Enabled through the settings file rather than through `enable()`,
+            // which downloads.
+            crate::config::settings::set_voice_preferences(
+                &root,
+                &super::super::VoicePreferences {
+                    enabled: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            Harness {
+                service: VoiceService::with_engine(
+                    root,
+                    APP_VERSION,
+                    Arc::new(CapturingEmitter::new()),
+                    Some(engine),
+                ),
+                directory,
+            }
+        }
+
+        fn voice(&self) -> VoiceServiceHandle {
+            self.service.handle()
+        }
+
+        /// Every command line the engine has received, in order.
+        fn commands(&self) -> Vec<String> {
+            std::fs::read_to_string(self.directory.path().join("commands.log"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// How many commands of one kind the engine has received, across every
+        /// process that has served this harness.
+        fn count_command(&self, kind: &str) -> usize {
+            self.commands()
+                .iter()
+                .filter(|line| line.contains(&format!("\"type\":\"{kind}\"")))
+                .count()
+        }
+
+        /// The most recent command of one kind the engine received.
+        fn last_command(&self, kind: &str) -> String {
+            self.commands()
+                .into_iter()
+                .rev()
+                .find(|line| line.contains(&format!("\"type\":\"{kind}\"")))
+                .unwrap_or_else(|| panic!("no {kind} command was sent"))
+        }
+    }
+
+    /// The pin the issue asks for: the selector must actually decide.
+    #[tokio::test]
+    async fn a_live_session_opens_with_the_model_dictation_is_set_to() {
+        let harness = Harness::new(COOPERATIVE);
+        let voice = harness.voice();
+
+        let first = voice.stream_start().await.expect("session opens");
+        voice.stream_finish(first).await.expect("session closes");
+        assert!(
+            harness.last_command("loadModel").contains("model-fast"),
+            "dictation defaults to Fast: {:?}",
+            harness.last_command("loadModel")
+        );
+
+        voice
+            .set_preferred_model(ModelPurpose::Dictation, VoiceModel::Accurate)
+            .await
+            .expect("the preference is accepted");
+        let second = voice.stream_start().await.expect("session opens");
+        voice.stream_finish(second).await.expect("session closes");
+
+        assert!(
+            harness.last_command("loadModel").contains("model-accurate"),
+            "the next session must open on the chosen model: {:?}",
+            harness.last_command("loadModel")
+        );
+        assert_eq!(
+            voice.preferred_file_model().await,
+            VoiceModel::Fast,
+            "choosing a dictation model must not move the file setting"
+        );
+    }
+
+    /// The wedge: dictation must survive a session nobody closed.
+    ///
+    /// A webview that reloads mid-stream, or a flush that throws, destroys the
+    /// only handle the caller had. The engine still holds that session and
+    /// refuses every `beginStream` after it — with a `Request` error, which
+    /// never recycles the process — so dictation stayed dead until the app
+    /// restarted. This service minted the id, so it can always close it.
+    #[tokio::test]
+    async fn a_stream_nobody_closed_does_not_wedge_the_next_dictation() {
+        let harness = Harness::new(COOPERATIVE);
+        let voice = harness.voice();
+
+        let abandoned = voice.stream_start().await.expect("first session opens");
+        // No finish, no cancel: exactly what a reloaded webview leaves behind.
+        let replacement = voice.stream_start().await.expect("dictation still works");
+        assert_ne!(abandoned, replacement);
+
+        let commands = harness.commands();
+        let closed = commands
+            .iter()
+            .position(|line| line.contains("endStream") && line.contains(&abandoned))
+            .expect("the abandoned session must be closed");
+        let reopened = commands
+            .iter()
+            .position(|line| line.contains("beginStream") && line.contains(&replacement))
+            .expect("the replacement session must be opened");
+        assert!(
+            closed < reopened,
+            "the stale session must be closed before the new one opens: {commands:?}"
+        );
+    }
+
+    /// Defence in depth for a divergence this service cannot otherwise explain.
+    #[tokio::test]
+    async fn a_stream_already_active_refusal_rebuilds_the_engine() {
+        // Refuses the first `beginStream` and accepts every one after. The
+        // marker outlives the process, so the retry can only succeed if a fresh
+        // engine was spawned to serve it.
+        let harness = Harness::new(
+            r#"    *'"type":"beginStream"'*)
+      if [ -e "$LOG.refused" ]; then
+        printf '{"type":"accepted","requestId":"%s"}\n' "$id"
+      else
+        : > "$LOG.refused"
+        printf '{"type":"error","requestId":"%s","code":"stream_already_active","message":"a stream is already open"}\n' "$id"
+      fi ;;"#,
+        );
+        let voice = harness.voice();
+
+        let error = voice
+            .stream_start()
+            .await
+            .expect_err("the engine refuses the first attempt");
+        assert!(
+            matches!(&error, VoiceError::Request { code, .. } if code == "stream_already_active"),
+            "{error:?}"
+        );
+        // A `Request` error never recycles the process on its own. Unless the
+        // service rebuilds the engine here, dictation is over for the life of
+        // the runner.
+        voice
+            .stream_start()
+            .await
+            .expect("the next attempt gets a clean engine");
+    }
+
+    /// The engine services one thing at a time, so say so.
+    #[tokio::test]
+    async fn a_file_transcription_is_declined_while_dictation_is_live() {
+        let harness = Harness::new(COOPERATIVE);
+        let voice = harness.voice();
+        let stream = voice.stream_start().await.expect("session opens");
+
+        let error = voice
+            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
+            .await
+            .expect_err("a file job must not run under a live session");
+        assert!(matches!(error, VoiceError::Busy), "{error:?}");
+
+        // Declining is not the same as breaking: closing the session frees it.
+        voice.stream_finish(stream).await.expect("session finishes");
+        voice
+            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
+            .await
+            .expect("the engine is free once the session is closed");
+    }
+
+    /// The other direction, which used to park instead of declining.
+    ///
+    /// A file job started mid-dictation held the process for its whole
+    /// duration. The live session's audio queued behind it while the UI's
+    /// bounded capture buffer discarded the front of the sentence to stay
+    /// bounded, and the session could not even be closed inside the desktop
+    /// proxy's timeout.
+    #[tokio::test]
+    async fn dictation_is_declined_while_a_file_transcription_is_in_flight() {
+        let harness = Harness::new(
+            r#"    *'"type":"beginStream"'*)
+      printf '{"type":"accepted","requestId":"%s"}\n' "$id" ;;
+    *'"type":"endStream"'*)
+      printf '{"type":"done","requestId":"%s","text":"","segments":[],"audioDurationMs":0}\n' "$id" ;;
+    *'"type":"transcribeFile"'*)
+      sleep 1
+      printf '{"type":"done","requestId":"%s","text":"a file","segments":[],"audioDurationMs":1}\n' "$id" ;;"#,
+        );
+        let voice = harness.voice();
+
+        let transcribing = {
+            let voice = voice.clone();
+            tokio::spawn(async move {
+                voice
+                    .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
+                    .await
+            })
+        };
+        // Long enough for the file job to claim the engine, well short of the
+        // second it holds it for.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let error = voice
+            .stream_start()
+            .await
+            .expect_err("dictation must decline rather than park behind the file");
+        assert!(matches!(error, VoiceError::Busy), "{error:?}");
+
+        transcribing.await.unwrap().expect("the file job completes");
+        voice
+            .stream_start()
+            .await
+            .expect("dictation works again once the engine is free");
+    }
+
+    /// A session being closed is not a session that is gone.
+    ///
+    /// The engine has not said it is done with it yet, and the close is holding
+    /// the process while it asks. Admitting anyone on the strength of a cleared
+    /// handle would park them behind exactly the work the decline exists to
+    /// keep them away from.
+    #[tokio::test]
+    async fn nothing_is_admitted_while_a_close_is_still_in_flight() {
+        let harness = Harness::new(
+            r#"    *'"type":"beginStream"'*)
+      printf '{"type":"accepted","requestId":"%s"}\n' "$id" ;;
+    *'"type":"endStream"'*)
+      sleep 1
+      printf '{"type":"done","requestId":"%s","text":"","segments":[],"audioDurationMs":0}\n' "$id" ;;
+    *'"type":"transcribeFile"'*)
+      printf '{"type":"done","requestId":"%s","text":"a file","segments":[],"audioDurationMs":1}\n' "$id" ;;"#,
+        );
+        let voice = harness.voice();
+        let stream = voice.stream_start().await.expect("session opens");
+
+        let closing = {
+            let voice = voice.clone();
+            tokio::spawn(async move { voice.stream_finish(stream).await })
+        };
+        // Inside the second the engine takes to answer the close.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let file = voice
+            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
+            .await
+            .expect_err("a file job must not be admitted mid-close");
+        assert!(matches!(file, VoiceError::Busy), "{file:?}");
+        let dictation = voice
+            .stream_start()
+            .await
+            .expect_err("a session must not open onto an engine still closing one");
+        assert!(matches!(dictation, VoiceError::Busy), "{dictation:?}");
+
+        closing.await.unwrap().expect("the close completes");
+
+        // And the decline was about this moment, not a permanent state.
+        voice
+            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
+            .await
+            .expect("the engine is free once the close lands");
+    }
+
+    /// A close that fails leaves the engine possibly still holding the session,
+    /// so the handle cannot simply be dropped: the process is recycled first,
+    /// and only a genuinely fresh engine is advertised as free.
+    #[tokio::test]
+    async fn a_close_that_fails_recycles_the_engine_before_admitting_anyone() {
+        let harness = Harness::new(
+            r#"    *'"type":"beginStream"'*)
+      printf '{"type":"accepted","requestId":"%s"}\n' "$id" ;;
+    *'"type":"endStream"'*)
+      printf '{"type":"error","requestId":"%s","code":"unknown_stream","message":"no such stream"}\n' "$id" ;;
+    *'"type":"transcribeFile"'*)
+      printf '{"type":"done","requestId":"%s","text":"a file","segments":[],"audioDurationMs":1}\n' "$id" ;;"#,
+        );
+        let voice = harness.voice();
+
+        let stream = voice.stream_start().await.expect("session opens");
+        let loads_before = harness.count_command("loadModel");
+        voice
+            .stream_finish(stream)
+            .await
+            .expect_err("the engine refuses the close");
+
+        // Admitted, because the engine that might still hold the old session
+        // has been replaced rather than merely forgotten — a second `loadModel`
+        // is a second process.
+        voice
+            .transcribe_file(Path::new("/tmp/whatever.wav"), VoiceModel::Fast, None)
+            .await
+            .expect("a fresh engine serves the next request");
+        assert!(
+            harness.count_command("loadModel") > loads_before,
+            "a failed close must recycle the process, not just drop the handle: {:?}",
+            harness.commands()
+        );
     }
 }

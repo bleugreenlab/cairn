@@ -127,6 +127,20 @@ pub struct AppliedCompaction {
     pub recency_start_block: i64,
     /// The marks this generation consumed, by child issue id.
     pub consumed_child_issue_ids: Vec<String>,
+    pub minted_eras: Vec<EraMint>,
+    pub arc_bytes: i64,
+    pub eras_through_seq: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EraMint {
+    pub start_block: i64,
+    pub end_block: i64,
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub summary: String,
+    pub source_tokens: i64,
+    pub children: Vec<ChildMark>,
 }
 
 /// Record that `mark`'s child reached a terminal status under `job_id`.
@@ -297,12 +311,44 @@ pub async fn persist_generation(
                 None => 1,
             };
 
+            let mut era_seq_rows = conn
+                .query(
+                    "SELECT COALESCE(MAX(seq), 0) FROM thread_eras WHERE job_id = ?1",
+                    params![job_id.as_str()],
+                )
+                .await?;
+            let mut eras_through_seq = era_seq_rows.next().await?
+                .map(|row| row.i64(0)).transpose()?.unwrap_or(0);
+            for mint in &applied.minted_eras {
+                eras_through_seq += 1;
+                conn.execute(
+                    "INSERT INTO thread_eras (
+                         job_id, seq, start_block, end_block, started_at, ended_at,
+                         summary, summary_status, source_tokens, minted_generation, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fallback', ?8, ?9, ?10)",
+                    params![job_id.as_str(), eras_through_seq, mint.start_block, mint.end_block,
+                        mint.started_at, mint.ended_at, mint.summary.as_str(),
+                        mint.source_tokens, generation, now],
+                ).await?;
+                for child in &mint.children {
+                    conn.execute(
+                        "INSERT INTO thread_era_children (
+                             job_id, era_seq, child_issue_id, child_issue_uri,
+                             child_title, final_status
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![job_id.as_str(), eras_through_seq, child.child_issue_id.as_str(),
+                            child.child_issue_uri.as_str(), child.child_title.as_str(),
+                            child.final_status.as_str()],
+                    ).await?;
+                }
+            }
+
             conn.execute(
                 "INSERT INTO thread_compactions (
                      job_id, generation, source_session_id, compacted_through_block,
                      recency_start_block, seed_bytes, source_bytes, candidate_bytes,
-                     trigger, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                     trigger, created_at, arc_bytes, eras_through_seq
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     job_id.as_str(),
                     generation,
@@ -313,7 +359,9 @@ pub async fn persist_generation(
                     applied.source_bytes,
                     applied.candidate_bytes,
                     applied.trigger.as_db(),
-                    now
+                    now,
+                    applied.arc_bytes,
+                    applied.eras_through_seq.unwrap_or(eras_through_seq)
                 ],
             )
             .await?;
@@ -340,6 +388,15 @@ pub async fn persist_generation(
                 )
                 .await?;
             }
+
+            // Entries are transient fold boundaries for only the newest generation.
+            // Eras carry settled history generation-independently, so retaining a
+            // full copied list per generation would recreate quadratic storage.
+            conn.execute(
+                "DELETE FROM thread_compaction_entries WHERE job_id = ?1 AND generation <> ?2",
+                params![job_id.as_str(), generation],
+            )
+            .await?;
 
             for child_issue_id in applied.consumed_child_issue_ids.iter() {
                 conn.execute(
@@ -412,6 +469,9 @@ mod tests {
             compacted_through_block: Some(4),
             recency_start_block: 5,
             consumed_child_issue_ids: consumed,
+            minted_eras: Vec::new(),
+            arc_bytes: 1_000,
+            eras_through_seq: None,
         }
     }
 

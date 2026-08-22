@@ -6,24 +6,29 @@ use std::future::Future;
 use std::sync::Arc;
 
 pub(in crate::backends) fn run_backend_db<T, Fut>(
-    backend_name: &'static str,
+    backend_name: &str,
     future: Fut,
 ) -> Result<T, String>
 where
     T: Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
+    // Copied because the name crosses into the spawned thread below. Taking a
+    // borrow rather than a `'static` literal is what lets a run be attributed
+    // to a provider its operator named.
+    let backend_name = backend_name.to_string();
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(move || run_backend_db_future(backend_name, future))
+        let panicked = format!("{backend_name} backend database task panicked");
+        std::thread::spawn(move || run_backend_db_future(&backend_name, future))
             .join()
-            .map_err(|_| format!("{backend_name} backend database task panicked"))?
+            .map_err(|_| panicked)?
     } else {
-        run_backend_db_future(backend_name, future)
+        run_backend_db_future(&backend_name, future)
     }
 }
 
 fn run_backend_db_future<T>(
-    backend_name: &'static str,
+    backend_name: &str,
     future: impl Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     tokio::runtime::Builder::new_current_thread()
@@ -47,7 +52,7 @@ fn run_backend_db_future<T>(
 /// silently writing the transcript into the private database. For a local run
 /// the private DB always carries the row, so this is a strict no-op.
 pub(in crate::backends) fn resolve_run_db(
-    backend_name: &'static str,
+    backend_name: &str,
     orch: &Orchestrator,
     run_id: &str,
 ) -> Result<Arc<LocalDb>, String> {
@@ -61,7 +66,7 @@ pub(in crate::backends) fn resolve_run_db(
 }
 
 pub(in crate::backends) fn transition_run_to_live(
-    backend_name: &'static str,
+    backend_name: &str,
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
     run_id: &str,
@@ -128,7 +133,7 @@ pub(in crate::backends) fn transition_run_to_live(
 }
 
 pub(in crate::backends) fn set_session_backend_id(
-    backend_name: &'static str,
+    backend_name: &str,
     db: &Arc<LocalDb>,
     session_id: &str,
     backend_id: &str,
@@ -159,7 +164,7 @@ pub(in crate::backends) fn set_session_backend_id(
 }
 
 pub(in crate::backends) fn run_job_id(
-    backend_name: &'static str,
+    backend_name: &str,
     db: &Arc<LocalDb>,
     run_id: &str,
 ) -> Option<String> {
@@ -193,7 +198,7 @@ pub(in crate::backends) fn run_job_id(
 }
 
 pub(in crate::backends) fn run_status(
-    backend_name: &'static str,
+    backend_name: &str,
     db: &Arc<LocalDb>,
     run_id: &str,
 ) -> Option<String> {
@@ -227,7 +232,7 @@ pub(in crate::backends) fn run_status(
 }
 
 pub(in crate::backends) fn is_task_spawned_run(
-    backend_name: &'static str,
+    backend_name: &str,
     db: &Arc<LocalDb>,
     run_id: &str,
 ) -> bool {

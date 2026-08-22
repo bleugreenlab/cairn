@@ -10,6 +10,7 @@ pub mod dev_instance_protocol;
 pub mod executor_protocol;
 pub mod identity;
 pub mod ids;
+pub mod imports;
 pub mod logging;
 pub mod maintenance;
 pub mod memory;

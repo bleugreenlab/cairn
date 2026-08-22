@@ -17,7 +17,6 @@ pub(crate) fn create_test_mcp_with_callback_url(
         "/test/path".to_string(),
         None,
         None,
-        vec![],
         home_uri.map(str::to_string),
     )
 }

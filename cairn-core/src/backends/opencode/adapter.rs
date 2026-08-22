@@ -74,11 +74,11 @@ pub(super) struct OpenCodeAdapter;
 impl WireAdapter for OpenCodeAdapter {
     type Message = ChatMessage;
 
-    fn backend_key(&self) -> &'static str {
+    fn backend_key(&self) -> &str {
         OPENCODE_BACKEND_KEY
     }
 
-    fn backend_name(&self) -> &'static str {
+    fn backend_name(&self) -> &str {
         OPENCODE_BACKEND_NAME
     }
 

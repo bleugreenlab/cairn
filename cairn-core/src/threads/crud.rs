@@ -225,46 +225,66 @@ pub async fn create(db: &LocalDb, input: CreateThread) -> Result<Thread, CairnEr
 /// back rather than leaving a thread describing an agent it never adopted, and a
 /// definition that lands is guaranteed to have had its derived trigger index
 /// rebuilt before this returns.
-pub async fn update(db: &LocalDb, input: UpdateThread) -> Result<Thread, CairnError> {
-    let current = get(db, &input.id)
-        .await?
-        .ok_or_else(|| CairnError::Internal("thread not found".into()))?;
-    let name = input.name.unwrap_or(current.name);
-    validate_thread_name(&name).map_err(CairnError::Internal)?;
-    let jurisdiction = input.jurisdiction.unwrap_or(current.jurisdiction);
+#[derive(Debug, Clone)]
+pub struct ThreadUpdate {
+    pub thread: Thread,
+    pub previous: Thread,
+}
+
+pub async fn update(db: &LocalDb, input: UpdateThread) -> Result<ThreadUpdate, CairnError> {
+    if let Some(name) = input.name.as_deref() {
+        validate_thread_name(name).map_err(CairnError::Internal)?;
+    }
     let definition_written = input.definition.is_some();
-    let definition = input.definition.unwrap_or(current.definition);
-    if let Some(value) = definition.as_deref() {
+    if let Some(value) = input.definition.as_ref().and_then(|value| value.as_deref()) {
         super::resolve_thread_definition(Some(value)).map_err(CairnError::Internal)?;
     }
-    let status = input.status.unwrap_or(current.status);
-    // Reopening is the moment routing comes back, so it is also the moment the
-    // session and its derived trigger index have to exist again: a thread whose
-    // definition changed while it was closed would otherwise stay deaf to its own
-    // triggers until something else happened to prompt it.
-    let reopening = status.is_active() && !current.status.is_active();
     let id = input.id;
+    let input_name = input.name;
+    let input_jurisdiction = input.jurisdiction;
+    let input_definition = input.definition;
+    let input_status = input.status;
     let model = input.model;
     db.write(|conn| {
-        let name = name.clone();
-        let jurisdiction = jurisdiction.clone();
-        let definition = definition.clone();
         let id = id.clone();
+        let input_name = input_name.clone();
+        let input_jurisdiction = input_jurisdiction.clone();
+        let input_definition = input_definition.clone();
+        let input_status = input_status.clone();
         let model = model.clone();
         Box::pin(async move {
-        conn.execute(
-            "UPDATE threads SET name=?1, jurisdiction=?2, definition=?3, status=?4, updated_at=unixepoch() WHERE id=?5",
-            params![name, jurisdiction, definition, status.as_str(), id.as_str()],
-        ).await?;
-        if status.is_active() && (definition_written || reopening) {
-            super::ensure_thread_session_conn(conn, &id, None).await?;
-        }
-        if let Some(model) = model.as_ref() {
-            set_session_model_conn(conn, &id, model).await?;
-        }
-        get_conn(conn, &id).await?.ok_or_else(|| DbError::Row("updated thread was not found".into()))
+            // The predecessor and update share one serialized write transaction.
+            // Rename notifications use this exact row as their old address, so a
+            // read outside the transaction could make overlapping renames both
+            // claim the same stale predecessor and strand name-addressed panes.
+            let previous = get_conn(conn, &id)
+                .await?
+                .ok_or_else(|| DbError::Row("thread not found".into()))?;
+            let name = input_name.unwrap_or_else(|| previous.name.clone());
+            let jurisdiction =
+                input_jurisdiction.unwrap_or_else(|| previous.jurisdiction.clone());
+            let definition = input_definition.unwrap_or_else(|| previous.definition.clone());
+            let status = input_status.unwrap_or_else(|| previous.status.clone());
+            let reopening = status.is_active() && !previous.status.is_active();
+
+            conn.execute(
+                "UPDATE threads SET name=?1, jurisdiction=?2, definition=?3, status=?4, updated_at=unixepoch() WHERE id=?5",
+                params![name, jurisdiction, definition, status.as_str(), id.as_str()],
+            ).await?;
+            if status.is_active() && (definition_written || reopening) {
+                super::ensure_thread_session_conn(conn, &id, None).await?;
+            }
+            if let Some(model) = model.as_ref() {
+                set_session_model_conn(conn, &id, model).await?;
+            }
+            let thread = get_conn(conn, &id)
+                .await?
+                .ok_or_else(|| DbError::Row("updated thread was not found".into()))?;
+            Ok(ThreadUpdate { thread, previous })
         })
-    }).await.map_err(Into::into)
+    })
+    .await
+    .map_err(Into::into)
 }
 
 /// Re-point a thread's session at another model.
@@ -808,8 +828,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(updated.name, thread.name, "the thread row is untouched");
-        assert_eq!(updated.jurisdiction, thread.jurisdiction);
+        assert_eq!(
+            updated.thread.name, thread.name,
+            "the thread row is untouched"
+        );
+        assert_eq!(updated.thread.jurisdiction, thread.jurisdiction);
         let session_model = db
             .query_one(
                 &format!(

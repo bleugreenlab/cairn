@@ -101,8 +101,15 @@ pub trait RemoteExecutorLifecycle: Send + Sync {
     ///
     /// The occupancy refusal is applied before this is called AND again inside
     /// the implementation under its own mutation gate; an implementation that
-    /// skips the second check has a race, not a shortcut.
-    async fn remove(&self, executor_id: &str) -> Result<RemoteExecutorMutationResult, String>;
+    /// skips the second check has a race, not a shortcut. `acknowledged` is the
+    /// operator having already been shown the occupancy and asked for the
+    /// removal anyway, and it must be carried into that second check — an
+    /// override honoured at one gate and refused at the other is no override.
+    async fn remove(
+        &self,
+        executor_id: &str,
+        acknowledged: bool,
+    ) -> Result<RemoteExecutorMutationResult, String>;
 
     /// Give an enrolled machine a different public address.
     ///
@@ -440,47 +447,90 @@ impl ExecutorOccupancy {
     }
 }
 
+/// What one machine holds, and whether that reading is current.
+///
+/// The two travel together because a count means opposite things depending on
+/// its age. A machine reporting four resident environments a second ago is
+/// occupied; the same four counted from a connection that has said nothing for
+/// fifteen minutes is a fossil of a machine that may already be gone, and
+/// serving it as current truth is how a removal comes to be refused on behalf
+/// of work that no longer exists (CAIRN-4360).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OccupancyReading {
+    pub occupancy: ExecutorOccupancy,
+    /// How long this machine's link has been silent, when the counts came from
+    /// a connection that has stopped reporting. `None` means the reading is
+    /// fresh, or that there is no connection behind it at all.
+    pub silence_ms: Option<u64>,
+}
+
+impl OccupancyReading {
+    pub fn is_empty(&self) -> bool {
+        self.occupancy.is_empty()
+    }
+
+    /// Whether these counts describe a machine that is still reporting.
+    pub fn is_current(&self) -> bool {
+        self.silence_ms.is_none()
+    }
+
+    pub fn summary(&self) -> String {
+        self.occupancy.summary()
+    }
+}
+
 /// What is currently on one machine, from the authoritative fleet snapshot.
-pub fn occupancy(orch: &Orchestrator, executor_id: &str) -> ExecutorOccupancy {
-    let inspections = orch.fleet.inspect_executors(unix_time_ms());
+pub fn occupancy(orch: &Orchestrator, executor_id: &str) -> OccupancyReading {
+    let now = unix_time_ms();
+    let inspections = orch.fleet.inspect_executors(now);
     let Some(inspection) = inspections
         .iter()
         .find(|inspection| inspection.health.identity.executor_id == executor_id)
     else {
         // A machine that is not attached is running nothing by definition: the
         // work it could hold lives in its own process, and there is no process.
-        return ExecutorOccupancy::default();
+        return OccupancyReading::default();
     };
     let snapshot = &inspection.occupancy;
-    ExecutorOccupancy {
-        running: snapshot.executing_requests.len(),
-        queued: snapshot.queued_requests.len(),
-        resident_cells: snapshot
-            .cells
-            .iter()
-            .filter(|cell| cell.residency.is_some())
-            .count(),
-        resident_processes: snapshot
-            .cells
-            .iter()
-            .map(|cell| cell.occupancy.processes.len())
-            .sum(),
+    let heartbeat_age_ms = inspection.health.heartbeat_age_ms;
+    OccupancyReading {
+        occupancy: ExecutorOccupancy {
+            running: snapshot.executing_requests.len(),
+            queued: snapshot.queued_requests.len(),
+            resident_cells: snapshot
+                .cells
+                .iter()
+                .filter(|cell| cell.residency.is_some())
+                .count(),
+            resident_processes: snapshot
+                .cells
+                .iter()
+                .map(|cell| cell.occupancy.processes.len())
+                .sum(),
+        },
+        // The same liveness bound placement applies. A machine placement has
+        // already stopped considering is not one whose counts a removal should
+        // treat as live.
+        silence_ms: (heartbeat_age_ms
+            > cairn_common::executor_protocol::EXECUTOR_PROGRESS_FRESHNESS_MS)
+            .then_some(heartbeat_age_ms),
     }
 }
 
-/// Refuse a removal while the machine still holds work.
+/// Refuse a removal while the machine still holds work, unless the caller has
+/// acknowledged stranding it.
 ///
 /// Removal stops supervision, cleans the remote, revokes the enrollment, and
 /// disconnects the generation. Doing that underneath running work does not
-/// stop the work politely — it strands it. So the answer is a refusal that says
-/// what is still there and what to do about it, and the drain the operator then
-/// enables is what actually empties the machine.
+/// stop the work politely — it strands it. So the default answer is a refusal
+/// that says what is still there and what to do about it.
 pub fn refuse_removal_while_occupied(
     orch: &Orchestrator,
     executor_id: &str,
     name: &str,
+    acknowledged: bool,
 ) -> Result<(), String> {
-    removal_refusal(occupancy(orch, executor_id), name)
+    removal_refusal(occupancy(orch, executor_id), name, acknowledged)
 }
 
 /// The removal rule itself, over an occupancy reading.
@@ -489,14 +539,48 @@ pub fn refuse_removal_while_occupied(
 /// checked against each kind of occupancy independently: running work, queued
 /// work, and residency each refuse on their own, and none of them is allowed to
 /// be the one that quietly does not.
-pub fn removal_refusal(occupancy: ExecutorOccupancy, name: &str) -> Result<(), String> {
-    if occupancy.is_empty() {
+///
+/// The refusal is not a wall. Draining is the way out only while the machine is
+/// answering — a drain empties a machine by letting its work finish, and a
+/// machine that has stopped reporting is not finishing anything. Counts that
+/// nothing on the machine will ever clear used to leave an operator with a
+/// permanently unremovable enrollment and a refusal pointing at a lever that
+/// could not move it. So every refusal names the acknowledged override, and
+/// taking it strands lanes that re-arm on another machine rather than work that
+/// silently disappears.
+pub fn removal_refusal(
+    reading: OccupancyReading,
+    name: &str,
+    acknowledged: bool,
+) -> Result<(), String> {
+    if reading.is_empty() || acknowledged {
         return Ok(());
     }
-    Err(format!(
-        "{name} still has {}. Enable draining first so it stops accepting new work, wait for what is on it to finish, then remove it. Removing it now would strand that work.",
-        occupancy.summary()
-    ))
+    match reading.silence_ms {
+        None => Err(format!(
+            "{name} still has {}. Enable draining first so it stops accepting new work, wait for what is on it to finish, then remove it. Removing it now would strand that work; remove it with confirm to do that deliberately.",
+            reading.summary()
+        )),
+        Some(silence_ms) => Err(format!(
+            "{name} last reported {} ago and it counted {} at the time. Those counts are history, not occupancy: a machine that is not answering is not finishing anything, so draining cannot empty it. Remove it with confirm to strand what the counts describe — the lanes behind them re-arm on another machine.",
+            silence_phrase(silence_ms),
+            reading.summary()
+        )),
+    }
+}
+
+/// How long a machine has been silent, in the coarse words a refusal uses.
+fn silence_phrase(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        format!("{}h", minutes / 60)
+    }
 }
 
 /// Resolve whatever a caller addressed a machine by — its public name, or the
@@ -814,10 +898,11 @@ pub async fn rename(
 pub async fn remove(
     orch: &Orchestrator,
     reference: &str,
+    acknowledged: bool,
 ) -> Result<RemoteExecutorMutationResult, String> {
     let executor_id = resolve_executor_reference(orch, reference)?;
     let name = public_name(orch, &executor_id);
-    refuse_removal_while_occupied(orch, &executor_id, &name)?;
+    refuse_removal_while_occupied(orch, &executor_id, &name, acknowledged)?;
     let configured = crate::config::settings::load_fleet(&orch.config_dir)
         .remote_executors
         .contains_key(&executor_id);
@@ -871,7 +956,7 @@ pub async fn remove(
         .fleet
         .management()
         .lifecycle()?
-        .remove(&executor_id)
+        .remove(&executor_id, acknowledged)
         .await?;
     orch.fleet
         .management()
@@ -1082,19 +1167,72 @@ pub async fn set_runtime_policy(
     }
 }
 
-/// Turn draining on or off. This is what disabling a machine means: it refuses
-/// new admissions and leaves what is already on it alone. It is live and
-/// generation-fenced, so a reconnect or a runner restart loses it.
+/// Turn draining on or off. This is what disabling a machine means: the runner
+/// refuses to place new work there and leaves what is already on it alone.
+///
+/// Durable and unfenced, and both properties are the point. It is persisted, so
+/// a reconnect or a runner restart keeps it and the machine is not re-admitted
+/// the moment it comes back. It takes no expected generation and does not
+/// require a live link, because a drain is this runner's own refusal rather
+/// than a setting on the machine — and the moment an operator reaches for it is
+/// the moment the machine has usually stopped answering (CAIRN-4360).
+///
+/// The settings write happens first, so what survives a restart is what the
+/// operator asked for. Telling the machine is best effort and reported.
 pub async fn set_drain_mode(
     orch: &Orchestrator,
     reference: &str,
-    expected_generation: u64,
     enabled: bool,
-) -> Result<bool, String> {
+) -> Result<DrainOutcome, String> {
     let executor_id = resolve_executor_reference(orch, reference)?;
-    orch.fleet
-        .set_executor_drain_mode(&executor_id, expected_generation, enabled)
-        .await
+    let mut config = crate::config::settings::load_fleet(&orch.config_dir);
+    if config.set_machine_drained(&executor_id, enabled) {
+        crate::config::settings::set_fleet(&orch.config_dir, &config)?;
+    }
+    let application = orch
+        .fleet
+        .set_executor_drain_mode(&executor_id, enabled)
+        .await;
+    Ok(DrainOutcome {
+        name: public_name(orch, &executor_id),
+        enabled,
+        application,
+    })
+}
+
+/// What a drain write did: the durable state it recorded, and whether the
+/// machine itself was in any condition to be told.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainOutcome {
+    pub name: String,
+    pub enabled: bool,
+    #[serde(flatten)]
+    pub application: crate::fleet::DrainApplication,
+}
+
+impl DrainOutcome {
+    /// One sentence for a person or an agent: what now holds, and what the
+    /// machine knows about it.
+    pub fn summary(&self) -> String {
+        let held = if self.enabled {
+            format!(
+                "{} is draining: new work is refused and resident work is left alone. It stays drained across reconnects and runner restarts until it is cleared",
+                self.name
+            )
+        } else {
+            format!(
+                "{} is no longer draining; new work is admitted again",
+                self.name
+            )
+        };
+        match &self.application {
+            crate::fleet::DrainApplication::Applied => format!("{held}."),
+            crate::fleet::DrainApplication::HeldWithoutMachine { reason } => format!(
+                "{held}. The machine was not told because {reason}; the runner is holding this itself and will tell it when it attaches."
+            ),
+        }
+    }
 }
 
 /// Refuse a fenced control whose generation is not the one that is live.
@@ -1172,6 +1310,10 @@ mod tests {
             panic!("replacement received an unexpected attach message");
         };
         assert_eq!(attached_policy, expected_policy);
+        assert!(matches!(
+            replacement_executor.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
 
         let application = apply_profile_runtime_policy(
             &orch,
@@ -1207,6 +1349,49 @@ mod tests {
         assert!(replacement_generation > snapshotted_generation);
     }
 
+    /// The durability half, end to end: a drain is written to fleet settings
+    /// before the machine is told, so a runner restart reading those settings
+    /// finds it. What evaporated across a reconnect twice in one hour was
+    /// exactly this write not existing (CAIRN-4360).
+    #[tokio::test]
+    async fn a_drain_is_persisted_before_the_machine_is_told() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, mut executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+        // Attaching states this machine's drain either way, so the message that
+        // matters here is the one the write produces.
+        assert!(matches!(
+            executor.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
+
+        let outcome = set_drain_mode(&orch, crate::fleet::LOCAL_EXECUTOR_NAME, true)
+            .await
+            .expect("a drain resolves and records");
+
+        assert!(outcome.enabled);
+        assert!(
+            crate::config::settings::load_fleet(&orch.config_dir)
+                .is_machine_drained(crate::fleet::COLOCATED_EXECUTOR_ID),
+            "the drain has to be on disk, or the next runner does not know about it"
+        );
+        assert!(orch.fleet.is_drained(crate::fleet::COLOCATED_EXECUTOR_ID));
+        assert!(matches!(
+            executor.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: true, .. })
+        ));
+
+        set_drain_mode(&orch, crate::fleet::LOCAL_EXECUTOR_NAME, false)
+            .await
+            .expect("clearing a drain resolves");
+        assert!(
+            !crate::config::settings::load_fleet(&orch.config_dir)
+                .is_machine_drained(crate::fleet::COLOCATED_EXECUTOR_ID),
+            "clearing has to reach disk too, or a cleared machine comes back drained"
+        );
+    }
+
     fn request(host: &str) -> EnrollmentRequest {
         EnrollmentRequest {
             host: host.into(),
@@ -1231,8 +1416,8 @@ mod tests {
                 host: first.host.clone(),
                 ssh_user: first.ssh_user.clone(),
                 platform: super::super::RemotePlatform::LinuxX86_64,
-                binary_path: "/home/dev/.local/bin/cairn-executor".into(),
-                cairn_home: "/home/dev/.cairn-executor".into(),
+                binary_path: "/home/dev/.local/bin/cairn-exec".into(),
+                cairn_home: "/home/dev/.cairn-exec".into(),
                 executor_id: first.executor_id.clone(),
                 device_id: first.device_id.clone(),
                 display_name: first.display_name.clone(),
@@ -1249,7 +1434,7 @@ mod tests {
         assert_eq!(repeated.tunnel_port, first.tunnel_port);
         assert_eq!(
             repeated.binary_path.as_deref(),
-            Some("/home/dev/.local/bin/cairn-executor")
+            Some("/home/dev/.local/bin/cairn-exec")
         );
     }
 
@@ -1349,7 +1534,7 @@ mod tests {
             );
         }
 
-        let result = remove(&orch, "Build host").await.unwrap();
+        let result = remove(&orch, "Build host", false).await.unwrap();
 
         assert_eq!(result.display_name, "Build host");
         assert!(result.config.is_none());
@@ -1418,13 +1603,21 @@ mod tests {
                 ..ExecutorOccupancy::default()
             },
         ] {
-            let refusal = removal_refusal(occupancy, "bglab-ub")
+            let reading = OccupancyReading {
+                occupancy,
+                silence_ms: None,
+            };
+            let refusal = removal_refusal(reading, "bglab-ub", false)
                 .err()
                 .unwrap_or_else(|| panic!("{occupancy:?} must refuse removal"));
             assert!(refusal.contains("bglab-ub"), "{refusal}");
             assert!(
                 refusal.contains("draining"),
                 "a refusal has to name the way out of it: {refusal}"
+            );
+            assert!(
+                refusal.contains("confirm"),
+                "and the override, so a refusal is never a dead end: {refusal}"
             );
         }
     }
@@ -1433,7 +1626,61 @@ mod tests {
     /// proceeds. There is no timeout and no force: emptiness is the condition.
     #[test]
     fn an_empty_machine_may_be_removed() {
-        assert!(removal_refusal(ExecutorOccupancy::default(), "bglab-ub").is_ok());
+        assert!(removal_refusal(OccupancyReading::default(), "bglab-ub", false).is_ok());
+    }
+
+    /// Counts read off a machine that stopped reporting are history. The
+    /// refusal must not offer draining as the way out of them: a drain empties
+    /// a machine by letting its work finish, and a machine that is not
+    /// answering is not finishing anything. Pointing at that lever is what left
+    /// an operator with an unremovable enrollment (CAIRN-4360).
+    #[test]
+    fn a_fossil_occupancy_is_refused_as_history_and_never_by_pointing_at_drain() {
+        let refusal = removal_refusal(
+            OccupancyReading {
+                occupancy: ExecutorOccupancy {
+                    resident_cells: 4,
+                    resident_processes: 1,
+                    ..ExecutorOccupancy::default()
+                },
+                silence_ms: Some(15 * 60 * 1_000),
+            },
+            "bglab-sp1",
+            false,
+        )
+        .err()
+        .expect("a non-empty reading still refuses by default");
+        assert!(refusal.contains("15m"), "{refusal}");
+        assert!(refusal.contains("history"), "{refusal}");
+        assert!(refusal.contains("confirm"), "{refusal}");
+        assert!(
+            !refusal.contains("Enable draining first"),
+            "a silent machine cannot drain its way empty: {refusal}"
+        );
+    }
+
+    /// The override is what makes every refusal survivable. An operator who has
+    /// read the counts and asked anyway is removing the machine, whether those
+    /// counts are live or fossil.
+    #[test]
+    fn an_acknowledged_removal_crosses_any_occupancy() {
+        let occupancy = ExecutorOccupancy {
+            running: 2,
+            queued: 1,
+            resident_cells: 5,
+            resident_processes: 1,
+        };
+        for silence_ms in [None, Some(15 * 60 * 1_000)] {
+            assert!(removal_refusal(
+                OccupancyReading {
+                    occupancy,
+                    silence_ms
+                },
+                "bglab-sp1",
+                true
+            )
+            .is_ok());
+        }
     }
 
     #[test]

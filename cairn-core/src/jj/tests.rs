@@ -28,6 +28,106 @@ pub(crate) fn jj_bin() -> Option<String> {
         .then_some(bin)
 }
 
+#[test]
+fn failed_amend_description_read_uses_and_announces_fallback() {
+    let (description, note) = amend_description(Err("injected description failure".to_string()));
+    assert_eq!(description, "amend");
+    assert_eq!(
+        note.as_deref(),
+        Some(
+            "the previous description could not be read, so `amend` was used: injected description failure"
+        )
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn seal_amend_converts_when_branch_has_no_owned_commit() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/cairn-1-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    let base = bookmark_commit(&jj, &ws, "main").unwrap();
+    write_base_marker(&ws, "main", &base).unwrap();
+
+    std::fs::write(ws.join("first.rs"), "one\n").unwrap();
+    let result = seal(&jj, &ws, "^", None).unwrap();
+    assert!(
+        result
+            .amend_note
+            .as_deref()
+            .is_some_and(|note| note.contains("amend converted to a new commit")),
+        "the base-target decision is explicit: {:?}",
+        result.amend_note
+    );
+    let child = bookmark_commit(&jj, &ws, branch).unwrap();
+    assert_ne!(child, base, "the integration base was not rewritten");
+    let parent = jj
+        .run(
+            &ws,
+            &["log", "-r", "@--", "--no-graph", "-T", "commit_id"],
+            "first amend child parent",
+        )
+        .unwrap();
+    assert_eq!(
+        parent, base,
+        "the first commit descends from the integration base"
+    );
+}
+
+#[test]
+#[serial_test::serial(jj)]
+fn seal_amend_converts_to_child_when_bookmark_read_fails() {
+    let Some(bin) = jj_bin() else { return };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/cairn-1-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    let base = bookmark_commit(&jj, &ws, "main").unwrap();
+    write_base_marker(&ws, "main", &base).unwrap();
+    std::fs::write(ws.join("a.rs"), "one\n").unwrap();
+    seal(&jj, &ws, "orig", None).unwrap();
+    let original = bookmark_commit(&jj, &ws, branch).unwrap();
+
+    std::fs::write(ws.join("b.rs"), "two\n").unwrap();
+    fail_next_local_bookmarks_at();
+    let result = seal(&jj, &ws, "^", None).unwrap();
+    assert!(
+        result.amend_note.as_deref().is_some_and(|note| {
+            note.contains("converted to a new commit")
+                && note.contains("injected local bookmark read failure")
+        }),
+        "the failed guard is surfaced: {:?}",
+        result.amend_note
+    );
+    let child = bookmark_commit(&jj, &ws, branch).unwrap();
+    assert_ne!(child, original, "the target was not rewritten");
+    let parent = jj
+        .run(
+            &ws,
+            &["log", "-r", "@--", "--no-graph", "-T", "commit_id"],
+            "amend child parent",
+        )
+        .unwrap();
+    assert_eq!(
+        parent, original,
+        "the fallback commit descends from the untouched target"
+    );
+}
+
 /// A managed jj store can be nested below the runner's ordinary Git checkout.
 /// The agent-only commit exists in jj's backing store, not in that ancestor
 /// checkout, so successful ancestor discovery must not select the wrong object
@@ -450,7 +550,6 @@ fn a_seal_whose_export_is_refused_rolls_back_and_reports_the_unpublished_commit(
     let branch = "agent/CAIRN-3280-builder-0";
     let ws = wts.path().join("job");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-
     // Occupy the branch's ref path with a directory, so git can never write the
     // ref itself and the export stays refused however often it is retried.
     let main_commit = git_stdout(proj.path(), &["rev-parse", "refs/heads/main"]);
@@ -5429,12 +5528,11 @@ fn seal_amend_converts_to_child_when_target_commit_is_shared() {
     );
 }
 
-/// WS3 boundary: a plain `^` amend whose target commit is NOT shared still
-/// squashes into the prior commit (keeping its change id) and sets no
-/// amend-conversion note.
+/// An unmanaged, unbookmarked checkout can still rewrite in place, and reports
+/// the exact commit it rewrote.
 #[test]
 #[serial_test::serial(jj)]
-fn seal_amend_squashes_when_target_commit_is_not_shared() {
+fn seal_amend_squashes_in_unmanaged_unbookmarked_checkout() {
     let Some(bin) = jj_bin() else {
         eprintln!(
             "skipping seal_amend_squashes_when_target_commit_is_not_shared: jj not resolvable"
@@ -5452,9 +5550,15 @@ fn seal_amend_squashes_when_target_commit_is_not_shared() {
     let branch = "agent/cairn-1-builder-0";
     let ws = wts.path().join("job");
     add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
-
     std::fs::write(ws.join("a.rs"), "one\n").unwrap();
     seal(&jj, &ws, "orig", None).unwrap();
+    let commit_before = bookmark_commit(&jj, &ws, branch).unwrap();
+    jj.run(
+        &ws,
+        &["bookmark", "delete", branch, "--ignore-working-copy"],
+        "remove managed bookmark for ambient amend fixture",
+    )
+    .unwrap();
     let change_before = jj
         .run(
             &ws,
@@ -5464,10 +5568,13 @@ fn seal_amend_squashes_when_target_commit_is_not_shared() {
         .unwrap();
 
     std::fs::write(ws.join("b.rs"), "two\n").unwrap();
-    let result = seal(&jj, &ws, "^", None).unwrap();
+    let result = seal_paths(&jj, &ws, "^", None, &[], None).unwrap();
     assert!(
-        result.amend_note.is_none(),
-        "no conversion without a foreign bookmark: {:?}",
+        result
+            .amend_note
+            .as_deref()
+            .is_some_and(|note| note.contains("rewrote commit") && note.contains(&commit_before)),
+        "the in-place rewrite names its target: {:?}",
         result.amend_note
     );
     let change_after = jj

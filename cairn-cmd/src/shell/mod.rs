@@ -19,6 +19,7 @@
 mod actions;
 mod complete;
 mod nav;
+mod view;
 
 use std::io::Write;
 
@@ -117,8 +118,7 @@ async fn peek(client: &CairnCmd, shell: &mut Shell, target: &str) {
     }
 }
 
-/// Issue the read and print the composed text, byte for byte as `cairn read`
-/// prints it. `None` when the callback itself failed.
+/// Issue the read and render the structured envelope for a human terminal.
 async fn render(
     client: &CairnCmd,
     target: &str,
@@ -129,8 +129,11 @@ async fn render(
 )> {
     match client.read_envelope(target).await {
         Ok(envelope) => {
-            let text = envelope.text;
-            println!("{}", text.trim_end());
+            let text = envelope.text.clone();
+            println!(
+                "{}",
+                view::render(&envelope, view::terminal_width(), view::color_enabled())
+            );
             let kind = envelope.segments.first().map(|segment| segment.kind);
             let spec = envelope
                 .affordances

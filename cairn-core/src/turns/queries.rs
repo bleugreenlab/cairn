@@ -789,7 +789,7 @@ async fn count_conn(conn: &cairn_db::turso::Connection, sql: &str, value: &str) 
         .ok_or_else(|| DbError::internal("count query returned no rows"))
 }
 
-fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {
+pub(crate) fn turn_from_row(row: &cairn_db::turso::Row) -> DbResult<Turn> {
     let state = row.text(6)?.parse::<TurnState>().map_err(DbError::Row)?;
     let yield_reason = row
         .opt_text(7)?

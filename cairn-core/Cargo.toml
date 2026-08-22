@@ -96,7 +96,7 @@ cairn-symbols = { path = "../cairn-symbols" }
 cairn-analytics = { path = "../cairn-analytics" }
 cairn-codec = { path = "../cairn-codec" }
 cairn-vcs = { path = "../cairn-vcs" }
-cairn-worktree = { path = "../cairn-worktree" }
+cairn-cell = { path = "../cairn-cell" }
 
 # The database layer (domain models, table records, and the storage engine with
 # its full-text search index) descends into cairn-db; cairn-core re-exports it at
@@ -166,7 +166,7 @@ tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
 cairn-core = { path = ".", features = ["test-utils"] }
 cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }
-cairn-executor = { path = "../../cairn-executor" }
+cairn-exec = { path = "../../cairn-exec" }
 
 [features]
 internal-api = []

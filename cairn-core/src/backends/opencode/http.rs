@@ -61,8 +61,8 @@ pub(super) fn build_body(model: &str, messages: &[ChatMessage], config: &Session
 
 pub(super) fn endpoint(api_key: &str) -> Endpoint {
     Endpoint {
-        provider_name: OPENCODE_BACKEND_NAME,
-        backend_key: OPENCODE_BACKEND_KEY,
+        provider_name: OPENCODE_BACKEND_NAME.to_string(),
+        backend_key: OPENCODE_BACKEND_KEY.to_string(),
         chat_url: CHAT_URL.to_string(),
         headers: vec![
             ("authorization".to_string(), format!("Bearer {api_key}")),

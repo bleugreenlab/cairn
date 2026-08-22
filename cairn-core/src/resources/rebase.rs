@@ -1,7 +1,9 @@
 //! `cairn:~/rebase` — the active conflict resolution session for a node's branch.
 //!
-//! When a base advance cannot replay a branch, the rebase is rolled back and the
-//! branch is left untouched. That is the safety property; the cost it used to
+//! When a base advance cannot replay a branch, the new base does not land and the
+//! branch remains on its pre-advance content. Replay may still rewrite the store
+//! commit identity, so the resource always publishes current coordinates. The
+//! preserved content is the safety property; the cost it used to
 //! carry was an information-free tree. This resource pays that cost back: it
 //! names what arrived, shows both sides of the merge, lists the incoming change's
 //! COMPLETE file set flagged conflicting versus clean-on-retry, states whether
@@ -550,8 +552,9 @@ fn render_summary(
 
     format!(
         "# Rebase session for `{branch}`\n{version_note}\n{incoming}, and the automatic replay of your branch \
-         onto it recorded a conflict, so it was rolled back. Your branch is untouched and on its \
-         own content; nothing was lost.\n\n{condition}\n{status}\n{markers}\n\n## Three-way \
+         onto it recorded a conflict and did not land the new base. Your branch remains on its \
+         pre-advance content, but replay machinery may rewrite its store commit identity; the \
+         coordinates below are current.\n\n{condition}\n{status}\n{markers}\n\n## Three-way \
          coordinates\n\n{coords}\nThese are immutable commits. Read any file as of either side \
          with `?branch=<commit>`, or read the merge:\n\n- `{base}?view=merged` — the two sides \
          merged line-wise, with everything non-overlapping already resolved. Add `file=PATH` for \

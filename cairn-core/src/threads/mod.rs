@@ -15,6 +15,8 @@
 pub mod compaction;
 pub mod crud;
 pub mod definition;
+pub mod era_worker;
+pub mod eras;
 pub use definition::{
     default_thread_definition, resolve_thread_definition, ThreadDefinition, ARC_ARTIFACT_NAME,
 };
@@ -187,7 +189,7 @@ pub(crate) fn dormant_thread_refusal() -> String {
 /// thread wholesale. Matching on `thread_id` alone therefore resolves to
 /// whichever of them is newest, which is how a thread came to report a finished
 /// sub-agent task as its live session.
-pub(crate) const SESSION_JOB_SHAPE: &str = "j.parent_job_id IS NULL AND j.uri_segment = 'thread'";
+pub const SESSION_JOB_SHAPE: &str = "j.parent_job_id IS NULL AND j.uri_segment = 'thread'";
 
 /// The thread that owns a job created beneath `parent_job_id`, or `None` when
 /// the parent belongs to no thread.

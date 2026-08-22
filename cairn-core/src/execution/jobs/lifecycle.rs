@@ -24,6 +24,107 @@ enum PushJobCoordinate {
     },
 }
 
+fn emit_resume_step(
+    event_name: &'static str,
+    started: std::time::Instant,
+    resume_id: &str,
+    job_id: &str,
+) {
+    let mut event = crate::resume_timing::ResumeTimingEvent::new(event_name);
+    event.step_us = Some(started.elapsed().as_micros());
+    event.resume_id = Some(resume_id);
+    event.job_id = Some(job_id);
+    event.emit();
+}
+
+/// Restores early queue claims when launch preparation fails before their
+/// canonical user events are stored. Successfully persisted rows are removed
+/// one by one so a partial event-storage failure never duplicates them.
+struct ClaimedMessagesLaunchGuard<'a> {
+    orch: &'a Orchestrator,
+    db: std::sync::Arc<crate::storage::LocalDb>,
+    pending_ids: Vec<String>,
+}
+
+impl ClaimedMessagesLaunchGuard<'_> {
+    fn persisted(&mut self, id: &str) {
+        self.pending_ids.retain(|pending| pending != id);
+    }
+}
+
+impl Drop for ClaimedMessagesLaunchGuard<'_> {
+    fn drop(&mut self) {
+        if self.pending_ids.is_empty() {
+            return;
+        }
+        if let Err(error) = crate::messages::queued::restore_claimed(&self.db, &self.pending_ids) {
+            log::error!("failed to restore queued operator messages after launch failure: {error}");
+        } else {
+            log::warn!(
+                "launch failed after queued operator messages were claimed; restored {} pending messages",
+                self.pending_ids.len()
+            );
+        }
+        let _ = self.orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "queued_messages", "action": "update"}),
+        );
+    }
+}
+
+/// Owns a newly-created successor until it is attached to a run. Any `?` in
+/// launch preparation therefore terminalizes the pending head instead of
+/// leaving the job permanently unsendable.
+struct PendingLaunchTurnGuard<'a> {
+    orch: &'a Orchestrator,
+    db: std::sync::Arc<crate::storage::LocalDb>,
+    turn_id: Option<String>,
+    run_id: Option<String>,
+}
+
+impl PendingLaunchTurnGuard<'_> {
+    fn started(&mut self, run_id: &str) {
+        if self.turn_id.is_some() {
+            self.run_id = Some(run_id.to_string());
+        }
+    }
+
+    fn adopted(&mut self) {
+        self.turn_id = None;
+    }
+}
+
+impl Drop for PendingLaunchTurnGuard<'_> {
+    fn drop(&mut self) {
+        let Some(turn_id) = self.turn_id.take() else {
+            return;
+        };
+        if let Some(run_id) = self.run_id.take() {
+            self.orch.process_state.transition_to_warm(&run_id);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let result = run_db({
+            let db = self.db.clone();
+            let turn_id = turn_id.clone();
+            async move {
+                db.execute(
+                    "UPDATE turns SET state = 'cancelled', ended_at = ?1, updated_at = ?1 WHERE id = ?2 AND state IN ('pending', 'running')",
+                    cairn_db::turso::params![now, turn_id.as_str()],
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        });
+        if let Err(error) = result {
+            log::error!("failed to cancel pending successor after launch failure: {error}");
+        }
+        let _ = self.orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "turns", "action": "update", "turnId": turn_id}),
+        );
+    }
+}
+
 fn push_job_coordinate(content_ref: &str) -> Option<PushJobCoordinate> {
     use cairn_common::uri::CairnResource;
     match cairn_common::uri::parse_uri(content_ref)? {
@@ -384,7 +485,8 @@ pub async fn on_job_complete_impl(orch: &Orchestrator, job_id: &str) -> Result<V
         })
         .await
         .map_err(|e| db_error("Job not found", e))
-    })?;
+    })?
+    .clone();
     match execution_id {
         Some(exec_id) if recipe_node_id.is_some() => {
             crate::execution::advancement::advance_execution_with_actions(orch, &exec_id).await
@@ -597,14 +699,14 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
                 .await
                 .map_err(|e| e.to_string())
         }
-    })?;
+    })?
+    .clone();
     // ---- Load job -------------------------------------------------------
     let job = run_db(load_job(
         owning_db.clone(),
         job_id.to_string(),
         "Job not found",
     ))?;
-
     // ---- Load project info ----------------------------------------------
     let (repo_path, project_key) = run_db(load_project_repo_and_key(
         orch.db.clone(),
@@ -1060,8 +1162,9 @@ fn continue_job_or_enqueue_inner(
     // Only a message-bearing send can be queued; a bare continue has nothing to
     // enqueue, so it falls straight through to the resume (and its guard).
     if let Some(text) = message.filter(|m| !m.trim().is_empty()) {
-        // Resolve the owning DB (team job -> its synced replica), mirroring
-        // continue_job_impl's own routing so team turns/queued rows stay correct.
+        // Message-bearing continues are compatibility ingress only. Persist first
+        // and hand launch work to a background nudge, matching the canonical
+        // enqueue command's acknowledgement boundary.
         let owning_db = run_db({
             let dbs = orch.db.clone();
             let job_id = job_id.to_string();
@@ -1071,64 +1174,30 @@ fn continue_job_or_enqueue_inner(
                     .map_err(|e| e.to_string())
             }
         })?;
-        if crate::messages::delivery::head_turn_active_sync(&owning_db, job_id) {
-            enqueue_continuation_message(&owning_db, job_id, text, request_id)?;
-            // Make the pending-queue chip appear immediately: QueryProvider
-            // invalidates `queuedMessages` on this db-change, the same mechanism
-            // the composer's own enqueue path relies on.
-            let _ = orch.services.emitter.emit(
-                "db-change",
-                serde_json::json!({"table": "queued_messages", "action": "update"}),
-            );
-            // Return the job's latest run to honor the Run return contract; the
-            // frontend ignores the value. `list_runs_for_job` orders newest-first,
-            // matching the frontend's `runs[0]` "latest" convention.
-            if let Some(run) = crate::runs::queries::list_runs_for_job(owning_db.clone(), job_id)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .next()
-            {
-                return Ok(run);
-            }
-            return Err("active turn has no run row after message was queued".to_string());
-        }
+        enqueue_continuation_message(&owning_db, job_id, text, request_id)?;
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "queued_messages", "action": "update"}),
+        );
         before_resume();
 
-        match continue_job_impl(
-            orch,
-            job_id,
-            message,
-            identity_override,
-            Some(ResumeContext {
-                supersede_pending_retry: true,
-                ..Default::default()
-            }),
-        ) {
-            Ok(run) => {
-                // Stamp the operator record delivered only after the authoritative
-                // turn-start path accepts the resume. Stamping before this point
-                // creates a delivered-only orphan if another turn wins the race.
-                if let Err(error) =
-                    crate::messages::queued::record_direct_delivery(&owning_db, job_id, text)
-                {
-                    log::warn!("recording an operator message for job {job_id} failed: {error}");
-                }
-                return Ok(run);
+        let latest = crate::runs::queries::list_runs_for_job(owning_db, job_id)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "queued continuation has no run row".to_string())?;
+        let orch = orch.clone();
+        let job_id = job_id.to_string();
+        std::thread::spawn(move || {
+            if let Err(error) = crate::messages::delivery::nudge_job_for_urgency(
+                &orch,
+                &job_id,
+                crate::messages::queued::Delivery::Queue,
+            ) {
+                log::warn!("queued continuation nudge for job {job_id} failed: {error}");
             }
-            Err(error) if crate::messages::delivery::head_turn_active_sync(&owning_db, job_id) => {
-                enqueue_continuation_message(&owning_db, job_id, text, request_id)?;
-                let _ = orch.services.emitter.emit(
-                    "db-change",
-                    serde_json::json!({"table": "queued_messages", "action": "update"}),
-                );
-                return crate::runs::queries::list_runs_for_job(owning_db, job_id)
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .next()
-                    .ok_or(error);
-            }
-            Err(error) => return Err(error),
-        }
+        });
+        return Ok(latest);
     }
     continue_job_impl(
         orch,
@@ -1309,6 +1378,7 @@ fn continue_job_impl_with_intent(
     continuation_intent: ContinuationIntent,
 ) -> Result<Run, String> {
     let resume_started = std::time::Instant::now();
+    let resume_id = ids::mint_child(job_id);
     // A closed thread takes no new turns, and this is the boundary that decides
     // what a turn is. Everything else dormancy gates — a prompt, a wake, a queued
     // push — exists to reach this function, and the desktop composer reaches it
@@ -1338,6 +1408,7 @@ fn continue_job_impl_with_intent(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut event = crate::resume_timing::ResumeTimingEvent::new("launch_lock_acquired")
         .elapsed(launch_wait_started);
+    event.resume_id = Some(&resume_id);
     event.job_id = Some(job_id);
     event.emit();
 
@@ -1376,6 +1447,7 @@ fn continue_job_impl_with_intent(
         prompt_resume,
         continuation_intent,
         resume_started,
+        &resume_id,
     )
 }
 
@@ -1474,6 +1546,7 @@ pub(crate) fn continue_job_launch_locked_for_watchdog(
         prompt_resume,
         ContinuationIntent::Normal,
         std::time::Instant::now(),
+        &ids::mint_child(job_id),
     )
 }
 
@@ -1485,6 +1558,7 @@ fn continue_job_launch_locked(
     prompt_resume: Option<ResumeContext>,
     continuation_intent: ContinuationIntent,
     resume_started: std::time::Instant,
+    resume_id: &str,
 ) -> Result<Run, String> {
     // Resolve the job's owning database ONCE (fail-closed): a team job resumes
     // against its synced replica, never the private DB.
@@ -1499,8 +1573,45 @@ fn continue_job_launch_locked(
     })?;
     let mut event = crate::resume_timing::ResumeTimingEvent::new("owning_database_resolved")
         .elapsed(resume_started);
+    event.resume_id = Some(resume_id);
     event.job_id = Some(job_id);
     event.emit();
+
+    // Claim operator-authored follow-ups before session preparation. Delivery is
+    // the durable claim itself; provider/session setup must not hold the UI's
+    // acknowledgement behind its database and process-startup work.
+    let queued_messages = match crate::messages::queued::claim_all_for_job(&owning_db, job_id) {
+        Ok(messages) => messages,
+        Err(error) => {
+            log::warn!(
+                "failed to claim queued messages for resume prompt on job {}: {}",
+                &job_id[..job_id.len().min(8)],
+                error
+            );
+            Vec::new()
+        }
+    };
+    let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_queue_claimed")
+        .elapsed(resume_started);
+    event.resume_id = Some(resume_id);
+    event.job_id = Some(job_id);
+    event.count = Some(queued_messages.len());
+    event.bytes = Some(
+        queued_messages
+            .iter()
+            .map(|message| message.content.len())
+            .sum(),
+    );
+    event.emit();
+    let has_queued = !queued_messages.is_empty();
+    let mut claimed_messages = ClaimedMessagesLaunchGuard {
+        orch,
+        db: owning_db.clone(),
+        pending_ids: queued_messages
+            .iter()
+            .map(|message| message.id.clone())
+            .collect(),
+    };
 
     // ---- Load job -------------------------------------------------------
     let (mut job, project_id, issue_id, project_path) = run_db(load_job_context(
@@ -1559,9 +1670,41 @@ fn continue_job_launch_locked(
     })?;
     let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_session_selected")
         .elapsed(resume_started);
+    event.resume_id = Some(resume_id);
     event.job_id = Some(job_id);
-    event.session_id = Some(current_session_id);
+    event.session_id = Some(&current_session_id);
     event.emit();
+
+    // Publish the successor before any expensive or fallible session preparation.
+    // Owned-wait and retry resumes already carry their own pending turn; every
+    // ordinary resume creates the same canonical follow-up here instead of near
+    // process spawn, so head-turn liveness is continuous across turnover.
+    let user_initiated = has_queued
+        || message.is_some()
+        || prompt_resume
+            .as_ref()
+            .is_some_and(|context| context.preclaimed_retry_turn_id.is_none());
+    let supersede_pending_retry = prompt_resume
+        .as_ref()
+        .is_some_and(|context| context.supersede_pending_retry);
+    let precreated_turn_id =
+        if preclaimed_successor_turn_id.is_none() && preclaimed_retry_turn_id.is_none() {
+            Some(create_followup_turn(
+                orch,
+                &current_session_id,
+                job_id,
+                user_initiated,
+                supersede_pending_retry,
+            )?)
+        } else {
+            None
+        };
+    let mut pending_launch_turn = PendingLaunchTurnGuard {
+        orch,
+        db: owning_db.clone(),
+        turn_id: precreated_turn_id.clone(),
+        run_id: None,
+    };
 
     // ---- Transition job to Running if in terminal state -------------------
     // Any resume (including the post-completion memory review) makes the agent
@@ -1569,9 +1712,11 @@ fn continue_job_launch_locked(
     // run state (it keys off the unconfirmed artifact), so a Running review does
     // not hide it (CAIRN-1576).
     if job.status != "running" {
+        let step_started = std::time::Instant::now();
         if let Err(e) = transition_job_to_running(orch, job_id) {
             log::warn!("Failed to transition job {} to running: {}", job_id, e);
         }
+        emit_resume_step("resume_step_job_running", step_started, resume_id, job_id);
     }
 
     // ---- Host agent snapshot ---------------------------------------------
@@ -1592,14 +1737,23 @@ fn continue_job_launch_locked(
     // into the agent's tool calls, where it is not. The ensure only fails when it
     // could not establish the invariant; a snapshot that already exists is
     // returned without consulting the agent files at all.
+    let step_started = std::time::Instant::now();
     job.execution_id = run_db_borrowed(ensure_host_agent_snapshot(
         orch,
         &job,
         project_path.as_deref(),
         SnapshotFreshness::for_job(&job),
     ))?;
+    emit_resume_step(
+        "resume_step_agent_snapshot",
+        step_started,
+        resume_id,
+        job_id,
+    );
 
+    let step_started = std::time::Instant::now();
     let agent_config = load_agent_config(orch, &job, project_path.as_deref())?;
+    emit_resume_step("resume_step_agent_config", step_started, resume_id, job_id);
     let process_residence = crate::scratch::ensure_job_scratch_dir(job_id, None);
     let process_residence = process_residence.to_string_lossy().to_string();
 
@@ -1633,6 +1787,7 @@ fn continue_job_launch_locked(
     // Cold-resume reseed decision (CAIRN-2534) is produced in the plain-resume
     // arm below and threaded into prompt assembly + seed-event storage.
     let mut reseed_outcome: Option<ReseedOutcome> = None;
+    let step_started = std::time::Instant::now();
     let (session_id, session_start, run_start_mode) = match run_db(load_session_optional(
         owning_db.clone(),
         current_session_id.clone(),
@@ -1858,6 +2013,36 @@ fn continue_job_launch_locked(
             )
         }
     };
+    if session_id.as_str() != current_session_id.as_str() {
+        let turn_id = precreated_turn_id
+            .as_deref()
+            .or(preclaimed_successor_turn_id.as_deref())
+            .or(preclaimed_retry_turn_id.as_deref())
+            .ok_or_else(|| "session rotated without an adoptable successor turn".to_string())?;
+        run_db({
+            let db = owning_db.clone();
+            let turn_id = turn_id.to_string();
+            let session_id = session_id.clone();
+            async move {
+                db.execute(
+                    "UPDATE turns
+                        SET session_id = ?1,
+                            sequence = (SELECT COALESCE(MAX(sequence), 0) + 1 FROM turns WHERE session_id = ?1),
+                            updated_at = ?2
+                      WHERE id = ?3 AND state = 'pending'",
+                    cairn_db::turso::params![session_id.as_str(), chrono::Utc::now().timestamp(), turn_id.as_str()],
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+        })?;
+    }
+    emit_resume_step(
+        "resume_step_session_loaded",
+        step_started,
+        resume_id,
+        job_id,
+    );
 
     // ---- Find or create run ---------------------------------------------
     // A delayed retry is best-effort. Recheck its durable claim immediately
@@ -1874,12 +2059,15 @@ fn continue_job_launch_locked(
     // here, where the reaper's precondition is already met: the launch lock is
     // held, and this precedes the warm-reuse decision below, so every row is
     // still carrying whatever process it had when this resume arrived.
+    let step_started = std::time::Instant::now();
     crate::runs::reap::reap_stale_runs_for_job(orch, &owning_db, job_id);
+    emit_resume_step("resume_step_reap_runs", step_started, resume_id, job_id);
     // Reconcile a reusable process against the job's requested model *before*
     // deciding to reuse it. `jobs.model` is the source of truth: a model change
     // restarts the process (cold resume with the new model) so the persisted
     // model wins. Cross-backend changes were already handled by rotation above,
     // so any process found here is on the correct backend.
+    let mut restarted_for_model_change = false;
     let existing_run_id = match orch.process_state.find_process_by_session(&session_id) {
         Some(found_run_id) => {
             match ensure_reused_process_model(
@@ -1894,6 +2082,7 @@ fn continue_job_launch_locked(
                         &session_id[..session_id.len().min(8)],
                         &found_run_id[..found_run_id.len().min(8)]
                     );
+                    restarted_for_model_change = true;
                     orch.process_state.stop_and_remove(&found_run_id);
                     None
                 }
@@ -1903,7 +2092,7 @@ fn continue_job_launch_locked(
     };
     // The owned-wait successor IS the intended (pending) active turn; reconcile
     // would cancel it, and the yielded predecessor leaves nothing else stale.
-    if existing_run_id.is_none() && !resuming_owned_wait {
+    if existing_run_id.is_none() && precreated_turn_id.is_none() && !resuming_owned_wait {
         let _ = reconcile_stale_active_turn_for_continue(orch, job_id, &session_id)?;
     }
     let (run_id, is_process_reuse) = if let Some(existing_id) = existing_run_id {
@@ -1916,6 +2105,7 @@ fn continue_job_launch_locked(
     } else {
         let new_run_id = ids::mint_child(job_id);
         let status_str = RunStatus::Starting.to_string();
+        let step_started = std::time::Instant::now();
         run_db(insert_run(
             owning_db.clone(),
             RunInsert {
@@ -1935,6 +2125,7 @@ fn continue_job_launch_locked(
                 warn_existing_active: true,
             },
         ))?;
+        emit_resume_step("resume_step_run_inserted", step_started, resume_id, job_id);
         let _ = orch.services.emitter.emit(
             "db-change",
             crate::notify::run_db_change_ids(
@@ -1947,6 +2138,20 @@ fn continue_job_launch_locked(
         );
         (new_run_id, false)
     };
+    let mut process_decision =
+        crate::resume_timing::ResumeTimingEvent::new("resume_process_decision");
+    process_decision.resume_id = Some(resume_id);
+    process_decision.job_id = Some(job_id);
+    process_decision.run_id = Some(&run_id);
+    process_decision.session_id = Some(&session_id);
+    process_decision.mode = Some(if is_process_reuse {
+        "reuse"
+    } else if restarted_for_model_change {
+        "restart_model_change"
+    } else {
+        "cold_spawn"
+    });
+    process_decision.emit();
 
     // ---- Create successor turn for follow-up ----------------------------
     // A resume carrying user-authored content (an explicit message or a
@@ -1954,13 +2159,6 @@ fn continue_job_launch_locked(
     // memory-review reflection. The pending-queued-message case (a user steer
     // that arrives without an explicit message) is detected inside
     // `create_followup_turn` against the rows the claim below sweeps up.
-    let user_initiated = message.is_some()
-        || prompt_resume
-            .as_ref()
-            .is_some_and(|context| context.preclaimed_retry_turn_id.is_none());
-    let supersede_pending_retry = prompt_resume
-        .as_ref()
-        .is_some_and(|context| context.supersede_pending_retry);
     let turn_id = if let Some(successor_id) = preclaimed_successor_turn_id.as_deref() {
         // Reuse the pre-created owned-wait successor instead of allocating a
         // follow-up; it is started (pending -> running on this run) below like any
@@ -1972,14 +2170,24 @@ fn continue_job_launch_locked(
             return Err("automatic retry was superseded before launch".to_string());
         }
         retry_turn_id
+    } else if let Some(turn_id) = precreated_turn_id.as_deref() {
+        turn_id.to_string()
     } else {
-        create_followup_turn(
+        let step_started = std::time::Instant::now();
+        let turn_id = create_followup_turn(
             orch,
             &session_id,
             job_id,
             user_initiated,
             supersede_pending_retry,
-        )?
+        )?;
+        let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_step_turn_created");
+        event.step_us = Some(step_started.elapsed().as_micros());
+        event.resume_id = Some(resume_id);
+        event.job_id = Some(job_id);
+        event.turn_id = Some(&turn_id);
+        event.emit();
+        turn_id
     };
     let retry_turn_prestarted = prompt_resume
         .as_ref()
@@ -1989,39 +2197,17 @@ fn continue_job_launch_locked(
     }
 
     // ---- Artifact schema ------------------------------------------------
+    let step_started = std::time::Instant::now();
     let artifact_schema_info = run_db(find_job_downstream_artifact_schema(
         owning_db.clone(),
         job.clone(),
     ))?;
-
-    // CAIRN-1309: claim every queued user follow-up for this job (both `queue`
-    // and any `steer` row that never reached a tool boundary). They are
-    // delivered on this resume — covering the turn-end flush and the resume that
-    // follows answering a question/permission prompt.
-    let queued_messages = match crate::messages::queued::claim_all_for_job(&owning_db, job_id) {
-        Ok(msgs) => msgs,
-        Err(error) => {
-            log::warn!(
-                "failed to claim queued messages for resume prompt on job {}: {}",
-                &job_id[..job_id.len().min(8)],
-                error
-            );
-            Vec::new()
-        }
-    };
-    let mut event = crate::resume_timing::ResumeTimingEvent::new("resume_queue_claimed")
-        .elapsed(resume_started);
-    event.job_id = Some(job_id);
-    event.session_id = Some(&session_id);
-    event.count = Some(queued_messages.len());
-    event.bytes = Some(
-        queued_messages
-            .iter()
-            .map(|message| message.content.len())
-            .sum(),
+    emit_resume_step(
+        "resume_step_artifact_schema",
+        step_started,
+        resume_id,
+        job_id,
     );
-    event.emit();
-    let has_queued = !queued_messages.is_empty();
 
     // When there is no explicit resume message but the user queued follow-ups,
     // the queued content *is* the user's prompt — don't lead with the generic
@@ -2062,6 +2248,7 @@ fn continue_job_launch_locked(
     };
     let mut event =
         crate::resume_timing::ResumeTimingEvent::new("resume_pushes_ready").elapsed(resume_started);
+    event.resume_id = Some(resume_id);
     event.job_id = Some(job_id);
     event.session_id = Some(&session_id);
     event.count = Some(drained_pushes.len());
@@ -2179,8 +2366,10 @@ fn continue_job_launch_locked(
     );
     let mut event =
         crate::resume_timing::ResumeTimingEvent::new("resume_prompt_ready").elapsed(resume_started);
+    event.resume_id = Some(resume_id);
     event.job_id = Some(job_id);
     event.session_id = Some(&session_id);
+    event.turn_id = Some(&turn_id);
     event.bytes = Some(prompt.len());
     event.emit();
 
@@ -2256,6 +2445,17 @@ fn continue_job_launch_locked(
                 now,
                 Some(&turn_id),
             )?;
+            let mut event =
+                crate::resume_timing::ResumeTimingEvent::new("queued_message_persisted");
+            event.resume_id = Some(resume_id);
+            event.queued_message_id = Some(&queued.id);
+            event.job_id = Some(job_id);
+            event.run_id = Some(&run_id);
+            event.session_id = Some(&session_id);
+            event.turn_id = Some(&turn_id);
+            event.bytes = Some(queued.content.len());
+            event.emit();
+            claimed_messages.persisted(&queued.id);
         }
         let _ = orch.services.emitter.emit(
             "db-change",
@@ -2283,9 +2483,11 @@ fn continue_job_launch_locked(
         if !trigger.synthetic {
             let mut event = crate::resume_timing::ResumeTimingEvent::new("user_message_persisted")
                 .elapsed(resume_started);
+            event.resume_id = Some(resume_id);
             event.job_id = Some(job_id);
             event.run_id = Some(&run_id);
             event.session_id = Some(&session_id);
+            event.turn_id = Some(&turn_id);
             event.emit();
         }
     }
@@ -2306,10 +2508,12 @@ fn continue_job_launch_locked(
         if !retry_turn_prestarted {
             start_turn(orch, &turn_id, &run_id)?;
         }
+        pending_launch_turn.started(&run_id);
         orch.process_state
             .set_current_turn_id(&run_id, Some(&turn_id));
 
         // Run stays Live — no durable status change for warm reuse.
+        let warm_prompt_started = std::time::Instant::now();
         let message_text = prompt.clone();
         let image_project_id = project_id.clone();
         let image_project_key = run_db({
@@ -2331,6 +2535,16 @@ fn continue_job_launch_locked(
             )
             .await
         })?;
+        let mut prompt_event = crate::resume_timing::ResumeTimingEvent::new("warm_prompt_resolved");
+        prompt_event.step_us = Some(warm_prompt_started.elapsed().as_micros());
+        prompt_event.resume_id = Some(resume_id);
+        prompt_event.job_id = Some(job_id);
+        prompt_event.run_id = Some(&run_id);
+        prompt_event.session_id = Some(&session_id);
+        prompt_event.turn_id = Some(&turn_id);
+        prompt_event.bytes = Some(message_content.text.len());
+        prompt_event.emit();
+        let stdin_started = std::time::Instant::now();
         crate::backends::stdin::send_user_message(
             &orch.process_state,
             &run_id,
@@ -2339,6 +2553,16 @@ fn continue_job_launch_locked(
             None,
             Some(&process_residence),
         )?;
+        pending_launch_turn.adopted();
+        let mut stdin_event = crate::resume_timing::ResumeTimingEvent::new("warm_stdin_written");
+        stdin_event.step_us = Some(stdin_started.elapsed().as_micros());
+        stdin_event.resume_id = Some(resume_id);
+        stdin_event.job_id = Some(job_id);
+        stdin_event.run_id = Some(&run_id);
+        stdin_event.session_id = Some(&session_id);
+        stdin_event.turn_id = Some(&turn_id);
+        stdin_event.bytes = Some(message_content.text.len());
+        stdin_event.emit();
         // The warm agent now holds the prompt these pushes rode in on.
         stamped_pushes.delivered();
     } else {
@@ -2373,6 +2597,8 @@ fn continue_job_launch_locked(
         if !retry_turn_prestarted {
             start_turn(orch, &turn_id, &run_id)?;
         }
+        pending_launch_turn.started(&run_id);
+        pending_launch_turn.adopted();
         orch.process_state
             .set_current_turn_id(&run_id, Some(&turn_id));
     }
@@ -3111,7 +3337,34 @@ fn compose_thread_seed_blocking(
     let db = owning_db.clone();
     let job_id = job.id.clone();
     let now = orch.services.clock.now();
-    run_db(async move { crate::resources::compose_thread_seed(&db, &job_id, now).await })
+    let settings = orch.get_settings();
+    let snapshot_policy = match (job.execution_id.clone(), job.agent_config_id.clone()) {
+        (Some(execution_id), Some(agent_config_id)) => run_db({
+            let db = owning_db.clone();
+            async move {
+                Ok::<_, String>(
+                    super::snapshots::load_thread_seed_policy(db, execution_id, agent_config_id)
+                        .await,
+                )
+            }
+        })
+        .ok()
+        .flatten(),
+        _ => None,
+    };
+    let policy = crate::resources::SeedPolicy {
+        budget_tokens: snapshot_policy
+            .and_then(|(budget, _)| (budget > 0).then_some(budget))
+            .unwrap_or(settings.seed_budget_tokens)
+            .max(1) as usize,
+        inline_eras: snapshot_policy
+            .and_then(|(_, eras)| (eras >= 0).then_some(eras))
+            .unwrap_or(settings.seed_eras)
+            .max(0) as usize,
+    };
+    run_db(async move {
+        crate::resources::compose_thread_seed_with_policy(&db, &job_id, now, policy).await
+    })
 }
 
 /// Compose a thread's seed, decide whether this continuation compacts, and apply
@@ -3211,6 +3464,8 @@ fn apply_thread_compaction(
         occupancy,
     } = decided;
     let seed_bytes = framed.len() as i64;
+    let first_minted_seq = seed.eras_through_seq.unwrap_or(0) + 1;
+    let minted_count = seed.minted_eras.len();
     let applied = crate::threads::compaction::AppliedCompaction {
         trigger,
         source_session_id: seed.source_session_id,
@@ -3221,6 +3476,9 @@ fn apply_thread_compaction(
         compacted_through_block: seed.compacted_through_block,
         recency_start_block: seed.recency_start_block,
         consumed_child_issue_ids: seed.consumed_child_issue_ids,
+        minted_eras: seed.minted_eras,
+        arc_bytes: seed.arc_bytes,
+        eras_through_seq: seed.eras_through_seq,
     };
     let now = orch.services.clock.now();
     run_db({
@@ -3232,6 +3490,9 @@ fn apply_thread_compaction(
                 .map_err(|error| format!("Failed to persist a thread compaction: {error}"))
         }
     })?;
+    for offset in 0..minted_count {
+        orch.enqueue_thread_era_summary(&job.id, (first_minted_seq + offset as i64) as i32);
+    }
 
     let outcome = rotate_with_seed(orch, owning_db, job, session, framed)?;
 
@@ -3495,13 +3756,71 @@ mod tests {
         decide_continue_action, ensure_reused_process_model, finish_forced_session_reseed,
         is_session_stale, prepend_resume_stamp, previous_turn_end_for_resume, push_job_coordinate,
         resolve_resume_trigger, session_prefers_native_resume, staleness_threshold_secs,
-        take_needs_fresh_session, ContinueSessionAction, PushJobCoordinate, ReseedOutcome,
-        ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
+        take_needs_fresh_session, ContinueSessionAction, PendingLaunchTurnGuard, PushJobCoordinate,
+        ReseedOutcome, ReuseDecision, RESEED_SEED_HEADER, SESSION_STALENESS_THRESHOLD_SECS,
         SYNTHETIC_CONTINUATION_PROMPT,
     };
     use crate::agent_process::process::{wrap_plain_stdin, AgentProcessState, RunHandle};
+    use crate::db::DbState;
+    use crate::orchestrator::Orchestrator;
+    use crate::services::testing::TestServicesBuilder;
     use crate::storage::migrated_test_db;
+    use crate::storage::SearchIndex;
     use std::sync::{Arc, Mutex};
+
+    fn test_orchestrator(db: crate::storage::LocalDb) -> Orchestrator {
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(DbState::new(
+            Arc::new(db),
+            Arc::new(SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+        ));
+        Orchestrator::builder(state, Arc::new(TestServicesBuilder::new().build()), root).build()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn precreated_successor_is_live_during_prologue_and_cancelled_on_launch_failure() {
+        let orch = test_orchestrator(migrated_test_db("precreated-successor-rollback").await);
+        let db = orch.db.local.clone();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)
+               VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id,project_id,status,current_session_id,created_at,updated_at)
+               VALUES('j','p','running','s',1,1);
+             INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at)
+               VALUES('s','j','claude','open',1,1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,state,start_reason,created_at,ended_at,updated_at)
+               VALUES('predecessor','s','j',1,'complete','initial',1,2,2);
+             UPDATE jobs SET current_turn_id='predecessor' WHERE id='j';",
+        )
+        .await
+        .unwrap();
+
+        let successor = super::create_followup_turn(&orch, "s", "j", true, false).unwrap();
+        assert!(crate::messages::delivery::head_turn_active_sync(&db, "j"));
+        let head = crate::turns::queries::get_head_turn(&db, "j")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.id, successor);
+        assert_eq!(head.state, crate::models::TurnState::Pending);
+
+        {
+            let _guard = PendingLaunchTurnGuard {
+                orch: &orch,
+                db: db.clone(),
+                turn_id: Some(successor.clone()),
+                run_id: None,
+            };
+        }
+        let head = crate::turns::queries::get_head_turn(&db, "j")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.id, successor);
+        assert_eq!(head.state, crate::models::TurnState::Cancelled);
+        assert!(!crate::messages::delivery::head_turn_active_sync(&db, "j"));
+    }
 
     #[test]
     fn wake_coordinate_parser_distinguishes_nested_tasks() {

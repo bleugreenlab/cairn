@@ -566,7 +566,10 @@ fn source_mcp_servers(
     manifest: &PackManifest,
 ) -> Result<BTreeMap<String, McpServerConfig>, String> {
     match manifest.mcp_source() {
-        Some(path) => Ok(pack::mcp::parse_pack_mcp_file(&path)?.into_iter().collect()),
+        Some(path) => Ok(pack::mcp::parse_pack_mcp_file(&path)?
+            .servers
+            .into_iter()
+            .collect()),
         None => Ok(BTreeMap::new()),
     }
 }
@@ -579,7 +582,10 @@ fn installed_mcp_servers(
     if !path.exists() {
         return Ok(BTreeMap::new());
     }
-    Ok(pack::mcp::parse_pack_mcp_file(&path)?.into_iter().collect())
+    Ok(pack::mcp::parse_pack_mcp_file(&path)?
+        .servers
+        .into_iter()
+        .collect())
 }
 
 fn materialize_item(
@@ -946,6 +952,118 @@ mod tests {
         assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(!crate::config::mcp_servers::workspace_mcp_entries(&repo).contains_key("matlab"));
+    }
+
+    /// Every connector this repository ships must actually reach the catalog,
+    /// and one that asks for nothing must be ready the moment it installs.
+    ///
+    /// The first half guards a silent failure. `discover_available_packs` logs
+    /// and SKIPS a pack whose manifest will not parse — right at runtime, since
+    /// one malformed pack must not cost the user the rest of the catalog, but it
+    /// means a typo in a shipped manifest ships as a connector that is simply
+    /// absent, with nothing red anywhere.
+    ///
+    /// The second is the open connector's whole promise: no credential, no
+    /// variable, nothing to configure, so `readiness` must return ready rather
+    /// than parking it behind a step the user can never take.
+    ///
+    /// What this CANNOT check is whether a server's declared auth matches the
+    /// auth the live server demands — an `oauth:` key on a server that needs
+    /// none, or its absence on one that does. Both are network facts, and a
+    /// readiness probe is required never to perform network I/O. Verifying that
+    /// is a probe against the real endpoint, done when a connector is added.
+    #[test]
+    fn every_shipped_connector_reaches_the_catalog_and_states_its_readiness() {
+        use crate::config::mcp_servers::NotReady;
+
+        crate::config::secrets::mock_keychain::install();
+        let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cairn-core manifest is nested under src-tauri");
+        let packs_dir = src_tauri.join(pack::PACKS_SOURCE_DIR);
+
+        let mut shipped: Vec<String> = std::fs::read_dir(&packs_dir)
+            .expect("read src-tauri/packs")
+            .map(|entry| entry.expect("readable pack entry").path())
+            .filter(|path| path.is_dir())
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        shipped.sort();
+
+        let discovered: Vec<String> = pack::discover_available_packs(src_tauri)
+            .into_iter()
+            .map(|manifest| manifest.id)
+            .collect();
+        assert_eq!(
+            discovered, shipped,
+            "every shipped pack directory must resolve to a manifest whose id is its \
+             directory name; a pack missing from this list failed to parse and was skipped"
+        );
+
+        let mut declared_by: BTreeMap<String, String> = BTreeMap::new();
+        for id in &shipped {
+            let mcp_file = packs_dir.join(id).join(pack::manifest::PACK_MCP_FILE);
+            if !mcp_file.is_file() {
+                continue;
+            }
+            let file = pack::mcp::parse_pack_mcp_file(&mcp_file)
+                .unwrap_or_else(|e| panic!("pack `{id}` ships an unparseable mcp.yaml: {e}"));
+            assert!(
+                !file.servers.is_empty(),
+                "pack `{id}` ships an mcp.yaml declaring no servers"
+            );
+
+            // Every variable a shipped server gates on must be described, or
+            // its settings row is back to naming an environment variable at
+            // someone with no way to act on it.
+            for (name, config) in &file.servers {
+                for var in config.referenced_vars() {
+                    let described = file
+                        .setup
+                        .get(&var)
+                        .is_some_and(|entry| entry.label.is_some() || entry.description.is_some());
+                    assert!(
+                        described,
+                        "pack `{id}` server `{name}` gates on ${{{var}}} with no `setup` entry \
+                         describing it; the settings row would have nothing to ask for"
+                    );
+                }
+            }
+
+            for (name, config) in file.servers {
+                if let Some(other) = declared_by.insert(name.clone(), id.clone()) {
+                    panic!(
+                        "packs `{other}` and `{id}` both declare MCP server `{name}`; the \
+                         install path refuses that collision, so one of them could never \
+                         be installed alongside the other"
+                    );
+                }
+
+                if matches!(config.transport.as_str(), "http" | "sse") {
+                    let url = config.url.as_deref().unwrap_or_default();
+                    assert!(
+                        url.starts_with("https://"),
+                        "remote connector `{name}` must reach its server over https, got {url:?}"
+                    );
+                }
+
+                let readiness = config.readiness(&name);
+                if config.oauth.is_some() {
+                    assert_eq!(
+                        readiness,
+                        Some(NotReady::NeedsAuth),
+                        "OAuth connector `{name}` must sit needs-auth until the user authorizes"
+                    );
+                } else if config.referenced_vars().is_empty() {
+                    assert_eq!(
+                        readiness, None,
+                        "connector `{name}` asks for no credential and no variable, so it \
+                         must be usable the moment its pack installs"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -40,6 +40,19 @@ pub enum DictationMode {
     Toggle,
 }
 
+/// Which kind of work a model preference is about.
+///
+/// Live dictation and file transcription want different things from a model —
+/// one is racing the speaker, the other is not — so they are separate choices
+/// rather than one setting the user has to compromise on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPurpose {
+    #[default]
+    File,
+    Dictation,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoicePreferences {
@@ -47,6 +60,12 @@ pub struct VoicePreferences {
     pub enabled: bool,
     #[serde(default)]
     pub preferred_file_model: VoiceModel,
+    /// The model live dictation opens a stream with. Defaults to `Fast`, which
+    /// is the only one that keeps up with a speaker on typical hardware, and
+    /// `serde(default)` so a settings file written before this existed still
+    /// loads.
+    #[serde(default)]
+    pub preferred_dictation_model: VoiceModel,
     #[serde(default)]
     pub dictation_mode: DictationMode,
     /// The microphone dictation opens, named by the `deviceId` the webview's
@@ -88,6 +107,7 @@ pub struct VoiceStatus {
     pub fast_model: ComponentState,
     pub accurate_model: ComponentState,
     pub preferred_file_model: VoiceModel,
+    pub preferred_dictation_model: VoiceModel,
     pub dictation_mode: DictationMode,
     pub input_device_id: Option<String>,
     pub detail: Option<String>,
@@ -217,6 +237,7 @@ mod tests {
             VoicePreferences {
                 enabled: false,
                 preferred_file_model: VoiceModel::Fast,
+                preferred_dictation_model: VoiceModel::Fast,
                 dictation_mode: DictationMode::Hold,
                 input_device_id: None,
             }
@@ -289,6 +310,33 @@ mod tests {
             serde_yaml::from_str("enabled: true\npreferredFileModel: accurate\n").unwrap();
         assert_eq!(preferences.dictation_mode, DictationMode::Hold);
         assert_eq!(preferences.input_device_id, None);
+    }
+
+    /// A settings file written before dictation had its own model must keep the
+    /// behaviour it had: Fast for live speech, whatever was chosen for files.
+    #[test]
+    fn a_settings_file_without_a_dictation_model_still_dictates_with_fast() {
+        let preferences: VoicePreferences =
+            serde_yaml::from_str("enabled: true\npreferredFileModel: accurate\n").unwrap();
+        assert_eq!(preferences.preferred_file_model, VoiceModel::Accurate);
+        assert_eq!(preferences.preferred_dictation_model, VoiceModel::Fast);
+    }
+
+    /// The two choices are independent, and both survive a round trip.
+    #[test]
+    fn dictation_and_file_models_are_remembered_separately() {
+        let split = VoicePreferences {
+            enabled: true,
+            preferred_file_model: VoiceModel::Accurate,
+            preferred_dictation_model: VoiceModel::Fast,
+            ..VoicePreferences::default()
+        };
+        let yaml = serde_yaml::to_string(&split).unwrap();
+        assert!(yaml.contains("preferredDictationModel: fast"), "{yaml}");
+        assert_eq!(
+            serde_yaml::from_str::<VoicePreferences>(&yaml).unwrap(),
+            split
+        );
     }
 
     /// The chosen microphone round-trips under the name the webview uses, and

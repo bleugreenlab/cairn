@@ -39,11 +39,11 @@ impl OpenRouterAdapter {
 impl WireAdapter for OpenRouterAdapter {
     type Message = ChatMessage;
 
-    fn backend_key(&self) -> &'static str {
+    fn backend_key(&self) -> &str {
         OPENROUTER_BACKEND_KEY
     }
 
-    fn backend_name(&self) -> &'static str {
+    fn backend_name(&self) -> &str {
         OPENROUTER_BACKEND_NAME
     }
 

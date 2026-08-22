@@ -927,6 +927,7 @@ fn parses_first_class_thread_resources() {
         ),
         ("cairn://p/cairn/design-review/wakes", vec!["wakes"]),
         ("cairn://p/cairn/design-review/memories", vec!["memories"]),
+        ("cairn://p/cairn/design-review/eras", vec!["eras"]),
         ("cairn://p/cairn/design-review/arc", vec!["arc"]),
     ] {
         let resource = parse_uri(uri).unwrap();
@@ -1591,6 +1592,33 @@ fn parses_only_node_memory_resources() {
         resource.to_route(),
         Some("/p/cairn/i/1498/1/builder/memories/2".to_string())
     );
+}
+
+#[test]
+fn parses_and_round_trips_node_eras_resources() {
+    let collection = CairnResource::NodeEras {
+        project: "cairn".to_string(),
+        number: 1498,
+        exec_seq: 1,
+        node_id: "builder".to_string(),
+    };
+    let collection_uri = "cairn://p/cairn/1498/1/builder/eras";
+    assert_eq!(parse_uri(collection_uri), Some(collection.clone()));
+    assert_eq!(collection.to_uri(), collection_uri);
+    assert_eq!(collection.kind(), ResourceKind::NodeEras);
+
+    let member = CairnResource::NodeEra {
+        project: "cairn".to_string(),
+        number: 1498,
+        exec_seq: 1,
+        node_id: "builder".to_string(),
+        era_seq: 3,
+    };
+    let member_uri = "cairn://p/cairn/1498/1/builder/eras/3";
+    assert_eq!(parse_uri(member_uri), Some(member.clone()));
+    assert_eq!(member.to_uri(), member_uri);
+    assert_eq!(member.project(), Some("cairn"));
+    assert_eq!(member.kind(), ResourceKind::NodeEra);
 }
 
 #[test]

@@ -1,6 +1,16 @@
 //! Bookmark / git-ref resolution, export, and publishing to origin.
 use super::*;
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(test)]
+static FAIL_NEXT_LOCAL_BOOKMARKS_AT: AtomicBool = AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_local_bookmarks_at() {
+    FAIL_NEXT_LOCAL_BOOKMARKS_AT.store(true, Ordering::SeqCst);
+}
 /// Query only candidate bookmark names in one structured jj invocation. An
 /// empty candidate set is resolved without spawning jj.
 pub(crate) fn query_local_bookmarks(
@@ -167,6 +177,10 @@ pub(crate) fn bookmark_landed_in(jj: &JjEnv, store: &Path, src: &str, dst: &str)
 /// `--ignore-working-copy` keeps the read from snapshotting `@` before the seal
 /// deliberately does so.
 pub(crate) fn local_bookmarks_at(jj: &JjEnv, ws: &Path, rev: &str) -> Result<Vec<String>, String> {
+    #[cfg(test)]
+    if FAIL_NEXT_LOCAL_BOOKMARKS_AT.swap(false, Ordering::SeqCst) {
+        return Err("injected local bookmark read failure".to_string());
+    }
     let out = jj.run(
         ws,
         &[

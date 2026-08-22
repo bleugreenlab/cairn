@@ -90,6 +90,10 @@ pub(super) async fn dispatch(
                     .await
                     .map_err(|e| build_failure(index, item, e))?;
                 }
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    crate::notify::thread_db_change(&thread, "insert"),
+                );
                 format!("Created thread cairn://p/{project}/{}", thread.name)
             }
         }
@@ -115,6 +119,10 @@ pub(super) async fn dispatch(
                         crate::threads::crud::delete(&db, &thread.id)
                             .await
                             .map_err(|e| build_failure(index, item, e.to_string()))?;
+                        let _ = orch.services.emitter.emit(
+                            "db-change",
+                            crate::notify::thread_db_change(&thread, "delete"),
+                        );
                         format!("Deleted thread {project}/{name}")
                     }
                 }
@@ -182,7 +190,7 @@ pub(super) async fn dispatch(
                         // the session establishment they imply — belongs to
                         // `crud::update` alone, so an agent-side patch and a
                         // desktop edit cannot reach different end states.
-                        let updated = crate::threads::crud::update(
+                        let outcome = crate::threads::crud::update(
                             &db,
                             cairn_db::models::UpdateThread {
                                 id: thread.id.clone(),
@@ -213,7 +221,14 @@ pub(super) async fn dispatch(
                         )
                         .await
                         .map_err(|e| build_failure(index, item, e.to_string()))?;
-                        format!("Patched thread cairn://p/{project}/{}", updated.name)
+                        let _ = orch.services.emitter.emit(
+                            "db-change",
+                            crate::notify::thread_update_db_change(
+                                &outcome.previous,
+                                &outcome.thread,
+                            ),
+                        );
+                        format!("Patched thread cairn://p/{project}/{}", outcome.thread.name)
                     }
                 }
                 _ => return Ok(None),

@@ -35,6 +35,12 @@ fn account(server: &str, var: &str) -> String {
     format!("{server}/{var}")
 }
 
+/// The keychain account for a `(server, var)` pair whose value is **not** a
+/// credential. See [`set_config_value`].
+fn config_account(server: &str, var: &str) -> String {
+    format!("config:{server}/{var}")
+}
+
 /// The server component used in keychain accounts for workspace or project MCP
 /// credentials. Workspace keys are intentionally unchanged for compatibility;
 /// project keys include the repo path so same-named servers in different
@@ -49,6 +55,63 @@ pub fn credential_key(server: &str, project_path: Option<&Path>) -> String {
 fn entry(server: &str, var: &str) -> Result<Entry, String> {
     Entry::new(&service(), &account(server, var))
         .map_err(|e| format!("Failed to open keychain entry: {e}"))
+}
+
+fn config_entry(server: &str, var: &str) -> Result<Entry, String> {
+    Entry::new(&service(), &config_account(server, var))
+        .map_err(|e| format!("Failed to open keychain entry: {e}"))
+}
+
+/// Store (or replace) a **non-credential** value for `var` referenced by
+/// `server` — a path to something the user installed, supplied through the pack
+/// setup affordance.
+///
+/// # Why a second store rather than a second meaning for the first
+///
+/// The keychain is the only store a Finder- or Dock-launched app can read a
+/// user-supplied value from, so a pack server's executable path has to live
+/// here alongside real credentials. But the credential broker's declared-secret
+/// signal is "a value in the keychain is a secret, because a human typed it
+/// into a secret field" — and registering a resolved secret makes it a
+/// process-global scrub target for the life of the process, which *refuses*
+/// every model-authored write that mentions it. A user's MATLAB install path
+/// registered that way is an undiagnosable agent lockout.
+///
+/// The declaration therefore has to be durable and attached to the entry, not
+/// inferred from the value at read time. Two things go wrong with inference:
+/// it silently reclassifies values stored through the ordinary secret field
+/// that happen to look like whatever it is sniffing for, and — because
+/// registration is process-lifetime and cannot be undone — one resolution taken
+/// while the filesystem disagreed would poison the value for the rest of the
+/// process, even after the world caught up.
+///
+/// So the account namespace carries the declaration: written here, it is
+/// configuration, always, on every read, forever. See
+/// [`crate::security::broker`].
+pub fn set_config_value(server: &str, var: &str, value: &str) -> Result<(), String> {
+    config_entry(server, var)?
+        .set_password(value)
+        .map_err(|e| format!("Failed to store value in keychain: {e}"))
+}
+
+/// Read the non-credential value for `var` referenced by `server`, if stored.
+pub fn get_config_value(server: &str, var: &str) -> Option<String> {
+    match config_entry(server, var).ok()?.get_password() {
+        Ok(value) => Some(value),
+        Err(Error::NoEntry) => None,
+        Err(e) => {
+            log::warn!("Failed to read MCP value {server}/{var} from keychain: {e}");
+            None
+        }
+    }
+}
+
+/// Remove the stored non-credential value for `var` referenced by `server`.
+pub fn delete_config_value(server: &str, var: &str) -> Result<(), String> {
+    match config_entry(server, var)?.delete_credential() {
+        Ok(()) | Err(Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Failed to delete value from keychain: {e}")),
+    }
 }
 
 /// Store (or replace) the secret value for `var` referenced by `server`.

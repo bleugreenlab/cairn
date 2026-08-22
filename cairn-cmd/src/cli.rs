@@ -94,7 +94,7 @@ pub(crate) fn build_cli_client(callback_url: String) -> CairnCmd {
     let home_uri = env::var("CAIRN_HOME_URI")
         .ok()
         .filter(|uri| parse_cairn_uri(uri).is_some());
-    CairnCmd::new_with_home_uri(callback_url, cwd, run_id, mcp_secret, Vec::new(), home_uri)
+    CairnCmd::new_with_home_uri(callback_url, cwd, run_id, mcp_secret, home_uri)
 }
 
 /// Extract printable text and the error flag from a tool result
@@ -687,7 +687,6 @@ mod tests {
             "/repo".into(),
             Some("run-1".into()),
             None,
-            vec![],
             None,
         );
         let request = check_run_request(&client, "rust-tests".into(), None, false);
@@ -706,7 +705,6 @@ mod tests {
             "/repo".into(),
             Some("run-1".into()),
             None,
-            vec![],
             None,
         );
         let request = check_run_request(&client, "rust-tests".into(), None, true);
@@ -723,7 +721,6 @@ mod tests {
             "/repo".into(),
             Some("run-1".into()),
             None,
-            vec![],
             None,
         );
         let request = check_run_status_request(&client, "manual-obs-1");
@@ -1051,7 +1048,6 @@ mod tests {
             "/repo".into(),
             None,
             None,
-            vec![],
             None,
         );
         let request = check_run_request(

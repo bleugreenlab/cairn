@@ -113,6 +113,25 @@ pub(crate) enum CheckExecMode {
     Shared,
 }
 
+fn write_check_transport_env(
+    shell_env: Vec<(String, String)>,
+    changed_body: String,
+    base_content: Option<String>,
+) -> Vec<(String, String)> {
+    let mut env = slot_check_env(shell_env);
+    env.push((CHANGED_FILES_CONTENT_ENV.to_string(), changed_body));
+    if let Some(base_content) = base_content {
+        env.push((BASE_CONTENT_CONTENT_ENV.to_string(), base_content));
+    }
+    env
+}
+
+fn write_check_planning_infrastructure_failure(error: &str) -> String {
+    format!(
+        "Write-check planning infrastructure failure: could not build authoritative executor base-content bundle: {error}"
+    )
+}
+
 #[derive(Debug)]
 enum CommitChecksContractError {
     Missing,
@@ -143,6 +162,52 @@ impl CommitChecksContractError {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn base_bundle_serializes_absent_wanted_paths_as_null() {
+    let wanted = BTreeSet::from([
+        EXECUTOR_PROTOCOL_SOURCE.to_string(),
+        "src-tauri/cairn-exec/src/new_wire.rs".to_string(),
+    ]);
+    let content: BTreeMap<String, Option<String>> =
+        wanted.iter().map(|path| (path.clone(), None)).collect();
+    let serialized = serde_json::to_value(content).unwrap();
+    assert_eq!(
+        serialized[EXECUTOR_PROTOCOL_SOURCE],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        serialized["src-tauri/cairn-exec/src/new_wire.rs"],
+        serde_json::Value::Null
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn write_transport_carries_changed_paths_and_base_content_together() {
+    let env = write_check_transport_env(
+        Vec::new(),
+        "src-tauri/cairn-exec/src/new_wire.rs".to_string(),
+        Some("{\"src-tauri/cairn-exec/src/new_wire.rs\":null}".to_string()),
+    );
+    assert!(env
+        .iter()
+        .any(|(key, value)| key == CHANGED_FILES_CONTENT_ENV
+            && value == "src-tauri/cairn-exec/src/new_wire.rs"));
+    assert!(env
+        .iter()
+        .any(|(key, value)| key == BASE_CONTENT_CONTENT_ENV
+            && value == "{\"src-tauri/cairn-exec/src/new_wire.rs\":null}"));
+}
+
+#[cfg(test)]
+#[test]
+fn base_bundle_failure_is_surfaced_as_planning_infrastructure() {
+    let result = write_check_planning_infrastructure_failure("jj failed");
+    assert!(result.contains("planning infrastructure failure"));
+    assert!(result.contains("jj failed"));
 }
 
 #[cfg(test)]
@@ -1051,6 +1116,7 @@ pub async fn run_manual_configured_check_with_progress(
                         run_context: None,
                         mutation_policy: MutationPolicy::PureVerdict,
                         status_board: Some(status_board.clone()),
+                        purpose: None,
                     },
                 )
                 .await?
@@ -1744,6 +1810,7 @@ pub(crate) async fn execute_job_verdict(
             run_context: None,
             mutation_policy: MutationPolicy::PureVerdict,
             status_board: None,
+            purpose: None,
         },
     )
     .await?;
@@ -2205,7 +2272,13 @@ async fn submit_single_planned_check_batch(
     }
     let submitted = if mutation_policy == MutationPolicy::PureVerdict {
         orch.fleet
-            .submit_pure_verdict_batch(orch, request.clone(), items, batch.run_context)
+            .submit_pure_verdict_batch(
+                orch,
+                request.clone(),
+                items,
+                batch.run_context,
+                batch.purpose,
+            )
             .await
     } else {
         let processes = items.into_iter().map(|item| item.process).collect();
@@ -2302,6 +2375,14 @@ pub(crate) struct PlannedCheckBatchRequest {
     pub run_context: Option<RunContext>,
     pub mutation_policy: MutationPolicy,
     pub status_board: Option<CheckStatusBoard>,
+    /// The question this batch answers, when it answers a standing one.
+    ///
+    /// Present for work whose whole point is to hold one answer current —
+    /// default-branch attestation above all, where each new tip is a newer
+    /// answer to the same question and must replace its predecessor rather than
+    /// run beside it. Absent for one-off work, which asks its question once and
+    /// is in competition with nothing.
+    pub purpose: Option<crate::fleet::purpose::PurposeKey>,
 }
 
 pub(crate) struct PlannedCheckBatchOutcome {
@@ -2511,6 +2592,9 @@ fn stalled_substrate_shape(
         State::Draining => SubstrateFailureShape::Draining,
         // Connected and no longer reporting: the machine stopped answering.
         State::ConnectedStalled => SubstrateFailureShape::MachineUnreachable,
+        // The machine answered explicitly; Cairn cannot start work until its
+        // incompatible local executor has been replaced.
+        State::PermanentRefusal => SubstrateFailureShape::Dispatch,
         // Running work already admitted, and every state the fleet counts as the
         // machine working. Those were answered as capacity above; naming them
         // keeps this match total.
@@ -2645,7 +2729,9 @@ use crate::execution::check_parsers::{
     ParsedCheckResult, MAX_FAILURE_NAMES,
 };
 use crate::execution::selection::{plan_checks, whole_suite_command, CheckPlan, CheckScope};
-use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries, GraphFileChange, JjEnv};
+use crate::jj::{
+    logical_changed_files, logical_tree_hash, read_blobs, tree_entries, GraphFileChange, JjEnv,
+};
 use crate::mcp::handlers::run::{CheckExecResult, CheckStatusEntry, CheckStatusPayload};
 use crate::mcp::handlers::RunContext;
 use crate::orchestrator::Orchestrator;
@@ -2660,6 +2746,75 @@ const DEFAULT_WRITE_CHECK_TIMEOUT_MS: u32 = 600_000;
 pub(crate) const DEFAULT_REVIEW_CHECK_TIMEOUT_MS: u32 = 1_800_000;
 /// Legacy normalization ceiling for the accepted `timeout` configuration value.
 const MAX_CHECK_TIMEOUT_MS: u32 = 3_600_000;
+
+const BASE_CONTENT_CONTENT_ENV: &str = "CAIRN_CHECK_BASE_CONTENT_CONTENT";
+const CHANGED_FILES_CONTENT_ENV: &str = "CAIRN_CHECK_CHANGED_FILES_CONTENT";
+const EXECUTOR_PROTOCOL_SOURCE: &str = "src-tauri/os/cairn-common/src/executor_protocol.rs";
+const EXECUTOR_WIRE_PATHS: &[&str] = &[
+    "src-tauri/cairn-exec/",
+    "src-tauri/cairn-orch/src/remote_executor.rs",
+    "src-tauri/os/cairn-core/src/execution/wire.rs",
+    "src-tauri/os/cairn-core/src/fleet/mod.rs",
+    "src-tauri/os/cairn-common/src/executor_protocol.rs",
+    "src-tauri/cairn-transport/src/routes/executor.rs",
+    "src-tauri/cairn-transport/src/server.rs",
+];
+const EXECUTOR_PROCESS_PATH_RENAMES: &[(&str, &str)] = &[
+    ("src-tauri/cairn-exec/", "src-tauri/cairn-executor/"),
+    ("src-tauri/cairn-orch/", "src-tauri/cairn-runner/"),
+];
+const NON_WIRE_RUNTIME_PATHS: &[&str] = &[
+    "src-tauri/cairn-orch/src/executor_distribution.rs",
+    "src-tauri/cairn-exec/src/storage.rs",
+    "src-tauri/cairn-exec/Cargo.toml",
+];
+
+fn executor_base_content_paths(changed: &[GraphFileChange]) -> BTreeSet<String> {
+    let mut paths = BTreeSet::from([EXECUTOR_PROTOCOL_SOURCE.to_string()]);
+    for path in changed.iter().filter_map(|change| {
+        let path = change.path.as_str();
+        (path.ends_with(".rs")
+            && !NON_WIRE_RUNTIME_PATHS.contains(&path)
+            && EXECUTOR_WIRE_PATHS
+                .iter()
+                .any(|wire| path == *wire || path.starts_with(wire)))
+        .then(|| path.to_string())
+    }) {
+        if let Some((current, legacy)) = EXECUTOR_PROCESS_PATH_RENAMES
+            .iter()
+            .find(|(current, _)| path.starts_with(current))
+        {
+            paths.insert(path.replacen(current, legacy, 1));
+        }
+        paths.insert(path);
+    }
+    paths
+}
+
+fn executor_base_content_bundle(
+    jj: &JjEnv,
+    repository: &Path,
+    base: &str,
+    changed: &[GraphFileChange],
+) -> Result<String, String> {
+    let wanted = executor_base_content_paths(changed);
+    let entries = tree_entries(jj, repository, base)?;
+    let selected: Vec<_> = entries
+        .iter()
+        .filter(|(path, _)| wanted.contains(path))
+        .collect();
+    let ids: Vec<_> = selected.iter().map(|(_, id)| id.as_str()).collect();
+    let blobs = read_blobs(jj, repository, &ids)?;
+    let mut content: BTreeMap<String, Option<String>> =
+        wanted.iter().map(|path| (path.clone(), None)).collect();
+    for (path, id) in selected {
+        let Some(bytes) = blobs.get(id) else { continue };
+        let source = std::str::from_utf8(bytes)
+            .map_err(|_| format!("base content for {path} is not UTF-8"))?;
+        content.insert(path.clone(), Some(source.to_string()));
+    }
+    serde_json::to_string(&content).map_err(|error| format!("serialize base content: {error}"))
+}
 
 /// Normalize the legacy `timeout` configuration value. This value may still
 /// travel through planning for mixed-version compatibility, but
@@ -3006,7 +3161,27 @@ fn classified_output_excerpt(
 /// suite; that edge case is deliberately left as-is.
 pub(crate) async fn cancel_stale_review_on_branch_advance(orch: &Orchestrator, job_id: &str) {
     for stale in jobs_sharing_branch(&orch.db.local, job_id).await {
-        orch.cancel_turn_end_checks(&stale);
+        // Name the tree the withdrawn wave was verifying. A supersession logged
+        // as "cancelled" alone leaves a reader unable to tell a wave stopped for
+        // the right reason — the tree it holds is no longer the node's — from
+        // one lost to a fault.
+        if orch.turn_end_checks_in_flight(&stale) {
+            let verifying = orch
+                .turn_end_check_runtime_status(&stale)
+                .map(|status| {
+                    let tree = status.tree_hash;
+                    format!("tree {}", &tree[..tree.len().min(12)])
+                })
+                .unwrap_or_else(|| "a tree it had not published yet".to_string());
+            log::info!(
+                "review wave for job {}: superseded — the branch advanced past the {verifying} it was verifying",
+                &stale[..stale.len().min(8)]
+            );
+        }
+        orch.cancel_turn_end_checks(
+            &stale,
+            crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
+        );
     }
 }
 
@@ -3029,7 +3204,7 @@ pub(crate) async fn cancel_stale_review_on_branch_advance(orch: &Orchestrator, j
 ///
 /// Always yields `job_id`, so a job with no recorded branch (or an unreadable
 /// row) still cancels its own suite exactly as before.
-async fn jobs_sharing_branch(db: &LocalDb, job_id: &str) -> Vec<String> {
+pub(crate) async fn jobs_sharing_branch(db: &LocalDb, job_id: &str) -> Vec<String> {
     let owner = job_id.to_string();
     let siblings = db
         .read(|conn| {
@@ -3208,6 +3383,24 @@ async fn run_write_checks_after_seal_inner(
             return None;
         }
         let tree_hash = logical_tree_hash(&planning_jj, &planning_repo, &planning_head).ok()?;
+        let changed_body = changed
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let base_content = if plans.iter().any(|plan| plan.name == "executor-protocol") {
+            match executor_base_content_bundle(
+                &planning_jj,
+                &planning_repo,
+                &planning_base,
+                &changed,
+            ) {
+                Ok(content) => Some(content),
+                Err(error) => return Some(Err(error)),
+            }
+        } else {
+            None
+        };
         let sealed_commit = planning_head.clone();
         // The narrowing baseline is this JOB's last green run of each check, not the
         // project's most recent row of any status. Both qualifiers carry weight: a
@@ -3267,11 +3460,22 @@ async fn run_write_checks_after_seal_inner(
                 (selected_plan, input_hash)
             })
             .collect();
-        Some((keyed, tree_hash, sealed_commit))
+        Some(Ok((
+            keyed,
+            tree_hash,
+            sealed_commit,
+            changed_body,
+            base_content,
+        )))
     })
     .await
     .ok()??;
-    let (keyed, tree_hash, sealed_commit) = planned;
+    let (keyed, tree_hash, sealed_commit, changed_body, base_content) = match planned {
+        Ok(planned) => planned,
+        Err(error) => {
+            return Some(write_check_planning_infrastructure_failure(&error));
+        }
+    };
 
     // The planning unit above is synchronous and sits on the critical path of
     // every source-touching commit, between the sealed commit and the agent
@@ -3308,7 +3512,7 @@ async fn run_write_checks_after_seal_inner(
             resolve_check_timeout_ms(checks.get(&plan.name), DEFAULT_WRITE_CHECK_TIMEOUT_MS)
         })
         .collect();
-    let slot_env = slot_check_env(jj.shell_env());
+    let slot_env = write_check_transport_env(jj.shell_env(), changed_body, base_content);
     // Reuse follows the suite's declared trust set, not the environment of the
     // executor that a miss may eventually select. Filter hits before placement so
     // a stored verdict consumes no build-slot capacity.
@@ -3638,6 +3842,7 @@ async fn run_write_checks_after_seal_inner(
                         run_context: Some(context),
                         mutation_policy: MutationPolicy::PureVerdict,
                         status_board: None,
+                        purpose: None,
                     },
                 )
                 .await
@@ -3788,6 +3993,7 @@ async fn submit_write_check_batch_for(
                     run_context: Some(run_context.clone()),
                     mutation_policy: MutationPolicy::AllowDelta,
                     status_board,
+                    purpose: None,
                 },
             )
             .await
@@ -4718,6 +4924,62 @@ fn check_result_key_for_executed_command(
     check_result_key(&executed, selector, entries, tree_hash, platform, toolchain)
 }
 
+/// A verdict a planned lane may report instead of executing, with the
+/// observation identity that reuse must cite.
+pub(crate) struct ReusedCheckVerdict {
+    pub(crate) entry: crate::execution::cache::CheckResultCacheEntry,
+    pub(crate) source_observation_id: String,
+    pub(crate) environment_fingerprint: String,
+    pub(crate) public_handle: String,
+}
+
+/// Whether a planned lane already holds a verdict this run may report without
+/// executing it, and that verdict if so.
+///
+/// The ONE predicate for that question, because two parties ask it and they must
+/// not disagree: a caller deciding whether to submit a lane at all, and the
+/// engine's cache phase deciding whether to consume that lane's batch result.
+/// Disagreement in one direction runs a command whose answer is already stored;
+/// in the other it skips a lane nothing will answer. Reuse also requires a
+/// resolvable public handle, because a verdict that cannot be cited is not
+/// evidence a reader can follow.
+pub(crate) fn reusable_verdict_for_plan(
+    db: Arc<LocalDb>,
+    project_id: &str,
+    plan: &CheckPlan,
+    input_hash: &str,
+    effective_env: &[(String, String)],
+) -> Option<ReusedCheckVerdict> {
+    let reused = get_reusable_check_result(
+        db.clone(),
+        ReusableCheckLookup {
+            project_id,
+            check_name: &plan.name,
+            input_hash,
+            verdict_platforms: &plan.verdict_platforms,
+            implementation_identity: cairn_common::check_environment::implementation_identity(),
+            verdict_environment_hash: &effective_verdict_environment_hash(plan, effective_env),
+            result_schema_version: crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION
+                as i64,
+        },
+    )
+    .ok()
+    .flatten()?;
+    let public_handle = crate::execution::cache::get_check_observation_public_handle(
+        db,
+        project_id,
+        &reused.source_observation_id,
+    )
+    .ok()
+    .flatten()?;
+    Some(ReusedCheckVerdict {
+        entry: reused.entry,
+        source_observation_id: reused.source_observation_id,
+        environment_fingerprint: reused.environment_fingerprint,
+        public_handle,
+    })
+}
+
 /// Execute the planned checks against the sealed tree, consulting the cache
 /// first. Each plan is paired with its per-check input hash (the cache key);
 /// `tree_hash` is the whole-tree pointer re-stamped onto every evaluated row so
@@ -4845,36 +5107,17 @@ where
         // a commit that changed none of this check's impact-matched files hits
         // even though the whole-tree hash moved.
         let schema_version = crate::execution::check_identity::CHECK_RESULT_SCHEMA_VERSION as i64;
-        let verdict_environment_hash = effective_verdict_environment_hash(plan, effective_env);
-        let Ok(Some(reused)) = get_reusable_check_result(
-            db.clone(),
-            ReusableCheckLookup {
-                project_id,
-                check_name: &plan.name,
-                input_hash,
-                verdict_platforms: &plan.verdict_platforms,
-                implementation_identity: cairn_common::check_environment::implementation_identity(),
-                verdict_environment_hash: &verdict_environment_hash,
-                result_schema_version: schema_version,
-            },
-        ) else {
-            // Legacy, incomplete, unstable, or environment-mismatched evidence is diagnostic only.
+        // Legacy, incomplete, unstable, or environment-mismatched evidence is diagnostic only.
+        let Some(reused) =
+            reusable_verdict_for_plan(db.clone(), project_id, plan, input_hash, effective_env)
+        else {
             misses.push(index);
             continue;
         };
         let entry = reused.entry;
         let source_observation = reused.source_observation_id;
         let source_environment_fingerprint = reused.environment_fingerprint;
-        let Some(public_handle) = crate::execution::cache::get_check_observation_public_handle(
-            db.clone(),
-            project_id,
-            &source_observation,
-        )
-        .ok()
-        .flatten() else {
-            misses.push(index);
-            continue;
-        };
+        let public_handle = reused.public_handle;
         let recorded = crate::execution::cache::RecordedCheckObservation {
             id: source_observation.clone(),
             public_handle,
@@ -6074,9 +6317,11 @@ pub(crate) async fn verify_review_tree(
     repository: &str,
     planning_root: &Path,
     commit_id: &str,
+    base_commit_id: &str,
     tree_hash: &str,
     tree_entries: &[(String, String)],
     changed: &[GraphFileChange],
+    attributed_changed: Option<&[GraphFileChange]>,
     requesting_job_id: &str,
     priority: CellPriority,
     scope: ReviewTreeCheckScope,
@@ -6167,20 +6412,43 @@ pub(crate) async fn verify_review_tree(
         toolchain,
     );
 
-    let changed_body = match scope {
-        ReviewTreeCheckScope::Gates => changed
-            .iter()
-            .map(|change| change.path.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        ReviewTreeCheckScope::All => String::new(),
+    // Full main-health uses the whole tree only to decide which suites apply.
+    // Protocol attribution must remain the actual integration-base diff.
+    let attributed_changed = attributed_changed.unwrap_or(changed);
+    let changed_body = attributed_changed
+        .iter()
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let base_content = if keyed
+        .iter()
+        .any(|(plan, _)| plan.name == "executor-protocol")
+    {
+        match executor_base_content_bundle(
+            &gate_jj,
+            &gate_repository,
+            base_commit_id,
+            attributed_changed,
+        ) {
+            Ok(content) => Some(content),
+            Err(error) => {
+                return ReviewTreeGateResult::InfrastructureFailure(format!(
+                    "build executor protocol base content from {base_commit_id}: {error}"
+                ))
+            }
+        }
+    } else {
+        None
     };
-    // Carry attribution in the request itself. A coordinator-local temporary
-    // path is unreadable when this pure-verdict check spills to a remote cell.
-    let env = vec![(
+    // Carry attribution and comparison content in the request itself. Coordinator-local
+    // temporary paths are unreadable when this pure-verdict check spills to a remote cell.
+    let mut env = vec![(
         "CAIRN_CHECK_CHANGED_FILES_CONTENT".to_string(),
         changed_body,
     )];
+    if let Some(base_content) = base_content {
+        env.push((BASE_CONTENT_CONTENT_ENV.to_string(), base_content));
+    }
     let timeouts: Vec<u32> = keyed
         .iter()
         .map(|(plan, _)| {
@@ -6307,6 +6575,15 @@ pub(crate) async fn verify_review_tree(
                     run_context: None,
                     mutation_policy: MutationPolicy::PureVerdict,
                     status_board: None,
+                    // One attestation slot per project. Arming a newer tip
+                    // replaces the older one by this key, so two concurrent
+                    // attestations of one project are unrepresentable rather
+                    // than prevented by cooperative cancellation. The key names
+                    // the project and never the revision — a newer tip is a
+                    // newer answer to the same standing question.
+                    purpose: Some(crate::fleet::purpose::PurposeKey::main_attestation(
+                        &project,
+                    )),
                 },
                 CheckBatchTopology::Unified,
             )
@@ -9419,6 +9696,7 @@ cairn-common = { path = "../cairn-common" }
                     Some(vec![HostPressureCondition::MemoryAvailable {
                         available_bytes: 1,
                         floor_bytes: 2,
+                        unmeasured_hold_bytes: 0,
                     }]),
                 ),
                 SubstrateFailureShape::Capacity,
@@ -9542,6 +9820,7 @@ cairn-common = { path = "../cairn-common" }
             deadline(Some(ExecutorSubstrateState::SupervisorRespawning), None),
             deadline(Some(ExecutorSubstrateState::SlotAdoption), None),
             deadline(Some(ExecutorSubstrateState::ConnectedStalled), None),
+            deadline(Some(ExecutorSubstrateState::PermanentRefusal), None),
             deadline(Some(ExecutorSubstrateState::Draining), None),
             deadline(None, None),
             deadline(None, Some(Vec::new())),
@@ -9550,6 +9829,7 @@ cairn-common = { path = "../cairn-common" }
                 Some(vec![HostPressureCondition::MemoryAvailable {
                     available_bytes: 1,
                     floor_bytes: 2,
+                    unmeasured_hold_bytes: 0,
                 }]),
             ),
             deadline(
@@ -9567,6 +9847,14 @@ cairn-common = { path = "../cairn-common" }
                 }]),
             ),
         ];
+        assert_eq!(
+            no_start_shape(&deadline(
+                Some(ExecutorSubstrateState::PermanentRefusal),
+                None,
+            )),
+            SubstrateFailureShape::Dispatch,
+            "an explicit refusal must not claim Cairn lost contact with the machine"
+        );
         for reason in specimens {
             assert_eq!(
                 no_start_shape(&reason).is_transient(),
@@ -12549,7 +12837,7 @@ cairn-common = { path = "../cairn-common" }
         for signature in [
             "sccache: encountered fatal error: failed to create output file",
             "error: couldn't create a temp dir: Operation not permitted (os error 1) at path /Users/mitch/.cairn/build-slots/cairn/slot-542/src-tauri/target/debug/deps/.tmp123456",
-            "Operation not permitted (os error 1) at /Users/dev/.cairn-executor/build-slots/cairn/slot-5/src-tauri/target/debug/deps/.tmp123456",
+            "Operation not permitted (os error 1) at /Users/dev/.cairn-exec/build-slots/cairn/slot-5/src-tauri/target/debug/deps/.tmp123456",
         ] {
             assert_eq!(
                 classify_check_failure(opaque, Some(1), false, false, None, signature)
@@ -13006,5 +13294,34 @@ cairn-common = { path = "../cairn-common" }
             .reusable
         );
         assert!(!check_reuse_decision("bun run test:rust", None, None).reusable);
+    }
+}
+
+#[cfg(test)]
+mod executor_base_content_tests {
+    use super::*;
+
+    fn changed(path: &str) -> GraphFileChange {
+        GraphFileChange {
+            path: path.to_string(),
+            previous_path: None,
+            status: "modified".to_string(),
+            additions: 1,
+            deletions: 1,
+        }
+    }
+
+    #[test]
+    fn base_bundle_selects_protocol_and_changed_rust_wire_paths() {
+        let paths = executor_base_content_paths(&[
+            changed("src-tauri/cairn-exec/src/main.rs"),
+            changed("src-tauri/cairn-exec/Cargo.toml"),
+            changed("src/unrelated.rs"),
+        ]);
+        assert!(paths.contains(EXECUTOR_PROTOCOL_SOURCE));
+        assert!(paths.contains("src-tauri/cairn-exec/src/main.rs"));
+        assert!(paths.contains("src-tauri/cairn-executor/src/main.rs"));
+        assert!(!paths.contains("src-tauri/cairn-exec/Cargo.toml"));
+        assert!(!paths.contains("src/unrelated.rs"));
     }
 }

@@ -517,6 +517,37 @@ pub async fn get(db: &LocalDb, id: &str) -> Result<Option<Issue>, CairnError> {
     .map_err(CairnError::from)
 }
 
+pub async fn get_by_number(
+    db: &LocalDb,
+    project_id: &str,
+    number: i32,
+) -> Result<Option<Issue>, CairnError> {
+    let project_id = project_id.to_string();
+    db.read(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            let sql = format!(
+                "SELECT {ISSUE_COLUMNS}
+                 FROM issues
+                 WHERE project_id = ?1 AND number = ?2
+                 LIMIT 1"
+            );
+            let mut rows = conn
+                .query(&sql, params![project_id.as_str(), number])
+                .await?;
+            let mut issues = match rows.next().await? {
+                Some(row) => vec![issue_from_row(&row)?],
+                None => Vec::new(),
+            };
+            drop(rows);
+            hydrate_issue_relations(conn, &mut issues).await?;
+            Ok(issues.pop())
+        })
+    })
+    .await
+    .map_err(CairnError::from)
+}
+
 pub async fn list(db: &LocalDb, project_id: &str) -> Result<Vec<Issue>, CairnError> {
     let project_id = project_id.to_string();
     db.read(|conn| {

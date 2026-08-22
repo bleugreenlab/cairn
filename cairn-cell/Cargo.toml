@@ -1,8 +1,8 @@
 [package]
-name = "cairn-worktree"
+name = "cairn-cell"
 version.workspace = true
 edition = "2021"
-description = "Shared worktree population policy and filesystem primitive"
+description = "Shared build-cell policy and filesystem primitives"
 license = "BUSL-1.1"
 
 [dependencies]

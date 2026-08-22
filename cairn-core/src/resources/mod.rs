@@ -12,6 +12,7 @@ mod codemap;
 mod common;
 mod dev_instances;
 mod diff;
+mod eras;
 mod executors;
 mod feed;
 mod files;
@@ -44,7 +45,8 @@ pub(crate) use common::{connect_and_find_node_job, node_branch, node_job_not_fou
 pub(crate) use common::{pointer_affordance_block, resolve_home_relative_resource_uri};
 pub(crate) use node::{render_reseed_digest, resolve_node_or_task_job_id};
 pub(crate) use read::{produce_cairn_resource, read_cairn_resource};
-pub(crate) use thread_seed::{compose_thread_seed, ThreadSeed};
+pub(crate) use thread_seed::{compose_thread_seed_with_policy, SeedPolicy, ThreadSeed};
 /// The one interpretation of a thread sub-path, shared by the read dispatcher,
 /// the write dispatcher, and anything that resolves a thread-addressed resource.
 pub(crate) use threads::delegate_thread_descendant;
+pub(crate) use transcript::era_source_digest;

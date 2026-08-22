@@ -592,13 +592,18 @@ pub(crate) const EXECUTOR_RUNTIME_POLICY: KeySpec = KeySpec::with_aliases(
 pub(crate) const EXECUTOR_DRAINING: KeySpec = KeySpec::new(
     "draining",
     KeyType::Bool,
-    "true refuses new admissions without terminating resident work; live and lost on reconnect",
+    "true refuses new admissions without terminating resident work; durable runner-side state, so it needs no generation, works on an unreachable machine, and survives reconnect until cleared",
 );
 pub(crate) const EXECUTOR_EXPECTED_GENERATION: KeySpec = KeySpec::with_aliases(
     "expectedGeneration",
     &["expected_generation"],
     KeyType::Int,
-    "the connection generation you read; required with runtimePolicy or draining",
+    "the connection generation you read; required with runtimePolicy",
+);
+pub(crate) const EXECUTOR_REMOVAL_CONFIRM: KeySpec = KeySpec::new(
+    "confirm",
+    KeyType::Bool,
+    "remove even though the machine still counts work: what the counts describe is stranded and its lanes re-arm elsewhere",
 );
 
 // Empty mutation set, named for readability.

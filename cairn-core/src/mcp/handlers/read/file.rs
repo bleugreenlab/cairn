@@ -1,7 +1,7 @@
 //! File target producers and the legacy single-target `read` callback.
 
 use crate::mcp::file_targets::validate_read_path;
-use crate::mcp::handlers::read::{error_segment, grep_body_counts, grep_counts, Produced};
+use crate::mcp::handlers::read::{error_segment, Produced};
 use crate::mcp::handlers::target::invalid_target_error;
 use crate::mcp::types::{IssueHistoryMode, McpCallbackRequest, ReadFilePayload};
 use crate::orchestrator::Orchestrator;
@@ -493,17 +493,17 @@ fn run_object_outline(
     service: &super::object_read::ObjectReadService,
     repo_path: &str,
     glob: Option<&str>,
-) -> Result<(String, bool), String> {
+) -> Result<(crate::symbols::render::Rendered, bool), String> {
     if service.entries().is_ok() {
         Ok((
-            crate::symbols::outline::outline_texts(&object_text_files(service)?, glob).body,
+            crate::symbols::outline::outline_texts(&object_text_files(service)?, glob),
             true,
         ))
     } else {
         let source = String::from_utf8(service.bytes().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
         Ok((
-            crate::symbols::outline::outline_text(
+            crate::symbols::outline::outline_text_rendered(
                 &source,
                 crate::symbols::engine::lang_for_path(std::path::Path::new(repo_path)),
             ),
@@ -879,9 +879,8 @@ pub(crate) fn produce_archived_file_segment(
             let src = String::from_utf8_lossy(bytes);
             let lang = crate::symbols::engine::lang_for_path(path);
             let rendered = crate::symbols::search::search_text(rel_path, &src, lang, &pattern);
-            let (matches, _files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            meta.match_count = Some(matches);
+            meta.match_count = Some(rendered.matches);
             meta.file_count = None;
             Ok(ReadSegment::text(rendered.body, meta))
         }
@@ -896,12 +895,11 @@ pub(crate) fn produce_archived_file_segment(
             }
             let src = String::from_utf8_lossy(bytes);
             let lang = crate::symbols::engine::lang_for_path(path);
-            let body = crate::symbols::outline::outline_text(&src, lang);
-            let (matches, _files) = grep_counts(&body);
+            let rendered = crate::symbols::outline::outline_text_rendered(&src, lang);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            meta.match_count = Some(matches);
+            meta.match_count = Some(rendered.matches);
             meta.file_count = None;
-            Ok(ReadSegment::text(body, meta))
+            Ok(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::Grep(mut grep_payload) => {
             // A single blob addresses exactly one file. A `glob`/`type` push-down
@@ -928,22 +926,19 @@ pub(crate) fn produce_archived_file_segment(
             // A failed search reconstructs as the same error segment the live
             // read rendered, not as an ineligible target: the coordinate is
             // faithfully addressable, the search itself is what failed.
-            let body = match crate::mcp::handlers::search::render_single_file_grep(
+            let window = match crate::mcp::handlers::search::render_single_file_grep(
                 bytes,
                 &label,
                 &grep_payload,
             ) {
-                Ok(body) => body,
+                Ok(window) => window,
                 Err(error) => return Ok(error_segment(uri, error)),
             };
-            let (match_count, file_count) =
-                grep_body_counts(&body, &effective_mode, &grep_payload.pattern);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            meta.match_count = match_count;
             // Mirrors the live producer's single-file grep arm: no file dimension
             // except under `files_with_matches`, whose body is the file list.
-            meta.file_count = (effective_mode == "files_with_matches").then_some(file_count);
-            Ok(ReadSegment::text(body, meta))
+            window.write_meta(&mut meta, effective_mode == "files_with_matches");
+            Ok(ReadSegment::text(window.body, meta))
         }
         ReadProjection::None => {
             if let Some(mime_type) = get_image_mime_type(path) {
@@ -1329,6 +1324,17 @@ pub(crate) async fn produce_file_segment(
             Ok(parsed) => parsed,
             Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
         };
+    if issue_history.is_some() {
+        if let Ok((run, _)) = super::super::run_context::lookup_run_routed(&orch.db, request).await
+        {
+            if run.thread_id.is_some() {
+                return Produced::Segment(error_segment(
+                    uri,
+                    "issue_history applies only to issue-owned jobs; this run is thread-owned and has no issue history".to_string(),
+                ));
+            }
+        }
+    }
     let char_offset = match parse_optional_usize(
         find_query_value(&split.params, "char_offset"),
         "char_offset",
@@ -1573,21 +1579,20 @@ pub(crate) async fn produce_file_segment(
                 };
                 crate::mcp::handlers::search::handle_grep(orch, &grep_request).await
             };
-            let body = match rendered {
-                Ok(body) => body,
+            let window = match rendered {
+                Ok(window) => window,
                 Err(error) => return Produced::Segment(error_segment(uri, error)),
             };
-            let (match_count, file_count) =
-                grep_body_counts(&body, &effective_mode, &grep_payload.pattern);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            meta.match_count = match_count;
             // A `content`/`count` body over one named file has no useful file
             // dimension — the caller named the file. A `files_with_matches` body
             // *is* the file dimension, so it always reports one, and a match is
             // never rendered as a bare filename with no count beside it.
-            meta.file_count =
-                (!single_file || effective_mode == "files_with_matches").then_some(file_count);
-            Produced::Segment(ReadSegment::text(body, meta))
+            window.write_meta(
+                &mut meta,
+                !single_file || effective_mode == "files_with_matches",
+            );
+            Produced::Segment(ReadSegment::text(window.body, meta))
         }
         ReadProjection::Ast { pattern, glob } => {
             let (rendered, is_directory) = if let Some(context) = branch_context.as_ref() {
@@ -1623,16 +1628,15 @@ pub(crate) async fn produce_file_segment(
                     target.is_dir(),
                 )
             };
-            let (matches, files) = grep_counts(&rendered.body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            meta.match_count = Some(matches);
+            meta.match_count = Some(rendered.matches);
             if is_directory {
-                meta.file_count = Some(files);
+                meta.file_count = Some(rendered.files);
             }
             Produced::Segment(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::Outline { glob } => {
-            let (body, is_directory) = if let Some(context) = branch_context.as_ref() {
+            let (rendered, is_directory) = if let Some(context) = branch_context.as_ref() {
                 let result = if context.service.entries().is_ok() {
                     overlay_files(orch, context).map(|files| {
                         let texts = files
@@ -1642,7 +1646,7 @@ pub(crate) async fn produce_file_segment(
                             })
                             .collect::<Vec<_>>();
                         (
-                            crate::symbols::outline::outline_texts(&texts, glob.as_deref()).body,
+                            crate::symbols::outline::outline_texts(&texts, glob.as_deref()),
                             true,
                         )
                     })
@@ -1656,17 +1660,16 @@ pub(crate) async fn produce_file_segment(
             } else {
                 let target = &resolved_target.full_path;
                 (
-                    crate::symbols::outline::outline(worktree, target, glob.as_deref()).body,
+                    crate::symbols::outline::outline(worktree, target, glob.as_deref()),
                     target.is_dir(),
                 )
             };
-            let (matches, _files) = grep_counts(&body);
             let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
-            meta.match_count = Some(matches);
+            meta.match_count = Some(rendered.matches);
             if is_directory {
-                meta.file_count = Some(crate::symbols::outline::file_count(&body));
+                meta.file_count = Some(rendered.files);
             }
-            Produced::Segment(ReadSegment::text(body, meta))
+            Produced::Segment(ReadSegment::text(rendered.body, meta))
         }
         ReadProjection::None => {
             let full_path = &resolved_target.full_path;
@@ -2207,8 +2210,9 @@ mod tests {
         )
         .unwrap();
         assert!(
-            rendered.contains("2:error: generated failure"),
-            "{rendered}"
+            rendered.body.contains("2:error: generated failure"),
+            "{}",
+            rendered.body
         );
     }
 
@@ -2347,7 +2351,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(object_grep, filesystem_grep);
+        assert_eq!(object_grep.body, filesystem_grep);
 
         let mut binary_grep = grep.clone();
         binary_grep.glob = None;
@@ -2382,10 +2386,12 @@ mod tests {
         let object_outline = run_object_outline(&service, "fixture", Some("*.rs"))
             .unwrap()
             .0;
-        let filesystem_outline = crate::symbols::outline::outline(&root, &root, Some("*.rs")).body;
+        let filesystem_outline = crate::symbols::outline::outline(&root, &root, Some("*.rs"));
+        // Whole-value equality, so parity covers the entry and file counts each
+        // producer reports and not just the text they render.
         assert_eq!(object_outline, filesystem_outline);
         assert_eq!(
-            crate::symbols::outline::outline_texts(&overlay_texts, Some("*.rs")).body,
+            crate::symbols::outline::outline_texts(&overlay_texts, Some("*.rs")),
             object_outline
         );
     }
@@ -2746,8 +2752,9 @@ mod tests {
     }
 
     /// The wave-1 regression: a directory grep with a context flag and no
-    /// explicit output_mode must render content (`path:N:text` match lines plus
-    /// `path:N-text` context lines) AND classify the segment as a content grep so
+    /// explicit output_mode must render content (the path as a heading over
+    /// `N:text` match rows and `N-text` context rows) AND classify the segment
+    /// as a content grep so
     /// the `[N matches in M files]` header suffix survives. Before the fix, the
     /// body was content but the metadata was silently `files_with_matches`
     /// (match_count unset), dropping the suffix.
@@ -2763,15 +2770,9 @@ mod tests {
 
         let seg = grep_segment(&orch, worktree.path(), "file:d?grep=NEEDLE&-C=1").await;
 
-        assert!(
-            seg.body.contains("a.txt:3:NEEDLE"),
-            "expected a `path:N:text` match line, got:\n{}",
-            seg.body
-        );
-        assert!(
-            seg.body.contains("a.txt:2-beta") && seg.body.contains("a.txt:4-gamma"),
-            "expected `path:N-text` context lines, got:\n{}",
-            seg.body
+        assert_eq!(
+            seg.body, "a.txt\n2-beta\n3:NEEDLE\n4-gamma",
+            "expected the path once as a heading over `N:text`/`N-text` rows"
         );
         // The metadata must agree with the body: a content grep carries a match
         // count so the enriched header renders `[N matches in M files]`.
@@ -2869,10 +2870,9 @@ mod tests {
 
         let seg = grep_segment(&orch, worktree.path(), "file:a.txt?grep=NEEDLE").await;
 
-        assert!(
-            seg.body.contains("a.txt:3:NEEDLE"),
-            "single-file grep should render content, got:\n{}",
-            seg.body
+        assert_eq!(
+            seg.body, "a.txt\n3:NEEDLE",
+            "single-file grep should render content"
         );
         assert_eq!(seg.meta.match_count, Some(1));
         // A single-file grep does not carry a file count (you named the file).

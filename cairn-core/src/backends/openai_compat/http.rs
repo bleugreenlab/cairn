@@ -8,18 +8,49 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
-const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(90);
+const STREAM_ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const STREAM_READ_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Endpoint {
-    pub(crate) provider_name: &'static str,
-    pub(crate) backend_key: &'static str,
+    /// What to call this provider in an error a user will read. A shipped
+    /// provider's product name, or the name an operator gave a custom one.
+    pub(crate) provider_name: String,
+    /// The backend key transcript rows and usage are attributed to. Owned
+    /// because a custom provider's key is minted when it is configured.
+    pub(crate) backend_key: String,
     pub(crate) chat_url: String,
     pub(crate) headers: Vec<(String, String)>,
     pub(crate) extra_body: Option<Value>,
+}
+
+/// Headers carry bearer keys, so the derived `Debug` would put every provider's
+/// credential into any log line or panic message that formatted an endpoint.
+/// Names stay — they are what makes a header diagnosis possible — and values
+/// never appear.
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Endpoint")
+            .field("provider_name", &self.provider_name)
+            .field("backend_key", &self.backend_key)
+            .field("chat_url", &self.chat_url)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| format!("{name}: <redacted>"))
+                    .collect::<Vec<_>>(),
+            )
+            .field("extra_body", &self.extra_body)
+            .finish()
+    }
 }
 
 pub(crate) fn post_chat_completion(
@@ -112,6 +143,58 @@ impl Endpoint {
 /// that genuinely finished on a server that never sends it.
 pub(crate) const TERMINAL_EVENTS: &str = "finish_reason or [DONE]";
 
+enum StreamRead {
+    Line(String),
+    Eof,
+    Cancelled,
+    Stalled,
+    AbsoluteDeadline,
+}
+
+fn read_stream_line(
+    lines: &Receiver<std::io::Result<String>>,
+    cancel: &AtomicBool,
+    request_started: Instant,
+    last_progress: Instant,
+    stall_timeout: Duration,
+    absolute_timeout: Duration,
+) -> std::io::Result<StreamRead> {
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Ok(StreamRead::Cancelled);
+        }
+        let absolute_elapsed = request_started.elapsed();
+        if absolute_elapsed >= absolute_timeout {
+            return Ok(StreamRead::AbsoluteDeadline);
+        }
+        let stalled_for = last_progress.elapsed();
+        if stalled_for >= stall_timeout {
+            return Ok(StreamRead::Stalled);
+        }
+        let wait = STREAM_READ_POLL_INTERVAL
+            .min(absolute_timeout - absolute_elapsed)
+            .min(stall_timeout - stalled_for);
+        match lines.recv_timeout(wait) {
+            Ok(Ok(line)) => return Ok(StreamRead::Line(line)),
+            Ok(Err(error)) => return Err(error),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(StreamRead::Eof),
+        }
+    }
+}
+
+fn stream_lines(reader: impl BufRead + Send + 'static) -> Receiver<std::io::Result<String>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        for line in reader.lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    receiver
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn post_chat_completion_streaming(
     orch: &Orchestrator,
@@ -129,7 +212,7 @@ pub(crate) fn post_chat_completion_streaming(
         }
     }
     let client = reqwest::blocking::Client::builder()
-        .timeout(STREAM_REQUEST_TIMEOUT)
+        .timeout(STREAM_ABSOLUTE_TIMEOUT)
         .build()
         .map_err(|error| {
             format!(
@@ -137,6 +220,7 @@ pub(crate) fn post_chat_completion_streaming(
                 endpoint.provider_name
             )
         })?;
+    let request_started = Instant::now();
     let response = client
         .post(&endpoint.chat_url)
         .headers(endpoint.header_map()?)
@@ -164,25 +248,35 @@ pub(crate) fn post_chat_completion_streaming(
     let mut aggregate = StreamingAggregate::default();
     let mut stream_state: Option<AssistantStreamState> = None;
     let mut saw_done_sentinel = false;
-    let reader = BufReader::new(response);
-    for line in reader.lines() {
-        // The cancel flag is observed at SSE line boundaries. During a streaming
-        // turn tokens flow near-continuously, so this fires promptly in practice;
-        // dropping the response (on break) closes the TCP connection so the
-        // provider stops generating promptly.
-        if cancel.load(Ordering::SeqCst) {
-            break;
-        }
-        let line = line.map_err(|error: std::io::Error| {
-            if error.kind() == std::io::ErrorKind::TimedOut {
-                format!(
-                    "{} generation exceeded {}s (an over-limit or hung upstream request); finalizing the turn instead of waiting indefinitely.",
-                    endpoint.provider_name, STREAM_REQUEST_TIMEOUT.as_secs()
-                )
-            } else {
-                format!("{} stream read failed: {error}", endpoint.provider_name)
+    let mut stalled = false;
+    let mut exceeded_absolute_deadline = false;
+    let mut last_progress = Instant::now();
+    let lines = stream_lines(BufReader::new(response));
+    loop {
+        let line = match read_stream_line(
+            &lines,
+            cancel,
+            request_started,
+            last_progress,
+            STREAM_STALL_TIMEOUT,
+            STREAM_ABSOLUTE_TIMEOUT,
+        )
+        .map_err(|error| format!("{} stream read failed: {error}", endpoint.provider_name))?
+        {
+            StreamRead::Line(line) => {
+                last_progress = Instant::now();
+                line
             }
-        })?;
+            StreamRead::Eof | StreamRead::Cancelled => break,
+            StreamRead::Stalled => {
+                stalled = true;
+                break;
+            }
+            StreamRead::AbsoluteDeadline => {
+                exceeded_absolute_deadline = true;
+                break;
+            }
+        };
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
@@ -274,13 +368,30 @@ pub(crate) fn post_chat_completion_streaming(
         )?;
     }
 
+    if stalled {
+        return Err(format!(
+            "{} generation stalled: no SSE progress for {}s; finalized the partial turn instead of waiting indefinitely.",
+            endpoint.provider_name,
+            STREAM_STALL_TIMEOUT.as_secs()
+        ));
+    }
+    if exceeded_absolute_deadline {
+        return Err(format!(
+            "{} generation exceeded the {} minute streaming backstop; finalized the partial turn.",
+            endpoint.provider_name,
+            STREAM_ABSOLUTE_TIMEOUT.as_secs() / 60
+        ));
+    }
+
     // Checked after finalizing so a truncated stream does not also leave a live
     // assistant message dangling in the UI, and before building the response so
     // no partial generation reaches the turn loop as a whole one. The cancel flag
-    // is read here rather than taken from the loop: a cancellation requested
-    // while the reader was blocked never reaches a line boundary at all.
+    // is read here as the authoritative cancellation verdict. Body reads happen
+    // on a bounded worker so a silent provider cannot prevent the session from
+    // advancing; the stall clock bounds silence while the client timeout remains
+    // only a generous backstop for a stream that never terminates.
     require_terminal_event(
-        endpoint.provider_name,
+        &endpoint.provider_name,
         TERMINAL_EVENTS,
         saw_done_sentinel || aggregate.finish_reason().is_some(),
         cancel.load(Ordering::SeqCst),
@@ -306,7 +417,7 @@ fn open_stream_state<'a>(
             run_id,
             session_id,
             turn_id,
-            endpoint.backend_key,
+            &endpoint.backend_key,
         )?);
     }
     Ok(state.as_mut().expect("stream state just initialized"))
@@ -364,11 +475,68 @@ mod tests {
 
 #[cfg(test)]
 mod terminal_event_tests {
-    use super::TERMINAL_EVENTS;
+    use super::{read_stream_line, stream_lines, StreamRead, TERMINAL_EVENTS};
     use crate::backends::http_loop::require_terminal_event;
     use crate::backends::openai_compat::wire::{ChatStreamChunk, StreamingAggregate};
+    use std::io::BufReader;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     const PROVIDER: &str = "Actual";
+
+    fn silent_stream() -> TcpStream {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        thread::spawn(move || {
+            let (_stream, _) = listener.accept().expect("accept test connection");
+            thread::sleep(Duration::from_secs(1));
+        });
+        let stream = TcpStream::connect(address).expect("connect test stream");
+        stream
+    }
+
+    #[test]
+    fn a_silent_socket_observes_cancellation_without_waiting_for_sse_progress() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancelling = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            cancelling.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let lines = stream_lines(BufReader::new(silent_stream()));
+        let result = read_stream_line(
+            &lines,
+            &cancel,
+            started,
+            started,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .expect("polling read");
+        assert!(matches!(result, StreamRead::Cancelled));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_silent_socket_reaches_the_stall_timeout() {
+        let started = Instant::now();
+        let lines = stream_lines(BufReader::new(silent_stream()));
+        let result = read_stream_line(
+            &lines,
+            &AtomicBool::new(false),
+            started,
+            started,
+            Duration::from_millis(80),
+            Duration::from_secs(1),
+        )
+        .expect("polling read");
+        assert!(matches!(result, StreamRead::Stalled));
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
 
     /// Replay an SSE fixture through the same parse-and-aggregate steps the
     /// streaming loop uses, and report whether the protocol said it was done.

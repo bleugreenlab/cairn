@@ -548,21 +548,6 @@ impl AgentProcessState {
         processes.get(run_id).map(|p| p.occupancy.clone())
     }
 
-    /// Whether the process for `run_id` is currently mid-turn
-    /// (ServingTurn, AwaitingHost, or Busy). Returns `false` if no live
-    /// handle is registered — mirrors [`RunHandle::is_active`] at the
-    /// state level so callers can ask "is this recipient mid-turn right
-    /// now?" without reaching into the lock themselves.
-    pub(crate) fn is_active(&self, run_id: &str) -> bool {
-        let Ok(processes) = self.processes.lock() else {
-            return false;
-        };
-        processes
-            .get(run_id)
-            .map(|p| p.is_active())
-            .unwrap_or(false)
-    }
-
     /// Whether this host holds a process handle for `run_id` at all — serving,
     /// awaiting the host, or parked warm — or `None` when the registry could not
     /// be inspected at all.

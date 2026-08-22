@@ -74,10 +74,13 @@ pub fn conflict_scaffolding_in_root_listing(listing: &str) -> Vec<String> {
 /// inside a materialized checkout addresses it.
 pub fn conflict_scaffolding_refusal(what: &str, commit: &str, entries: &[String]) -> String {
     format!(
-        "refusing to {what} commit {commit}: its tree carries jj conflict scaffolding ({}). \
+        "this branch cannot be built on any machine: refusing to {what} commit {commit}: its tree carries jj conflict scaffolding ({}). \
          Exporting a conflict-flagged commit writes the destination side of every conflicted \
          file into the top-level tree with no markers, so this tree is not a resolved merge. \
-         The branch needs repair in the store before it can be used.",
+         Commit a real resolution, then use `cairn:~/rebase` with `action:\"replay\"`; \
+         `take-committed-tip` preserves the conflict flag and cannot clear this condition. \
+         If a clean resolution commit cannot be authored, no agent-side action can repair the \
+         branch; an operator must repair it in the store.",
         entries.join(", ")
     )
 }

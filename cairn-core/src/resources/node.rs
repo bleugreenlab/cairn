@@ -2164,17 +2164,26 @@ fn render_gated_artifact_actions(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct ArtifactCoordinates<'a> {
+    pub project_key: &'a str,
+    pub number: i32,
+    pub exec_seq: i32,
+    pub node_name: &'a str,
+}
+
 pub(super) async fn read_node_artifact(
     orch: &crate::orchestrator::Orchestrator,
-    project_key: &str,
-    number: i32,
-    exec_seq: i32,
-    node_name: &str,
+    coordinates: ArtifactCoordinates<'_>,
     artifact_name: Option<&str>,
     format: ArtifactFormat,
     diff_full: bool,
 ) -> String {
+    let ArtifactCoordinates {
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+    } = coordinates;
     let routed_db = orch.db.for_project(project_key).await;
     let db = &*routed_db;
     let (conn, job) =
@@ -2517,17 +2526,19 @@ pub(super) async fn read_task_chat_turn(
     crate::transcripts::format_transcript_full(&event_rows)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn read_task_artifact(
     db: &LocalDb,
-    project_key: &str,
-    number: i32,
-    exec_seq: i32,
-    node_name: &str,
+    coordinates: ArtifactCoordinates<'_>,
     task_name: &str,
     artifact_name: Option<&str>,
     format: ArtifactFormat,
 ) -> String {
+    let ArtifactCoordinates {
+        project_key,
+        number,
+        exec_seq,
+        node_name,
+    } = coordinates;
     let (conn, _parent_job, task_job) =
         match connect_and_find_task_job(db, project_key, number, exec_seq, node_name, task_name)
             .await

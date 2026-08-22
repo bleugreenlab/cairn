@@ -313,6 +313,20 @@ fn record_footer(uri: &str, offset: usize, shown: usize, total: usize, noun: &st
     )
 }
 
+/// Continue footer for a grep whose `head_limit` window elided results. Shaped
+/// like the line-window footer because it answers the same question — what did
+/// I see, out of what, and how do I get the rest — and its continue widens the
+/// window to the true total, so one read completes the enumeration.
+fn grep_window_footer(uri: &str, shown: usize, total: usize, noun: &str) -> String {
+    format!(
+        "[{} 1\u{2013}{} of {} — continue: {}]",
+        noun,
+        shown,
+        total,
+        target_with_query_param(uri, "head_limit", total),
+    )
+}
+
 fn grep_footer(uri: &str, shown_lines: usize) -> String {
     format!(
         "[first {} matching lines shown — output truncated to fit budget; continue: {}]",
@@ -353,15 +367,29 @@ fn segment_suffix(meta: &SegmentMeta, shown: usize) -> Option<String> {
                 total
             ))
         }
-        SegmentKind::Grep => match (meta.match_count, meta.file_count) {
-            (Some(matches), Some(files)) => Some(format!("{matches} matches in {files} files")),
-            (Some(matches), None) => Some(format!("{matches} matches")),
-            // A `files_with_matches` grep has no match dimension: its body is the
-            // list of files that matched, so the file count is the honest count.
-            // Without it the header falls silent and a hit reads like a miss.
-            (None, Some(files)) => Some(format!("{files} files")),
-            (None, None) => None,
-        },
+        SegmentKind::Grep => {
+            // The counts describe the COMPLETE result, so the header answers
+            // "how many are there".
+            let counts = match (meta.match_count, meta.file_count) {
+                (Some(matches), Some(files)) => format!("{matches} matches in {files} files"),
+                (Some(matches), None) => format!("{matches} matches"),
+                // A `files_with_matches` grep has no match dimension: its body is
+                // the list of files that matched, so the file count is the honest
+                // count. Without it the header falls silent and a hit reads like a
+                // miss.
+                (None, Some(files)) => format!("{files} files"),
+                (None, None) => return None,
+            };
+            // A `head_limit` window makes the body a sample of that result, and
+            // saying so here is the whole difference between a partial
+            // enumeration and a wrong one.
+            match (meta.grep_shown, meta.total_units, meta.unit_noun.as_deref()) {
+                (Some(shown), Some(total), Some(noun)) => {
+                    Some(format!("{counts}; {shown} of {total} {noun} shown"))
+                }
+                _ => Some(counts),
+            }
+        }
         SegmentKind::Glob => Some(format!("{} files", meta.file_count?)),
         SegmentKind::Directory
         | SegmentKind::Image
@@ -559,7 +587,12 @@ pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> 
         );
         let body_budget = content_budget.saturating_sub(meter.count(&fixed));
         let cut = cut_body(&body, body_budget, numbered, logical_full_lines, meter);
-        let truncated = cut.budget_truncated || window_short || cut.char_offset.is_some();
+        // A grep window that elided matches is a truncated read like any other:
+        // a structured consumer must be able to see that without re-deriving it.
+        let truncated = cut.budget_truncated
+            || window_short
+            || cut.char_offset.is_some()
+            || meta.grep_shown.is_some();
 
         let head = header(&meta, cut.shown_lines, truncated);
         let mut candidate = if cut.body.is_empty() {
@@ -570,10 +603,14 @@ pub fn render_segment(seg: ReadSegment, budget: u32, meter: &dyn TokenMeter) -> 
 
         let footer = match meta.natural_unit {
             NaturalUnit::Match => {
-                if cut.budget_truncated {
-                    Some(grep_footer(&meta.uri, cut.shown_lines))
-                } else {
-                    None
+                match (meta.grep_shown, meta.total_units, meta.unit_noun.as_deref()) {
+                    // The budget cut the body below even the window's own size, so
+                    // its footer is the one that describes what is actually here.
+                    _ if cut.budget_truncated => Some(grep_footer(&meta.uri, cut.shown_lines)),
+                    (Some(shown), Some(total), Some(noun)) => {
+                        Some(grep_window_footer(&meta.uri, shown, total, noun))
+                    }
+                    _ => None,
                 }
             }
             // Record/turn pages are rendered by render_record_segment, never here.
@@ -920,6 +957,88 @@ mod tests {
         assert!(r.text.len() <= 1_500);
         assert!(r.meta.truncated);
         assert!(r.text.ends_with(&format!("![browser]({STORED_IMAGE})")));
+    }
+
+    /// A `head_limit` window that elided matches must be visible in the
+    /// composed text alone — header and footer — because that text is all an
+    /// agent reading an enumeration ever sees. The counts stay the whole
+    /// result's; the window says how much of it is here; the continue widens
+    /// `head_limit` to the true total so one more read finishes the job.
+    #[test]
+    fn a_windowed_grep_says_so_in_its_header_and_footer() {
+        let uri = "file:src?grep=needle&head_limit=8";
+        let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+        meta.match_count = Some(23);
+        meta.file_count = Some(6);
+        meta.total_units = Some(23);
+        meta.unit_noun = Some("matches".to_string());
+        meta.grep_shown = Some(8);
+        let r = render_segment(ReadSegment::text("src/a.rs:1:needle", meta), 10_000);
+
+        assert!(
+            r.text
+                .starts_with("=== file:src?grep=needle&head_limit=8 [23 matches in 6 files; 8 of 23 matches shown] ==="),
+            "{}",
+            r.text
+        );
+        assert!(
+            r.text.ends_with(
+                "[matches 1\u{2013}8 of 23 — continue: file:src?grep=needle&head_limit=23]"
+            ),
+            "{}",
+            r.text
+        );
+        // A partial read is a truncated read, for consumers that read metadata
+        // rather than text.
+        assert!(r.meta.truncated);
+    }
+
+    /// The same segment with nothing elided keeps the plain header and grows no
+    /// footer: the marker means something precisely because a complete read does
+    /// not carry it.
+    #[test]
+    fn a_complete_grep_carries_no_window_marker() {
+        let mut meta = SegmentMeta::new(
+            "file:src?grep=needle",
+            SegmentKind::Grep,
+            NaturalUnit::Match,
+        );
+        meta.match_count = Some(23);
+        meta.file_count = Some(6);
+        meta.total_units = Some(23);
+        meta.unit_noun = Some("matches".to_string());
+        let r = render_segment(ReadSegment::text("src/a.rs:1:needle", meta), 10_000);
+
+        assert_eq!(
+            r.text,
+            "=== file:src?grep=needle [23 matches in 6 files] ===\nsrc/a.rs:1:needle"
+        );
+        assert!(!r.meta.truncated);
+    }
+
+    /// Under `files_with_matches` the window's unit is the file, and the footer
+    /// has to name the unit it actually counted rather than saying "matches"
+    /// over a body that carries none.
+    #[test]
+    fn a_windowed_file_list_reports_files_not_matches() {
+        let uri = "file:src?grep=needle&output_mode=files_with_matches&head_limit=2";
+        let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+        meta.file_count = Some(6);
+        meta.total_units = Some(6);
+        meta.unit_noun = Some("files".to_string());
+        meta.grep_shown = Some(2);
+        let r = render_segment(ReadSegment::text("src/a.rs\nsrc/b.rs", meta), 10_000);
+
+        assert!(
+            r.text.contains("[6 files; 2 of 6 files shown]"),
+            "{}",
+            r.text
+        );
+        assert!(
+            r.text.contains("[files 1\u{2013}2 of 6 — continue:"),
+            "{}",
+            r.text
+        );
     }
 
     #[test]

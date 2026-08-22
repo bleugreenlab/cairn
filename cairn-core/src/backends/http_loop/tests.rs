@@ -549,10 +549,10 @@ fn seam_text_gen(text: &str) -> Generation<SeamMessage> {
 impl WireAdapter for SeamAdapter {
     type Message = SeamMessage;
 
-    fn backend_key(&self) -> &'static str {
+    fn backend_key(&self) -> &str {
         "seam"
     }
-    fn backend_name(&self) -> &'static str {
+    fn backend_name(&self) -> &str {
         "Seam"
     }
     fn default_model(&self) -> &'static str {

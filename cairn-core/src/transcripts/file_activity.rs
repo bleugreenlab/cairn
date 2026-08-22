@@ -62,6 +62,13 @@ pub struct FileTouch {
     pub action: FileAction,
 }
 
+/// One assistant event's recognized tool calls, projected as a batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventBatch {
+    pub verb: &'static str,
+    pub paths: Vec<String>,
+}
+
 /// Longest stored path. Matches `tool_extract`'s target bound: a path longer
 /// than this is a pathological input, not a file anyone is watching.
 const MAX_PATH_LEN: usize = 300;
@@ -72,13 +79,20 @@ const MAX_PATH_LEN: usize = 300;
 /// both call it on the same event data, so the row that lands and the frame that
 /// goes out cannot describe different files. Total by construction — malformed
 /// or unrecognized data yields an empty vec.
+fn tool_uses_from_event_data(data: &str) -> Option<Value> {
+    let parsed = serde_json::from_str::<Value>(data).ok()?;
+    parsed.get("toolUses")?.as_array()?;
+    Some(parsed)
+}
+
 pub fn touches_from_event_data(data: &str) -> Vec<FileTouch> {
-    let Ok(parsed) = serde_json::from_str::<Value>(data) else {
+    let Some(parsed) = tool_uses_from_event_data(data) else {
         return Vec::new();
     };
-    let Some(uses) = parsed.get("toolUses").and_then(Value::as_array) else {
-        return Vec::new();
-    };
+    let uses = parsed
+        .get("toolUses")
+        .and_then(Value::as_array)
+        .expect("validated above");
     let mut out = Vec::new();
     for use_info in uses {
         let Some(tool_use_id) = str_field(use_info, "id") else {
@@ -104,6 +118,38 @@ pub fn touches_from_event_data(data: &str) -> Vec<FileTouch> {
         }
     }
     out
+}
+
+/// Extract the ordered path union and last recognized verb from one event.
+pub fn batch_from_event_data(data: &str) -> Option<EventBatch> {
+    let parsed = tool_uses_from_event_data(data)?;
+    let uses = parsed
+        .get("toolUses")
+        .and_then(Value::as_array)
+        .expect("validated above");
+    let mut verb = None;
+    let mut paths = Vec::new();
+    for use_info in uses {
+        let Some(name) = str_field(use_info, "name") else {
+            continue;
+        };
+        let base = normalize_base(&name);
+        let recognized = match base.as_str() {
+            "read" | "grep" | "glob" | "notebookread" => "read",
+            "write" | "edit" | "multiedit" | "notebookedit" => "write",
+            "run" | "bash" => "run",
+            _ => continue,
+        };
+        verb = Some(recognized);
+        if let Some(input) = use_info.get("input") {
+            for (path, _) in touches_from_tool_input(&base, input) {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    verb.map(|verb| EventBatch { verb, paths })
 }
 
 /// Strip an MCP prefix (`mcp__cairn__write` -> `write`) and lowercase, matching
@@ -268,6 +314,39 @@ fn truncate(s: &str) -> String {
 ///
 /// `INSERT OR REPLACE` keyed on `{event_id}:{tool_use_id}:{ordinal}` makes a
 /// re-insert of the same event idempotent.
+pub(crate) async fn record_presence_conn(
+    conn: &Connection,
+    run_id: &str,
+    batch: &EventBatch,
+    ts_ms: i64,
+) -> DbResult<()> {
+    let file_paths = serde_json::to_string(&batch.paths).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO job_presence
+             (job_id, project_id, issue_number, role, agent_config_id, verb, file_paths, ts_ms)
+         SELECT r.job_id, COALESCE(r.project_id, j.project_id), i.number,
+                COALESCE(j.node_name, j.uri_segment), j.agent_config_id, ?1, ?2, ?3
+         FROM runs r
+         LEFT JOIN jobs j ON j.id = r.job_id
+         LEFT JOIN issues i ON i.id = j.issue_id
+         WHERE r.id = ?4 AND r.job_id IS NOT NULL
+         LIMIT 1
+         ON CONFLICT(job_id) DO UPDATE SET
+             project_id = excluded.project_id,
+             issue_number = excluded.issue_number,
+             role = excluded.role,
+             agent_config_id = excluded.agent_config_id,
+             verb = excluded.verb,
+             file_paths = CASE WHEN excluded.file_paths = '[]'
+                               THEN job_presence.file_paths ELSE excluded.file_paths END,
+             ts_ms = excluded.ts_ms
+         WHERE excluded.ts_ms >= job_presence.ts_ms",
+        params![batch.verb, file_paths, ts_ms, run_id],
+    )
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn record_touches_conn(
     conn: &Connection,
     event_id: &str,
@@ -315,6 +394,41 @@ mod tests {
             .iter()
             .map(|touch| (touch.path.as_str(), touch.action.as_str()))
             .collect()
+    }
+
+    #[test]
+    fn batch_uses_last_verb_and_union_of_paths() {
+        let data = json!({
+            "toolUses": [
+                { "id": "one", "name": "read", "input": { "paths": ["file:a.rs", "file:b.rs"] } },
+                { "id": "two", "name": "write", "input": { "changes": [
+                    { "target": "file:b.rs", "mode": "patch" },
+                    { "target": "file:c.rs", "mode": "patch" }
+                ] } }
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            batch_from_event_data(&data),
+            Some(EventBatch {
+                verb: "write",
+                paths: vec!["a.rs".into(), "b.rs".into(), "c.rs".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn run_batch_has_no_paths_and_unknown_batch_is_absent() {
+        let run = assistant_data("run", json!({ "commands": [{ "command": "cargo test" }] }));
+        assert_eq!(
+            batch_from_event_data(&run),
+            Some(EventBatch {
+                verb: "run",
+                paths: vec![]
+            })
+        );
+        let unknown = assistant_data("answer", json!({}));
+        assert_eq!(batch_from_event_data(&unknown), None);
     }
 
     #[test]

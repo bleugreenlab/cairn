@@ -15,6 +15,7 @@ pub mod build_change;
 pub mod build_services;
 pub mod config_resource;
 pub mod conflict_session;
+pub mod custom_providers;
 pub mod device_presence;
 pub mod docs;
 pub mod executor_registry; // Synced visibility; live placement remains in fleet.
@@ -26,7 +27,7 @@ pub mod parent_wake;
 pub mod recipes;
 pub mod replay_base;
 pub mod session;
-pub mod settings;
+mod settings;
 pub mod skills;
 mod team_attention_push;
 pub mod wakes;
@@ -34,7 +35,7 @@ pub mod workflow_configs;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as TokioMutex;
@@ -92,6 +93,7 @@ pub struct OrchestratorBuilder {
     account_manager: Arc<AccountManager>,
     notifier: Notifier,
     thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
+    issue_status_cache: Arc<generation_cache::IssueStatusCache>,
     api_config: ApiConfig,
     effect_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkflowEffect>>,
     browser_command_tx: Option<crate::browsers::BrowserCommandTx>,
@@ -102,6 +104,47 @@ pub struct OrchestratorBuilder {
     recent_turn_end_check_requests: Arc<Mutex<HashMap<String, HashMap<String, String>>>>,
     boot_at: i64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TurnEndCancelReason {
+    IssueResolved = 0,
+    BranchAdvanced = 1,
+    UserRequested = 2,
+}
+
+impl TurnEndCancelReason {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::IssueResolved => "its issue resolved",
+            Self::BranchAdvanced => "its branch advanced",
+            Self::UserRequested => "a user requested cancellation",
+        }
+    }
+
+    // Keep this exhaustive and adjacent to the decoder: encoding a new variant
+    // without decoding it below would make `cancelled()` park forever after the
+    // cancellation had already won its one notification.
+    fn to_discriminant(self) -> u8 {
+        match self {
+            Self::IssueResolved => 0,
+            Self::BranchAdvanced => 1,
+            Self::UserRequested => 2,
+        }
+    }
+
+    fn from_discriminant(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::IssueResolved),
+            1 => Some(Self::BranchAdvanced),
+            2 => Some(Self::UserRequested),
+            NOT_CANCELLED => None,
+            _ => None,
+        }
+    }
+}
+
+const NOT_CANCELLED: u8 = u8::MAX;
 
 impl OrchestratorBuilder {
     pub(crate) fn new(db: Arc<DbState>, services: Arc<Services>, config_dir: PathBuf) -> Self {
@@ -124,8 +167,12 @@ impl OrchestratorBuilder {
         // anywhere in the crate — passes the projection generations on its way
         // out. Wrapping in `build()` instead would leave `Notifier` bound to the
         // raw emitter and silently miss the job and thread mutations it carries.
-        let thread_status_cache = Arc::new(generation_cache::ThreadStatusCache::new(
+        let thread_status_cache = Arc::new(generation_cache::ThreadStatusCache::with_coalescing(
             "thread status projection",
+            generation_cache::THREAD_STATUS_COALESCE_FLOOR,
+        ));
+        let issue_status_cache = Arc::new(generation_cache::IssueStatusCache::new(
+            "issue status projection",
         ));
         let services = Arc::new(Services {
             process: services.process.clone(),
@@ -134,6 +181,7 @@ impl OrchestratorBuilder {
             emitter: Arc::new(generation_cache::ProjectionInvalidatingEmitter::new(
                 services.emitter.clone(),
                 thread_status_cache.clone(),
+                issue_status_cache.clone(),
             )),
             clock: services.clock.clone(),
             fs: services.fs.clone(),
@@ -171,6 +219,7 @@ impl OrchestratorBuilder {
             account_manager,
             notifier,
             thread_status_cache,
+            issue_status_cache,
             api_config: ApiConfig::default(),
             effect_tx: None,
             browser_command_tx: None,
@@ -387,6 +436,7 @@ impl OrchestratorBuilder {
             attached_ui: Arc::new(Mutex::new(AttachedUi::default())),
             vibe_state: self.vibe_state,
             embed_tx: Arc::new(Mutex::new(None)),
+            era_summary_tx: crate::threads::era_worker::sender_slot(),
             embed_client: std::sync::OnceLock::new(),
             semantic_search: std::sync::OnceLock::new(),
             anon_device_manager,
@@ -416,6 +466,7 @@ impl OrchestratorBuilder {
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             build_service_reconcile: Arc::new(Mutex::new(())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
+            compile_cache_service: Arc::new(RwLock::new(None)),
             agent_completion_attention_dedupe: Arc::new(Mutex::new(HashSet::new())),
             codemap_refresh_in_flight: Arc::new(Mutex::new(HashSet::new())),
             session_reseed_fallback_attempted: Arc::new(Mutex::new(HashSet::new())),
@@ -432,6 +483,7 @@ impl OrchestratorBuilder {
                 ),
             ),
             thread_status_cache: self.thread_status_cache,
+            issue_status_cache: self.issue_status_cache,
             codex_pool: Arc::new(crate::backends::codex::pool::CodexAppServerPool::default()),
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -451,6 +503,9 @@ impl OrchestratorBuilder {
                     };
                 }
             });
+        }
+        if tokio::runtime::Handle::try_current().is_ok() {
+            crate::threads::era_worker::spawn(orchestrator.clone(), &orchestrator.era_summary_tx);
         }
         orchestrator
     }
@@ -779,17 +834,18 @@ impl Drop for JjStoreGuard {
 
 /// A one-shot cancellation handle for an in-flight turn-end (`when:review`) check
 /// suite. Cloneable so the runner holds one clone while the in-flight registry
-/// holds another; a merge/close pulling [`Orchestrator::cancel_turn_end_checks`]
-/// wakes the runner's `select!`, which drops the suite (killing any running check
-/// through its process's kill-on-drop guard). The `AtomicBool` is the source of
-/// truth — re-checked around the wait — so the `Notify` wakeup can never be lost.
+/// holds another; an issue resolution, branch advance, or user request pulling
+/// [`Orchestrator::cancel_turn_end_checks`] wakes the runner's `select!`, which
+/// drops the suite (killing any running check through its process's kill-on-drop
+/// guard). The atomic reason is the source of truth — re-checked around the wait
+/// — so the `Notify` wakeup can never be lost.
 #[derive(Clone)]
 pub struct TurnEndCancel {
     inner: Arc<TurnEndCancelInner>,
 }
 
 struct TurnEndCancelInner {
-    cancelled: AtomicBool,
+    reason: AtomicU8,
     notify: tokio::sync::Notify,
     status: Mutex<Option<TurnEndCheckRuntimeStatus>>,
 }
@@ -805,7 +861,7 @@ impl Default for TurnEndCancel {
     fn default() -> Self {
         Self {
             inner: Arc::new(TurnEndCancelInner {
-                cancelled: AtomicBool::new(false),
+                reason: AtomicU8::new(NOT_CANCELLED),
                 notify: tokio::sync::Notify::new(),
                 status: Mutex::new(None),
             }),
@@ -815,24 +871,37 @@ impl Default for TurnEndCancel {
 
 impl TurnEndCancel {
     /// Signal cancellation. Idempotent.
-    fn cancel(&self) {
-        self.inner.cancelled.store(true, Ordering::SeqCst);
-        // `notify_one` stores a permit when no waiter is parked, so a cancel that
-        // races just ahead of the runner's `cancelled().await` is not lost.
-        self.inner.notify.notify_one();
+    fn cancel(&self, reason: TurnEndCancelReason) {
+        if self
+            .inner
+            .reason
+            .compare_exchange(
+                NOT_CANCELLED,
+                reason.to_discriminant(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            // `notify_one` stores a permit when no waiter is parked, so a cancel
+            // that races just ahead of the runner's `cancelled().await` is not lost.
+            self.inner.notify.notify_one();
+        }
     }
 
     /// Whether cancellation has been signalled.
     fn is_cancelled(&self) -> bool {
-        self.inner.cancelled.load(Ordering::SeqCst)
+        self.inner.reason.load(Ordering::SeqCst) != NOT_CANCELLED
     }
 
     /// Resolve as soon as cancellation is signalled — immediately when already
     /// cancelled, otherwise when [`Self::cancel`] next fires.
-    pub(crate) async fn cancelled(&self) {
+    pub(crate) async fn cancelled(&self) -> TurnEndCancelReason {
         loop {
-            if self.is_cancelled() {
-                return;
+            if let Some(reason) =
+                TurnEndCancelReason::from_discriminant(self.inner.reason.load(Ordering::SeqCst))
+            {
+                return reason;
             }
             self.inner.notify.notified().await;
         }
@@ -1005,8 +1074,9 @@ pub struct Orchestrator {
     /// Job ids with an in-flight turn-end (`when:idle`/`when:review`) check run,
     /// each mapped to its cancellation handle. Single-flight guard so a rapid
     /// re-idle does not stack suites; the signal the PR-node / `/checks` render
-    /// reads to show a "running" state; and the lever a merge/close pulls to quit a
-    /// minutes-long suite mid-flight ([`Orchestrator::cancel_turn_end_checks`]).
+    /// reads to show a "running" state; and the lever an issue resolution, branch
+    /// advance, or user request pulls to quit a minutes-long suite mid-flight
+    /// ([`Orchestrator::cancel_turn_end_checks`]).
     /// Runtime-only; never persisted.
     build_service_runtime: Arc<
         Mutex<HashMap<String, crate::orchestrator::build_services::BuildServiceRuntimeDiagnostic>>,
@@ -1037,6 +1107,9 @@ pub struct Orchestrator {
     /// Per-project thread activity rollup, keyed by project id. Shared with the
     /// emitter decorator that advances its generation.
     pub(crate) thread_status_cache: Arc<generation_cache::ThreadStatusCache>,
+    /// Per-project issue activity/PR rollup, keyed by project id. Shares the
+    /// emitter decorator that advances the thread rollup's generation.
+    pub(crate) issue_status_cache: Arc<generation_cache::IssueStatusCache>,
     /// Runner-owned persistent commit-addressed execution workspaces.
     pub fleet: Arc<crate::fleet::Fleet>,
     /// Runtime-only object-channel credentials and staged managed-executor uploads.
@@ -1073,6 +1146,8 @@ pub struct Orchestrator {
     vibe_state: Option<Arc<VibeState>>,
     /// Sender into the async event-embed worker. None until the worker is started.
     embed_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmbedJob>>>>,
+    /// Bounded ingress for fallback-era summary upgrades. None only before startup wiring.
+    era_summary_tx: crate::threads::era_worker::EraSummarySender,
     /// The `/embed` gateway client, built once so the embed worker and search's
     /// semantic lane share one connection pool. Built lazily because it needs
     /// the account managers, which are wired after the struct is assembled.
@@ -1226,6 +1301,20 @@ pub struct Orchestrator {
     /// daemons instead of a recovery. See `orchestrator::build_services`.
     build_service_reconcile: Arc<Mutex<()>>,
 
+    /// What the supervisor last observed about this machine's compile-cache
+    /// service: which service it is, whether settings enable it, and whether
+    /// its launch program resolves.
+    ///
+    /// Held here because establishing it is not free — it parses the settings
+    /// file and resolves the launch program against PATH, which shells out —
+    /// while the substrate-health snapshot that reports it is read on every
+    /// fleet change. Reconciliation already visits all three facts on every
+    /// pass, so it publishes them here and readers only ever consume them.
+    /// `None` until this process has reconciled once.
+    /// See `orchestrator::build_services`.
+    compile_cache_service:
+        Arc<RwLock<Option<crate::orchestrator::build_services::ObservedCompileCacheService>>>,
+
     /// Per-run dedupe for legacy `agent-attention` terminal toasts.
     ///
     /// The completion toast now fires at the turn idle boundary while the same
@@ -1281,6 +1370,13 @@ impl Drop for JobLaunchClaim {
 }
 
 impl Orchestrator {
+    /// Queue a persisted fallback era for its one-way generated-summary upgrade.
+    /// Returns false when startup has not wired the worker or its bounded queue
+    /// is full; persistence remains authoritative and the startup sweep retries it.
+    pub fn enqueue_thread_era_summary(&self, job_id: impl Into<String>, seq: i32) -> bool {
+        crate::threads::era_worker::enqueue(&self.era_summary_tx, job_id, seq)
+    }
+
     pub fn invalidate_sidebar_active_issues(&self) {
         self.sidebar_active_issues_generation
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
@@ -1318,6 +1414,21 @@ impl Orchestrator {
         }
         Ok(())
     }
+
+    /// Whether the fleet's silence is still explained by this runner's own
+    /// startup rather than by an absent fleet, given a count of the executors
+    /// the caller has already projected.
+    ///
+    /// This is the only thing `cairn://executors` needs from the substrate
+    /// health snapshot, and it takes the count rather than going and finding
+    /// one because that resource has already projected the fleet: building the
+    /// whole health snapshot to read one boolean off it would repeat a fleet
+    /// clone and a per-executor projection, and add the compile-cache and
+    /// store-lock projections besides.
+    pub fn fleet_warming_up(&self, executor_count: usize, captured_at_unix_ms: u64) -> bool {
+        fleet_is_warming(executor_count, self.boot_at, captured_at_unix_ms)
+    }
+
     pub fn substrate_health_snapshot(
         &self,
     ) -> cairn_common::executor_protocol::SubstrateHealthSnapshot {
@@ -1444,7 +1555,7 @@ impl Orchestrator {
                 holds: summarize_bounded(&metrics.holds_ms),
             })
             .collect::<Vec<_>>();
-        let warming_up = fleet_is_warming(executors.len(), self.boot_at, captured_at_unix_ms);
+        let warming_up = self.fleet_warming_up(executors.len(), captured_at_unix_ms);
         let mut reasons = Vec::new();
         if executors.is_empty() && !warming_up {
             reasons.push(SubstrateHealthReason::NoExecutors);
@@ -1478,9 +1589,9 @@ impl Orchestrator {
         }
     }
 
-    pub fn cancel_cell_request(&self, request_id: &str) -> bool {
+    pub fn cancel_cell_request(&self, request_id: &str) -> crate::fleet::CancelOutcome {
         let cancelled = self.fleet.cancel_request(request_id);
-        if cancelled {
+        if cancelled != crate::fleet::CancelOutcome::Unknown {
             let _ = self
                 .services
                 .emitter
@@ -2024,13 +2135,12 @@ impl Orchestrator {
 
     /// Signal any in-flight turn-end check suite for `job_id` to quit. Best-effort
     /// and idempotent: a no-op when no suite is in flight for the job. Fired when
-    /// the job's issue reaches a terminal (merged/closed) state so a minutes-long
-    /// review suite does not keep burning CPU against a tree nobody will look at
-    /// again (CAIRN-2648).
-    pub fn cancel_turn_end_checks(&self, job_id: &str) {
+    /// the job's issue reaches a terminal state, its branch advances beyond the
+    /// checked tree, or a user explicitly cancels the suite.
+    pub fn cancel_turn_end_checks(&self, job_id: &str, reason: TurnEndCancelReason) {
         if let Ok(map) = self.turn_end_checks_in_flight.lock() {
             if let Some(cancel) = map.get(job_id) {
-                cancel.cancel();
+                cancel.cancel(reason);
             }
         }
         self.invalidate_node_check_status(job_id, "cancellation");
@@ -2227,6 +2337,7 @@ impl Orchestrator {
             config.to,
             config.route,
             config.inbound_capabilities,
+            crate::channels::router::SessionBoundary::Fresh,
         );
     }
 
@@ -2831,7 +2942,7 @@ impl Orchestrator {
             loop {
                 interval.tick().await;
                 for db in orch.db.all_dbs().await {
-                    if let Err(error) = crate::runs::watchdog_reconciler::reconcile_watchdog_leases(
+                    match crate::runs::watchdog_reconciler::reconcile_watchdog_leases(
                         &db,
                         crate::runs::watchdog_reconciler::ReconcileScope::Periodic,
                         chrono::Utc::now().timestamp(),
@@ -2840,7 +2951,19 @@ impl Orchestrator {
                     )
                     .await
                     {
-                        log::error!("Codex watchdog periodic reconciliation failed: {error}");
+                        // The all-zero result is the positive control that distinguishes a
+                        // healthy idle sweep from a sweep that was never spawned or stalled.
+                        Ok(report) => log::info!(
+                            "Codex watchdog periodic reconciliation: inspected={}, recovered={}, lost_claim={}, failed={}, ambiguous_clock={}",
+                            report.inspected,
+                            report.recovered,
+                            report.lost_claim,
+                            report.recovery_failed,
+                            report.ambiguous_clock
+                        ),
+                        Err(error) => {
+                            log::error!("Codex watchdog periodic reconciliation failed: {error}")
+                        }
                     }
                 }
                 let orch = orch.clone();
@@ -3013,7 +3136,18 @@ impl Orchestrator {
 
     fn refresh_provider_model_catalog_blocking(&self, backend_name: &str) -> ProviderModelCatalog {
         let backend = backend_for_name(Some(backend_name));
-        let (mut models, error) = if backend_name == "ollama" {
+        let (mut models, error) = if let Some(account_id) =
+            crate::backends::catalog::custom_account_id(backend_name)
+        {
+            // Inventory is per provider, and a custom provider IS one account,
+            // so discovery is scoped to that account rather than merged across
+            // a vendor's hosts. Two custom providers serving the same model id
+            // therefore stay two distinct models, each on its own provider.
+            match crate::backends::custom::CustomProviderConfig::resolve(self, account_id, None) {
+                Ok(config) => crate::backends::custom::models::discover_blocking(&config),
+                Err(error) => (Vec::new(), Some(error)),
+            }
+        } else if backend_name == "ollama" {
             crate::backends::ollama::models::discover_catalog_blocking(self)
         } else if backend_name == crate::backends::actual::ACTUAL_BACKEND_KEY {
             // Inventory is per target, so discovery needs the configured
@@ -3190,11 +3324,13 @@ mod tests {
                     memory_budget_bytes: None,
                     sandbox: None,
                     toolchain_detection: None,
+                    build_prerequisites: None,
                 },
                 current_load: 0,
                 warm_roots: Vec::new(),
                 observed_at_unix_ms: 0,
                 liveness_observed_at_unix_ms: Some(0),
+                facts_stale_refresh_blocked: None,
             },
             admission: AdmissionHealth::default(),
             queues: Vec::new(),
@@ -3249,6 +3385,7 @@ mod tests {
             drain_mode: false,
             resident_processes: Default::default(),
             command_processes: Default::default(),
+            evicted_cells: Vec::new(),
             build_skew: None,
         }
     }

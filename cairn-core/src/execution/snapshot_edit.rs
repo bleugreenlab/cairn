@@ -66,6 +66,8 @@ pub async fn update_execution_agent(
                 bundles: Vec::new(),
                 is_project_scoped: project_path.is_some(),
                 file_path: PathBuf::new(),
+                seed_budget_tokens: agent_snapshot.seed_budget_tokens,
+                seed_eras: agent_snapshot.seed_eras,
             },
             None,
             &presets,

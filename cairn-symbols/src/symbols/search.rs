@@ -1,6 +1,6 @@
 //! The `?ast=` read modifier: a raw structural pattern search over a file or a
 //! directory tree. Sibling to `?grep=` — it composes with `?glob=` and renders
-//! the same grep-style `path:line:snippet` rows.
+//! through the same grep renderer, so its results read identically.
 //!
 //! A pattern is language-specific (it parses under one grammar), so over a mixed
 //! tree the engine compiles the pattern lazily per language and skips files
@@ -117,6 +117,8 @@ fn empty_ast_result() -> Rendered {
                It is not a tree-sitter node-kind name like `function_declaration`."
             .to_string(),
         suffix: Some("0 matches".to_string()),
+        matches: 0,
+        files: 0,
     }
 }
 
@@ -237,8 +239,7 @@ mod tests {
         write(dir.path(), "a.rs", "fn one() {}\nfn two() {}\n");
         let r = search(dir.path(), &dir.path().join("a.rs"), "fn $N() {}", None);
         assert_eq!(r.suffix.as_deref(), Some("2 matches"));
-        assert!(r.body.contains("a.rs:1:"));
-        assert!(r.body.contains("a.rs:2:"));
+        assert_eq!(r.body, "a.rs\n1:fn one() {}\n2:fn two() {}");
     }
 
     #[test]
@@ -248,8 +249,8 @@ mod tests {
         write(dir.path(), "src/b.rs", "fn two() {}\n");
         let r = search(dir.path(), dir.path(), "fn $N() {}", None);
         assert_eq!(r.suffix.as_deref(), Some("2 matches in 2 files"));
-        assert!(r.body.contains("src/a.rs:1:"));
-        assert!(r.body.contains("src/b.rs:1:"));
+        // Each path once, as a heading over its own rows.
+        assert_eq!(r.body, "src/a.rs\n1:fn one() {}\n\nsrc/b.rs\n1:fn two() {}");
     }
 
     #[test]
@@ -259,7 +260,7 @@ mod tests {
         write(dir.path(), "b.py", "def two():\n    pass\n");
         let r = search(dir.path(), dir.path(), "fn $N() {}", Some("**/*.rs"));
         assert_eq!(r.suffix.as_deref(), Some("1 matches"));
-        assert!(r.body.contains("a.rs:1:"));
+        assert_eq!(r.body, "a.rs\n1:fn one() {}");
     }
 
     #[test]
@@ -272,8 +273,7 @@ mod tests {
             "fn $N() {}",
         );
         assert_eq!(r.suffix.as_deref(), Some("2 matches"));
-        assert!(r.body.contains("src/a.rs:1:"));
-        assert!(r.body.contains("src/a.rs:2:"));
+        assert_eq!(r.body, "src/a.rs\n1:fn one() {}\n2:fn two() {}");
     }
 
     #[test]
@@ -311,7 +311,7 @@ mod tests {
         write(dir.path(), "a.rs", "fn beta() { alpha(); }\n");
         let r = search(dir.path(), &dir.path().join("a.rs"), "alpha()", None);
         assert!(
-            r.body.contains("a.rs:1:fn beta() { alpha(); }"),
+            r.body.contains("a.rs\n1:fn beta() { alpha(); }"),
             "body: {}",
             r.body
         );

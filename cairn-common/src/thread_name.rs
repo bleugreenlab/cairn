@@ -14,6 +14,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "comments",
     "images",
     "issues",
+    "map",
     "messages",
     "memories",
     "recipes",

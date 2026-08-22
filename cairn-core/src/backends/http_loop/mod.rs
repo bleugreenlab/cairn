@@ -313,10 +313,16 @@ pub(in crate::backends) trait WireAdapter {
 
     /// Stable backend key stored in transcript `raw` payloads and used to route
     /// the run to its owning DB (OpenRouter: `"openrouter"`).
-    fn backend_key(&self) -> &'static str;
+    ///
+    /// Borrowed from the adapter rather than `'static`, because a custom
+    /// provider's key names the account that defines it and is therefore minted
+    /// at configuration time rather than at compile time.
+    fn backend_key(&self) -> &str;
 
-    /// Human-readable backend name for logs and transcript error text.
-    fn backend_name(&self) -> &'static str;
+    /// Human-readable backend name for logs and transcript error text. For a
+    /// custom provider this is the name its operator gave it, which is what
+    /// makes diagnostics about it legible.
+    fn backend_name(&self) -> &str;
 
     /// Fallback model id when the session carries none.
     fn default_model(&self) -> &'static str;
@@ -407,8 +413,11 @@ where
     A::Message: Send + 'static,
 {
     let session_id = config.session_start.session_id().to_string();
-    let backend_key = adapter.backend_key();
-    let backend_name = adapter.backend_name();
+    // Owned rather than borrowed from the adapter, which moves into the turn
+    // thread below. For a custom provider these are configuration — the key its
+    // account minted, the name its operator gave it — not compile-time literals.
+    let backend_key = adapter.backend_key().to_string();
+    let backend_name = adapter.backend_name().to_string();
     let connection = adapter.connection(orch).inspect_err(|error| {
         insert_error_event(orch, &config.run_id, Some(&session_id), error);
     })?;
@@ -428,7 +437,7 @@ where
     // run-state and streaming-transcript writes below. A team run lives wholly in
     // its synced replica; targeting the private DB would fail the
     // message_streams→runs foreign key. Fail-closed.
-    let run_db = match resolve_run_db(backend_name, orch, &config.run_id) {
+    let run_db = match resolve_run_db(&backend_name, orch, &config.run_id) {
         Ok(db) => db,
         Err(error) => {
             insert_error_event(orch, &config.run_id, Some(&session_id), &error);
@@ -444,7 +453,7 @@ where
             orch,
             &config.run_id,
             Some(&session_id),
-            backend_key,
+            &backend_key,
             &prompt_segments,
         );
     }
@@ -454,14 +463,14 @@ where
     // orientation tail) must lead the system message on New and Resume alike.
     let system_prompt = flatten_prompt_segments(&prompt_segments);
 
-    if let Err(error) = set_session_backend_id(backend_name, &run_db, &session_id, &session_id) {
+    if let Err(error) = set_session_backend_id(&backend_name, &run_db, &session_id, &session_id) {
         log::warn!("Failed to set {backend_name} backend id: {error}");
     }
-    if let Err(error) = transition_run_to_live(backend_name, orch, &run_db, &config.run_id) {
+    if let Err(error) = transition_run_to_live(&backend_name, orch, &run_db, &config.run_id) {
         log::warn!("Failed to transition {backend_name} run to live: {error}");
     }
 
-    let process_job_id = run_job_id(backend_name, &run_db, &config.run_id);
+    let process_job_id = run_job_id(&backend_name, &run_db, &config.run_id);
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut handle = RunHandle::new(
@@ -472,7 +481,7 @@ where
             Some(session_id.clone()),
             process_job_id,
         );
-        handle.backend = Some(backend_key.to_string());
+        handle.backend = Some(backend_key.clone());
         handle.model = config.model.as_ref().map(|model| model.to_string());
         // An HTTP-loop backend owns its turn/tool loop in-process and has no warm
         // process, so foreground questions and inline delegated tasks suspend the
@@ -550,8 +559,11 @@ fn run_http_turn<A: WireAdapter>(
     system_prompt: String,
     adapter: A,
 ) -> Result<(), String> {
-    let backend_key = adapter.backend_key();
-    let backend_name = adapter.backend_name();
+    // Owned rather than borrowed from the adapter, which moves into the turn
+    // thread below. For a custom provider these are configuration — the key its
+    // account minted, the name its operator gave it — not compile-time literals.
+    let backend_key = adapter.backend_key().to_string();
+    let backend_name = adapter.backend_name().to_string();
     let model = config
         .model
         .as_ref()
@@ -578,6 +590,9 @@ fn run_http_turn<A: WireAdapter>(
         // borrows `conversation` when no trim is needed; it is dropped before the
         // post-response mutations below.
         let outgoing = adapter.fit_conversation(&conversation, context_window);
+        if matches!(outgoing, Cow::Owned(_)) {
+            log::info!("[cairn-context-trim] backend={backend_key} model={model}");
+        }
         let generation = adapter.post_generation(
             orch,
             &run_db,
@@ -631,7 +646,7 @@ fn run_http_turn<A: WireAdapter>(
                 orch,
                 &config.run_id,
                 &session_id,
-                backend_key,
+                &backend_key,
                 &model,
                 context_window,
                 usage,
@@ -670,7 +685,7 @@ fn run_http_turn<A: WireAdapter>(
                     generation_id.as_deref(),
                     response_model.as_deref(),
                     exact_cost,
-                    backend_key,
+                    &backend_key,
                 )?;
             }
             store_success_result(
@@ -683,7 +698,7 @@ fn run_http_turn<A: WireAdapter>(
                 generation_id.as_deref(),
                 response_model.as_deref(),
                 exact_cost,
-                backend_key,
+                &backend_key,
             )?;
             // Schema-constrained call: capture the model's final structured
             // content as the return artifact server-side (CAIRN-2505), validated
@@ -695,7 +710,7 @@ fn run_http_turn<A: WireAdapter>(
                     Ok(value) => {
                         let orch_capture = orch.clone();
                         let run_id_capture = config.run_id.clone();
-                        if let Err(e) = run_backend_db(backend_key, async move {
+                        if let Err(e) = run_backend_db(&backend_key, async move {
                             crate::mcp::handlers::comments_artifacts::capture_call_structured_output(
                                 &orch_capture,
                                 &run_id_capture,
@@ -738,7 +753,7 @@ fn run_http_turn<A: WireAdapter>(
             generation_id.as_deref(),
             response_model.as_deref(),
             reasoning_details.as_ref(),
-            backend_key,
+            &backend_key,
         )?;
 
         let mut suspend: Option<(usize, SuspendKind)> = None;
@@ -764,7 +779,7 @@ fn run_http_turn<A: WireAdapter>(
                 turn_id.as_deref(),
                 &tool_call.id,
                 &result,
-                backend_key,
+                &backend_key,
             )?;
             conversation.push(adapter.render_tool_result_message(&tool_call.id, result));
         }
@@ -788,7 +803,7 @@ fn run_http_turn<A: WireAdapter>(
                     turn_id.as_deref(),
                     &tool_call.id,
                     &placeholder,
-                    backend_key,
+                    &backend_key,
                 )?;
             }
             return finalize_suspended(orch, &config.run_id, kind);
@@ -813,7 +828,7 @@ fn run_http_turn<A: WireAdapter>(
                 generation_id.as_deref(),
                 response_model.as_deref(),
                 exact_cost,
-                backend_key,
+                &backend_key,
             )?;
             finish_run(orch, &config.run_id, RunStatus::Exited);
             return Ok(());
@@ -840,7 +855,7 @@ fn run_http_turn<A: WireAdapter>(
         None,
         None,
         exact_cost,
-        backend_key,
+        &backend_key,
     )?;
     store_success_result(
         orch,
@@ -852,7 +867,7 @@ fn run_http_turn<A: WireAdapter>(
         None,
         None,
         exact_cost,
-        backend_key,
+        &backend_key,
     )?;
     finish_run(orch, &config.run_id, RunStatus::Exited);
     Ok(())

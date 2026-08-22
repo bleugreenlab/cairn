@@ -26,6 +26,7 @@ mod claude_transcript;
 pub mod claude_usage;
 pub mod codex;
 pub mod context_window;
+pub mod custom;
 mod http_loop;
 pub mod ollama;
 mod openai_compat;
@@ -687,6 +688,15 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
         Some(opencode::OPENCODE_BACKEND_KEY) => Box::new(opencode::OpenCodeBackend),
         Some("ollama") => Box::new(ollama::OllamaBackend),
         Some(actual::ACTUAL_BACKEND_KEY) => Box::new(actual::ActualBackend),
+        // A custom provider's key names the account that defines it. Resolving
+        // the account itself needs a workspace, which this has none of, so the
+        // backend carries the id and looks the rest up when it is handed an
+        // orchestrator.
+        Some(key) if catalog::custom_account_id(key).is_some() => {
+            Box::new(custom::CustomBackend::new(
+                catalog::custom_account_id(key).expect("guarded by the match"),
+            ))
+        }
         _ => Box::new(claude::ClaudeBackend),
     }
 }
@@ -1148,6 +1158,24 @@ pub(crate) mod tests {
     fn backend_factory_returns_codex() {
         let backend = backend_for_name(Some("codex"));
         assert_eq!(backend.name(), "Codex");
+    }
+
+    #[test]
+    fn backend_factory_resolves_a_custom_key_to_its_own_provider() {
+        // Two custom keys are two different backends, each naming its account.
+        // Falling back to Claude here would run a job on a provider the user
+        // never chose.
+        let first = backend_for_name(Some("custom:acc_1"));
+        let second = backend_for_name(Some("custom:acc_2"));
+        assert_eq!(first.name(), "custom:acc_1");
+        assert_eq!(second.name(), "custom:acc_2");
+        assert!(first.supports_resume());
+        assert!(!first.supports_warm_processes());
+    }
+
+    #[test]
+    fn backend_factory_does_not_mistake_a_malformed_custom_key_for_a_provider() {
+        assert_eq!(backend_for_name(Some("custom:")).name(), "Claude");
     }
 
     #[test]

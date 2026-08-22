@@ -371,8 +371,8 @@ async fn home_project_id_for_job(db: &LocalDb, job_id: &str) -> Result<Option<St
     .map_err(|error| format!("Failed to resolve a job's home project: {error}"))
 }
 
-/// Every job the canonical references in `text` address, deduplicated and
-/// jurisdiction-filtered.
+/// Every job the canonical URIs and project-qualified thread names in `text`
+/// address, deduplicated and jurisdiction-filtered.
 ///
 /// Extraction is [`cairn_common::uri::scan_uris`] — the one text scanner, which
 /// hands each candidate to the one URI parser. Nothing that fails to parse as a
@@ -392,6 +392,37 @@ async fn mention_recipients(
                 continue;
             }
             jobs.push(job);
+        }
+    }
+    for job in qualified_thread_mentions(db, text).await? {
+        if jobs.contains(&job) || !job_may_see_post(db, &job, project_id).await? {
+            continue;
+        }
+        jobs.push(job);
+    }
+    Ok(jobs)
+}
+
+/// Thread names in prose are references only in their project-qualified form
+/// (`project/thread`). A bare thread name is ordinary language and must not wake
+/// a long-lived session merely because the two happen to coincide.
+async fn qualified_thread_mentions(db: &LocalDb, text: &str) -> Result<Vec<String>, String> {
+    let mut jobs = Vec::new();
+    for candidate in text.split(|character: char| {
+        !character.is_ascii_alphanumeric() && !matches!(character, '-' | '/')
+    }) {
+        if candidate.split('/').count() != 2 {
+            continue;
+        }
+        let Some(resource @ CairnResource::Thread { .. }) =
+            cairn_common::uri::parse_uri(&format!("cairn://p/{candidate}"))
+        else {
+            continue;
+        };
+        if let Some(job) = home_job_for_resource(db, &resource).await? {
+            if !jobs.contains(&job) {
+                jobs.push(job);
+            }
         }
     }
     Ok(jobs)

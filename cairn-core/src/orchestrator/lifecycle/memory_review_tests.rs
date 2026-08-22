@@ -291,7 +291,7 @@ async fn disabled_memory_review_does_not_send_review_turn() {
     .unwrap();
 
     finish_memory_review_if_due(&orch, "j-review", "run-review");
-    crate::messages::delivery::flush_pending_directs_on_idle(&orch, "run-review");
+    crate::messages::delivery::flush_pending_directs_on_idle(&orch, "run-review").unwrap();
 
     assert_eq!(review_state(&orch).await, None);
     assert_eq!(memory_status(&orch).await, "draft");
@@ -553,7 +553,7 @@ async fn idle_flush_creates_memory_review_turn_from_pending_push() {
             .await
             .unwrap()
     );
-    crate::messages::delivery::flush_pending_directs_on_idle(&orch, "run-review");
+    crate::messages::delivery::flush_pending_directs_on_idle(&orch, "run-review").unwrap();
 
     assert_eq!(memory_review_turn_count(&orch).await, 1);
     assert!(matches!(

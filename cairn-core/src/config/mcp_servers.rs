@@ -26,6 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+use super::pack::mcp::McpVarRequirement;
+
 /// Filesystem context carried only by an installed Agent Plugin MCP server.
 ///
 /// This is deliberately excluded from serde: plugin roots are installation
@@ -455,6 +457,15 @@ pub struct WorkspaceMcpEntry {
     /// surface still shows it so the user can supply what it needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub not_ready: Option<NotReady>,
+    /// What to ask the user for, one entry per variable [`Self::not_ready`]
+    /// names, described the way the providing pack described it.
+    ///
+    /// This is what makes the gate an action rather than a dead end: the
+    /// verdict says a variable is unset, and this says what the value is, what
+    /// kind of field takes it, and where to get it. Empty for a user-authored
+    /// entry, which is never gated.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup: Vec<McpVarRequirement>,
 }
 
 /// Append every `${VAR}` name found in `input` to `out`.
@@ -601,12 +612,17 @@ pub fn workspace_mcp_entries(config_dir: &Path) -> BTreeMap<String, WorkspaceMcp
         let not_ready = entry
             .config
             .readiness(&super::secrets::credential_key(&name, None));
+        let setup = match &not_ready {
+            Some(NotReady::MissingVars { vars }) => entry.requirements(vars),
+            _ => Vec::new(),
+        };
         entries.insert(
             name,
             WorkspaceMcpEntry {
                 config: entry.config,
                 origin: format!("pack:{}", entry.pack_id),
                 not_ready,
+                setup,
             },
         );
     }
@@ -618,6 +634,7 @@ pub fn workspace_mcp_entries(config_dir: &Path) -> BTreeMap<String, WorkspaceMcp
                 config,
                 origin: "workspace".to_string(),
                 not_ready: None,
+                setup: Vec::new(),
             },
         );
     }
@@ -890,6 +907,62 @@ mod tests {
         assert!(workspace_mcp_entries(ws.path())["readiness-matlab"]
             .not_ready
             .is_none());
+    }
+
+    /// The gate has to be actionable, not just accurate. A pack that describes
+    /// its variable turns "missing READINESS_MATLAB_BIN" into a labelled field
+    /// with a download link, and the description travels with the verdict so no
+    /// surface has to go looking for it.
+    #[test]
+    fn a_gated_pack_server_carries_the_setup_copy_for_what_it_needs() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        install_pack_with_servers(
+            ws.path(),
+            "matlab",
+            "mcpServers:\n  \
+               setup-matlab:\n    \
+                 command: ${SETUP_MATLAB_BIN}\n\
+             setup:\n  \
+               SETUP_MATLAB_BIN:\n    \
+                 kind: path\n    \
+                 label: MATLAB MCP server executable\n    \
+                 helpUrl: https://example.test/download\n",
+        );
+
+        let entries = workspace_mcp_entries(ws.path());
+        let setup = &entries["setup-matlab"].setup;
+        assert_eq!(setup.len(), 1);
+        assert_eq!(setup[0].var, "SETUP_MATLAB_BIN");
+        assert_eq!(
+            setup[0].setup.kind,
+            crate::config::pack::mcp::McpVarKind::Path
+        );
+        assert_eq!(
+            setup[0].setup.label.as_deref(),
+            Some("MATLAB MCP server executable")
+        );
+
+        // Once the value is there the ask is gone with the gate: a surface that
+        // kept rendering the field would be asking for something already given.
+        crate::config::secrets::set_secret("setup-matlab", "SETUP_MATLAB_BIN", "/opt/mcp").unwrap();
+        assert!(workspace_mcp_entries(ws.path())["setup-matlab"]
+            .setup
+            .is_empty());
+    }
+
+    /// A user-authored server is never gated, so it never carries an ask.
+    #[test]
+    fn a_user_authored_server_is_never_asked_to_be_set_up() {
+        mock_keychain::install();
+        let ws = TempDir::new().unwrap();
+        std::fs::write(
+            ws.path().join("settings.yaml"),
+            "mcpServers:\n  mine:\n    command: ${ALSO_UNSET_FOR_THIS_TEST}\n",
+        )
+        .unwrap();
+
+        assert!(workspace_mcp_entries(ws.path())["mine"].setup.is_empty());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Write-verb MCP handler.
 
 pub(crate) mod file_mutations;
+mod home_targets;
 mod preview;
 mod replay;
 mod types;
@@ -212,17 +213,12 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     // Resolve home-relative (`cairn:~/...`) targets to canonical up front, so
     // blocking-append classification — which runs on the raw target before the
     // dispatch that would otherwise resolve it — sees the real resource. All
-    // clients forward `cairn:~/` raw so this lookup uses the run's current home.
-    for item in payload.changes.iter_mut() {
-        if item.target.starts_with("cairn:~") {
-            if let Ok(resolved) =
-                crate::resources::mutations::resolve_change_target_uri(orch, request, &item.target)
-                    .await
-            {
-                item.target = resolved;
-            }
-        }
-    }
+    // clients forward `cairn:~/` raw, so the run's home is looked up here and
+    // carried across the batch: an item that renames this run's own thread moves
+    // the home the items after it name, and the record this returns is what lets
+    // a failure be reported in the shorthand the caller wrote. See
+    // [`home_targets`].
+    let home_targets = home_targets::resolve(orch, request, &mut payload.changes).await;
 
     if let Some(result) = handle_apply_change(orch, request, &payload).await {
         return result;
@@ -763,7 +759,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
 
     // Blocking appends (task/question collections) are deferred to the end of the
     // call and run as a single group; everything else applies first in order.
-    let blocking_indices: Vec<usize> = payload
+    let mut blocking_indices: Vec<usize> = payload
         .changes
         .iter()
         .enumerate()
@@ -840,6 +836,33 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
 
     while index < payload.changes.len() {
         let item = &payload.changes[index];
+
+        // An item whose `cairn:~` shorthand never reached a real resource — the
+        // home lookup failed, or the rename it resolved through did not apply —
+        // is refused here, in the vocabulary of the shorthand the caller wrote.
+        // Dispatching it would instead fail downstream against a canonical URI
+        // the caller never typed, in whatever terms that dispatcher happens to
+        // use. A refused item also leaves the deferred blocking group, so a
+        // target that resolves to nothing is not run at the end of the call.
+        if let Some(error) = home_targets.blocked(index, &applied) {
+            blocking_indices.retain(|blocked| *blocked != index);
+            let IndexedFailure { failure, .. } = *build_failure(index, item, error);
+            if atomic {
+                let report = change_report_json(applied, vec![failure], commit, atomic);
+                if guard_resource_report {
+                    replay::finalize_report(
+                        &orch.db.local,
+                        write_call.as_ref().expect("guarded resource call"),
+                        &report,
+                    )
+                    .await;
+                }
+                return report;
+            }
+            failures.push(failure);
+            index += 1;
+            continue;
+        }
 
         if item.mode == ChangeMode::Revert {
             first_file_change = Some(IndexedChange { index, item });
@@ -1012,7 +1035,8 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
                     }
                     applied.push(change.into());
                 }
-                Err(failure) => {
+                Err(mut failure) => {
+                    failure.error = home_targets.annotate(index, failure.error);
                     let IndexedFailure {
                         failure,
                         commit: failure_commit,
@@ -1452,7 +1476,9 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
         }
     }
 
-    if let Some(kind) = blocking_kind {
+    // An emptied group has nothing left to run: every member was refused before
+    // dispatch, and its failures are already in the report.
+    if let Some(kind) = blocking_kind.filter(|_| !blocking_indices.is_empty()) {
         let blocking_result =
             run_blocking_group(orch, request, &payload.changes, &blocking_indices, kind).await;
         // The blocking result (task output / suspend marker / question answer) is

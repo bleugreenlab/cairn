@@ -27,6 +27,52 @@ static ROUTE_SUBMISSIONS: OnceLock<
 const ADMISSION_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const ADMISSION_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 const DESKTOP_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(60);
+const SESSION_RESUME_WINDOW: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Default)]
+struct SessionContinuity {
+    config: Option<Vec<u8>>,
+    downtime_started: Option<Instant>,
+    running_since: Option<Instant>,
+}
+
+impl SessionContinuity {
+    fn boundary<T: Serialize>(&mut self, config: &T, now: Instant) -> router::SessionBoundary {
+        let config = serde_json::to_vec(config).expect("channel config serializes");
+        let boundary = match (&self.config, self.downtime_started) {
+            (Some(previous), Some(started))
+                if previous == &config && now.duration_since(started) <= SESSION_RESUME_WINDOW =>
+            {
+                router::SessionBoundary::Resumed
+            }
+            _ => router::SessionBoundary::Fresh,
+        };
+        if self.config.as_ref() != Some(&config) {
+            self.config = Some(config);
+            self.downtime_started = None;
+        }
+        self.running_since = Some(now);
+        boundary
+    }
+
+    fn stopped(&mut self, now: Instant) {
+        self.downtime_started.get_or_insert(now);
+        self.running_since = None;
+    }
+
+    fn observe_running(&mut self, now: Instant) {
+        if self
+            .running_since
+            .is_some_and(|started| now.duration_since(started) > SESSION_RESUME_WINDOW)
+        {
+            self.downtime_started = None;
+        }
+    }
+
+    fn disabled(&mut self) {
+        *self = Self::default();
+    }
+}
 
 #[derive(Default)]
 struct AdmissionFailureReporter {
@@ -104,11 +150,13 @@ pub async fn configured_conversations_json(
 }
 
 async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
+    let mut continuity = SessionContinuity::default();
     loop {
         let config = crate::config::settings::load_settings(&orch.config_dir)
             .channels
             .discord;
         if !config.enabled {
+            continuity.disabled();
             clear_admission_state("discord");
             tokio::select! {
                 () = DISCORD_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
@@ -172,14 +220,6 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
             .insert("discord", provider.clone());
         clear_admission_state("discord");
         set_router_blocker("discord", None);
-        let mut tasks = router::spawn(
-            orch.clone(),
-            provider.clone(),
-            "discord",
-            config.guild_id.clone(),
-            config.route.clone(),
-            config.inbound_capabilities,
-        );
         let (mut gateway, shard_manager) = match provider.start().await {
             Ok(gateway) => gateway,
             Err(error) => {
@@ -188,13 +228,20 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
                     .lock()
                     .expect("channel runtime lock poisoned")
                     .remove("discord");
-                for task in tasks.drain(..) {
-                    task.abort();
-                }
                 tokio::time::sleep(ADMISSION_RETRY_INTERVAL).await;
                 continue;
             }
         };
+        let boundary = continuity.boundary(&config, Instant::now());
+        let mut tasks = router::spawn(
+            orch.clone(),
+            provider.clone(),
+            "discord",
+            config.guild_id.clone(),
+            config.route.clone(),
+            config.inbound_capabilities,
+            boundary,
+        );
         let surface_orch = orch.clone();
         let surface_provider: Arc<dyn discord::DiscordApi> = provider.clone();
         tasks.push(tokio::spawn(async move {
@@ -228,6 +275,7 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
                 }
                 () = DISCORD_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => break,
                 () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {
+                    continuity.observe_running(Instant::now());
                     let current = crate::config::settings::load_settings(&orch.config_dir).channels.discord;
                     if current != config { break; }
                 }
@@ -249,6 +297,7 @@ async fn supervise_discord(orch: crate::orchestrator::Orchestrator) {
             .expect("route submission slot poisoned")
             .remove("discord");
         set_router_blocker("discord", None);
+        continuity.stopped(Instant::now());
     }
 }
 
@@ -476,6 +525,10 @@ pub struct ResolvedQuestionMessage {
     pub provider_guid: String,
     pub caption_guid: Option<String>,
     pub sent_at: i64,
+    pub original_text: String,
+    pub answer: Option<String>,
+    pub answering_surface: Option<String>,
+    pub multi_select: bool,
     pub receipt: String,
 }
 
@@ -646,6 +699,8 @@ pub struct ChannelRuntimeStatus {
     pub presence_mode: OperatorPresenceMode,
     pub operator_presence: OperatorPresence,
     pub last_send_error: Option<String>,
+    pub pending_count: i64,
+    pub failed_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -730,6 +785,9 @@ pub async fn runtime_status(
     let last_send_error = ledger::latest_send_error(&orch.db.local, provider_id)
         .await
         .unwrap_or_default();
+    let undelivered = ledger::undelivered_counts(&orch.db.local, provider_id)
+        .await
+        .unwrap_or_default();
     ChannelRuntimeStatus {
         provider: provider_id,
         state,
@@ -742,6 +800,8 @@ pub async fn runtime_status(
         presence_mode,
         operator_presence,
         last_send_error,
+        pending_count: undelivered.pending,
+        failed_count: undelivered.failed,
     }
 }
 
@@ -980,6 +1040,7 @@ async fn spawn_imessage(
         config.to.clone(),
         config.route.clone(),
         config.inbound_capabilities,
+        router::SessionBoundary::Fresh,
     ));
 
     loop {
@@ -1003,11 +1064,13 @@ async fn spawn_imessage(
 }
 
 async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
+    let mut continuity = SessionContinuity::default();
     loop {
         let config = crate::config::settings::load_settings(&orch.config_dir)
             .channels
             .telegram;
         if !config.enabled {
+            continuity.disabled();
             clear_admission_state("telegram");
             tokio::select! {
                 () = TELEGRAM_ADMISSION_WAKE.get_or_init(tokio::sync::Notify::new).notified() => {},
@@ -1084,6 +1147,7 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             config.chat_id.clone(),
             config.route.clone(),
             config.inbound_capabilities,
+            continuity.boundary(&config, Instant::now()),
         );
         let mut polling = provider.start();
         let mut polling_finished = false;
@@ -1098,6 +1162,7 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
                     break;
                 }
                 () = tokio::time::sleep(ADMISSION_RETRY_INTERVAL) => {
+                    continuity.observe_running(Instant::now());
                     let current = crate::config::settings::load_settings(&orch.config_dir).channels.telegram;
                     if current != config { break; }
                 }
@@ -1119,6 +1184,7 @@ async fn supervise_telegram(orch: crate::orchestrator::Orchestrator) {
             .expect("route submission slot poisoned")
             .remove("telegram");
         set_router_blocker("telegram", None);
+        continuity.stopped(Instant::now());
     }
 }
 
@@ -1285,6 +1351,71 @@ pub fn render_text_floor(ask: &OutboundAsk) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_continuity_resumes_only_an_identical_short_interruption() {
+        let start = Instant::now();
+        let mut continuity = SessionContinuity::default();
+        let config = serde_json::json!({"enabled": true, "destination": "one"});
+
+        assert_eq!(
+            continuity.boundary(&config, start),
+            router::SessionBoundary::Fresh
+        );
+        continuity.stopped(start + Duration::from_secs(10));
+        assert_eq!(
+            continuity.boundary(&config, start + Duration::from_secs(20)),
+            router::SessionBoundary::Resumed
+        );
+
+        continuity.stopped(start + Duration::from_secs(30));
+        assert_eq!(
+            continuity.boundary(
+                &config,
+                start + SESSION_RESUME_WINDOW + Duration::from_secs(11)
+            ),
+            router::SessionBoundary::Fresh
+        );
+    }
+
+    #[test]
+    fn session_continuity_keeps_downtime_across_failed_starts() {
+        let start = Instant::now();
+        let mut continuity = SessionContinuity::default();
+        let config = serde_json::json!({"enabled": true});
+        continuity.boundary(&config, start);
+        continuity.stopped(start + Duration::from_secs(1));
+
+        assert_eq!(
+            continuity.boundary(&config, start + Duration::from_secs(2)),
+            router::SessionBoundary::Resumed
+        );
+        continuity.stopped(start + Duration::from_secs(3));
+        assert_eq!(
+            continuity.boundary(
+                &config,
+                start + SESSION_RESUME_WINDOW + Duration::from_secs(2)
+            ),
+            router::SessionBoundary::Fresh
+        );
+    }
+
+    #[test]
+    fn config_change_and_reenable_start_fresh_sessions() {
+        let start = Instant::now();
+        let mut continuity = SessionContinuity::default();
+        continuity.boundary(&"one", start);
+        continuity.stopped(start + Duration::from_secs(1));
+        assert_eq!(
+            continuity.boundary(&"two", start + Duration::from_secs(2)),
+            router::SessionBoundary::Fresh
+        );
+        continuity.disabled();
+        assert_eq!(
+            continuity.boundary(&"two", start + Duration::from_secs(3)),
+            router::SessionBoundary::Fresh
+        );
+    }
 
     #[tokio::test]
     #[serial_test::serial(operator_presence)]

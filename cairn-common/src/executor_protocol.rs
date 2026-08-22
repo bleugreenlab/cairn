@@ -8,6 +8,13 @@ use crate::protocol::{CallbackRequest, CallbackResponse};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
 
+/// Process exit code used when an executor has been told it cannot attach.
+///
+/// This is a process-boundary contract between `cairn-executor` and the local
+/// runner supervisor. Other failures remain ordinary non-zero exits and retain
+/// the supervisor's restart pacing.
+pub const EXECUTOR_PERMANENT_REFUSAL_EXIT_CODE: u8 = 78;
+
 /// Receives and accepts one executor Ready message before starting work that is
 /// explicitly outside the readiness boundary.
 pub async fn accept_ready_then<T, R, E, Receive, Accept, PostReady>(
@@ -24,6 +31,24 @@ where
     let accepted = accept(message)?;
     post_ready();
     Ok(accepted)
+}
+
+/// Protocol intent for a resident process that must use the spawning machine's
+/// default shell. This is deliberately not a filesystem path: resolving a path
+/// before placement would couple the process to the runner's platform.
+pub const RESIDENT_PROCESS_DEFAULT_SHELL: &str = "cairn:default-shell";
+/// Protocol intent for the command flag accepted by the resolved shell.
+pub const RESIDENT_PROCESS_SHELL_COMMAND_FLAG: &str = "cairn:shell-command-flag";
+
+/// The compact result of shadow-ranking a pinned batch as hermetic work.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementCounterfactualWinner {
+    pub executor_name: String,
+    pub executor_id: String,
+    pub reason: PlacementReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prediction: Option<PlacementPrediction>,
 }
 
 /// One bounded, generation-aware transition in an enrolled remote's link.
@@ -52,6 +77,17 @@ pub enum RemoteConnectionPhase {
     ProtocolReady,
     ProtocolReadyTimedOut,
     HeartbeatLost,
+    /// The link beat on time throughout, but the facts those beats carried
+    /// stopped being recomputed. Distinct from [`Self::HeartbeatLost`] because
+    /// the two look nothing alike from the machine's side: nothing was lost
+    /// here, and an operator reading "heartbeat lost" against a machine whose
+    /// heartbeats never missed would be looking for the wrong failure.
+    ///
+    /// Additive and runner-local, so it is not a wire compatibility boundary
+    /// and does not bump [`EXECUTOR_PROTOCOL_VERSION`]: this whole enum is the
+    /// runner's own record of what it observed about a link, never anything an
+    /// executor sends or reads.
+    TelemetryStalled,
     Disconnected,
     SshExited,
     RemoteProcessExited,
@@ -64,8 +100,49 @@ pub struct CommandProcessHealth {
     pub tracked_live_count: usize,
     pub reaped_stale_count: usize,
     pub unverified_count: usize,
+    /// Cells whose tree a destructive operation declined to touch because a
+    /// process from a prior epoch of that cell was still alive inside it.
+    ///
+    /// Capacity, not fault: the operation was skipped and will be retried, and
+    /// the cell is intact.
+    #[serde(default)]
+    pub survivor_blocked_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_age_ms: Option<u64>,
+}
+
+/// What a released cell is still waiting to die.
+///
+/// A batch that completes normally has every process in its tree verified gone
+/// before the cell is released, and this is absent. It is present exactly when
+/// that verification did not succeed — a descendant that escaped the group the
+/// executor created, or a reap that could not prove absence — and it is the one
+/// record that outlives the epoch it belonged to.
+///
+/// It exists because the executor's in-memory model answers a bookkeeping
+/// question ("is this cell assigned to anyone?") and destructive tree
+/// operations need a physical one ("is anything still writing in this tree?").
+/// Release used to drop command ownership outright, so the physical question
+/// had no evidence left to consult.
+///
+/// Additive and defaulted, so this is not a wire compatibility boundary and
+/// does not bump [`EXECUTOR_PROTOCOL_VERSION`]. Neither [`CellOccupancy`] nor
+/// [`CommandProcessHealth`] refuses unknown keys, so a peer that never heard of
+/// draining ignores the key, and this executor defaults it from that peer's
+/// payload. What changed is which cells this executor is willing to hand out,
+/// which it already expresses in the vocabulary every peer understands —
+/// [`CellUnavailableReason::Provisioning`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DrainingCommandOwnership {
+    /// The epoch these processes were launched under. Stamped so a survivor can
+    /// never be mistaken for the current occupant's own work.
+    #[serde(default)]
+    pub cell_epoch: u64,
+    #[serde(default)]
+    pub released_at_unix_ms: u64,
+    #[serde(default)]
+    pub ownership: CommandBatchOwnership,
 }
 
 /// Durable ownership of one transient command batch in a cell.
@@ -348,14 +425,38 @@ pub enum PlacementWorkClass {
 /// Cadence and freshness bound for measured CPU admission decisions.
 pub const CPU_ADMISSION_SAMPLE_INTERVAL_MS: u64 = 5_000;
 
+/// How long an executor that has measured its own CPU may go without a new
+/// reading before admission treats it as blind.
+///
+/// Three sample intervals, the same allowance the runner gives a link before
+/// calling it stale. The bound has to tolerate ordinary jitter — a sampler that
+/// misses one tick on a busy machine is busy, not broken — while still being
+/// far shorter than the minutes a genuinely starved sampler goes quiet for.
+pub const CPU_ADMISSION_BLIND_AFTER_MS: u64 = 3 * CPU_ADMISSION_SAMPLE_INTERVAL_MS;
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CpuAdmissionState {
+    /// No utilization reading has ever been taken on this machine — the first
+    /// sample is still establishing its baseline, or this platform has no CPU
+    /// probe at all. Reachable only before the first successful sample: nothing
+    /// afterwards returns here, because a machine cannot stop having measured.
     #[default]
     Unknown,
     Accepting,
     Pressured,
 }
+
+// There is deliberately no `Blind` state here, and the omission is the design.
+//
+// Whether a machine has gone blind is a question about the age of its last
+// reading, and only the sampler could set a state saying so — but the failure
+// being described is the sampler not running. A transported `Blind` would
+// therefore be set by a party that cannot observe the condition and trusted by
+// parties that can: every consumer already holds `measured_at_unix_ms` and a
+// clock, which is the whole answer. `measured_at_unix_ms.is_none()` means never
+// measured; an age past `CPU_ADMISSION_BLIND_AFTER_MS` means blind; otherwise
+// the state below is the verdict. One definition, derived wherever it is read.
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -763,7 +864,184 @@ pub struct LearnedResourceEstimate {
 /// enrolled remotes. A peer at 60 never reports the transition history used to
 /// diagnose attach and link failures, so the handshake must not present the two
 /// wire contracts as equivalent.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 62;
+///
+/// Bumped to 63 because an execution environment is now a lease against a live
+/// executor session rather than a permanent binding. A runner at 63 rebuilds an
+/// environment whose executor is gone instead of refusing the owner's work
+/// forever, and it sends a returning executor a [`ResidencyOperation::Release`]
+/// for a residency that moved while it was away. An executor talking to a runner
+/// at 62 would keep that superseded cell, leaving two machines answering for one
+/// owner, so the two behaviors must not be presented as one contract.
+///
+/// Bumped to 64 for a binary-safe Windows CLI transfer. A runner at 63 streamed
+/// the CLI's bytes into a PowerShell `-EncodedCommand` script over the SSH stdin
+/// channel, which hosts a child PowerShell with serialized text streams and does
+/// not carry a binary payload intact; the CLI now arrives by `scp` and is
+/// verified where it lands, exactly as the executor beside it already was. The
+/// two runners therefore install the same file by different means, and the
+/// published artifact set a peer resolves is keyed by this number.
+///
+/// Also at 64, [`RemoteAttachAttempt`] carries [`RemoteArtifactFault`], so a
+/// target with nothing published reads as unpublished rather than as a bare
+/// mismatch, and is paced accordingly.
+///
+/// Bumped to 65 because reclaiming a build cell's target is a disk-pressure tier
+/// rather than something a hold release does. An executor at 64 trims the slot
+/// it just released against a fixed ceiling and ignores
+/// [`ExecutorRuntimePolicy::slot_target_max_bytes`] entirely, so an operator who
+/// sets that ceiling on a fleet at 64 changes nothing while the machine keeps
+/// deleting the build it just finished. The behavior is what has to roll, not
+/// only the field: the two must not be presented as one contract.
+///
+/// Bumped to 66 because adopting a retained cell now degrades to eviction. An
+/// executor at 65 died on the first retained cell it could not validate, so it
+/// reported nothing at all; one at 66 reaches Ready without that cell and names
+/// it in [`ExecutorSubstrateReport::evicted_cells`]. A runner reading the older
+/// report cannot tell an environment that was released from one that never
+/// existed.
+///
+/// Bumped to 67 because a stale CPU reading now brakes admission instead of
+/// releasing it. An executor at 66 wipes [`CpuAdmissionHealth`] to its default
+/// on any missed sample and on any policy write, so a machine that had been
+/// measuring for hours reports `measuredAtUnixMs: null` — indistinguishable
+/// from a platform with no CPU probe, and admitted against as if idle. One at
+/// 67 keeps the last reading and its collection time through both, which is
+/// what lets any reader derive blindness from the reading's age and hold
+/// non-interactive admission with [`HostPressureCondition::TelemetryBlind`].
+/// A runner reading the older report cannot recover that distinction, because
+/// the older executor no longer holds the evidence.
+///
+/// Telemetry-stall remediation deliberately did NOT bump this. The runner now
+/// recycles a link that beats on time while the facts its beats carry stop
+/// being recomputed, but every part of that is runner-owned: the bound, the
+/// decision, the pacing, and the [`RemoteConnectionPhase`] it records. The
+/// evidence it decides on is `liveness_observed_at_unix_ms`, which a v67
+/// executor already publishes. Nothing an executor sends or accepts changed, so
+/// a v67 executor and a runner carrying that remediation are fully compatible.
+///
+/// Bumping it anyway would have been actively harmful rather than merely
+/// conservative. The version is compared for exact equality when a connection
+/// is accepted, so a bump refuses every deployed executor until a matching
+/// artifact has rolled to every machine — and the fleet state this remediation
+/// exists to repair is precisely when that dependency is least affordable.
+///
+/// Runner-held draining did not bump it either, for the same reason and with
+/// the same care. A drain became durable runner state that outlives the
+/// connection it was set on, and the runner now states it on every attach and
+/// refuses placement on a drained machine itself — but `DrainModeRequest` is a
+/// message a v67 executor already accepts, its handling is unchanged, and
+/// everything else that moved (a machine's drain on the fleet projection, the
+/// placement rejection that names it) is runner-local and never crosses to an
+/// executor. Refusing every deployed executor until an artifact rolls, in
+/// order to ship the lever that disables a machine nobody can reach, would
+/// withhold the fix exactly where it is needed.
+///
+/// The survivor precondition on a cell tree deliberately did NOT bump this
+/// either. [`CellOccupancy::draining`] and
+/// [`CommandProcessHealth::survivor_blocked_count`] are both `#[serde(default)]`
+/// on structs that accept unknown keys, so nothing an executor sends or accepts
+/// changed: an older peer ignores them, and this one defaults them from an
+/// older peer's payload. Which cells this executor is willing to hand out did
+/// change, and it says so in the vocabulary every peer already understands —
+/// [`CellUnavailableReason::Provisioning`].
+///
+/// The one place they are more than additive is a cell's own state file, which
+/// an executor lacking them drops on rewrite. That is a persisted-format
+/// concern, which this codebase answers with tolerant readers rather than with
+/// this number, and the hazard needs one machine's binary rolled backwards onto
+/// state a newer one wrote — far less costly than refusing every deployed
+/// executor for it.
+///
+/// The build-prerequisite verdict did not bump it, and the test is the same
+/// one: what does a runner get wrong if the executor it is talking to is
+/// older? Nothing. [`ExecutorCapabilities::build_prerequisites`] is additive
+/// and defaulted, an older executor omits it, and the runner renders that
+/// omission as the honest "not reported by this executor" rather than as a
+/// machine that failed — the same shape [`ExecutorCapabilities::toolchain_detection`]
+/// already has. Nothing an executor sends or accepts changed, and no decision
+/// anywhere reads the new field. Bumping would refuse every attached machine
+/// until an artifact rolled, in exchange for a fact that arrives on its own as
+/// each machine's binary is next replaced.
+///
+/// Bumped to 68 because the available-memory floor now holds the claims of
+/// resident work whose demand has never been measured, and
+/// [`HostPressureCondition::MemoryAvailable`] carries that hold as its own
+/// number. An executor at 67 admits every cold arrival against a floor of
+/// two gigabytes, which is how eight unprofiled workspace builds walked into a
+/// 121 GiB machine and crushed it (CAIRN-4365). A runner reading the older
+/// report sees a floor with no explanation for its size.
+///
+/// The blocked-refresh marker did not bump it either, and the reasoning is the
+/// one above about `build_prerequisites` rather than a new argument.
+/// [`ExecutorAdvertisement::facts_stale_refresh_blocked`] is additive and
+/// `#[serde(default)]`: an older executor omits it and the runner reads the
+/// omission as the absence of an explanation, which is precisely how every
+/// runner behaved before the field existed. Nothing an executor accepts
+/// changed, and no older peer is misled by a newer one — which is what lets the
+/// runner judge an unexplained freeze exactly as it always did, rather than
+/// needing to know its peer's vintage (CAIRN-4420).
+///
+/// That the number below moved anyway does not retire the argument, and it is
+/// worth being exact about what it costs. The marker exists so a wedged
+/// liveness refresh is answered by a report rather than by bouncing the link,
+/// and a bounced machine can only return through an artifact matching the
+/// runner's version — so this remedy is worth the least when it is gated behind
+/// a roll. It is not gated behind one it caused: the release carries a bump of
+/// its own for the change recorded below, and this field rides in on it for
+/// free. Had it been the only change here, the number would not have moved.
+///
+/// Bumped to 70 because macOS teardown now treats a failed process-group signal
+/// as verified completion when a census finds no token-matched owned identity
+/// (CAIRN-4437). This changes whether the executor admits the next batch after a
+/// numeric process-group identifier is reused, so deployed executors and their
+/// runner-visible placement behavior must move together.
+///
+/// Bumped to 71 because what losing the link means changed on both halves at
+/// once. An executor before this treats a failed runner read as the end of the
+/// process and takes its running cells down with it within a millisecond; a 71
+/// executor keeps them running and dials back within
+/// [`EXECUTOR_RECONNECT_MAX_DELAY_MS`]. The runner side is sized from exactly
+/// that: it now leaves a carrier standing for [`EXECUTOR_REATTACH_GRACE_MS`]
+/// when a generation goes absent, because the machine behind it is expected to
+/// be working and coming back. Pair a 71 runner with an older executor and both
+/// halves are wrong in the same window — the runner waits a minute and a half
+/// for a process that died on the read, holding a machine out of placement
+/// while the work it is waiting for no longer exists. Unlike an additive field,
+/// this is not something an older peer can ignore: it is a claim about what its
+/// silence means.
+///
+/// Version 72 makes [`ProcessBatch::execution_residency`] authoritative at the
+/// executor's drain gate too. A 72 runner deliberately admits a batch pinned to
+/// a drained resident environment; an older executor rejects the same batch
+/// downstream, contradicting the runner's placement verdict and preventing the
+/// drain from ever emptying. The field shape did not change, but its admission
+/// meaning did, so mixed peers are not compatible.
+///
+/// Version 74 makes conflict-scaffolding rejection a pre-admission executor
+/// behavior. An older executor can park the same permanently unrunnable commit
+/// until its progress window expires and report capacity-shaped silence, while a
+/// 74 executor returns the causal checkout refusal before queueing it.
+///
+/// Version 75 adds the runner-visible permanent-refusal substrate state. A
+/// runner that understands this state stops presenting a protocol-incompatible
+/// local executor as though it were actively respawning.
+///
+/// Version 76 makes a residency's command batches participate in the same
+/// operation fence as checkout refresh and release. An older executor can move
+/// the checkout under a batch after a newer runner has accepted the refresh, so
+/// the behavioral contract is not safe across mixed peers even though no field
+/// changed shape.
+///
+/// Version 77 reruns configured setup before every new command occupancy. An
+/// older executor treats matching tracked inputs as proof that ignored setup
+/// outputs still exist and can therefore run a JavaScript suite without its
+/// dependencies. The behavior must roll to every executor even though the wire
+/// shape is unchanged.
+///
+/// Version 78 makes the default shell and its command flag spawn-side intents.
+/// Older executors try to execute the program intent as a literal path, while
+/// older runners send their own platform's shell path and invocation syntax.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 78;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -891,6 +1169,59 @@ pub const EXECUTOR_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// thresholds must not collapse into each other.
 pub const EXECUTOR_LINK_STALL_REMEDIATION_MS: u64 = 150_000;
 
+/// How long the runner tolerates a link that beats on time while the facts
+/// those beats carry stay frozen, before it bounces the connection.
+///
+/// An executor emits beats from one task and recomputes what they carry on
+/// another. When the second task wedges, the first keeps beating: the link is
+/// perfect, progress is fresh, and every number the runner holds about that
+/// machine is history. Placement correctly refuses such a machine, and without
+/// this bound it refuses it forever — the fleet quietly collapses to whichever
+/// machines attached most recently, with no disconnect anywhere to explain it.
+///
+/// Ten refresh intervals. The payload recomputes on the beat's own cadence, so
+/// this is ten consecutive passes that produced nothing while the link stayed
+/// demonstrably alive — far past a slow pass, and not something an executor
+/// grinding through a storage walk reaches, because a slow pass still finishes
+/// and stamps.
+///
+/// Strictly greater than [`EXECUTOR_LINK_STALL_REMEDIATION_MS`] so silence is
+/// always the earlier and stronger verdict: a link the runner has already given
+/// up on for going quiet must never be re-diagnosed as a telemetry problem.
+pub const EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS: u64 = 10 * EXECUTOR_HEARTBEAT_INTERVAL_MS;
+
+const _: () = assert!(EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS > EXECUTOR_LINK_STALL_REMEDIATION_MS);
+
+/// How long the executor's liveness refresher waits for one pass before it
+/// publishes what it already has, naming the phase the pass is stuck in.
+///
+/// This bounds a *wait*, never a run. Nothing is cancelled when a pass crosses
+/// it, no work is charged for crossing it, and a pass that returns afterwards
+/// publishes its facts normally. What ends at the bound is the refresher's own
+/// blocking on it, because exactly one refresher exists: a pass that never
+/// returns otherwise freezes a healthy machine's advertised facts permanently,
+/// with no evidence anywhere of what it is waiting on (CAIRN-4420).
+///
+/// Two heartbeat intervals — generous by orders of magnitude for a pass that
+/// normally takes milliseconds — and far enough below
+/// [`EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS`] that the explanation reaches the
+/// runner several beats before the freeze it explains could be remediated.
+pub const LIVENESS_REFRESH_BOUND_MS: u64 = 2 * EXECUTOR_HEARTBEAT_INTERVAL_MS;
+
+const _: () = assert!(
+    LIVENESS_REFRESH_BOUND_MS + 2 * EXECUTOR_HEARTBEAT_INTERVAL_MS
+        < EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS
+);
+
+/// A refresh phase slower than this is named in the executor's log along with
+/// how long it took.
+///
+/// The phases take different locks and touch different subsystems, so which one
+/// is slow is most of why it is slow. One production pass over this threshold
+/// locates a wedge that a frozen advertisement can only report the existence
+/// of.
+pub const LIVENESS_REFRESH_PHASE_WARN_MS: u64 = 5_000;
+
 /// How long a queued entry survives without the runner confirming that somebody
 /// is still waiting for it.
 ///
@@ -910,6 +1241,31 @@ pub const REQUESTER_LIVENESS_WINDOW_MS: u64 = 3 * EXECUTOR_HEARTBEAT_INTERVAL_MS
 
 const _: () = assert!(REQUESTER_LIVENESS_WINDOW_MS > EXECUTOR_HEARTBEAT_INTERVAL_MS);
 const _: () = assert!(REQUESTER_LIVENESS_WINDOW_MS < EXECUTOR_LINK_STALL_REMEDIATION_MS);
+
+/// The longest a detached `cairn-executor` waits before reaching for its runner
+/// again.
+///
+/// A gap is not an error state on the executor's side: its cells keep running
+/// through one, so this paces reconnection to spare a restarting runner a
+/// reconnect storm rather than to give anything time to heal.
+pub const EXECUTOR_RECONNECT_MAX_DELAY_MS: u64 = 30_000;
+
+/// How long the runner leaves an SSH carrier standing while the protocol
+/// generation behind it is absent, before recycling the machine.
+///
+/// This is the runner's half of a single agreement, and the two halves are
+/// stated together because getting them wrong is invisible in either file
+/// alone: an executor whose link drops keeps working and dials back within
+/// [`EXECUTOR_RECONNECT_MAX_DELAY_MS`], so a runner that recycles the carrier
+/// faster than that kills a machine that was already on its way back — and
+/// kills, with it, whatever that machine was in the middle of. Three ceilings
+/// covers several reconnect attempts including the connect budget of each.
+///
+/// Nothing here bounds how long work may run. What is being waited on is the
+/// absence of a link, and the wait ends the moment a generation attaches.
+pub const EXECUTOR_REATTACH_GRACE_MS: u64 = 3 * EXECUTOR_RECONNECT_MAX_DELAY_MS;
+
+const _: () = assert!(EXECUTOR_REATTACH_GRACE_MS > 2 * EXECUTOR_RECONNECT_MAX_DELAY_MS);
 
 /// How long a stopping `cairn-executor` waits for its own in-flight blocking
 /// work before it exits.
@@ -1217,6 +1573,53 @@ impl ToolchainDetection {
     }
 }
 
+/// What a prerequisite script concluded about the machine it ran on.
+///
+/// A missing package and an unrunnable check are opposite facts, and both
+/// collapse into "the lane failed" without a vocabulary that separates them —
+/// the same distinction [`ToolchainDetection`] draws between a machine with no
+/// toolchain and a probe that never worked.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum BuildPrerequisiteStatus {
+    /// The script ran and found nothing missing.
+    Satisfied,
+    /// The script ran and named what this machine does not have.
+    Missing,
+    /// The script could not be run at all, so nothing is known either way.
+    /// Deliberately not `Missing`: an unprovisioned machine and one whose check
+    /// is broken need different repairs.
+    Unchecked,
+}
+
+/// Whether a machine carries the system packages Cairn's workspace needs in
+/// order to compile, judged by the repository's own provisioning script.
+///
+/// This exists because the toolchain vocabulary is coarser than the workspace's
+/// real requirement. `cargo --version` succeeds on a Linux machine with no
+/// `libwebkit2gtk-4.1-dev`, so that machine honestly advertises `rust` and is
+/// still structurally unable to build the desktop crate: every lane whose crate
+/// cone reaches it dies inside a `glib-sys` build script before one first-party
+/// crate compiles, and returns an infrastructure exit instead of a verdict. A
+/// real code failure underneath is masked completely.
+///
+/// The verdict is reported, never enforced. Placement eligibility is an
+/// admission question that belongs to the fleet's admission path, and this type
+/// deliberately stops at making the condition legible — today it is invisible.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuildPrerequisiteCheck {
+    /// The script that decided this, spelled as the repository spells it, so a
+    /// verdict names the command that would repair the machine.
+    pub script: String,
+    pub status: BuildPrerequisiteStatus,
+    /// The script's own diagnostic, verbatim: on failure it names the host, the
+    /// packages it could not find, and the provisioning command to run. Carried
+    /// rather than summarized because the summary is what makes an
+    /// infrastructure exit unactionable in the first place.
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorCapabilities {
@@ -1248,6 +1651,24 @@ pub struct ExecutorCapabilities {
     /// deliberately different facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchain_detection: Option<ToolchainDetection>,
+    /// Whether this machine can actually build the workspace, as distinct from
+    /// whether it has a Rust toolchain. Absent from an executor built before
+    /// the prerequisite check existed.
+    ///
+    /// Additive and defaulted for the same reason [`Self::toolchain_detection`]
+    /// is, and on the same terms: an older peer omits the key, a newer runner
+    /// renders the omission honestly, placement is unchanged either way, and
+    /// [`EXECUTOR_PROTOCOL_VERSION`] does not move.
+    ///
+    /// The verdict is taken once, when the executor attaches, so a machine
+    /// provisioned or degraded while it stays attached keeps reporting the
+    /// verdict from its last attach. That is a known seam rather than an
+    /// oversight: refreshing a capability fact needs a producer for
+    /// [`ExecutorMessage::AdvertisementUpdated`], which this executor does not
+    /// yet have, and inventing a second refresh path for this one fact would
+    /// have to be torn out when that producer lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_prerequisites: Option<BuildPrerequisiteCheck>,
 }
 
 impl ExecutorCapabilities {
@@ -1401,6 +1822,82 @@ pub struct VerifiedWarmRoot {
     pub commit: String,
 }
 
+/// The phases of one liveness refresh pass, in the order the pass runs them.
+///
+/// Named on the wire because a pass that stops returning can only be diagnosed
+/// by where it stopped. Each phase waits on something different — residency
+/// operation locks, the managed-object manifests, pool state, host probes, the
+/// snapshot consumer — and an advertisement that merely stopped moving says
+/// nothing about which of them the machine is inside.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LivenessRefreshPhase {
+    /// Reclaiming residencies whose holders stopped answering. Takes pool state
+    /// and the per-holder residency operation locks.
+    ExpireResidencies,
+    /// Dropping in-memory managed-object manifests nothing is using.
+    EvictIdleManifests,
+    /// Reading pool state to build the fleet snapshot.
+    Snapshot,
+    /// Sampling host probes and queue health.
+    SubstrateReport,
+    /// Collecting the verified warm roots this machine can serve.
+    WarmRoots,
+    /// Swapping in the new report and handing the snapshot to its consumer.
+    Publish,
+}
+
+impl LivenessRefreshPhase {
+    /// The phases in the order one pass runs them.
+    pub const ORDER: [Self; 6] = [
+        Self::ExpireResidencies,
+        Self::EvictIdleManifests,
+        Self::Snapshot,
+        Self::SubstrateReport,
+        Self::WarmRoots,
+        Self::Publish,
+    ];
+
+    /// What the machine is waiting on, for a log line or a resource a person
+    /// reads.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ExpireResidencies => "expiring residencies",
+            Self::EvictIdleManifests => "evicting idle manifests",
+            Self::Snapshot => "reading pool state",
+            Self::SubstrateReport => "sampling substrate health",
+            Self::WarmRoots => "collecting warm roots",
+            Self::Publish => "publishing the snapshot",
+        }
+    }
+}
+
+/// Why the facts a heartbeat carries are still the previous pass's.
+///
+/// Its presence is the whole point. A machine whose refresh wedged used to go
+/// on beating with facts that quietly aged, indistinguishable from a machine
+/// whose facts genuinely had not changed, and the only way to tell them apart
+/// was to wait out the stall bound and bounce the link. An executor that says
+/// *these facts are stale and here is the phase I am stuck in* has reported the
+/// fault itself, and a report is not a reason to destroy the reporter
+/// (CAIRN-4420).
+///
+/// Both stamps are the executor's own clock, like
+/// [`ExecutorAdvertisement::liveness_observed_at_unix_ms`], so a reader derives
+/// ages exactly as it already does for the facts themselves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LivenessRefreshBlocked {
+    /// The phase the pass entered and has not left.
+    pub phase: LivenessRefreshPhase,
+    /// When the blocked pass began.
+    pub pass_started_unix_ms: u64,
+    /// When it entered the phase it is stuck in. Carried separately because a
+    /// pass that spent its budget across every phase and a pass that went into
+    /// one phase and never came out are different faults.
+    pub phase_entered_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorAdvertisement {
@@ -1424,6 +1921,18 @@ pub struct ExecutorAdvertisement {
     /// claim" rather than as infinitely stale.
     #[serde(default)]
     pub liveness_observed_at_unix_ms: Option<u64>,
+    /// Set while a refresh pass has overrun
+    /// [`LIVENESS_REFRESH_BOUND_MS`], naming the phase it is stuck in. This is
+    /// what makes the stamp above stand still *with an explanation* rather than
+    /// silently, and the difference is what separates a machine reporting its
+    /// own fault from a machine that has stopped saying anything true.
+    ///
+    /// `None` both from an executor whose last pass completed and from one too
+    /// old to report it. Reading them the same way is deliberate: no
+    /// explanation is the state every runner assumed before this field existed,
+    /// and it is the state the stall watchdog was written for.
+    #[serde(default)]
+    pub facts_stale_refresh_blocked: Option<LivenessRefreshBlocked>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1901,6 +2410,15 @@ pub enum HostPressureCondition {
     MemoryAvailable {
         available_bytes: u64,
         floor_bytes: u64,
+        /// How much of `floor_bytes` is held for resident work whose demand has
+        /// never been measured, rather than asked for by the arriving request.
+        ///
+        /// Without this the floor is a number with no derivation: an operator
+        /// reading "floor 112 GiB" against a request that asked for 16 cannot
+        /// tell a policy from a bug. Defaulted so an executor that predates the
+        /// hold still deserializes.
+        #[serde(default)]
+        unmeasured_hold_bytes: u64,
     },
     DiskFree {
         free_bytes: u64,
@@ -1916,6 +2434,16 @@ pub enum HostPressureCondition {
         clear_utilization: f64,
         state_since_unix_ms: u64,
         measured_at_unix_ms: u64,
+    },
+    /// A reading admission decides on has stopped moving on a machine that was
+    /// producing it. Named by the same [`MachineMeasurement`] the runner's
+    /// placement seam reports blindness with, so the two ends of the fleet
+    /// describe the same failure in the same words.
+    TelemetryBlind {
+        measurement: MachineMeasurement,
+        measured_at_unix_ms: u64,
+        age_ms: u64,
+        blind_after_ms: u64,
     },
 }
 
@@ -1935,6 +2463,9 @@ pub struct HostPressureEvidence {
 pub enum ExecutorSubstrateState {
     SupervisorSpawning,
     SupervisorRespawning,
+    /// The child declared that this runner/executor binary pairing cannot
+    /// attach. Supervision remains dormant until the executable is replaced.
+    PermanentRefusal,
     ProtocolAttaching,
     InitialStorageSweep,
     StorageAccounting,
@@ -2222,6 +2753,8 @@ impl ResidencyFootprint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResidentProcessSpec {
+    /// Executable path, or [`RESIDENT_PROCESS_DEFAULT_SHELL`] when the spawning
+    /// executor must resolve its own user's shell.
     pub program: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -2454,13 +2987,25 @@ pub struct CellOccupancy {
     /// signal anything found in the checkout.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_ownership: Option<CommandBatchOwnership>,
+    /// A prior epoch's ownership that has not been proven dead yet.
+    ///
+    /// Occupancy on purpose rather than a field beside it: a tree with a live
+    /// writer in it is occupied in the only sense destructive operations care
+    /// about, so every gate already written in terms of [`Self::is_empty`] —
+    /// the target reclaim, retirement, cell selection — refuses it without
+    /// being taught about survivors individually.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draining: Option<DrainingCommandOwnership>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub processes: std::collections::BTreeMap<String, ResidentProcess>,
 }
 
 impl CellOccupancy {
     pub fn is_empty(&self) -> bool {
-        self.command.is_none() && self.command_ownership.is_none() && self.processes.is_empty()
+        self.command.is_none()
+            && self.command_ownership.is_none()
+            && self.draining.is_none()
+            && self.processes.is_empty()
     }
 
     pub fn live_processes(&self) -> impl Iterator<Item = (&String, &ResidentProcess)> {
@@ -2535,6 +3080,11 @@ pub enum ResidencyEventKind {
     CheckoutRefreshed {
         #[serde(alias = "base_commit")]
         base_commit: String,
+    },
+    CheckoutHistoryDiscontinuity {
+        prior_head: String,
+        new_base_commit: String,
+        cell_epoch: u64,
     },
     Releasing,
     Released,
@@ -3904,6 +4454,10 @@ pub struct ExecutorRuntimePolicy {
     /// storage sweep reclaims it.
     #[serde(default = "default_quarantine_forensic_window_ms")]
     pub quarantine_forensic_window_ms: u64,
+    /// Bytes of build output one build cell may hold before a slot-target
+    /// reclaim empties it outright rather than trimming it.
+    #[serde(default = "default_slot_target_max_bytes")]
+    pub slot_target_max_bytes: u64,
     #[serde(default)]
     pub cpu_admission: CpuAdmissionPolicy,
 }
@@ -3990,6 +4544,21 @@ pub const IDLE_RETENTION_CEILING_TOTAL: usize = 16;
 /// longer at the risk of meeting the admission watermark first.
 pub const IDLE_RETENTION_PRESSURE_FREE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
+/// Bytes of build output one build cell may hold before a slot-target reclaim
+/// stops trimming it and empties it.
+///
+/// A runaway guard, not an operating point. This was 40 GiB and was enforced on
+/// every hold release, which put it under the roughly 56 GiB a full Cairn test
+/// build leaves behind: every completed build was over budget by construction,
+/// so releasing a slot deleted the build that had just finished and the next
+/// lane recompiled it. One night measured 484 GB reclaimed in five hours while
+/// the volume still had 414 GiB free (CAIRN-4349). Reclamation is a disk
+/// pressure tier now, and this number only bounds a cell that has grown past
+/// any plausible build, so it has to sit above a full test build of the largest
+/// project the machine serves. Below that it is not a budget at all — it is a
+/// delete-everything policy with a number attached.
+pub const SLOT_TARGET_MAX_BYTES: u64 = 96 * 1024 * 1024 * 1024;
+
 /// How long a quarantined build cell is held before the storage sweep reclaims
 /// it.
 ///
@@ -4033,6 +4602,10 @@ const fn default_idle_retention_pressure_free_bytes() -> u64 {
     IDLE_RETENTION_PRESSURE_FREE_BYTES
 }
 
+const fn default_slot_target_max_bytes() -> u64 {
+    SLOT_TARGET_MAX_BYTES
+}
+
 impl Default for ExecutorRuntimePolicy {
     fn default() -> Self {
         Self {
@@ -4047,6 +4620,7 @@ impl Default for ExecutorRuntimePolicy {
             idle_retention_ceiling_total: default_idle_retention_ceiling_total(),
             idle_retention_pressure_free_bytes: default_idle_retention_pressure_free_bytes(),
             quarantine_forensic_window_ms: default_quarantine_forensic_window_ms(),
+            slot_target_max_bytes: default_slot_target_max_bytes(),
             cpu_admission: CpuAdmissionPolicy::default(),
         }
     }
@@ -4092,6 +4666,9 @@ impl ExecutorRuntimePolicy {
         if self.quarantine_forensic_window_ms == 0 {
             return Err("executor quarantine forensic window must be greater than zero".into());
         }
+        if self.slot_target_max_bytes == 0 {
+            return Err("executor slot-target ceiling must be greater than zero".into());
+        }
         if self.memory_budget_bytes == Some(0) {
             return Err("executor memory budget must be greater than zero when configured".into());
         }
@@ -4134,6 +4711,10 @@ pub struct ExecutorSubstrateReport {
     /// resident generations and restartability by design.
     #[serde(default)]
     pub command_processes: CommandProcessHealth,
+    /// Retained cells this executor released instead of adopting, most recent
+    /// last. Bounded, and cleared by nothing but a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evicted_cells: Vec<EvictedCellReport>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -4144,6 +4725,39 @@ pub struct ResidentProcessHealth {
     pub unverified_stale_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oldest_stale_age_ms: Option<u64>,
+}
+
+/// A retained execution environment adoption gave up rather than took.
+///
+/// An executor coming back finds the cells its predecessor held on disk and
+/// re-adopts them. A cell whose recorded state cannot be made adoptable on this
+/// machine — a checkout standing on objects the store no longer holds, a
+/// residency nothing can reconcile — is released instead, and its holder
+/// re-acquires an environment through ordinary placement.
+///
+/// It is reported rather than only logged because eviction discards whatever
+/// the checkout held that was never committed. An owner whose environment was
+/// rebuilt underneath it is owed the reason.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct EvictedCellReport {
+    pub project_id: String,
+    #[serde(rename = "slotId")]
+    pub cell_id: String,
+    /// The residency holder that must re-acquire, as its storage key
+    /// (`job:…`, `service:…`). Empty when the cell's state named none.
+    #[serde(default)]
+    pub holder: String,
+    /// The validation failure, verbatim, so the report and the executor's log
+    /// line cannot tell different stories.
+    pub reason: String,
+    pub evicted_at_unix_ms: u64,
+    /// True when the cell was refused but its tree or authority could not be
+    /// retired, so the same cell is still on disk and the next restart will meet
+    /// it again. The refusal is durable; the release is not. Defaults false,
+    /// which is what a report that does not mention it means.
+    #[serde(default)]
+    pub retirement_failed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -4186,12 +4800,18 @@ pub struct ExecutorHealthSnapshot {
     pub connection_generation: u64,
     #[serde(default)]
     pub applied_policy: ExecutorRuntimePolicy,
+    /// Whether this machine is refusing new admissions. True when the runner
+    /// holds a drain for it — durable fleet state that outlives this connection
+    /// — or when the executor itself reports one. Either way it is one fact,
+    /// and the surfaces render it as one.
     #[serde(default)]
     pub drain_mode: bool,
     #[serde(default)]
     pub resident_processes: ResidentProcessHealth,
     #[serde(default)]
     pub command_processes: CommandProcessHealth,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evicted_cells: Vec<EvictedCellReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_skew: Option<BuildSkew>,
 }
@@ -4258,6 +4878,33 @@ pub enum RemoteLinkState {
     Pending,
 }
 
+/// Why an attach attempt failed at artifact distribution, when that is what
+/// failed.
+///
+/// Carried as a fact rather than reconstructed from the message, because reading
+/// meaning back out of an English sentence is what made a genuinely unpublished
+/// target indistinguishable from corrupted bytes. The two call for opposite
+/// things: an absent artifact is waiting for a publication and should poll
+/// occasionally, while a mismatch between a manifest and its bytes is a broken
+/// release that no amount of retrying repairs.
+///
+/// Absent on an ordinary attach failure, and absent from any peer that predates
+/// this field, which reads as "the runner did not say" rather than as "nothing
+/// was wrong".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteArtifactFault {
+    /// Nothing is published for this target at this protocol. Ordinary right
+    /// after a protocol bump, and it clears on its own when CI publishes.
+    Unpublished,
+    /// The manifest names an artifact and the bytes served disagree with it.
+    /// A person has to repair the release; retrying cannot.
+    Integrity,
+    /// The runner verified the bytes locally and the remote rejected them on
+    /// arrival, which makes the transfer itself the suspect.
+    RemoteIntegrity,
+}
+
 /// The longest a summary may run before it is elided.
 ///
 /// A bound rather than a convention, because the headline is composed from
@@ -4282,6 +4929,10 @@ pub struct RemoteAttachAttempt {
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_for_ms: Option<u64>,
+    /// Present only when artifact distribution is what failed. Readers switch on
+    /// this rather than matching the summary's text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_fault: Option<RemoteArtifactFault>,
 }
 
 impl RemoteAttachAttempt {
@@ -4293,7 +4944,14 @@ impl RemoteAttachAttempt {
             summary,
             detail,
             held_for_ms: None,
+            artifact_fault: None,
         }
+    }
+
+    /// Name what went wrong in artifact distribution, when that is what did.
+    pub fn with_artifact_fault(mut self, fault: Option<RemoteArtifactFault>) -> Self {
+        self.artifact_fault = fault;
+        self
     }
 
     /// A link that attached, held for `held_for_ms`, and then went away.
@@ -4308,6 +4966,7 @@ impl RemoteAttachAttempt {
             summary,
             detail,
             held_for_ms: Some(held_for_ms),
+            artifact_fault: None,
         }
     }
 }
@@ -4362,6 +5021,11 @@ pub struct EnrolledRemote {
     pub link: RemoteLinkState,
     /// `None` only while [`RemoteLinkState::Pending`] holds.
     pub last_attempt: Option<RemoteAttachAttempt>,
+    /// Whether the runner is holding this machine drained. Drain is runner-side
+    /// state, so it is known for a machine that is not attached — and it is the
+    /// state that decides what happens when this one comes back.
+    #[serde(default)]
+    pub drained: bool,
     /// When this machine's link was last up, or `None` if it has not attached
     /// since this runner started.
     pub last_seen_unix_ms: Option<u64>,
@@ -4391,6 +5055,11 @@ pub struct PlacementDecision {
     /// Where the work already lived, when it already lived somewhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_executor_id: Option<String>,
+    /// Where the same batch would have landed if its execution-home constraints
+    /// were replaced by transferable, spill-eligible placement. This is a
+    /// shadow decision only: dispatch still follows `outcome`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unpinned_winner: Option<PlacementCounterfactualWinner>,
     /// The operator policy consulted after hard placement gates and forecast
     /// comparability were established.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4407,6 +5076,13 @@ impl PlacementDecision {
     pub fn mentions_executor(&self, executor_id: &str) -> bool {
         match &self.outcome {
             PlacementOutcome::Selected(selection) if selection.executor_id == executor_id => true,
+            _ if self
+                .unpinned_winner
+                .as_ref()
+                .is_some_and(|winner| winner.executor_id == executor_id) =>
+            {
+                true
+            }
             _ => self
                 .rejected
                 .iter()
@@ -4637,6 +5313,16 @@ pub enum ReservationFallback {
     /// The learned memory peak approached the machine's entire budget, which is
     /// evidence of host-wide pressure rather than this command's isolated demand.
     MemoryObservationQuarantined,
+    /// This machine has not measured this command, but other machines have, and
+    /// their observations stood in as the prior.
+    ///
+    /// Still a prior, never a measurement: it is labeled here, the reservation
+    /// stays [`ResourceReservationSource::Unmeasured`], and nothing writes it
+    /// into this machine's learned store. What it replaces is a command-class
+    /// floor that could not distinguish a workspace build from a type-check,
+    /// which on a large machine let a cold wave admit against essentially
+    /// nothing (CAIRN-4365).
+    FleetPrior,
 }
 
 impl ReservationFallback {
@@ -4648,6 +5334,7 @@ impl ReservationFallback {
             Self::BelowConfidenceFloor => "belowConfidenceFloor",
             Self::CallerDeclared => "callerDeclared",
             Self::MemoryObservationQuarantined => "memoryObservationQuarantined",
+            Self::FleetPrior => "fleetPrior",
         }
     }
 }
@@ -5142,6 +5829,11 @@ pub enum PlacementRejectionReason {
     /// requester counts as the verdict. Placement will not turn a lane red on a
     /// platform the project does not gate on.
     UntrustedVerdictPlatform { os: String, trusted: Vec<String> },
+    /// An operator has drained this machine. The runner refuses to place on it
+    /// here rather than relying on the executor to reject the admission,
+    /// because a drain is the runner's own fact and holds whether or not the
+    /// machine is in any condition to answer.
+    Drained,
 }
 
 impl PlacementRejectionReason {
@@ -5194,6 +5886,7 @@ impl PlacementRejectionReason {
                 "runs {os}, and this verdict counts only from {}",
                 trusted.join(", ")
             ),
+            Self::Drained => "drained by an operator; refusing new work".into(),
         }
     }
 }
@@ -5709,7 +6402,7 @@ pub struct ExecutorConfig {
     #[serde(default)]
     pub setup_commands: Vec<String>,
     #[serde(default)]
-    pub populate: cairn_worktree::PopulateConfig,
+    pub populate: cairn_cell::PopulateConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub population_source_root: Option<String>,
 }
@@ -5989,7 +6682,22 @@ pub enum ExecutorMessage {
         snapshot: FleetSnapshot,
         health: ExecutorSubstrateReport,
     },
-    Shutdown,
+    /// The runner is ending this link on purpose, and says why.
+    ///
+    /// The reason is the whole point of the frame. Without it a bounce the
+    /// runner decided on reaches the executor as a bare socket reset, and both
+    /// ends log the same `Connection reset without closing handshake` about
+    /// each other — which is how one afternoon's link flapping was attributed
+    /// three different ways by three different threads.
+    ///
+    /// Additive and defaulted, so it is not a wire compatibility boundary and
+    /// does not bump [`EXECUTOR_PROTOCOL_VERSION`]: a peer that predates the
+    /// field sends nothing and reads an empty reason, which is exactly the
+    /// unexplained shutdown it already understood.
+    Shutdown {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
+    },
     CallbackRequest {
         correlation_id: String,
         callback: RunnerCallback,
@@ -6361,7 +7069,9 @@ mod tests {
                 snapshot,
                 health: ExecutorSubstrateReport::default(),
             },
-            ExecutorMessage::Shutdown,
+            ExecutorMessage::Shutdown {
+                reason: "the runner is recycling this link".into(),
+            },
             ExecutorMessage::CallbackRequest {
                 correlation_id: "denial".into(),
                 callback: RunnerCallback::SandboxDenied {
@@ -6445,6 +7155,7 @@ mod tests {
         let occupancy = CellOccupancy {
             command: Some(command),
             command_ownership: None,
+            draining: None,
             processes: std::collections::BTreeMap::from([(
                 "shell".to_string(),
                 ResidentProcess {
@@ -6616,6 +7327,7 @@ mod tests {
         let mut occupancy = CellOccupancy {
             command: None,
             command_ownership: None,
+            draining: None,
             processes: std::collections::BTreeMap::from([(
                 "server".to_string(),
                 process(ResidentProcessStatus::Running {
@@ -6788,6 +7500,7 @@ mod tests {
             mobility: PlacementMobility::SpillEligible,
             selector: None,
             pinned_executor_id: None,
+            unpinned_winner: None,
             policy: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 prediction: None,
@@ -6862,6 +7575,11 @@ mod tests {
                 "decidingReason":
                     "least recently selected among candidates equal on every earlier placement key"
             }))
+        );
+        assert_eq!(
+            wire.pointer("/unpinnedWinner"),
+            None,
+            "older runner records omit additive shadow evidence"
         );
         let decoded: PlacementDecision = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, decision);
@@ -6976,6 +7694,7 @@ mod tests {
                 memory_budget_bytes: None,
                 sandbox: None,
                 toolchain_detection: None,
+                build_prerequisites: None,
             },
             current_load: 1,
             warm_roots: vec![VerifiedWarmRoot {
@@ -6988,6 +7707,7 @@ mod tests {
             }],
             observed_at_unix_ms: 4,
             liveness_observed_at_unix_ms: None,
+            facts_stale_refresh_blocked: None,
         }
     }
 
@@ -7173,6 +7893,43 @@ mod tests {
         assert!(round_tripped.toolchain_detection.is_some());
     }
 
+    /// The prerequisite verdict is additive on the same terms, and this is what
+    /// makes leaving [`EXECUTOR_PROTOCOL_VERSION`] where it stands safe rather
+    /// than merely convenient: an older executor's advertisement still decodes,
+    /// and the field it omits reads as "this peer was never asked" — which a
+    /// runner is then free to render honestly.
+    #[test]
+    fn capabilities_without_a_prerequisite_verdict_still_decode() {
+        let older = serde_json::json!({
+            "os": "linux",
+            "arch": "aarch64",
+            "logicalCores": 20,
+            "toolchains": ["rust", "bun"],
+            "projectsServed": [],
+        });
+        let decoded: ExecutorCapabilities = serde_json::from_value(older).unwrap();
+        assert_eq!(decoded.build_prerequisites, None);
+        // The machine this stages advertises `rust` and cannot build: an absent
+        // verdict must never be mistaken for a satisfied one.
+        assert_eq!(decoded.toolchains, vec!["rust", "bun"]);
+
+        let refused = ExecutorCapabilities {
+            build_prerequisites: Some(BuildPrerequisiteCheck {
+                script: "scripts/setup-self-hosted-runner-linux.sh --check".into(),
+                status: BuildPrerequisiteStatus::Missing,
+                detail: "Missing Linux self-hosted runner prerequisites on bglab-sp1: libwebkit2gtk-4.1-dev".into(),
+            }),
+            ..decoded
+        };
+        let encoded = serde_json::to_string(&refused).unwrap();
+        // Spelled the way every other key on this struct is spelled, because a
+        // camelCase slip here decodes as the absent field and is invisible.
+        assert!(encoded.contains("\"buildPrerequisites\""), "{encoded}");
+        assert!(encoded.contains("\"missing\""), "{encoded}");
+        let round_tripped: ExecutorCapabilities = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(round_tripped, refused);
+    }
+
     /// The public selector carries no opaque identity, and a caller reaching for
     /// the retired keys is refused rather than silently placed anywhere.
     #[test]
@@ -7325,6 +8082,7 @@ mod tests {
             occupancy: CellOccupancy {
                 command: None,
                 command_ownership: None,
+                draining: None,
                 processes,
             },
             ..template.clone()
@@ -7366,6 +8124,7 @@ mod tests {
             occupancy: CellOccupancy {
                 command: None,
                 command_ownership: None,
+                draining: None,
                 processes,
             },
             ..template.clone()
@@ -7531,6 +8290,7 @@ mod tests {
                     HostPressureCondition::MemoryAvailable {
                         available_bytes: 1,
                         floor_bytes: 2,
+                        unmeasured_hold_bytes: 0,
                     },
                     HostPressureCondition::DiskFree {
                         free_bytes: 3,
@@ -7757,6 +8517,7 @@ mod tests {
             occupancy: CellOccupancy {
                 command: Some(command.clone()),
                 command_ownership: None,
+                draining: None,
                 processes,
             },
         };
@@ -7790,12 +8551,16 @@ mod tests {
                     os: "macos".into(),
                     arch: "aarch64".into(),
                     link: RemoteLinkState::AttachFailed,
-                    last_attempt: Some(RemoteAttachAttempt::bootstrap_failure(
-                        1_785_124_850_000,
-                        "executor protocol v28 has no published artifact",
-                    )),
+                    last_attempt: Some(
+                        RemoteAttachAttempt::bootstrap_failure(
+                            1_785_124_850_000,
+                            "no aarch64-apple-darwin cairn-cmd artifact published for executor protocol v28",
+                        )
+                        .with_artifact_fault(Some(RemoteArtifactFault::Unpublished)),
+                    ),
                     last_seen_unix_ms: Some(1_785_117_770_000),
                     connection_timeline: Vec::new(),
+                    drained: false,
                 },
                 EnrolledRemote {
                     name: "bglab-ub".into(),
@@ -7808,6 +8573,10 @@ mod tests {
                     )),
                     last_seen_unix_ms: Some(1_785_114_170_000),
                     connection_timeline: Vec::new(),
+                    // The machine an operator drained while it was unreachable:
+                    // the fact travels on the wire whether or not the machine
+                    // is there to confirm it.
+                    drained: true,
                 },
                 EnrolledRemote {
                     name: "bglab-win".into(),
@@ -7817,6 +8586,7 @@ mod tests {
                     last_attempt: None,
                     last_seen_unix_ms: None,
                     connection_timeline: Vec::new(),
+                    drained: false,
                 },
             ],
             compile_cache: Some(CompileCacheHealth {
@@ -7905,6 +8675,7 @@ mod tests {
                 drain_mode: true,
                 resident_processes: ResidentProcessHealth::default(),
                 command_processes: CommandProcessHealth::default(),
+                evicted_cells: Vec::new(),
                 build_skew: Some(BuildSkew {
                     runner_build_id: "runner".into(),
                     executor_build_id: "executor".into(),
@@ -8470,6 +9241,7 @@ mod tests {
                 last_attempt: None,
                 last_seen_unix_ms: None,
                 connection_timeline: Vec::new(),
+                drained: false,
             }],
             status: SubstrateHealthStatus::Degraded,
             warming_up: false,

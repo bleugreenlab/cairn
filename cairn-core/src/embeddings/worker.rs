@@ -234,21 +234,22 @@ async fn process_batch(
                                             let session_id = position
                                                 .as_ref()
                                                 .map(|meta| meta.session_id.as_str());
-                                            let issue_id = match queries::issue_id_for_event_async(
-                                                &event_db, event_id,
-                                            )
-                                            .await
-                                            {
-                                                Ok(issue_id) => issue_id,
-                                                Err(e) => {
-                                                    log::warn!(
-                                                        "Failed to resolve issue id for vibe {}: {}",
+                                            let (issue_id, thread_id) =
+                                                match queries::skyline_scope_for_event_async(
+                                                    &event_db, event_id,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(scope) => scope,
+                                                    Err(e) => {
+                                                        log::warn!(
+                                                        "Failed to resolve skyline scope for vibe {}: {}",
                                                         event_id,
                                                         e
                                                     );
-                                                    None
-                                                }
-                                            };
+                                                        (None, None)
+                                                    }
+                                                };
                                             let _ = emitter.emit(
                                                 "db-change",
                                                 serde_json::json!({
@@ -260,6 +261,8 @@ async fn process_batch(
                                                     "session_id": session_id,
                                                     "issueId": issue_id,
                                                     "issue_id": issue_id,
+                                                    "threadId": thread_id,
+                                                    "thread_id": thread_id,
                                                 }),
                                             );
                                         }

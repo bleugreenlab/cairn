@@ -1,0 +1,17 @@
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"reasoning":"I should read the file first."}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"read","arguments":""}}]}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pa"}}]}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ths\": [\"file:s"}}]}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"rc/lib.rs\"]}"}}]}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_def","type":"function","function":{"name":"run","arguments":"{\"commands\":[]}"}}]}}]}
+
+data: {"id":"chatcmpl-2","model":"qwen3.8-27b","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":102,"completion_tokens":44}}
+
+data: [DONE]

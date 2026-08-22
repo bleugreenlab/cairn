@@ -326,8 +326,13 @@ impl VoiceProcess {
     ) -> VoiceResult<ProtocolEvent> {
         let mut receiver = self.events_tx.subscribe();
         self.write(command).await?;
+        // The idle clock belongs to this request, so only this request's events
+        // re-arm it. Re-arming on every event the dispatcher broadcasts would
+        // measure the engine's general liveness instead, letting a chatty
+        // neighbour keep a request that will never be answered waiting forever.
+        let mut deadline = tokio::time::Instant::now() + timeout;
         loop {
-            let event = tokio::time::timeout(timeout, receiver.recv())
+            let event = tokio::time::timeout_at(deadline, receiver.recv())
                 .await
                 .map_err(|_| VoiceError::Transport("engine request timed out".into()))?
                 .map_err(|e| {
@@ -336,6 +341,7 @@ impl VoiceProcess {
             if event_request_id(&event) != Some(request_id) {
                 continue;
             }
+            deadline = tokio::time::Instant::now() + timeout;
             match event {
                 ProtocolEvent::Error { code, message, .. } => {
                     return Err(VoiceError::Request { code, message })
@@ -582,6 +588,57 @@ done"#,
             .unwrap();
         assert_eq!(transcript.text, "finished");
         process.shutdown().await.unwrap();
+    }
+
+    /// A waiter measures its own request, not the engine's pulse.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_waiter_times_out_on_its_own_silence_not_the_engines() {
+        // An engine that chatters about a different request and never answers
+        // this one. While the timeout re-armed on every event, this waiter
+        // outlived its deadline for as long as the chatter continued.
+        let engine = fake_engine(
+            r#"while IFS= read -r command; do
+  case "$command" in
+    *'"requestId":"victim"'*)
+      for _ in $(seq 1 40); do
+        printf '%s\n' '{"type":"accepted","requestId":"neighbour"}'
+        sleep 0.05
+      done
+      ;;
+  esac
+done"#,
+        );
+        let process = VoiceProcess::spawn(
+            engine.path().join("fake-voice-engine").as_path(),
+            "test",
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let error = process
+            .wait(
+                &ProtocolCommand::BeginStream {
+                    request_id: "victim".into(),
+                    stream_id: "stream".into(),
+                    options: Value::Null,
+                },
+                "victim",
+                Duration::from_millis(200),
+                |event| matches!(event, ProtocolEvent::Accepted { .. }),
+            )
+            .await
+            .expect_err("a request nobody answers must time out");
+        let waited = started.elapsed();
+
+        assert!(matches!(error, VoiceError::Transport(_)), "{error:?}");
+        assert!(
+            waited < Duration::from_secs(1),
+            "waited {waited:?}, so another request's events re-armed this one's clock"
+        );
+        let _ = process.shutdown().await;
     }
 
     #[cfg(unix)]

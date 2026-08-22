@@ -60,7 +60,24 @@
 //! - Delivery-state dampening: red checks may intentionally execute again, but an
 //!   unchanged sealed tree plus unchanged canonical outcome fingerprint wakes the
 //!   author only once. Distinct failures and post-green regressions wake normally.
+//!
+//! ## The node's own work has right of way
+//!
+//! A wave plans at turn-end but takes admission minutes later, and by then the
+//! node it checks is often working again — running its own suite, or a
+//! `cairn check run` it invoked. Launching there put the review lanes into
+//! contention with the very commands the agent is iterating on, and the node's
+//! next commit then cancelled the wave mid-suite, having already spent a
+//! placement and part of a heavy compile.
+//!
+//! So the wave yields: it waits for the node to go quiet before it asks any
+//! machine for room ([`defer_until_node_settles`]). A commit landing during that
+//! wait withdraws the wave for free, before admission; a wave that reaches the
+//! machine reaches it against a tree the node has stopped moving. The wait is
+//! bounded and always ends in a wave that runs — see [`WAVE_SETTLE_CEILING_MS`]
+//! for why deferral may never become suppression.
 
+use std::collections::BTreeSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
@@ -81,7 +98,7 @@ use crate::execution::selection::CheckPlan;
 use crate::execution::wire::CheckResourceIdentityInput;
 use crate::fleet::CellPriority;
 use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries, JjEnv};
-use crate::orchestrator::{attention_push, Orchestrator, TurnEndCancel};
+use crate::orchestrator::{attention_push, Orchestrator, TurnEndCancel, TurnEndCancelReason};
 use crate::storage::{LocalDb, RowExt};
 
 /// Internal batch input carrying newline-delimited changed paths to the executor,
@@ -102,7 +119,7 @@ enum TurnEndDisposition {
     Skipped(&'static str),
     Withdrawn(String),
     CacheCovered(&'static str),
-    Cancelled(&'static str),
+    Cancelled(String),
     CompletedWithDelivery,
 }
 impl TurnEndDisposition {
@@ -111,7 +128,7 @@ impl TurnEndDisposition {
             Self::Skipped(r) => ("skipped", (*r).into()),
             Self::Withdrawn(r) => ("withdrawn", r.clone()),
             Self::CacheCovered(r) => ("cache_covered", (*r).into()),
-            Self::Cancelled(r) => ("cancelled", (*r).into()),
+            Self::Cancelled(r) => ("cancelled", r.clone()),
             Self::CompletedWithDelivery => (
                 "completed",
                 "check wave completed and delivery was persisted".into(),
@@ -134,7 +151,7 @@ pub(crate) fn request_turn_end_attempt(
             .map_err(|e| e.to_string())?;
         db.write(move |conn| { let id=stored_id.clone(); let job=job_id.clone(); Box::pin(async move {
             conn.execute("INSERT INTO turn_end_check_attempts(id,job_id,state,reason,created_at,updated_at) VALUES (?1,?2,'requested',NULL,unixepoch()*1000,unixepoch()*1000)",(id.as_str(),job.as_str())).await?;
-            conn.execute("UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2 AND (turn_end_check_attempt_id IS NULL OR NOT EXISTS (SELECT 1 FROM turn_end_check_attempts current WHERE current.id=jobs.turn_end_check_attempt_id AND current.state IN ('requested','claimed','runtime_started','submitted')))",(id.as_str(),job.as_str())).await?;
+            conn.execute("UPDATE jobs SET turn_end_check_attempt_id=?1 WHERE id=?2 AND (turn_end_check_attempt_id IS NULL OR NOT EXISTS (SELECT 1 FROM turn_end_check_attempts current WHERE current.id=jobs.turn_end_check_attempt_id AND current.state IN ('requested','claimed','runtime_started','deferred','submitted')))",(id.as_str(),job.as_str())).await?;
             Ok::<_,crate::storage::DbError>(())
         })}).await.map_err(|e|e.to_string())
     })?;
@@ -190,7 +207,7 @@ pub(crate) async fn reconcile_turn_end_attempts_on_startup(orch: &Orchestrator) 
         "host restarted before the turn-end check attempt reached a durable terminal state";
     for db in orch.db.all_dbs().await {
         if let Err(error)=db.write(|conn| Box::pin(async move {
-            conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','submitted')",(REASON,)).await?;
+            conn.execute("UPDATE turn_end_check_attempts SET state='failed',reason=?1,updated_at=unixepoch()*1000 WHERE state IN ('requested','claimed','runtime_started','deferred','submitted')",(REASON,)).await?;
             Ok::<_,crate::storage::DbError>(())
         })).await { log::warn!("startup turn-end attempt reconciliation failed: {error}"); }
     }
@@ -324,7 +341,7 @@ pub(crate) async fn cancel_turn_end_checks_for_issue(
     match job_ids {
         Ok(ids) => {
             for job_id in &ids {
-                orch.cancel_turn_end_checks(job_id);
+                orch.cancel_turn_end_checks(job_id, TurnEndCancelReason::IssueResolved);
             }
             log::debug!(
                 "cancel_turn_end_checks_for_issue({}): signalled {} job(s)",
@@ -493,6 +510,248 @@ async fn issue_id_for_job(db: &LocalDb, job_id: &str) -> Option<String> {
     .await
     .ok()
     .flatten()
+}
+
+/// How often a deferred wave re-asks whether its node has gone quiet.
+const WAVE_SETTLE_POLL_MS: u64 = 3_000;
+
+/// The longest a wave defers to its node's own work before taking admission
+/// anyway.
+///
+/// Deferral must never become suppression. Yielding is safe because a node that
+/// is working reaches another turn-end, which arms another wave — but the review
+/// gate may not be made to DEPEND on that. Evidence of "busy" that never clears
+/// (a node that submits without pause, a cell whose advertised occupancy outlives
+/// the command in it) has to end in a wave that runs rather than one that waited
+/// forever. This is a bound on WAITING, never on running: nothing is killed when
+/// it elapses, a wave is released.
+///
+/// Long enough to sit out a full `rust-tests` a builder started itself, and no
+/// longer.
+const WAVE_SETTLE_CEILING_MS: u64 = 10 * 60 * 1_000;
+
+/// One node's own work, as the fleet currently reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NodeWorkInFlight {
+    /// How many fleet requests the node's jobs hold right now.
+    requests: usize,
+    /// One representative command, so the record a reader sees names what the
+    /// wave yielded to rather than only that it yielded.
+    command: String,
+}
+
+impl NodeWorkInFlight {
+    fn describe(&self) -> String {
+        match self.requests {
+            1 => format!("its own `{}`", self.command),
+            n => format!("{n} commands of its own, including `{}`", self.command),
+        }
+    }
+}
+
+/// What `jobs` is running on the fleet right now, or `None` when they hold
+/// nothing.
+///
+/// Reads exactly what the Running list reads — the cells' current occupancy and
+/// the queue behind them — so the work a wave says it is yielding to is the work
+/// an operator can watch it yield to. A queued request counts: it holds a place
+/// in an admission queue and is about to become a running command.
+///
+/// Ownership is read from either the requesting job or the owner reference,
+/// because different submitters populate different ones and a wave that missed
+/// half the node's work would defer to nothing.
+fn node_work_in_flight(
+    snapshot: &cairn_common::executor_protocol::FleetSnapshot,
+    jobs: &BTreeSet<String>,
+) -> Option<NodeWorkInFlight> {
+    if jobs.is_empty() {
+        return None;
+    }
+    let owned = |requesting: Option<&str>,
+                 owner: Option<&cairn_common::executor_protocol::CellOwnerRef>| {
+        requesting.is_some_and(|job| jobs.contains(job))
+            || owner
+                .and_then(|owner| owner.job_id.as_deref())
+                .is_some_and(|job| jobs.contains(job))
+    };
+    let running = snapshot
+        .cells
+        .iter()
+        .filter_map(|cell| cell.occupancy.command.as_ref())
+        .filter(|active| owned(active.requesting_job_id.as_deref(), active.owner.as_ref()))
+        .map(|active| active.command.as_str());
+    let queued = snapshot
+        .queued_requests
+        .iter()
+        .filter(|queued| owned(queued.requesting_job_id.as_deref(), queued.owner.as_ref()))
+        .map(|queued| queued.command.as_str());
+    let mut commands: Vec<&str> = running.chain(queued).collect();
+    if commands.is_empty() {
+        return None;
+    }
+    commands.sort_unstable();
+    Some(NodeWorkInFlight {
+        requests: commands.len(),
+        command: summarize_command(commands[0]),
+    })
+}
+
+/// A command as a log line wants it: the first non-empty line, bounded.
+fn summarize_command(command: &str) -> String {
+    const MAX: usize = 60;
+    let first = command
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(command)
+        .trim();
+    match first.char_indices().nth(MAX) {
+        Some((cut, _)) => format!("{}\u{2026}", &first[..cut]),
+        None => first.to_string(),
+    }
+}
+
+/// The environment overrides the turn-end engine evaluates its cache phase
+/// under. Named once so the reuse re-check above submission and the engine's own
+/// lookup below it cannot drift apart into two different verdict identities.
+const TURN_END_EFFECTIVE_ENV: &[(String, String)] = &[];
+
+/// The indices of `lanes` that still have to run.
+///
+/// Indices rather than a filtered list, because batch items and the check engine
+/// both address a lane by its position in the ORIGINAL plan set: a lane answered
+/// from cache has to keep its place so outcomes reassemble in plan order.
+fn lanes_to_submit(
+    lanes: &[(CheckPlan, String)],
+    covered: impl Fn(&CheckPlan, &str) -> bool,
+) -> Vec<usize> {
+    lanes
+        .iter()
+        .enumerate()
+        .filter(|(_, (plan, input_hash))| !covered(plan, input_hash))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// Whether a wave may take admission now, keep waiting, or has waited long
+/// enough that it must run regardless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleDecision {
+    Proceed,
+    Wait,
+    ProceedUnsettled,
+}
+
+fn settle_decision(busy: bool, waited_ms: u64) -> SettleDecision {
+    if !busy {
+        return SettleDecision::Proceed;
+    }
+    if waited_ms >= WAVE_SETTLE_CEILING_MS {
+        SettleDecision::ProceedUnsettled
+    } else {
+        SettleDecision::Wait
+    }
+}
+
+/// How a wave's deferral ended.
+///
+/// Two outcomes rather than four, because the caller has exactly one decision to
+/// take from this. Which of the three proceeding paths it was — never waited,
+/// waited and the node settled, waited out the ceiling — is recorded on the
+/// attempt row and logged at the moment it happens, where the reason is still in
+/// hand; re-deriving it here would only let the two accounts drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WaveSettle {
+    /// Take admission.
+    Proceed,
+    /// The wave was withdrawn while waiting, having asked for no machine at all.
+    Cancelled {
+        waited_ms: u64,
+        reason: TurnEndCancelReason,
+    },
+}
+
+/// Wait for the node this wave checks to stop running work of its own.
+///
+/// Scoped to every job sharing the node's branch — the same scope the
+/// branch-advance withdrawal uses, so the two agree about whose work is whose.
+/// A sibling's wave counts as work too, and that is the point: the second wave
+/// waits, and by the time it proceeds the first one's verdicts are in the cache
+/// answering it, instead of both compiling the same tree at once.
+async fn defer_until_node_settles(
+    orch: &Orchestrator,
+    job_id: &str,
+    attempt_id: &str,
+    cancel: &TurnEndCancel,
+) -> WaveSettle {
+    let started = std::time::Instant::now();
+    let mut deferred = false;
+    loop {
+        // Branch membership is re-resolved on every pass rather than fixed at
+        // entry. A wait can last minutes, and the node spawning a sub-agent task
+        // during one is precisely a node that is still working: a membership set
+        // frozen before the wait would see that task's cell as somebody else's
+        // and call the node quiet the moment the original command cleared.
+        let mut jobs: BTreeSet<String> =
+            crate::execution::checks::jobs_sharing_branch(&orch.db.local, job_id)
+                .await
+                .into_iter()
+                .collect();
+        jobs.insert(job_id.to_string());
+        let work = node_work_in_flight(&orch.fleet.snapshot(), &jobs);
+        let waited_ms = started.elapsed().as_millis() as u64;
+        match settle_decision(work.is_some(), waited_ms) {
+            SettleDecision::Proceed if !deferred => return WaveSettle::Proceed,
+            SettleDecision::Proceed => {
+                let reason = format!(
+                    "the node settled after {}s; taking admission",
+                    waited_ms / 1_000
+                );
+                record_settle(orch, job_id, attempt_id, "runtime_started", &reason);
+                log::info!("turn-end checks for job {}: {reason}", short_id(job_id));
+                return WaveSettle::Proceed;
+            }
+            SettleDecision::ProceedUnsettled => {
+                let work = work.map(|work| work.describe()).unwrap_or_default();
+                let reason = format!(
+                    "the node has been running {work} for {}s; running the review lanes anyway \
+                     rather than letting a deferral become a dropped review gate",
+                    waited_ms / 1_000
+                );
+                record_settle(orch, job_id, attempt_id, "runtime_started", &reason);
+                log::warn!("turn-end checks for job {}: {reason}", short_id(job_id));
+                return WaveSettle::Proceed;
+            }
+            SettleDecision::Wait => {
+                if !deferred {
+                    let work = work.map(|work| work.describe()).unwrap_or_default();
+                    let reason = format!(
+                        "deferring: the node is running {work}, which has right of way over its \
+                         own review wave"
+                    );
+                    record_settle(orch, job_id, attempt_id, "deferred", &reason);
+                    log::info!("turn-end checks for job {}: {reason}", short_id(job_id));
+                    deferred = true;
+                }
+                tokio::select! {
+                    biased;
+                    reason = cancel.cancelled() => return WaveSettle::Cancelled { waited_ms, reason },
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(WAVE_SETTLE_POLL_MS)) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Persist one step of the deferral onto the attempt row. Best-effort: a wave
+/// that cannot record why it waited still runs, because the verdict is the
+/// obligation and the record is the explanation.
+fn record_settle(orch: &Orchestrator, job_id: &str, attempt_id: &str, state: &str, reason: &str) {
+    if let Err(error) = transition_turn_end_attempt(orch, job_id, attempt_id, state, Some(reason)) {
+        log::warn!(
+            "turn-end checks for job {}: could not record the {state} step ({error})",
+            short_id(job_id)
+        );
+    }
 }
 
 async fn run_turn_end_checks_inner(
@@ -834,19 +1093,75 @@ async fn run_turn_end_checks_inner(
             ));
         }
     };
+    // 8. Yield to the node's own work before asking any machine for room. The
+    // wave has spent nothing but runner-local planning up to here, so a withdrawal
+    // that lands during the wait costs a placement and a partial compile less than
+    // the same withdrawal landing mid-suite.
+    if let WaveSettle::Cancelled { waited_ms, reason } =
+        defer_until_node_settles(orch, job_id, attempt_id, cancel).await
+    {
+        log::info!(
+            "turn-end checks for job {}: withdrawn after deferring {}s to the node's own work because {}; \
+             no machine was ever asked",
+            short_id(job_id),
+            waited_ms / 1_000,
+            reason.describe()
+        );
+        return Ok(TurnEndDisposition::Cancelled(format!(
+            "withdrawn while deferring to the node's own work because {}, before taking admission",
+            reason.describe()
+        )));
+    }
+
+    // 9. Ask the cache again, now that the wait is over.
+    //
+    // The plan set was filtered before the deferral; a wave that waited minutes
+    // for its node has given a sibling on the same branch, or the agent's own
+    // `cairn check run`, time to publish a verdict for the very tree it is about
+    // to check. Submitting the pre-wait plan set would execute those lanes and
+    // then discard the results when the engine's cache phase answered them from
+    // the stored verdict instead. The predicate is the engine's own, so a lane
+    // held back here is exactly a lane the engine will report from reuse.
+    let covered_db = db.clone();
+    let covered_project = coords.project_id.clone();
+    let covered_lanes = to_run.clone();
+    let submit = tokio::task::spawn_blocking(move || {
+        lanes_to_submit(&covered_lanes, |plan, input_hash| {
+            crate::execution::checks::reusable_verdict_for_plan(
+                covered_db.clone(),
+                &covered_project,
+                plan,
+                input_hash,
+                TURN_END_EFFECTIVE_ENV,
+            )
+            .is_some()
+        })
+    })
+    .await
+    .map_err(|error| format!("turn-end reuse re-check task failed: {error}"))?;
+    let reused = to_run.len() - submit.len();
     log::info!(
-        "turn-end checks for job {}: launching {} check(s) [{}] over {} changed file(s)",
+        "turn-end checks for job {}: launching {} of {} applicable check(s) [{}] over {} changed \
+         file(s){}",
         short_id(job_id),
+        submit.len(),
         to_run.len(),
-        to_run
+        submit
             .iter()
-            .map(|(p, _)| p.name.as_str())
+            .map(|&index| to_run[index].0.name.as_str())
             .collect::<Vec<_>>()
             .join(", "),
-        changed.len()
+        changed.len(),
+        match reused {
+            0 => String::new(),
+            n => format!(
+                "; {n} answered from verdicts recorded for this tree while the wave planned or \
+                 deferred"
+            ),
+        }
     );
 
-    // 8. Prepare the host-readable, job-scoped log DIRECTORY (cleared for a fresh
+    // 10. Prepare the host-readable, job-scoped log DIRECTORY (cleared for a fresh
     // run) so the PR-node / `/checks` render can tail each check's OWN log live
     // while the suite runs. One file per check keeps a running check's preview
     // scoped to that check instead of the whole suite's interleaved output.
@@ -857,7 +1172,7 @@ async fn run_turn_end_checks_inner(
         serde_json::json!({"table": "check_result_cache", "action": "update"}),
     );
 
-    // 9. Build the changed-files override consumed by diff-scoped check scripts.
+    // 11. Build the changed-files override consumed by diff-scoped check scripts.
     // Cell checkouts are materialized at the immutable request base, so the
     // already-computed agent delta remains the canonical attribution source.
     let changed_files_body = changed
@@ -867,8 +1182,11 @@ async fn run_turn_end_checks_inner(
         .join("\n");
     let extra_env = vec![(CHANGED_FILES_CONTENT_ENV.to_string(), changed_files_body)];
 
-    // 10. Submit every miss through one sequential pure-verdict lease, then feed
-    // the keyed outcomes through the shared persistence, parsing, and ordering path.
+    // 12. Submit every remaining miss through one sequential pure-verdict lease,
+    // then feed the keyed outcomes through the shared persistence, parsing, and
+    // ordering path. Lanes held back above are absent from the batch and absent
+    // from its results; the engine answers each of them from the stored verdict,
+    // so they still land on the tree, in plan order, in the delivery below.
     let timeouts: Vec<u32> = to_run
         .iter()
         .map(|(plan, _)| {
@@ -876,96 +1194,114 @@ async fn run_turn_end_checks_inner(
         })
         .collect();
     let checks_tool_id = format!("turn-checks:{job_id}");
-    let items: Vec<_> = to_run
-        .iter()
-        .enumerate()
-        .map(|(index, (plan, input_hash))| {
-            let log_path = turn_end_log_path(orch, job_id, &plan.name);
-            let _ = std::fs::write(log_path, b"");
-            PlannedCheckBatchItem {
-                index,
-                name: plan.name.clone(),
-                input_hash: input_hash.clone(),
-                resource_identity: CheckResourceIdentityInput::Configured {
-                    name: plan.name.clone(),
-                    check: checks
-                        .get(&plan.name)
-                        .expect("planned check must retain its configured definition")
-                        .clone(),
-                },
-                command: plan.command.clone(),
-                stream_id: crate::mcp::handlers::run::check_stream_id(&checks_tool_id, index),
-                env: extra_env.clone(),
-                verdict_environment_names: plan.verdict_environment_names.clone(),
-                timeout_ms: timeouts[index].into(),
-                executor: checks
-                    .get(&plan.name)
-                    .and_then(|check| check.executor.clone()),
-                verdict_platforms: checks
-                    .get(&plan.name)
-                    .map(crate::execution::check_identity::verdict_platforms)
-                    .unwrap_or_default(),
-                resource_class: plan.resource_class,
-            }
-        })
-        .collect();
-    let batch = PlannedCheckBatchRequest {
-        project_id: coords.project_id.clone(),
-        repository: canonical_repo,
-        store_dir,
-        sealed_commit: sealed_commit.clone(),
-        requesting_job_id: job_id.to_string(),
-        owner: cairn_common::executor_protocol::CellOwnerRef {
-            project_id: coords.project_id.clone(),
-            project_key: Some(coords.project_key.clone()),
-            issue_number: Some(coords.number),
-            job_id: Some(job_id.to_string()),
-            execution_seq: Some(coords.exec_seq),
-            node_kind: Some(coords.node_segment.clone()),
-        },
-        affinity_key: Some(job_id.to_string()),
-        priority: CellPriority::ReviewCheck,
-        env: extra_env,
-        items,
-        run_context: None,
-        mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
-        status_board: None,
-    };
-    // The last decision before the machine is asked for anything. Everything
-    // since the first check took minutes, and a merge landing inside that window
-    // is exactly the specimen this closes: the wave withdraws here having taken
-    // no admission, rather than composing a red infrastructure check out of a
-    // teardown Cairn performed itself.
-    if let WaveLaunchability::Withdrawn(withdrawal) = turn_end_launchability(orch, job_id).await {
+    let batched_results = if submit.is_empty() {
         log::info!(
-            "turn-end checks for job {}: {}; withdrawing {} planned check(s) before submission",
-            short_id(job_id),
-            withdrawal.describe(),
-            to_run.len()
+            "turn-end checks for job {}: every applicable lane already holds a verdict for this \
+             tree; taking no admission",
+            short_id(job_id)
         );
-        return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
-    }
-    transition_turn_end_attempt(orch, job_id, attempt_id, "submitted", None)?;
-    let batched_results = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
+        std::collections::HashMap::new()
+    } else {
+        let items: Vec<_> = submit
+            .iter()
+            .map(|&index| {
+                let (plan, input_hash) = &to_run[index];
+                let log_path = turn_end_log_path(orch, job_id, &plan.name);
+                let _ = std::fs::write(log_path, b"");
+                PlannedCheckBatchItem {
+                    index,
+                    name: plan.name.clone(),
+                    input_hash: input_hash.clone(),
+                    resource_identity: CheckResourceIdentityInput::Configured {
+                        name: plan.name.clone(),
+                        check: checks
+                            .get(&plan.name)
+                            .expect("planned check must retain its configured definition")
+                            .clone(),
+                    },
+                    command: plan.command.clone(),
+                    stream_id: crate::mcp::handlers::run::check_stream_id(&checks_tool_id, index),
+                    env: extra_env.clone(),
+                    verdict_environment_names: plan.verdict_environment_names.clone(),
+                    timeout_ms: timeouts[index].into(),
+                    executor: checks
+                        .get(&plan.name)
+                        .and_then(|check| check.executor.clone()),
+                    verdict_platforms: checks
+                        .get(&plan.name)
+                        .map(crate::execution::check_identity::verdict_platforms)
+                        .unwrap_or_default(),
+                    resource_class: plan.resource_class,
+                }
+            })
+            .collect();
+        let batch = PlannedCheckBatchRequest {
+            project_id: coords.project_id.clone(),
+            repository: canonical_repo,
+            store_dir,
+            sealed_commit: sealed_commit.clone(),
+            requesting_job_id: job_id.to_string(),
+            owner: cairn_common::executor_protocol::CellOwnerRef {
+                project_id: coords.project_id.clone(),
+                project_key: Some(coords.project_key.clone()),
+                issue_number: Some(coords.number),
+                job_id: Some(job_id.to_string()),
+                execution_seq: Some(coords.exec_seq),
+                node_kind: Some(coords.node_segment.clone()),
+            },
+            affinity_key: Some(job_id.to_string()),
+            priority: CellPriority::ReviewCheck,
+            env: extra_env,
+            items,
+            run_context: None,
+            mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
+            status_board: None,
+            // A turn-end wave answers for one node's own tip, so no other wave
+            // is asking its question and there is nothing for it to displace.
+            purpose: None,
+        };
+        // The last decision before the machine is asked for anything. Everything
+        // since the first check took minutes, and a merge landing inside that window
+        // is exactly the specimen this closes: the wave withdraws here having taken
+        // no admission, rather than composing a red infrastructure check out of a
+        // teardown Cairn performed itself.
+        if let WaveLaunchability::Withdrawn(withdrawal) = turn_end_launchability(orch, job_id).await
+        {
             log::info!(
-                "turn-end checks for job {}: cancelled mid-suite (issue resolved); abandoning {} check(s)",
+                "turn-end checks for job {}: {}; withdrawing {} planned check(s) before submission",
                 short_id(job_id),
-                to_run.len()
+                withdrawal.describe(),
+                submit.len()
             );
-            if orch.fleet.cancel_job_requests(job_id) > 0 {
-                let _ = orch
-                    .services
-                    .emitter
-                    .emit("substrate-health-change", serde_json::json!({}));
-            }
-            return Ok(TurnEndDisposition::Cancelled("issue resolved while the check wave was submitted"));
+            return Ok(TurnEndDisposition::Withdrawn(withdrawal.describe()));
         }
-        results = submit_planned_check_batch(orch, batch) => results
-            .map_err(|error| format!("turn-end check batch configuration failed: {error}"))?,
+        transition_turn_end_attempt(orch, job_id, attempt_id, "submitted", None)?;
+        let outcome = tokio::select! {
+            biased;
+            reason = cancel.cancelled() => {
+                log::info!(
+                    "turn-end checks for job {}: cancelled mid-suite because {}; abandoning {} check(s)",
+                    short_id(job_id),
+                    reason.describe(),
+                    submit.len()
+                );
+                if orch.fleet.cancel_job_requests(job_id) > 0 {
+                    let _ = orch
+                        .services
+                        .emitter
+                        .emit("substrate-health-change", serde_json::json!({}));
+                }
+                return Ok(TurnEndDisposition::Cancelled(format!(
+                    "cancelled while the check wave was submitted because {}",
+                    reason.describe()
+                )));
+            }
+            results = submit_planned_check_batch(orch, batch) => results
+                .map_err(|error| format!("turn-end check batch configuration failed: {error}"))?,
+        };
+        outcome.results
     };
-    for (index, result) in &batched_results.results {
+    for (index, result) in &batched_results {
         if let Ok(result) = result {
             let _ = std::fs::write(
                 turn_end_log_path(orch, job_id, &to_run[*index].0.name),
@@ -973,7 +1309,7 @@ async fn run_turn_end_checks_inner(
             );
         }
     }
-    let batched_results = std::sync::Arc::new(std::sync::Mutex::new(batched_results.results));
+    let batched_results = std::sync::Arc::new(std::sync::Mutex::new(batched_results));
     let sealed_coordinates: Vec<_> = to_run
         .iter()
         .map(|(_, input_hash)| {
@@ -1054,7 +1390,7 @@ async fn run_turn_end_checks_inner(
         }
     );
 
-    // 10. Deliver one push per distinct check state. Red execution evidence is
+    // 13. Deliver one push per distinct check state. Red execution evidence is
     // deliberately not reusable, so the attention ledger, not the result cache,
     // owns notification dampening. The stable lane-state key records green/red
     // transitions without treating volatile execution detail as a new state.
@@ -1532,9 +1868,10 @@ mod tests {
     use super::*;
     use crate::execution::checks_status::{NodeCheckState, NodeCheckStatus};
     use cairn_common::executor_protocol::{
-        CellCheckoutKind, CellOccupancy, CellResidency, OwnerDeathPolicy, PersistentCellLifecycle,
-        PersistentCellState, RepositoryLocator, ResidencyFootprint, ResidencyHolder,
-        ResidencyPhase,
+        ActiveCellRequest, CellAdmissionKind, CellCheckoutKind, CellCommandClass, CellOccupancy,
+        CellOwnerRef, CellPriority, CellResidency, OwnerDeathPolicy, PersistentCellLifecycle,
+        PersistentCellState, QueuedCellRequest, RepositoryLocator, ResidencyFootprint,
+        ResidencyHolder, ResidencyPhase, ResourceReservation,
     };
 
     fn cell_held_by(holder: ResidencyHolder, phase: ResidencyPhase) -> PersistentCellState {
@@ -1580,6 +1917,224 @@ mod tests {
             }),
             occupancy: CellOccupancy::default(),
         }
+    }
+
+    fn active_command(
+        job: Option<&str>,
+        owner_job: Option<&str>,
+        command: &str,
+    ) -> ActiveCellRequest {
+        ActiveCellRequest {
+            executor_id: "executor".into(),
+            request_id: format!("request-{command}"),
+            attempt_id: "attempt".into(),
+            command: command.into(),
+            command_class: CellCommandClass::default(),
+            owner: owner_job.map(|job| CellOwnerRef {
+                project_id: "p".into(),
+                project_key: None,
+                issue_number: None,
+                job_id: Some(job.into()),
+                execution_seq: None,
+                node_kind: None,
+            }),
+            priority: CellPriority::AgentInteractive,
+            requesting_job_id: job.map(str::to_string),
+            affinity_key: None,
+            queued_at_unix_ms: 0,
+            started_at_unix_ms: Some(1),
+            stage: None,
+            resource_reservation: ResourceReservation::default(),
+            learned_estimate: None,
+            subscriber_count: 1,
+        }
+    }
+
+    fn queued_command(job: Option<&str>, command: &str) -> QueuedCellRequest {
+        QueuedCellRequest {
+            admission_kind: CellAdmissionKind::default(),
+            executor_id: "executor".into(),
+            request_id: format!("request-{command}"),
+            attempt_id: "attempt".into(),
+            project_id: "p".into(),
+            command: command.into(),
+            command_class: CellCommandClass::default(),
+            owner: None,
+            priority: CellPriority::AgentInteractive,
+            effective_priority: None,
+            requesting_job_id: job.map(str::to_string),
+            affinity_key: None,
+            command_resource_identity: None,
+            queued_at_unix_ms: 0,
+            resource_reservation: ResourceReservation::default(),
+            learned_estimate: None,
+            subscriber_count: 1,
+            substrate_hold: None,
+            placement: None,
+        }
+    }
+
+    fn cell_running(command: ActiveCellRequest) -> PersistentCellState {
+        let mut cell = cell_held_by(
+            ResidencyHolder::Job {
+                job_id: "j-1".into(),
+            },
+            ResidencyPhase::Active,
+        );
+        cell.occupancy = CellOccupancy {
+            command: Some(command),
+            ..CellOccupancy::default()
+        };
+        cell
+    }
+
+    fn branch_jobs(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// The wave yields to work the node itself is running, whoever on the branch
+    /// submitted it and whether it is running or still queued behind admission.
+    #[test]
+    fn a_nodes_own_running_and_queued_work_both_count_as_busy() {
+        let jobs = branch_jobs(&["j-1", "j-task"]);
+        let running = cairn_common::executor_protocol::FleetSnapshot {
+            cells: vec![cell_running(active_command(
+                Some("j-1"),
+                None,
+                "cargo test --workspace",
+            ))],
+            ..Default::default()
+        };
+        assert_eq!(
+            node_work_in_flight(&running, &jobs),
+            Some(NodeWorkInFlight {
+                requests: 1,
+                command: "cargo test --workspace".into()
+            })
+        );
+
+        let queued = cairn_common::executor_protocol::FleetSnapshot {
+            queued_requests: vec![queued_command(Some("j-task"), "bun run test:frontend")],
+            ..Default::default()
+        };
+        assert_eq!(
+            node_work_in_flight(&queued, &jobs).map(|work| work.requests),
+            Some(1),
+            "a request holding a place in an admission queue is about to be a running command"
+        );
+
+        let owner_only = cairn_common::executor_protocol::FleetSnapshot {
+            cells: vec![cell_running(active_command(
+                None,
+                Some("j-1"),
+                "cargo build",
+            ))],
+            ..Default::default()
+        };
+        assert_eq!(
+            node_work_in_flight(&owner_only, &jobs).map(|work| work.requests),
+            Some(1),
+            "different submitters populate different ownership fields; either one is the node's"
+        );
+    }
+
+    /// Deferring to somebody else's work would park a wave on a node that is
+    /// idle, which is the one state it should be running in.
+    #[test]
+    fn another_nodes_work_never_defers_this_wave() {
+        let snapshot = cairn_common::executor_protocol::FleetSnapshot {
+            cells: vec![cell_running(active_command(
+                Some("j-elsewhere"),
+                None,
+                "cargo test",
+            ))],
+            queued_requests: vec![queued_command(None, "main-health")],
+            ..Default::default()
+        };
+        assert_eq!(node_work_in_flight(&snapshot, &branch_jobs(&["j-1"])), None);
+        assert_eq!(
+            node_work_in_flight(&snapshot, &BTreeSet::new()),
+            None,
+            "an empty branch set owns no work"
+        );
+        assert_eq!(
+            node_work_in_flight(&Default::default(), &branch_jobs(&["j-1"])),
+            None,
+            "an idle fleet defers nothing"
+        );
+    }
+
+    /// A verdict landing while the wave waited is the reuse the deferral exists
+    /// to reach. A lane holding one must not be submitted again — and must keep
+    /// its index, because that is how the engine matches batch results back to
+    /// plans.
+    #[test]
+    fn a_lane_answered_while_the_wave_waited_is_not_submitted_again() {
+        let lanes = vec![uncached_plan("rust-tests"), uncached_plan("rust-lint")];
+        assert_eq!(lanes_to_submit(&lanes, |_, _| false), vec![0, 1]);
+        assert_eq!(
+            lanes_to_submit(&lanes, |_, input_hash| input_hash == "input-rust-tests"),
+            vec![1],
+            "the surviving lane keeps its position in the plan set"
+        );
+        assert!(
+            lanes_to_submit(&lanes, |_, _| true).is_empty(),
+            "a fully answered set takes no admission at all"
+        );
+        assert!(lanes_to_submit(&[], |_, _| false).is_empty());
+    }
+
+    /// The whole point of the gate is that it ends. A node that never goes quiet
+    /// gets its review lanes anyway, because a deferral that could last forever
+    /// is a review gate that silently disappeared.
+    #[test]
+    fn deferral_always_ends_in_a_wave_that_runs() {
+        assert_eq!(settle_decision(false, 0), SettleDecision::Proceed);
+        assert_eq!(
+            settle_decision(false, WAVE_SETTLE_CEILING_MS * 2),
+            SettleDecision::Proceed
+        );
+        assert_eq!(settle_decision(true, 0), SettleDecision::Wait);
+        assert_eq!(
+            settle_decision(true, WAVE_SETTLE_CEILING_MS - 1),
+            SettleDecision::Wait
+        );
+        assert_eq!(
+            settle_decision(true, WAVE_SETTLE_CEILING_MS),
+            SettleDecision::ProceedUnsettled,
+            "at the ceiling the wave runs rather than waiting further"
+        );
+    }
+
+    /// A deferral nobody can read is indistinguishable from a wave that never
+    /// ran, so what was yielded to has to survive into the record.
+    #[test]
+    fn a_deferral_names_the_work_it_yielded_to() {
+        assert_eq!(
+            NodeWorkInFlight {
+                requests: 1,
+                command: "cargo test".into()
+            }
+            .describe(),
+            "its own `cargo test`"
+        );
+        assert_eq!(
+            NodeWorkInFlight {
+                requests: 3,
+                command: "cargo test".into()
+            }
+            .describe(),
+            "3 commands of its own, including `cargo test`"
+        );
+    }
+
+    #[test]
+    fn a_command_summary_is_one_bounded_line() {
+        assert_eq!(summarize_command("\n  cargo test  \nsecond"), "cargo test");
+        let summary = summarize_command(&"x".repeat(200));
+        assert!(summary.ends_with('\u{2026}'));
+        assert_eq!(summary.chars().count(), 61);
+        assert_eq!(summarize_command(""), "");
     }
 
     /// A wave checks the workspace its job works in, so a workspace being taken
@@ -2336,7 +2891,7 @@ mod tests {
                 "cached",
             ),
             (
-                TurnEndDisposition::Cancelled("cancelled"),
+                TurnEndDisposition::Cancelled("cancelled".into()),
                 "cancelled",
                 "cancelled",
             ),

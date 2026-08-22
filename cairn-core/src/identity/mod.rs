@@ -33,6 +33,29 @@ pub struct UserIdentity {
     pub github_token: Option<String>,
 }
 
+/// Sampling controls understood by OpenAI-compatible inference servers.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct CustomSampling {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_penalty: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i64>,
+}
+
+impl CustomSampling {
+    pub fn is_empty(&self) -> bool {
+        self.repetition_penalty.is_none()
+            && self.temperature.is_none()
+            && self.top_p.is_none()
+            && self.top_k.is_none()
+    }
+}
+
 /// Claude authentication method.
 ///
 /// Subscription auth is a Cairn-managed profile and nothing else. Every
@@ -116,6 +139,16 @@ pub enum ApiProvider {
     /// GitHub APIs
     #[serde(rename = "github", alias = "git_hub")]
     GitHub,
+    /// An HTTP inference service the operator runs and names themselves.
+    ///
+    /// Unlike every other variant, this one does not identify a vendor. It
+    /// identifies a *kind* of account: one account here is one named custom
+    /// provider, and its [`ProviderAuth::CustomEndpoint`] carries where to reach
+    /// it, what protocol it speaks, and how its models are known. The account id
+    /// is that provider's stable identity, which is why renaming it or moving it
+    /// to a new address does not disturb anything that already selected it.
+    #[serde(rename = "custom")]
+    Custom,
 }
 
 impl ApiProvider {
@@ -129,6 +162,7 @@ impl ApiProvider {
             ApiProvider::Ollama => "ollama",
             ApiProvider::Actual => "actual",
             ApiProvider::GitHub => "github",
+            ApiProvider::Custom => "custom",
         }
     }
 
@@ -143,6 +177,7 @@ impl ApiProvider {
             ApiProvider::Ollama,
             ApiProvider::Actual,
             ApiProvider::GitHub,
+            ApiProvider::Custom,
         ]
     }
 }
@@ -158,6 +193,7 @@ impl std::fmt::Display for ApiProvider {
             ApiProvider::Ollama => write!(f, "Ollama"),
             ApiProvider::Actual => write!(f, "Actual"),
             ApiProvider::GitHub => write!(f, "GitHub"),
+            ApiProvider::Custom => write!(f, "Custom"),
         }
     }
 }
@@ -237,7 +273,108 @@ pub enum ProviderAuth {
     /// Cairn-managed Claude CLI profile. Its path is derived from the account id.
     #[serde(rename = "claude_profile")]
     ClaudeProfile,
+    /// One named custom provider: an HTTP inference service the operator already
+    /// runs, reached at an address they supply.
+    ///
+    /// Everything that decides how to talk to that service is held together
+    /// here, for the same reason an Actual target is: a bearer key means nothing
+    /// apart from the endpoint it authenticates to, and a protocol family means
+    /// nothing apart from the endpoint that speaks it. Splitting any of them out
+    /// would let a second provider inherit the first one's answer.
+    #[serde(rename = "custom_endpoint", rename_all = "camelCase")]
+    CustomEndpoint {
+        /// The root of the OpenAI-compatible API surface — the URL `/models`
+        /// and `/chat/completions` hang off, canonicalized by
+        /// [`ProviderAuth::custom_endpoint`].
+        base_url: String,
+        /// What this endpoint actually speaks. Explicit and stored, never
+        /// inferred from the shape of the URL: an address that answers on the
+        /// OpenAI paths is evidence about routing, not about semantics.
+        protocol: CustomProtocol,
+        /// Optional bearer credential, sent as `Authorization: Bearer`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        api_key: Option<String>,
+        /// Operator-supplied request headers. Treated as secret at rest,
+        /// because the reason to add one is almost always to authenticate.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        headers: Vec<CustomHeader>,
+        /// How this provider's models become known.
+        models: CustomModelPolicy,
+        /// Optional endpoint-specific sampling controls, sent on every
+        /// chat-completions generation. Every absent field stays absent on the
+        /// wire so the server's configured defaults remain authoritative.
+        #[serde(default, skip_serializing_if = "CustomSampling::is_empty")]
+        sampling: CustomSampling,
+        /// Maximum tokens the endpoint may generate for one agent-loop turn.
+        #[serde(default = "default_custom_max_output_tokens")]
+        max_output_tokens: i64,
+    },
 }
+
+pub const DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS: i64 = 32_768;
+
+fn default_custom_max_output_tokens() -> i64 {
+    DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS
+}
+
+/// The wire protocol a custom endpoint speaks.
+///
+/// One variant, deliberately. Cairn serves the OpenAI Chat Completions family
+/// and nothing else here, and the field exists so that stays a *statement* the
+/// operator made rather than an assumption Cairn drew. An endpoint routing the
+/// Messages or Responses paths as well is evidence those routes exist, not that
+/// their semantics have been verified, so a second variant is earned by a
+/// verified adapter and by fixtures, not by an address that answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomProtocol {
+    #[serde(rename = "openai-chat")]
+    OpenAiChatCompletions,
+}
+
+impl CustomProtocol {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CustomProtocol::OpenAiChatCompletions => "openai-chat",
+        }
+    }
+}
+
+/// One operator-supplied request header.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Where a custom provider's model inventory comes from.
+///
+/// Both shapes preserve model ids byte for byte. A served id is the string the
+/// endpoint will accept back on the wire; normalizing it — casing it, stripping
+/// a prefix, humanizing a separator — would produce a name that looks tidier and
+/// no longer resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "camelCase")]
+pub enum CustomModelPolicy {
+    /// Ask the endpoint, via `GET {base_url}/models`.
+    Discover,
+    /// Take the operator's word for it. For a server that serves inference but
+    /// does not enumerate, which is a normal shape rather than a broken one.
+    Explicit { ids: Vec<String> },
+}
+
+impl CustomModelPolicy {
+    pub(crate) fn mode_str(&self) -> &'static str {
+        match self {
+            CustomModelPolicy::Discover => "discover",
+            CustomModelPolicy::Explicit { .. } => "explicit",
+        }
+    }
+}
+
+/// Headers Cairn sets itself on every request, which an operator override would
+/// silently break rather than customize.
+const RESERVED_CUSTOM_HEADERS: &[&str] =
+    &["authorization", "content-type", "content-length", "host"];
 
 impl ProviderAuth {
     /// Parse and canonicalize provider connection metadata at its input boundary.
@@ -303,6 +440,146 @@ impl ProviderAuth {
         })
     }
 
+    /// Build and canonicalize one named custom provider at its input boundary.
+    ///
+    /// Everything refused here is refused because it would otherwise fail later
+    /// with a message that does not name the field responsible. A URL carrying
+    /// its own credentials, a query string, or a fragment is ambiguous about
+    /// what Cairn is supposed to send; a header Cairn already sets is an
+    /// override that would be silently discarded or would break the request
+    /// body; an empty explicit model list is a provider that can never serve
+    /// anything.
+    ///
+    /// The one thing this *infers* is the API root. An address with no path is
+    /// taken to mean the default OpenAI layout and resolves to `/v1`, because
+    /// that is what `http://host:8000` universally means for a server of this
+    /// kind; any other path is taken literally. The resolved URL is what gets
+    /// stored and what diagnostics show, so the inference is visible rather than
+    /// re-derived at request time.
+    pub fn custom_endpoint(
+        base_url: &str,
+        protocol: CustomProtocol,
+        api_key: Option<&str>,
+        headers: &[(String, String)],
+        models: CustomModelPolicy,
+        sampling: CustomSampling,
+        max_output_tokens: i64,
+    ) -> Result<Self, String> {
+        if max_output_tokens <= 0 {
+            return Err("maximum output tokens must be greater than zero".to_string());
+        }
+        let raw = base_url.trim();
+        let parsed = reqwest::Url::parse(raw)
+            .map_err(|error| format!("invalid endpoint URL '{raw}': {error}"))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(format!(
+                "invalid endpoint URL '{raw}': expected an http or https address"
+            ));
+        }
+        if parsed.host_str().is_none_or(str::is_empty) {
+            return Err(format!("invalid endpoint URL '{raw}': no host"));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(format!(
+                "invalid endpoint URL '{raw}': put credentials in the API key field, not the URL"
+            ));
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(format!(
+                "invalid endpoint URL '{raw}': give the API root, without a query string or fragment"
+            ));
+        }
+        let path = parsed.path().trim_end_matches('/');
+        let resolved = format!(
+            "{}://{}{}",
+            parsed.scheme(),
+            parsed
+                .host_str()
+                .map(|host| match parsed.port() {
+                    Some(port) => format!("{host}:{port}"),
+                    None => host.to_string(),
+                })
+                .unwrap_or_default(),
+            if path.is_empty() { "/v1" } else { path },
+        );
+
+        let api_key = api_key
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut resolved_headers = Vec::with_capacity(headers.len());
+        for (name, value) in headers {
+            let name = name.trim();
+            let value = value.trim();
+            if name.is_empty() {
+                return Err("a custom header needs a name".to_string());
+            }
+            let lowered = name.to_ascii_lowercase();
+            if RESERVED_CUSTOM_HEADERS.contains(&lowered.as_str()) {
+                return Err(format!(
+                    "'{name}' is set by Cairn on every request and cannot be overridden\
+                     {}",
+                    if lowered == "authorization" {
+                        "; use the API key field instead"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if seen.contains(&lowered) {
+                return Err(format!("header '{name}' is set twice"));
+            }
+            reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| format!("'{name}' is not a valid header name"))?;
+            reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+                format!("the value for header '{name}' is not a valid header value")
+            })?;
+            seen.push(lowered);
+            resolved_headers.push(CustomHeader {
+                name: name.to_string(),
+                value: value.to_string(),
+            });
+        }
+
+        let models = match models {
+            CustomModelPolicy::Discover => CustomModelPolicy::Discover,
+            CustomModelPolicy::Explicit { ids } => {
+                let mut resolved_ids: Vec<String> = Vec::with_capacity(ids.len());
+                for id in ids {
+                    // Only surrounding whitespace is stripped. The id itself is
+                    // what goes back on the wire as `model`, so it is preserved
+                    // exactly as the operator gave it.
+                    let id = id.trim().to_string();
+                    if id.is_empty() {
+                        continue;
+                    }
+                    if !resolved_ids.contains(&id) {
+                        resolved_ids.push(id);
+                    }
+                }
+                if resolved_ids.is_empty() {
+                    return Err(
+                        "list at least one model id, or let Cairn discover them from the endpoint"
+                            .to_string(),
+                    );
+                }
+                CustomModelPolicy::Explicit { ids: resolved_ids }
+            }
+        };
+
+        Ok(Self::CustomEndpoint {
+            base_url: resolved,
+            protocol,
+            api_key,
+            headers: resolved_headers,
+            models,
+            sampling,
+            max_output_tokens,
+        })
+    }
+
     /// Get the raw credential value, if any.
     fn credential_value(&self) -> Option<&str> {
         match self {
@@ -310,6 +587,7 @@ impl ProviderAuth {
             // The relay key is a secret and must be reachable here, or every
             // caller that redacts by asking for the credential would leak it.
             ProviderAuth::ActualTarget { api_key, .. } => api_key.as_deref(),
+            ProviderAuth::CustomEndpoint { api_key, .. } => api_key.as_deref(),
             ProviderAuth::BaseUrl { .. } | ProviderAuth::ClaudeProfile => None,
         }
     }
@@ -322,6 +600,7 @@ impl ProviderAuth {
             ProviderAuth::BaseUrl { .. } => "base_url",
             ProviderAuth::ActualTarget { .. } => "actual_target",
             ProviderAuth::ClaudeProfile => "claude_profile",
+            ProviderAuth::CustomEndpoint { .. } => "custom_endpoint",
         }
     }
 }
@@ -389,8 +668,15 @@ pub struct ProviderAccount {
 
 impl ProviderAccount {
     /// Which agent backends can consume this credential.
-    pub(crate) fn compatible_backends(&self) -> Vec<&'static str> {
-        match (&self.api_provider, &self.auth) {
+    ///
+    /// Owned rather than `&'static str` because a custom provider's backend key
+    /// is derived from the account itself: the account IS the provider, so it
+    /// serves exactly one backend and no other account can serve that one.
+    pub(crate) fn compatible_backends(&self) -> Vec<String> {
+        let keys: Vec<&str> = match (&self.api_provider, &self.auth) {
+            (ApiProvider::Custom, ProviderAuth::CustomEndpoint { .. }) => {
+                return vec![crate::backends::catalog::custom_key(&self.id)]
+            }
             // API keys work with both CLI and Native
             (ApiProvider::Anthropic, ProviderAuth::ApiKey { .. }) => vec!["claude", "native"],
             (ApiProvider::OpenAI, ProviderAuth::ApiKey { .. }) => vec!["codex", "native"],
@@ -415,7 +701,13 @@ impl ProviderAccount {
             (ApiProvider::Anthropic, ProviderAuth::OAuthToken { .. }) => vec![],
             (ApiProvider::Anthropic, ProviderAuth::ClaudeProfile) => vec!["claude"],
             _ => vec![],
-        }
+        };
+        keys.into_iter().map(str::to_string).collect()
+    }
+
+    /// Whether this account's credential can serve `backend`.
+    pub(crate) fn serves_backend(&self, backend: &str) -> bool {
+        self.compatible_backends().iter().any(|key| key == backend)
     }
 }
 
@@ -655,14 +947,12 @@ impl IdentityStore {
         if let Some(id) = override_id {
             return accounts
                 .iter()
-                .find(|a| a.id == id && a.compatible_backends().contains(&backend))
+                .find(|a| a.id == id && a.serves_backend(backend))
                 .copied();
         }
 
         // No override — first compatible account wins
-        accounts
-            .into_iter()
-            .find(|a| a.compatible_backends().contains(&backend))
+        accounts.into_iter().find(|a| a.serves_backend(backend))
     }
 
     /// Whether a session's pinned subscription account can still run.
@@ -710,7 +1000,7 @@ impl IdentityStore {
             return accounts.into_iter().find(|account| {
                 account.id == id
                     && excluded_id != Some(account.id.as_str())
-                    && account.compatible_backends().contains(&backend)
+                    && account.serves_backend(backend)
             });
         }
 
@@ -719,7 +1009,7 @@ impl IdentityStore {
             .filter(|account| {
                 excluded_id != Some(account.id.as_str())
                     && provider.routes(&account.auth)
-                    && account.compatible_backends().contains(&backend)
+                    && account.serves_backend(backend)
             })
             .filter_map(|account| {
                 let (headroom, since) = match account.health.as_ref() {
@@ -797,9 +1087,7 @@ impl IdentityStore {
         };
         self.accounts_for_provider(provider, None)
             .into_iter()
-            .find(|account| {
-                account.id == account_id && account.compatible_backends().contains(&backend)
-            })?;
+            .find(|account| account.id == account_id && account.serves_backend(backend))?;
         Some(self.resolve(None, Some(&overrides)))
     }
 
@@ -847,11 +1135,13 @@ impl IdentityStore {
                     crate::identity::claude_profile::profile_dir_in(&self.config_dir, &a.id),
                 )),
                 // A retired setup token is not Claude auth, and neither is a
-                // host URL or an Actual target. `best_account_for` already
-                // filters on `compatible_backends`, so none reach here.
+                // host URL, an Actual target, or a custom endpoint.
+                // `best_account_for` already filters on `compatible_backends`,
+                // so none reach here.
                 ProviderAuth::OAuthToken { .. }
                 | ProviderAuth::BaseUrl { .. }
-                | ProviderAuth::ActualTarget { .. } => None,
+                | ProviderAuth::ActualTarget { .. }
+                | ProviderAuth::CustomEndpoint { .. } => None,
             });
 
         // Resolve Codex auth from best OpenAI account
@@ -862,6 +1152,7 @@ impl IdentityStore {
                 ProviderAuth::OAuthToken { value } => Some(CodexAuth::OAuthToken(value.clone())),
                 ProviderAuth::BaseUrl { .. }
                 | ProviderAuth::ActualTarget { .. }
+                | ProviderAuth::CustomEndpoint { .. }
                 | ProviderAuth::ClaudeProfile => None,
             });
 
@@ -954,6 +1245,32 @@ pub struct AccountInfo {
     /// secret — it names a cluster, it does not authenticate to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cluster_id: Option<String>,
+    /// The wire protocol a custom endpoint speaks. Absent for every other
+    /// provider, whose protocol is a property of the shipped adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol: Option<String>,
+    /// How a custom provider's models become known: `discover`, or `explicit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_discovery: Option<String>,
+    /// The model ids an explicitly-listed custom provider serves, exactly as
+    /// the operator gave them. Empty for a discovering one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    model_ids: Vec<String>,
+    /// Maximum tokens generated by one custom-provider agent turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<i64>,
+    /// The NAMES of the operator's extra request headers — never their values,
+    /// which are secrets. Enough to show that headers are configured and which
+    /// ones, without ever rendering what they carry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    header_names: Vec<String>,
+    /// Whether a bearer credential is stored. The key itself never leaves the
+    /// identity store.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    has_api_key: bool,
+    /// Non-secret generation settings for a custom provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sampling: Option<CustomSampling>,
     compatible_backends: Vec<String>,
     project_id: Option<String>,
     sort_order: i32,
@@ -974,6 +1291,49 @@ impl From<&ProviderAccount> for AccountInfo {
             base_url: match &account.auth {
                 ProviderAuth::BaseUrl { url } => Some(url.clone()),
                 ProviderAuth::ActualTarget { base_url, .. } => Some(base_url.clone()),
+                ProviderAuth::CustomEndpoint { base_url, .. } => Some(base_url.clone()),
+                _ => None,
+            },
+            protocol: match &account.auth {
+                ProviderAuth::CustomEndpoint { protocol, .. } => {
+                    Some(protocol.as_str().to_string())
+                }
+                _ => None,
+            },
+            model_discovery: match &account.auth {
+                ProviderAuth::CustomEndpoint { models, .. } => Some(models.mode_str().to_string()),
+                _ => None,
+            },
+            model_ids: match &account.auth {
+                ProviderAuth::CustomEndpoint {
+                    models: CustomModelPolicy::Explicit { ids },
+                    ..
+                } => ids.clone(),
+                _ => Vec::new(),
+            },
+            max_output_tokens: match &account.auth {
+                ProviderAuth::CustomEndpoint {
+                    max_output_tokens, ..
+                } => Some(*max_output_tokens),
+                _ => None,
+            },
+            header_names: match &account.auth {
+                ProviderAuth::CustomEndpoint { headers, .. } => {
+                    headers.iter().map(|header| header.name.clone()).collect()
+                }
+                _ => Vec::new(),
+            },
+            has_api_key: matches!(
+                &account.auth,
+                ProviderAuth::CustomEndpoint {
+                    api_key: Some(_),
+                    ..
+                }
+            ),
+            sampling: match &account.auth {
+                ProviderAuth::CustomEndpoint { sampling, .. } if !sampling.is_empty() => {
+                    Some(sampling.clone())
+                }
                 _ => None,
             },
             target_kind: match &account.auth {
@@ -1888,6 +2248,209 @@ mod tests {
         assert_eq!(ProviderAuth::ClaudeProfile.credential_value(), None);
     }
 
+    fn custom(
+        base_url: &str,
+        api_key: Option<&str>,
+        headers: &[(&str, &str)],
+        models: CustomModelPolicy,
+    ) -> Result<ProviderAuth, String> {
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        ProviderAuth::custom_endpoint(
+            base_url,
+            CustomProtocol::OpenAiChatCompletions,
+            api_key,
+            &headers,
+            models,
+            CustomSampling::default(),
+            DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
+        )
+    }
+
+    fn base_url_of(auth: &ProviderAuth) -> &str {
+        match auth {
+            ProviderAuth::CustomEndpoint { base_url, .. } => base_url,
+            _ => panic!("expected a custom endpoint"),
+        }
+    }
+
+    #[test]
+    fn a_bare_address_resolves_to_the_default_openai_layout() {
+        // `http://host:8000` universally means `/v1` for a server of this kind.
+        // Resolving it once and storing the answer is what keeps the URL that
+        // diagnostics show the same one requests go to.
+        let auth = custom(
+            "http://10.10.10.83:8000",
+            None,
+            &[],
+            CustomModelPolicy::Discover,
+        )
+        .unwrap();
+        assert_eq!(base_url_of(&auth), "http://10.10.10.83:8000/v1");
+
+        let trailing = custom(
+            "http://10.10.10.83:8000/",
+            None,
+            &[],
+            CustomModelPolicy::Discover,
+        )
+        .unwrap();
+        assert_eq!(base_url_of(&trailing), "http://10.10.10.83:8000/v1");
+    }
+
+    #[test]
+    fn an_explicit_path_is_taken_literally() {
+        // A server behind a prefix, or one that does not use `/v1` at all, is a
+        // normal deployment. Only an ABSENT path is inferred.
+        for (given, expected) in [
+            ("http://host:8000/v1", "http://host:8000/v1"),
+            (
+                "https://gw.example.com/inference/v2/",
+                "https://gw.example.com/inference/v2",
+            ),
+            (
+                "https://gw.example.com/openai",
+                "https://gw.example.com/openai",
+            ),
+        ] {
+            let auth = custom(given, None, &[], CustomModelPolicy::Discover).unwrap();
+            assert_eq!(base_url_of(&auth), expected, "for {given}");
+        }
+    }
+
+    #[test]
+    fn an_ambiguous_or_unsafe_address_is_refused_at_the_boundary() {
+        let cases = [
+            ("ftp://host/v1", "http or https"),
+            ("not a url", "invalid endpoint URL"),
+            // Credentials in the URL are a second, invisible source of auth.
+            ("http://user:pass@host:8000/v1", "API key field"),
+            ("http://host:8000/v1?key=abc", "query string"),
+            ("http://host:8000/v1#frag", "query string or fragment"),
+        ];
+        for (given, expected) in cases {
+            let error = custom(given, None, &[], CustomModelPolicy::Discover)
+                .expect_err(&format!("{given} should be refused"));
+            assert!(error.contains(expected), "for {given}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_header_cairn_already_sets_cannot_be_overridden() {
+        // Silently discarding one, or letting it through to break the request
+        // body, are both worse than saying no.
+        let error = custom(
+            "http://host:8000/v1",
+            None,
+            &[("Authorization", "Bearer x")],
+            CustomModelPolicy::Discover,
+        )
+        .expect_err("authorization is Cairn's");
+        assert!(error.contains("API key field"), "{error}");
+
+        for reserved in ["content-type", "Content-Length", "host"] {
+            assert!(custom(
+                "http://host:8000/v1",
+                None,
+                &[(reserved, "x")],
+                CustomModelPolicy::Discover
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn a_header_set_twice_or_malformed_is_refused() {
+        let duplicate = custom(
+            "http://host:8000/v1",
+            None,
+            &[("x-tenant", "a"), ("X-Tenant", "b")],
+            CustomModelPolicy::Discover,
+        )
+        .expect_err("one header, one value");
+        assert!(duplicate.contains("set twice"), "{duplicate}");
+
+        let malformed = custom(
+            "http://host:8000/v1",
+            None,
+            &[("x tenant", "a")],
+            CustomModelPolicy::Discover,
+        )
+        .expect_err("a space is not a header name");
+        assert!(malformed.contains("valid header name"), "{malformed}");
+    }
+
+    #[test]
+    fn an_explicit_model_list_keeps_its_ids_exactly() {
+        let auth = custom(
+            "http://host:8000/v1",
+            None,
+            &[],
+            CustomModelPolicy::Explicit {
+                ids: vec![
+                    "  qwen3.8-27b  ".into(),
+                    "Meta-Llama-3.1-8B-Instruct".into(),
+                    // A repeat is the same model named twice, not two models.
+                    "qwen3.8-27b".into(),
+                    "   ".into(),
+                ],
+            },
+        )
+        .unwrap();
+        let ProviderAuth::CustomEndpoint {
+            models: CustomModelPolicy::Explicit { ids },
+            ..
+        } = &auth
+        else {
+            panic!("expected an explicit list");
+        };
+        assert_eq!(ids, &["qwen3.8-27b", "Meta-Llama-3.1-8B-Instruct"]);
+    }
+
+    #[test]
+    fn an_empty_explicit_list_is_a_provider_that_can_never_serve() {
+        let error = custom(
+            "http://host:8000/v1",
+            None,
+            &[],
+            CustomModelPolicy::Explicit { ids: vec![] },
+        )
+        .expect_err("nothing to serve");
+        assert!(error.contains("at least one model id"), "{error}");
+    }
+
+    #[test]
+    fn a_blank_api_key_is_no_key_rather_than_an_empty_bearer() {
+        let auth = custom(
+            "http://host:8000/v1",
+            Some("   "),
+            &[],
+            CustomModelPolicy::Discover,
+        )
+        .unwrap();
+        assert_eq!(auth.credential_value(), None);
+        assert_eq!(auth.auth_type_label(), "custom_endpoint");
+    }
+
+    #[test]
+    fn a_custom_account_serves_exactly_its_own_backend() {
+        let auth = custom(
+            "http://host:8000/v1",
+            None,
+            &[],
+            CustomModelPolicy::Discover,
+        )
+        .unwrap();
+        let mut account = test_account(ApiProvider::Custom, auth);
+        account.id = "acc_spark".to_string();
+        assert_eq!(account.compatible_backends(), vec!["custom:acc_spark"]);
+        assert!(account.serves_backend("custom:acc_spark"));
+        assert!(!account.serves_backend("custom:acc_other"));
+        assert!(!account.serves_backend("ollama"));
+    }
+
     #[test]
     fn provider_auth_type_labels() {
         assert_eq!(api_key_auth("x").auth_type_label(), "api_key");
@@ -1927,6 +2490,7 @@ mod tests {
                 ApiProvider::Ollama,
                 ApiProvider::Actual,
                 ApiProvider::GitHub,
+                ApiProvider::Custom,
             ]
         );
     }

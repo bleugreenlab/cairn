@@ -138,7 +138,7 @@ pub(super) async fn resolve_contention(
                 return ContentionEstimate {
                     co_resident_compile_jobs: load.co_resident_compile_jobs,
                     co_resident_light_jobs: load.co_resident_light_jobs,
-                    multiplier_millis: median_ms(&profile.recent_multiplier_millis)
+                    multiplier_millis: upper_median(&profile.recent_multiplier_millis)
                         .clamp(1_000, u32::MAX as u64)
                         as u32,
                     source,
@@ -241,6 +241,90 @@ pub(super) fn cold_start_prior(
     }
 }
 
+/// What the rest of the fleet has measured one command doing, one high-water
+/// mark per machine context that has seen it enough times to speak.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct FleetEvidence {
+    /// Upper peak resident bytes, one entry per contributing context.
+    peaks: Vec<u64>,
+    /// Upper disk growth, one entry per contributing context.
+    disks: Vec<u64>,
+}
+
+/// The prior for a command this machine has never measured, taken from the
+/// machines that have.
+///
+/// The cold-start case is the permissive one, and on a large machine it is
+/// permissive to the point of being no brake at all: a class prior cannot tell a
+/// workspace build from a type-check, so eight unprofiled cargo builds offered
+/// to a fresh 121 GiB machine each reserved two gigabytes, fit trivially, and
+/// took the machine down (CAIRN-4365). The fleet already knew what those
+/// commands cost — the same identities carried hundreds of samples between 11
+/// and 15 gigabytes on three other machines — and nothing consulted them.
+///
+/// Memory and disk demand travel between machines; speed does not. A compiler
+/// holds roughly the same working set wherever it runs, which is why this
+/// borrows a reservation and [`resolve_duration`] deliberately borrows nothing:
+/// how fast a machine is is exactly the thing another machine cannot tell you.
+///
+/// The statistic is the median of the per-context high-water marks, not their
+/// maximum. Each contributing number is already an upper, so their median is the
+/// typical worst case rather than a typical case — and it gives one poisoned
+/// context a single vote, the same reason [`resolve_duration`] predicts from a
+/// median. A maximum would let one observation taken on a saturated machine
+/// (64 GiB for a command whose fleet-wide floor is 2.4) become every other
+/// machine's opening reservation.
+fn fleet_prior(
+    evidence: &FleetEvidence,
+    class_prior: &ResourceReservation,
+    memory_budget_bytes: Option<u64>,
+) -> Option<ResourceReservation> {
+    if evidence.peaks.is_empty() {
+        return None;
+    }
+    let borrowed_peak = upper_median(&evidence.peaks);
+    // The quarantine that guards a machine's own observations guards a borrowed
+    // one for the same reason and with more force: a peak that would consume
+    // this machine describes some other machine's saturation, or a machine this
+    // command has no business running on. Either way it is not this machine's
+    // prior, and letting it through would refuse the work here forever.
+    if memory_budget_bytes.is_some_and(|budget| {
+        borrowed_peak.saturating_mul(MEMORY_QUARANTINE_DENOMINATOR)
+            >= budget.saturating_mul(MEMORY_QUARANTINE_NUMERATOR)
+    }) {
+        return None;
+    }
+    let memory = with_headroom(borrowed_peak);
+    let memory = memory_budget_bytes.map_or(memory, |budget| {
+        let cap = budget.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
+            / MEMORY_RESERVATION_CAP_DENOMINATOR;
+        memory.min(cap)
+    });
+    // A prior is a floor. Borrowed evidence may raise the class prior and never
+    // lower it, so a fleet that happens to have run this command on idle
+    // machines cannot talk a host into admitting more than a cold start allows.
+    let memory_bytes = memory.max(class_prior.memory_bytes);
+    if memory_bytes <= class_prior.memory_bytes {
+        return None;
+    }
+    // Same floor rule as memory above: borrowed disk evidence may raise the
+    // class prior and never lower it, and no evidence at all leaves it standing.
+    let disk_growth_bytes = if evidence.disks.is_empty() {
+        class_prior.disk_growth_bytes
+    } else {
+        with_headroom(upper_median(&evidence.disks)).max(class_prior.disk_growth_bytes)
+    };
+    Some(ResourceReservation {
+        memory_bytes,
+        disk_growth_bytes,
+        concurrency_units: class_prior.concurrency_units,
+        // Borrowed, therefore still unmeasured HERE. This is what keeps the
+        // executor's cold-work brake applying to it and keeps every downstream
+        // reader from mistaking another machine's history for this one's.
+        source: ResourceReservationSource::Unmeasured,
+    })
+}
+
 /// The conservative duration a work class is assumed to take on a machine that
 /// has never run it.
 ///
@@ -330,7 +414,7 @@ pub(super) async fn resolve_duration(
         return prior(DurationFallback::ProfileTooOld);
     }
     DurationEstimate {
-        predicted_ms: median_ms(&profile.recent_ms),
+        predicted_ms: upper_median(&profile.recent_ms),
         source: DurationEvidence::Learned,
         sample_count: profile.sample_count,
         profile_key: Some(identity.key.clone()),
@@ -343,7 +427,7 @@ pub(super) async fn resolve_duration(
 
 /// The upper median of a non-empty window. Integer throughout: a prediction in
 /// whole milliseconds is already finer than anything downstream compares on.
-fn median_ms(samples: &[u64]) -> u64 {
+fn upper_median(samples: &[u64]) -> u64 {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
     sorted[sorted.len() / 2]
@@ -396,6 +480,31 @@ pub(super) struct DurationContext {
     pub now_unix_ms: u64,
 }
 
+/// How one resolution came to its number, in the shape every caller reads.
+fn profile_rationale(
+    identity: Option<&CommandResourceIdentity>,
+    context: &ProfileContext,
+    prior: &ResourceReservation,
+    profile: Option<&ResourceProfile>,
+    fallback: Option<ReservationFallback>,
+) -> ReservationRationale {
+    ReservationRationale {
+        // A learned profile speaks for memory, disk, and duration only. Any
+        // declared concurrency is re-applied over this by the caller, which
+        // is also what records it here.
+        declared_concurrency_units: None,
+        profile_key: identity.map(|identity| identity.key.clone()),
+        profile_context: context.describe(),
+        sample_count: profile.map_or(0, |profile| profile.sample_count),
+        upper_peak_rss_bytes: profile.and_then(|profile| profile.upper_peak_rss_bytes),
+        upper_disk_growth_bytes: profile.and_then(|profile| profile.upper_disk_delta_bytes),
+        upper_duration_ms: profile.and_then(|profile| profile.upper_duration_ms),
+        prior: prior.clone(),
+        headroom_percent: HEADROOM_PERCENT,
+        fallback,
+    }
+}
+
 pub(super) async fn resolve_reservation(
     db: Arc<LocalDb>,
     identity: Option<&CommandResourceIdentity>,
@@ -413,28 +522,17 @@ pub(super) async fn resolve_reservation(
         duration_context.now_unix_ms,
     )
     .await;
-    let rationale = |fallback: Option<ReservationFallback>, profile: Option<&ResourceProfile>| {
-        ReservationRationale {
-            // A learned profile speaks for memory, disk, and duration only. Any
-            // declared concurrency is re-applied over this by the caller, which
-            // is also what records it here.
-            declared_concurrency_units: None,
-            profile_key: identity.map(|identity| identity.key.clone()),
-            profile_context: context.describe(),
-            sample_count: profile.map_or(0, |profile| profile.sample_count),
-            upper_peak_rss_bytes: profile.and_then(|profile| profile.upper_peak_rss_bytes),
-            upper_disk_growth_bytes: profile.and_then(|profile| profile.upper_disk_delta_bytes),
-            upper_duration_ms: profile.and_then(|profile| profile.upper_duration_ms),
-            prior: prior.clone(),
-            headroom_percent: HEADROOM_PERCENT,
-            fallback,
-        }
-    };
     let Some(identity) = identity else {
         return ResolvedResourceProfile {
             reservation: prior.clone(),
             learned_estimate: None,
-            rationale: rationale(Some(ReservationFallback::NoCommandIdentity), None),
+            rationale: profile_rationale(
+                None,
+                context,
+                &prior,
+                None,
+                Some(ReservationFallback::NoCommandIdentity),
+            ),
             duration,
             item_durations: Vec::new(),
         };
@@ -442,13 +540,43 @@ pub(super) async fn resolve_reservation(
     // A store that could not be read and a work class that has never run are
     // both "no learned number", and they call for different responses: one is a
     // cold start, the other is a fault worth seeing on the decision record.
-    let profile = match load_profile(db, identity, context).await {
+    let local = load_profile(db.clone(), identity, context).await;
+    // The fleet is consulted only where this machine is still cold or thinly
+    // evidenced, which is the only place a borrowed number could change an
+    // answer. A machine that has measured this command past the confidence floor
+    // speaks for itself and pays for no extra query.
+    let cold_here =
+        !matches!(&local, Ok(Some(profile)) if profile.sample_count >= MIN_CONFIDENT_SAMPLES);
+    let borrowed = match cold_here {
+        false => None,
+        true => load_fleet_evidence(db, identity, context)
+            .await
+            .ok()
+            .and_then(|evidence| fleet_prior(&evidence, &prior, memory_budget_bytes)),
+    };
+    // The prior is settled before anything explains itself, so every rationale
+    // below reports the number this resolution actually stood on.
+    let prior = borrowed.clone().unwrap_or(prior);
+    let rationale = |fallback: Option<ReservationFallback>, profile: Option<&ResourceProfile>| {
+        profile_rationale(Some(identity), context, &prior, profile, fallback)
+    };
+    // A borrowed prior explains the number whenever it is the number. Saying
+    // only "no profile recorded" here would describe the absence and hide the
+    // evidence that filled it.
+    let cold_fallback = |otherwise| match borrowed.is_some() {
+        true => ReservationFallback::FleetPrior,
+        false => otherwise,
+    };
+    let profile = match local {
         Ok(Some(profile)) => profile,
         Ok(None) => {
             return ResolvedResourceProfile {
                 reservation: prior.clone(),
                 learned_estimate: None,
-                rationale: rationale(Some(ReservationFallback::NoProfileRecorded), None),
+                rationale: rationale(
+                    Some(cold_fallback(ReservationFallback::NoProfileRecorded)),
+                    None,
+                ),
                 duration,
                 item_durations: Vec::new(),
             }
@@ -470,13 +598,14 @@ pub(super) async fn resolve_reservation(
                 >= budget.saturating_mul(MEMORY_QUARANTINE_NUMERATOR)
         })
     });
+    let reservation = reservation_for_profile(
+        &profile,
+        prior.clone(),
+        memory_budget_bytes,
+        memory_quarantined,
+    );
     ResolvedResourceProfile {
-        reservation: reservation_for_profile(
-            &profile,
-            prior.clone(),
-            memory_budget_bytes,
-            memory_quarantined,
-        ),
+        reservation: reservation.clone(),
         learned_estimate: Some(cairn_common::executor_protocol::LearnedResourceEstimate {
             sample_count: profile.sample_count,
             upper_duration_ms: profile.upper_duration_ms,
@@ -486,8 +615,15 @@ pub(super) async fn resolve_reservation(
         rationale: rationale(
             if memory_quarantined {
                 Some(ReservationFallback::MemoryObservationQuarantined)
+            } else if below_floor {
+                // Thin local evidence and a borrowed prior both reach this
+                // branch, and which one set the number is the useful fact.
+                Some(match reservation.source {
+                    ResourceReservationSource::Learned => ReservationFallback::BelowConfidenceFloor,
+                    _ => cold_fallback(ReservationFallback::BelowConfidenceFloor),
+                })
             } else {
-                below_floor.then_some(ReservationFallback::BelowConfidenceFloor)
+                None
             },
             Some(&profile),
         ),
@@ -631,7 +767,17 @@ fn reservation_for_profile(
         memory_bytes,
         disk_growth_bytes,
         concurrency_units: prior.concurrency_units,
-        source: ResourceReservationSource::Learned,
+        // Measured only when a measurement is what set the memory number. Below
+        // the confidence floor, and whenever a peak is quarantined, the prior
+        // can be the larger of the two and hold the reservation on its own — and
+        // a prior returned as `Learned` is a guess wearing evidence's clothes.
+        // Downstream this is load-bearing rather than cosmetic: the executor
+        // holds resident UNMEASURED claims against its available-memory floor,
+        // so mislabeling turns that brake off for exactly the work it exists for.
+        source: match memory_bytes > prior.memory_bytes {
+            true => ResourceReservationSource::Learned,
+            false => prior.source,
+        },
     }
 }
 
@@ -679,6 +825,61 @@ async fn load_profile(
             }
         })
     }).await.map_err(|error| error.to_string())
+}
+
+/// Every OTHER machine context's high-water marks for one command identity.
+///
+/// The exclusion is the whole point: this answers "what does this command cost
+/// elsewhere", and a machine's own row is not elsewhere. A context is excluded
+/// only on an exact match of all four keys, so a machine that was re-toolchained
+/// contributes its own pre-toolchain history — which is the strongest evidence
+/// any prior could have.
+///
+/// Only contexts past the confidence floor contribute. A single observation
+/// elsewhere is as thin as a single observation here, and borrowing it would
+/// spread one machine's bad afternoon across the fleet.
+async fn load_fleet_evidence(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+) -> Result<FleetEvidence, String> {
+    let identity = identity.clone();
+    let context = context.clone();
+    db.read(|conn| {
+        let identity = identity.clone();
+        let context = context.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT upper_peak_rss_bytes, upper_disk_delta_bytes
+                 FROM command_resource_profiles
+                 WHERE identity_version=?1 AND command_identity=?2 AND sample_count>=?3
+                   AND NOT (executor_class=?4 AND os=?5 AND arch=?6 AND toolchain_fingerprint=?7)",
+                    params![
+                        identity.version as i64,
+                        identity.key,
+                        MIN_CONFIDENT_SAMPLES as i64,
+                        context.executor_class,
+                        context.os,
+                        context.arch,
+                        context.toolchain_fingerprint
+                    ],
+                )
+                .await?;
+            let mut evidence = FleetEvidence::default();
+            while let Some(row) = rows.next().await? {
+                if let Some(peak) = row.get::<Option<i64>>(0)? {
+                    evidence.peaks.push(peak as u64);
+                }
+                if let Some(disk) = row.get::<Option<i64>>(1)? {
+                    evidence.disks.push(disk as u64);
+                }
+            }
+            Ok(evidence)
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
 async fn load_duration_profile(
@@ -851,6 +1052,7 @@ mod tests {
             memory_budget_bytes: None,
             sandbox: None,
             toolchain_detection: None,
+            build_prerequisites: None,
         }
     }
 
@@ -969,9 +1171,16 @@ mod tests {
         assert_eq!(thin.reservation.memory_bytes, prior.memory_bytes);
     }
 
-    /// A profile is keyed by the machine context it was learned on, so an
-    /// observation from one platform can never be read as evidence about
-    /// another.
+    /// A profile is keyed by the machine context it was learned on, so one
+    /// platform's observation is never READ AS this platform's measurement.
+    ///
+    /// That is a claim about evidence, not about ignorance, and the difference
+    /// matters: the same observation may still stand in as a labeled PRIOR here
+    /// (see `a_cold_machine_borrows_the_fleets_evidence_without_calling_it_measured`),
+    /// because how much memory a compiler holds travels between machines even
+    /// though how fast one runs does not. What must never happen is the borrowed
+    /// number arriving as this machine's learned profile — so the keyed lookup
+    /// below stays exact, and the borrowing goes through its own path.
     #[tokio::test]
     async fn a_profile_learned_on_one_platform_does_not_answer_for_another() {
         let db = Arc::new(crate::storage::migrated_test_db("resource-profile-context.db").await);
@@ -1129,6 +1338,202 @@ mod tests {
         assert_eq!(reservation.memory_bytes, 125);
         assert_eq!(reservation.disk_growth_bytes, 250);
         assert_eq!(reservation.source, ResourceReservationSource::Learned);
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn class_prior() -> ResourceReservation {
+        ResourceReservation {
+            memory_bytes: 2 * GIB,
+            disk_growth_bytes: 4 * GIB,
+            concurrency_units: 1,
+            source: ResourceReservationSource::Unmeasured,
+        }
+    }
+
+    /// A borrowed prior is the median of what other machines measured, never
+    /// their maximum. Each contributing number is already a high-water mark, so
+    /// their median is a typical WORST case — which is what a reservation wants
+    /// — and one context measured under saturation gets a single vote instead of
+    /// setting every other machine's opening reservation.
+    #[test]
+    fn a_fleet_prior_takes_the_median_of_other_machines_high_water_marks() {
+        let evidence = FleetEvidence {
+            peaks: vec![11 * GIB, 13 * GIB, 15 * GIB, 15 * GIB, 64 * GIB],
+            disks: vec![4 * GIB, 8 * GIB, 12 * GIB],
+        };
+        let borrowed = fleet_prior(&evidence, &class_prior(), Some(103 * GIB))
+            .expect("three machines past the confidence floor is evidence");
+        assert_eq!(borrowed.memory_bytes, with_headroom(15 * GIB));
+        assert_eq!(borrowed.disk_growth_bytes, with_headroom(8 * GIB));
+        assert_eq!(
+            borrowed.source,
+            ResourceReservationSource::Unmeasured,
+            "borrowed from elsewhere is still unmeasured here, and the executor's \
+             cold-work brake reads exactly this label"
+        );
+        assert_eq!(borrowed.concurrency_units, class_prior().concurrency_units);
+    }
+
+    /// A prior is a floor. Machines that all happened to run this command
+    /// cheaply cannot talk a host into admitting more than a cold start allows.
+    #[test]
+    fn a_fleet_prior_never_lowers_the_class_floor() {
+        let evidence = FleetEvidence {
+            peaks: vec![100 * 1024 * 1024, 120 * 1024 * 1024],
+            disks: Vec::new(),
+        };
+        assert_eq!(fleet_prior(&evidence, &class_prior(), None), None);
+    }
+
+    /// The quarantine that guards a machine's own observations guards a borrowed
+    /// one with more force. A peak that would consume this machine describes
+    /// somewhere else's saturation, or a machine this command has no business
+    /// running on; adopting it as a prior would refuse the work here forever.
+    #[test]
+    fn a_borrowed_peak_that_would_consume_this_machine_is_refused() {
+        let evidence = FleetEvidence {
+            peaks: vec![60 * GIB],
+            disks: Vec::new(),
+        };
+        let roomy = fleet_prior(&evidence, &class_prior(), Some(103 * GIB))
+            .expect("a machine with room for it can hold this prior");
+        assert_eq!(roomy.memory_bytes, with_headroom(60 * GIB));
+        assert_eq!(
+            fleet_prior(&evidence, &class_prior(), Some(64 * GIB)),
+            None,
+            "a prior that would take nine tenths of the host is not this host's prior"
+        );
+    }
+
+    /// The bglab-sp1 case end to end: a machine with no history of its own, a
+    /// fleet with plenty of it, and a reservation that reflects the second
+    /// without ever claiming to be the first (CAIRN-4365).
+    #[tokio::test]
+    async fn a_cold_machine_borrows_the_fleets_evidence_without_calling_it_measured() {
+        let db =
+            Arc::new(crate::storage::migrated_test_db("resource-profile-fleet-prior.db").await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let context = |executor_class: &str, os: &str, arch: &str| ProfileContext {
+            executor_class: executor_class.into(),
+            os: os.into(),
+            arch: arch.into(),
+            toolchain_fingerprint: "rust".into(),
+        };
+        // A brand-new linux/aarch64 machine, the first of its platform in the
+        // fleet, so not one profile anywhere shares its context.
+        let sp1 = context("sp1:sp1", "linux", "aarch64");
+        for (elsewhere, peak) in [
+            (context("local:colocated", "macos", "aarch64"), 11 * GIB),
+            (context("bbs:bbs", "linux", "x86_64"), 15 * GIB),
+            (context("fedora:fedora", "linux", "x86_64"), 13 * GIB),
+        ] {
+            for _ in 0..MIN_CONFIDENT_SAMPLES {
+                update_profile(
+                    db.clone(),
+                    &identity,
+                    &elsewhere,
+                    10,
+                    Some(peak),
+                    Some(4 * GIB),
+                    Some(300_000),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let prior = cold_start_prior(CellCommandClass::CargoTest, &capabilities());
+        let resolved = resolve_reservation(
+            db,
+            Some(&identity),
+            &sp1,
+            prior.clone(),
+            Some(103 * GIB),
+            test_duration_context(),
+        )
+        .await;
+
+        assert_eq!(
+            resolved.rationale.fallback,
+            Some(ReservationFallback::FleetPrior),
+            "the record has to name where a number this large came from"
+        );
+        assert_eq!(
+            resolved.reservation.memory_bytes,
+            with_headroom(13 * GIB),
+            "the median of what three other machines measured, with the usual headroom"
+        );
+        assert_eq!(
+            resolved.reservation.source,
+            ResourceReservationSource::Unmeasured,
+            "another machine's history is not this machine's measurement"
+        );
+        assert!(
+            resolved.learned_estimate.is_none(),
+            "nothing was learned here, and the record must not imply otherwise"
+        );
+        assert!(
+            resolved.reservation.memory_bytes > prior.memory_bytes * 5,
+            "the class floor is what let eight of these onto one machine at once"
+        );
+        assert!(
+            !resolved.duration.is_learned(),
+            "memory demand travels between machines; speed does not, and this \
+             machine still has no idea how fast it runs this command"
+        );
+    }
+
+    /// A prior that holds the number is not a measurement, whatever raised it.
+    ///
+    /// The executor holds resident UNMEASURED claims against its available
+    /// memory, so this label is load-bearing rather than cosmetic: a prior
+    /// returned as `Learned` switches that brake off for exactly the work it
+    /// exists to brake.
+    #[test]
+    fn a_prior_that_holds_the_number_is_not_reported_as_measured() {
+        let prior = ResourceReservation {
+            memory_bytes: 1_000,
+            disk_growth_bytes: 200,
+            concurrency_units: 1,
+            source: ResourceReservationSource::Unmeasured,
+        };
+        let profile = |upper_peak_rss_bytes| ResourceProfile {
+            sample_count: 50,
+            upper_peak_rss_bytes,
+            upper_disk_delta_bytes: Some(20),
+            upper_duration_ms: Some(30),
+        };
+
+        let thin = reservation_for_profile(
+            &ResourceProfile {
+                sample_count: 1,
+                ..profile(Some(10))
+            },
+            prior.clone(),
+            None,
+            false,
+        );
+        assert_eq!(thin.memory_bytes, prior.memory_bytes);
+        assert_eq!(
+            thin.source,
+            ResourceReservationSource::Unmeasured,
+            "one observation smaller than the prior did not set this number"
+        );
+
+        let quarantined =
+            reservation_for_profile(&profile(Some(10_000)), prior.clone(), None, true);
+        assert_eq!(
+            quarantined.source,
+            ResourceReservationSource::Unmeasured,
+            "a quarantined peak leaves the prior standing, and a prior is not evidence"
+        );
+
+        let measured = reservation_for_profile(&profile(Some(10_000)), prior, None, false);
+        assert_eq!(measured.source, ResourceReservationSource::Learned);
     }
 
     #[test]

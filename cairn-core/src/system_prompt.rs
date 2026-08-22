@@ -48,7 +48,8 @@ fn resource_mutation_reference() -> String {
     let mut out = String::from(
         "## Resource Mutations\n\n\
          `write` mutates a resource by URI. Keys are typed; [optional]. \
-         Home-relative `cairn:~/...` targets resolve to your own node. An \
+         Node-relative `cairn:~/...` targets resolve to your own node; project-relative \
+         `cairn:@/...` targets resolve to its project. An \
          unsupported mode or a missing required key is rejected with the \
          resource's valid mutations and an example.\n\n",
     );
@@ -251,24 +252,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompt_carries_one_version_control_contract() {
-        let prompt = cairn_system_prompt(false);
-        assert!(prompt.contains("must carry a `commit_msg`"));
-        assert!(prompt.contains("never rebase or force-push by hand"));
-        // No marker residue survives substitution.
-        assert!(!prompt.contains("<!--"));
-        assert!(!prompt.contains("TIER:VERSION_CONTROL"));
-    }
-
-    #[test]
-    fn legacy_tier_argument_does_not_change_virtual_contract() {
-        let prompt = cairn_system_prompt(true);
-        assert!(prompt.contains("must carry a `commit_msg`"));
-        assert_eq!(prompt.matches("## Version Control").count(), 1);
-        assert!(!prompt.contains("<!--"));
-    }
-
-    #[test]
     fn system_prompt_carries_no_substrate_vocabulary() {
         for ambient in [false, true] {
             assert_no_substrate_vocabulary("system prompt", &cairn_system_prompt(ambient));
@@ -285,21 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn every_tier_carries_visual_markdown_guidance() {
-        for ambient in [false, true] {
-            let prompt = cairn_system_prompt(ambient);
-            assert!(prompt.contains("`mermaid` and `vega-lite` fenced code blocks"));
-            assert!(prompt.contains("`$…$` as inline math"));
-            assert!(prompt.contains("`$$…$$` as display math"));
-            assert!(prompt.contains("literal dollar signs in code spans"));
-            assert!(prompt.contains("inline data with `data.values`"));
-            assert!(prompt.contains("not remote `data.url` sources"));
-            assert!(prompt.contains("`inlinehtml` fences render as live sandboxed HTML previews"));
-            assert!(prompt.contains("plain `html` fences stay code"));
-        }
-    }
-
-    #[test]
     fn virtual_residence_prompt_is_one_deterministic_contract() {
         // Agent jobs have one version-control contract. The legacy ambient flag
         // cannot select a second agent-workspace implementation.
@@ -309,28 +277,8 @@ mod tests {
         // section heading appears exactly once.
         let authoring = cairn_system_prompt(false);
         assert!(!authoring.contains(VERSION_CONTROL_MARKER));
+        assert!(!authoring.contains("<!--"));
         assert_eq!(authoring.matches("## Version Control").count(), 1);
-    }
-
-    /// A capability only exists for an agent that can find it at the moment it
-    /// needs it. "Is this failure mine, or already on the base?" has two answers
-    /// — the canonical producer for a configured suite, `branch` for anything
-    /// else — so the prompt carries both rather than leaving them to the tool
-    /// schema. Asserted by shape, not by the example's wording, which is
-    /// copy-edited freely.
-    #[test]
-    fn every_tier_shows_how_to_run_a_check_against_another_branch() {
-        for ambient in [false, true] {
-            let prompt = cairn_system_prompt(ambient);
-            assert!(prompt.contains(r#"], branch:"main"})"#));
-            assert!(prompt.contains("cairn check run <suite>... [--branch <revision>]"));
-            assert!(prompt.contains(r#"read({paths:["file:src/lib.rs?branch=main"]})"#));
-            assert!(prompt.contains("cannot be combined with `commit_msg`"));
-            // `run` presents shell, inline code, MCP tools, and REPL sends as
-            // peer item classes, so an unqualified description invites
-            // attaching `branch` to a class the handler rejects.
-            assert!(prompt.contains("an MCP-tool or REPL batch executes on the host"));
-        }
     }
 
     #[test]

@@ -22,6 +22,35 @@ use super::grammar::{self, LangSpec};
 use super::render::{render_locations, render_locations_with_context, LocationHit, Rendered};
 use super::walk::{build_globset, relative, source_files};
 
+/// Apply the row cap, reporting what it elided.
+///
+/// A truncated location list that says nothing is indistinguishable from a
+/// complete one — the same defect `head_limit` carried on grep — and "every
+/// caller of this symbol" is exactly the question these ops are asked before a
+/// signature change. Returns `(shown, total)` when rows were dropped.
+fn cap_locations(hits: &mut Vec<LocationHit>, limit: Option<usize>) -> Option<(usize, usize)> {
+    let total = hits.len();
+    let limit = limit?;
+    if total <= limit {
+        return None;
+    }
+    hits.truncate(limit);
+    Some((limit, total))
+}
+
+/// Append the elision notice to a rendered location list. The symbols renderer
+/// has no resource URI to build a continue from, so it names the total and the
+/// knob that widens the window.
+fn with_window_notice(mut rendered: Rendered, window: Option<(usize, usize)>) -> Rendered {
+    let Some((shown, total)) = window else {
+        return rendered;
+    };
+    rendered.body.push_str(&format!(
+        "\n[locations 1\u{2013}{shown} of {total} — raise head_limit to see the rest]"
+    ));
+    rendered
+}
+
 /// The structural navigation operations the symbols resource exposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolOp {
@@ -80,10 +109,8 @@ pub fn query_texts(
     match op {
         Some(op) => {
             let mut hits = collect_texts(op);
-            if let Some(limit) = proj.limit {
-                hits.truncate(limit);
-            }
-            if proj.before == 0 && proj.after == 0 {
+            let window = cap_locations(&mut hits, proj.limit);
+            let rendered = if proj.before == 0 && proj.after == 0 {
                 render_locations(&hits)
             } else {
                 let source_map = sources
@@ -96,7 +123,8 @@ pub fn query_texts(
                     proj.before,
                     proj.after,
                 )
-            }
+            };
+            with_window_notice(rendered, window)
         }
         None => {
             let defs = collect_texts(SymbolOp::Definition);
@@ -176,14 +204,13 @@ pub fn query(
     match op {
         Some(op) => {
             let mut hits = collect(root, &files, op, name);
-            if let Some(limit) = proj.limit {
-                hits.truncate(limit);
-            }
-            if proj.before == 0 && proj.after == 0 {
+            let window = cap_locations(&mut hits, proj.limit);
+            let rendered = if proj.before == 0 && proj.after == 0 {
                 render_locations(&hits)
             } else {
                 render_locations_with_context(root, &hits, proj.before, proj.after)
-            }
+            };
+            with_window_notice(rendered, window)
         }
         None => overview(root, &files, name),
     }
@@ -197,13 +224,9 @@ fn overview(root: &Path, files: &[(PathBuf, SupportLang)], name: &str) -> Render
         body.push_str(&format!("no declaration of '{name}' found"));
     } else {
         body.push_str("definition:\n");
-        body.push_str(
-            &defs
-                .iter()
-                .map(|h| format!("{}:{}:{}", h.path, h.line, h.snippet))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        // Through the same renderer as every other location list, so the
+        // overview's rows never drift from the ones `?op=definition` returns.
+        body.push_str(&render_locations(&defs).body);
     }
     body.push_str(&format!("\n\nreferences: {ref_count}"));
     Rendered::message(body)
@@ -415,13 +438,17 @@ mod tests {
             &NavProjection::default(),
         );
         assert!(r.body.contains("definition:"));
-        assert!(r.body.contains("a.rs:1:"));
+        assert!(r.body.contains("a.rs\n1:"), "body: {}", r.body);
         // Three occurrences across two lines: decl line + the call line.
         assert!(r.body.contains("references: 2"));
     }
 
+    /// The cap counts rows, and a capped list says what it left out: one row of
+    /// three, plus the notice that makes the difference visible. A location list
+    /// answers "every reference to this name", so a silent cap turns a complete
+    /// answer and a sample into the same document.
     #[test]
-    fn limit_caps_rows() {
+    fn limit_caps_rows_and_says_what_it_elided() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("a.rs"),
@@ -441,7 +468,30 @@ mod tests {
             None,
             &proj,
         );
-        assert_eq!(r.body.lines().count(), 1, "body: {}", r.body);
+        // The path heading, the single kept row, then the notice.
+        let lines: Vec<&str> = r.body.lines().collect();
+        assert_eq!(lines.len(), 3, "body: {}", r.body);
+        assert_eq!(lines[0], "a.rs", "body: {}", r.body);
+        assert!(lines[1].starts_with("1:"), "body: {}", r.body);
+        assert_eq!(
+            lines[2], "[locations 1\u{2013}1 of 3 \u{2014} raise head_limit to see the rest]",
+            "body: {}",
+            r.body
+        );
+
+        // An uncapped read of the same symbol carries no notice — the marker
+        // means something because a complete list does not have it.
+        let complete = query(
+            dir.path(),
+            dir.path(),
+            Some(SymbolOp::References),
+            "alpha",
+            None,
+            &NavProjection::default(),
+        );
+        // One heading plus three rows, and no notice.
+        assert_eq!(complete.body.lines().count(), 4, "body: {}", complete.body);
+        assert!(!complete.body.contains("raise head_limit"));
     }
 
     #[test]
@@ -467,9 +517,10 @@ mod tests {
         );
         // Caller is `beta`, declared on 1-based line 2 (the match), with line 1
         // and line 3 as context rows rendered with `-` separators.
-        assert!(r.body.contains("a.rs:2:"), "body: {}", r.body);
-        assert!(r.body.contains("a.rs:1-"), "body: {}", r.body);
-        assert!(r.body.contains("a.rs:3-    alpha();"), "body: {}", r.body);
+        assert!(r.body.starts_with("a.rs\n"), "body: {}", r.body);
+        assert!(r.body.contains("\n2:"), "body: {}", r.body);
+        assert!(r.body.contains("\n1-"), "body: {}", r.body);
+        assert!(r.body.contains("\n3-    alpha();"), "body: {}", r.body);
     }
 
     #[test]
@@ -488,6 +539,6 @@ mod tests {
             None,
             &NavProjection::default(),
         );
-        assert_eq!(r.body, "a.rs:1:fn alpha() {}");
+        assert_eq!(r.body, "a.rs\n1:fn alpha() {}");
     }
 }

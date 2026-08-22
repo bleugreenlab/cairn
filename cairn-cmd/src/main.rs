@@ -25,7 +25,6 @@ mod test_support;
 mod timeouts;
 
 use cli::{default_callback_url, run_cli_change, run_cli_check, run_cli_read, run_cli_watch};
-use schemas::AgentInfo;
 use server::CairnCmd;
 
 cairn_common::sidecar_version_stamp!();
@@ -37,10 +36,6 @@ struct Args {
     /// Subcommand. When omitted, opens the interactive Cairn shell.
     #[command(subcommand)]
     command: Option<Command>,
-
-    /// JSON-encoded list of available agents [{name, description}, ...]
-    #[arg(long, global = true)]
-    agents: Option<String>,
 }
 
 const BARE_NON_TTY_ERROR: &str = "cairn: the MCP server has moved to `cairn mcp`.\n\
@@ -93,19 +88,6 @@ mod cli_parse_tests {
         assert_eq!(suites, ["rust-tests", "lint"]);
         assert_eq!(branch.as_deref(), Some("main"));
         assert!(!retry);
-    }
-
-    #[test]
-    fn mcp_accepts_global_agents_after_the_subcommand() {
-        let args = Args::try_parse_from([
-            "cairn",
-            "mcp",
-            "--agents",
-            "[{\"name\":\"Explore\",\"description\":\"x\"}]",
-        ])
-        .unwrap();
-        assert!(matches!(args.command, Some(Command::Mcp)));
-        assert!(args.agents.is_some());
     }
 
     #[test]
@@ -359,30 +341,7 @@ async fn async_main() -> Result<()> {
         tracing::info!("Home URI: {}", uri);
     }
 
-    // Parse available agents from JSON argument
-    let available_agents: Vec<AgentInfo> = if let Some(ref agents_json) = args.agents {
-        match serde_json::from_str::<Vec<AgentInfo>>(agents_json) {
-            Ok(agents) => {
-                tracing::info!("Loaded {} available agents", agents.len());
-                agents
-            }
-            Err(e) => {
-                tracing::warn!("Failed to parse agents JSON: {}", e);
-                Vec::new()
-            }
-        }
-    } else {
-        Vec::new()
-    };
-
-    let service = CairnCmd::new_with_home_uri(
-        callback_url,
-        cwd,
-        run_id,
-        mcp_secret,
-        available_agents,
-        home_uri,
-    );
+    let service = CairnCmd::new_with_home_uri(callback_url, cwd, run_id, mcp_secret, home_uri);
 
     // Create stdio transport and run the server
     let transport = rmcp::transport::stdio();

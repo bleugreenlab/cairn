@@ -7,11 +7,15 @@ use std::sync::Arc;
 
 use crate::execution::checks::{verify_review_tree, ReviewTreeCheckScope, ReviewTreeGateResult};
 use crate::fleet::CellPriority;
-use crate::jj::{logical_tree_hash, tree_entries, GraphFileChange, JjEnv};
+use crate::jj::{logical_changed_files, logical_tree_hash, tree_entries, GraphFileChange, JjEnv};
 use crate::orchestrator::{attention_push, Orchestrator};
 use crate::storage::RowExt;
 
 const SETTLE_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn main_review_base(commit: &str) -> String {
+    format!("{commit}^")
+}
 
 #[derive(Clone)]
 pub(crate) struct MainCheckRun {
@@ -269,6 +273,15 @@ async fn run(
         .unwrap_or_else(|| project_id.to_string());
     let short_commit = commit.chars().take(8).collect::<String>();
 
+    // Main-health compares the attested head with its immediate parent, matching
+    // the final-head retry's authoritative integration boundary.
+    let base_commit = main_review_base(&commit);
+    let attributed_changed = logical_changed_files(&jj, &repository, &base_commit, &commit)
+        .ok_or_else(|| {
+            format!(
+                "default-head changed-file attribution could not be resolved for {base_commit}..{commit}"
+            )
+        })?;
     let result = verify_review_tree(
         orch,
         result_db,
@@ -276,9 +289,11 @@ async fn run(
         repo_path,
         Path::new(repo_path),
         &commit,
+        &base_commit,
         &tree_hash,
         &entries,
         &whole_tree,
+        Some(&attributed_changed),
         &owner,
         CellPriority::ReviewCheck,
         ReviewTreeCheckScope::All,
@@ -477,6 +492,11 @@ fn main_health_report(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn main_review_uses_immediate_parent_as_base() {
+        assert_eq!(super::main_review_base("sealed-head"), "sealed-head^");
+    }
+
     use super::*;
 
     #[tokio::test]

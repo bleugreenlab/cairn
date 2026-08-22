@@ -379,10 +379,12 @@ mod tests {
         );
         let first = mcp::parse_pack_mcp_file(&first_path)
             .unwrap()
+            .servers
             .remove("test")
             .unwrap();
         let second = mcp::parse_pack_mcp_file(&second_path)
             .unwrap()
+            .servers
             .remove("test")
             .unwrap();
         assert_eq!(

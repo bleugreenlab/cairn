@@ -52,9 +52,20 @@
 //! So the broker does not guess from the bytes. It asks whether the value was
 //! *declared* to be a credential, and there are exactly two ways to declare one:
 //!
-//! - **By storage.** A value in the OS keychain is there because a human typed
-//!   it into the settings UI's secret field. Choosing that store is the
-//!   declaration.
+//! - **By storage.** A value in the OS keychain's secret namespace is there
+//!   because a human typed it into a secret field. Choosing that store is the
+//!   declaration, and it is never second-guessed: a stored secret is protected
+//!   whatever its bytes happen to look like.
+//!
+//!   The keychain has a second, explicitly non-credential namespace, written
+//!   only by the pack setup affordance for a variable its pack declared
+//!   `kind: path` (see [`crate::config::secrets::set_config_value`]). A
+//!   Dock-launched app can read no other store, so a pack server's executable
+//!   path has to live in the keychain too — but registering the user's own
+//!   install directory would refuse every model-authored write that mentions
+//!   it. The namespace carries that distinction durably, so it means the same
+//!   thing on every read rather than depending on what the filesystem says at
+//!   the moment of the read.
 //! - **By configuration.** A server's `secrets:` list names the `${VAR}`s that
 //!   carry credentials. This is what brings an environment-resolved token —
 //!   a developer's exported `LINEAR_API_KEY` — back under the registry, which a
@@ -287,8 +298,12 @@ enum Origin {
     /// A value the operator typed into the settings UI's secret field on the way
     /// to storing it. Declared by the act of typing it there.
     Override,
-    /// The OS keychain. Declared by the choice of store.
+    /// The OS keychain's secret namespace. Declared by the choice of store.
     Keychain,
+    /// The OS keychain's declared-configuration namespace, written only by the
+    /// pack setup affordance for a variable its pack declared `kind: path`.
+    /// Not a credential, by the same choice of store.
+    KeychainConfig,
     /// The process environment. Declared only if the server config says so.
     Environment,
 }
@@ -354,6 +369,15 @@ fn keychain(credential_key: &str, var: &str) -> Option<String> {
     crate::config::secrets::get_secret(credential_key, var)
 }
 
+/// Read one MCP `${VAR}` from the keychain's declared-configuration namespace.
+///
+/// Separate from [`keychain`] because the namespace a value was written to IS
+/// its declaration — see [`crate::config::secrets::set_config_value`] for why
+/// that has to be durable rather than sniffed from the value.
+fn keychain_config(credential_key: &str, var: &str) -> Option<String> {
+    crate::config::secrets::get_config_value(credential_key, var)
+}
+
 /// Resolve one `${VAR}` for a configured MCP server: settings-UI override, then
 /// the OS keychain, then the process environment.
 ///
@@ -372,11 +396,18 @@ fn resolve_mcp_var(
         Some(value) => (value.clone(), Origin::Override),
         None => match keychain(credential_key, var) {
             Some(value) => (value, Origin::Keychain),
-            None => (std::env::var(var).ok()?, Origin::Environment),
+            // The declared-configuration namespace of the same keychain, read
+            // only after the secret namespace, so nothing here can shadow a
+            // credential the user stored under the same name.
+            None => match keychain_config(credential_key, var) {
+                Some(value) => (value, Origin::KeychainConfig),
+                None => (std::env::var(var).ok()?, Origin::Environment),
+            },
         },
     };
     let declared = match origin {
         Origin::Override | Origin::Keychain => Declared::Secret,
+        Origin::KeychainConfig => Declared::Configuration,
         Origin::Environment if authored.declares_secret(var) => Declared::Secret,
         Origin::Environment => Declared::Configuration,
     };
@@ -1248,6 +1279,94 @@ mod tests {
             !is_registered(&format!("mcp-server:{server}:{var}")),
             "an undeclared environment value must not become a process-global scrub target"
         );
+    }
+
+    /// A value the pack setup affordance stored is configuration, and stays
+    /// configuration across the whole life of the thing it points at.
+    ///
+    /// This is the case that rules out inferring the distinction from the
+    /// filesystem. Registration is process-lifetime and cannot be undone, so a
+    /// single resolution taken while the file was absent would pin the user's
+    /// install path as a scrub target for the rest of the process — refusing
+    /// every model-authored write that mentions it — and it would never recover
+    /// when the file came back. The declaration lives in the namespace the
+    /// value was written to, so none of these moments differ.
+    #[test]
+    fn a_declared_configuration_value_is_never_registered_whatever_the_disk_says() {
+        use_mock_keychain();
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("matlab-mcp-server");
+        let (server, var) = ("broker-path-server", "MATLAB_MCP_SERVER");
+        let value = executable.to_string_lossy().to_string();
+        let id = format!("mcp-server:{server}:{var}");
+        crate::config::secrets::set_config_value(server, var, &value).unwrap();
+
+        let resolve = || resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
+
+        // Configured before the binary is installed — an ordinary order of
+        // events, and the one that used to poison the value permanently.
+        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert!(!is_registered(&id), "absent target: still not a credential");
+
+        // Installed.
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert!(
+            !is_registered(&id),
+            "present target: still not a credential"
+        );
+
+        // Gone mid-upgrade, then back.
+        std::fs::remove_file(&executable).unwrap();
+        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert!(
+            !is_registered(&id),
+            "vanished target: still not a credential"
+        );
+        std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+        assert_eq!(resolve().as_deref(), Some(value.as_str()));
+        assert!(
+            !is_registered(&id),
+            "restored target: still not a credential"
+        );
+    }
+
+    /// The other half of that invariant: a value in the ordinary secret store
+    /// is protected whatever its bytes look like. A token that happens to name
+    /// a real file, or a credential that is literally a path, is still a
+    /// credential — the user put it in the secret field, and nothing about the
+    /// value gets to overrule that.
+    #[test]
+    fn a_stored_secret_is_protected_even_when_it_looks_like_a_path() {
+        use_mock_keychain();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("looks-like-config");
+        std::fs::write(&file, b"x").unwrap();
+        let (server, var) = ("broker-pathy-secret-server", "PATHY_TOKEN");
+        let value = file.to_string_lossy().to_string();
+        crate::config::secrets::set_secret(server, var, &value).unwrap();
+
+        resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
+        assert!(
+            is_registered(&format!("mcp-server:{server}:{var}")),
+            "the secret store's declaration must never be second-guessed"
+        );
+    }
+
+    /// The secret namespace is read first, so a leftover credential can never
+    /// be silently downgraded by a later configuration write under the same
+    /// name. (`store_pack_mcp_value` clears the other side on write; this is
+    /// the belt to that suspenders.)
+    #[test]
+    fn a_secret_wins_over_a_configuration_value_of_the_same_name() {
+        use_mock_keychain();
+        let (server, var) = ("broker-both-server", "CONTESTED");
+        crate::config::secrets::set_secret(server, var, "secret-Zx91Qw82Lm").unwrap();
+        crate::config::secrets::set_config_value(server, var, "/opt/thing").unwrap();
+
+        let resolved = resolve_mcp_var(server, &authored(&[]), &HashMap::new(), var, "test");
+        assert_eq!(resolved.as_deref(), Some("secret-Zx91Qw82Lm"));
+        assert!(is_registered(&format!("mcp-server:{server}:{var}")));
     }
 
     /// A value the operator typed into the settings UI, on its way to the

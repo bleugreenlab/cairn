@@ -122,6 +122,8 @@ pub(crate) fn delegate_thread_descendant(resource: CairnResource) -> Result<Cair
         ["progress"] => at_thread!(NodeProgress),
         ["memories"] => at_thread!(NodeMemories),
         ["memories", seq] => at_thread!(NodeMemory, memory_seq: parse_seq("memory sequence", seq)?),
+        ["eras"] => at_thread!(NodeEras),
+        ["eras", seq] => at_thread!(NodeEra, era_seq: parse_seq("era sequence", seq)?),
         ["terminal", slug] => at_thread!(NodeTerminal, slug: (*slug).to_string()),
         ["repl", slug] => at_thread!(NodeRepl, slug: (*slug).to_string()),
         ["browser"] => at_thread!(NodeBrowser, slug: DEFAULT_BROWSER_SLUG.to_string()),
@@ -572,6 +574,7 @@ mod delegation_tests {
             ("chat/2/7", "chat/2/7"),
             ("symbols/build_widget", "symbols/build_widget"),
             ("memories/4", "memories/4"),
+            ("eras/7", "eras/7"),
             ("questions/q-1", "questions/q-1"),
             ("permissions/perm-1", "permissions/perm-1"),
             ("terminal/smoke", "terminal/smoke"),
@@ -895,5 +898,70 @@ mod tests {
 
         let overview = read_thread(&db, "thr", "design-review", &[]).await;
         assert!(overview.contains("Live session: not started"), "{overview}");
+    }
+
+    /// An era's rendered range derives from the thread's CURRENT coordinates
+    /// rather than a value baked in at mint time -- the point of not
+    /// persisting `range_uri` (CAIRN-4302 amendment): a rename never orphans
+    /// it.
+    #[tokio::test]
+    async fn thread_eras_render_through_the_node_family_with_a_live_derived_range() {
+        let db = fixture().await;
+        let job_id = crate::threads::ensure_thread_session(&db, "t-design")
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO thread_eras (
+                 job_id, seq, start_block, end_block, started_at, ended_at, summary,
+                 summary_status, summary_model, source_tokens, minted_generation, created_at
+             ) VALUES (?1, 1, 0, 2, 10, 20, 'Settled the initial layout question.', 'fallback', NULL, 500, 1, 30)",
+            (job_id.as_str(),),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO thread_era_children (job_id, era_seq, child_issue_id, child_issue_uri, child_title, final_status)
+             VALUES (?1, 1, 'i-child', 'cairn://p/thr/12', 'Child issue', 'merged')",
+            (job_id.as_str(),),
+        )
+        .await
+        .unwrap();
+
+        let collection = super::super::eras::render_node_eras(
+            &db,
+            "design-review",
+            "cairn://p/thr/design-review/eras",
+            "cairn://p/thr/design-review/chat",
+            &job_id,
+            50,
+            0,
+        )
+        .await;
+        assert!(collection.contains("1 era(s)"), "{collection}");
+        assert!(
+            collection.contains("cairn://p/thr/design-review/chat?offset=0&limit=3"),
+            "the range is derived from the thread's live chat URI, not persisted: {collection}"
+        );
+        assert!(!collection.contains("/0/0/"), "{collection}");
+
+        let member = super::super::eras::render_node_era(
+            &db,
+            "design-review",
+            "cairn://p/thr/design-review/eras/1",
+            "cairn://p/thr/design-review/chat",
+            &job_id,
+            1,
+        )
+        .await;
+        assert!(
+            member.contains("Settled the initial layout question."),
+            "{member}"
+        );
+        assert!(member.contains("Child issue"), "{member}");
+        assert!(
+            member.contains("cairn://p/thr/design-review/chat?offset=0&limit=3"),
+            "{member}"
+        );
+        assert!(!member.contains("/0/0/"), "{member}");
     }
 }

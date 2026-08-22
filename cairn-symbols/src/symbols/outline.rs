@@ -25,9 +25,12 @@ pub fn outline(root: &Path, target: &Path, glob: Option<&str>) -> Rendered {
         // header (`=== uri ===`) already carries the path, so repeating it on
         // every row is pure noise.
         let display = relative(root, target).to_string_lossy().into_owned();
-        return Rendered::message(outline_file(target).unwrap_or_else(|| {
-            format!("no bundled grammar for {display} — outline needs a known file type")
-        }));
+        return match outline_file(target) {
+            Some(rows) => single_file_outline(rows),
+            None => Rendered::message(format!(
+                "no bundled grammar for {display} — outline needs a known file type"
+            )),
+        };
     }
     let globset = match glob {
         Some(raw) => match build_globset(raw) {
@@ -44,14 +47,39 @@ pub fn outline(root: &Path, target: &Path, glob: Option<&str>) -> Rendered {
         let display = relative(root, &path).to_string_lossy().into_owned();
         if let Some(rendered) = outline_file(&path) {
             if !rendered.is_empty() {
-                blocks.push(format!("{display}\n{rendered}"));
+                blocks.push((display, rendered));
             }
         }
     }
+    multi_file_outline(blocks)
+}
+
+/// A single file's path-less rows, counted as one entry per line. There is no
+/// path dimension to count, and no heading to mistake a row for.
+fn single_file_outline(rows: String) -> Rendered {
+    let entries = rows.lines().filter(|line| !line.is_empty()).count();
+    Rendered::counted(rows, entries, 0)
+}
+
+/// Join per-file `(path, rows)` blocks into the heading layout, counting the
+/// entries and files while the blocks are still separate. Reading those counts
+/// back off the joined text would mean deciding which lines are headings, which
+/// a path like `1:foo.rs` makes unanswerable.
+fn multi_file_outline(blocks: Vec<(String, String)>) -> Rendered {
     if blocks.is_empty() {
         return Rendered::message("no outline entries");
     }
-    Rendered::message(blocks.join("\n\n"))
+    let files = blocks.len();
+    let entries: usize = blocks
+        .iter()
+        .map(|(_, rows)| rows.lines().filter(|line| !line.is_empty()).count())
+        .sum();
+    let body = blocks
+        .iter()
+        .map(|(path, rows)| format!("{path}\n{rows}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Rendered::counted(body, entries, files)
 }
 
 pub fn outline_texts(files: &[(String, String)], glob: Option<&str>) -> Rendered {
@@ -72,14 +100,10 @@ pub fn outline_texts(files: &[(String, String)], glob: Option<&str>) -> Rendered
         }
         let rendered = outline_text(src, lang_for_path(path_ref));
         if !rendered.is_empty() {
-            blocks.push(format!("{path}\n{rendered}"));
+            blocks.push((path.clone(), rendered));
         }
     }
-    if blocks.is_empty() {
-        Rendered::message("no outline entries")
-    } else {
-        Rendered::message(blocks.join("\n\n"))
-    }
+    multi_file_outline(blocks)
 }
 
 fn outline_file(path: &Path) -> Option<String> {
@@ -99,19 +123,10 @@ pub fn outline_text(src: &str, lang: Option<SupportLang>) -> String {
     }
 }
 
-/// Count the file headers in a multi-file outline body. Entry rows are
-/// line-numbered (`\d+:…`); every other non-empty line is a file header. Used
-/// to report `N matches in M files` for a directory outline.
-pub fn file_count(body: &str) -> usize {
-    body.lines()
-        .filter(|line| !line.is_empty() && !is_row(line))
-        .count()
-}
-
-/// Whether a body line is an entry row (`\d+:…`) rather than a file header.
-fn is_row(line: &str) -> bool {
-    let digits = line.bytes().take_while(|b| b.is_ascii_digit()).count();
-    digits > 0 && line.as_bytes().get(digits) == Some(&b':')
+/// The single-file bytes entry, carrying its entry count. Callers need the
+/// count and must not re-derive it from the rows.
+pub fn outline_text_rendered(src: &str, lang: Option<SupportLang>) -> Rendered {
+    single_file_outline(outline_text(src, lang))
 }
 
 /// Extract top-level items with their direct members from a source string.
@@ -443,13 +458,35 @@ mod tests {
         assert!(r
             .body
             .contains("b.rs\n1:pub fn beta() {}  [function exported]"));
-        // Two header lines, two rows.
-        assert_eq!(file_count(&r.body), 2);
+        // Two files, one entry each, counted as the blocks were built rather
+        // than parsed back out of the joined body.
+        assert_eq!((r.matches, r.files), (2, 2));
     }
 
     #[test]
-    fn file_count_counts_headers_not_rows() {
-        let body = "src/a.rs\n1:fn x()  [function]\n2:fn y()  [function]\n\nsrc/b.rs\n3:fn z()  [function]";
-        assert_eq!(file_count(body), 2);
+    fn counts_survive_a_path_that_looks_like_an_entry_row() {
+        // A file named `1:odd.rs` renders a heading indistinguishable from an
+        // entry row, and `--.rs` one indistinguishable from a group separator.
+        // Counting at assembly time cannot be fooled by either. (Both need a
+        // known extension to be outlined at all, so the separator case is
+        // spelled `--.rs`.)
+        let files = vec![
+            ("1:odd.rs".to_string(), "pub fn alpha() {}\n".to_string()),
+            ("--.rs".to_string(), "pub fn beta() {}\n".to_string()),
+        ];
+        let r = outline_texts(&files, None);
+        assert_eq!((r.matches, r.files), (2, 2));
+    }
+
+    #[test]
+    fn a_single_file_outline_counts_entries_and_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )
+        .unwrap();
+        let r = outline(dir.path(), &dir.path().join("a.rs"), None);
+        assert_eq!((r.matches, r.files), (2, 0));
     }
 }

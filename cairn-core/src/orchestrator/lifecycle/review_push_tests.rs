@@ -1368,11 +1368,15 @@ async fn turn_end_cancel_resolves_immediately_when_already_cancelled() {
     use crate::orchestrator::TurnEndCancel;
     let cancel = TurnEndCancel::default();
     assert!(!cancel.is_cancelled());
-    cancel.cancel();
+    cancel.cancel(crate::orchestrator::TurnEndCancelReason::IssueResolved);
     assert!(cancel.is_cancelled());
-    tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
         .await
         .expect("an already-cancelled token resolves without blocking");
+    assert_eq!(
+        reason,
+        crate::orchestrator::TurnEndCancelReason::IssueResolved
+    );
 }
 
 #[tokio::test]
@@ -1385,11 +1389,15 @@ async fn turn_end_cancel_wakes_a_parked_waiter() {
     };
     // Let the waiter park on `notified()` before signalling.
     tokio::task::yield_now().await;
-    cancel.cancel();
-    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+    cancel.cancel(crate::orchestrator::TurnEndCancelReason::BranchAdvanced);
+    let reason = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
         .await
         .expect("cancel wakes the parked waiter")
         .expect("the waiter task joins cleanly");
+    assert_eq!(
+        reason,
+        crate::orchestrator::TurnEndCancelReason::BranchAdvanced
+    );
 }
 
 #[tokio::test]
@@ -1406,15 +1414,35 @@ async fn cancel_turn_end_checks_signals_the_in_flight_token() {
     );
     assert!(!cancel.is_cancelled());
 
-    orch.cancel_turn_end_checks("j-prod");
+    orch.cancel_turn_end_checks(
+        "j-prod",
+        crate::orchestrator::TurnEndCancelReason::IssueResolved,
+    );
     assert!(
         cancel.is_cancelled(),
         "the cancel lever signals the in-flight suite's token"
     );
+    assert_eq!(
+        cancel.cancelled().await,
+        crate::orchestrator::TurnEndCancelReason::IssueResolved,
+        "the cause travels with the cancellation signal"
+    );
+    orch.cancel_turn_end_checks(
+        "j-prod",
+        crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
+    );
+    assert_eq!(
+        cancel.cancelled().await,
+        crate::orchestrator::TurnEndCancelReason::IssueResolved,
+        "a later producer cannot overwrite the cause that cancelled the wave"
+    );
 
     orch.end_turn_end_checks("j-prod");
     // After release the slot is free again and a stale cancel is a no-op.
-    orch.cancel_turn_end_checks("j-prod");
+    orch.cancel_turn_end_checks(
+        "j-prod",
+        crate::orchestrator::TurnEndCancelReason::BranchAdvanced,
+    );
     assert!(orch.try_begin_turn_end_checks("j-prod").is_some());
 }
 

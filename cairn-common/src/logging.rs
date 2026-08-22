@@ -16,7 +16,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use tracing::field::{Field, Visit};
@@ -120,9 +120,9 @@ impl ProcessTag {
         match self {
             ProcessTag::App => "cairn-app",
             ProcessTag::Cmd => "cairn-cmd",
-            ProcessTag::Executor => "cairn-executor",
+            ProcessTag::Executor => "cairn-exec",
             ProcessTag::Server => "cairn-server",
-            ProcessTag::Runner => "cairn-runner",
+            ProcessTag::Runner => "cairn-orch",
         }
     }
 }
@@ -438,15 +438,47 @@ fn emit_span_profile(
 /// JSONL file layer that must record its emitted events. When profiler is off the
 /// returned `Targets` enables nothing, so the layer's callbacks never fire.
 fn profiler_span_filter(directives: &str) -> Targets {
-    let enabled = directives
-        .parse::<Targets>()
-        .map(|targets| targets.would_enable(PROFILER_TARGET, &Level::INFO))
-        .unwrap_or(false);
-    if enabled {
+    if profiler_directive_enabled(directives) {
         Targets::new().with_target(PROFILER_TARGET, LevelFilter::INFO)
     } else {
         Targets::new()
     }
+}
+
+/// Whether a resolved directive string lets `profiler`-target records through.
+fn profiler_directive_enabled(directives: &str) -> bool {
+    directives
+        .parse::<Targets>()
+        .map(|targets| targets.would_enable(PROFILER_TARGET, &Level::INFO))
+        .unwrap_or(false)
+}
+
+/// The profiler decision this process made at [`init`].
+///
+/// The tracing filter is installed exactly once per process, so this answer is
+/// fixed for the process lifetime — changing the log level on disk does not move
+/// an already-running process, which is why the desktop app's log-verbosity
+/// control says the change takes effect after a restart.
+///
+/// It exists so that nothing has to *re-derive* the decision from its own inputs.
+/// The resolution reads `CAIRN_FILE_LOG`, then `CAIRN_LOG_LEVEL`, then the
+/// settings file, and a caller that consults only the settings file (as the
+/// webview once did) disagrees with this process whenever an environment
+/// variable is in play — emitting events into a filter that drops them, or
+/// staying silent while the backend profiles.
+#[derive(Clone, Debug)]
+pub struct ProfilerGate {
+    /// Whether `profiler`-target records survive this process's file-layer filter.
+    pub enabled: bool,
+    /// The directive string the decision was resolved from, for diagnosis.
+    pub directives: String,
+}
+
+static PROFILER_GATE: OnceLock<ProfilerGate> = OnceLock::new();
+
+/// This process's resolved profiler gate, or `None` before [`init`] has run.
+pub fn profiler_gate() -> Option<&'static ProfilerGate> {
+    PROFILER_GATE.get()
 }
 
 /// Build the rotating JSONL appender for `log_dir`, creating the directory if it
@@ -729,6 +761,7 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
     // (zero overhead) otherwise. It tracks the configured level rather than
     // whether a file layer survived, so a degraded logger still profiles into
     // whatever layers remain.
+    let profiler_enabled = profiler_directive_enabled(&file_directives);
     let span_layer = SpanDurationLayer.with_filter(profiler_span_filter(&file_directives));
 
     // Build the subscriber. `Option<Layer>` is itself a `Layer`, so a degraded
@@ -760,6 +793,21 @@ pub fn init(config: LogConfig) -> Result<LogGuard, Box<dyn std::error::Error>> {
 
     // Bridge log:: crate into tracing (ignore if already set)
     let _ = tracing_log::LogTracer::init();
+
+    // Record and announce the profiler decision now that a subscriber exists.
+    // Announced on an ordinary target rather than `profiler`, so that any log —
+    // including one written with the profiler off — answers "was the profiler on
+    // in this process, and why" without a reader having to infer it from the
+    // absence of events.
+    let gate = PROFILER_GATE.get_or_init(|| ProfilerGate {
+        enabled: profiler_enabled,
+        directives: file_directives.clone(),
+    });
+    tracing::info!(
+        profiler_enabled = gate.enabled,
+        directives = %gate.directives,
+        "resolved profiler gate"
+    );
 
     // Announce a degrade through the subscriber that was just installed, so a
     // binary with a stderr layer says why its files stopped appearing. A CLI
@@ -888,7 +936,7 @@ mod tests {
     #[test]
     fn housekeeping_prunes_each_expired_log_by_age_and_leaves_other_files() {
         let dir = tempfile::tempdir().unwrap();
-        let old_log = dir.path().join("cairn-runner.2026-07-01.jsonl");
+        let old_log = dir.path().join("cairn-orch.2026-07-01.jsonl");
         let fresh_log = dir.path().join("cairn-app.2026-08-05.jsonl");
         let unrelated = dir.path().join("notes.jsonl");
         std::fs::write(&old_log, "old").unwrap();
@@ -913,7 +961,7 @@ mod tests {
     #[test]
     fn housekeeping_marks_a_large_daily_file_for_one_warning() {
         let dir = tempfile::tempdir().unwrap();
-        let log = dir.path().join("cairn-runner.2026-08-05.jsonl");
+        let log = dir.path().join("cairn-orch.2026-08-05.jsonl");
         std::fs::File::create(&log)
             .unwrap()
             .set_len(LOG_SIZE_WARNING_BYTES)

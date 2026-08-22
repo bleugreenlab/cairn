@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cairn_common::uri::{build_node_permission_uri, build_node_question_uri, parse_uri};
+use cairn_common::uri::{parse_uri, CairnResource};
 use cairn_db::turso::{params, Value};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,6 +43,9 @@ const SWEEP_LIMIT: usize = 100;
 /// of every caller that might one day notify it.
 const SWEEP_FLOOR: Duration = Duration::from_secs(1);
 const ATTENTION_GRACE: Duration = Duration::from_secs(3 * 60);
+const RETRY_BASE: Duration = Duration::from_secs(5);
+const RETRY_CAP: Duration = Duration::from_secs(5 * 60);
+const MAX_ATTEMPTS: i64 = 6;
 const FOLLOW_POLL_LIMIT: usize = 10;
 /// How much of a target's title a poll option carries before it is elided. A
 /// Messages balloon renders an option as a wrapped block, so a full thread title
@@ -54,11 +57,53 @@ const FOLLOW_POLL_TITLE_LIMIT: usize = 64;
 /// supersedes them.
 const FOLLOW_POLL_PREFIX: &str = "threads:";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionBoundary {
+    Fresh,
+    Resumed,
+}
+
+async fn seal_gate_for_provider(
+    claims: &ClaimSet,
+    ledger: &LocalDb,
+    provider_id: &'static str,
+    conversation: &str,
+    rendering: &'static str,
+    gate: &Gate,
+) -> Result<bool, String> {
+    let delivery_key = gate.delivery_key(provider_id, conversation);
+    if claims.holds(&delivery_key) {
+        return Ok(false);
+    }
+    let id = Uuid::new_v4().to_string();
+    let rendered = render_text_floor(&gate.ask);
+    let inserted = ledger::insert_intent_with_status(
+        ledger,
+        &ledger::NewOutbound {
+            id: &id,
+            channel: provider_id,
+            kind: gate.kind,
+            binding_ref: &gate.binding_ref,
+            conversation,
+            job_id: gate.job_id.as_deref(),
+            rendered_text: &rendered,
+            rendering,
+            created_at: chrono::Utc::now().timestamp_millis(),
+        },
+        "expired",
+    )
+    .await?;
+    claims.claim(&delivery_key);
+    Ok(inserted)
+}
+
 #[derive(Debug, Deserialize)]
 struct StoredQuestion {
     question: String,
     #[serde(default)]
     options: Vec<StoredOption>,
+    #[serde(default, rename = "multiSelect")]
+    multi_select: bool,
 }
 
 fn permission_answer_token(decision: PermissionDecision) -> &'static str {
@@ -138,11 +183,16 @@ fn route_binding_target(binding_ref: &str) -> Option<&str> {
 
 fn routed_gate_target(uri: &str) -> Option<String> {
     let resource = parse_uri(uri)?;
-    Some(format!(
-        "cairn://p/{}/{}",
-        resource.project()?,
-        resource.issue_number()?
-    ))
+    match resource {
+        CairnResource::Thread { project, name, .. } => {
+            Some(cairn_common::uri::build_thread_uri(&project, &name))
+        }
+        resource => Some(format!(
+            "cairn://p/{}/{}",
+            resource.project()?,
+            resource.issue_number()?
+        )),
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -519,6 +569,7 @@ async fn cleanup_resolved_question(
     provider: &dyn ChannelProvider,
     record: &ledger::OutboundRecord,
     receipt: &str,
+    multi_select: bool,
 ) -> Result<bool, String> {
     if !ledger::claim_question_cleanup(db, &record.id, chrono::Utc::now().timestamp_millis())
         .await?
@@ -526,23 +577,39 @@ async fn cleanup_resolved_question(
         return Ok(false);
     }
 
-    cleanup_claimed_question(provider, record, receipt).await?;
+    cleanup_claimed_question(db, provider, record, receipt, multi_select).await?;
     Ok(true)
 }
 
 async fn cleanup_claimed_question(
+    db: &LocalDb,
     provider: &dyn ChannelProvider,
     record: &ledger::OutboundRecord,
     receipt: &str,
+    multi_select: bool,
 ) -> Result<(), String> {
     let (Some(provider_guid), Some(sent_at)) = (&record.provider_guid, record.sent_at) else {
         return Ok(());
     };
+    let action_ref = if record.kind == "question" {
+        record
+            .binding_ref
+            .rsplit_once(':')
+            .map(|(prompt_id, _)| prompt_id)
+            .unwrap_or(&record.binding_ref)
+    } else {
+        &record.binding_ref
+    };
+    let resolution = ledger::resolution_for_action(db, action_ref).await?;
     let message = ResolvedQuestionMessage {
         conversation: record.conversation.clone(),
         provider_guid: provider_guid.clone(),
         caption_guid: record.caption_guid.clone(),
         sent_at,
+        original_text: record.rendered_text.clone(),
+        answer: resolution.as_ref().map(|value| value.answer.clone()),
+        answering_surface: resolution.map(|value| value.winner_surface),
+        multi_select,
         receipt: receipt.to_string(),
     };
     provider.cleanup_question(&message).await.map_err(|error| {
@@ -609,14 +676,18 @@ fn cancel_resolved_attention(
     deferred: &mut HashMap<String, DeferredAttention>,
     live: &HashSet<String>,
     snapshot_complete: bool,
-) -> Vec<String> {
+) -> Vec<DeferredAttention> {
     if !snapshot_complete {
         return Vec::new();
     }
     let cancelled = deferred
         .iter()
         .filter(|(binding, _)| !live.contains(*binding))
-        .map(|(_, attention)| attention.id.clone())
+        .map(|(_, attention)| DeferredAttention {
+            id: attention.id.clone(),
+            gate: attention.gate.clone(),
+            deadline: attention.deadline,
+        })
         .collect::<Vec<_>>();
     deferred.retain(|binding, _| live.contains(binding));
     cancelled
@@ -1064,6 +1135,38 @@ impl ChannelRouter {
         Ok(())
     }
 
+    async fn question_is_multi_select(
+        &self,
+        record: &ledger::OutboundRecord,
+    ) -> Result<bool, String> {
+        if record.kind != "question" {
+            return Ok(false);
+        }
+        let Some((prompt_id, index)) = record.binding_ref.rsplit_once(':') else {
+            return Ok(false);
+        };
+        let Ok(index) = index.parse::<usize>() else {
+            return Ok(false);
+        };
+        for db in self.orch.db.all_dbs().await {
+            if let Some(json) = db
+                .query_opt_text(
+                    "SELECT questions FROM prompts WHERE id=?1",
+                    params![prompt_id],
+                )
+                .await
+                .map_err(|error| error.to_string())?
+            {
+                let questions: Vec<StoredQuestion> =
+                    serde_json::from_str(&json).map_err(|error| error.to_string())?;
+                return Ok(questions
+                    .get(index)
+                    .is_some_and(|question| question.multi_select));
+            }
+        }
+        Ok(false)
+    }
+
     async fn followed_uri(&self, selector: &str) -> Result<Option<String>, String> {
         let follows = ledger::list_follows(self.ledger(), self.provider_id).await?;
         if let Some(exact) = follows
@@ -1182,9 +1285,12 @@ impl ChannelRouter {
     /// looking live, and the first successful sweep would text all of it -- the
     /// original incident, reproduced. The caller retries until this succeeds.
     ///
-    /// Retrying is safe: claiming is `INSERT OR IGNORE` and expiry is an
-    /// idempotent `UPDATE`, so a second pass completes a partial first one.
-    async fn draw_the_session_line(&self) -> Result<(), String> {
+    /// Retrying is safe: sealing is a single `INSERT OR IGNORE`, so a second pass
+    /// completes a partial first one without touching already-owed work.
+    async fn draw_the_session_line(&self, boundary: SessionBoundary) -> Result<(), String> {
+        if boundary == SessionBoundary::Resumed {
+            return Ok(());
+        }
         let mut fenced = 0;
         let mut expired_dangling = 0;
         for db in self.orch.db.all_dbs().await {
@@ -1196,7 +1302,10 @@ impl ChannelRouter {
             log::warn!("channel removed unresolvable home-relative focus");
         }
         for follow in ledger::list_follows(self.ledger(), self.provider_id).await? {
-            if follow.uri == "cairn:~" || follow.uri.starts_with("cairn:~/") {
+            if follow.uri == "cairn:~"
+                || follow.uri.starts_with("cairn:~/")
+                || follow.uri.starts_with("cairn:@")
+            {
                 // A home-relative URI only has meaning together with the session
                 // that emitted it. Legacy ledger rows retained neither that
                 // context nor a stable identity, so guessing would risk routing
@@ -1241,15 +1350,9 @@ impl ChannelRouter {
             )
             .await?;
         }
-        let expired = ledger::expire_undelivered(
-            self.ledger(),
-            self.provider_id,
-            chrono::Utc::now().timestamp_millis(),
-        )
-        .await?;
-        if fenced > 0 || expired > 0 || expired_dangling > 0 {
+        if fenced > 0 || expired_dangling > 0 {
             log::info!(
-                "channel sealed the pre-session backlog: {fenced} gate(s) fenced, {expired} intent(s) expired, {expired_dangling} dangling review(s) expired"
+                "channel sealed the pre-session backlog: {fenced} gate(s) sealed, {expired_dangling} dangling review(s) expired"
             );
         }
         Ok(())
@@ -1332,8 +1435,14 @@ impl ChannelRouter {
                 )
                 .await?
             {
-                let _ =
-                    cleanup_claimed_question(self.provider.as_ref(), &update, "✓ unfollowed").await;
+                let _ = cleanup_claimed_question(
+                    self.ledger(),
+                    self.provider.as_ref(),
+                    &update,
+                    "✓ unfollowed",
+                    false,
+                )
+                .await;
             }
         }
         Ok(())
@@ -1403,7 +1512,7 @@ impl ChannelRouter {
         else {
             return Ok(());
         };
-        let delivered = self.send_claimed(id.clone(), gate).await?;
+        let delivered = self.send_claimed(id.clone(), gate, false).await?;
         require_command_delivery(
             delivered,
             ledger::get_by_binding(self.ledger(), self.provider_id, "question", &binding_ref)
@@ -1708,8 +1817,57 @@ impl ChannelRouter {
         record: &ledger::OutboundRecord,
         receipt: &str,
     ) -> Result<(), String> {
-        cleanup_resolved_question(self.ledger(), self.provider.as_ref(), record, receipt).await?;
+        let multi_select = self.question_is_multi_select(record).await?;
+        cleanup_resolved_question(
+            self.ledger(),
+            self.provider.as_ref(),
+            record,
+            receipt,
+            multi_select,
+        )
+        .await?;
         Ok(())
+    }
+
+    /// A gate disappearing from a routed snapshot is only a hint. Confirm the
+    /// owning domain row resolved before converting owed delivery into `expired`.
+    async fn gate_is_resolved(&self, gate: &Gate) -> Result<bool, String> {
+        for db in self.orch.db.all_dbs().await {
+            let resolved = match gate.kind {
+                "permission" => db
+                    .query_opt_i64(
+                        "SELECT status != 'pending' FROM permission_requests WHERE id = ?1",
+                        (gate.binding_ref.clone(),),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+                "question" => {
+                    let prompt_id = gate
+                        .binding_ref
+                        .rsplit_once(':')
+                        .map(|(prompt, _)| prompt)
+                        .unwrap_or(&gate.binding_ref);
+                    db.query_opt_i64(
+                        "SELECT response IS NOT NULL FROM prompts WHERE id = ?1",
+                        (prompt_id.to_string(),),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                }
+                "review" => db
+                    .query_opt_i64(
+                        "SELECT retired_at IS NOT NULL OR delivered_event_id IS NOT NULL FROM attention_pushes WHERE key = ?1",
+                        (gate.binding_ref.clone(),),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+                _ => None,
+            };
+            if let Some(resolved) = resolved {
+                return Ok(resolved != 0);
+            }
+        }
+        Ok(false)
     }
 
     /// Claims every gate open in one database right now, across every kind
@@ -1722,7 +1880,16 @@ impl ChannelRouter {
         gates.extend(reviews.gates);
         let mut fenced = 0;
         for gate in gates {
-            if self.claim(&gate).await?.is_some() {
+            if seal_gate_for_provider(
+                &self.claims,
+                self.ledger(),
+                self.provider_id,
+                gate.conversation.as_deref().unwrap_or(&self.destination),
+                self.rendering_for(&gate.ask),
+                &gate,
+            )
+            .await?
+            {
                 fenced += 1;
             }
         }
@@ -1793,11 +1960,15 @@ impl ChannelRouter {
                 continue;
             };
 
+            // Read before the effect runs: parking a refusal withdraws the
+            // winning answer, and the conversation that sent it still has to be
+            // told what became of it.
+            let winner = ledger::resolution_for_action(self.ledger(), &action_ref)
+                .await?
+                .ok_or_else(|| format!("{kind} action has no provenance: {action_ref}"))?;
+
             let result = if kind == "question" {
                 let response = answers[0].1.clone();
-                let winner = ledger::resolution_for_action(self.ledger(), &action_ref)
-                    .await?
-                    .ok_or_else(|| format!("question action has no provenance: {action_ref}"))?;
                 crate::mcp::handlers::planning::answer_prompt_id_domain(
                     &self.orch,
                     &action_ref,
@@ -1807,9 +1978,6 @@ impl ChannelRouter {
                 .await
                 .map(|_| ())
             } else {
-                let provenance = ledger::resolution_for_action(self.ledger(), &action_ref)
-                    .await?
-                    .ok_or_else(|| format!("permission action has no provenance: {action_ref}"))?;
                 let answer = answers
                     .first()
                     .map(|(_, answer)| answer.as_str())
@@ -1818,8 +1986,7 @@ impl ChannelRouter {
                     Ok(decision) => {
                         let recovered =
                             crate::mcp::handlers::permission::recovered_permission_answer(
-                                decision,
-                                &provenance,
+                                decision, &winner,
                             )?;
                         crate::mcp::handlers::permission::resolve_permission_request_domain(
                             &self.orch,
@@ -1846,13 +2013,60 @@ impl ChannelRouter {
                     )
                     .await?;
                 }
+                // What a failure means is the ledger's to say. A refusal the
+                // domain will give again is gated on an operator acting rather
+                // than on time: re-attempting it re-derives the same refusal
+                // from the same stored answer, which is how four permanently
+                // unapprovable actions produced ~112,000 'will retry' lines in a
+                // day (CAIRN-4364). One line at park time, then silence until a
+                // new answer claims the vacated gate.
                 Err(error) => {
-                    ledger::release_ask_action(self.ledger(), &lease, &error).await?;
-                    log::warn!("channel domain action {action_ref} will retry: {error}");
+                    match ledger::record_ask_action_failure(
+                        self.ledger(),
+                        &lease,
+                        &error,
+                        chrono::Utc::now().timestamp_millis(),
+                    )
+                    .await?
+                    {
+                        ledger::AskActionFailure::Parked => {
+                            log::warn!(
+                                "channel domain action {action_ref} is parked for the operator: {error}"
+                            );
+                            self.report_operator_pending(&winner, &error).await;
+                        }
+                        ledger::AskActionFailure::Retryable => {
+                            log::warn!("channel domain action {action_ref} will retry: {error}");
+                        }
+                        // Another worker owns this attempt's outcome; saying
+                        // anything here would be a second voice on one event.
+                        ledger::AskActionFailure::Stale => {}
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// Tells the conversation that answered a gate that its answer was withdrawn
+    /// and the request is waiting for an operator.
+    ///
+    /// Parking is otherwise silent, and a channel reply is the surface that would
+    /// learn nothing: the ledger accepted the answer, and only the domain knew it
+    /// could not be applied. A sweep running on a different provider says
+    /// nothing rather than addressing a conversation it does not own.
+    async fn report_operator_pending(&self, winner: &ledger::AskResolution, refusal: &str) {
+        if winner.winner_provider != self.provider_id
+            || winner.winner_conversation.trim().is_empty()
+        {
+            return;
+        }
+        if let Err(error) = self.send_notice(&winner.winner_conversation, refusal).await {
+            log::warn!(
+                "channel could not report the operator-pending refusal for {}: {error}",
+                winner.action_ref
+            );
+        }
     }
 
     async fn sweep_pending_cleanup(&self) -> Result<(), String> {
@@ -1868,7 +2082,16 @@ impl ChannelRouter {
                         .map(str::to_owned)
                 })
                 .unwrap_or_else(|| "✓ answered in another conversation".to_string());
-            match cleanup_claimed_question(self.provider.as_ref(), &record, &receipt).await {
+            let multi_select = self.question_is_multi_select(&record).await?;
+            match cleanup_claimed_question(
+                self.ledger(),
+                self.provider.as_ref(),
+                &record,
+                &receipt,
+                multi_select,
+            )
+            .await
+            {
                 Ok(()) => {
                     ledger::acknowledge_cleanup(self.ledger(), &record.id).await?;
                 }
@@ -2024,8 +2247,21 @@ impl ChannelRouter {
             &live,
             snapshot_complete,
         );
-        for id in cancelled {
-            ledger::mark_expired(self.ledger(), &id, chrono::Utc::now().timestamp_millis()).await?;
+        for attention in cancelled {
+            if self.gate_is_resolved(&attention.gate).await? {
+                ledger::mark_expired(
+                    self.ledger(),
+                    &attention.id,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
+            } else if delivered < SWEEP_LIMIT
+                && self
+                    .send_claimed(attention.id, attention.gate, false)
+                    .await?
+            {
+                delivered += 1;
+            }
         }
         if snapshot_complete {
             for record in ledger::list_unresolved(self.ledger(), self.provider_id).await? {
@@ -2241,7 +2477,7 @@ impl ChannelRouter {
                     .insert(delivery_key.clone(), deferred);
                 return Ok(false);
             }
-            return self.send_claimed(deferred.id, deferred.gate).await;
+            return self.send_claimed(deferred.id, deferred.gate, false).await;
         }
         let conversation = gate.conversation.as_deref().unwrap_or(&self.destination);
         if let Some(record) = ledger::get_by_conversation_binding(
@@ -2254,10 +2490,42 @@ impl ChannelRouter {
         .await?
         {
             return match record.status.as_str() {
-                // A failed intent may already have crossed the provider boundary.
-                // Retrying it can duplicate an iMessage, so failure is terminal.
+                "pending" => {
+                    if gate.is_presence_aware() && presence == OperatorPresence::Present {
+                        let age_ms = chrono::Utc::now()
+                            .timestamp_millis()
+                            .saturating_sub(record.created_at)
+                            as u64;
+                        if let Some(remaining) =
+                            ATTENTION_GRACE.checked_sub(Duration::from_millis(age_ms))
+                        {
+                            self.deferred_attention
+                                .lock()
+                                .expect("deferred attention set poisoned")
+                                .insert(
+                                    delivery_key,
+                                    DeferredAttention {
+                                        id: record.id,
+                                        gate,
+                                        deadline: now + remaining,
+                                    },
+                                );
+                            return Ok(false);
+                        }
+                    }
+                    self.send_claimed(record.id, gate, false).await
+                }
+                "failed"
+                    if record.attempts < MAX_ATTEMPTS
+                        && record
+                            .next_attempt_at
+                            .is_some_and(|at| at <= chrono::Utc::now().timestamp_millis()) =>
+                {
+                    self.send_claimed(record.id, gate, true).await
+                }
                 "failed" => Ok(false),
                 "expired" => Ok(true),
+                "sent" | "resolved" => Ok(false),
                 _ => Ok(false),
             };
         }
@@ -2278,13 +2546,23 @@ impl ChannelRouter {
                 );
             return Ok(false);
         }
-        self.send_claimed(id, gate).await
+        self.send_claimed(id, gate, false).await
     }
 
     /// Reports whether this call put something on the wire, so a sweep's batch
     /// bounds sends rather than gates examined.
-    async fn send_claimed(&self, id: String, gate: Gate) -> Result<bool, String> {
-        if !ledger::begin_delivery(self.ledger(), &id).await? {
+    async fn send_claimed(&self, id: String, gate: Gate, retry: bool) -> Result<bool, String> {
+        let health = self.provider.health();
+        if matches!(health, super::ChannelHealth::Unavailable { .. }) {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let claimed = if retry {
+            ledger::begin_retry_delivery(self.ledger(), &id, now, MAX_ATTEMPTS).await?
+        } else {
+            ledger::begin_delivery(self.ledger(), &id).await?
+        };
+        if !claimed {
             return Ok(false);
         }
         let options_json = match &gate.ask {
@@ -2333,7 +2611,32 @@ impl ChannelRouter {
                     gate.kind,
                     gate.binding_ref
                 );
-                ledger::mark_failed(self.ledger(), &id, &error).await?;
+                let current = ledger::get_by_id(self.ledger(), &id)
+                    .await?
+                    .ok_or_else(|| format!("delivery intent disappeared: {id}"))?;
+                let increment = matches!(health, super::ChannelHealth::Ready);
+                let attempt = current.attempts + i64::from(increment);
+                let shift = attempt.saturating_sub(1).clamp(0, 16) as u32;
+                let backoff = RETRY_BASE
+                    .checked_mul(1u32 << shift)
+                    .unwrap_or(RETRY_CAP)
+                    .min(RETRY_CAP);
+                ledger::mark_failed(
+                    self.ledger(),
+                    &id,
+                    &error,
+                    now + backoff.as_millis() as i64,
+                    increment,
+                )
+                .await?;
+                if increment && attempt >= MAX_ATTEMPTS {
+                    log::warn!(
+                        "channel delivery terminally failed kind={} binding_ref={} conversation={} attempts={attempt}: {error}",
+                        gate.kind,
+                        gate.binding_ref,
+                        message.conversation,
+                    );
+                }
                 return Ok(false);
             }
         }
@@ -2922,6 +3225,7 @@ pub fn spawn(
     destination: String,
     route: MessageClassPolicy,
     inbound_capabilities: ChannelInboundCapabilities,
+    boundary: SessionBoundary,
 ) -> Vec<tokio::task::JoinHandle<()>> {
     let router = Arc::new(ChannelRouter::new_for_provider(
         orch,
@@ -2954,7 +3258,7 @@ pub fn spawn(
         // here on, and the backlog that predates it belongs to the app, not the
         // phone. Sealing it off COMPLETELY is a precondition for sweeping at all,
         // so a failure parks the sweep rather than letting it text the backlog.
-        while let Err(error) = sweep.draw_the_session_line().await {
+        while let Err(error) = sweep.draw_the_session_line(boundary).await {
             super::set_router_blocker(provider_id, Some(error.clone()));
             log::warn!(
                 "channel cannot seal the pre-session backlog, so it is not sweeping yet: {error}"
@@ -2997,12 +3301,12 @@ pub fn spawn(
 /// separate gates raised within the same second. The router bounds DELIVERIES.
 async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
     db.read(|conn| Box::pin(async move {
-        let mut rows = conn.query("SELECT p.id, p.questions, COALESCE(p.job_id, r.job_id), COALESCE(j.node_name, j.uri_segment, 'agent'), pr.key, i.number, e.seq, j.uri_segment, p.uri_segment FROM prompts p JOIN runs r ON r.id=p.run_id LEFT JOIN jobs j ON j.id=COALESCE(p.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) LEFT JOIN projects pr ON pr.id=i.project_id LEFT JOIN executions e ON e.id=j.execution_id WHERE p.response IS NULL AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY p.created_at DESC", ()).await?;
+        let mut rows = conn.query("SELECT p.id, p.questions, COALESCE(p.job_id, r.job_id), COALESCE(j.node_name, j.uri_segment, 'agent'), p.uri_segment FROM prompts p JOIN runs r ON r.id=p.run_id LEFT JOIN jobs j ON j.id=COALESCE(p.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) WHERE p.response IS NULL AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY p.created_at DESC", ()).await?;
         let mut gates = Vec::new();
         while let Some(row) = rows.next().await? {
             let prompt_id = row.text(0)?; let questions_json = row.text(1)?; let job_id = row.opt_text(2)?; let context = format!("[Cairn · {}]", row.text(3)?);
-            let question_uri = match (row.opt_text(4)?, row.opt_i64(5)?, row.opt_i64(6)?, row.opt_text(7)?, row.opt_text(8)?) {
-                (Some(project), Some(number), Some(exec_seq), Some(node), Some(segment)) => Some(build_node_question_uri(&project, number as i32, exec_seq as i32, &node, &segment)),
+            let question_uri = match (job_id.as_deref(), row.opt_text(4)?) {
+                (Some(job_id), Some(segment)) => crate::jobs::queries::home_uri_for_job_conn(conn, job_id).await?.map(|home| format!("{home}/questions/{segment}")),
                 _ => None,
             };
             let questions: Vec<StoredQuestion> = serde_json::from_str(&questions_json).map_err(|e| crate::storage::DbError::Row(e.to_string()))?;
@@ -3017,8 +3321,8 @@ async fn load_questions(db: &LocalDb) -> Result<Vec<Gate>, String> {
 
 async fn load_permissions(db: &LocalDb) -> Result<Vec<Gate>, String> {
     db.read(|conn| Box::pin(async move {
-        let mut rows = conn.query("SELECT req.id, req.tool_name, req.tool_input, COALESCE(req.job_id,r.job_id), COALESCE(j.node_name,j.uri_segment,'agent'), p.key, i.number, e.seq, j.uri_segment, req.uri_segment FROM permission_requests req JOIN runs r ON r.id=req.run_id LEFT JOIN jobs j ON j.id=COALESCE(req.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) LEFT JOIN projects p ON p.id=i.project_id LEFT JOIN executions e ON e.id=j.execution_id WHERE req.status='pending' AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY req.created_at DESC", ()).await?;
-        let mut gates=Vec::new(); while let Some(row)=rows.next().await? { let id=row.text(0)?; let tool=row.text(1)?; let input=row.text(2)?; let uri=match(row.opt_text(5)?,row.opt_i64(6)?,row.opt_i64(7)?,row.opt_text(8)?,row.opt_text(9)?){(Some(project),Some(number),Some(exec_seq),Some(node),Some(segment))=>Some(build_node_permission_uri(&project,number as i32,exec_seq as i32,&node,&segment)),_=>None}; let summary=permission_ask_body(&tool, &input, uri.as_deref()); let target_uri = uri.as_deref().and_then(routed_gate_target); gates.push(Gate { conversation: None, target_uri, kind:"permission", initiated_by: OutboundInitiator::CairnPush, binding_ref:id.clone(), job_id:row.opt_text(3)?, context:format!("[Cairn · {}]",row.text(4)?), ask:OutboundAsk::Permission { request_id:id, summary } }); } Ok(gates)
+        let mut rows = conn.query("SELECT req.id, req.tool_name, req.tool_input, COALESCE(req.job_id,r.job_id), COALESCE(j.node_name,j.uri_segment,'agent'), req.uri_segment FROM permission_requests req JOIN runs r ON r.id=req.run_id LEFT JOIN jobs j ON j.id=COALESCE(req.job_id,r.job_id) LEFT JOIN issues i ON i.id=COALESCE(j.issue_id,r.issue_id) WHERE req.status='pending' AND COALESCE(i.status,'open') NOT IN ('merged','closed','failed') ORDER BY req.created_at DESC", ()).await?;
+        let mut gates=Vec::new(); while let Some(row)=rows.next().await? { let id=row.text(0)?; let tool=row.text(1)?; let input=row.text(2)?; let job_id=row.opt_text(3)?; let uri=match(job_id.as_deref(),row.opt_text(5)?){(Some(job_id),Some(segment))=>crate::jobs::queries::home_uri_for_job_conn(conn,job_id).await?.map(|home|format!("{home}/permissions/{segment}")),_=>None}; let summary=permission_ask_body(&tool, &input, uri.as_deref()); let target_uri = uri.as_deref().and_then(routed_gate_target); gates.push(Gate { conversation: None, target_uri, kind:"permission", initiated_by: OutboundInitiator::CairnPush, binding_ref:id.clone(), job_id, context:format!("[Cairn · {}]",row.text(4)?), ask:OutboundAsk::Permission { request_id:id, summary } }); } Ok(gates)
     })).await.map_err(|e| e.to_string())
 }
 
@@ -3338,9 +3642,79 @@ const CHANNEL: &str = "imessage";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::ledger::expire_undelivered;
     use crate::models::IMessageChannelConfig;
     use crate::storage::migrated_test_db;
+
+    #[tokio::test]
+    async fn legacy_ownerless_job_questions_load_without_a_uri() {
+        let db = migrated_test_db("channel-router-ownerless-job-question.db").await;
+        db.execute_batch(
+            "INSERT INTO workspaces (id, name, created_at, updated_at)
+               VALUES ('w', 'Workspace', 1, 1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
+             INSERT INTO jobs (id, project_id, agent_config_id, status, uri_segment, created_at, updated_at)
+               VALUES ('legacy-manager', 'p', 'manager', 'failed', 'manager', 1, 1);
+             INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('legacy-run', 'p', 'legacy-manager', 'failed', 1, 1);
+             INSERT INTO prompts (id, run_id, job_id, questions, uri_segment, created_at)
+               VALUES ('legacy-prompt', 'legacy-run', 'legacy-manager',
+                       '[{\"question\":\"Choose?\",\"options\":[]}]', 'q-1', 1);",
+        )
+        .await
+        .unwrap();
+
+        let questions = load_questions(&db).await.unwrap();
+
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].target_uri, None);
+        let OutboundAsk::Question { text, .. } = &questions[0].ask else {
+            panic!("expected question gate")
+        };
+        assert_eq!(text, "Choose?");
+    }
+
+    #[tokio::test]
+    async fn thread_gates_carry_canonical_thread_targets() {
+        let db = migrated_test_db("channel-router-thread-gates.db").await;
+        let fixture = crate::test_support::seed_thread_session(&db).await;
+        db.execute_batch(&format!(
+            "INSERT INTO runs (id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('thread-run', '{}', '{}', 'running', 1, 1);
+             INSERT INTO prompts (id, run_id, job_id, questions, uri_segment, created_at)
+               VALUES ('thread-prompt', 'thread-run', '{}', '[{{\"question\":\"Choose?\",\"options\":[]}}]', 'ask-1', 1);
+             INSERT INTO permission_requests (id, run_id, job_id, tool_use_id, tool_name, tool_input, status, uri_segment, created_at)
+               VALUES ('thread-permission', 'thread-run', '{}', 'tool-1', 'Bash', '{{}}', 'pending', 'permit-1', 1);",
+            fixture.project_id,
+            fixture.session_job_id,
+            fixture.session_job_id,
+            fixture.session_job_id,
+        ))
+        .await
+        .unwrap();
+
+        let questions = load_questions(&db).await.unwrap();
+        assert_eq!(questions.len(), 1);
+        assert_eq!(
+            questions[0].target_uri.as_deref(),
+            Some("cairn://p/thread-project/design")
+        );
+        let OutboundAsk::Question { text, .. } = &questions[0].ask else {
+            panic!("expected question gate")
+        };
+        assert!(text.contains("cairn://p/thread-project/design/questions/ask-1"));
+
+        let permissions = load_permissions(&db).await.unwrap();
+        assert_eq!(permissions.len(), 1);
+        assert_eq!(
+            permissions[0].target_uri.as_deref(),
+            Some("cairn://p/thread-project/design")
+        );
+        let OutboundAsk::Permission { summary, .. } = &permissions[0].ask else {
+            panic!("expected permission gate")
+        };
+        assert!(summary.contains("cairn://p/thread-project/design/permissions/permit-1"));
+    }
 
     /// The rendered plan for a statement, one node per line.
     async fn query_plan(db: &LocalDb, sql: &str, binds: Vec<Value>) -> String {
@@ -4457,6 +4831,17 @@ mod tests {
         cleanups: std::sync::atomic::AtomicUsize,
     }
 
+    impl RecordingPollProvider {
+        fn new() -> Self {
+            Self {
+                sends: Mutex::new(Vec::new()),
+                deliveries: Mutex::new(Vec::new()),
+                next_guid: std::sync::atomic::AtomicUsize::new(1),
+                cleanups: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl ChannelProvider for RecordingPollProvider {
         fn capabilities(&self) -> crate::channels::ChannelCapabilities {
@@ -4491,7 +4876,7 @@ mod tests {
             crate::channels::ChannelHealth::Ready
         }
 
-        async fn cleanup_question(&self, _: &ResolvedQuestionMessage) -> Result<(), String> {
+        async fn cleanup_question(&self, _message: &ResolvedQuestionMessage) -> Result<(), String> {
             self.cleanups
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
@@ -4529,12 +4914,7 @@ mod tests {
         )
         .boot_at(0)
         .build();
-        let provider = Arc::new(RecordingPollProvider {
-            sends: Mutex::new(Vec::new()),
-            deliveries: Mutex::new(Vec::new()),
-            next_guid: std::sync::atomic::AtomicUsize::new(1),
-            cleanups: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let provider = Arc::new(RecordingPollProvider::new());
         let router = ChannelRouter::new(
             orch,
             provider.clone(),
@@ -4868,12 +5248,7 @@ mod tests {
         ] {
             let (orch, db) = route_test_orchestrator(db_name).await;
             seed_threads_and_an_issue(&db).await;
-            let provider = Arc::new(RecordingPollProvider {
-                sends: Mutex::new(Vec::new()),
-                deliveries: Mutex::new(Vec::new()),
-                next_guid: std::sync::atomic::AtomicUsize::new(1),
-                cleanups: std::sync::atomic::AtomicUsize::new(0),
-            });
+            let provider = Arc::new(RecordingPollProvider::new());
             let router = ChannelRouter::new_for_provider(
                 orch,
                 provider,
@@ -4968,12 +5343,7 @@ mod tests {
     }
 
     fn test_router(orch: Orchestrator) -> (ChannelRouter, Arc<RecordingPollProvider>) {
-        let provider = Arc::new(RecordingPollProvider {
-            sends: Mutex::new(Vec::new()),
-            deliveries: Mutex::new(Vec::new()),
-            next_guid: std::sync::atomic::AtomicUsize::new(1),
-            cleanups: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let provider = Arc::new(RecordingPollProvider::new());
         let router = ChannelRouter::new(
             orch,
             provider.clone(),
@@ -4989,12 +5359,7 @@ mod tests {
     #[tokio::test]
     async fn capability_rejection_notice_returns_to_the_arriving_discord_conversation() {
         let (orch, _db) = route_test_orchestrator("channel-router-discord-bounded-notice.db").await;
-        let provider = Arc::new(RecordingPollProvider {
-            sends: Mutex::new(Vec::new()),
-            deliveries: Mutex::new(Vec::new()),
-            next_guid: std::sync::atomic::AtomicUsize::new(1),
-            cleanups: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let provider = Arc::new(RecordingPollProvider::new());
         let router = ChannelRouter::new_for_provider(
             orch,
             provider.clone(),
@@ -5036,12 +5401,7 @@ mod tests {
         ledger::set_focus(&db, "discord", "cairn://p/cairn/general", 2)
             .await
             .unwrap();
-        let provider = Arc::new(RecordingPollProvider {
-            sends: Mutex::new(Vec::new()),
-            deliveries: Mutex::new(Vec::new()),
-            next_guid: std::sync::atomic::AtomicUsize::new(1),
-            cleanups: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let provider = Arc::new(RecordingPollProvider::new());
         let router = ChannelRouter::new_for_provider(
             orch,
             provider.clone(),
@@ -5180,6 +5540,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumed_session_preserves_backlog_and_follow_cursor() {
+        let (orch, db) = route_test_orchestrator("channel-router-resumed-session.db").await;
+        seed_run(&db).await;
+        seed_prompt(&db, "during-outage", 500).await;
+        db.execute_batch(
+            "INSERT INTO channel_conversation_binding
+               (provider, conversation, target_uri, binding_kind, message_classes, followed_at, cursor_rowid, selected_at)
+             VALUES ('imessage', 'imessage:legacy', 'cairn:~/', 'follow', 7, 4, 30, 4);",
+        )
+        .await
+        .unwrap();
+        let (router, _provider) = test_router(orch);
+
+        router
+            .draw_the_session_line(SessionBoundary::Resumed)
+            .await
+            .unwrap();
+
+        let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
+        assert_eq!(follows.len(), 1);
+        assert_eq!(follows[0].cursor_rowid, 30);
+        assert_eq!(
+            db.query_opt_i64("SELECT COUNT(*) FROM channel_outbound", ())
+                .await
+                .unwrap(),
+            Some(0),
+            "asks raised during a short gateway outage remain live"
+        );
+    }
+
+    #[tokio::test]
     async fn startup_drops_an_orphaned_home_relative_focus() {
         let (orch, db) = route_test_orchestrator("channel-router-relative-focus.db").await;
         db.execute(
@@ -5192,7 +5583,10 @@ mod tests {
         .unwrap();
         let (router, _provider) = test_router(orch);
 
-        router.draw_the_session_line().await.unwrap();
+        router
+            .draw_the_session_line(SessionBoundary::Fresh)
+            .await
+            .unwrap();
 
         assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
     }
@@ -5209,7 +5603,10 @@ mod tests {
         .unwrap();
         let (router, _provider) = test_router(orch);
 
-        router.draw_the_session_line().await.unwrap();
+        router
+            .draw_the_session_line(SessionBoundary::Fresh)
+            .await
+            .unwrap();
 
         assert!(ledger::list_follows(&db, CHANNEL).await.unwrap().is_empty());
         assert_eq!(ledger::get_focus(&db, CHANNEL).await.unwrap(), None);
@@ -5241,6 +5638,8 @@ mod tests {
             sent_at: Some(1),
             resolved_at: None,
             last_error: None,
+            attempts: 0,
+            next_attempt_at: None,
         };
 
         assert_eq!(
@@ -5378,7 +5777,10 @@ mod tests {
             .unwrap();
         let (router, _provider) = test_router(orch);
 
-        router.draw_the_session_line().await.unwrap();
+        router
+            .draw_the_session_line(SessionBoundary::Fresh)
+            .await
+            .unwrap();
 
         let follows = ledger::list_follows(&db, CHANNEL).await.unwrap();
         assert_eq!(
@@ -5915,6 +6317,77 @@ mod tests {
         assert_eq!(firing.status, "fired");
     }
 
+    struct UnavailableProvider {
+        sends: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelProvider for UnavailableProvider {
+        fn capabilities(&self) -> crate::channels::ChannelCapabilities {
+            crate::channels::ChannelCapabilities::default()
+        }
+
+        async fn send(
+            &self,
+            _message: &OutboundMessage,
+        ) -> Result<crate::channels::SentIds, String> {
+            self.sends.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("an unavailable provider must not be called")
+        }
+
+        fn subscribe(&self) -> tokio::sync::mpsc::Receiver<InboundEvent> {
+            tokio::sync::mpsc::channel(1).1
+        }
+
+        fn health(&self) -> crate::channels::ChannelHealth {
+            crate::channels::ChannelHealth::Unavailable {
+                reason: "executor offline".into(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_leaves_new_intent_pending_without_sending() {
+        let (orch, db) = route_test_orchestrator("route-unavailable-pending.db").await;
+        let provider = Arc::new(UnavailableProvider {
+            sends: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let router = ChannelRouter::new(
+            orch,
+            provider.clone(),
+            IMessageChannelConfig {
+                enabled: true,
+                to: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+        let gate = Gate {
+            kind: "route",
+            initiated_by: OutboundInitiator::CairnPush,
+            binding_ref: "route:unavailable".into(),
+            job_id: None,
+            context: "[Cairn]".into(),
+            ask: OutboundAsk::Notify {
+                text: "queued".into(),
+            },
+            conversation: None,
+            target_uri: None,
+        };
+
+        assert!(!router
+            .deliver_or_defer(gate, OperatorPresence::Away, Instant::now())
+            .await
+            .unwrap());
+        assert_eq!(provider.sends.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let record = ledger::get_by_binding(&db, CHANNEL, "route", "route:unavailable")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, "pending");
+        assert_eq!(record.last_error, None);
+        assert_eq!(record.next_attempt_at, None);
+    }
+
     struct FailingNotifyProvider;
 
     #[async_trait::async_trait]
@@ -6020,9 +6493,14 @@ mod tests {
         seed_run(&db).await;
         seed_prompt(&db, "backlog", 500).await;
 
-        // The session opens: claim what already exists, then abandon the claims.
-        assert_eq!(sweep_questions(&claims, &db).await, vec!["backlog:0"]);
-        assert_eq!(expire_undelivered(&db, CHANNEL, 500).await.unwrap(), 1);
+        // The session opens: seal what already exists directly into `expired`.
+        for gate in load_questions(&db).await.unwrap() {
+            assert!(
+                seal_gate_for_provider(&claims, &db, CHANNEL, "+15551234567", "text", &gate,)
+                    .await
+                    .unwrap()
+            );
+        }
 
         // A live ask lands in the very same wall-clock second the session opened.
         seed_prompt(&db, "live", 500).await;
@@ -6066,19 +6544,14 @@ mod tests {
         // Sealing is unbounded, so it claims the whole backlog and not one batch.
         let mut sealed = 0;
         for gate in load_questions(&db).await.unwrap() {
-            if claim_gate(&claims, &db, "+15551234567", "text", &gate)
+            if seal_gate_for_provider(&claims, &db, CHANNEL, "+15551234567", "text", &gate)
                 .await
                 .unwrap()
-                .is_some()
             {
                 sealed += 1;
             }
         }
         assert_eq!(sealed, backlog);
-        assert_eq!(
-            expire_undelivered(&db, CHANNEL, 500).await.unwrap() as usize,
-            backlog
-        );
 
         // The live ask shares the backlog's exact timestamp and sorts nowhere in
         // particular among 105 identical keys.
@@ -6141,6 +6614,7 @@ mod tests {
 
     struct CleanupCountingProvider {
         cleanups: std::sync::atomic::AtomicUsize,
+        multi_select: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -6166,9 +6640,11 @@ mod tests {
             crate::channels::ChannelHealth::Ready
         }
 
-        async fn cleanup_question(&self, _: &ResolvedQuestionMessage) -> Result<(), String> {
+        async fn cleanup_question(&self, message: &ResolvedQuestionMessage) -> Result<(), String> {
             self.cleanups
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.multi_select
+                .store(message.multi_select, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -6197,16 +6673,17 @@ mod tests {
             .unwrap();
         let provider = CleanupCountingProvider {
             cleanups: std::sync::atomic::AtomicUsize::new(0),
+            multi_select: std::sync::atomic::AtomicBool::new(false),
         };
 
         let (sweep, answer_delivered) = tokio::join!(
-            cleanup_resolved_question(&db, &provider, &record, "✓ closed"),
+            cleanup_resolved_question(&db, &provider, &record, "✓ closed", false),
             async {
                 let won = ledger::claim_question_answer(&db, &record.id, "Ship it", 12)
                     .await
                     .unwrap();
                 if won {
-                    cleanup_claimed_question(&provider, &record, "✓ answered: Ship it")
+                    cleanup_claimed_question(&db, &provider, &record, "✓ answered: Ship it", false)
                         .await
                         .unwrap();
                     true
@@ -6236,6 +6713,56 @@ mod tests {
                 .as_deref(),
             Some("{\"answer\":\"Ship it\"}")
         );
+    }
+
+    #[tokio::test]
+    async fn finish_question_carries_durable_multi_select_to_provider_cleanup() {
+        let (orch, project_db) =
+            route_test_orchestrator("channel-router-multi-select-cleanup.db").await;
+        seed_run(&project_db).await;
+        project_db.execute("INSERT INTO prompts (id, run_id, questions, created_at) VALUES ('multi', 'run-1', ?1, 1)", (r#"[{"question":"Choose","options":[],"multiSelect":true}]"#,)).await.unwrap();
+        let provider = Arc::new(CleanupCountingProvider {
+            cleanups: std::sync::atomic::AtomicUsize::new(0),
+            multi_select: std::sync::atomic::AtomicBool::new(false),
+        });
+        let router = ChannelRouter::new(
+            orch,
+            provider.clone(),
+            IMessageChannelConfig {
+                enabled: true,
+                to: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+        ledger::insert_intent(
+            router.ledger(),
+            &ledger::NewOutbound {
+                id: "multi-intent",
+                channel: CHANNEL,
+                kind: "question",
+                binding_ref: "multi:0",
+                conversation: "+15551234567",
+                job_id: None,
+                rendered_text: "Choose",
+                rendering: "poll",
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+        ledger::mark_sent(router.ledger(), "multi-intent", "guid", None, None, 2)
+            .await
+            .unwrap();
+        let record = ledger::get_by_binding(router.ledger(), CHANNEL, "question", "multi:0")
+            .await
+            .unwrap()
+            .unwrap();
+
+        router.finish_question(&record, "✓ answered").await.unwrap();
+
+        assert!(provider
+            .multi_select
+            .load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]
@@ -6380,6 +6907,110 @@ mod tests {
         assert!(db.query_one("SELECT resolved_at FROM channel_ask_resolution WHERE binding_ref = 'permission-request'", (), |row| row.i64(0)).await.unwrap() > 0);
     }
 
+    /// A domain effect refused because only an operator may approve it is
+    /// attempted ONCE, and the answer that earned the refusal is withdrawn.
+    ///
+    /// The refusal says nothing about this moment. The stored answer came from a
+    /// surface that is not allowed to give it, so every later attempt re-derives
+    /// the same refusal from the same row — four such actions logged ~112,000
+    /// 'will retry' lines in a day (CAIRN-4364). The quieter half of the bug is
+    /// worse: a channel reply claims the gate before anything asks whether that
+    /// surface may decide, so an unwithdrawn refused answer keeps replaying for
+    /// the operator whose approval the prompt is waiting for.
+    #[tokio::test]
+    async fn an_operator_pending_refusal_parks_the_action_after_one_attempt() {
+        let (orch, db) = route_test_orchestrator("channel-router-operator-pending-park.db").await;
+        seed_run(&db).await;
+        let escape = crate::mcp::handlers::fence::Crossing::shell_command(
+            "command blocked by the executor sandbox".to_string(),
+            "cat ~/.cairn/operator_auth_secret",
+        )
+        .stored_tool_input_for_test();
+        db.execute(
+            "INSERT INTO permission_requests (id, run_id, tool_use_id, tool_name, tool_input, status, created_at) VALUES ('req-1', 'run-1', 'tool-1', 'run', ?1, 'pending', 500)",
+            params![escape],
+        )
+        .await
+        .unwrap();
+        ledger::claim_ask_resolution(
+            &db,
+            "req-1",
+            "allow",
+            cairn_common::identity::AppearanceTransport::ChannelReply,
+            Some(CHANNEL),
+            Some("imessage:+15551234567"),
+            Some("+15551234567"),
+            "permission",
+            "req-1",
+            10,
+        )
+        .await
+        .unwrap();
+
+        let (router, provider) = test_router(orch);
+        for _ in 0..3 {
+            router.sweep_pending_domain_actions().await.unwrap();
+        }
+
+        assert_eq!(
+            db.query_one(
+                "SELECT attempt_count FROM channel_ask_action WHERE action_ref = 'req-1'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            1,
+            "an answer only an operator can lift is attempted once, not once per sweep"
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT parked_at IS NOT NULL FROM channel_ask_action WHERE action_ref = 'req-1'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            1,
+            "the action records that it is waiting for a person"
+        );
+        assert_eq!(
+            db.query_one(
+                "SELECT COUNT(*) FROM channel_ask_resolution WHERE action_ref = 'req-1'",
+                (),
+                |row| row.i64(0)
+            )
+            .await
+            .unwrap(),
+            0,
+            "the refused answer is withdrawn, leaving the gate open for the operator"
+        );
+        assert_eq!(
+            db.query_opt_text(
+                "SELECT status FROM permission_requests WHERE id = 'req-1'",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("pending"),
+        );
+
+        let deliveries = provider.deliveries.lock().unwrap();
+        assert_eq!(
+            deliveries.len(),
+            1,
+            "the conversation that answered is told once, not once per sweep"
+        );
+        let OutboundAsk::Notify { text } = &deliveries[0].ask else {
+            panic!("expected a notice back to the answering conversation")
+        };
+        assert!(
+            text.contains("still pending for the operator"),
+            "unexpected notice: {text}"
+        );
+    }
+
     #[test]
     fn permission_words_are_strict() {
         for spelling in ["1", "yes", "y", "approve", "allow", "Approve"] {
@@ -6416,6 +7047,8 @@ mod tests {
             sent_at: Some(0),
             resolved_at: None,
             last_error: None,
+            attempts: 0,
+            next_attempt_at: None,
         };
         assert_eq!(question_answer(&record, "2"), "New");
         assert_eq!(
@@ -6518,7 +7151,10 @@ mod tests {
         assert!(cancel_resolved_attention(&mut deferred, &HashSet::new(), false).is_empty());
         assert!(deferred.contains_key("healthy:0"));
         assert_eq!(
-            cancel_resolved_attention(&mut deferred, &HashSet::new(), true),
+            cancel_resolved_attention(&mut deferred, &HashSet::new(), true)
+                .into_iter()
+                .map(|attention| attention.id)
+                .collect::<Vec<_>>(),
             vec!["intent"]
         );
         assert!(deferred.is_empty());

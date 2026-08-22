@@ -20,6 +20,9 @@ pub const ROOT_URI: &str = "cairn://";
 /// rather than the client resolving it textually.
 const HOME_PREFIX: &str = "cairn:~";
 
+/// The project-anchored shorthand, also resolved live by the host.
+const PROJECT_PREFIX: &str = "cairn:@";
+
 /// The segments of a canonical `cairn://` URI, with any `?query` discarded.
 ///
 /// The root yields an empty vector. A target that is not canonical — a `file:`
@@ -56,6 +59,7 @@ pub fn nearest_ancestor(uri: &str) -> Option<String> {
     if segments.is_empty() {
         return None;
     }
+
     loop {
         segments.pop();
         if segments.is_empty() {
@@ -103,7 +107,11 @@ pub fn resolve_relative(base: &str, input: &str) -> Result<String, String> {
     }
     // The host resolves home shorthand against the authenticated run; a client
     // that expanded it textually would answer with a stale home.
-    if input == HOME_PREFIX || input.starts_with("cairn:~/") {
+    if input == HOME_PREFIX
+        || input.starts_with("cairn:~/")
+        || input == PROJECT_PREFIX
+        || input.starts_with(PROJECT_PREFIX)
+    {
         return Ok(input.to_string());
     }
 
@@ -203,6 +211,18 @@ mod tests {
             resolve_relative(ROOT_URI, "cairn:~/todos").unwrap(),
             "cairn:~/todos"
         );
+    }
+
+    #[test]
+    fn project_shorthand_is_forwarded_for_the_host_to_resolve() {
+        for target in [
+            "cairn:@",
+            "cairn:@/issues?status=active",
+            "cairn:@4321",
+            "cairn:@performance",
+        ] {
+            assert_eq!(resolve_relative(ROOT_URI, target).unwrap(), target);
+        }
     }
 
     #[test]

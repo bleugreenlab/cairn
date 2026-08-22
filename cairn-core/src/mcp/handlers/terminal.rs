@@ -4,13 +4,13 @@
 //! batches, but share the same process/sandbox primitives where behavior overlaps.
 
 use super::run::MAX_BUFFER_SIZE;
-use crate::services::{ensure_submitted_line, get_default_shell, LeaseTerminalBinding, PtySession};
+use crate::services::{ensure_submitted_line, LeaseTerminalBinding, PtySession};
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::executor_protocol::{
     CellOwnerRef, ProcessSandboxMode, ResidencyAcquireRequest, ResidencyFence, ResidencyOperation,
     ResidencyResult, ResidentProcessEvent, ResidentProcessEventKind, ResidentProcessIoMode,
     ResidentProcessKind, ResidentProcessSpec, ResidentProcessStatus, ResidentPtySize,
-    ResidentSandboxPolicy,
+    ResidentSandboxPolicy, RESIDENT_PROCESS_DEFAULT_SHELL, RESIDENT_PROCESS_SHELL_COMMAND_FLAG,
 };
 use cairn_common::ids;
 use cairn_common::uri::CairnResource;
@@ -2793,7 +2793,11 @@ async fn spawn_terminal_session(
     } else {
         super::run::RunCheckout::ProjectLive
     };
-    let program = shell.unwrap_or_else(get_default_shell);
+    // An omitted shell is an intent, not a runner-local path. The executor may
+    // live on another platform, so only the machine that owns the PTY can turn
+    // this marker into its user's shell. Explicit shell configuration remains a
+    // concrete program and is validated by that same spawn site.
+    let program = shell.unwrap_or_else(|| RESIDENT_PROCESS_DEFAULT_SHELL.to_string());
     let resolved_sandbox = super::run::build_run_sandbox_policy(
         orch,
         &target.cwd,
@@ -2808,15 +2812,11 @@ async fn spawn_terminal_session(
         (true, super::run::RunCheckout::AgentOwned) => ProcessSandboxMode::Confined,
         (true, super::run::RunCheckout::ProjectLive) => ProcessSandboxMode::ReadOnlyCheckout,
     };
-    let sandbox_policy = resolved_sandbox.map(|(mut policy, _)| {
-        // Every terminal boots the user's real shell, whose startup config then
-        // runs inside the fence and needs its own state roots writable. Granted
-        // for both command modes: a `ShellInput` terminal is a full interactive
-        // shell, and shells differ in what a non-interactive `-c` still sources
-        // (fish reads its config either way), so the grant follows the shell
-        // rather than the mode. A `run` batch goes through `/bin/sh -c` and
-        // sources no user config, which is why it does not ask for this.
-        policy.grant_interactive_shell_state(&program);
+    let sandbox_policy = resolved_sandbox.map(|(policy, _)| {
+        // Shell-state grants are added after program resolution by the executor.
+        // Their paths derive from that machine's HOME and XDG environment, so
+        // materializing them here would repeat the same cross-machine bug as
+        // resolving the shell executable on the runner.
         ResidentSandboxPolicy {
             worktree: policy.worktree.to_string_lossy().into_owned(),
             writable_extra: policy
@@ -2841,13 +2841,10 @@ async fn spawn_terminal_session(
     // typed line, which the shell survives. With no command there is nothing to
     // bind either way, and both modes are the same bare shell.
     let args = match command_mode {
-        TerminalCommandMode::LifetimeProcess if !command.is_empty() => {
-            if cfg!(windows) {
-                vec!["-Command".to_string(), command.clone()]
-            } else {
-                vec!["-c".to_string(), command.clone()]
-            }
-        }
+        TerminalCommandMode::LifetimeProcess if !command.is_empty() => vec![
+            RESIDENT_PROCESS_SHELL_COMMAND_FLAG.to_string(),
+            command.clone(),
+        ],
         _ => Vec::new(),
     };
     let result = orch
@@ -3982,15 +3979,6 @@ mod terminal_finalize_tests {
         )
     }
 
-    /// The shell flag that carries a command as the shell's own argument.
-    fn shell_command_flag() -> &'static str {
-        if cfg!(windows) {
-            "-Command"
-        } else {
-            "-c"
-        }
-    }
-
     /// A terminal an agent job owns. The seeded run identity is what carries the
     /// agent's fence dial into the spawn; a target left without one models the
     /// operator's own terminal, which no dial stands behind.
@@ -4047,6 +4035,44 @@ mod terminal_finalize_tests {
         process
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn omitted_terminal_shell_crosses_the_wire_as_spawn_side_intent() {
+        let db = crate::storage::migrated_test_db("term_default_shell_intent.db").await;
+        let orch = test_orchestrator(db);
+        seed(&orch.db.local).await;
+        seed_terminal_fence(&orch, Fence::Allow).await;
+        let checkout = tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join(".jj")).unwrap();
+        let (mut target, fence) = test_terminal_target("default-shell-intent");
+        target.cwd = checkout.path().to_string_lossy().into_owned();
+        target.run_id = Some("run-terminal-policy".into());
+        let (executor, _, _, start_process) =
+            attach_fake_terminal_executor(&orch, fence, FakeTerminalStart::ImmediateExit);
+
+        spawn_terminal_session(
+            &orch,
+            node_terminal_resource(&target.slug),
+            target,
+            "echo ready".into(),
+            None,
+            None,
+            None,
+            ResidentPtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let process = start_process.lock().unwrap().clone().unwrap();
+        executor.abort();
+        assert_eq!(process.program, RESIDENT_PROCESS_DEFAULT_SHELL);
+        assert!(!process.program.starts_with('/'));
+    }
+
     /// An agent's terminal *is* the command it was asked to run: the executor
     /// receives that command as the shell's own argument, so the keyed process
     /// dies exactly when the command finishes and reports its real status. Typing
@@ -4068,7 +4094,10 @@ mod terminal_finalize_tests {
 
         assert_eq!(
             process.args,
-            vec![shell_command_flag().to_string(), "bun test".to_string()],
+            vec![
+                RESIDENT_PROCESS_SHELL_COMMAND_FLAG.to_string(),
+                "bun test".to_string()
+            ],
             "an agent terminal must run its command as the lifetime process"
         );
     }
@@ -4334,7 +4363,7 @@ mod terminal_finalize_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn terminal_spawn_grants_the_shell_its_own_state_writes() {
+    async fn terminal_spawn_leaves_shell_state_resolution_to_the_executor() {
         let db = crate::storage::migrated_test_db("term_policy_shell_state.db").await;
         let orch = test_orchestrator(db);
         seed(&orch.db.local).await;
@@ -4351,18 +4380,14 @@ mod terminal_finalize_tests {
         let policy = process
             .sandbox_policy
             .expect("ask fence must carry a policy");
-        // Which roots those are is pinned hermetically in cairn-sandbox; what
-        // this pins is that the terminal seam asks for them at all, so a fenced
-        // shell stops printing denial stanzas over its own startup.
-        for dir in crate::services::sandbox::interactive_shell_state_dirs("/bin/sh") {
-            assert!(
-                policy
+        assert!(
+            crate::services::sandbox::interactive_shell_state_dirs("/bin/sh")
+                .into_iter()
+                .all(|dir| !policy
                     .writable_extra
-                    .contains(&dir.to_string_lossy().into_owned()),
-                "the shell's own state must stay writable inside the fence: {}",
-                dir.display()
-            );
-        }
+                    .contains(&dir.to_string_lossy().into_owned())),
+            "runner-local shell state paths must not cross to another machine"
+        );
     }
 
     fn test_terminal_slot(fence: &ResidencyFence) -> PersistentCellState {
@@ -4413,6 +4438,7 @@ mod terminal_finalize_tests {
             occupancy: cairn_common::executor_protocol::CellOccupancy {
                 command: None,
                 command_ownership: None,
+                draining: None,
                 processes: std::collections::BTreeMap::from([(
                     "main".into(),
                     ResidentProcess {

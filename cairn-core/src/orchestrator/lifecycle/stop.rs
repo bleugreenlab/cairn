@@ -581,7 +581,12 @@ pub fn live_run_id_for_job(orch: &Orchestrator, job_id: &str) -> Option<String> 
         .map_err(|e| e.to_string())
     })
     .ok()
-    .and_then(|ids| ids.into_iter().next())
+    .and_then(|ids| {
+        ids.iter()
+            .find(|run_id| orch.process_state.has_process(run_id) == Some(true))
+            .cloned()
+            .or_else(|| ids.into_iter().next())
+    })
 }
 
 /// Deliberately stop a running workflow node (CAIRN-2516).

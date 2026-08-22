@@ -441,8 +441,8 @@ impl PackManifest {
             return Vec::new();
         };
         match super::mcp::parse_pack_mcp_file(&path) {
-            Ok(servers) => {
-                let mut names: Vec<String> = servers.into_keys().collect();
+            Ok(file) => {
+                let mut names: Vec<String> = file.servers.into_keys().collect();
                 names.sort();
                 names
             }

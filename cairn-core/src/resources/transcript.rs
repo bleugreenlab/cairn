@@ -20,6 +20,49 @@ pub(super) struct EventRow {
     pub created_at: i64,
 }
 
+/// Load the raw transcript content for one immutable era span.
+///
+/// The summary model benefits from the event payloads rather than the compact
+/// UI projection: user and assistant prose remain intact, while tool events
+/// retain the target and outcome that made the turn meaningful.
+pub(crate) async fn era_source_digest(
+    db: &crate::storage::LocalDb,
+    job_id: &str,
+    start_block: i64,
+    end_block: i64,
+) -> Result<String, String> {
+    let conn = db.connect().await.map_err(|error| error.to_string())?;
+    let events = load_job_events_ordered(
+        &conn,
+        job_id,
+        db.team_id().map(|_| db.content_store().as_ref()),
+        db.private_route_db().map(|db| db.as_ref()),
+    )
+    .await;
+    let blocks = group_turn_blocks(&events);
+    let start = start_block.max(0) as usize;
+    let end = (end_block.max(start_block).max(0) as usize).min(blocks.len().saturating_sub(1));
+    let mut digest = String::new();
+    for (index, block) in blocks
+        .iter()
+        .enumerate()
+        .take(end.saturating_add(1))
+        .skip(start)
+    {
+        digest.push_str(&format!("\n## Turn {}\n", index + 1));
+        for event in &block.events {
+            digest.push_str(&event.event_type);
+            digest.push_str(": ");
+            digest.push_str(&event.data);
+            digest.push('\n');
+        }
+    }
+    // An era is normally bounded by fold policy. This is a final guard for
+    // legacy first-pass spans and pathological tool output.
+    digest.truncate(digest.floor_char_boundary(96_000));
+    Ok(digest)
+}
+
 impl EventRow {
     fn to_transcript_row(&self) -> crate::transcripts::TranscriptRow {
         (
@@ -2127,8 +2170,8 @@ mod tests {
     /// rendered transcript body selects the same matched-line *contents* the old
     /// transcript grep did for `grep`/`-i`/`context` and for
     /// `grep`/`-i`/`head_limit` (without context). The output format gains a
-    /// line-number prefix and `head_limit` now caps output lines rather than
-    /// matches; both are intentional unifications, so parity is over content.
+    /// line-number prefix; `head_limit` caps matches, as its name says, so
+    /// parity is over content.
     #[test]
     fn universal_grep_matches_old_transcript_selection() {
         use crate::mcp::handlers::search::{build_grep_payload, grep_materialized_body};
@@ -2157,10 +2200,10 @@ mod tests {
             None,
         )
         .unwrap();
-        let (rendered, matches) = grep_materialized_body(transcript, &payload).unwrap();
-        assert_eq!(matches, 2);
+        let window = grep_materialized_body(transcript, &payload).unwrap();
+        assert_eq!(window.match_count, Some(2));
         assert_eq!(
-            contents(&rendered),
+            contents(&window.body),
             vec!["alpha", "Beta match", "gamma", "second MATCH", "omega"],
         );
 
@@ -2175,8 +2218,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let (rendered, _matches) = grep_materialized_body(transcript, &payload).unwrap();
-        assert_eq!(contents(&rendered), vec!["Beta match"]);
+        let window = grep_materialized_body(transcript, &payload).unwrap();
+        assert_eq!(contents(&window.body), vec!["Beta match"]);
+        // One of two matches shown, and the window says so rather than letting
+        // the body pass for the whole transcript's hits.
+        assert_eq!(window.match_count, Some(2));
+        assert_eq!(window.shown, Some(1));
 
         // No matches: the shared finalizer's message.
         let payload = build_grep_payload(
@@ -2189,9 +2236,9 @@ mod tests {
             None,
         )
         .unwrap();
-        let (rendered, matches) = grep_materialized_body(transcript, &payload).unwrap();
-        assert_eq!(matches, 0);
-        assert_eq!(rendered, "No matches found for pattern 'zeta'");
+        let window = grep_materialized_body(transcript, &payload).unwrap();
+        assert_eq!(window.match_count, Some(0));
+        assert_eq!(window.body, "No matches found for pattern 'zeta'");
     }
 
     #[tokio::test]

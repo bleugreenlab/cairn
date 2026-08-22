@@ -1,32 +1,98 @@
+//! The two Turso migration lineages and everything derived from them.
+//!
+//! A migration's identity is written exactly once, as the name of its SQL file.
+//! `migration!` and `team_migration!` below turn that one filename stem into the
+//! registered version, the registered name, and the `include_str!` path, so the
+//! three can never disagree and renumbering is a file rename plus one string.
+
+/// Registers a private-lineage migration (`turso_migrations/`) from its SQL
+/// filename stem.
+///
+/// The stem — `0205_wake_schedules` — is the whole identity: the version, the
+/// name recorded in `cairn_schema_migrations`, and the embedded SQL all come
+/// from it. A stem that is not `NNNN_name`, or that names no file, fails the
+/// build rather than registering a migration nobody wrote.
+///
+/// The `rebuild_fk_off:` form registers a table-rebuilding migration and states
+/// what the rebuild must preserve; see `Migration::rebuild_fk_off`.
+macro_rules! migration {
+    ($stem:literal) => {
+        Migration::new(
+            version_from_stem($stem),
+            name_from_stem($stem),
+            include_str!(concat!("../../../../turso_migrations/", $stem, ".sql")),
+        )
+    };
+    ($stem:literal, rebuild_fk_off: $verify:expr $(,)?) => {
+        Migration::rebuild_fk_off(
+            version_from_stem($stem),
+            name_from_stem($stem),
+            include_str!(concat!("../../../../turso_migrations/", $stem, ".sql")),
+            $verify,
+        )
+    };
+}
+
+/// CAIRN-4477: retry state for the runner-local outbound channel queue.
+macro_rules! private_channel_outbound_retry {
+    () => {
+        migration!("0211_channel_outbound_retry")
+    };
+}
+
+/// CAIRN-4398: serve the per-job newest-check-result projection from one
+/// check-partitioned recency index. `check_result_cache` is shared project state,
+/// so both database lineages compose this migration.
+macro_rules! shared_tail_check_result_cache_job_check_recency_index {
+    () => {
+        migration!("0209_check_result_cache_job_check_recency_index")
+    };
+}
+
+/// Registers a team-lineage migration (`turso_migrations_team/`) from its SQL
+/// filename stem. Identity is derived exactly as in `migration!`.
+macro_rules! team_migration {
+    ($stem:literal) => {
+        Migration::new(
+            version_from_stem($stem),
+            name_from_stem($stem),
+            include_str!(concat!("../../../../turso_migrations_team/", $stem, ".sql")),
+        )
+    };
+}
+
 macro_rules! private_codex_watchdog_ledger {
     () => {
-        Migration::new(
-            "0188",
-            "codex_watchdog_ledger",
-            include_str!("../../../../turso_migrations/0188_codex_watchdog_ledger.sql"),
-        )
+        migration!("0188_codex_watchdog_ledger")
     };
 }
 
 /// Reconstructable launch payloads for ephemeral calls waiting in local runtime admission.
 macro_rules! private_prepared_runtime_calls {
     () => {
-        Migration::new(
-            "0204",
-            "prepared_runtime_calls",
-            include_str!("../../../../turso_migrations/0204_prepared_runtime_calls.sql"),
-        )
+        migration!("0204_prepared_runtime_calls")
     };
 }
 
 /// Anchored recurrence rules owned by a durable local thread home.
 macro_rules! private_wake_schedules {
     () => {
-        Migration::new(
-            "0205",
-            "wake_schedules",
-            include_str!("../../../../turso_migrations/0205_wake_schedules.sql"),
-        )
+        migration!("0205_wake_schedules")
+    };
+}
+
+/// Persisted era summaries for thread seed composition (CAIRN-4302).
+macro_rules! private_thread_eras {
+    () => {
+        migration!("0207_thread_eras")
+    };
+}
+
+/// CAIRN-4364: parks a channel domain action whose refusal only an operator can
+/// lift, so the cadence sweep stops retrying an answer that cannot change.
+macro_rules! private_channel_ask_action_park {
+    () => {
+        migration!("0208_channel_ask_action_park")
     };
 }
 
@@ -36,11 +102,7 @@ macro_rules! private_wake_schedules {
 /// nothing and cost a payload per merge.
 macro_rules! private_codemap_cache {
     () => {
-        Migration::new(
-            "0202",
-            "codemap_cache",
-            include_str!("../../../../turso_migrations/0202_codemap_cache.sql"),
-        )
+        migration!("0202_codemap_cache")
     };
 }
 
@@ -48,21 +110,13 @@ macro_rules! private_codemap_cache {
 /// only authority for these rows; team admission is coordinated by Postgres.
 macro_rules! private_runtime_admission {
     () => {
-        Migration::new(
-            "0203",
-            "runtime_admission",
-            include_str!("../../../../turso_migrations/0203_runtime_admission.sql"),
-        )
+        migration!("0203_runtime_admission")
     };
 }
 
 macro_rules! shared_tail_liveness_join_indexes {
     () => {
-        Migration::new(
-            "0195",
-            "index_liveness_joins",
-            include_str!("../../../../turso_migrations/0195_index_liveness_joins.sql"),
-        )
+        migration!("0195_index_liveness_joins")
     };
 }
 
@@ -71,11 +125,7 @@ macro_rules! shared_tail_liveness_join_indexes {
 /// ProjectScoped, so the change is written once and composed into both lineages.
 macro_rules! shared_tail_attention_push_retirement {
     () => {
-        Migration::new(
-            "0196",
-            "attention_push_retirement",
-            include_str!("../../../../turso_migrations/0196_attention_push_retirement.sql"),
-        )
+        migration!("0196_attention_push_retirement")
     };
 }
 
@@ -84,67 +134,37 @@ macro_rules! shared_tail_attention_push_retirement {
 /// from the team lineage.
 macro_rules! private_attention_push_retirement_backfill {
     () => {
-        Migration::new(
-            "0197",
-            "attention_push_retirement_backfill",
-            include_str!(
-                "../../../../turso_migrations/0197_attention_push_retirement_backfill.sql"
-            ),
-        )
+        migration!("0197_attention_push_retirement_backfill")
     };
 }
 
 macro_rules! private_posts {
     () => {
-        Migration::new(
-            "0194",
-            "posts",
-            include_str!("../../../../turso_migrations/0194_posts.sql"),
-        )
+        migration!("0194_posts")
     };
 }
 
 macro_rules! private_canonical_project_routes {
     () => {
-        Migration::new(
-            "0193",
-            "canonical_project_routes",
-            include_str!("../../../../turso_migrations/0193_canonical_project_routes.sql"),
-        )
+        migration!("0193_canonical_project_routes")
     };
 }
 
 macro_rules! shared_tail_canonical_project_keys {
     () => {
-        Migration::new(
-            "0191",
-            "canonical_project_keys",
-            include_str!("../../../../turso_migrations/0191_canonical_project_keys.sql"),
-        )
+        migration!("0191_canonical_project_keys")
     };
 }
 
 macro_rules! private_canonical_discord_surface_project_keys {
     () => {
-        Migration::new(
-            "0192",
-            "canonical_discord_surface_project_keys",
-            include_str!(
-                "../../../../turso_migrations/0192_canonical_discord_surface_project_keys.sql"
-            ),
-        )
+        migration!("0192_canonical_discord_surface_project_keys")
     };
 }
 
 macro_rules! private_canonicalize_channel_permission_answers {
     () => {
-        Migration::new(
-            "0190",
-            "canonicalize_channel_permission_answers",
-            include_str!(
-                "../../../../turso_migrations/0190_canonicalize_channel_permission_answers.sql"
-            ),
-        )
+        migration!("0190_canonicalize_channel_permission_answers")
     };
 }
 
@@ -154,11 +174,7 @@ macro_rules! private_canonicalize_channel_permission_answers {
 /// both.
 macro_rules! shared_tail_project_thread_number {
     () => {
-        Migration::new(
-            "0199",
-            "project_thread_number",
-            include_str!("../../../../turso_migrations/0199_project_thread_number.sql"),
-        )
+        migration!("0199_project_thread_number")
     };
 }
 
@@ -168,11 +184,20 @@ macro_rules! shared_tail_project_thread_number {
 /// telemetry — so the change is written once and composed into both lineages.
 macro_rules! shared_tail_job_file_activity {
     () => {
-        Migration::new(
-            "0201",
-            "job_file_activity",
-            include_str!("../../../../turso_migrations/0201_job_file_activity.sql"),
-        )
+        migration!("0201_job_file_activity")
+    };
+}
+
+macro_rules! shared_tail_job_presence {
+    () => {
+        migration!("0210_job_presence")
+    };
+}
+
+/// Partial index for the sidebar thread unread scan (CAIRN-4331).
+macro_rules! shared_tail_thread_unread_scan_index {
+    () => {
+        migration!("0206_index_thread_unread_scan")
     };
 }
 
@@ -181,190 +206,116 @@ macro_rules! shared_tail_job_file_activity {
 /// would let a teammate's reading clear this operator's unread badge.
 macro_rules! private_thread_read_positions {
     () => {
-        Migration::new(
-            "0200",
-            "thread_read_positions",
-            include_str!("../../../../turso_migrations/0200_thread_read_positions.sql"),
-        )
+        migration!("0200_thread_read_positions")
     };
 }
 
 macro_rules! shared_tail_thread_status_rollup_index {
     () => {
-        Migration::new(
-            "0198",
-            "index_thread_status_rollup",
-            include_str!("../../../../turso_migrations/0198_index_thread_status_rollup.sql"),
-        )
+        migration!("0198_index_thread_status_rollup")
     };
 }
 
 macro_rules! private_github_relay_key_rotation_time {
     () => {
-        Migration::new(
-            "0189",
-            "github_relay_key_rotation_time",
-            include_str!("../../../../turso_migrations/0189_github_relay_key_rotation_time.sql"),
-        )
+        migration!("0189_github_relay_key_rotation_time")
     };
 }
 
 macro_rules! private_repair_prompts_column_order_parity {
     () => {
-        Migration::rebuild_fk_off(
-            "0186",
-            "repair_prompts_column_order_parity",
-            include_str!(
-                "../../../../turso_migrations/0186_repair_prompts_column_order_parity.sql"
-            ),
-            &[RebuildCheck::Conserved("prompts")],
+        migration!(
+            "0186_repair_prompts_column_order_parity",
+            rebuild_fk_off: &[RebuildCheck::Conserved("prompts")]
         )
     };
 }
 
 macro_rules! private_ask_resolution_provenance {
     () => {
-        Migration::new(
-            "0184",
-            "ask_resolution_provenance",
-            include_str!("../../../../turso_migrations/0184_ask_resolution_provenance.sql"),
-        )
+        migration!("0184_ask_resolution_provenance")
     };
 }
 
 macro_rules! private_repair_attention_pushes_index_parity {
     () => {
-        Migration::new(
-            "0185",
-            "repair_attention_pushes_index_parity",
-            include_str!(
-                "../../../../turso_migrations/0185_repair_attention_pushes_index_parity.sql"
-            ),
-        )
+        migration!("0185_repair_attention_pushes_index_parity")
     };
 }
 
 macro_rules! shared_tail_issue_authorship {
     () => {
-        Migration::new(
-            "0187",
-            "issue_authorship",
-            include_str!("../../../../turso_migrations/0187_issue_authorship.sql"),
-        )
+        migration!("0187_issue_authorship")
     };
 }
 
 macro_rules! private_channel_ask_resolution {
     () => {
-        Migration::new(
-            "0182",
-            "channel_ask_resolution",
-            include_str!("../../../../turso_migrations/0182_channel_ask_resolution.sql"),
-        )
+        migration!("0182_channel_ask_resolution")
     };
 }
 
 macro_rules! private_channel_conversation_binding {
     () => {
-        Migration::new(
-            "0181",
-            "channel_conversation_binding",
-            include_str!("../../../../turso_migrations/0181_channel_conversation_binding.sql"),
-        )
+        migration!("0181_channel_conversation_binding")
     };
 }
 
 macro_rules! private_discord_surface {
     () => {
-        Migration::new(
-            "0180",
-            "discord_surface",
-            include_str!("../../../../turso_migrations/0180_discord_surface.sql"),
-        )
+        migration!("0180_discord_surface")
     };
 }
 
 macro_rules! private_channel_inbound_rejection_reason {
     () => {
-        Migration::new(
-            "0176",
-            "channel_inbound_rejection_reason",
-            include_str!("../../../../turso_migrations/0176_channel_inbound_rejection_reason.sql"),
-        )
+        migration!("0176_channel_inbound_rejection_reason")
     };
 }
 
 macro_rules! private_github_relay_pending_key {
     () => {
-        Migration::new(
-            "0179",
-            "github_relay_pending_key",
-            include_str!("../../../../turso_migrations/0179_github_relay_pending_key.sql"),
-        )
+        migration!("0179_github_relay_pending_key")
     };
 }
 
 macro_rules! private_github_relay_delivery_health {
     () => {
-        Migration::new(
-            "0178",
-            "github_relay_delivery_health",
-            include_str!("../../../../turso_migrations/0178_github_relay_delivery_health.sql"),
-        )
+        migration!("0178_github_relay_delivery_health")
     };
 }
 
-use super::migration::RebuildCheck;
+use super::migration::{name_from_stem, version_from_stem, RebuildCheck};
 use super::Migration;
 
 macro_rules! shared_tail_tool_analytics_hourly {
     () => {
-        Migration::new(
-            "0177",
-            "tool_analytics_hourly",
-            include_str!("../../../../turso_migrations/0177_tool_analytics_hourly.sql"),
-        )
+        migration!("0177_tool_analytics_hourly")
     };
 }
 
 macro_rules! private_canonicalize_uri_identity_columns {
     () => {
-        Migration::new(
-            "0175",
-            "canonicalize_uri_identity_columns",
-            include_str!("../../../../turso_migrations/0175_canonicalize_uri_identity_columns.sql"),
-        )
+        migration!("0175_canonicalize_uri_identity_columns")
     };
 }
 
 macro_rules! shared_tail_lowercase_project_keys {
     () => {
-        Migration::new(
-            "0173",
-            "lowercase_project_keys",
-            include_str!("../../../../turso_migrations/0173_lowercase_project_keys.sql"),
-        )
+        migration!("0173_lowercase_project_keys")
     };
 }
 
 macro_rules! private_lowercase_project_routes {
     () => {
-        Migration::new(
-            "0174",
-            "lowercase_project_routes",
-            include_str!("../../../../turso_migrations/0174_lowercase_project_routes.sql"),
-        )
+        migration!("0174_lowercase_project_routes")
     };
 }
 
 /// CAIRN-3897: make the two logical families sharing check_result_cache explicit.
 macro_rules! shared_tail_check_result_cache_row_family {
     () => {
-        Migration::new(
-            "0171",
-            "check_result_cache_row_family",
-            include_str!("../../../../turso_migrations/0171_check_result_cache_row_family.sql"),
-        )
+        migration!("0171_check_result_cache_row_family")
     };
 }
 
@@ -390,31 +341,19 @@ macro_rules! shared_tail {
         // written once here. The SQL file lives in `turso_migrations/`; it is
         // numbered 0084 to follow the private head (0082 + the 0083 cas_cache
         // private head), and the team lineage records it after its 0002 head.
-        Migration::new(
-            "0084",
-            "archival_pack_hash",
-            include_str!("../../../../turso_migrations/0084_archival_pack_hash.sql"),
-        )
+        migration!("0084_archival_pack_hash")
     };
 }
 
 macro_rules! private_build_change_ride_alongs {
     () => {
-        Migration::new(
-            "0170",
-            "build_change_ride_alongs",
-            include_str!("../../../../turso_migrations/0170_build_change_ride_alongs.sql"),
-        )
+        migration!("0170_build_change_ride_alongs")
     };
 }
 
 macro_rules! private_route_fact_samples {
     () => {
-        Migration::new(
-            "0169",
-            "route_fact_samples",
-            include_str!("../../../../turso_migrations/0169_route_fact_samples.sql"),
-        )
+        migration!("0169_route_fact_samples")
     };
 }
 
@@ -422,11 +361,7 @@ macro_rules! private_route_fact_samples {
 /// shared project state, so the index is composed once into both lineages.
 macro_rules! shared_tail_turns_created_at_index {
     () => {
-        Migration::new(
-            "0163",
-            "turns_created_at_index",
-            include_str!("../../../../turso_migrations/0163_turns_created_at_index.sql"),
-        )
+        migration!("0163_turns_created_at_index")
     };
 }
 
@@ -435,11 +370,7 @@ macro_rules! shared_tail_turns_created_at_index {
 /// file's header for why that is an authorization property, not a storage one.
 macro_rules! private_authority_grants {
     () => {
-        Migration::new(
-            "0166",
-            "authority_grants",
-            include_str!("../../../../turso_migrations/0166_authority_grants.sql"),
-        )
+        migration!("0166_authority_grants")
     };
 }
 
@@ -449,21 +380,13 @@ macro_rules! private_authority_grants {
 /// would send a disclosure hint further than the disclosure.
 macro_rules! private_authority_attribution {
     () => {
-        Migration::new(
-            "0183",
-            "authority_attribution",
-            include_str!("../../../../turso_migrations/0183_authority_attribution.sql"),
-        )
+        migration!("0183_authority_attribution")
     };
 }
 
 macro_rules! private_disclosure_remediation {
     () => {
-        Migration::new(
-            "0172",
-            "disclosure_remediation",
-            include_str!("../../../../turso_migrations/0172_disclosure_remediation.sql"),
-        )
+        migration!("0172_disclosure_remediation")
     };
 }
 
@@ -472,52 +395,32 @@ macro_rules! private_disclosure_remediation {
 /// Carries the inheritance job creation now performs back over existing rows.
 macro_rules! shared_tail_inherit_thread_id_for_child_jobs {
     () => {
-        Migration::new(
-            "0167",
-            "inherit_thread_id_for_child_jobs",
-            include_str!("../../../../turso_migrations/0167_inherit_thread_id_for_child_jobs.sql"),
-        )
+        migration!("0167_inherit_thread_id_for_child_jobs")
     };
 }
 
 /// CAIRN-3888: durable current arm attempt for turn-end check settlement.
 macro_rules! shared_tail_turn_end_check_attempts {
     () => {
-        Migration::new(
-            "0168",
-            "turn_end_check_attempts",
-            include_str!("../../../../turso_migrations/0168_turn_end_check_attempts.sql"),
-        )
+        migration!("0168_turn_end_check_attempts")
     };
 }
 
 macro_rules! shared_tail_thread_title_retires {
     () => {
-        Migration::new(
-            "0160",
-            "thread_title_retires",
-            include_str!("../../../../turso_migrations/0160_thread_title_retires.sql"),
-        )
+        migration!("0160_thread_title_retires")
     };
 }
 
 macro_rules! shared_tail_migrate_issue_threads {
     () => {
-        Migration::new(
-            "0157",
-            "migrate_issue_threads",
-            include_str!("../../../../turso_migrations/0157_migrate_issue_threads.sql"),
-        )
+        migration!("0157_migrate_issue_threads")
     };
 }
 
 macro_rules! shared_tail_threads_entity {
     () => {
-        Migration::new(
-            "0156",
-            "threads_entity",
-            include_str!("../../../../turso_migrations/0156_threads_entity.sql"),
-        )
+        migration!("0156_threads_entity")
     };
 }
 
@@ -525,115 +428,67 @@ macro_rules! shared_tail_threads_entity {
 /// projection writes milliseconds; the pre-observation writer wrote seconds.
 macro_rules! shared_tail_check_result_cache_ran_at_millis {
     () => {
-        Migration::new(
-            "0165",
-            "check_result_cache_ran_at_millis",
-            include_str!("../../../../turso_migrations/0165_check_result_cache_ran_at_millis.sql"),
-        )
+        migration!("0165_check_result_cache_ran_at_millis")
     };
 }
 
 macro_rules! shared_tail_verdict_reuse_facts {
     () => {
-        Migration::new(
-            "0155",
-            "verdict_reuse_facts",
-            include_str!("../../../../turso_migrations/0155_verdict_reuse_facts.sql"),
-        )
+        migration!("0155_verdict_reuse_facts")
     };
 }
 
 macro_rules! shared_tail_repair_check_observation_public_handle {
     () => {
-        Migration::new(
-            "0154",
-            "repair_check_observation_public_handle",
-            include_str!(
-                "../../../../turso_migrations/0154_repair_check_observation_public_handle.sql"
-            ),
-        )
+        migration!("0154_repair_check_observation_public_handle")
     };
 }
 
 macro_rules! private_route_firing_content {
     () => {
-        Migration::new(
-            "0159",
-            "route_firing_content",
-            include_str!("../../../../turso_migrations/0159_route_firing_content.sql"),
-        )
+        migration!("0159_route_firing_content")
     };
 }
 
 macro_rules! private_channel_outbound_route_kind {
     () => {
-        Migration::new(
-            "0153",
-            "channel_outbound_route_kind",
-            include_str!("../../../../turso_migrations/0153_channel_outbound_route_kind.sql"),
-        )
+        migration!("0153_channel_outbound_route_kind")
     };
 }
 
 macro_rules! shared_tail_rebase_replay_status {
     () => {
-        Migration::new(
-            "0150",
-            "rebase_replay_status",
-            include_str!("../../../../turso_migrations/0150_rebase_replay_status.sql"),
-        )
+        migration!("0150_rebase_replay_status")
     };
 }
 
 macro_rules! private_command_contention_profiles {
     () => {
-        Migration::new(
-            "0149",
-            "command_contention_profiles",
-            include_str!("../../../../turso_migrations/0149_command_contention_profiles.sql"),
-        )
+        migration!("0149_command_contention_profiles")
     };
 }
 
 macro_rules! private_channel_thread_suppression {
     () => {
-        Migration::new(
-            "0148",
-            "channel_thread_suppression",
-            include_str!("../../../../turso_migrations/0148_channel_thread_suppression.sql"),
-        )
+        migration!("0148_channel_thread_suppression")
     };
 }
 
 macro_rules! shared_tail_check_observation_public_handle {
     () => {
-        Migration::new(
-            "0146",
-            "add_check_observation_public_handle",
-            include_str!(
-                "../../../../turso_migrations/0146_add_check_observation_public_handle.sql"
-            ),
-        )
+        migration!("0146_add_check_observation_public_handle")
     };
 }
 
 macro_rules! shared_tail_pr_resolution_attribution {
     () => {
-        Migration::new(
-            "0145",
-            "pr_resolution_attribution",
-            include_str!("../../../../turso_migrations/0145_pr_resolution_attribution.sql"),
-        )
+        migration!("0145_pr_resolution_attribution")
     };
 }
 
 macro_rules! private_channel_thread_state {
     () => {
-        Migration::new(
-            "0144",
-            "channel_thread_state",
-            include_str!("../../../../turso_migrations/0144_channel_thread_state.sql"),
-        )
+        migration!("0144_channel_thread_state")
     };
 }
 
@@ -642,35 +497,25 @@ macro_rules! shared_tail_virtual_reconcile_coordinates {
         // `jobs` loses two columns in place via ALTER TABLE DROP COLUMN;
         // `jj_reconcile_items` is copied whole out of its `_legacy` rename. Both
         // carry every row.
-        Migration::rebuild_fk_off(
-            "0118",
-            "virtual_reconcile_coordinates",
-            include_str!("../../../../turso_migrations/0118_virtual_reconcile_coordinates.sql"),
-            &[
+        migration!(
+            "0118_virtual_reconcile_coordinates",
+            rebuild_fk_off: &[
                 RebuildCheck::Conserved("jobs"),
                 RebuildCheck::Conserved("jj_reconcile_items"),
-            ],
+            ]
         )
     };
 }
 
 macro_rules! shared_tail_jj_reconcile_quarantines {
     () => {
-        Migration::new(
-            "0116",
-            "add_jj_reconcile_quarantines",
-            include_str!("../../../../turso_migrations/0116_add_jj_reconcile_quarantines.sql"),
-        )
+        migration!("0116_add_jj_reconcile_quarantines")
     };
 }
 
 macro_rules! shared_tail_agent_waits {
     () => {
-        Migration::new(
-            "0115",
-            "add_agent_waits",
-            include_str!("../../../../turso_migrations/0115_add_agent_waits.sql"),
-        )
+        migration!("0115_add_agent_waits")
     };
 }
 
@@ -679,11 +524,7 @@ macro_rules! shared_tail_agent_waits {
 /// API-owned mark-and-sweep, while local projects retain the same data model.
 macro_rules! shared_tail_pack_catalog {
     () => {
-        Migration::new(
-            "0112",
-            "pack_catalog",
-            include_str!("../../../../turso_migrations/0112_pack_catalog.sql"),
-        )
+        migration!("0112_pack_catalog")
     };
 }
 
@@ -691,23 +532,13 @@ macro_rules! shared_tail_pack_catalog {
 /// the executor-hosted PTY transport.
 macro_rules! shared_tail_terminal_lifetime_lease {
     () => {
-        Migration::new(
-            "0113",
-            "bind_agent_terminals_to_lifetime_leases",
-            include_str!(
-                "../../../../turso_migrations/0113_bind_agent_terminals_to_lifetime_leases.sql"
-            ),
-        )
+        migration!("0113_bind_agent_terminals_to_lifetime_leases")
     };
 }
 
 macro_rules! shared_tail_jj_reconcile_intents {
     () => {
-        Migration::new(
-            "0114",
-            "add_jj_reconcile_intents",
-            include_str!("../../../../turso_migrations/0114_add_jj_reconcile_intents.sql"),
-        )
+        migration!("0114_add_jj_reconcile_intents")
     };
 }
 
@@ -720,11 +551,7 @@ macro_rules! shared_tail_jj_reconcile_intents {
 /// 0088_reopen_analytics_backfill.
 macro_rules! shared_tail_token_rollup_hourly {
     () => {
-        Migration::new(
-            "0087",
-            "token_rollup_hourly",
-            include_str!("../../../../turso_migrations/0087_token_rollup_hourly.sql"),
-        )
+        migration!("0087_token_rollup_hourly")
     };
 }
 
@@ -734,11 +561,7 @@ macro_rules! shared_tail_token_rollup_hourly {
 /// main's analytics migrations (0086-0088) after this branch rebased onto #2037.
 macro_rules! shared_tail_check_result_cache {
     () => {
-        Migration::new(
-            "0089",
-            "check_result_cache",
-            include_str!("../../../../turso_migrations/0089_check_result_cache.sql"),
-        )
+        migration!("0089_check_result_cache")
     };
 }
 
@@ -749,11 +572,7 @@ macro_rules! shared_tail_check_result_cache {
 /// after 0089 in each lineage.
 macro_rules! shared_tail_check_result_input_hash {
     () => {
-        Migration::new(
-            "0090",
-            "check_result_cache_input_hash",
-            include_str!("../../../../turso_migrations/0090_check_result_cache_input_hash.sql"),
-        )
+        migration!("0090_check_result_cache_input_hash")
     };
 }
 
@@ -763,11 +582,7 @@ macro_rules! shared_tail_check_result_input_hash {
 /// tables, so this schema change is appended to both lineages.
 macro_rules! shared_tail_tool_invocation_durations {
     () => {
-        Migration::new(
-            "0092",
-            "tool_invocation_durations",
-            include_str!("../../../../turso_migrations/0092_tool_invocation_durations.sql"),
-        )
+        migration!("0092_tool_invocation_durations")
     };
 }
 
@@ -776,11 +591,7 @@ macro_rules! shared_tail_tool_invocation_durations {
 /// migration lands in both lineages; the cache key remains input-hash based.
 macro_rules! shared_tail_check_result_job_id {
     () => {
-        Migration::new(
-            "0093",
-            "check_result_cache_job_id",
-            include_str!("../../../../turso_migrations/0093_check_result_cache_job_id.sql"),
-        )
+        migration!("0093_check_result_cache_job_id")
     };
 }
 
@@ -789,11 +600,7 @@ macro_rules! shared_tail_check_result_job_id {
 /// unambiguous match for the PR source branch.
 macro_rules! shared_tail_relink_merge_request_jobs {
     () => {
-        Migration::new(
-            "0095",
-            "relink_merge_request_jobs",
-            include_str!("../../../../turso_migrations/0095_relink_merge_request_jobs.sql"),
-        )
+        migration!("0095_relink_merge_request_jobs")
     };
 }
 
@@ -812,11 +619,7 @@ macro_rules! shared_tail_relink_merge_request_jobs {
 /// migration the composed list no longer contains.
 macro_rules! shared_tail_jobs_child_base {
     () => {
-        Migration::new(
-            "0096",
-            "jobs_child_base",
-            include_str!("../../../../turso_migrations/0096_jobs_child_base.sql"),
-        )
+        migration!("0096_jobs_child_base")
     };
 }
 
@@ -828,11 +631,7 @@ macro_rules! shared_tail_jobs_child_base {
 /// finalize reclaim and the worktree GC backstop.
 macro_rules! shared_tail_jobs_owns_ephemeral_worktree {
     () => {
-        Migration::new(
-            "0097",
-            "jobs_owns_ephemeral_worktree",
-            include_str!("../../../../turso_migrations/0097_jobs_owns_ephemeral_worktree.sql"),
-        )
+        migration!("0097_jobs_owns_ephemeral_worktree")
     };
 }
 
@@ -844,11 +643,7 @@ macro_rules! shared_tail_jobs_owns_ephemeral_worktree {
 /// is written once here and appended after 0097 in each lineage.
 macro_rules! shared_tail_call_output_contract {
     () => {
-        Migration::new(
-            "0098",
-            "call_output_contract_and_run_tags",
-            include_str!("../../../../turso_migrations/0098_call_output_contract_and_run_tags.sql"),
-        )
+        migration!("0098_call_output_contract_and_run_tags")
     };
 }
 
@@ -859,11 +654,7 @@ macro_rules! shared_tail_call_output_contract {
 /// and its progress syncs so teammates see the panel.
 macro_rules! shared_tail_workflow_progress {
     () => {
-        Migration::new(
-            "0101",
-            "workflow_progress",
-            include_str!("../../../../turso_migrations/0101_workflow_progress.sql"),
-        )
+        migration!("0101_workflow_progress")
     };
 }
 
@@ -873,11 +664,7 @@ macro_rules! shared_tail_workflow_progress {
 /// ADD COLUMN, written once here and appended after 0101 in both lineages.
 macro_rules! shared_tail_check_result_failure_kind {
     () => {
-        Migration::new(
-            "0102",
-            "check_result_cache_failure_kind",
-            include_str!("../../../../turso_migrations/0102_check_result_cache_failure_kind.sql"),
-        )
+        migration!("0102_check_result_cache_failure_kind")
     };
 }
 
@@ -889,11 +676,7 @@ macro_rules! shared_tail_check_result_failure_kind {
 /// bespoke runtime repair.
 macro_rules! shared_tail_executions_runner_device_id {
     () => {
-        Migration::new(
-            "0103",
-            "executions_runner_device_id",
-            include_str!("../../../../turso_migrations/0103_executions_runner_device_id.sql"),
-        )
+        migration!("0103_executions_runner_device_id")
     };
 }
 
@@ -902,31 +685,19 @@ macro_rules! shared_tail_executions_runner_device_id {
 /// data cleanup and represent these worktree-less records canonically as NULL.
 macro_rules! shared_tail_clear_invalid_job_worktree_paths {
     () => {
-        Migration::new(
-            "0104",
-            "clear_invalid_job_worktree_paths",
-            include_str!("../../../../turso_migrations/0104_clear_invalid_job_worktree_paths.sql"),
-        )
+        migration!("0104_clear_invalid_job_worktree_paths")
     };
 }
 
 macro_rules! shared_tail_add_turn_end_reason {
     () => {
-        Migration::new(
-            "0105",
-            "add_turn_end_reason",
-            include_str!("../../../../turso_migrations/0105_add_turn_end_reason.sql"),
-        )
+        migration!("0105_add_turn_end_reason")
     };
 }
 
 macro_rules! shared_tail_index_hot_gui_status_queries {
     () => {
-        Migration::new(
-            "0106",
-            "index_hot_gui_status_queries",
-            include_str!("../../../../turso_migrations/0106_index_hot_gui_status_queries.sql"),
-        )
+        migration!("0106_index_hot_gui_status_queries")
     };
 }
 /// CAIRN-2804: retain executor attribution and the runner-local toolchain claim
@@ -934,11 +705,7 @@ macro_rules! shared_tail_index_hot_gui_status_queries {
 /// additive migration is composed once into both lineages.
 macro_rules! shared_tail_check_result_cache_provenance {
     () => {
-        Migration::new(
-            "0109",
-            "check_result_cache_provenance",
-            include_str!("../../../../turso_migrations/0109_check_result_cache_provenance.sql"),
-        )
+        migration!("0109_check_result_cache_provenance")
     };
 }
 
@@ -947,11 +714,7 @@ macro_rules! shared_tail_check_result_cache_provenance {
 /// this index-only migration is composed once into both lineages.
 macro_rules! shared_tail_check_result_cache_recency_index {
     () => {
-        Migration::new(
-            "0121",
-            "check_result_cache_recency_index",
-            include_str!("../../../../turso_migrations/0121_check_result_cache_recency_index.sql"),
-        )
+        migration!("0121_check_result_cache_recency_index")
     };
 }
 
@@ -959,11 +722,7 @@ macro_rules! shared_tail_check_result_cache_recency_index {
 /// are shared project state, so this additive migration reaches both lineages.
 macro_rules! shared_tail_session_account {
     () => {
-        Migration::new(
-            "0122",
-            "session_account",
-            include_str!("../../../../turso_migrations/0122_session_account.sql"),
-        )
+        migration!("0122_session_account")
     };
 }
 
@@ -975,11 +734,7 @@ macro_rules! shared_tail_session_account {
 /// lineages, exactly like `job_terminals`.
 macro_rules! shared_tail_job_repls {
     () => {
-        Migration::new(
-            "0123",
-            "job_repls",
-            include_str!("../../../../turso_migrations/0123_job_repls.sql"),
-        )
+        migration!("0123_job_repls")
     };
 }
 
@@ -988,11 +743,7 @@ macro_rules! shared_tail_job_repls {
 /// composed into both lineages immediately after it.
 macro_rules! shared_tail_repl_exchanges {
     () => {
-        Migration::new(
-            "0124",
-            "repl_exchanges",
-            include_str!("../../../../turso_migrations/0124_repl_exchanges.sql"),
-        )
+        migration!("0124_repl_exchanges")
     };
 }
 
@@ -1001,11 +752,7 @@ macro_rules! shared_tail_repl_exchanges {
 /// carried by the synced team lineage, so this reaches both.
 macro_rules! shared_tail_rebind_terminals_to_residencies {
     () => {
-        Migration::new(
-            "0125",
-            "rebind_terminals_to_residencies",
-            include_str!("../../../../turso_migrations/0125_rebind_terminals_to_residencies.sql"),
-        )
+        migration!("0125_rebind_terminals_to_residencies")
     };
 }
 
@@ -1015,11 +762,7 @@ macro_rules! shared_tail_rebind_terminals_to_residencies {
 /// index-only migration is composed once here and reaches both lineages.
 macro_rules! shared_tail_agent_waits_concurrent_calls {
     () => {
-        Migration::new(
-            "0126",
-            "agent_waits_concurrent_calls",
-            include_str!("../../../../turso_migrations/0126_agent_waits_concurrent_calls.sql"),
-        )
+        migration!("0126_agent_waits_concurrent_calls")
     };
 }
 
@@ -1029,11 +772,7 @@ macro_rules! shared_tail_agent_waits_concurrent_calls {
 /// synced issue must resolve the same image URIs — so it reaches both lineages.
 macro_rules! shared_tail_image_refs {
     () => {
-        Migration::new(
-            "0127",
-            "image_refs",
-            include_str!("../../../../turso_migrations/0127_image_refs.sql"),
-        )
+        migration!("0127_image_refs")
     };
 }
 
@@ -1043,11 +782,7 @@ macro_rules! shared_tail_image_refs {
 /// tail — a teammate has no in-flight socket of ours to deduplicate.
 macro_rules! private_write_replay_ledger {
     () => {
-        Migration::new(
-            "0128",
-            "write_replay_ledger",
-            include_str!("../../../../turso_migrations/0128_write_replay_ledger.sql"),
-        )
+        migration!("0128_write_replay_ledger")
     };
 }
 
@@ -1056,11 +791,7 @@ macro_rules! private_write_replay_ledger {
 /// tables are project-scoped shared state, so both lineages receive the column.
 macro_rules! shared_tail_mcp_continuation_prompts {
     () => {
-        Migration::new(
-            "0129",
-            "mcp_continuation_prompts",
-            include_str!("../../../../turso_migrations/0129_mcp_continuation_prompts.sql"),
-        )
+        migration!("0129_mcp_continuation_prompts")
     };
 }
 
@@ -1069,11 +800,7 @@ macro_rules! shared_tail_mcp_continuation_prompts {
 /// lineages converge on having none; it is a no-op wherever none were written.
 macro_rules! shared_tail_retire_snapshot_child_wakes {
     () => {
-        Migration::new(
-            "0130",
-            "retire_snapshot_child_wakes",
-            include_str!("../../../../turso_migrations/0130_retire_snapshot_child_wakes.sql"),
-        )
+        migration!("0130_retire_snapshot_child_wakes")
     };
 }
 
@@ -1083,11 +810,7 @@ macro_rules! shared_tail_retire_snapshot_child_wakes {
 /// `events` is project-scoped shared state, so both lineages receive it.
 macro_rules! shared_tail_unique_event_sequence {
     () => {
-        Migration::new(
-            "0131",
-            "unique_event_sequence",
-            include_str!("../../../../turso_migrations/0131_unique_event_sequence.sql"),
-        )
+        migration!("0131_unique_event_sequence")
     };
 }
 
@@ -1097,34 +820,22 @@ macro_rules! shared_tail_unique_event_sequence {
 /// shared project state and composed once into both lineages.
 macro_rules! shared_tail_check_result_cache_infra_suppression {
     () => {
-        Migration::new(
-            "0132",
-            "check_result_cache_infra_suppression",
-            include_str!(
-                "../../../../turso_migrations/0132_check_result_cache_infra_suppression.sql"
-            ),
-        )
+        migration!("0132_check_result_cache_infra_suppression")
     };
 }
 
 macro_rules! shared_tail_check_result_observations {
     () => {
-        Migration::rebuild_fk_off(
-            "0134",
-            "check_result_observations",
-            include_str!("../../../../turso_migrations/0134_check_result_observations.sql"),
-            &[RebuildCheck::Conserved("check_result_cache")],
+        migration!(
+            "0134_check_result_observations",
+            rebuild_fk_off: &[RebuildCheck::Conserved("check_result_cache")]
         )
     };
 }
 
 macro_rules! shared_tail_check_definition_provenance {
     () => {
-        Migration::new(
-            "0135",
-            "check_definition_provenance",
-            include_str!("../../../../turso_migrations/0135_check_definition_provenance.sql"),
-        )
+        migration!("0135_check_definition_provenance")
     };
 }
 
@@ -1133,11 +844,7 @@ macro_rules! shared_tail_check_definition_provenance {
 /// tables it extends are shared; a team replica carries the same data model.
 macro_rules! shared_tail_conflict_resolution_sessions {
     () => {
-        Migration::new(
-            "0136",
-            "conflict_resolution_sessions",
-            include_str!("../../../../turso_migrations/0136_conflict_resolution_sessions.sql"),
-        )
+        migration!("0136_conflict_resolution_sessions")
     };
 }
 
@@ -1146,11 +853,7 @@ macro_rules! shared_tail_conflict_resolution_sessions {
 /// is written once and composed into both.
 macro_rules! shared_tail_issue_kind {
     () => {
-        Migration::new(
-            "0138",
-            "issue_kind",
-            include_str!("../../../../turso_migrations/0138_issue_kind.sql"),
-        )
+        migration!("0138_issue_kind")
     };
 }
 
@@ -1158,11 +861,7 @@ macro_rules! shared_tail_issue_kind {
 /// personal messaging account. It must not replicate into a team database.
 macro_rules! private_channel_persistence {
     () => {
-        Migration::new(
-            "0137",
-            "channel_persistence",
-            include_str!("../../../../turso_migrations/0137_channel_persistence.sql"),
-        )
+        migration!("0137_channel_persistence")
     };
 }
 
@@ -1177,53 +876,31 @@ macro_rules! private_channel_persistence {
 /// `command_resource_profiles` private.
 macro_rules! private_command_duration_profiles {
     () => {
-        Migration::new(
-            "0143",
-            "command_duration_profiles",
-            include_str!("../../../../turso_migrations/0143_command_duration_profiles.sql"),
-        )
+        migration!("0143_command_duration_profiles")
     };
 }
 
 macro_rules! private_route_firings {
     () => {
-        Migration::new(
-            "0152",
-            "route_firings",
-            include_str!("../../../../turso_migrations/0152_route_firings.sql"),
-        )
+        migration!("0152_route_firings")
     };
 }
 
 macro_rules! private_response_invocations {
     () => {
-        Migration::new(
-            "0151",
-            "response_invocations",
-            include_str!("../../../../turso_migrations/0151_response_invocations.sql"),
-        )
+        migration!("0151_response_invocations")
     };
 }
 
 macro_rules! private_quarantine_saturation_memory_profiles {
     () => {
-        Migration::new(
-            "0147",
-            "quarantine_saturation_memory_profiles",
-            include_str!(
-                "../../../../turso_migrations/0147_quarantine_saturation_memory_profiles.sql"
-            ),
-        )
+        migration!("0147_quarantine_saturation_memory_profiles")
     };
 }
 
 macro_rules! private_thread_compaction {
     () => {
-        Migration::new(
-            "0139",
-            "thread_compaction",
-            include_str!("../../../../turso_migrations/0139_thread_compaction.sql"),
-        )
+        migration!("0139_thread_compaction")
     };
 }
 
@@ -1231,11 +908,7 @@ macro_rules! private_thread_compaction {
 /// never replicates into a team database, so this rebuild stays private.
 macro_rules! private_channel_outbound_expired {
     () => {
-        Migration::new(
-            "0142",
-            "channel_outbound_expired",
-            include_str!("../../../../turso_migrations/0142_channel_outbound_expired.sql"),
-        )
+        migration!("0142_channel_outbound_expired")
     };
 }
 
@@ -1303,6 +976,8 @@ macro_rules! team_lineage {
             shared_tail_thread_status_rollup_index!(),
             shared_tail_project_thread_number!(),
             shared_tail_job_file_activity!(),
+            shared_tail_job_presence!(),
+            shared_tail_thread_unread_scan_index!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1328,31 +1003,17 @@ macro_rules! private_lineage {
             // The synced `projects.repo_path` is the creator's path and cannot be
             // overwritten by teammates; this private router column is the
             // effective local path on this machine.
-            Migration::new(
-                "0085",
-                "project_routes_local_path",
-                include_str!("../../../../turso_migrations/0085_project_routes_local_path.sql"),
-            ),
+            migration!("0085_project_routes_local_path"),
             // CAIRN-2252: one-time marker for the historical analytics-rollup
             // backfill. Per-install runner-transient state (mirrors
             // archival_backfill_state); never synced to a team replica.
-            Migration::new(
-                "0086",
-                "analytics_rollup_backfill_state",
-                include_str!(
-                    "../../../../turso_migrations/0086_analytics_rollup_backfill_state.sql"
-                ),
-            ),
+            migration!("0086_analytics_rollup_backfill_state"),
             // CAIRN-2270: reopen the one-time historical analytics-rollup backfill
             // so it re-folds every run into the hour-grain token_rollup the shared
             // 0087 migration recreated empty. Private-only: it resets
             // analytics_rollup_backfill_state (migration 0086), which exists only
             // in this lineage.
-            Migration::new(
-                "0088",
-                "reopen_analytics_backfill",
-                include_str!("../../../../turso_migrations/0088_reopen_analytics_backfill.sql"),
-            ),
+            migration!("0088_reopen_analytics_backfill"),
             shared_tail_check_result_cache!(),
             shared_tail_check_result_input_hash!(),
             // CAIRN-2277: drop the dead `projects.server_id` column, its FK to the
@@ -1360,28 +1021,18 @@ macro_rules! private_lineage {
             // rebuild_fk_off because many tables FK-reference `projects(id)` and
             // `projects` itself referenced `servers`. Private-only: the team
             // snapshot schema never carries the local `servers` column/table.
-            Migration::rebuild_fk_off(
-                "0091",
-                "drop_projects_server_id_and_servers",
-                include_str!(
-                    "../../../../turso_migrations/0091_drop_projects_server_id_and_servers.sql"
-                ),
+            migration!(
+                "0091_drop_projects_server_id_and_servers",
                 // `servers` is dropped outright, not rebuilt; `projects` copies
                 // every row minus the `server_id` column.
-                &[RebuildCheck::Conserved("projects")],
+                rebuild_fk_off: &[RebuildCheck::Conserved("projects")]
             ),
             shared_tail_tool_invocation_durations!(),
             shared_tail_check_result_job_id!(),
             // CAIRN-2385: one-time repair marker for historical
             // tool_invocations.result_ts rows. Private-only because the marker
             // table is runner-transient state, not team-replicated data.
-            Migration::new(
-                "0094",
-                "tool_invocation_result_backfill_state",
-                include_str!(
-                    "../../../../turso_migrations/0094_tool_invocation_result_backfill_state.sql"
-                ),
-            ),
+            migration!("0094_tool_invocation_result_backfill_state"),
             shared_tail_relink_merge_request_jobs!(),
             shared_tail_jobs_child_base!(),
             shared_tail_jobs_owns_ephemeral_worktree!(),
@@ -1394,56 +1045,28 @@ macro_rules! private_lineage {
             // calls. A per-machine runner-transient replay cache (never synced),
             // so it lives ONLY in the private lineage's tail -- absent from
             // TEAM_MIGRATIONS.
-            Migration::new(
-                "0099",
-                "workflow_journal",
-                include_str!("../../../../turso_migrations/0099_workflow_journal.sql"),
-            ),
+            migration!("0099_workflow_journal"),
             // CAIRN-2498: workflow restart durability. workflow_run records the
             // durable spawn params for startup re-dispatch; workflow_call links
             // an in-flight ephemeral call back to its journal key. Both are
             // per-machine runner-transient replay state (never synced), so they
             // live ONLY in the private lineage's tail -- absent from
             // TEAM_MIGRATIONS, like workflow_journal above.
-            Migration::new(
-                "0100",
-                "workflow_restart_durability",
-                include_str!(
-                    "../../../../turso_migrations/0100_workflow_restart_durability.sql"
-                ),
-            ),
+            migration!("0100_workflow_restart_durability"),
             shared_tail_add_turn_end_reason!(),
             shared_tail_index_hot_gui_status_queries!(),
             // Token usage rows and analytics backfill state are local/private.
             // Re-normalize OpenAI-style history and force a complete rollup fold.
-            Migration::new(
-                "0107",
-                "normalize_openai_token_usage_components",
-                include_str!(
-                    "../../../../turso_migrations/0107_normalize_openai_token_usage_components.sql"
-                ),
-            ),
+            migration!("0107_normalize_openai_token_usage_components"),
             // Executor enrollment grants and credentials establish trust with
             // this runner device. They are host-local identity/credential state,
             // never collaboration data synced into a team replica.
-            Migration::new(
-                "0108",
-                "executor_enrollment",
-                include_str!("../../../../turso_migrations/0108_executor_enrollment.sql"),
-            ),
+            migration!("0108_executor_enrollment"),
             shared_tail_check_result_cache_provenance!(),
-            Migration::new(
-                "0110",
-                "executor_enrollment_expiry",
-                include_str!("../../../../turso_migrations/0110_executor_enrollment_expiry.sql"),
-            ),
+            migration!("0110_executor_enrollment_expiry"),
             // Machine-local resource learning contains executor observations and
             // must never replicate into a team database.
-            Migration::new(
-                "0111",
-                "command_resource_profiles",
-                include_str!("../../../../turso_migrations/0111_command_resource_profiles.sql"),
-            ),
+            migration!("0111_command_resource_profiles"),
             shared_tail_pack_catalog!(),
             shared_tail_terminal_lifetime_lease!(),
             shared_tail_jj_reconcile_intents!(),
@@ -1451,26 +1074,14 @@ macro_rules! private_lineage {
             shared_tail_jj_reconcile_quarantines!(),
             // Workflow restart records are runner-local state, so their executor
             // anchor migration belongs to the private lineage with workflow_run.
-            Migration::new(
-                "0117",
-                "workflow_executor_anchor",
-                include_str!("../../../../turso_migrations/0117_workflow_executor_anchor.sql"),
-            ),
+            migration!("0117_workflow_executor_anchor"),
             shared_tail_virtual_reconcile_coordinates!(),
-            Migration::new(
-                "0119",
-                "virtual_workflow_coordinates",
-                include_str!("../../../../turso_migrations/0119_virtual_workflow_coordinates.sql"),
-            ),
+            migration!("0119_virtual_workflow_coordinates"),
             // CAIRN-3103: cadence marker for the whole-database integrity sweep,
             // which replaced the per-migration integrity_check. Per-install
             // runner-transient state (mirrors archival_backfill_state); never
             // synced to a team replica.
-            Migration::new(
-                "0120",
-                "integrity_sweep_state",
-                include_str!("../../../../turso_migrations/0120_integrity_sweep_state.sql"),
-            ),
+            migration!("0120_integrity_sweep_state"),
             shared_tail_check_result_cache_recency_index!(),
             shared_tail_session_account!(),
             shared_tail_job_repls!(),
@@ -1486,11 +1097,7 @@ macro_rules! private_lineage {
             // The public name an executor answers to is host-local enrollment
             // state, exactly like the credential beside it, and never
             // collaboration data synced into a team replica.
-            Migration::new(
-                "0133",
-                "executor_enrollment_names",
-                include_str!("../../../../turso_migrations/0133_executor_enrollment_names.sql"),
-            ),
+            migration!("0133_executor_enrollment_names"),
             shared_tail_check_result_observations!(),
             shared_tail_check_definition_provenance!(),
             shared_tail_conflict_resolution_sessions!(),
@@ -1522,53 +1129,23 @@ macro_rules! private_lineage {
             private_route_firing_content!(),
             shared_tail_threads_entity!(),
             shared_tail_migrate_issue_threads!(),
-            Migration::new(
-                "0158",
-                "executor_desktop_automation",
-                include_str!("../../../../turso_migrations/0158_executor_desktop_automation.sql"),
-            ),
+            migration!("0158_executor_desktop_automation"),
             shared_tail_thread_title_retires!(),
             // Must follow `private_thread_compaction!()`: they alter that table.
-            Migration::new(
-                "0140",
-                "thread_compaction_seed_bytes",
-                include_str!(
-                    "../../../../turso_migrations/0140_thread_compaction_seed_bytes.sql"
-                ),
-            ),
-            Migration::new(
-                "0141",
-                "thread_compaction_capacity_trigger",
-                include_str!(
-                    "../../../../turso_migrations/0141_thread_compaction_capacity_trigger.sql"
-                ),
-            ),
+            migration!("0140_thread_compaction_seed_bytes"),
+            migration!("0141_thread_compaction_capacity_trigger"),
             // Data-only clear of a derived cache. The table is shared with the
             // team lineage, but nothing here is schema, and a team replica's
             // stale rows self-heal: an unparseable row is a cache miss that
             // rebuilds in the compact shape.
-            Migration::new(
-                "0161",
-                "clear_skyline_cache_for_compact_bars",
-                include_str!(
-                    "../../../../turso_migrations/0161_clear_skyline_cache_for_compact_bars.sql"
-                ),
-            ),
+            migration!("0161_clear_skyline_cache_for_compact_bars"),
             // CAIRN-3810: per-turn semantic vectors backing the search lane.
             // Private-only for the same reason `resource_embeddings` is.
-            Migration::new(
-                "0162",
-                "turn_embeddings",
-                include_str!("../../../../turso_migrations/0162_turn_embeddings.sql"),
-            ),
+            migration!("0162_turn_embeddings"),
             shared_tail_turns_created_at_index!(),
             // CAIRN-3810: separates the sweep's consent boundary from its
             // reconciliation floor. Private-only, like `turn_embeddings`.
-            Migration::new(
-                "0164",
-                "turn_embedding_state",
-                include_str!("../../../../turso_migrations/0164_turn_embedding_state.sql"),
-            ),
+            migration!("0164_turn_embedding_state"),
             shared_tail_check_result_cache_ran_at_millis!(),
             private_authority_grants!(),
             shared_tail_inherit_thread_id_for_child_jobs!(),
@@ -1606,471 +1183,147 @@ macro_rules! private_lineage {
             shared_tail_project_thread_number!(),
             private_thread_read_positions!(),
             shared_tail_job_file_activity!(),
+            shared_tail_job_presence!(),
             private_codemap_cache!(),
             private_runtime_admission!(),
             private_prepared_runtime_calls!(),
             private_wake_schedules!(),
+            shared_tail_thread_unread_scan_index!(),
+            private_thread_eras!(),
+            private_channel_ask_action_park!(),
+            shared_tail_check_result_cache_job_check_recency_index!(),
+            private_channel_outbound_retry!(),
         ]
     };
 }
 
 pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
-    Migration::new(
-        "0001",
-        "initial_schema",
-        include_str!("../../../../turso_migrations/0001_initial_schema.sql"),
-    ),
-    Migration::new(
-        "0002",
-        "search_outbox",
-        include_str!("../../../../turso_migrations/0002_search_outbox.sql"),
-    ),
-    Migration::new(
-        "0003",
-        "seed_default_workspace",
-        include_str!("../../../../turso_migrations/0003_seed_default_workspace.sql"),
-    ),
-    Migration::new(
-        "0004",
-        "add_issue_dependencies",
-        include_str!("../../../../turso_migrations/0004_add_issue_dependencies.sql"),
-    ),
-    Migration::new(
-        "0005",
-        "change_preview_events",
-        include_str!("../../../../turso_migrations/0005_change_preview_events.sql"),
-    ),
-    Migration::new(
-        "0006",
-        "uri_segments",
-        include_str!("../../../../turso_migrations/0006_uri_segments.sql"),
-    ),
-    Migration::new(
-        "0007",
-        "add_uri_segment_to_prompts",
-        include_str!("../../../../turso_migrations/0007_add_uri_segment_to_prompts.sql"),
-    ),
-    Migration::new(
-        "0008",
-        "add_job_id_to_prompts",
-        include_str!("../../../../turso_migrations/0008_add_job_id_to_prompts.sql"),
-    ),
-    Migration::new(
-        "0009",
-        "cohere_embeddings",
-        include_str!("../../../../turso_migrations/0009_cohere_embeddings.sql"),
-    ),
-    Migration::new(
-        "0010",
-        "anon_device",
-        include_str!("../../../../turso_migrations/0010_anon_device.sql"),
-    ),
-    Migration::new(
-        "0011",
-        "session_current_pos",
-        include_str!("../../../../turso_migrations/0011_session_current_pos.sql"),
-    ),
-    Migration::new(
-        "0012",
-        "resource_surfacings",
-        include_str!("../../../../turso_migrations/0012_resource_surfacings.sql"),
-    ),
-    Migration::new(
-        "0013",
-        "memory_redux",
-        include_str!("../../../../turso_migrations/0013_memory_redux.sql"),
-    ),
-    Migration::new(
-        "0014",
-        "add_tool_use_id_to_prompts",
-        include_str!("../../../../turso_migrations/0014_add_tool_use_id_to_prompts.sql"),
-    ),
-    Migration::new(
-        "0015",
-        "add_artifact_confirmed",
-        include_str!("../../../../turso_migrations/0015_add_artifact_confirmed.sql"),
-    ),
-    Migration::new(
-        "0016",
-        "remove_ready_status",
-        include_str!("../../../../turso_migrations/0016_remove_ready_status.sql"),
-    ),
-    Migration::new(
-        "0017",
-        "messages_delivered_at",
-        include_str!("../../../../turso_migrations/0017_messages_delivered_at.sql"),
-    ),
-    Migration::new(
-        "0018",
-        "pr_node_port_fires",
-        include_str!("../../../../turso_migrations/0018_pr_node_port_fires.sql"),
-    ),
-    Migration::new(
-        "0019",
-        "merge_request_owner",
-        include_str!("../../../../turso_migrations/0019_merge_request_owner.sql"),
-    ),
-    Migration::new(
-        "0020",
-        "add_uri_segment_to_action_runs",
-        include_str!("../../../../turso_migrations/0020_add_uri_segment_to_action_runs.sql"),
-    ),
-    Migration::new(
-        "0021",
-        "vibe_axes",
-        include_str!("../../../../turso_migrations/0021_vibe_axes.sql"),
-    ),
-    Migration::new(
-        "0022",
-        "add_segments_to_permission_requests",
-        include_str!("../../../../turso_migrations/0022_add_segments_to_permission_requests.sql"),
-    ),
-    Migration::new(
-        "0023",
-        "add_labels",
-        include_str!("../../../../turso_migrations/0023_add_labels.sql"),
-    ),
-    Migration::new(
-        "0024",
-        "add_parent_issue",
-        include_str!("../../../../turso_migrations/0024_add_parent_issue.sql"),
-    ),
-    Migration::rebuild_fk_off(
-        "0025",
-        "remove_managers",
-        include_str!("../../../../turso_migrations/0025_remove_managers.sql"),
+    migration!("0001_initial_schema"),
+    migration!("0002_search_outbox"),
+    migration!("0003_seed_default_workspace"),
+    migration!("0004_add_issue_dependencies"),
+    migration!("0005_change_preview_events"),
+    migration!("0006_uri_segments"),
+    migration!("0007_add_uri_segment_to_prompts"),
+    migration!("0008_add_job_id_to_prompts"),
+    migration!("0009_cohere_embeddings"),
+    migration!("0010_anon_device"),
+    migration!("0011_session_current_pos"),
+    migration!("0012_resource_surfacings"),
+    migration!("0013_memory_redux"),
+    migration!("0014_add_tool_use_id_to_prompts"),
+    migration!("0015_add_artifact_confirmed"),
+    migration!("0016_remove_ready_status"),
+    migration!("0017_messages_delivered_at"),
+    migration!("0018_pr_node_port_fires"),
+    migration!("0019_merge_request_owner"),
+    migration!("0020_add_uri_segment_to_action_runs"),
+    migration!("0021_vibe_axes"),
+    migration!("0022_add_segments_to_permission_requests"),
+    migration!("0023_add_labels"),
+    migration!("0024_add_parent_issue"),
+    migration!(
+        "0025_remove_managers",
         // Five unfiltered rebuilds dropping `manager_id`. The four manager tables
         // are dropped, not rebuilt.
-        &[
+        rebuild_fk_off: &[
             RebuildCheck::Conserved("issues"),
             RebuildCheck::Conserved("jobs"),
             RebuildCheck::Conserved("turns"),
             RebuildCheck::Conserved("messages"),
             RebuildCheck::Conserved("merge_requests"),
-        ],
+        ]
     ),
-    Migration::new(
-        "0026",
-        "child_side_channel_notices",
-        include_str!("../../../../turso_migrations/0026_child_side_channel_notices.sql"),
-    ),
-    Migration::new(
-        "0027",
-        "session_channel_cursor",
-        include_str!("../../../../turso_migrations/0027_session_channel_cursor.sql"),
-    ),
-    Migration::new(
-        "0028",
-        "issue_parent_job",
-        include_str!("../../../../turso_migrations/0028_issue_parent_job.sql"),
-    ),
-    Migration::new(
-        "0029",
-        "queued_messages",
-        include_str!("../../../../turso_migrations/0029_queued_messages.sql"),
-    ),
-    Migration::new(
-        "0030",
-        "checkpoint_runs",
-        include_str!("../../../../turso_migrations/0030_checkpoint_runs.sql"),
-    ),
-    Migration::rebuild_fk_off(
-        "0031",
-        "drop_dead_chats_table",
-        include_str!("../../../../turso_migrations/0031_drop_dead_chats_table.sql"),
+    migration!("0026_child_side_channel_notices"),
+    migration!("0027_session_channel_cursor"),
+    migration!("0028_issue_parent_job"),
+    migration!("0029_queued_messages"),
+    migration!("0030_checkpoint_runs"),
+    migration!(
+        "0031_drop_dead_chats_table",
         // Only the FK reference to `chats` goes away; `chat_id` survives as a
         // vestigial column and every row is copied.
-        &[
+        rebuild_fk_off: &[
             RebuildCheck::Conserved("runs"),
             RebuildCheck::Conserved("sessions"),
-        ],
+        ]
     ),
-    Migration::new(
-        "0032",
-        "drop_workspaces_timezone_column",
-        include_str!("../../../../turso_migrations/0032_drop_workspaces_timezone_column.sql"),
-    ),
-    Migration::new(
-        "0033",
-        "annotations",
-        include_str!("../../../../turso_migrations/0033_annotations.sql"),
-    ),
-    Migration::new(
-        "0034",
-        "annotation_message_links",
-        include_str!("../../../../turso_migrations/0034_annotation_message_links.sql"),
-    ),
-    Migration::new(
-        "0035",
-        "annotation_uri_seq",
-        include_str!("../../../../turso_migrations/0035_annotation_uri_seq.sql"),
-    ),
-    Migration::new(
-        "0036",
-        "wake_subscriptions",
-        include_str!("../../../../turso_migrations/0036_wake_subscriptions.sql"),
-    ),
-    Migration::new(
-        "0037",
-        "unify_side_channel_notices",
-        include_str!("../../../../turso_migrations/0037_unify_side_channel_notices.sql"),
-    ),
-    Migration::rebuild_fk_off(
-        "0038",
-        "drop_annotation_tables",
-        include_str!("../../../../turso_migrations/0038_drop_annotation_tables.sql"),
+    migration!("0032_drop_workspaces_timezone_column"),
+    migration!("0033_annotations"),
+    migration!("0034_annotation_message_links"),
+    migration!("0035_annotation_uri_seq"),
+    migration!("0036_wake_subscriptions"),
+    migration!("0037_unify_side_channel_notices"),
+    migration!(
+        "0038_drop_annotation_tables",
         // Three bare `DROP TABLE IF EXISTS`; nothing is rebuilt, so there is
         // nothing to verify.
-        &[],
+        rebuild_fk_off: &[]
     ),
-    Migration::new(
-        "0039",
-        "memory_intake_ledger",
-        include_str!("../../../../turso_migrations/0039_memory_intake_ledger.sql"),
-    ),
-    Migration::new(
-        "0040",
-        "add_is_workspace_to_projects",
-        include_str!("../../../../turso_migrations/0040_add_is_workspace_to_projects.sql"),
-    ),
-    Migration::new(
-        "0041",
-        "memory_triage_batches_and_drop_when_to_use",
-        include_str!(
-            "../../../../turso_migrations/0041_memory_triage_batches_and_drop_when_to_use.sql"
-        ),
-    ),
+    migration!("0039_memory_intake_ledger"),
+    migration!("0040_add_is_workspace_to_projects"),
+    migration!("0041_memory_triage_batches_and_drop_when_to_use"),
     // Column values transformed in place by CASE expressions; no WHERE filter.
-    Migration::rebuild_fk_off(
-        "0042",
-        "memory_scope_node_id_and_status_lattice",
-        include_str!(
-            "../../../../turso_migrations/0042_memory_scope_node_id_and_status_lattice.sql"
-        ),
-        &[RebuildCheck::Conserved("memories")],
+    migration!(
+        "0042_memory_scope_node_id_and_status_lattice",
+        rebuild_fk_off: &[RebuildCheck::Conserved("memories")]
     ),
-    Migration::new(
-        "0043",
-        "memory_triage_decision",
-        include_str!("../../../../turso_migrations/0043_memory_triage_decision.sql"),
-    ),
-    Migration::new(
-        "0044",
-        "jobs_memory_review_state",
-        include_str!("../../../../turso_migrations/0044_jobs_memory_review_state.sql"),
-    ),
-    Migration::rebuild_fk_off(
-        "0045",
-        "memory_canon_v2_consolidation",
-        include_str!("../../../../turso_migrations/0045_memory_canon_v2_consolidation.sql"),
+    migration!("0043_memory_triage_decision"),
+    migration!("0044_jobs_memory_review_state"),
+    migration!(
+        "0045_memory_canon_v2_consolidation",
         // Deliberately lossy: pre-v2 rows are not copied at all (the new table is
         // created empty) and `memory_triage_issue_memories` is emptied first.
-        &[RebuildCheck::Reshaped("memories")],
+        rebuild_fk_off: &[RebuildCheck::Reshaped("memories")]
     ),
-    Migration::rebuild_fk_off(
-        "0046",
-        "memory_review_sent_state",
-        include_str!("../../../../turso_migrations/0046_memory_review_sent_state.sql"),
+    migration!(
+        "0046_memory_review_sent_state",
         // `memory_review_state` value remapped; every row copied.
-        &[RebuildCheck::Conserved("jobs")],
+        rebuild_fk_off: &[RebuildCheck::Conserved("jobs")]
     ),
-    Migration::new(
-        "0047",
-        "add_message_urgency",
-        include_str!("../../../../turso_migrations/0047_add_message_urgency.sql"),
-    ),
-    Migration::new(
-        "0048",
-        "add_event_thinking_tokens",
-        include_str!("../../../../turso_migrations/0048_add_event_thinking_tokens.sql"),
-    ),
-    Migration::new(
-        "0049",
-        "event_vibes_session_id",
-        include_str!("../../../../turso_migrations/0049_event_vibes_session_id.sql"),
-    ),
-    Migration::new(
-        "0050",
-        "session_skyline_cache_vibe_watermark",
-        include_str!("../../../../turso_migrations/0050_session_skyline_cache_vibe_watermark.sql"),
-    ),
-    Migration::new(
-        "0051",
-        "clear_skyline_cache_for_content_bar_decomposition",
-        include_str!(
-            "../../../../turso_migrations/0051_clear_skyline_cache_for_content_bar_decomposition.sql"
-        ),
-    ),
-    Migration::new(
-        "0052",
-        "clear_skyline_cache_for_visual_height_sizing",
-        include_str!(
-            "../../../../turso_migrations/0052_clear_skyline_cache_for_visual_height_sizing.sql"
-        ),
-    ),
-    Migration::new(
-        "0053",
-        "job_pack_anchor",
-        include_str!("../../../../turso_migrations/0053_job_pack_anchor.sql"),
-    ),
-    Migration::new(
-        "0054",
-        "archival_storage",
-        include_str!("../../../../turso_migrations/0054_archival_storage.sql"),
-    ),
-    Migration::new(
-        "0055",
-        "archival_backfill_state",
-        include_str!("../../../../turso_migrations/0055_archival_backfill_state.sql"),
-    ),
-    Migration::new(
-        "0056",
-        "archival_blobs",
-        include_str!("../../../../turso_migrations/0056_archival_blobs.sql"),
-    ),
-    Migration::new(
-        "0057",
-        "event_read_tokens",
-        include_str!("../../../../turso_migrations/0057_event_read_tokens.sql"),
-    ),
-    Migration::new(
-        "0058",
-        "terminal_exit_wakes",
-        include_str!("../../../../turso_migrations/0058_terminal_exit_wakes.sql"),
-    ),
-    Migration::new(
-        "0059",
-        "jobs_needs_fresh_session",
-        include_str!("../../../../turso_migrations/0059_jobs_needs_fresh_session.sql"),
-    ),
-    Migration::new(
-        "0060",
-        "attention_items",
-        include_str!("../../../../turso_migrations/0060_attention_items.sql"),
-    ),
-    Migration::new(
-        "0061",
-        "attention_escalate_at",
-        include_str!("../../../../turso_migrations/0061_attention_escalate_at.sql"),
-    ),
-    Migration::new(
-        "0062",
-        "attention_fingerprint",
-        include_str!("../../../../turso_migrations/0062_attention_fingerprint.sql"),
-    ),
-    Migration::new(
-        "0063",
-        "comment_seq",
-        include_str!("../../../../turso_migrations/0063_comment_seq.sql"),
-    ),
-    Migration::new(
-        "0064",
-        "clear_skyline_cache_for_system_event_filter",
-        include_str!(
-            "../../../../turso_migrations/0064_clear_skyline_cache_for_system_event_filter.sql"
-        ),
-    ),
-    Migration::new(
-        "0065",
-        "merge_request_is_local",
-        include_str!("../../../../turso_migrations/0065_merge_request_is_local.sql"),
-    ),
-    Migration::new(
-        "0066",
-        "config_disables",
-        include_str!("../../../../turso_migrations/0066_config_disables.sql"),
-    ),
-    Migration::new(
-        "0067",
-        "tool_invocations",
-        include_str!("../../../../turso_migrations/0067_tool_invocations.sql"),
-    ),
-    Migration::new(
-        "0068",
-        "job_browsers",
-        include_str!("../../../../turso_migrations/0068_job_browsers.sql"),
-    ),
-    Migration::new(
-        "0069",
-        "add_event_cost_usd",
-        include_str!("../../../../turso_migrations/0069_add_event_cost_usd.sql"),
-    ),
-    Migration::new(
-        "0070",
-        "attention_pushes",
-        include_str!("../../../../turso_migrations/0070_attention_pushes.sql"),
-    ),
-    Migration::new(
-        "0071",
-        "attention_push_fingerprint",
-        include_str!("../../../../turso_migrations/0071_attention_push_fingerprint.sql"),
-    ),
-    Migration::new(
-        "0072",
-        "merge_request_head_sha",
-        include_str!("../../../../turso_migrations/0072_merge_request_head_sha.sql"),
-    ),
-    Migration::new(
-        "0073",
-        "attention_read_cursors",
-        include_str!("../../../../turso_migrations/0073_attention_read_cursors.sql"),
-    ),
-    Migration::new(
-        "0074",
-        "drop_attention_ledger",
-        include_str!("../../../../turso_migrations/0074_drop_attention_ledger.sql"),
-    ),
-    Migration::new(
-        "0075",
-        "drop_messages_delivered_at",
-        include_str!("../../../../turso_migrations/0075_drop_messages_delivered_at.sql"),
-    ),
-    Migration::new(
-        "0076",
-        "terminal_output_wakes",
-        include_str!("../../../../turso_migrations/0076_terminal_output_wakes.sql"),
-    ),
-    Migration::new(
-        "0077",
-        "event_content_change_id",
-        include_str!("../../../../turso_migrations/0077_event_content_change_id.sql"),
-    ),
-    Migration::new(
-        "0078",
-        "browser_last_active_at",
-        include_str!("../../../../turso_migrations/0078_browser_last_active_at.sql"),
-    ),
-    Migration::new(
-        "0079",
-        "index_runs_session_id_created_at",
-        include_str!("../../../../turso_migrations/0079_index_runs_session_id_created_at.sql"),
-    ),
-    Migration::new(
-        "0080",
-        "token_rollup",
-        include_str!("../../../../turso_migrations/0080_token_rollup.sql"),
-    ),
-    Migration::new(
-        "0081",
-        "drop_runs_backend",
-        include_str!("../../../../turso_migrations/0081_drop_runs_backend.sql"),
-    ),
-    Migration::new(
-        "0082",
-        "team_routing",
-        include_str!("../../../../turso_migrations/0082_team_routing.sql"),
-    ),
+    migration!("0047_add_message_urgency"),
+    migration!("0048_add_event_thinking_tokens"),
+    migration!("0049_event_vibes_session_id"),
+    migration!("0050_session_skyline_cache_vibe_watermark"),
+    migration!("0051_clear_skyline_cache_for_content_bar_decomposition"),
+    migration!("0052_clear_skyline_cache_for_visual_height_sizing"),
+    migration!("0053_job_pack_anchor"),
+    migration!("0054_archival_storage"),
+    migration!("0055_archival_backfill_state"),
+    migration!("0056_archival_blobs"),
+    migration!("0057_event_read_tokens"),
+    migration!("0058_terminal_exit_wakes"),
+    migration!("0059_jobs_needs_fresh_session"),
+    migration!("0060_attention_items"),
+    migration!("0061_attention_escalate_at"),
+    migration!("0062_attention_fingerprint"),
+    migration!("0063_comment_seq"),
+    migration!("0064_clear_skyline_cache_for_system_event_filter"),
+    migration!("0065_merge_request_is_local"),
+    migration!("0066_config_disables"),
+    migration!("0067_tool_invocations"),
+    migration!("0068_job_browsers"),
+    migration!("0069_add_event_cost_usd"),
+    migration!("0070_attention_pushes"),
+    migration!("0071_attention_push_fingerprint"),
+    migration!("0072_merge_request_head_sha"),
+    migration!("0073_attention_read_cursors"),
+    migration!("0074_drop_attention_ledger"),
+    migration!("0075_drop_messages_delivered_at"),
+    migration!("0076_terminal_output_wakes"),
+    migration!("0077_event_content_change_id"),
+    migration!("0078_browser_last_active_at"),
+    migration!("0079_index_runs_session_id_created_at"),
+    migration!("0080_token_rollup"),
+    migration!("0081_drop_runs_backend"),
+    migration!("0082_team_routing"),
     // PRIVATE-ONLY (CAIRN-2188): the local read-through cache for content-store
     // objects (team-run packs/blobs fetched by hash). Fetched bytes must never
     // land on the synced team replica, so this is a private head entry, not a
     // SHARED_TAIL change. Classified `Private(PrivateReason::RebuildableCache)` in
     // `TABLE_SCOPES`; the `team_schema_matches_private` projection test proves it
     // stays out of the team lineage.
-    Migration::new(
-        "0083",
-        "cas_cache",
-        include_str!("../../../../turso_migrations/0083_cas_cache.sql"),
-    ),
+    migration!("0083_cas_cache"),
 ];
 
 /// Team-DB migration lineage (the team-rooted counterpart of `TURSO_MIGRATIONS`).
@@ -2086,57 +1339,29 @@ pub const TURSO_MIGRATIONS: &[Migration] = private_lineage![
 /// (after whitespace normalization) for every shared table except the four
 /// intentional re-rootings.
 pub const TEAM_MIGRATIONS: &[Migration] = team_lineage![
-    Migration::new(
-        "0001",
-        "team_initial_schema",
-        include_str!("../../../../turso_migrations_team/0001_team_initial_schema.sql"),
-    ),
+    team_migration!("0001_team_initial_schema"),
     // Catch-up: the team head (0001) omitted `labels` (team-scoped label
     // management is deferred), but the routed issue-content paths JOIN it for
     // read-resolution. This adds the EMPTY table so that JOIN resolves uniformly
     // across both lineages instead of failing `no such table: labels`
     // (CAIRN-2186). Team-only by design: the private lineage already has `labels`
     // from 0023, so this is not a SHARED_TAIL change.
-    Migration::new(
-        "0002",
-        "labels_read_completeness",
-        include_str!("../../../../turso_migrations_team/0002_labels_read_completeness.sql"),
-    ),
+    team_migration!("0002_labels_read_completeness"),
     // CAIRN-2629: per-machine device presence for team runner selection. Team-only
     // (no private counterpart): the runner picker, clone validation, and
     // "waiting for <device>" UX all read it. `CREATE TABLE IF NOT EXISTS` makes it
     // self-sufficient against the migration-vs-sync race; the idempotent
     // `ensure_device_presence_table` repair at team-open backstops it.
-    Migration::new(
-        "0003",
-        "device_presence",
-        include_str!("../../../../turso_migrations_team/0003_device_presence.sql"),
-    ),
+    team_migration!("0003_device_presence"),
     // Team-only durable inbox for remote clients. Canonical effects remain in
     // shared tables; only the synced delivery envelope is team-specific.
-    Migration::new(
-        "0004",
-        "remote_intents",
-        include_str!("../../../../turso_migrations_team/0004_remote_intents.sql"),
-    ),
+    team_migration!("0004_remote_intents"),
     // Team-only non-secret executor advertisements. Enrollment credentials and
     // revocation state remain private; only fleet availability is replicated.
-    Migration::new(
-        "0005",
-        "executor_registry",
-        include_str!("../../../../turso_migrations_team/0005_executor_registry.sql"),
-    ),
+    team_migration!("0005_executor_registry"),
     // CAIRN-2870: inventory is emergent executor health, not advertised capacity.
-    Migration::new(
-        "0006",
-        "elastic_executor_inventory",
-        include_str!("../../../../turso_migrations_team/0006_elastic_executor_inventory.sql"),
-    ),
-    Migration::new(
-        "0007",
-        "ask_resolution_provenance",
-        include_str!("../../../../turso_migrations_team/0007_ask_resolution_provenance.sql"),
-    ),
+    team_migration!("0006_elastic_executor_inventory"),
+    team_migration!("0007_ask_resolution_provenance"),
 ];
 
 // ── Table scope: the single source of truth (CAIRN-2210) ────────────────────
@@ -2314,6 +1539,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("jj_reconcile_items", TableScope::ProjectScoped),
     ("jj_reconcile_quarantines", TableScope::ProjectScoped),
     ("job_file_activity", TableScope::ProjectScoped),
+    ("job_presence", TableScope::ProjectScoped),
     ("jobs", TableScope::ProjectScoped),
     ("labels", TableScope::ProjectScoped),
     ("memories", TableScope::ProjectScoped),
@@ -2593,6 +1819,14 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
     (
+        "thread_eras",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
+        "thread_era_children",
+        TableScope::Private(PrivateReason::RebuildableCache),
+    ),
+    (
         "ci_logs_cache",
         TableScope::Private(PrivateReason::RebuildableCache),
     ),
@@ -2828,6 +2062,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "job_file_activity",
         id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "job_presence",
+        id_columns: &["job_id", "project_id"],
     },
     RekeyTableManifest {
         table: "job_browsers",
@@ -3156,6 +2394,76 @@ mod tests {
         );
     }
 
+    /// The name half of every `version_name` entry `MigrationRunner::run` reports.
+    ///
+    /// The two lineage pins below list names rather than full stems on purpose.
+    /// What they exist to catch is a silent change in apply ORDER or MEMBERSHIP,
+    /// and neither is derivable from the registry: order here is authored, not
+    /// ascending. The private tail interleaves shared-tail migrations with
+    /// private-only ones in the order they were written, so several pairs run out
+    /// of numeric order by design, and no computation over the registry can tell a
+    /// correct order from one somebody quietly changed. Versions are the opposite
+    /// — wholly derivable, and already checked twice over: `migration!` splits
+    /// each one out of its filename at compile time, and `check:migrations` proves
+    /// the files are contiguously numbered and each registered. Restating them
+    /// here would buy nothing and would mean that renumbering a migration, routine
+    /// while the version is a globally contended counter, had to be retyped in
+    /// every entry below.
+    fn applied_names(applied: &[String]) -> Vec<&str> {
+        applied
+            .iter()
+            .map(|entry| {
+                entry
+                    .split_once('_')
+                    .expect("the runner reports applied migrations as version_name")
+                    .1
+            })
+            .collect()
+    }
+
+    /// Every migration is registered exactly once in each lineage it belongs to.
+    ///
+    /// Nothing else checks this. `MigrationRunner::run` skips a version it has
+    /// already recorded, so a migration composed into one lineage twice applies
+    /// once and the lineage pins stay byte-identical to a correct registry;
+    /// `check:migrations` collects registrations into a set, where the duplicate
+    /// collapses too. A lineage is assembled from per-migration macros whose
+    /// invocation says nothing about where else it is invoked, so composing one
+    /// twice is an easy edit to make and, until this test, an invisible one.
+    ///
+    /// Names are held to the same rule as versions because the lineage pins
+    /// identify migrations by name; two migrations sharing one would make those
+    /// pins ambiguous about which had moved.
+    #[test]
+    fn each_migration_is_registered_once_per_lineage() {
+        for (lineage, registry) in [("private", TURSO_MIGRATIONS), ("team", TEAM_MIGRATIONS)] {
+            for (field, values) in [
+                (
+                    "version",
+                    registry.iter().map(|m| m.version).collect::<Vec<_>>(),
+                ),
+                (
+                    "name",
+                    registry.iter().map(|m| m.name()).collect::<Vec<_>>(),
+                ),
+            ] {
+                let mut sorted = values;
+                sorted.sort_unstable();
+                let mut duplicates = sorted
+                    .windows(2)
+                    .filter(|pair| pair[0] == pair[1])
+                    .map(|pair| pair[0])
+                    .collect::<Vec<_>>();
+                duplicates.dedup();
+
+                assert!(
+                    duplicates.is_empty(),
+                    "the {lineage} lineage registers {field} more than once: {duplicates:?}"
+                );
+            }
+        }
+    }
+
     async fn migrated_db() -> DbResult<LocalDb> {
         let temp = tempdir()?;
         let path = temp.keep().join("cairn-real-turso-schema.db");
@@ -3164,216 +2472,221 @@ mod tests {
             .run(&db)
             .await?;
         assert_eq!(
-            applied,
+            applied_names(&applied),
             vec![
-                "0001_initial_schema".to_string(),
-                "0002_search_outbox".to_string(),
-                "0003_seed_default_workspace".to_string(),
-                "0004_add_issue_dependencies".to_string(),
-                "0005_change_preview_events".to_string(),
-                "0006_uri_segments".to_string(),
-                "0007_add_uri_segment_to_prompts".to_string(),
-                "0008_add_job_id_to_prompts".to_string(),
-                "0009_cohere_embeddings".to_string(),
-                "0010_anon_device".to_string(),
-                "0011_session_current_pos".to_string(),
-                "0012_resource_surfacings".to_string(),
-                "0013_memory_redux".to_string(),
-                "0014_add_tool_use_id_to_prompts".to_string(),
-                "0015_add_artifact_confirmed".to_string(),
-                "0016_remove_ready_status".to_string(),
-                "0017_messages_delivered_at".to_string(),
-                "0018_pr_node_port_fires".to_string(),
-                "0019_merge_request_owner".to_string(),
-                "0020_add_uri_segment_to_action_runs".to_string(),
-                "0021_vibe_axes".to_string(),
-                "0022_add_segments_to_permission_requests".to_string(),
-                "0023_add_labels".to_string(),
-                "0024_add_parent_issue".to_string(),
-                "0025_remove_managers".to_string(),
-                "0026_child_side_channel_notices".to_string(),
-                "0027_session_channel_cursor".to_string(),
-                "0028_issue_parent_job".to_string(),
-                "0029_queued_messages".to_string(),
-                "0030_checkpoint_runs".to_string(),
-                "0031_drop_dead_chats_table".to_string(),
-                "0032_drop_workspaces_timezone_column".to_string(),
-                "0033_annotations".to_string(),
-                "0034_annotation_message_links".to_string(),
-                "0035_annotation_uri_seq".to_string(),
-                "0036_wake_subscriptions".to_string(),
-                "0037_unify_side_channel_notices".to_string(),
-                "0038_drop_annotation_tables".to_string(),
-                "0039_memory_intake_ledger".to_string(),
-                "0040_add_is_workspace_to_projects".to_string(),
-                "0041_memory_triage_batches_and_drop_when_to_use".to_string(),
-                "0042_memory_scope_node_id_and_status_lattice".to_string(),
-                "0043_memory_triage_decision".to_string(),
-                "0044_jobs_memory_review_state".to_string(),
-                "0045_memory_canon_v2_consolidation".to_string(),
-                "0046_memory_review_sent_state".to_string(),
-                "0047_add_message_urgency".to_string(),
-                "0048_add_event_thinking_tokens".to_string(),
-                "0049_event_vibes_session_id".to_string(),
-                "0050_session_skyline_cache_vibe_watermark".to_string(),
-                "0051_clear_skyline_cache_for_content_bar_decomposition".to_string(),
-                "0052_clear_skyline_cache_for_visual_height_sizing".to_string(),
-                "0053_job_pack_anchor".to_string(),
-                "0054_archival_storage".to_string(),
-                "0055_archival_backfill_state".to_string(),
-                "0056_archival_blobs".to_string(),
-                "0057_event_read_tokens".to_string(),
-                "0058_terminal_exit_wakes".to_string(),
-                "0059_jobs_needs_fresh_session".to_string(),
-                "0060_attention_items".to_string(),
-                "0061_attention_escalate_at".to_string(),
-                "0062_attention_fingerprint".to_string(),
-                "0063_comment_seq".to_string(),
-                "0064_clear_skyline_cache_for_system_event_filter".to_string(),
-                "0065_merge_request_is_local".to_string(),
-                "0066_config_disables".to_string(),
-                "0067_tool_invocations".to_string(),
-                "0068_job_browsers".to_string(),
-                "0069_add_event_cost_usd".to_string(),
-                "0070_attention_pushes".to_string(),
-                "0071_attention_push_fingerprint".to_string(),
-                "0072_merge_request_head_sha".to_string(),
-                "0073_attention_read_cursors".to_string(),
-                "0074_drop_attention_ledger".to_string(),
-                "0075_drop_messages_delivered_at".to_string(),
-                "0076_terminal_output_wakes".to_string(),
-                "0077_event_content_change_id".to_string(),
-                "0078_browser_last_active_at".to_string(),
-                "0079_index_runs_session_id_created_at".to_string(),
-                "0080_token_rollup".to_string(),
-                "0081_drop_runs_backend".to_string(),
-                "0082_team_routing".to_string(),
-                "0083_cas_cache".to_string(),
-                "0084_archival_pack_hash".to_string(),
+                "initial_schema",
+                "search_outbox",
+                "seed_default_workspace",
+                "add_issue_dependencies",
+                "change_preview_events",
+                "uri_segments",
+                "add_uri_segment_to_prompts",
+                "add_job_id_to_prompts",
+                "cohere_embeddings",
+                "anon_device",
+                "session_current_pos",
+                "resource_surfacings",
+                "memory_redux",
+                "add_tool_use_id_to_prompts",
+                "add_artifact_confirmed",
+                "remove_ready_status",
+                "messages_delivered_at",
+                "pr_node_port_fires",
+                "merge_request_owner",
+                "add_uri_segment_to_action_runs",
+                "vibe_axes",
+                "add_segments_to_permission_requests",
+                "add_labels",
+                "add_parent_issue",
+                "remove_managers",
+                "child_side_channel_notices",
+                "session_channel_cursor",
+                "issue_parent_job",
+                "queued_messages",
+                "checkpoint_runs",
+                "drop_dead_chats_table",
+                "drop_workspaces_timezone_column",
+                "annotations",
+                "annotation_message_links",
+                "annotation_uri_seq",
+                "wake_subscriptions",
+                "unify_side_channel_notices",
+                "drop_annotation_tables",
+                "memory_intake_ledger",
+                "add_is_workspace_to_projects",
+                "memory_triage_batches_and_drop_when_to_use",
+                "memory_scope_node_id_and_status_lattice",
+                "memory_triage_decision",
+                "jobs_memory_review_state",
+                "memory_canon_v2_consolidation",
+                "memory_review_sent_state",
+                "add_message_urgency",
+                "add_event_thinking_tokens",
+                "event_vibes_session_id",
+                "session_skyline_cache_vibe_watermark",
+                "clear_skyline_cache_for_content_bar_decomposition",
+                "clear_skyline_cache_for_visual_height_sizing",
+                "job_pack_anchor",
+                "archival_storage",
+                "archival_backfill_state",
+                "archival_blobs",
+                "event_read_tokens",
+                "terminal_exit_wakes",
+                "jobs_needs_fresh_session",
+                "attention_items",
+                "attention_escalate_at",
+                "attention_fingerprint",
+                "comment_seq",
+                "clear_skyline_cache_for_system_event_filter",
+                "merge_request_is_local",
+                "config_disables",
+                "tool_invocations",
+                "job_browsers",
+                "add_event_cost_usd",
+                "attention_pushes",
+                "attention_push_fingerprint",
+                "merge_request_head_sha",
+                "attention_read_cursors",
+                "drop_attention_ledger",
+                "drop_messages_delivered_at",
+                "terminal_output_wakes",
+                "event_content_change_id",
+                "browser_last_active_at",
+                "index_runs_session_id_created_at",
+                "token_rollup",
+                "drop_runs_backend",
+                "team_routing",
+                "cas_cache",
+                "archival_pack_hash",
                 // CAIRN-2270: the shared 0087 re-grain lives in the SHARED_TAIL,
                 // which the macro emits BEFORE the private tail (0085/0086), so it
                 // applies here between 0084 and 0085 despite its higher number.
-                "0087_token_rollup_hourly".to_string(),
-                "0085_project_routes_local_path".to_string(),
-                "0086_analytics_rollup_backfill_state".to_string(),
-                "0088_reopen_analytics_backfill".to_string(),
-                "0089_check_result_cache".to_string(),
-                "0090_check_result_cache_input_hash".to_string(),
-                "0091_drop_projects_server_id_and_servers".to_string(),
-                "0092_tool_invocation_durations".to_string(),
-                "0093_check_result_cache_job_id".to_string(),
-                "0094_tool_invocation_result_backfill_state".to_string(),
-                "0095_relink_merge_request_jobs".to_string(),
-                "0096_jobs_child_base".to_string(),
-                "0097_jobs_owns_ephemeral_worktree".to_string(),
-                "0098_call_output_contract_and_run_tags".to_string(),
-                "0101_workflow_progress".to_string(),
-                "0102_check_result_cache_failure_kind".to_string(),
-                "0103_executions_runner_device_id".to_string(),
-                "0104_clear_invalid_job_worktree_paths".to_string(),
-                "0099_workflow_journal".to_string(),
-                "0100_workflow_restart_durability".to_string(),
-                "0105_add_turn_end_reason".to_string(),
-                "0106_index_hot_gui_status_queries".to_string(),
-                "0107_normalize_openai_token_usage_components".to_string(),
-                "0108_executor_enrollment".to_string(),
-                "0109_check_result_cache_provenance".to_string(),
-                "0110_executor_enrollment_expiry".to_string(),
-                "0111_command_resource_profiles".to_string(),
-                "0112_pack_catalog".to_string(),
-                "0113_bind_agent_terminals_to_lifetime_leases".to_string(),
-                "0114_add_jj_reconcile_intents".to_string(),
-                "0115_add_agent_waits".to_string(),
-                "0116_add_jj_reconcile_quarantines".to_string(),
-                "0117_workflow_executor_anchor".to_string(),
-                "0118_virtual_reconcile_coordinates".to_string(),
-                "0119_virtual_workflow_coordinates".to_string(),
-                "0120_integrity_sweep_state".to_string(),
-                "0121_check_result_cache_recency_index".to_string(),
-                "0122_session_account".to_string(),
-                "0123_job_repls".to_string(),
-                "0124_repl_exchanges".to_string(),
-                "0125_rebind_terminals_to_residencies".to_string(),
-                "0126_agent_waits_concurrent_calls".to_string(),
-                "0127_image_refs".to_string(),
-                "0128_write_replay_ledger".to_string(),
-                "0129_mcp_continuation_prompts".to_string(),
-                "0130_retire_snapshot_child_wakes".to_string(),
-                "0131_unique_event_sequence".to_string(),
-                "0132_check_result_cache_infra_suppression".to_string(),
-                "0133_executor_enrollment_names".to_string(),
-                "0134_check_result_observations".to_string(),
-                "0135_check_definition_provenance".to_string(),
-                "0136_conflict_resolution_sessions".to_string(),
-                "0139_thread_compaction".to_string(),
-                "0143_command_duration_profiles".to_string(),
-                "0147_quarantine_saturation_memory_profiles".to_string(),
-                "0137_channel_persistence".to_string(),
-                "0142_channel_outbound_expired".to_string(),
-                "0144_channel_thread_state".to_string(),
-                "0148_channel_thread_suppression".to_string(),
-                "0138_issue_kind".to_string(),
-                "0145_pr_resolution_attribution".to_string(),
-                "0146_add_check_observation_public_handle".to_string(),
-                "0154_repair_check_observation_public_handle".to_string(),
-                "0155_verdict_reuse_facts".to_string(),
-                "0149_command_contention_profiles".to_string(),
-                "0150_rebase_replay_status".to_string(),
-                "0151_response_invocations".to_string(),
-                "0152_route_firings".to_string(),
-                "0153_channel_outbound_route_kind".to_string(),
-                "0159_route_firing_content".to_string(),
-                "0156_threads_entity".to_string(),
-                "0157_migrate_issue_threads".to_string(),
-                "0158_executor_desktop_automation".to_string(),
-                "0160_thread_title_retires".to_string(),
-                "0140_thread_compaction_seed_bytes".to_string(),
-                "0141_thread_compaction_capacity_trigger".to_string(),
-                "0161_clear_skyline_cache_for_compact_bars".to_string(),
-                "0162_turn_embeddings".to_string(),
-                "0163_turns_created_at_index".to_string(),
-                "0164_turn_embedding_state".to_string(),
-                "0165_check_result_cache_ran_at_millis".to_string(),
-                "0166_authority_grants".to_string(),
-                "0167_inherit_thread_id_for_child_jobs".to_string(),
-                "0168_turn_end_check_attempts".to_string(),
-                "0169_route_fact_samples".to_string(),
-                "0170_build_change_ride_alongs".to_string(),
-                "0171_check_result_cache_row_family".to_string(),
-                "0172_disclosure_remediation".to_string(),
-                "0173_lowercase_project_keys".to_string(),
-                "0174_lowercase_project_routes".to_string(),
-                "0175_canonicalize_uri_identity_columns".to_string(),
-                "0176_channel_inbound_rejection_reason".to_string(),
-                "0177_tool_analytics_hourly".to_string(),
-                "0178_github_relay_delivery_health".to_string(),
-                "0179_github_relay_pending_key".to_string(),
-                "0180_discord_surface".to_string(),
-                "0181_channel_conversation_binding".to_string(),
-                "0182_channel_ask_resolution".to_string(),
-                "0183_authority_attribution".to_string(),
-                "0184_ask_resolution_provenance".to_string(),
-                "0185_repair_attention_pushes_index_parity".to_string(),
-                "0186_repair_prompts_column_order_parity".to_string(),
-                "0187_issue_authorship".to_string(),
-                "0188_codex_watchdog_ledger".to_string(),
-                "0189_github_relay_key_rotation_time".to_string(),
-                "0190_canonicalize_channel_permission_answers".to_string(),
-                "0191_canonical_project_keys".to_string(),
-                "0192_canonical_discord_surface_project_keys".to_string(),
-                "0193_canonical_project_routes".to_string(),
-                "0194_posts".to_string(),
-                "0195_index_liveness_joins".to_string(),
-                "0196_attention_push_retirement".to_string(),
-                "0197_attention_push_retirement_backfill".to_string(),
-                "0198_index_thread_status_rollup".to_string(),
-                "0199_project_thread_number".to_string(),
-                "0200_thread_read_positions".to_string(),
-                "0201_job_file_activity".to_string(),
-                "0202_codemap_cache".to_string(),
-                "0203_runtime_admission".to_string(),
-                "0204_prepared_runtime_calls".to_string(),
-                "0205_wake_schedules".to_string(),
+                "token_rollup_hourly",
+                "project_routes_local_path",
+                "analytics_rollup_backfill_state",
+                "reopen_analytics_backfill",
+                "check_result_cache",
+                "check_result_cache_input_hash",
+                "drop_projects_server_id_and_servers",
+                "tool_invocation_durations",
+                "check_result_cache_job_id",
+                "tool_invocation_result_backfill_state",
+                "relink_merge_request_jobs",
+                "jobs_child_base",
+                "jobs_owns_ephemeral_worktree",
+                "call_output_contract_and_run_tags",
+                "workflow_progress",
+                "check_result_cache_failure_kind",
+                "executions_runner_device_id",
+                "clear_invalid_job_worktree_paths",
+                "workflow_journal",
+                "workflow_restart_durability",
+                "add_turn_end_reason",
+                "index_hot_gui_status_queries",
+                "normalize_openai_token_usage_components",
+                "executor_enrollment",
+                "check_result_cache_provenance",
+                "executor_enrollment_expiry",
+                "command_resource_profiles",
+                "pack_catalog",
+                "bind_agent_terminals_to_lifetime_leases",
+                "add_jj_reconcile_intents",
+                "add_agent_waits",
+                "add_jj_reconcile_quarantines",
+                "workflow_executor_anchor",
+                "virtual_reconcile_coordinates",
+                "virtual_workflow_coordinates",
+                "integrity_sweep_state",
+                "check_result_cache_recency_index",
+                "session_account",
+                "job_repls",
+                "repl_exchanges",
+                "rebind_terminals_to_residencies",
+                "agent_waits_concurrent_calls",
+                "image_refs",
+                "write_replay_ledger",
+                "mcp_continuation_prompts",
+                "retire_snapshot_child_wakes",
+                "unique_event_sequence",
+                "check_result_cache_infra_suppression",
+                "executor_enrollment_names",
+                "check_result_observations",
+                "check_definition_provenance",
+                "conflict_resolution_sessions",
+                "thread_compaction",
+                "command_duration_profiles",
+                "quarantine_saturation_memory_profiles",
+                "channel_persistence",
+                "channel_outbound_expired",
+                "channel_thread_state",
+                "channel_thread_suppression",
+                "issue_kind",
+                "pr_resolution_attribution",
+                "add_check_observation_public_handle",
+                "repair_check_observation_public_handle",
+                "verdict_reuse_facts",
+                "command_contention_profiles",
+                "rebase_replay_status",
+                "response_invocations",
+                "route_firings",
+                "channel_outbound_route_kind",
+                "route_firing_content",
+                "threads_entity",
+                "migrate_issue_threads",
+                "executor_desktop_automation",
+                "thread_title_retires",
+                "thread_compaction_seed_bytes",
+                "thread_compaction_capacity_trigger",
+                "clear_skyline_cache_for_compact_bars",
+                "turn_embeddings",
+                "turns_created_at_index",
+                "turn_embedding_state",
+                "check_result_cache_ran_at_millis",
+                "authority_grants",
+                "inherit_thread_id_for_child_jobs",
+                "turn_end_check_attempts",
+                "route_fact_samples",
+                "build_change_ride_alongs",
+                "check_result_cache_row_family",
+                "disclosure_remediation",
+                "lowercase_project_keys",
+                "lowercase_project_routes",
+                "canonicalize_uri_identity_columns",
+                "channel_inbound_rejection_reason",
+                "tool_analytics_hourly",
+                "github_relay_delivery_health",
+                "github_relay_pending_key",
+                "discord_surface",
+                "channel_conversation_binding",
+                "channel_ask_resolution",
+                "authority_attribution",
+                "ask_resolution_provenance",
+                "repair_attention_pushes_index_parity",
+                "repair_prompts_column_order_parity",
+                "issue_authorship",
+                "codex_watchdog_ledger",
+                "github_relay_key_rotation_time",
+                "canonicalize_channel_permission_answers",
+                "canonical_project_keys",
+                "canonical_discord_surface_project_keys",
+                "canonical_project_routes",
+                "posts",
+                "index_liveness_joins",
+                "attention_push_retirement",
+                "attention_push_retirement_backfill",
+                "index_thread_status_rollup",
+                "project_thread_number",
+                "thread_read_positions",
+                "job_file_activity",
+                "job_presence",
+                "codemap_cache",
+                "runtime_admission",
+                "prepared_runtime_calls",
+                "wake_schedules",
+                "index_thread_unread_scan",
+                "thread_eras",
+                "channel_ask_action_park",
+                "check_result_cache_job_check_recency_index",
             ]
         );
         Ok(db)
@@ -4204,6 +3517,52 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// 0209 covers both sides of the correlated newest-result lookup used by
+    /// `execution::cache::latest_check_results_for_job`. Pin the production
+    /// predicate and ordering so a future query or index edit cannot silently
+    /// restore a per-job history scan.
+    #[tokio::test]
+    async fn migration_0209_indexes_latest_check_results_for_job() {
+        const LATEST_FOR_JOB: &str = "
+            SELECT c.check_name
+            FROM check_result_cache c
+            WHERE c.job_id = 'job'
+              AND NOT EXISTS (
+                  SELECT 1 FROM check_result_cache newer
+                  WHERE newer.job_id = c.job_id
+                    AND newer.check_name = c.check_name
+                    AND (newer.ran_at > c.ran_at
+                         OR (newer.ran_at = c.ran_at
+                             AND newer.tree_hash > c.tree_hash)
+                         OR (newer.ran_at = c.ran_at
+                             AND newer.tree_hash = c.tree_hash
+                             AND newer.input_hash > c.input_hash))
+              )
+            ORDER BY c.check_name ASC
+        ";
+
+        let db = migrated_db().await.unwrap();
+        let plan = explain_plan(&db, LATEST_FOR_JOB).await;
+        let index_steps = plan
+            .iter()
+            .filter(|step| step.contains("idx_check_result_cache_job_check_recency"))
+            .count();
+        assert!(
+            index_steps >= 2,
+            "outer rows and correlated newer-row probes must both use the 0209 index, got {plan:?}"
+        );
+        assert!(
+            !plan
+                .iter()
+                .any(|step| step.contains("SCAN check_result_cache")),
+            "latest results must not scan check_result_cache, got {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.contains("SORTER")),
+            "the index must supply check-name ordering without a sorter, got {plan:?}"
+        );
     }
 
     /// 0078 indexes the session-transcript loader's hottest query. This asserts
@@ -5826,82 +5185,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            applied,
+            applied_names(&applied),
             vec![
-                "0001_team_initial_schema".to_string(),
-                "0002_labels_read_completeness".to_string(),
+                "team_initial_schema",
+                "labels_read_completeness",
                 // CAIRN-2629: team-only device_presence table (head migration).
-                "0003_device_presence".to_string(),
-                "0004_remote_intents".to_string(),
+                "device_presence",
+                "remote_intents",
                 // Non-secret fleet advertisements are team-visible; enrollment
                 // credentials and grant consumption remain private.
-                "0005_executor_registry".to_string(),
-                "0006_elastic_executor_inventory".to_string(),
-                "0007_ask_resolution_provenance".to_string(),
+                "executor_registry",
+                "elastic_executor_inventory",
+                "ask_resolution_provenance",
                 // Shared-tail migrations land in the team lineage after the team
                 // head, preserving one shared SQL source for project-scoped tables.
-                "0084_archival_pack_hash".to_string(),
+                "archival_pack_hash",
                 // CAIRN-2270: the token_rollup hour re-grain is a shared-table
                 // change, so it lands in the team lineage too.
-                "0087_token_rollup_hourly".to_string(),
-                "0089_check_result_cache".to_string(),
-                "0090_check_result_cache_input_hash".to_string(),
-                "0092_tool_invocation_durations".to_string(),
-                "0093_check_result_cache_job_id".to_string(),
-                "0095_relink_merge_request_jobs".to_string(),
-                "0096_jobs_child_base".to_string(),
-                "0097_jobs_owns_ephemeral_worktree".to_string(),
-                "0098_call_output_contract_and_run_tags".to_string(),
-                "0101_workflow_progress".to_string(),
-                "0102_check_result_cache_failure_kind".to_string(),
+                "token_rollup_hourly",
+                "check_result_cache",
+                "check_result_cache_input_hash",
+                "tool_invocation_durations",
+                "check_result_cache_job_id",
+                "relink_merge_request_jobs",
+                "jobs_child_base",
+                "jobs_owns_ephemeral_worktree",
+                "call_output_contract_and_run_tags",
+                "workflow_progress",
+                "check_result_cache_failure_kind",
                 // CAIRN-2629: executions.runner_device_id is a shared column.
-                "0103_executions_runner_device_id".to_string(),
-                "0104_clear_invalid_job_worktree_paths".to_string(),
-                "0105_add_turn_end_reason".to_string(),
-                "0106_index_hot_gui_status_queries".to_string(),
-                "0109_check_result_cache_provenance".to_string(),
-                "0112_pack_catalog".to_string(),
-                "0113_bind_agent_terminals_to_lifetime_leases".to_string(),
-                "0114_add_jj_reconcile_intents".to_string(),
-                "0115_add_agent_waits".to_string(),
-                "0116_add_jj_reconcile_quarantines".to_string(),
-                "0118_virtual_reconcile_coordinates".to_string(),
-                "0121_check_result_cache_recency_index".to_string(),
-                "0122_session_account".to_string(),
-                "0123_job_repls".to_string(),
-                "0124_repl_exchanges".to_string(),
-                "0125_rebind_terminals_to_residencies".to_string(),
-                "0126_agent_waits_concurrent_calls".to_string(),
-                "0127_image_refs".to_string(),
-                "0129_mcp_continuation_prompts".to_string(),
-                "0130_retire_snapshot_child_wakes".to_string(),
-                "0131_unique_event_sequence".to_string(),
-                "0132_check_result_cache_infra_suppression".to_string(),
-                "0134_check_result_observations".to_string(),
-                "0135_check_definition_provenance".to_string(),
-                "0136_conflict_resolution_sessions".to_string(),
-                "0138_issue_kind".to_string(),
-                "0145_pr_resolution_attribution".to_string(),
-                "0146_add_check_observation_public_handle".to_string(),
-                "0154_repair_check_observation_public_handle".to_string(),
-                "0155_verdict_reuse_facts".to_string(),
-                "0150_rebase_replay_status".to_string(),
-                "0156_threads_entity".to_string(),
-                "0157_migrate_issue_threads".to_string(),
-                "0160_thread_title_retires".to_string(),
-                "0163_turns_created_at_index".to_string(),
-                "0165_check_result_cache_ran_at_millis".to_string(),
-                "0167_inherit_thread_id_for_child_jobs".to_string(),
-                "0168_turn_end_check_attempts".to_string(),
-                "0171_check_result_cache_row_family".to_string(),
-                "0173_lowercase_project_keys".to_string(),
-                "0177_tool_analytics_hourly".to_string(),
-                "0187_issue_authorship".to_string(),
-                "0191_canonical_project_keys".to_string(),
-                "0195_index_liveness_joins".to_string(),
-                "0196_attention_push_retirement".to_string(),
-                "0198_index_thread_status_rollup".to_string(),
-                "0199_project_thread_number".to_string(),
+                "executions_runner_device_id",
+                "clear_invalid_job_worktree_paths",
+                "add_turn_end_reason",
+                "index_hot_gui_status_queries",
+                "check_result_cache_provenance",
+                "pack_catalog",
+                "bind_agent_terminals_to_lifetime_leases",
+                "add_jj_reconcile_intents",
+                "add_agent_waits",
+                "add_jj_reconcile_quarantines",
+                "virtual_reconcile_coordinates",
+                "check_result_cache_recency_index",
+                "session_account",
+                "job_repls",
+                "repl_exchanges",
+                "rebind_terminals_to_residencies",
+                "agent_waits_concurrent_calls",
+                "image_refs",
+                "mcp_continuation_prompts",
+                "retire_snapshot_child_wakes",
+                "unique_event_sequence",
+                "check_result_cache_infra_suppression",
+                "check_result_observations",
+                "check_definition_provenance",
+                "conflict_resolution_sessions",
+                "issue_kind",
+                "pr_resolution_attribution",
+                "add_check_observation_public_handle",
+                "repair_check_observation_public_handle",
+                "verdict_reuse_facts",
+                "rebase_replay_status",
+                "threads_entity",
+                "migrate_issue_threads",
+                "thread_title_retires",
+                "turns_created_at_index",
+                "check_result_cache_ran_at_millis",
+                "inherit_thread_id_for_child_jobs",
+                "turn_end_check_attempts",
+                "check_result_cache_row_family",
+                "lowercase_project_keys",
+                "tool_analytics_hourly",
+                "issue_authorship",
+                "canonical_project_keys",
+                "index_liveness_joins",
+                "attention_push_retirement",
+                "index_thread_status_rollup",
+                "project_thread_number",
+                // CAIRN-4226: `job_file_activity` is ProjectScoped, so the shared
+                // tail composes it into this lineage as well as the private one.
+                "job_file_activity",
+                "job_presence",
+                // CAIRN-4331: the sidebar unread-scan partial index covers a
+                // shared table, so it lands in both lineages.
+                "index_thread_unread_scan",
             ]
         );
         // The team lineage is rooted at `teams`, not the private `workspaces`.

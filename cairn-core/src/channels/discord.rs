@@ -522,21 +522,28 @@ impl ChannelProvider for DiscordProvider {
         let channel_id = self.conversation_channel(&message.conversation)?;
         let message_id = parse_message(&message.provider_guid, channel_id)?;
         channel_id
-            .edit_message(
-                &self.http,
-                message_id,
-                resolved_question_edit(&message.receipt),
-            )
+            .edit_message(&self.http, message_id, resolved_question_edit(message))
             .await
             .map(|_| ())
             .map_err(|error| format!("could not clear Discord buttons: {error}"))
     }
 }
 
-fn resolved_question_edit(receipt: &str) -> EditMessage {
-    EditMessage::new()
-        .content(truncate_with_ellipsis(receipt, 2000))
-        .components(Vec::new())
+fn resolved_question_edit(message: &ResolvedQuestionMessage) -> EditMessage {
+    let mut outcome = message.receipt.clone();
+    if let Some(surface) = message.answering_surface.as_deref() {
+        outcome.push_str(" via ");
+        outcome.push_str(surface);
+    }
+    let outcome = truncate_with_ellipsis(&outcome, 2000);
+    let question_limit = 2000usize.saturating_sub(outcome.chars().count() + 2);
+    let question = truncate_with_ellipsis(&message.original_text, question_limit);
+    let content = if question.is_empty() {
+        outcome
+    } else {
+        format!("{question}\n\n{outcome}")
+    };
+    EditMessage::new().content(content).components(Vec::new())
 }
 
 struct RenderedAsk {
@@ -992,8 +999,22 @@ mod tests {
 
     #[test]
     fn resolved_question_edit_shows_the_answer_and_removes_buttons() {
-        let edit = serde_json::to_value(resolved_question_edit("✓ answered: Docs day")).unwrap();
-        assert_eq!(edit["content"], "✓ answered: Docs day");
+        let edit = serde_json::to_value(resolved_question_edit(&ResolvedQuestionMessage {
+            conversation: "discord:1/2".into(),
+            provider_guid: "2:3".into(),
+            caption_guid: None,
+            sent_at: 0,
+            original_text: "Which day?".into(),
+            answer: Some("Docs day".into()),
+            answering_surface: Some("app".into()),
+            multi_select: false,
+            receipt: "✓ answered: Docs day".into(),
+        }))
+        .unwrap();
+        assert_eq!(
+            edit["content"],
+            "Which day?\n\n✓ answered: Docs day via app"
+        );
         assert_eq!(edit["components"], serde_json::json!([]));
     }
 

@@ -13,8 +13,8 @@ use cairn_db::turso::params;
 
 /// Emit a system message for a job lifecycle event.
 ///
-/// Looks up the job's issue context and posts to the issue channel.
-/// No-op if the job isn't associated with an issue.
+/// Looks up the job's issue or thread context and posts to that channel.
+/// No-op if the job isn't associated with either.
 ///
 /// `run_id` identifies the run this event is about. When set, it becomes
 /// the `sender_run_id` on the message so that delivery filters can exclude
@@ -34,7 +34,7 @@ pub(crate) fn emit_job_event(
     };
     let ctx = match lookup_job_context(db.clone(), job_id) {
         Some(ctx) => ctx,
-        None => return, // No issue context — standalone job, skip
+        None => return, // No message-channel context — standalone job, skip
     };
 
     let label = match &ctx.uri {
@@ -54,8 +54,8 @@ pub(crate) fn emit_job_event(
 
     let msg = super::db::insert_message(
         &db,
-        &ChannelType::Issue,
-        Some(&ctx.issue_key),
+        &ctx.channel_type,
+        Some(&ctx.channel_id),
         run_id, // Identifies which agent this event is about
         "system",
         None,
@@ -82,8 +82,8 @@ pub enum JobEvent {
 }
 
 struct JobContext {
-    /// Issue channel key in KEY/NUMBER format (e.g. "CRN/40")
-    issue_key: String,
+    channel_id: String,
+    channel_type: ChannelType,
     node_name: String,
     uri: Option<String>,
 }
@@ -126,10 +126,11 @@ async fn lookup_job_context_async(
             let mut rows = conn
                 .query(
                     "SELECT j.uri_segment, j.node_name, p.key, i.number, e.seq,
-                            parent.uri_segment AS parent_uri_segment
+                            parent.uri_segment AS parent_uri_segment, t.name, j.thread_id
                      FROM jobs j
-                     JOIN issues i ON j.issue_id = i.id
-                     JOIN projects p ON i.project_id = p.id
+                     LEFT JOIN issues i ON j.issue_id = i.id
+                     JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
+                     LEFT JOIN threads t ON t.id = j.thread_id
                      LEFT JOIN executions e ON j.execution_id = e.id
                      LEFT JOIN jobs parent ON j.parent_job_id = parent.id
                      WHERE j.id = ?1
@@ -145,22 +146,40 @@ async fn lookup_job_context_async(
             let uri_segment = row.opt_text(0)?;
             let node_name = row.opt_text(1)?.unwrap_or_else(|| "unknown".to_string());
             let project_key = row.text(2)?;
-            let issue_number = row.i64(3)? as i32;
+            let issue_number = row.opt_i64(3)?.map(|number| number as i32);
             let exec_seq = row.opt_i64(4)?.unwrap_or(1) as i32;
             let parent_uri_segment = row.opt_text(5)?;
-            let issue_key = format!("{}/{}", project_key, issue_number);
-            let uri = uri_segment.as_deref().map(|segment| {
-                cairn_common::uri::build_job_base_uri(
-                    &project_key,
-                    issue_number,
-                    exec_seq,
-                    segment,
-                    parent_uri_segment.as_deref(),
+            let thread_name = row.opt_text(6)?;
+            let thread_id = row.opt_text(7)?;
+            let (channel_type, channel_id, uri) = if let Some(issue_number) = issue_number {
+                let uri = uri_segment.as_deref().map(|segment| {
+                    cairn_common::uri::build_job_base_uri(
+                        &project_key,
+                        issue_number,
+                        exec_seq,
+                        segment,
+                        parent_uri_segment.as_deref(),
+                    )
+                });
+                (
+                    ChannelType::Issue,
+                    format!("{project_key}/{issue_number}"),
+                    uri,
                 )
-            });
+            } else if let (Some(thread_name), Some(thread_id)) = (thread_name, thread_id) {
+                let root = cairn_common::uri::build_thread_uri(&project_key, &thread_name);
+                let uri = match (parent_uri_segment.as_deref(), uri_segment.as_deref()) {
+                    (Some(_), Some(segment)) => Some(format!("{root}/task/{segment}")),
+                    _ => Some(root),
+                };
+                (ChannelType::Thread, thread_id, uri)
+            } else {
+                return Ok(None);
+            };
 
             Ok::<_, DbError>(Some(JobContext {
-                issue_key,
+                channel_id,
+                channel_type,
                 node_name,
                 uri,
             }))
@@ -194,8 +213,8 @@ pub fn emit_terminal_created(orch: &Orchestrator, job_id: &str, slug: &str, titl
 
     let msg = super::db::insert_message(
         &db,
-        &ChannelType::Issue,
-        Some(&ctx.issue_key),
+        &ctx.channel_type,
+        Some(&ctx.channel_id),
         None, // No sender_run_id — user-initiated, all agents should see it
         "system",
         None,
@@ -232,8 +251,8 @@ pub fn emit_repl_created(orch: &Orchestrator, job_id: &str, slug: &str, interpre
 
     let msg = super::db::insert_message(
         &db,
-        &ChannelType::Issue,
-        Some(&ctx.issue_key),
+        &ctx.channel_type,
+        Some(&ctx.channel_id),
         None, // No sender_run_id — user-initiated, all agents should see it
         "system",
         None,
@@ -296,7 +315,7 @@ mod tests {
             .expect("sub-task job context");
 
         assert_eq!(ctx.node_name, "review");
-        assert_eq!(ctx.issue_key, "proj/42");
+        assert_eq!(ctx.channel_id, "proj/42");
         assert_eq!(
             ctx.uri.as_deref(),
             Some("cairn://p/proj/42/1/builder/task/review"),
@@ -354,6 +373,34 @@ mod tests {
                 Some(cairn_common::uri::CairnResource::Task { .. })
             ),
             "sub-task URI should parse as Task: {sub_uri}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thread_jobs_resolve_thread_channel_and_canonical_uris() {
+        let db = migrated_db().await;
+        let fixture = crate::test_support::seed_thread_session(&db).await;
+
+        let session = lookup_job_context_async(&db, fixture.session_job_id)
+            .await
+            .unwrap()
+            .expect("thread session context");
+        assert_eq!(session.channel_type, ChannelType::Thread);
+        assert_eq!(session.channel_id, fixture.thread_id);
+        assert_eq!(
+            session.uri.as_deref(),
+            Some("cairn://p/thread-project/design")
+        );
+
+        let task = lookup_job_context_async(&db, fixture.task_job_id)
+            .await
+            .unwrap()
+            .expect("thread task context");
+        assert_eq!(task.channel_type, ChannelType::Thread);
+        assert_eq!(task.channel_id, fixture.thread_id);
+        assert_eq!(
+            task.uri.as_deref(),
+            Some("cairn://p/thread-project/design/task/task")
         );
     }
 

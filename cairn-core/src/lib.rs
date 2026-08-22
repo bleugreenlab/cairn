@@ -51,6 +51,9 @@ pub mod dispatch;
 pub mod security;
 pub mod transitions;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 // ── Stable data/config surface ─────────────────────────
 pub mod error;
 pub use error::CairnError;

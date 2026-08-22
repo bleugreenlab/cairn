@@ -58,6 +58,119 @@ async fn insert_question_fixture(db: &LocalDb) {
     .unwrap();
 }
 
+const THREAD_QUESTIONS: &str = r#"[{"question":"Proceed?","header":"Confirm","options":[{"label":"Yes","description":"Proceed"}],"multiSelect":false}]"#;
+
+/// The PRODUCTION shape of a thread that has actually run, holding a pending
+/// question on its session job.
+///
+/// Hand-written because the shared `test_support::seed_thread_session` helper is
+/// `pub(crate)` and an integration test cannot reach it. These columns mirror it
+/// and must keep doing so: session job with `issue_id` NULL and `thread_id` set,
+/// a synthetic host execution carrying `issue_id` NULL and `seq` NULL, and the
+/// reserved `thread` uri_segment with no parent job that `SESSION_JOB_SHAPE`
+/// keys on. A fixture that gave the thread an issue would prove nothing about
+/// the path under test.
+async fn insert_thread_question_fixture(db: &LocalDb) {
+    let project_id = common::create_project(db, "tqt").await;
+    db.write(|conn| {
+        let project_id = project_id.clone();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+                 VALUES ('thread-1', ?1, 'design', 'active', 'needs_input', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO executions(id, recipe_id, project_id, status, started_at)
+                 VALUES ('host-exec-1', 'host-thread-job-1', ?1, 'running', 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO jobs(id, execution_id, thread_id, project_id, node_name, status, current_session_id, uri_segment, created_at, updated_at)
+                 VALUES ('thread-job-1', 'host-exec-1', 'thread-1', ?1, 'Thread', 'running', 'thread-session-1', 'thread', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('thread-session-1', 'thread-job-1', 'active', 1, 1)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-t1', ?1, 'thread-job-1', 'live', 'thread-session-1', 1, 1, 'resume')",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO prompts(id, run_id, job_id, questions, response, created_at, answered_at, uri_segment, tool_use_id)
+                 VALUES ('prompt-t1', 'run-t1', 'thread-job-1', ?1, NULL, 1, NULL, 'q-1', 'toolu-thread')",
+                params![THREAD_QUESTIONS],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+/// A thread answering its own question must record the thread's CANONICAL home
+/// as the resolution actor.
+///
+/// The repair that made this URI resolvable routes through the reserved
+/// `(0, 0, thread-name)` coordinate. Provenance built by reassembling those
+/// arguments would persist `cairn://p/tqt/0/0/design` — a sentinel that resolves
+/// to nothing — into the receipt, and every later audit of who answered would
+/// read it that way forever. Asserting the DISPLAYED target cannot catch this;
+/// the stored actor is the thing that has to be right.
+#[tokio::test]
+async fn a_thread_answering_its_question_records_the_canonical_thread_actor() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    insert_thread_question_fixture(&db).await;
+    let orch = orchestrator(&temp, db.clone());
+
+    let result = handle_write(
+        &orch,
+        &change_request(json!({
+            "changes": [{
+                "target": "cairn://p/tqt/design/questions/q-1",
+                "mode": "patch",
+                "payload": {"answer": "Yes"}
+            }]
+        })),
+    )
+    .await;
+    assert!(
+        result.contains("Answered question q-1"),
+        "the thread's question must answer through its canonical URI: {result}"
+    );
+
+    let actor = db
+        .read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT winner_actor FROM channel_ask_resolution WHERE action_ref = 'prompt-t1'",
+                        (),
+                    )
+                    .await?;
+                rows.next().await?.map(|row| row.text(0)).transpose()
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        actor.as_deref(),
+        Some("cairn://p/tqt/design"),
+        "the receipt must name the thread's canonical home, not a 0/0 sentinel"
+    );
+}
+
 fn change_request(payload: serde_json::Value) -> McpCallbackRequest {
     McpCallbackRequest {
         thread_id: None,

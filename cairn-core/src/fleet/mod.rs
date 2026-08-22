@@ -9,6 +9,7 @@ pub mod management;
 pub(crate) mod occupancy;
 pub(crate) mod output_guard;
 pub(crate) mod placement;
+pub(crate) mod purpose;
 pub(crate) mod residency;
 mod resource_profiles;
 pub(crate) mod service_placement;
@@ -24,24 +25,26 @@ use cairn_common::executor_protocol::{
     ExecutorInspection, ExecutorMessage, ExecutorSelector, ExecutorSubstrateEvidence,
     ExecutorSubstrateReport, ExecutorSubstrateState, InventoryAuthorityState, MachineMeasurement,
     MaterializationReadFailureKind, MaterializationReadRequest, MaterializationReadResult,
-    ObjectTransferCoordinate, ObservationReuse, PlacementDecision, PlacementMobility,
-    PlacementOutcome, PlacementPolicyEvidence, PlacementPrediction, PlacementReadings,
-    PlacementReason, PlacementRejection, PlacementRejectionReason, PlacementSelection,
-    PlacementSyncCost, PlacementTieBreak, PreparationForecast, ProcessBatch, ProcessBatchExecution,
-    ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode, QueueForecast, QueueUnknownReason,
-    QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget, RemoteAttachAttempt,
-    RemoteConnectionPhase, RemoteConnectionTransition, RemoteLinkState, RepositoryLocator,
+    ObjectTransferCoordinate, ObservationReuse, PlacementCounterfactualWinner, PlacementDecision,
+    PlacementMobility, PlacementOutcome, PlacementPolicyEvidence, PlacementPrediction,
+    PlacementReadings, PlacementReason, PlacementRejection, PlacementRejectionReason,
+    PlacementSelection, PlacementSyncCost, PlacementTieBreak, PreparationForecast, ProcessBatch,
+    ProcessBatchExecution, ProcessBatchFile, ProcessBatchItem, ProcessSandboxMode, QueueForecast,
+    QueueUnknownReason, QueuedPlacementEvidence, QueuedPlacementRejection, QueuedPlacementTarget,
+    RemoteAttachAttempt, RemoteConnectionTransition, RemoteLinkState, RepositoryLocator,
     ReservationFallback, ReservationRationale, ResidencyAcquireRequest, ResidencyFailureKind,
     ResidencyFence, ResidencyHolder, ResidencyOperation, ResidencyResult, ResidencyRuntimeConfig,
     ResidentProcessEvent, ResidentProcessEventKind, RunnerCallback, RunnerCallbackResult,
-    WarmthUnknownReason, CPU_ADMISSION_SAMPLE_INTERVAL_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
-    LOCAL_EXECUTOR_NAME, MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    WarmthUnknownReason, CPU_ADMISSION_BLIND_AFTER_MS, EXECUTOR_HEARTBEAT_INTERVAL_MS,
+    EXECUTOR_LINK_STALL_REMEDIATION_MS, EXECUTOR_PROGRESS_FRESHNESS_MS,
+    EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME,
+    MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
 use cairn_common::executor_protocol::{
     executor_names_match, normalize_executor_name, EXECUTOR_NAME_RULE,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -203,6 +206,7 @@ fn validate_custom_profile_name(name: &str) -> Result<(), String> {
             "placement profile name must be nonblank and have no surrounding whitespace".into(),
         );
     }
+
     if is_built_in_profile(name) {
         return Err(format!(
             "built-in placement profile {name} cannot be shadowed"
@@ -388,6 +392,17 @@ pub struct FleetConfig {
     pub remote_host_identities: BTreeMap<String, String>,
     #[serde(default)]
     pub desktop_automation: DesktopAutomationConfig,
+    /// Machines an operator has drained, by the key
+    /// [`FleetConfig::drain_key`] gives them.
+    ///
+    /// Draining is an admission-refusal fact the RUNNER holds, not a setting on
+    /// the machine: it says this runner will not place new work there. That is
+    /// why it lives here rather than only in the executor's memory. A drain is
+    /// reached for precisely when a machine is in no condition to agree to it,
+    /// and a flag that died with the connection let a crushed machine be
+    /// dogpiled again the moment it came back (CAIRN-4360).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub drained_machines: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -777,6 +792,57 @@ impl FleetConfig {
             .collect()
     }
 
+    /// How a machine is named in durable fleet state.
+    ///
+    /// The colocated executor has no enrollment to hang a key off, so it is
+    /// keyed by the name that addresses it; every other machine is keyed by its
+    /// stable identity, which a rename does not move. This is the same key
+    /// convention `executor_policies` uses, and drain must not invent a second
+    /// one: two spellings of "this machine" is how a drain comes to be held for
+    /// a machine nobody can clear it from.
+    pub fn drain_key(executor_id: &str) -> &str {
+        if executor_id == COLOCATED_EXECUTOR_ID {
+            LOCAL_EXECUTOR_NAME
+        } else {
+            executor_id
+        }
+    }
+
+    /// Whether this runner is holding a machine drained.
+    pub fn is_machine_drained(&self, executor_id: &str) -> bool {
+        self.drained_machines.contains(Self::drain_key(executor_id))
+    }
+
+    /// Record or clear a drain. Returns whether the stored state changed.
+    pub fn set_machine_drained(&mut self, executor_id: &str, drained: bool) -> bool {
+        let key = Self::drain_key(executor_id).to_string();
+        if drained {
+            self.drained_machines.insert(key)
+        } else {
+            self.drained_machines.remove(&key)
+        }
+    }
+
+    /// Drop a removed machine's drain along with it, so a name that is enrolled
+    /// again does not inherit a refusal nobody asked for.
+    pub fn forget_drain(&mut self, executor_id: &str) {
+        self.drained_machines.remove(Self::drain_key(executor_id));
+    }
+
+    /// Every machine this runner is holding drained, by executor identity.
+    pub fn drained_executor_ids(&self) -> Vec<String> {
+        self.drained_machines
+            .iter()
+            .map(|key| {
+                if key == LOCAL_EXECUTOR_NAME {
+                    COLOCATED_EXECUTOR_ID.to_string()
+                } else {
+                    key.clone()
+                }
+            })
+            .collect()
+    }
+
     pub fn resolve_executor_policy(
         &self,
         executor_id: &str,
@@ -945,6 +1011,21 @@ pub enum LinkRemediation {
         /// subsequent teardown against a reattach that lands in between.
         executor_id: String,
         generation: u64,
+        cause: LinkStallCause,
+    },
+}
+
+/// Why a link that never closed has stopped being usable.
+///
+/// Named rather than collapsed into one duration because the two failures look
+/// nothing alike to whoever reads the log or the machine: one went quiet, the
+/// other never missed a beat and has been republishing the same history for
+/// minutes. An operator told "heartbeat lost" about a machine whose heartbeats
+/// all arrived goes looking for the wrong failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStallCause {
+    /// Nothing at all has been recorded on this link.
+    Silence {
         /// How long the runner has recorded no progress at all on this link.
         silence_ms: u64,
         /// How long since the socket pump last completed a loop iteration.
@@ -956,6 +1037,60 @@ pub enum LinkRemediation {
         /// for a silent executor and a wedged pump.
         pump_silence_ms: u64,
     },
+    /// Beats keep arriving on time; what they carry stopped being recomputed.
+    TelemetryFrozen {
+        /// How long ago the executor last recomputed the facts its beats carry,
+        /// by its own stamp.
+        facts_age_ms: u64,
+    },
+}
+
+impl LinkStallCause {
+    /// One line an operator can act on.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Silence {
+                silence_ms,
+                pump_silence_ms,
+            } => format!(
+                "the link recorded nothing for {silence_ms}ms (socket pump last turned over {pump_silence_ms}ms ago)"
+            ),
+            Self::TelemetryFrozen { facts_age_ms } => format!(
+                "heartbeats kept arriving but the facts they carry were last measured {facts_age_ms}ms ago"
+            ),
+        }
+    }
+
+    /// Whether this cause has to wait its turn behind another machine's
+    /// recovery. Only frozen telemetry does: it is the failure that arrives on
+    /// many machines at once.
+    pub fn is_paced(&self) -> bool {
+        matches!(self, Self::TelemetryFrozen { .. })
+    }
+}
+
+/// The bounds a link's two stall verdicts are judged against.
+///
+/// Injected rather than read from the constants so a verdict is testable
+/// without wall-clock sleeps, following [`deadline_evidence`]. They travel as
+/// one value because they are judged together and in a fixed order, and because
+/// two bare `u64` parameters are two parameters a caller can transpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkStallBounds {
+    /// How long total silence is tolerated before the link is bounced.
+    pub silence_ms: u64,
+    /// How long a link that keeps beating may carry facts that stopped being
+    /// recomputed before it is bounced.
+    pub telemetry_ms: u64,
+}
+
+impl Default for LinkStallBounds {
+    fn default() -> Self {
+        Self {
+            silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS,
+            telemetry_ms: EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS,
+        }
+    }
 }
 
 struct CoalescedLeaderCompletionGuard {
@@ -1018,6 +1153,7 @@ impl Default for FleetConfig {
             remote_executors: BTreeMap::new(),
             remote_host_identities: BTreeMap::new(),
             desktop_automation: DesktopAutomationConfig::default(),
+            drained_machines: BTreeSet::new(),
         }
     }
 }
@@ -1075,6 +1211,10 @@ struct PendingResult {
     waiter: oneshot::Sender<CellOutcome>,
 }
 type PendingResults = HashMap<RequestIdentity, PendingResult>;
+
+/// What a reattached connection still owes an accounting for: the generation
+/// that owes it, and the executions carried across the gap into it.
+type HeldExecutions = (u64, HashSet<RequestIdentity>);
 
 struct PendingLifetimeResult {
     executor_id: String,
@@ -1299,6 +1439,33 @@ impl ExplorationState {
     }
 }
 
+/// What a drain write reached.
+///
+/// A drain is durable runner state either way: the runner has stopped placing
+/// work on the machine the moment it is recorded. This says only whether the
+/// machine itself was told, which is a courtesy the runner extends when it can
+/// and reports honestly when it cannot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", tag = "application")]
+pub enum DrainApplication {
+    /// The executor acknowledged the change on its own admission path too.
+    Applied,
+    /// The runner holds the drain and the machine does not know yet.
+    HeldWithoutMachine { reason: String },
+}
+
+/// How long a successor waits for a displaced predecessor to confirm death
+/// before dispatching anyway.
+///
+/// An escape hatch, not a schedule. An ordinary retirement resolves in the time
+/// a message takes to cross the link plus the time the item takes to reach its
+/// next phase transition. This budget exists so that a predecessor which can
+/// never report — its machine gone, its link severed beyond the watchdog's
+/// reach — cannot silently stop a project from ever being attested again.
+/// Reaching it is worth a log line, because at that point the guarantee has
+/// genuinely lapsed and the overlap it prevents may be real.
+const RETIREMENT_CONFIRMATION_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Clone, Default)]
 pub struct Fleet {
     connections: Arc<Mutex<HashMap<String, ExecutorConnectionState>>>,
@@ -1306,19 +1473,65 @@ pub struct Fleet {
     disconnect_origins: Arc<Mutex<HashMap<(String, u64), ExecutorDisconnectOrigin>>>,
     connection_ready: Arc<tokio::sync::Notify>,
     pending: Arc<Mutex<PendingResults>>,
+    /// Executions carried across a link gap that the reattached connection has
+    /// not yet accounted for, with the generation that owes the accounting.
+    ///
+    /// Emptied by the first snapshot of that generation, which is the machine's
+    /// own statement of what it still has.
+    unreconciled_executions: Arc<Mutex<HashMap<String, HeldExecutions>>>,
     pending_residency: Arc<Mutex<PendingResidencyResults>>,
     pending_materialization_reads: Arc<Mutex<PendingMaterializationReads>>,
     pending_policy: Arc<Mutex<HashMap<String, PendingPolicyResult>>>,
     desired_runtime_policies:
         Arc<Mutex<HashMap<String, cairn_common::executor_protocol::ExecutorRuntimePolicy>>>,
     pending_drain: Arc<Mutex<HashMap<String, PendingDrainResult>>>,
+    /// Machines this runner is holding drained, by executor identity.
+    ///
+    /// The in-memory face of [`FleetConfig::drained_machines`], hydrated when
+    /// the runner reads its fleet settings and updated by every drain write.
+    /// Placement and attach both consult it, so neither has to read disk and
+    /// neither depends on the machine being reachable enough to be asked.
+    drained: Arc<Mutex<HashSet<String>>>,
     residency_routes: Arc<Mutex<HashMap<(String, String), ResidencyRoute>>>,
     residency_route_path: Arc<Option<PathBuf>>,
     residency_route_store_error: Arc<Mutex<Option<String>>>,
+    /// Environments this runner rebuilt because the executor session holding the
+    /// previous one ended, keyed by holder and drained by the surface that
+    /// reports it. Held in memory on purpose: it is a fact about this runner's
+    /// current session, and an unreported one is worth less than a stale one
+    /// resurfacing days later.
+    environment_evictions: Arc<Mutex<HashMap<String, EnvironmentEviction>>>,
+    /// When each absent executor was first observed to be absent, which is what
+    /// separates a link that flapped from a machine that left. Stamped when a
+    /// connection goes away and when an acquisition first finds a route with no
+    /// connection behind it; cleared when the executor attaches again.
+    link_absence_since: Arc<Mutex<HashMap<String, u64>>>,
+    /// When the runner last bounced a link for publishing frozen facts.
+    ///
+    /// Facts freezing on several machines within one window is the specimen
+    /// this remediation exists for, and it is also the case where recycling all
+    /// of them together is worst. The trigger is shared, so a simultaneous
+    /// bounce reruns whatever caused it on the whole fleet at once, drops every
+    /// in-flight attempt in one window, and hands the survivors the entire
+    /// load. One machine at a time, spaced, recovers capacity just as fast in
+    /// the case that matters and leaves a legible sequence behind instead of a
+    /// cliff.
+    ///
+    /// Silence bounces are deliberately not paced through here: a link nobody
+    /// has heard from is already gone, and making its replacement wait behind
+    /// another machine's recovery would only extend the outage.
+    last_telemetry_bounce_unix_ms: Arc<Mutex<u64>>,
     /// One acquisition flight per execution environment, keyed by holder.
     /// [`Fleet::residency_acquire_flight`] owns both the keying and the pruning.
     residency_acquisitions: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     resident_process_subscribers: Arc<Mutex<Vec<ResidentProcessSubscriber>>>,
+    /// At most one live work item per question. The single chokepoint fact that
+    /// makes duplicate answers unrepresentable rather than merely suppressed;
+    /// see [`purpose`].
+    purposes: Arc<Mutex<purpose::PurposeRegistry>>,
+    /// Woken whenever a terminal outcome clears a purpose debt, so a successor
+    /// waiting on its predecessor's death learns of it rather than polling.
+    purpose_quiesced: Arc<tokio::sync::Notify>,
     cancelled_leaders: Arc<Mutex<HashSet<RequestIdentity>>>,
     coalesced_leaders: Arc<Mutex<HashSet<RequestIdentity>>>,
     preparing_leaders: Arc<Mutex<HashMap<RequestIdentity, LeaderPreparation>>>,
@@ -1626,6 +1839,35 @@ struct ResidencyRoute {
     repository: RepositoryLocator,
     executor_id: String,
     pending: bool,
+}
+
+/// How long an execution environment outlives its executor's link being down
+/// before the runner concludes the environment is gone and rebuilds it.
+///
+/// This is the whole distance between a link that flapped and a machine that
+/// left, and both mistakes it sits between are real. Too short and a reconnect
+/// window costs an agent its uncommitted files and resident processes; too long
+/// and a job is parked on a machine that is never coming back — which is the
+/// failure this bound was introduced to end, and which ran for hours.
+///
+/// Five minutes, matching the grace an executor gives an owner that stopped
+/// answering before reclaiming its cell: the two are the same judgement made
+/// from opposite sides of the link, and they should not disagree about how long
+/// silence takes to mean absence.
+const ENVIRONMENT_LEASE_GRACE_MS: u64 = 5 * 60 * 1000;
+
+/// An execution environment the runner rebuilt because the executor session
+/// holding the previous one ended.
+///
+/// Recorded so the loss is stated rather than absorbed. A rebuilt environment is
+/// a fresh checkout at the state the durable side holds, so committed work is
+/// intact and everything only the old environment had — uncommitted files,
+/// installed packages, resident shells — is not.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EnvironmentEviction {
+    /// The machine the lost environment was resident on, by the name a
+    /// placement request would address it with.
+    pub(crate) executor: String,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -2067,6 +2309,11 @@ struct ExecutorConnectionState {
     health: ExecutorSubstrateReport,
     executor_build_id: Option<String>,
     colocated: bool,
+    /// Whether the runner is holding this machine drained. Stamped from the
+    /// durable set when the connection is made and whenever a drain is written,
+    /// so the placement gate reads one field on the candidate rather than
+    /// reaching for fleet state it would have to lock separately.
+    drained: bool,
     /// When the socket pump serving this connection last dequeued an inbound
     /// message, stamped by the transport rather than by anything in core. A
     /// wedged pump cannot advance `last_progress_unix_ms` either, so the two
@@ -2111,10 +2358,33 @@ struct RefusedPlacement {
     diagnostic: String,
 }
 
+fn refused_placement(
+    request: &CellRequest,
+    decided_at_unix_ms: u64,
+    policy: &ActivePlacementPolicy,
+    unpinned_winner: Option<PlacementCounterfactualWinner>,
+    diagnostic: String,
+) -> RefusedPlacement {
+    RefusedPlacement {
+        decision: placement_decision(
+            request,
+            decided_at_unix_ms,
+            Some(policy_evidence(request, policy, false)),
+            unpinned_winner,
+            PlacementOutcome::Refused {
+                diagnostic: diagnostic.clone(),
+            },
+            Vec::new(),
+        ),
+        diagnostic,
+    }
+}
+
 fn placement_decision(
     request: &CellRequest,
     decided_at_unix_ms: u64,
     policy: Option<PlacementPolicyEvidence>,
+    unpinned_winner: Option<PlacementCounterfactualWinner>,
     outcome: PlacementOutcome,
     rejected: Vec<PlacementRejection>,
 ) -> PlacementDecision {
@@ -2129,6 +2399,7 @@ fn placement_decision(
             .filter(|selector| !selector.is_empty())
             .cloned(),
         pinned_executor_id: request.pinned_executor_id.clone(),
+        unpinned_winner,
         policy,
         outcome,
         rejected,
@@ -2157,6 +2428,44 @@ impl Drop for CoalescedSubscriberDropGuard {
             self.pool.detach_coalesced_subscriber(&self.identity);
         }
     }
+}
+
+/// What the dispatch gate decided about an item that has won its question.
+enum PurposeGate {
+    /// The question owes no unconfirmed deaths; this item may dispatch.
+    Clear,
+    /// A newer answer took the question while this item waited at the gate.
+    /// It never dispatched, so it has been settled and must not proceed.
+    Displaced,
+    /// The debt did not clear within the budget.
+    Owed {
+        outstanding: Option<(RequestIdentity, u64)>,
+    },
+}
+
+/// What detaching one subscriber did to the execution it was waiting on.
+enum Detachment {
+    /// The last subscriber let go, so the execution itself is retired.
+    Retired { leader: RequestIdentity },
+    /// Interest released; the execution continues for the subscribers left.
+    Released { remaining: usize },
+    /// No such subscriber.
+    Unknown,
+}
+
+/// What a retraction did, in terms a surface can state without guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase", tag = "outcome")]
+pub enum CancelOutcome {
+    /// Nobody else wanted this answer, so the work has been told to stop. Its
+    /// row clears when the machine reports that it did; a delivered instruction
+    /// is not yet a stopped process.
+    Stopping,
+    /// This requester let go and the work continues for the ones that remain.
+    Released { remaining: usize },
+    /// Nothing live goes by that name: it finished, or was already retired,
+    /// between the row rendering and the click landing.
+    Unknown,
 }
 
 struct SubmitDropGuard {
@@ -2212,11 +2521,13 @@ impl Fleet {
                 memory_budget_bytes: None,
                 sandbox: None,
                 toolchain_detection: None,
+                build_prerequisites: None,
             },
             current_load: 0,
             warm_roots: Vec::new(),
             observed_at_unix_ms: unix_time_ms(),
             liveness_observed_at_unix_ms: None,
+            facts_stale_refresh_blocked: None,
         };
         self.attach_advertised_executor(advertisement, sender, true, None)
     }
@@ -2241,6 +2552,24 @@ impl Fleet {
                 policy,
             });
         }
+        // Attaching is where the two accounts of this machine's drain are
+        // reconciled, so the runner states its own on every connection rather
+        // than only when it holds one. The runner's refusal is what enforces a
+        // drain; this is what keeps the executor's admission from disagreeing
+        // with it in either direction.
+        //
+        // Sending only `true` would be assuming a new connection means a new
+        // process with default state, and drain mode is process state: an
+        // executor that keeps running across a link bounce keeps whatever it
+        // was last told. A drain cleared while the machine was detached — the
+        // path this change exists to allow — would then leave the executor
+        // refusing work the runner believes it is admitting, each side correct
+        // about itself and opposite about the fleet.
+        let drained = self.drained.lock().unwrap().contains(&executor_id);
+        let _ = sender.send(ExecutorMessage::DrainModeRequest {
+            correlation_id: uuid::Uuid::new_v4().to_string(),
+            enabled: drained,
+        });
         let generation = {
             let mut generations = self.connection_generations.lock().unwrap();
             let generation = generations
@@ -2252,6 +2581,7 @@ impl Fleet {
             generations.insert(executor_id.clone(), generation);
             generation
         };
+        self.link_absence_since.lock().unwrap().remove(&executor_id);
         let replaced = {
             let mut connections = self.connections.lock().unwrap();
             connections
@@ -2267,6 +2597,7 @@ impl Fleet {
                         health: ExecutorSubstrateReport::default(),
                         executor_build_id,
                         colocated,
+                        drained,
                         pump_tick: Arc::new(AtomicU64::new(unix_time_ms())),
                     },
                 )
@@ -2277,6 +2608,20 @@ impl Fleet {
                 &executor_id,
                 "executor connection was replaced before returning a result",
             );
+        }
+        // Work this machine was running when its last link went away is still
+        // its work. Carrying it onto this connection is what lets the result of
+        // a command that outlived the gap be delivered to whoever asked for it.
+        let carried = self.rebind_held_executions(&executor_id, generation);
+        if !carried.is_empty() {
+            log::info!(
+                "executor_id={executor_id} reattached at generation {generation} carrying {} held execution(s)",
+                carried.len()
+            );
+            self.unreconciled_executions
+                .lock()
+                .unwrap()
+                .insert(executor_id.clone(), (generation, carried));
         }
         self.connection_ready.notify_waiters();
         generation
@@ -2332,16 +2677,31 @@ impl Fleet {
             if let Some(record) = self.enrolled_remotes.lock().unwrap().get_mut(executor_id) {
                 record.last_seen_unix_ms = Some(unix_time_ms());
             }
+            self.link_absence_since
+                .lock()
+                .unwrap()
+                .entry(executor_id.to_string())
+                .or_insert_with(unix_time_ms);
             if executor_id == COLOCATED_EXECUTOR_ID {
                 self.disconnect_origins
                     .lock()
                     .unwrap()
                     .insert((executor_id.to_string(), generation), origin);
             }
-            self.fail_for_executor(
-                executor_id,
-                "executor connection closed before returning a result",
-            );
+            // Who ended the link decides what it says about the work. A runner
+            // that closed this connection is recycling the process behind it,
+            // so the work really is gone; a link that simply went away says
+            // nothing about a machine that is still running and still coming
+            // back.
+            match origin {
+                ExecutorDisconnectOrigin::RunnerInitiated => self.fail_for_executor(
+                    executor_id,
+                    "executor connection closed before returning a result",
+                ),
+                ExecutorDisconnectOrigin::PeerOrIo => {
+                    self.hold_executions_across_link_gap(executor_id);
+                }
+            }
             self.connection_ready.notify_waiters();
         }
         disconnected
@@ -2428,13 +2788,15 @@ impl Fleet {
         // Snapshot the attached identities and release that lock before taking
         // the enrollment one, so this read never holds both at once.
         let attached: HashSet<String> = self.connections.lock().unwrap().keys().cloned().collect();
+        let drained: HashSet<String> = self.drained.lock().unwrap().clone();
         let mut values: Vec<_> = self
             .enrolled_remotes
             .lock()
             .unwrap()
             .iter()
             .filter(|(executor_id, _)| !attached.contains(*executor_id))
-            .map(|(_, record)| EnrolledRemote {
+            .map(|(executor_id, record)| EnrolledRemote {
+                drained: drained.contains(executor_id),
                 name: record.name.clone(),
                 os: record.os.clone(),
                 arch: record.arch.clone(),
@@ -2474,12 +2836,26 @@ impl Fleet {
     }
 
     pub fn declare_colocated_substrate_failure(&self, diagnostic: String) {
-        let now = unix_time_ms();
-        let mut evidence = ExecutorSubstrateEvidence::without_queue(
+        self.declare_colocated_substrate_failure_state(
             ExecutorSubstrateState::SupervisorRespawning,
-            now,
-            now,
+            diagnostic,
         );
+    }
+
+    pub fn declare_colocated_permanent_refusal(&self, diagnostic: String) {
+        self.declare_colocated_substrate_failure_state(
+            ExecutorSubstrateState::PermanentRefusal,
+            diagnostic,
+        );
+    }
+
+    fn declare_colocated_substrate_failure_state(
+        &self,
+        state: ExecutorSubstrateState,
+        diagnostic: String,
+    ) {
+        let now = unix_time_ms();
+        let mut evidence = ExecutorSubstrateEvidence::without_queue(state, now, now);
         evidence.diagnostic = Some(diagnostic);
         *self.colocated_substrate_state.lock().unwrap() = Some(evidence);
         self.connection_ready.notify_waiters();
@@ -2564,8 +2940,7 @@ impl Fleet {
             .map(|entry| now_unix_ms.saturating_sub(entry.last_progress_unix_ms))
     }
 
-    /// Whether the colocated link has gone silent long enough that continuing to
-    /// wait on it is no longer the right move.
+    /// Whether the colocated link has stopped being worth waiting on.
     ///
     /// `now_unix_ms` is a parameter rather than read from the clock so the
     /// decision is testable without wall-clock sleeps, following
@@ -2574,10 +2949,23 @@ impl Fleet {
     /// paths already own that case, and a link that was never established is not
     /// a link to bounce.
     ///
-    /// The criterion is silence, never duration. Any inbound message — heartbeat,
-    /// snapshot, result — bumps `last_progress_unix_ms`, so an executor grinding
-    /// through an hour-long check keeps reporting `Healthy` throughout.
-    pub fn assess_colocated_link(&self, now_unix_ms: u64, bound_ms: u64) -> LinkRemediation {
+    /// Neither criterion is duration. Any inbound message — heartbeat, snapshot,
+    /// result — bumps `last_progress_unix_ms`, and every beat carries a fresh
+    /// recompute stamp, so an executor grinding through an hour-long check keeps
+    /// reporting `Healthy` throughout.
+    ///
+    /// Silence is judged first because it is the stronger statement: a link
+    /// nobody has heard from cannot also be diagnosed as having a telemetry
+    /// problem, and reporting it as one would send an operator after the wrong
+    /// failure.
+    ///
+    /// A fact freeze the executor explains is not remediated here at all; see
+    /// [`unexplained_facts_age_ms`].
+    pub fn assess_colocated_link(
+        &self,
+        now_unix_ms: u64,
+        bounds: LinkStallBounds,
+    ) -> LinkRemediation {
         let observed = self
             .connections
             .lock()
@@ -2590,21 +2978,78 @@ impl Fleet {
                     entry.generation,
                     entry.last_progress_unix_ms,
                     entry.pump_tick.load(Ordering::Relaxed),
+                    unexplained_facts_age_ms(entry, now_unix_ms),
                 )
             });
-        let Some((executor_id, generation, last_progress_unix_ms, pump_tick)) = observed else {
+        let Some((executor_id, generation, last_progress_unix_ms, pump_tick, facts_age_ms)) =
+            observed
+        else {
             return LinkRemediation::Healthy;
         };
         let silence_ms = now_unix_ms.saturating_sub(last_progress_unix_ms);
-        if silence_ms <= bound_ms {
-            return LinkRemediation::Healthy;
+        if silence_ms > bounds.silence_ms {
+            return LinkRemediation::Bounce {
+                executor_id,
+                generation,
+                cause: LinkStallCause::Silence {
+                    silence_ms,
+                    pump_silence_ms: now_unix_ms.saturating_sub(pump_tick),
+                },
+            };
         }
-        LinkRemediation::Bounce {
-            executor_id,
-            generation,
-            silence_ms,
-            pump_silence_ms: now_unix_ms.saturating_sub(pump_tick),
+        match facts_age_ms {
+            Some(facts_age_ms) if facts_age_ms > bounds.telemetry_ms => LinkRemediation::Bounce {
+                executor_id,
+                generation,
+                cause: LinkStallCause::TelemetryFrozen { facts_age_ms },
+            },
+            _ => LinkRemediation::Healthy,
         }
+    }
+
+    /// How long this exact connection generation has been publishing facts that
+    /// stopped being recomputed, for a link that is otherwise beating normally.
+    ///
+    /// `None` covers four different "nothing to remediate" answers on purpose:
+    /// the generation is not attached, the link is silent past its own bound so
+    /// silence remediation owns it, the executor publishes no recompute stamp
+    /// at all, or it publishes one that is frozen *and says why* — see
+    /// [`unexplained_facts_age_ms`]. A clock that was never claimed is not a
+    /// stalled clock, no machine may be bounced for a fact it never offered,
+    /// and a machine reporting its own wedge has already done the thing the
+    /// bounce exists to provoke.
+    pub fn managed_telemetry_stall_ms(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+    ) -> Option<u64> {
+        let connections = self.connections.lock().unwrap();
+        let entry = connections
+            .get(executor_id)
+            .filter(|entry| entry.generation == generation)?;
+        if now_unix_ms.saturating_sub(entry.last_progress_unix_ms)
+            > EXECUTOR_LINK_STALL_REMEDIATION_MS
+        {
+            return None;
+        }
+        unexplained_facts_age_ms(entry, now_unix_ms)
+    }
+
+    /// Take the fleet's single telemetry-bounce turn, or decline.
+    ///
+    /// Callers must hold a turn before recycling a link for frozen telemetry;
+    /// see [`Fleet::last_telemetry_bounce_unix_ms`] for why that failure is the
+    /// one that must not be answered fleet-simultaneously. Declining is not an
+    /// error: the next poll re-assesses, and a machine whose facts are still
+    /// frozen a minute later takes the turn then.
+    pub fn claim_telemetry_stall_bounce(&self, now_unix_ms: u64) -> bool {
+        let mut last = self.last_telemetry_bounce_unix_ms.lock().unwrap();
+        if *last != 0 && now_unix_ms.saturating_sub(*last) < TELEMETRY_STALL_BOUNCE_SPACING_MS {
+            return false;
+        }
+        *last = now_unix_ms;
+        true
     }
 
     /// Abandon a colocated link that has gone silent, so the supervisor can
@@ -2624,7 +3069,7 @@ impl Fleet {
         &self,
         executor_id: &str,
         generation: u64,
-        silence_ms: u64,
+        cause: LinkStallCause,
     ) -> bool {
         if !self
             .connections
@@ -2670,10 +3115,11 @@ impl Fleet {
         let abandoned_in_flight = self.abandon_in_flight_for_leaders(&abandoned_leaders);
         log::warn!(
             "abandoned stalled executor link executor_id={executor_id} generation={generation} \
-             silence_ms={silence_ms} disconnected={disconnected} \
+             cause={cause} disconnected={disconnected} \
              abandoned_attempts={} abandoned_in_flight={abandoned_in_flight} \
              last_known_state={last_known_state:?}",
             abandoned_leaders.len(),
+            cause = cause.describe(),
         );
         disconnected
     }
@@ -2730,11 +3176,19 @@ impl Fleet {
             .map(|entry| entry.generation)
     }
 
+    /// End a managed executor's link deliberately, telling it why.
+    ///
+    /// The reason travels to the machine rather than staying in this runner's
+    /// log. An executor whose link simply dies reads a socket reset and
+    /// records that its runner dropped it; one that is told records the
+    /// runner's own account of the decision, so the two logs of a single event
+    /// agree instead of accusing each other.
     pub fn shutdown_advertised_executor(
         &self,
         executor_id: &str,
         device_id: &str,
         generation: u64,
+        reason: impl Into<String>,
     ) -> bool {
         let sender = self
             .connections
@@ -2744,7 +3198,9 @@ impl Fleet {
             .filter(|entry| entry.generation == generation && entry.identity.device_id == device_id)
             .map(|entry| entry.sender.clone());
         let Some(sender) = sender else { return false };
-        let _ = sender.send(ExecutorMessage::Shutdown);
+        let _ = sender.send(ExecutorMessage::Shutdown {
+            reason: reason.into(),
+        });
         self.disconnect_advertised_executor_with_origin(
             executor_id,
             generation,
@@ -2769,7 +3225,9 @@ impl Fleet {
         let Some((executor_id, generation, sender)) = target else {
             return false;
         };
-        let _ = sender.send(ExecutorMessage::Shutdown);
+        let _ = sender.send(ExecutorMessage::Shutdown {
+            reason: "this runner is shutting down".into(),
+        });
         self.disconnect_advertised_executor_with_origin(
             &executor_id,
             generation,
@@ -2969,6 +3427,7 @@ impl Fleet {
                 snapshot, health, ..
             }
             | ExecutorMessage::SnapshotUpdated { snapshot, health } => {
+                self.reconcile_held_executions(executor_id, generation, &snapshot);
                 self.set_executor_snapshot(executor_id, generation, snapshot, health)
             }
             ExecutorMessage::Heartbeat {
@@ -3123,22 +3582,48 @@ impl Fleet {
             .cells
             .iter()
             .filter_map(|cell| {
-                cell.residency.as_ref().map(|residency| ResidencyRoute {
-                    holder: residency.holder.clone(),
-                    repository: residency.repository.clone(),
-                    executor_id: executor_id.to_string(),
-                    pending: false,
+                cell.residency.as_ref().map(|residency| {
+                    (
+                        ResidencyRoute {
+                            holder: residency.holder.clone(),
+                            repository: residency.repository.clone(),
+                            executor_id: executor_id.to_string(),
+                            pending: false,
+                        },
+                        ResidencyFence {
+                            holder: residency.holder.clone(),
+                            incarnation_id: residency.incarnation_id.clone(),
+                            cell_epoch: cell.cell_epoch,
+                        },
+                    )
                 })
             })
             .collect::<Vec<_>>();
         entry.snapshot = snapshot;
         entry.health = health;
+        let connected = connections.keys().cloned().collect::<HashSet<_>>();
         drop(connections);
+        let mut superseded = Vec::new();
         if let Err(error) = self.update_residency_routes(|known| {
             known.retain(|(route_executor, _), route| {
                 route_executor != executor_id || route.pending
             });
-            for route in routes {
+            for (route, fence) in routes {
+                // One owner, one environment. A machine coming back with a cell
+                // for an owner that another live machine now hosts is reporting a
+                // leftover from before it went away: recording it would leave the
+                // owner's next acquisition facing two environments and unable to
+                // choose, which is the ambiguity re-placement exists to avoid. The
+                // leftover is released instead of recorded.
+                if known.values().any(|held| {
+                    !held.pending
+                        && held.holder == route.holder
+                        && held.executor_id != *executor_id
+                        && connected.contains(&held.executor_id)
+                }) {
+                    superseded.push(fence);
+                    continue;
+                }
                 known.insert(
                     (route.executor_id.clone(), route.holder.storage_key()),
                     route,
@@ -3146,6 +3631,9 @@ impl Fleet {
             }
         }) {
             tracing::error!(%error, "persist executor residency route snapshot failed");
+        }
+        for fence in superseded {
+            self.release_superseded_residency(executor_id, generation, fence);
         }
         for event in reconciled_process_events {
             for subscriber in self.resident_process_subscribers.lock().unwrap().iter() {
@@ -3667,7 +4155,14 @@ impl Fleet {
     /// admitted, and when, remains the executor's try_admit alone (CAIRN-3268);
     /// a forecast only tells a caller how long its own patience is worth.
     pub(crate) fn occupancy_for(&self, scope: PlacementScope<'_>) -> occupancy::MachineOccupancy {
-        let now_unix_ms = unix_time_ms();
+        self.occupancy_for_at(scope, unix_time_ms())
+    }
+
+    fn occupancy_for_at(
+        &self,
+        scope: PlacementScope<'_>,
+        now_unix_ms: u64,
+    ) -> occupancy::MachineOccupancy {
         let connections = self.connections.lock().unwrap();
         connections
             .values()
@@ -3984,27 +4479,52 @@ impl Fleet {
         }
     }
 
+    /// Hold or release a drain on a machine.
+    ///
+    /// Unlike every other executor control, this one is not fenced on the
+    /// connection generation and does not fail when the machine is unreachable.
+    /// A drain is the runner's own refusal to place work, so it needs nothing
+    /// from the machine to be true; the generation fence exists to stop config
+    /// landing on the wrong process incarnation, and a drain is
+    /// incarnation-independent by nature. The moment an operator reaches for
+    /// this lever is, almost by definition, the moment the machine has stopped
+    /// answering (CAIRN-4360).
+    ///
+    /// The live push is therefore best effort and its outcome is reported, not
+    /// returned as failure: the runner has already stopped placing work either
+    /// way, and a machine that is not listening will be told when it attaches.
     pub async fn set_executor_drain_mode(
         &self,
         executor_id: &str,
-        expected_generation: u64,
         enabled: bool,
-    ) -> Result<bool, String> {
-        let sender = self
-            .connections
-            .lock()
-            .unwrap()
-            .get(executor_id)
-            .filter(|entry| entry.generation == expected_generation)
-            .map(|entry| entry.sender.clone())
-            .ok_or_else(|| "executor connection generation is stale".to_string())?;
+    ) -> DrainApplication {
+        {
+            let mut drained = self.drained.lock().unwrap();
+            if enabled {
+                drained.insert(executor_id.to_string());
+            } else {
+                drained.remove(executor_id);
+            }
+        }
+        let live = {
+            let mut connections = self.connections.lock().unwrap();
+            connections.get_mut(executor_id).map(|entry| {
+                entry.drained = enabled;
+                (entry.sender.clone(), entry.generation)
+            })
+        };
+        let Some((sender, generation)) = live else {
+            return DrainApplication::HeldWithoutMachine {
+                reason: "it is not attached".into(),
+            };
+        };
         let correlation_id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = oneshot::channel();
         self.pending_drain.lock().unwrap().insert(
             correlation_id.clone(),
             PendingDrainResult {
                 executor_id: executor_id.to_string(),
-                generation: expected_generation,
+                generation,
                 waiter: tx,
             },
         );
@@ -4016,16 +4536,54 @@ impl Fleet {
             .is_err()
         {
             self.pending_drain.lock().unwrap().remove(&correlation_id);
-            return Err("executor disconnected while changing drain mode".into());
+            return DrainApplication::HeldWithoutMachine {
+                reason: "its link closed before the request was sent".into(),
+            };
         }
         match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err("executor dropped the drain-mode response".into()),
+            Ok(Ok(Ok(_))) => DrainApplication::Applied,
+            Ok(Ok(Err(error))) => DrainApplication::HeldWithoutMachine { reason: error },
+            Ok(Err(_)) => DrainApplication::HeldWithoutMachine {
+                reason: "it dropped the drain-mode response".into(),
+            },
             Err(_) => {
                 self.pending_drain.lock().unwrap().remove(&correlation_id);
-                Err("executor drain-mode update timed out".into())
+                DrainApplication::HeldWithoutMachine {
+                    reason: "it did not answer within ten seconds".into(),
+                }
             }
         }
+    }
+
+    /// Whether this runner is holding a machine drained.
+    pub fn is_drained(&self, executor_id: &str) -> bool {
+        self.drained.lock().unwrap().contains(executor_id)
+    }
+
+    /// Adopt the durable set of drained machines, stamping any connection that
+    /// is already up.
+    ///
+    /// Called when the runner reads its fleet settings. Stamping live
+    /// connections is what makes the order irrelevant: the colocated executor
+    /// can attach before settings are read, and a drain that only took effect
+    /// on the next attach would leave the fleet placing work on a machine an
+    /// operator has already disabled.
+    pub fn hydrate_drained(&self, executor_ids: impl IntoIterator<Item = String>) {
+        let adopted: HashSet<String> = executor_ids.into_iter().collect();
+        let mut connections = self.connections.lock().unwrap();
+        for (executor_id, entry) in connections.iter_mut() {
+            let drained = adopted.contains(executor_id);
+            // Stated to every live connection, in both directions, for the same
+            // reason attaching states it: an executor process can outlive the
+            // runner that last told it something, so "the settings say clear"
+            // is not evidence that the machine is not still draining itself.
+            let _ = entry.sender.send(ExecutorMessage::DrainModeRequest {
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                enabled: drained,
+            });
+            entry.drained = drained;
+        }
+        *self.drained.lock().unwrap() = adopted;
     }
 
     pub fn set_desired_executor_runtime_policy(
@@ -4039,7 +4597,17 @@ impl Fleet {
             .insert(executor_id.to_string(), policy);
     }
 
-    pub(crate) fn cancel_request(&self, request_id: &str) -> bool {
+    /// Retract interest in one dispatched request, and report what that did.
+    ///
+    /// This is what the operator's ✗ reaches, and what it may honestly claim
+    /// depends on a fact only the model holds: whether anyone else still wants
+    /// the same answer. Check work coalesces, so one execution routinely serves
+    /// several requesters, and a click on one of their rows releases that
+    /// requester without stopping anything. Returning a bare `true` for that
+    /// case reported success for an action that changed nothing an operator
+    /// could see — the row stayed, fed by executor occupancy, because the work
+    /// was still running for everyone else.
+    pub(crate) fn cancel_request(&self, request_id: &str) -> CancelOutcome {
         let subscriber = self
             .in_flight
             .lock()
@@ -4049,8 +4617,21 @@ impl Fleet {
             .find(|(id, _)| id == request_id)
             .cloned();
         if let Some(identity) = subscriber {
-            self.detach_coalesced_subscriber(&identity);
-            return true;
+            return match self.detach_coalesced_subscriber(&identity) {
+                Detachment::Retired { leader } => {
+                    // Retiring, not retired: the key stays owed until this
+                    // leader's terminal outcome lands, so a fresh answer to the
+                    // same question waits for the death rather than starting
+                    // beside it.
+                    self.purposes
+                        .lock()
+                        .unwrap()
+                        .retire(&leader, unix_time_ms());
+                    CancelOutcome::Stopping
+                }
+                Detachment::Released { remaining } => CancelOutcome::Released { remaining },
+                Detachment::Unknown => CancelOutcome::Unknown,
+            };
         }
         let owner = self
             .pending
@@ -4066,17 +4647,42 @@ impl Fleet {
                 )
             });
         let Some((attempt_id, executor_id, generation)) = owner else {
-            return false;
+            return CancelOutcome::Unknown;
         };
-        self.send_to(
-            &executor_id,
-            generation,
-            ExecutorMessage::Cancel {
-                request_id: request_id.into(),
-                attempt_id,
-            },
-        )
-        .is_ok()
+        let identity = (request_id.to_string(), attempt_id.clone());
+        self.purposes
+            .lock()
+            .unwrap()
+            .retire(&identity, unix_time_ms());
+        // Delivery is what this can honestly claim. An executor built from this
+        // tree binds the request identity when its Submit is received, so a
+        // Cancel naming it is found whatever phase it has reached; an older one
+        // can still lose a retirement that lands in the instant between handling
+        // a Submit and its task starting. That window is narrow and getting
+        // narrower — the pre-submit gate above means a retirement known before
+        // dispatch never produces a submit to race — and it is not worth
+        // grounding every deployed executor to close, so it is stated here
+        // rather than hidden behind a version bump.
+        if self
+            .send_to(
+                &executor_id,
+                generation,
+                ExecutorMessage::Cancel {
+                    request_id: request_id.into(),
+                    attempt_id,
+                },
+            )
+            .is_ok()
+        {
+            // The honest word is "stopping". A delivered instruction is not a
+            // stopped process, and the row stays until the machine reports the
+            // terminal outcome — which is also what releases this question for
+            // its next answer. Reporting "retired" here would be the same
+            // mistake the registry used to make, told to the operator instead.
+            CancelOutcome::Stopping
+        } else {
+            CancelOutcome::Unknown
+        }
     }
 
     fn complete_coalesced_for_leader(
@@ -4125,16 +4731,126 @@ impl Fleet {
         true
     }
 
-    fn detach_coalesced_subscriber(&self, identity: &RequestIdentity) {
+    /// Terminate a work item the chokepoint has displaced or released.
+    ///
+    /// Retirement is recorded before it is delivered, because the item may not
+    /// be on the wire yet: an item still being placed is stopped by the record
+    /// alone, at the pre-submit gate in [`Fleet::execute_prepared`], and never
+    /// reaches an executor. An item already dispatched is told, and an executor
+    /// built from this tree observes that at every phase transition it has left,
+    /// because it binds the request identity when the `Submit` is received. An
+    /// executor older than that binding can still lose a retirement that lands
+    /// in the instant between handling a `Submit` and its task starting; the
+    /// reasoning for tolerating that rather than moving the protocol version is
+    /// recorded at `Fleet::bind_request_identity` in the executor crate.
+    ///
+    /// The last clause of "terminated means dead" — that the item's process
+    /// tree is reaped and its checkout quiescent before the cell is reused — is
+    /// deliberately not enforced here, because it is already enforced where the
+    /// tree actually is. The executor takes one `TreeQuiescent` proof for the
+    /// length of a batch hold and every reset on the cancellation path consumes
+    /// it, so a retirement delivered from here cannot reach a tree reset that
+    /// skipped the reaper: the type system on the far side refuses to compile
+    /// one. This path composes with that gate rather than duplicating it, and
+    /// duplicating it would be worse than redundant — a second liveness opinion
+    /// formed a network hop away from the processes it describes is exactly the
+    /// stale copy of a remote truth this design exists to abolish.
+    /// Wait until this question owes no unconfirmed deaths.
+    ///
+    /// The gate that separates "one holder is recorded" from "one work item
+    /// exists". Winning a purpose key establishes which answer is newest; it
+    /// says nothing about whether the answer it displaced has stopped consuming
+    /// a cell. Dispatching on the strength of the record alone is what left an
+    /// operator watching several attestations of one project at once, and a
+    /// registry that showed a single item throughout would have made that
+    /// overlap harder to see rather than impossible.
+    ///
+    /// The predecessor's own terminal outcome is the only evidence accepted
+    /// here, because it is the only one that is downstream of the work actually
+    /// stopping. The executor's quiescence proof guards reuse of the
+    /// predecessor's own tree; it says nothing about a successor placed on a
+    /// different cell or a different machine, which is exactly the overlap this
+    /// gate exists to prevent.
+    async fn await_purpose_quiescent(
+        &self,
+        key: &purpose::PurposeKey,
+        me: &RequestIdentity,
+    ) -> PurposeGate {
+        let deadline = tokio::time::Instant::now() + RETIREMENT_CONFIRMATION_BUDGET;
+        loop {
+            // Arm the wakeup before reading the registry. A debt cleared in the
+            // gap between reading and awaiting would otherwise be a wakeup this
+            // waiter never hears, and the successor would sit out the whole
+            // budget for a predecessor that had already died.
+            let quiesced = self.purpose_quiesced.notified();
+            let outstanding = {
+                let mut registry = self.purposes.lock().unwrap();
+                // Have I been displaced while waiting here? A burst of merges
+                // makes this ordinary: this item took the question from its
+                // predecessor, and a newer tip took it from this one before the
+                // predecessor had finished dying.
+                //
+                // Being displaced is what puts an item into the debt set, so
+                // without this an item would wait for a set that now contains
+                // itself, and could only leave it by completing work the gate is
+                // still holding it back from starting. Settling it here is sound
+                // precisely because this gate sits upstream of everything: an
+                // item displaced at this point has not been coalesced, placed,
+                // or submitted, so there is provably nothing running to confirm
+                // dead. Waiting for a terminal outcome nothing will produce is
+                // what deadlocked the burst.
+                if !registry.is_live_holder(key, me) {
+                    registry.finish(me);
+                    drop(registry);
+                    self.purpose_quiesced.notify_waiters();
+                    return PurposeGate::Displaced;
+                }
+                if registry.pending_retirements(key) == 0 {
+                    return PurposeGate::Clear;
+                }
+                registry.oldest_pending_retirement(key)
+            };
+            if tokio::time::timeout_at(deadline, quiesced).await.is_err() {
+                return PurposeGate::Owed { outstanding };
+            }
+        }
+    }
+
+    fn retire_dispatched_item(&self, request: &RequestIdentity) {
+        self.cancelled_leaders
+            .lock()
+            .unwrap()
+            .insert(request.clone());
+        let owner = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(request)
+            .map(|pending| (pending.executor_id.clone(), pending.generation));
+        if let Some((executor_id, generation)) = owner {
+            let _ = self.send_to(
+                &executor_id,
+                generation,
+                ExecutorMessage::Cancel {
+                    request_id: request.0.clone(),
+                    attempt_id: request.1.clone(),
+                },
+            );
+        }
+    }
+
+    fn detach_coalesced_subscriber(&self, identity: &RequestIdentity) -> Detachment {
+        let remaining;
         let leader_to_cancel = {
             let mut registry = self.in_flight.lock().unwrap();
             let Some(result_identity) = registry.subscriber_keys.remove(identity) else {
-                return;
+                return Detachment::Unknown;
             };
             let Some(execution) = registry.by_key.get_mut(&result_identity) else {
-                return;
+                return Detachment::Unknown;
             };
             execution.subscribers.remove(identity);
+            remaining = execution.subscribers.len();
             if execution.subscribers.is_empty() {
                 let leader = execution.leader.clone();
                 // Keep the empty execution as a tombstone until the leader publishes its
@@ -4158,7 +4874,7 @@ impl Fleet {
             }
         };
         let Some(leader) = leader_to_cancel else {
-            return;
+            return Detachment::Released { remaining };
         };
         let owner = self.pending.lock().unwrap().get(&leader).map(|pending| {
             (
@@ -4177,6 +4893,7 @@ impl Fleet {
                 },
             );
         }
+        Detachment::Retired { leader }
     }
 
     pub(crate) fn cancel_job_requests(&self, job_id: &str) -> usize {
@@ -4801,9 +5518,15 @@ impl Fleet {
     /// The executor a job home occupies, or will occupy before it has been routed.
     ///
     /// Job residencies are untargeted and immobile, so an unrouted home can only
-    /// land on the colocated executor.
+    /// land on the colocated executor. A route naming an executor that is no
+    /// longer connected names nothing this job can occupy: the cell it recorded
+    /// died with that executor session, and the next acquisition rebuilds the
+    /// environment wherever placement lands
+    /// ([`Self::resolve_residency_acquire_route`]). Reading it as occupancy is
+    /// how a batch came to be measured for compatibility against a machine that
+    /// was gone.
     pub(crate) fn job_home_executor(&self, holder: &ResidencyHolder) -> Option<String> {
-        self.residency_route_executor(holder).or_else(|| {
+        self.live_residency_route_executor(holder).or_else(|| {
             self.connections
                 .lock()
                 .unwrap()
@@ -4811,6 +5534,123 @@ impl Fleet {
                 .find(|entry| entry.colocated && !entry.sender.is_closed())
                 .map(|entry| entry.identity.executor_id.clone())
         })
+    }
+
+    /// The executor a residency is routed to, only while that executor holds a
+    /// live connection.
+    fn live_residency_route_executor(&self, holder: &ResidencyHolder) -> Option<String> {
+        let routed = self
+            .residency_routes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|route| route.holder == *holder)
+            .map(|route| route.executor_id.clone())
+            .collect::<Vec<_>>();
+        let connections = self.connections.lock().unwrap();
+        routed
+            .into_iter()
+            .find(|executor_id| connections.contains_key(executor_id))
+    }
+
+    /// What to call an executor in text a person or an agent reads, whether or
+    /// not it is still connected. A lost environment has to name the machine it
+    /// was on, and that machine is by definition not connected.
+    pub(crate) fn executor_name_for_text(&self, executor_id: &str) -> String {
+        if let Some(name) = self.executor_public_name(executor_id) {
+            return name;
+        }
+        if executor_id == COLOCATED_EXECUTOR_ID {
+            return LOCAL_EXECUTOR_NAME.to_string();
+        }
+        self.enrolled_remotes
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .map(|record| record.name.clone())
+            .unwrap_or_else(|| executor_id.to_string())
+    }
+
+    /// When this runner first observed that an executor was not connected.
+    ///
+    /// Stamped on disconnect, and stamped here for an executor this process has
+    /// never seen — a route loaded from the authority file after a runner
+    /// restart names a machine whose absence starts being counted the first time
+    /// anyone asks for it, not at some instant nobody observed.
+    fn link_absent_since(&self, executor_id: &str, now_unix_ms: u64) -> u64 {
+        *self
+            .link_absence_since
+            .lock()
+            .unwrap()
+            .entry(executor_id.to_string())
+            .or_insert(now_unix_ms)
+    }
+
+    /// Whether the link a residency failure came from is one the runner is still
+    /// trying to restore.
+    ///
+    /// The environment's own executor answers this, not the colocated one: a job
+    /// whose home is on a remote is neither helped nor bound by what the
+    /// supervisor is doing about a machine it never asked for. A machine still
+    /// inside its lease grace counts as restoring, because the runner has
+    /// neither given up on it nor rebuilt the environment — and a caller that
+    /// waits rather than refuses is precisely what that grace is for.
+    pub(crate) fn residency_link_restoration(
+        &self,
+        holder: &ResidencyHolder,
+    ) -> placement::LinkRestoration {
+        let routed = self
+            .residency_routes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|route| route.holder == *holder)
+            .map(|route| route.executor_id.clone())
+            .collect::<Vec<_>>();
+        let now = unix_time_ms();
+        let absent = {
+            let connections = self.connections.lock().unwrap();
+            routed
+                .iter()
+                .filter(|executor_id| !connections.contains_key(*executor_id))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let within_grace = absent.iter().any(|executor_id| {
+            now.saturating_sub(self.link_absent_since(executor_id, now))
+                < ENVIRONMENT_LEASE_GRACE_MS
+        });
+        if within_grace {
+            return placement::LinkRestoration::Restoring;
+        }
+        self.link_restoration()
+    }
+
+    /// Whether the runner has positive evidence it is bringing one executor's
+    /// link back.
+    ///
+    /// Only the colocated executor is supervised by this runner, so only it can
+    /// produce that evidence. A remote that stopped answering is read as gone
+    /// until it attaches again, which is the reading that acts rather than the
+    /// one that waits — the same default [`placement`] takes everywhere else.
+    fn executor_link_restoration(&self, executor_id: &str) -> placement::LinkRestoration {
+        if executor_id == COLOCATED_EXECUTOR_ID {
+            self.link_restoration()
+        } else {
+            placement::LinkRestoration::NotRestoring
+        }
+    }
+
+    /// Report, once, that an owner's execution environment was rebuilt because
+    /// the executor session holding the previous one ended.
+    pub(crate) fn take_environment_eviction(
+        &self,
+        holder: &ResidencyHolder,
+    ) -> Option<EnvironmentEviction> {
+        self.environment_evictions
+            .lock()
+            .unwrap()
+            .remove(&holder.storage_key())
     }
 
     /// Whether one live executor satisfies the caller's complete selector.
@@ -4829,6 +5669,26 @@ impl Fleet {
             .map(|entry| matches_selector(entry, selector))
     }
 
+    /// Where an acquisition for an owner that already has an environment must
+    /// go, or `None` when it is free to be placed.
+    ///
+    /// A route is a **lease against a live executor session**, not a permanent
+    /// binding. The cell it names lives inside that session, so a session that
+    /// ended took the environment with it and the route that survives names
+    /// nothing. Reading such a route as authority anyway is what stranded jobs
+    /// indefinitely (CAIRN-4332): every batch resolved the dead binding and was
+    /// refused structurally, while nothing ever removed the route, because route
+    /// reconciliation rewrites an executor's routes from that executor's own
+    /// snapshots and a disconnected executor sends none. The refusal was
+    /// therefore permanent, on a fleet with live machines that could have
+    /// rebuilt the environment in seconds.
+    ///
+    /// So a route with no live session behind it is evicted here and the
+    /// acquisition falls through to ordinary placement, which materializes the
+    /// environment again at the state the durable side holds. The one exception
+    /// is a link the runner is actively restoring: that environment is not gone,
+    /// it is seconds away, so the failure is capacity-shaped and the caller
+    /// waits for it rather than moving.
     #[allow(clippy::result_large_err)]
     fn resolve_residency_acquire_route(
         &self,
@@ -4849,14 +5709,32 @@ impl Fleet {
                 .cloned()
                 .collect::<Vec<_>>()
         };
-        if existing.len() > 1 {
+        if existing.is_empty() {
+            return Ok(None);
+        }
+        let mut live = {
+            let connections = self.connections.lock().unwrap();
+            existing
+                .iter()
+                .filter_map(|route| {
+                    connections
+                        .get(&route.executor_id)
+                        .map(|entry| (route.clone(), selected_executor(entry)))
+                })
+                .collect::<Vec<_>>()
+        };
+        // Two machines both claiming to hold one owner's environment right now is
+        // a contradiction only they can resolve, and picking one would be picking
+        // which live cell to orphan.
+        if live.len() > 1 {
             return Err(residency_core_failure(
                 ResidencyFailureKind::ConflictingDeclaration,
                 "multiple executors report the same execution environment",
                 None,
             ));
         }
-        let Some(route) = existing.into_iter().next() else {
+        let Some((route, selected)) = live.pop() else {
+            self.evict_lost_environment(&request.holder, &existing)?;
             return Ok(None);
         };
         if route.repository.identity() != request.repository.identity() {
@@ -4871,19 +5749,155 @@ impl Fleet {
         // (a colocated path resolved differently, say). The identity above is
         // what makes them the same environment; this is the address.
         request.repository = route.repository.clone();
-        self.connections
-            .lock()
-            .unwrap()
-            .get(&route.executor_id)
-            .map(selected_executor)
-            .map(Some)
-            .ok_or_else(|| {
-                residency_core_failure(
-                    ResidencyFailureKind::Admission,
-                    "the executor holding this execution environment is disconnected",
-                    None,
+        // One live session answers for this environment, so a route left over
+        // from a session that ended is stale by construction. Dropping it now
+        // keeps a later reconnection from resurrecting an ambiguity that no
+        // acquisition could resolve.
+        self.forget_superseded_routes(&request.holder, &route.executor_id);
+        Ok(Some(selected))
+    }
+
+    /// Answer for an environment whose every route names an executor this runner
+    /// has no live connection to, and leave the route authority in the state that
+    /// answer implies.
+    ///
+    /// Absence from the connection map is not death. A transport that dropped
+    /// leaves the executor process running and its cells intact, so treating the
+    /// first missed connection as proof the environment is gone would turn every
+    /// network blip into lost uncommitted files, packages, and resident
+    /// processes. What separates the two is time: a link that flapped comes back,
+    /// and a machine that left does not. So the environment is held for a grace
+    /// period during which the failure is capacity-shaped and the caller waits,
+    /// and only a machine still unreachable at the end of it is treated as gone.
+    ///
+    /// Evicting the routes is what makes the next step placement rather than
+    /// refusal, and it is done before anything is placed so the two cannot
+    /// disagree about how many environments this owner has.
+    #[allow(clippy::result_large_err)]
+    fn evict_lost_environment(
+        &self,
+        holder: &ResidencyHolder,
+        lost: &[ResidencyRoute],
+    ) -> Result<(), ResidencyResult> {
+        if let Some(restoring) = lost.iter().find(|route| {
+            self.executor_link_restoration(&route.executor_id)
+                == placement::LinkRestoration::Restoring
+        }) {
+            // Not lost, just away: the supervisor says it is bringing this link
+            // back, and rebuilding the environment somewhere else would abandon a
+            // cell that is about to answer again. Carrying the placement evidence
+            // is what makes this a wait rather than a refusal.
+            let diagnostic = format!(
+                "the machine holding this execution environment ({}) is reconnecting",
+                self.executor_name_for_text(&restoring.executor_id)
+            );
+            return Err(residency_core_failure(
+                ResidencyFailureKind::Admission,
+                diagnostic.clone(),
+                Some(CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::ExecutorUnavailable,
+                    diagnostic,
+                }),
+            ));
+        }
+        let now = unix_time_ms();
+        if let Some((route, absent_ms)) = lost
+            .iter()
+            .map(|route| {
+                (
+                    route,
+                    now.saturating_sub(self.link_absent_since(&route.executor_id, now)),
                 )
             })
+            // The most recently seen machine decides: while any of this owner's
+            // routes still has a machine that might answer, the environment is
+            // not yet gone.
+            .min_by_key(|(_, absent_ms)| *absent_ms)
+            .filter(|(_, absent_ms)| *absent_ms < ENVIRONMENT_LEASE_GRACE_MS)
+        {
+            let diagnostic = format!(
+                "the machine holding this execution environment ({}) has not answered for {}s",
+                self.executor_name_for_text(&route.executor_id),
+                absent_ms / 1_000
+            );
+            return Err(residency_core_failure(
+                ResidencyFailureKind::Admission,
+                diagnostic.clone(),
+                Some(CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::ExecutorUnavailable,
+                    diagnostic,
+                }),
+            ));
+        }
+        // Named in a stable order, because this reaches an agent as prose and
+        // the map these came from has no order of its own.
+        let mut names = lost
+            .iter()
+            .map(|route| self.executor_name_for_text(&route.executor_id))
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        let executor = names.join(", ");
+        if let Err(error) = self.update_residency_routes(|routes| {
+            routes.retain(|_, route| route.holder != *holder);
+        }) {
+            return Err(residency_core_failure(
+                ResidencyFailureKind::Persistence,
+                format!("release the lost execution environment route: {error}"),
+                None,
+            ));
+        }
+        tracing::warn!(
+            %holder,
+            %executor,
+            "execution environment lost with its executor session; rebuilding it through placement"
+        );
+        self.environment_evictions
+            .lock()
+            .unwrap()
+            .insert(holder.storage_key(), EnvironmentEviction { executor });
+        Ok(())
+    }
+
+    /// Tell an executor to let go of a cell whose owner now lives somewhere
+    /// else.
+    ///
+    /// Deliberately fire-and-forget: the runner has no waiter for the response,
+    /// and what matters is that the leftover stops answering for this owner,
+    /// which is the executor's to reach. A lost message costs nothing that the
+    /// cell's own death policy does not eventually reclaim.
+    fn release_superseded_residency(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        fence: ResidencyFence,
+    ) {
+        tracing::warn!(
+            executor = %executor_id,
+            holder = %fence.holder,
+            "releasing an execution environment that was superseded while its executor was away"
+        );
+        let _ = self.send_to(
+            executor_id,
+            generation,
+            ExecutorMessage::ResidencyRequest {
+                correlation_id: uuid::Uuid::new_v4().to_string(),
+                config: ResidencyRuntimeConfig::NotRequired,
+                operation: ResidencyOperation::Release { fence },
+            },
+        );
+    }
+
+    /// Forget every route for one owner except the one a live executor answers
+    /// for.
+    fn forget_superseded_routes(&self, holder: &ResidencyHolder, live_executor_id: &str) {
+        if let Err(error) = self.update_residency_routes(|routes| {
+            routes.retain(|_, route| {
+                route.holder != *holder || route.executor_id == live_executor_id
+            });
+        }) {
+            tracing::error!(%error, "persist superseded residency route removal failed");
+        }
     }
 
     pub(crate) async fn submit_pure_verdict(
@@ -5087,23 +6101,30 @@ impl Fleet {
         mut items: Vec<ProcessBatchItem>,
         runner_context_id: Option<String>,
     ) -> ProcessBatch {
-        let mut files = Vec::new();
+        let mut files: Vec<ProcessBatchFile> = Vec::new();
         for item in &mut items {
             // Zero is the executor protocol's unbounded-process sentinel. Check
             // duration estimates inform placement, but elapsed time cannot turn a
             // live check into a failure.
             item.timeout_ms = 0;
-            if let Some(index) = item
-                .env
-                .iter()
-                .position(|(key, _)| key == "CAIRN_CHECK_CHANGED_FILES_CONTENT")
-            {
-                let (_, contents) = item.env.remove(index);
-                if files.is_empty() {
-                    files.push(ProcessBatchFile {
-                        env: "CAIRN_CHECK_CHANGED_FILES".to_string(),
-                        contents,
-                    });
+            for (content_env, file_env) in [
+                (
+                    "CAIRN_CHECK_CHANGED_FILES_CONTENT",
+                    "CAIRN_CHECK_CHANGED_FILES",
+                ),
+                (
+                    "CAIRN_CHECK_BASE_CONTENT_CONTENT",
+                    "CAIRN_CHECK_BASE_CONTENT",
+                ),
+            ] {
+                if let Some(index) = item.env.iter().position(|(key, _)| key == content_env) {
+                    let (_, contents) = item.env.remove(index);
+                    if !files.iter().any(|file| file.env == file_env) {
+                        files.push(ProcessBatchFile {
+                            env: file_env.to_string(),
+                            contents,
+                        });
+                    }
                 }
             }
         }
@@ -5126,6 +6147,7 @@ impl Fleet {
         request: CellRequest,
         items: Vec<PureVerdictBatchItem>,
         run_context: Option<crate::mcp::handlers::RunContext>,
+        purpose: Option<purpose::PurposeKey>,
     ) -> Vec<Result<CoalescedCellOutcome, CellOutcome>> {
         if request.mutation_policy != MutationPolicy::PureVerdict {
             let mut outcomes = Vec::with_capacity(items.len());
@@ -5137,6 +6159,87 @@ impl Fleet {
             return outcomes;
         }
         let leader = (request.request_id.clone(), request.attempt_id.clone());
+        // The chokepoint. An item that names a purpose holds that purpose alone:
+        // admitting it is, in the same locked transition, the retirement of
+        // whatever older item was answering the same question, and no phase of
+        // the older one is exempt from being displaced.
+        //
+        // Winning the key is only half of it. The successor then waits for the
+        // predecessor's terminal outcome before dispatching, because retirement
+        // is something the displaced work does rather than something the record
+        // says about it.
+        if let Some(key) = &purpose {
+            let admission =
+                self.purposes
+                    .lock()
+                    .unwrap()
+                    .admit(key.clone(), leader.clone(), unix_time_ms());
+            match admission {
+                purpose::Admission::Admitted => {}
+                purpose::Admission::Replaced { retire, phase } => {
+                    log::info!(
+                        "purpose {key} moves to {leader:?}, retiring {retire:?} from {phase:?}"
+                    );
+                    self.retire_dispatched_item(&retire);
+                }
+                purpose::Admission::Superseded { holder } => {
+                    // Newest-wins is decided here rather than by which item
+                    // reaches an executor first, so a stale one never dispatches
+                    // at all and never takes an occupancy row.
+                    log::info!(
+                        "purpose {key} is already held by {holder:?}; {leader:?} is stale and will not dispatch"
+                    );
+                    let mut refused = Vec::with_capacity(items.len());
+                    for _ in &items {
+                        refused.push(Err(CellOutcome::Cancelled {
+                            request_id: leader.0.clone(),
+                            attempt_id: leader.1.clone(),
+                        }));
+                    }
+                    return refused;
+                }
+            }
+            // Nothing below this line may run while a displaced answer to the
+            // same question is still alive somewhere in the fleet.
+            match self.await_purpose_quiescent(key, &leader).await {
+                PurposeGate::Clear => {}
+                PurposeGate::Displaced => {
+                    log::info!(
+                        "purpose {key} moved on while {leader:?} waited to dispatch; it never ran"
+                    );
+                    let mut refused = Vec::with_capacity(items.len());
+                    for _ in &items {
+                        refused.push(Err(CellOutcome::Cancelled {
+                            request_id: leader.0.clone(),
+                            attempt_id: leader.1.clone(),
+                        }));
+                    }
+                    return refused;
+                }
+                PurposeGate::Owed { outstanding } => {
+                    // Refusing is the whole point. Dispatching here would
+                    // knowingly create the overlap this gate exists to prevent,
+                    // and a log line is a record rather than a decision anyone
+                    // made. A refused wave is visible, is retried by the next
+                    // cadence, and leaves the operator a red they can act on;
+                    // a silent second attestation leaves them the symptom that
+                    // opened this issue.
+                    let diagnostic = format!(
+                        "purpose {key} still owes a confirmed death after {}s (outstanding \
+                         {outstanding:?}); refusing to dispatch a second answer to one question",
+                        RETIREMENT_CONFIRMATION_BUDGET.as_secs()
+                    );
+                    log::warn!("{diagnostic}");
+                    self.purposes.lock().unwrap().finish(&leader);
+                    self.purpose_quiesced.notify_waiters();
+                    let mut refused = Vec::with_capacity(items.len());
+                    for _ in &items {
+                        refused.push(Err(executor_unavailable(diagnostic.clone())));
+                    }
+                    return refused;
+                }
+            }
+        }
         let wait_horizon_unix_ms = request.wait_horizon_unix_ms;
         let mut receivers = Vec::with_capacity(items.len());
         let mut newly_claimed = Vec::new();
@@ -5257,6 +6360,13 @@ impl Fleet {
                     pool.runner_contexts.lock().unwrap().remove(&id);
                 }
                 pool.cancelled_leaders.lock().unwrap().remove(&leader);
+                // The terminal outcome is what actually retires an item, and
+                // this is where it lands. Fenced by identity inside the
+                // registry, so a displaced item clears only its own debt and
+                // never the entry its replacement now holds; the wakeup then
+                // releases whichever successor was waiting on this death.
+                pool.purposes.lock().unwrap().finish(&leader);
+                pool.purpose_quiesced.notify_waiters();
                 match &outcome {
                     CellOutcome::Completed {
                         output,
@@ -5721,7 +6831,7 @@ impl Fleet {
                     project_key: request.project_id.clone(),
                     default_timeout_seconds: config.default_timeout_seconds,
                     setup_commands: Vec::new(),
-                    populate: cairn_worktree::PopulateConfig::default(),
+                    populate: cairn_cell::PopulateConfig::default(),
                     population_source_root: None,
                 },
                 object_plane: orch.object_plane.clone(),
@@ -5891,6 +7001,27 @@ impl Fleet {
             guard.disarm();
             return executor_unavailable(diagnostic);
         }
+        // A retirement that landed while this item was being placed stops it
+        // here. Submitting anyway and chasing it with a Cancel is what made
+        // retirement a race the work usually won: the submitted item took an
+        // occupancy row, and the cancel behind it could be handled before the
+        // executor had bound the identity it named.
+        if self.cancelled_leaders.lock().unwrap().remove(&key) {
+            self.pending.lock().unwrap().remove(&key);
+            if !selected.colocated {
+                object_plane.revoke_request(
+                    &key.0,
+                    &key.1,
+                    &selected.executor_id,
+                    selected.generation,
+                );
+            }
+            guard.disarm();
+            return CellOutcome::Cancelled {
+                request_id: key.0,
+                attempt_id: key.1,
+            };
+        }
         let sent = selected
             .sender
             .send(ExecutorMessage::Submit {
@@ -5899,6 +7030,14 @@ impl Fleet {
                 batch,
             })
             .is_ok();
+        if sent {
+            self.purposes
+                .lock()
+                .unwrap()
+                .advance(&key, purpose::ItemPhase::Dispatched);
+        }
+        // Retirement can still land in the instant between the gate above and
+        // this send, so the delivered form remains.
         let cancelled_before_correlation = self.cancelled_leaders.lock().unwrap().remove(&key);
         if cancelled_before_correlation {
             let _ = self.send_to(
@@ -6123,20 +7262,14 @@ impl Fleet {
         // transport-side heartbeat and snapshot processing.
         let connections = self.connections.lock().unwrap().clone();
         let now = unix_time_ms();
-        let refuse = |diagnostic: String| RefusedPlacement {
-            decision: placement_decision(
-                request,
-                now,
-                Some(policy_evidence(request, policy, false)),
-                PlacementOutcome::Refused {
-                    diagnostic: diagnostic.clone(),
-                },
-                Vec::new(),
-            ),
-            diagnostic,
-        };
-        // Stage one: which machines could structurally take this at all.
-        let survey = survey_candidates(&connections, request, now).map_err(refuse)?;
+        // Stage one: which machines could structurally take this at all. Keep the
+        // actual survey's refusal while the shadow is ranked independently: an
+        // unavailable home is the most important case for the counterfactual.
+        let actual_survey = survey_candidates(&connections, request, now);
+        let shadow_request = hermetic_shadow_request(request);
+        let shadow_survey = shadow_request
+            .as_ref()
+            .and_then(|shadow| survey_candidates(&connections, shadow, now).ok());
         // Stage two: what it would cost on each of them. Resource profiles are
         // executor-context keyed, so this is a per-candidate question -- and it
         // is asked only of candidates, so a request waiting for an executor to
@@ -6148,7 +7281,21 @@ impl Fleet {
         let oracle = DurationOracle {
             db: plan.map(|plan| plan.db.clone()),
         };
-        for entry in &survey.usable {
+        let mut estimation_entries = actual_survey
+            .as_ref()
+            .map(|survey| survey.usable.clone())
+            .unwrap_or_default();
+        if let Some(shadow) = shadow_survey.as_ref() {
+            for entry in &shadow.usable {
+                if !estimation_entries
+                    .iter()
+                    .any(|candidate| candidate.identity.executor_id == entry.identity.executor_id)
+                {
+                    estimation_entries.push(entry);
+                }
+            }
+        }
+        for entry in &estimation_entries {
             let context = ReservationPlan::context_for(
                 &entry.identity.device_id,
                 &entry.identity.executor_id,
@@ -6213,7 +7360,42 @@ impl Fleet {
         let exploration = exploration_by_work_class
             .entry(request.placement_work_class)
             .or_default();
-        let draft = rank_survey(
+        let unpinned_winner = match (shadow_request.as_ref(), shadow_survey) {
+            (Some(shadow_request), Some(shadow_survey)) => rank_survey(
+                shadow_request,
+                shadow_survey,
+                SurveyRankingContext {
+                    reservations: &reservations,
+                    predictions: &predictions,
+                    sync_costs: &sync_costs,
+                    policy,
+                    now_unix_ms: now,
+                    exploration,
+                },
+            )
+            .ok()
+            .and_then(|draft| draft.selected)
+            .map(|(_, selection)| PlacementCounterfactualWinner {
+                executor_name: selection.executor_name,
+                executor_id: selection.executor_id,
+                reason: selection.reason,
+                prediction: selection.prediction,
+            }),
+            _ => None,
+        };
+        let survey = match actual_survey {
+            Ok(survey) => survey,
+            Err(diagnostic) => {
+                return Err(refused_placement(
+                    request,
+                    now,
+                    policy,
+                    unpinned_winner,
+                    diagnostic,
+                ));
+            }
+        };
+        let draft = match rank_survey(
             request,
             survey,
             SurveyRankingContext {
@@ -6224,8 +7406,18 @@ impl Fleet {
                 now_unix_ms: now,
                 exploration,
             },
-        )
-        .map_err(refuse)?;
+        ) {
+            Ok(draft) => draft,
+            Err(diagnostic) => {
+                return Err(refused_placement(
+                    request,
+                    now,
+                    policy,
+                    unpinned_winner,
+                    diagnostic,
+                ));
+            }
+        };
         let Some((selected, selection)) = draft.selected else {
             return Ok(None);
         };
@@ -6259,6 +7451,7 @@ impl Fleet {
             request,
             now,
             Some(draft.policy),
+            unpinned_winner,
             PlacementOutcome::Selected(Box::new(selection)),
             draft.rejected,
         );
@@ -6334,7 +7527,157 @@ impl Fleet {
             .map_err(|_| "executor connection is closed".to_string())
     }
 
+    /// Hold this executor's running work across a link gap.
+    ///
+    /// A link going away is a fact about a socket, not about the machine behind
+    /// it. A `cairn-executor` keeps its cells running through a gap and dials
+    /// back on its own, so the commands it is running are still running and
+    /// their results are still coming. Resolving them the instant a transport
+    /// blip lands is what made every blip cost whatever the machine was doing:
+    /// one check lane died sixteen minutes into its run that way, and another
+    /// died part-way through writing objects that a different node was then
+    /// wedged without.
+    ///
+    /// Held work is bounded from three directions, none of them a clock that
+    /// only knows how long something has been quiet: the reattached connection
+    /// accounts for it against its first snapshot
+    /// ([`Fleet::reconcile_held_executions`]), the runner abandons it as soon as
+    /// it knows the process is gone ([`Fleet::abandon_held_executions`]), and
+    /// each submitter's own silence watchdog remains underneath.
+    fn hold_executions_across_link_gap(&self, executor_id: &str) -> usize {
+        self.fail_calls_for_executor(
+            executor_id,
+            "executor connection closed before answering this call",
+        );
+        let held = self
+            .pending
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.executor_id == executor_id)
+            .count();
+        if held > 0 {
+            log::info!(
+                "holding {held} in-flight execution(s) for executor_id={executor_id} across a link gap"
+            );
+        }
+        held
+    }
+
+    /// Re-bind work held across a gap to the connection that came back.
+    ///
+    /// What identifies an execution is what it is on the machine, not the link
+    /// that carried the order, so a result computed during the gap arrives on
+    /// the new generation and has to be accepted there.
+    fn rebind_held_executions(
+        &self,
+        executor_id: &str,
+        generation: u64,
+    ) -> HashSet<RequestIdentity> {
+        let mut pending = self.pending.lock().unwrap();
+        let mut carried = HashSet::new();
+        for (key, entry) in pending.iter_mut() {
+            if entry.executor_id == executor_id && entry.generation != generation {
+                entry.generation = generation;
+                carried.insert(key.clone());
+            }
+        }
+        carried
+    }
+
+    /// Settle work held across a gap against what the machine says it has.
+    ///
+    /// The first snapshot of the new connection is the machine's own account of
+    /// what it is running. Anything held that does not appear in it did not
+    /// survive — the process behind the link was replaced while the link was
+    /// down — and is resolved now rather than left waiting for a result nobody
+    /// is going to send.
+    fn reconcile_held_executions(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        snapshot: &FleetSnapshot,
+    ) {
+        let held = {
+            let mut carried = self.unreconciled_executions.lock().unwrap();
+            match carried.get(executor_id) {
+                Some((held_generation, _)) if *held_generation == generation => {
+                    carried.remove(executor_id).map(|(_, keys)| keys)
+                }
+                _ => None,
+            }
+        };
+        let Some(held) = held else { return };
+        let identify =
+            |request_id: &String, attempt_id: &String| (request_id.clone(), attempt_id.clone());
+        let accounted: HashSet<RequestIdentity> = snapshot
+            .executing_requests
+            .iter()
+            .map(|request| identify(&request.request_id, &request.attempt_id))
+            .chain(
+                snapshot
+                    .queued_requests
+                    .iter()
+                    .map(|request| identify(&request.request_id, &request.attempt_id)),
+            )
+            .chain(
+                snapshot
+                    .recent_completions
+                    .iter()
+                    .map(|completion| identify(&completion.request_id, &completion.attempt_id)),
+            )
+            .collect();
+        for key in held.difference(&accounted) {
+            let entry = {
+                let mut pending = self.pending.lock().unwrap();
+                match pending.get(key) {
+                    Some(entry)
+                        if entry.executor_id == executor_id && entry.generation == generation =>
+                    {
+                        pending.remove(key)
+                    }
+                    _ => None,
+                }
+            };
+            let Some(entry) = entry else { continue };
+            log::warn!(
+                "executor_id={executor_id} reattached without request {} attempt {}",
+                key.0,
+                key.1
+            );
+            let _ = entry.waiter.send(executor_unavailable(format!(
+                "the executor reattached without request {} attempt {}: it is no longer running or queued on that machine",
+                key.0, key.1
+            )));
+        }
+    }
+
+    /// Give up on work held across a gap, because the process running it is
+    /// gone.
+    ///
+    /// Only the runner's own supervisor knows this: it is what kills a remote
+    /// process group, and what watches the carrier that process lives under.
+    pub fn abandon_held_executions(&self, executor_id: &str, diagnostic: &str) {
+        self.unreconciled_executions
+            .lock()
+            .unwrap()
+            .remove(executor_id);
+        self.fail_executions_for_executor(executor_id, diagnostic);
+    }
+
+    /// Resolve everything this executor owed, because none of it is coming.
     fn fail_for_executor(&self, executor_id: &str, diagnostic: &str) {
+        self.fail_executions_for_executor(executor_id, diagnostic);
+        self.fail_calls_for_executor(executor_id, diagnostic);
+    }
+
+    /// Resolve the cell executions this executor was running.
+    ///
+    /// Separate from the calls below because only this half has work behind it.
+    /// An execution is a command that is running on a machine right now, and
+    /// deciding it is lost is a decision about that machine's process — not one
+    /// a socket is entitled to make on its own.
+    fn fail_executions_for_executor(&self, executor_id: &str, diagnostic: &str) {
         let mut pending = self.pending.lock().unwrap();
         let keys: Vec<_> = pending
             .iter()
@@ -6348,7 +7691,14 @@ impl Fleet {
                     .send(executor_unavailable(diagnostic.to_string()));
             }
         }
-        drop(pending);
+    }
+
+    /// Resolve the calls whose answers were in flight when the link went.
+    ///
+    /// A call has nothing running behind it worth preserving: it is a question
+    /// that is cheap to ask again, and the answer it was waiting for described
+    /// a moment that has already passed. These fail on any link loss.
+    fn fail_calls_for_executor(&self, executor_id: &str, diagnostic: &str) {
         let mut lifetime = self.pending_residency.lock().unwrap();
         let correlations: Vec<_> = lifetime
             .iter()
@@ -6618,7 +7968,12 @@ fn choose_executor(
         request,
         &HashMap::new(),
         repository_sync_cost,
-        unix_time_ms(),
+        // The fixture clock, not the wall clock. Every fixture machine stamps
+        // its last progress at `NOW`, and placement rejects a connection that
+        // has been silent past the freshness bound — so reading the real clock
+        // here aged every fixture out of the fleet and refused these placements
+        // for a reason none of them are about.
+        NOW,
     )?
     .selected
     .map(|(selected, _)| selected))
@@ -6781,6 +8136,25 @@ pub(crate) struct PlacementScope<'a> {
     pub(crate) verdict_platforms: &'a [String],
 }
 
+/// Recast a residency-pinned request as the hermetic request that will replace it.
+///
+/// All three machine-binding gates move together. Clearing only the pin would
+/// leave the shadow request immobile and its checkout non-transferable, making
+/// the counterfactual silently choose the colocated executor every time.
+fn hermetic_shadow_request(request: &CellRequest) -> Option<CellRequest> {
+    request.pinned_executor_id.as_ref()?;
+    let identity = request.repository.identity();
+    let mut shadow = request.clone();
+    shadow.pinned_executor_id = None;
+    shadow.placement_mobility = PlacementMobility::SpillEligible;
+    shadow.repository = RepositoryLocator::ManagedObjects {
+        project_id: identity.project_id,
+        repository_id: identity.repository_id,
+        object_format: identity.object_format,
+    };
+    Some(shadow)
+}
+
 impl<'a> PlacementScope<'a> {
     fn of(request: &'a CellRequest) -> Self {
         Self {
@@ -6861,7 +8235,13 @@ fn candidate_rejection(
     scope: PlacementScope<'_>,
     now_unix_ms: u64,
 ) -> Option<PlacementRejectionReason> {
-    if entry.sender.is_closed() {
+    if entry.drained && scope.pinned_executor_id != Some(entry.identity.executor_id.as_str()) {
+        // The runner owns this refusal rather than asking the machine. A
+        // residency pin is the exception: that work is already on the machine
+        // and must be allowed to finish so the drain can empty it. Selectors and
+        // unpinned requests are new placement and remain refused.
+        Some(PlacementRejectionReason::Drained)
+    } else if entry.sender.is_closed() {
         Some(PlacementRejectionReason::ConnectionClosed)
     } else if now_unix_ms.saturating_sub(entry.last_progress_unix_ms)
         > EXECUTOR_PROGRESS_FRESHNESS_MS
@@ -6954,7 +8334,11 @@ fn survey_candidates<'a>(
     // naming what exists. An untargeted request with nothing usable is instead
     // waiting for its own executor to attach, which its horizon already bounds.
     if usable.is_empty() && targeted {
-        return Err(no_matching_executor_diagnostic(connections, request));
+        return Err(no_matching_executor_diagnostic(
+            connections,
+            request,
+            &rejected,
+        ));
     }
     // Waiting is the right answer for a mobile request that trust left with
     // nothing: a machine on a platform this verdict counts from may still
@@ -7239,13 +8623,27 @@ impl<'a> ScoredCandidate<'a> {
             .map(|queue| queue.depth)
             .sum::<usize>();
         let cpu_admission = &entry.health.host.cpu_admission;
+        // A verdict is trusted for exactly as long as it is not blind. Two
+        // different bounds here — one interval to trust it, three to call it
+        // blind — left a ten-second gap where a machine ranked as neither
+        // pressured nor blind, which is to say as idle.
         let cpu_admission_fresh = cpu_admission
             .measured_at_unix_ms
             .is_some_and(|measured_at| {
-                now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_SAMPLE_INTERVAL_MS
+                now_unix_ms.saturating_sub(measured_at) <= CPU_ADMISSION_BLIND_AFTER_MS
             });
         let cpu_pressured =
             cpu_admission_fresh && cpu_admission.state == CpuAdmissionState::Pressured;
+        // A machine that measured its own cores and stopped is not a machine
+        // with headroom, and ranking it as one is how work keeps arriving at a
+        // host nobody can see into. Derived from the reading's age rather than
+        // from any state the executor sent, because the executor could only set
+        // such a state from the sampler whose silence is the condition itself.
+        let cpu_blind = cpu_admission
+            .measured_at_unix_ms
+            .is_some_and(|measured_at| {
+                now_unix_ms.saturating_sub(measured_at) > CPU_ADMISSION_BLIND_AFTER_MS
+            });
         let cpu_headroom_risk = (cpu_admission_fresh
             && cpu_admission.state == CpuAdmissionState::Accepting)
             .then(|| {
@@ -7263,6 +8661,7 @@ impl<'a> ScoredCandidate<'a> {
             prediction.predicted_verdict_ms = prediction.adjusted_run_ms;
         }
         let admission_accepts = !cpu_pressured
+            && !cpu_blind
             && queue_depth < entry.health.applied_policy.maximum_queue_depth
             && admission.memory_capacity_bytes.is_none_or(|capacity| {
                 active.memory_bytes.saturating_add(demand.memory_bytes) <= capacity
@@ -8578,6 +9977,54 @@ const EXECUTOR_LINK_STALE_AFTER_MS: u64 = 90_000;
 /// health verdict only — link stall remediation is silence, and silence alone.
 const EXECUTOR_TELEMETRY_STALE_AFTER_MS: u64 = EXECUTOR_LINK_STALE_AFTER_MS;
 
+/// The minimum gap between two telemetry-stall bounces anywhere in the fleet.
+///
+/// Two heartbeat intervals: long enough for the machine that just went to
+/// reattach and publish a beat or two, so the next candidate is judged against
+/// a fleet that has already absorbed the previous recovery rather than against
+/// the moment of maximum disruption.
+const TELEMETRY_STALL_BOUNCE_SPACING_MS: u64 = 2 * EXECUTOR_HEARTBEAT_INTERVAL_MS;
+
+/// How long ago this connection's executor last recomputed the facts its
+/// heartbeats carry, by the executor's own stamp.
+///
+/// `None` when the executor publishes no such stamp. The beat's own
+/// `observed_at_unix_ms` is deliberately not substituted for it: that would
+/// answer a freshness question about the facts with a timestamp taken when they
+/// were shipped, which is precisely the conflation the split stamp exists to
+/// prevent.
+fn published_facts_age_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> Option<u64> {
+    entry
+        .advertisement
+        .liveness_observed_at_unix_ms
+        .map(|observed_at| now_unix_ms.saturating_sub(observed_at))
+}
+
+/// How long this connection has been publishing facts that stopped being
+/// recomputed *and has not said why*.
+///
+/// Stall remediation reads this rather than the raw age, because the two
+/// freezes are not the same fault. An executor whose refresh pass has overrun
+/// its bound names the phase it is stuck in on every beat: that is a machine
+/// reporting its own defect while still running its work and still answering
+/// its link, and recycling that link answers the report by destroying the
+/// reporter along with every batch it holds. A freeze with no explanation is
+/// the case the watchdog was written for and reaches it unchanged — including
+/// from an executor too old to explain itself, which claims nothing here and is
+/// judged exactly as before.
+///
+/// The facts are equally stale either way, and nothing here makes them
+/// trustworthy: placement, warmth, queue forecasting and `telemetry_stale` all
+/// keep reading [`published_facts_age_ms`] and keep refusing them. What the
+/// explanation buys is the difference between a degraded machine and a dead
+/// link.
+fn unexplained_facts_age_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> Option<u64> {
+    if entry.advertisement.facts_stale_refresh_blocked.is_some() {
+        return None;
+    }
+    published_facts_age_ms(entry, now_unix_ms)
+}
+
 fn executor_health_snapshot(
     entry: &ExecutorConnectionState,
     captured_at_unix_ms: u64,
@@ -8585,10 +10032,7 @@ fn executor_health_snapshot(
 ) -> ExecutorHealthSnapshot {
     let heartbeat_age_ms =
         captured_at_unix_ms.saturating_sub(entry.advertisement.observed_at_unix_ms);
-    let liveness_age_ms = entry
-        .advertisement
-        .liveness_observed_at_unix_ms
-        .map(|observed_at| captured_at_unix_ms.saturating_sub(observed_at));
+    let liveness_age_ms = published_facts_age_ms(entry, captured_at_unix_ms);
     let telemetry_stale =
         liveness_age_ms.is_some_and(|age| age > EXECUTOR_TELEMETRY_STALE_AFTER_MS);
     ExecutorHealthSnapshot {
@@ -8612,9 +10056,13 @@ fn executor_health_snapshot(
         inventory: entry.health.inventory.clone(),
         connection_generation: entry.generation,
         applied_policy: entry.health.applied_policy.clone(),
-        drain_mode: entry.health.drain_mode,
+        // One fact with two witnesses: the drain this runner is holding, and
+        // the one the executor reports. A machine that has not yet been told
+        // about a drain is still drained, so the surfaces read the union.
+        drain_mode: entry.drained || entry.health.drain_mode,
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
+        evicted_cells: entry.health.evicted_cells.clone(),
         build_skew: expected_build_ids
             .get(&entry.identity.executor_id)
             .zip(entry.executor_build_id.as_ref())
@@ -8756,7 +10204,41 @@ fn known_executor_inventory(connections: &HashMap<String, ExecutorConnectionStat
 fn no_matching_executor_diagnostic(
     connections: &HashMap<String, ExecutorConnectionState>,
     request: &CellRequest,
+    rejected: &[PlacementRejection],
 ) -> String {
+    if let Some(pinned) = request.pinned_executor_id.as_deref() {
+        if let Some(rejection) = rejected
+            .iter()
+            .find(|rejection| rejection.executor_id == pinned)
+        {
+            return format!(
+                "the executor holding this job's execution home ({}) cannot run its resident work: {}. Read cairn://executors for live state.",
+                rejection.executor_name,
+                rejection.reason.describe()
+            );
+        }
+    }
+
+    let drained_target = rejected.iter().find(|rejection| {
+        matches!(rejection.reason, PlacementRejectionReason::Drained)
+            && connections
+                .get(&rejection.executor_id)
+                .is_some_and(|entry| {
+                    request
+                        .executor
+                        .as_ref()
+                        .filter(|selector| !selector.is_empty())
+                        .is_none_or(|selector| matches_selector(entry, selector))
+                        && serves_project(entry, &request.project_id)
+                })
+    });
+    if let Some(rejection) = drained_target {
+        return format!(
+            "{} is drained by an operator, so the runner is refusing new work there. Only an operator can clear the drain; read cairn://executors for live state.",
+            rejection.executor_name
+        );
+    }
+
     // A pin and a selector are different halves of the same failure, and a
     // refusal reporting only the pin tells an agent its batch was misplaced when
     // what actually failed is the request it wrote. The caller's own words
@@ -9005,9 +10487,272 @@ pub(crate) fn unix_time_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The instant every fleet fixture is stamped at, so a test's machines, their
+/// telemetry, and the placement clock reading them all agree.
+#[cfg(test)]
+const NOW: u64 = 1_000_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_common::executor_protocol::{
+        LivenessRefreshBlocked, LivenessRefreshPhase, RemoteConnectionPhase,
+        LIVENESS_REFRESH_BOUND_MS,
+    };
+
+    /// The claim the whole design rests on, exercised as composition rather
+    /// than as bookkeeping: a successor that has won a question does not get to
+    /// run until the answer it displaced is confirmed dead.
+    ///
+    /// Asserting only that the registry shows one holder would pass against the
+    /// exact defect this guards. The registry showing one item is compatible
+    /// with two items running — that is precisely what a fire-and-forget cancel
+    /// produces — so what is asserted here is that the gate is still closed
+    /// while the death is unconfirmed, and opens on the terminal outcome and
+    /// nothing else.
+    #[tokio::test]
+    async fn a_successor_does_not_run_until_what_it_displaced_is_confirmed_dead() {
+        let fleet = Fleet::default();
+        let key = purpose::PurposeKey::main_attestation("project");
+        let older: RequestIdentity = ("tip-x".into(), "tip-x-attempt".into());
+        let newer: RequestIdentity = ("tip-x1".into(), "tip-x1-attempt".into());
+
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), older.clone(), 10);
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), newer.clone(), 20);
+
+        let mut waiting = {
+            let fleet = fleet.clone();
+            let (key, newer) = (key.clone(), newer.clone());
+            tokio::spawn(async move { fleet.await_purpose_quiescent(&key, &newer).await })
+        };
+
+        // Winning the key is not permission to dispatch. This also parks the
+        // waiter on its wakeup, so the notification below cannot be delivered
+        // before anyone is listening for it.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiting)
+                .await
+                .is_err(),
+            "the successor must not proceed while the item it displaced is still alive"
+        );
+
+        // The predecessor's terminal outcome arrives, exactly as the leader
+        // task delivers it.
+        fleet.purposes.lock().unwrap().finish(&older);
+        fleet.purpose_quiesced.notify_waiters();
+
+        let gate = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a confirmed death must release the successor")
+            .expect("the waiting task must not panic");
+        assert!(matches!(gate, PurposeGate::Clear));
+    }
+
+    /// The burst this issue exists for: three tips in quick succession, where
+    /// the middle one is displaced while it is still waiting to dispatch.
+    ///
+    /// Being displaced is what puts an item into the debt set, so a gate that
+    /// only asked "does this question owe anything" would have the middle item
+    /// waiting on itself — and it could only leave that set by completing work
+    /// the gate was holding it back from starting. The deadlock was real,
+    /// reachable from an ordinary merge stream, and cost the newest tip the full
+    /// budget on a request that had provably never run.
+    #[tokio::test]
+    async fn an_item_displaced_while_waiting_to_dispatch_settles_instead_of_deadlocking() {
+        let fleet = Fleet::default();
+        let key = purpose::PurposeKey::main_attestation("project");
+        let a: RequestIdentity = ("tip-a".into(), "a".into());
+        let b: RequestIdentity = ("tip-b".into(), "b".into());
+        let c: RequestIdentity = ("tip-c".into(), "c".into());
+
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), a.clone(), 10);
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), b.clone(), 20);
+
+        // B holds the question and waits for A's death.
+        let mut b_gate = {
+            let fleet = fleet.clone();
+            let (key, b) = (key.clone(), b.clone());
+            tokio::spawn(async move { fleet.await_purpose_quiescent(&key, &b).await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut b_gate)
+                .await
+                .is_err(),
+            "B must wait for A"
+        );
+
+        // C arrives and takes the question from B, which is still at the gate.
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), c.clone(), 30);
+        fleet.purpose_quiesced.notify_waiters();
+
+        let gate = tokio::time::timeout(std::time::Duration::from_secs(5), b_gate)
+            .await
+            .expect("a displaced waiter must not wait out the budget on itself")
+            .expect("the waiting task must not panic");
+        assert!(
+            matches!(gate, PurposeGate::Displaced),
+            "B never dispatched, so it is settled rather than owed a death"
+        );
+
+        // B settled its own debt on the way out, so the question owes only A.
+        let registry = fleet.purposes.lock().unwrap();
+        assert_eq!(registry.pending_retirements(&key), 1);
+        assert!(registry.is_live_holder(&key, &c));
+    }
+
+    /// A debt that never clears refuses the successor rather than dispatching
+    /// beside it.
+    ///
+    /// Proceeding would knowingly create the overlap this whole design exists to
+    /// prevent, on the reasoning that a logged overlap is better than a stall.
+    /// It is not: a warning is a record, not a decision anyone made, and the
+    /// operator symptom of that overlap is exactly what opened this issue. A
+    /// refusal is visible, is re-armed by the next cadence, and never puts two
+    /// answers to one question on the fleet.
+    #[tokio::test(start_paused = true)]
+    async fn a_debt_that_never_clears_refuses_rather_than_dispatching_beside_it() {
+        let fleet = Fleet::default();
+        let key = purpose::PurposeKey::main_attestation("project");
+        let newer: RequestIdentity = ("tip-x1".into(), "attempt".into());
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), ("tip-x".into(), "attempt".into()), 10);
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), newer.clone(), 20);
+
+        // Nothing ever clears the debt; the budget is what returns.
+        let gate = fleet.await_purpose_quiescent(&key, &newer).await;
+        assert!(
+            matches!(gate, PurposeGate::Owed { .. }),
+            "an unpaid debt must refuse the successor, not wave it through"
+        );
+        assert_eq!(
+            fleet.purposes.lock().unwrap().pending_retirements(&key),
+            1,
+            "the debt is still owed; the gate never pretended it was paid"
+        );
+    }
+
+    /// A question with nothing outstanding does not make its next answer wait.
+    #[tokio::test]
+    async fn an_uncontested_question_dispatches_without_waiting() {
+        let fleet = Fleet::default();
+        let key = purpose::PurposeKey::main_attestation("project");
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), ("tip-x".into(), "attempt".into()), 10);
+
+        let gate = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fleet.await_purpose_quiescent(&key, &("tip-x".into(), "attempt".into())),
+        )
+        .await
+        .expect("a question owing no deaths must not delay its own answer");
+        assert!(matches!(gate, PurposeGate::Clear));
+    }
+
+    /// The chokepoint's whole promise, composed rather than in pieces: arming a
+    /// newer answer to a question retires the older one, and the retirement is
+    /// recorded where the pre-submit gate will find it.
+    ///
+    /// The phase the displaced item had reached is deliberately not part of the
+    /// condition. An item still being placed has no executor to tell, so the
+    /// record alone must stop it — that is what closes the window in which a
+    /// superseded wave used to dispatch anyway and then chase itself with a
+    /// cancel it could lose.
+    #[test]
+    fn arming_a_newer_answer_retires_the_older_before_it_can_dispatch() {
+        let fleet = Fleet::default();
+        let key = purpose::PurposeKey::main_attestation("project");
+        let older: RequestIdentity = ("tip-x".into(), "tip-x-attempt".into());
+        let newer: RequestIdentity = ("tip-x1".into(), "tip-x1-attempt".into());
+
+        assert_eq!(
+            fleet
+                .purposes
+                .lock()
+                .unwrap()
+                .admit(key.clone(), older.clone(), 10),
+            purpose::Admission::Admitted
+        );
+        let admission = fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), newer.clone(), 20);
+        let purpose::Admission::Replaced { retire, .. } = admission else {
+            panic!("a newer answer to one question must displace the older, got {admission:?}");
+        };
+        assert_eq!(retire, older);
+
+        fleet.retire_dispatched_item(&retire);
+        assert!(
+            fleet.cancelled_leaders.lock().unwrap().contains(&older),
+            "a retirement must be recorded even with no executor to deliver it to"
+        );
+
+        // The gate consumes the record, and consumes it once: a later item that
+        // was never retired must not inherit this one's cancellation.
+        assert!(fleet.cancelled_leaders.lock().unwrap().remove(&older));
+        assert!(!fleet.cancelled_leaders.lock().unwrap().contains(&newer));
+    }
+
+    /// A stale item is refused by the registry rather than left to race, so the
+    /// key still names the newest answer afterwards.
+    #[test]
+    fn an_answer_older_than_the_live_one_never_becomes_the_live_one() {
+        let fleet = Fleet::default();
+        let key = purpose::PurposeKey::main_attestation("project");
+        let newer: RequestIdentity = ("newer".into(), "newer-attempt".into());
+        let older: RequestIdentity = ("older".into(), "older-attempt".into());
+
+        fleet
+            .purposes
+            .lock()
+            .unwrap()
+            .admit(key.clone(), newer.clone(), 50);
+        assert_eq!(
+            fleet
+                .purposes
+                .lock()
+                .unwrap()
+                .admit(key.clone(), older.clone(), 20),
+            purpose::Admission::Superseded {
+                holder: newer.clone()
+            }
+        );
+        assert!(
+            !fleet.cancelled_leaders.lock().unwrap().contains(&newer),
+            "refusing a stale arrival must not retire the live item it lost to"
+        );
+    }
 
     /// A machine's desktop configuration is keyed by the name it answers to, so
     /// the two operations that change which names exist have to move it.
@@ -9172,11 +10917,212 @@ mod tests {
         );
     }
 
+    /// The acceptance case for the whole issue: a command that outlives the
+    /// link that ordered it is delivered to whoever asked for it.
+    ///
+    /// The executor keeps its cells running across a link gap, so the result of
+    /// a check that was sixteen minutes into its run when the socket reset is
+    /// still coming. It arrives on the connection that came back, under a new
+    /// generation, and the waiter it belongs to has to still be there.
+    #[tokio::test]
+    async fn work_running_on_a_machine_outlives_the_link_that_ordered_it() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        pool.pending.lock().unwrap().insert(
+            key.clone(),
+            PendingResult {
+                executor_id: COLOCATED_EXECUTOR_ID.into(),
+                generation,
+                requesting_job_id: Some("job".into()),
+                waiter: result_tx,
+            },
+        );
+
+        // Nobody decided this. A socket reset is not a statement about the
+        // process on the other end of it.
+        assert!(pool.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, generation));
+        assert!(
+            pool.pending.lock().unwrap().contains_key(&key),
+            "a link that went away on its own must not resolve the work it was carrying"
+        );
+
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let reattached = pool.attach_executor(sender);
+        assert_ne!(reattached, generation);
+
+        let finished = CellOutcome::Cancelled {
+            request_id: key.0.clone(),
+            attempt_id: key.1.clone(),
+        };
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            reattached,
+            ExecutorMessage::Result {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+                outcome: finished.clone(),
+            },
+        );
+        assert_eq!(
+            result_rx.await.unwrap(),
+            finished,
+            "the result computed across the gap must reach the waiter that asked for it"
+        );
+    }
+
+    /// The machine's own account of what it is running is what keeps held work
+    /// held, and the result then arrives on the new connection like any other.
+    #[tokio::test]
+    async fn work_a_reattached_machine_says_it_still_has_stays_held() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        pool.pending.lock().unwrap().insert(
+            key.clone(),
+            PendingResult {
+                executor_id: COLOCATED_EXECUTOR_ID.into(),
+                generation,
+                requesting_job_id: None,
+                waiter: result_tx,
+            },
+        );
+        assert!(pool.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, generation));
+
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let reattached = pool.attach_executor(sender);
+        let executing: cairn_common::executor_protocol::ExecutingCellRequest =
+            serde_json::from_value(serde_json::json!({
+                "requestId": key.0,
+                "attemptId": key.1,
+                "startedAtUnixMs": 0,
+                "processIds": [],
+            }))
+            .unwrap();
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            reattached,
+            ExecutorMessage::SnapshotUpdated {
+                snapshot: FleetSnapshot {
+                    executing_requests: vec![executing],
+                    ..FleetSnapshot::default()
+                },
+                health: ExecutorSubstrateReport::default(),
+            },
+        );
+        assert!(
+            pool.pending.lock().unwrap().contains_key(&key),
+            "work the machine says it is still running stays held"
+        );
+
+        let finished = CellOutcome::Cancelled {
+            request_id: key.0.clone(),
+            attempt_id: key.1.clone(),
+        };
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            reattached,
+            ExecutorMessage::Result {
+                request_id: key.0.clone(),
+                attempt_id: key.1.clone(),
+                outcome: finished.clone(),
+            },
+        );
+        assert_eq!(result_rx.await.unwrap(), finished);
+    }
+
+    /// Holding work is not hoping for it. A machine that comes back without the
+    /// work says so in the first snapshot of the new connection, and that is the
+    /// answer — waiting out a watchdog for a result nobody is going to send is
+    /// the other way to lose a lane.
+    #[tokio::test]
+    async fn a_machine_that_reattaches_without_the_work_resolves_it_at_once() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        pool.pending.lock().unwrap().insert(
+            key.clone(),
+            PendingResult {
+                executor_id: COLOCATED_EXECUTOR_ID.into(),
+                generation,
+                requesting_job_id: None,
+                waiter: result_tx,
+            },
+        );
+        assert!(pool.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, generation));
+
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let reattached = pool.attach_executor(sender);
+
+        // A first snapshot without it means the process behind the link was
+        // replaced while the link was down.
+        pool.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            reattached,
+            ExecutorMessage::SnapshotUpdated {
+                snapshot: FleetSnapshot::default(),
+                health: ExecutorSubstrateReport::default(),
+            },
+        );
+        assert!(matches!(
+            result_rx.await.unwrap(),
+            CellOutcome::Unavailable {
+                reason: CellUnavailableReason::ExecutorUnavailable,
+                ref diagnostic,
+            } if diagnostic.contains("no longer running or queued")
+        ));
+    }
+
+    /// The supervisor is the only thing that knows a machine's process is gone,
+    /// because killing it is what the supervisor does. Its verdict resolves held
+    /// work immediately rather than leaving it to a clock.
+    #[tokio::test]
+    async fn the_supervisors_verdict_that_a_machine_is_gone_resolves_its_held_work() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let (result_tx, result_rx) = oneshot::channel();
+        pool.pending.lock().unwrap().insert(
+            key,
+            PendingResult {
+                executor_id: COLOCATED_EXECUTOR_ID.into(),
+                generation,
+                requesting_job_id: None,
+                waiter: result_tx,
+            },
+        );
+        assert!(pool.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, generation));
+
+        pool.abandon_held_executions(
+            COLOCATED_EXECUTOR_ID,
+            "the runner recycled this machine's executor: telemetry stalled",
+        );
+        assert!(matches!(
+            result_rx.await.unwrap(),
+            CellOutcome::Unavailable {
+                reason: CellUnavailableReason::ExecutorUnavailable,
+                ref diagnostic,
+            } if diagnostic.contains("telemetry stalled")
+        ));
+        assert!(pool.pending.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn colocated_shutdown_is_immediate_retryable_infrastructure() {
         let pool = Fleet::default();
         let (sender, mut executor) = mpsc::unbounded_channel();
         let generation = pool.attach_executor(sender);
+        assert!(matches!(
+            executor.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
         let (result_tx, result_rx) = oneshot::channel();
         pool.pending.lock().unwrap().insert(
             ("request".into(), "attempt".into()),
@@ -9193,7 +11139,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(matches!(
             executor.recv().await,
-            Some(ExecutorMessage::Shutdown)
+            Some(ExecutorMessage::Shutdown { .. })
         ));
         assert!(matches!(
             result_rx.await.unwrap(),
@@ -9764,6 +11710,7 @@ mod tests {
             memory_budget_bytes: None,
             sandbox: None,
             toolchain_detection: None,
+            build_prerequisites: None,
         }
     }
 
@@ -10195,7 +12142,7 @@ mod tests {
             colocated_link_with_executing_leader(0);
 
         assert_eq!(
-            pool.assess_colocated_link(unix_time_ms(), EXECUTOR_LINK_STALL_REMEDIATION_MS),
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
             LinkRemediation::Healthy
         );
     }
@@ -10227,15 +12174,19 @@ mod tests {
             ExecutorSubstrateState::ConnectedStalled
         );
         assert_eq!(
-            pool.assess_colocated_link(stalled_at, EXECUTOR_LINK_STALL_REMEDIATION_MS),
+            pool.assess_colocated_link(stalled_at, LinkStallBounds::default()),
             LinkRemediation::Healthy
         );
         assert!(matches!(
             pool.assess_colocated_link(
                 unix_time_ms() + EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
-                EXECUTOR_LINK_STALL_REMEDIATION_MS,
+                LinkStallBounds::default(),
             ),
-            LinkRemediation::Bounce { generation: bounced, .. } if bounced == generation
+            LinkRemediation::Bounce {
+                generation: bounced,
+                cause: LinkStallCause::Silence { .. },
+                ..
+            } if bounced == generation
         ));
     }
 
@@ -10246,11 +12197,18 @@ mod tests {
         assert_eq!(
             pool.assess_colocated_link(
                 unix_time_ms() + EXECUTOR_LINK_STALL_REMEDIATION_MS * 10,
-                EXECUTOR_LINK_STALL_REMEDIATION_MS,
+                LinkStallBounds::default(),
             ),
             LinkRemediation::Healthy
         );
-        assert!(!pool.abandon_stalled_colocated_link(COLOCATED_EXECUTOR_ID, 1, 0));
+        assert!(!pool.abandon_stalled_colocated_link(
+            COLOCATED_EXECUTOR_ID,
+            1,
+            LinkStallCause::Silence {
+                silence_ms: 0,
+                pump_silence_ms: 0,
+            },
+        ));
     }
 
     /// The regression guard for the whole issue: a subscriber whose execution had
@@ -10282,7 +12240,10 @@ mod tests {
         assert!(pool.abandon_stalled_colocated_link(
             COLOCATED_EXECUTOR_ID,
             generation,
-            EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+            LinkStallCause::Silence {
+                silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+                pump_silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+            },
         ));
 
         // Resolution arrives as a published coalesced outcome rather than a
@@ -10350,7 +12311,7 @@ mod tests {
         assert!(matches!(
             pool.assess_colocated_link(
                 unix_time_ms() + EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
-                EXECUTOR_LINK_STALL_REMEDIATION_MS,
+                LinkStallBounds::default(),
             ),
             LinkRemediation::Bounce { .. }
         ));
@@ -10362,14 +12323,251 @@ mod tests {
         assert!(!pool.abandon_stalled_colocated_link(
             COLOCATED_EXECUTOR_ID,
             stale_generation,
-            EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+            LinkStallCause::Silence {
+                silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+                pump_silence_ms: EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+            },
         ));
         assert_eq!(pool.executor_generation(), Some(replacement));
         assert_eq!(
-            pool.assess_colocated_link(unix_time_ms(), EXECUTOR_LINK_STALL_REMEDIATION_MS),
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
             LinkRemediation::Healthy
         );
         drop(replacement_executor);
+    }
+
+    /// Put this connection's published facts that far in the past while leaving
+    /// the link itself beating normally: the CAIRN-4362 specimen shape.
+    fn facts_last_measured(pool: &Fleet, age_ms: u64) {
+        let mut connections = pool.connections.lock().unwrap();
+        let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
+        entry.last_progress_unix_ms = unix_time_ms();
+        entry.advertisement.liveness_observed_at_unix_ms =
+            Some(unix_time_ms().saturating_sub(age_ms));
+    }
+
+    /// The specimen this remediation exists for: three machines refused for
+    /// placement for a quarter of an hour while every heartbeat arrived on
+    /// time. Silence remediation cannot see it, because there is no silence.
+    #[test]
+    fn a_link_whose_facts_froze_while_it_kept_beating_is_bounced() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1);
+
+        assert!(matches!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Bounce {
+                generation: bounced,
+                cause: LinkStallCause::TelemetryFrozen { .. },
+                ..
+            } if bounced == generation
+        ));
+    }
+
+    /// Say that this connection's executor has reported which phase its refresh
+    /// pass is stuck in, which is what a machine naming its own wedge looks
+    /// like on the wire.
+    fn refresh_blocked_in(pool: &Fleet, phase: LivenessRefreshPhase) {
+        let mut connections = pool.connections.lock().unwrap();
+        let entry = connections.get_mut(COLOCATED_EXECUTOR_ID).unwrap();
+        let began = unix_time_ms().saturating_sub(LIVENESS_REFRESH_BOUND_MS);
+        entry.advertisement.facts_stale_refresh_blocked = Some(LivenessRefreshBlocked {
+            phase,
+            pass_started_unix_ms: began,
+            phase_entered_unix_ms: began,
+        });
+    }
+
+    /// The bounce is not free: it ends the executor daemon and every batch
+    /// running on the machine (CAIRN-4417). Spending that on a machine that is
+    /// telling us exactly what it is stuck in trades a reported fault for an
+    /// unreported one, so an explained freeze stays a health verdict and the
+    /// link keeps its work.
+    #[test]
+    fn a_fact_freeze_the_executor_explains_is_not_bounced() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS * 10);
+        refresh_blocked_in(&pool, LivenessRefreshPhase::Snapshot);
+
+        assert_eq!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Healthy
+        );
+        assert_eq!(
+            pool.managed_telemetry_stall_ms(COLOCATED_EXECUTOR_ID, generation, unix_time_ms()),
+            None,
+            "a machine that named its wedge has already done what the bounce exists to provoke"
+        );
+    }
+
+    /// Explaining a freeze is not a way to be trusted through it. The facts are
+    /// exactly as stale as they were, every surface that judges freshness still
+    /// says so, and only the remedy changed.
+    #[test]
+    fn an_explained_freeze_is_still_reported_as_stale_telemetry() {
+        let (pool, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS * 10);
+        refresh_blocked_in(&pool, LivenessRefreshPhase::Snapshot);
+
+        let health = pool.executor_health(unix_time_ms()).remove(0);
+        assert!(health.telemetry_stale);
+        assert_eq!(health.status, ExecutorHealthStatus::Online);
+        assert_eq!(
+            health
+                .advertisement
+                .facts_stale_refresh_blocked
+                .map(|blocked| blocked.phase),
+            Some(LivenessRefreshPhase::Snapshot),
+            "the phase has to survive to the surface an operator reads"
+        );
+    }
+
+    /// And an explanation buys nothing against silence. A machine that reported
+    /// a wedge and then stopped answering is gone, whatever its last beat said,
+    /// or the marker becomes a way to be unbounceable.
+    #[test]
+    fn silence_outranks_an_explained_fact_freeze() {
+        let (pool, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS * 10);
+        refresh_blocked_in(&pool, LivenessRefreshPhase::Snapshot);
+
+        assert!(matches!(
+            pool.assess_colocated_link(
+                unix_time_ms() + EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+                LinkStallBounds::default(),
+            ),
+            LinkRemediation::Bounce {
+                cause: LinkStallCause::Silence { .. },
+                ..
+            }
+        ));
+    }
+
+    /// Frozen facts are a health verdict long before they are grounds to take a
+    /// machine away. Inside the bound the link keeps its work.
+    #[test]
+    fn frozen_facts_inside_the_bound_are_a_verdict_rather_than_a_bounce() {
+        let (pool, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS - 1);
+
+        assert_eq!(
+            pool.assess_colocated_link(unix_time_ms(), LinkStallBounds::default()),
+            LinkRemediation::Healthy
+        );
+    }
+
+    /// Silence is the stronger statement, and the two send an operator to
+    /// different places. A link nobody has heard from must never be reported as
+    /// a machine with a telemetry problem.
+    #[test]
+    fn silence_outranks_frozen_facts_when_both_are_past_their_bounds() {
+        let (pool, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, 0);
+
+        assert!(matches!(
+            pool.assess_colocated_link(
+                unix_time_ms() + EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1,
+                LinkStallBounds::default(),
+            ),
+            LinkRemediation::Bounce {
+                cause: LinkStallCause::Silence { .. },
+                ..
+            }
+        ));
+    }
+
+    /// A machine that never claimed a recompute clock cannot have one stop.
+    /// `attach_executor` advertises none, which is exactly what an executor
+    /// built before the split stamp sends.
+    #[test]
+    fn a_link_that_publishes_no_recompute_stamp_is_never_bounced_for_it() {
+        let (pool, ..) = colocated_link_with_executing_leader(0);
+
+        assert_eq!(
+            pool.assess_colocated_link(
+                unix_time_ms() + EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS * 10,
+                LinkStallBounds {
+                    silence_ms: u64::MAX,
+                    ..LinkStallBounds::default()
+                },
+            ),
+            LinkRemediation::Healthy
+        );
+    }
+
+    /// What the SSH carrier's poll reads. The age is the executor's own
+    /// recompute stamp, so the carrier and the colocated supervisor judge the
+    /// same fact.
+    #[test]
+    fn a_managed_link_reports_how_long_its_facts_have_been_frozen() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1);
+
+        let stall = pool
+            .managed_telemetry_stall_ms(COLOCATED_EXECUTOR_ID, generation, unix_time_ms())
+            .expect("an attached link with a frozen recompute stamp reports its age");
+        assert!(stall > EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS);
+    }
+
+    /// A link that has also gone silent belongs to silence remediation, which
+    /// acts sooner and says something different. Reporting a telemetry stall
+    /// here would let the carrier recycle it under the wrong name.
+    #[test]
+    fn a_silent_managed_link_reports_no_telemetry_stall() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1);
+
+        assert_eq!(
+            pool.managed_telemetry_stall_ms(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                unix_time_ms() + EXECUTOR_LINK_STALL_REMEDIATION_MS + 1,
+            ),
+            None
+        );
+    }
+
+    /// The same generation fence the silence path carries: a reattach that
+    /// lands between assessment and action owns the link now.
+    #[test]
+    fn a_superseded_generation_reports_no_telemetry_stall() {
+        let (pool, generation, ..) = colocated_link_with_executing_leader(0);
+        facts_last_measured(&pool, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS + 1);
+
+        assert_eq!(
+            pool.managed_telemetry_stall_ms(COLOCATED_EXECUTOR_ID, generation + 1, unix_time_ms(),),
+            None
+        );
+    }
+
+    /// The wedge arrives on every attached machine inside one window, so the
+    /// cure must not be a fleet-wide recycle. One turn at a time, and a
+    /// declined turn is simply retaken on a later poll.
+    #[test]
+    fn telemetry_bounces_are_taken_one_machine_at_a_time() {
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+
+        assert!(pool.claim_telemetry_stall_bounce(now));
+        assert!(!pool.claim_telemetry_stall_bounce(now));
+        assert!(!pool.claim_telemetry_stall_bounce(now + TELEMETRY_STALL_BOUNCE_SPACING_MS - 1));
+        assert!(pool.claim_telemetry_stall_bounce(now + TELEMETRY_STALL_BOUNCE_SPACING_MS));
+    }
+
+    /// Ordering the two bounds is what keeps their verdicts from collapsing:
+    /// telemetry remediation must never fire on a link silence would have
+    /// already taken, and neither may fire before the health verdict that warns
+    /// about it.
+    #[test]
+    fn stall_bounds_stay_ordered_against_the_health_verdicts_they_follow() {
+        let bounds = LinkStallBounds::default();
+        assert!(bounds.telemetry_ms > bounds.silence_ms);
+        assert!(bounds.telemetry_ms > EXECUTOR_TELEMETRY_STALE_AFTER_MS);
+        assert!(bounds.silence_ms > EXECUTOR_PROGRESS_FRESHNESS_MS);
+        assert!(
+            TELEMETRY_STALL_BOUNCE_SPACING_MS < bounds.telemetry_ms,
+            "pacing must not outlast the condition it paces"
+        );
     }
 
     #[test]
@@ -10505,7 +12703,18 @@ mod tests {
                 ref diagnostic,
             } if diagnostic.contains("load canonical project execution policy")
         ));
-        assert!(executor.try_recv().is_err());
+        // Attach states the runner's drain posture, so an empty channel is not
+        // the available evidence. What this guards is that a refused request
+        // reached no executor: nothing beyond that opening frame was sent, and
+        // nothing ran.
+        assert!(matches!(
+            executor.try_recv(),
+            Ok(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
+        assert!(
+            executor.try_recv().is_err(),
+            "a request refused during preparation must never reach an executor"
+        );
         assert!(!repository.join("command-ran").exists());
     }
 
@@ -10580,6 +12789,10 @@ mod tests {
             .unwrap();
         assert!(matches!(
             rx.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
+        assert!(matches!(
+            rx.recv().await,
             Some(ExecutorMessage::Submit { .. })
         ));
     }
@@ -10622,8 +12835,19 @@ mod tests {
             }
         ));
         assert!(!pool.pending.lock().unwrap().contains_key(&first_key));
+        // Attaching states the runner's drain posture before any work is sent,
+        // so the cancellation is not the first frame. Skipping what attach says
+        // rather than asserting on frame position keeps this test about the
+        // watchdog cancelling a wedged submission, and keeps a future attach
+        // frame from turning it red again.
+        let cancellation = loop {
+            match executor.recv().await {
+                Some(ExecutorMessage::DrainModeRequest { .. }) => continue,
+                other => break other,
+            }
+        };
         assert!(matches!(
-            executor.recv().await,
+            cancellation,
             Some(ExecutorMessage::Cancel { request_id, attempt_id })
                 if request_id == first_key.0 && attempt_id == first_key.1
         ));
@@ -10963,6 +13187,14 @@ mod tests {
             .await
             .expect("a kernel-live command must outlive the acquisition deadline");
         assert!(matches!(outcome.outcome, CellOutcome::Cancelled { .. }));
+        // Attaching states the runner's drain posture, so the channel is not
+        // empty to begin with. What this guards is that no *cancellation* went
+        // to the machine, which is a different claim from the machine hearing
+        // nothing at all.
+        assert!(matches!(
+            executor.try_recv(),
+            Ok(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
         assert!(matches!(
             executor.try_recv(),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -11066,6 +13298,40 @@ mod tests {
             !batch.stop_on_error,
             "one red check must not hide the verdicts behind it"
         );
+    }
+
+    #[test]
+    fn check_batches_materialize_content_environment() {
+        let item = ProcessBatchItem {
+            header: "protocol".into(),
+            stream_id: "protocol".into(),
+            execution: ProcessBatchExecution::Direct,
+            program: "true".into(),
+            args: Vec::new(),
+            env: vec![
+                (
+                    "CAIRN_CHECK_CHANGED_FILES_CONTENT".into(),
+                    "src/lib.rs".into(),
+                ),
+                (
+                    "CAIRN_CHECK_BASE_CONTENT_CONTENT".into(),
+                    "{\"src/lib.rs\":\"base\"}".into(),
+                ),
+                ("PRESERVED".into(), "yes".into()),
+            ],
+            stdin: None,
+            timeout_ms: 1,
+            command_resource_identity: None,
+            verdict_environment_names: Vec::new(),
+        };
+
+        let batch = Fleet::check_process_batch(vec![item], None);
+        assert_eq!(batch.files.len(), 2);
+        assert_eq!(batch.files[0].env, "CAIRN_CHECK_CHANGED_FILES");
+        assert_eq!(batch.files[0].contents, "src/lib.rs");
+        assert_eq!(batch.files[1].env, "CAIRN_CHECK_BASE_CONTENT");
+        assert_eq!(batch.files[1].contents, "{\"src/lib.rs\":\"base\"}");
+        assert_eq!(batch.items[0].env, vec![("PRESERVED".into(), "yes".into())]);
     }
 
     #[test]
@@ -11283,9 +13549,6 @@ mod tests {
         ));
     }
 
-    /// The instant every placement test derives reading ages from.
-    const NOW: u64 = 1_000_000_000;
-
     fn fleet_entry(
         id: &str,
         os: &str,
@@ -11302,6 +13565,7 @@ mod tests {
         (
             id.into(),
             ExecutorConnectionState {
+                drained: false,
                 identity: identity.clone(),
                 advertisement: ExecutorAdvertisement {
                     identity,
@@ -11316,6 +13580,7 @@ mod tests {
                         memory_budget_bytes: None,
                         sandbox: None,
                         toolchain_detection: None,
+                        build_prerequisites: None,
                     },
                     current_load: load,
                     warm_roots: warm
@@ -11332,6 +13597,7 @@ mod tests {
                         .collect(),
                     observed_at_unix_ms: 1,
                     liveness_observed_at_unix_ms: None,
+                    facts_stale_refresh_blocked: None,
                 },
                 generation: 1,
                 sender,
@@ -11391,6 +13657,118 @@ mod tests {
         request.executor = None;
         request.placement_mobility = PlacementMobility::SpillEligible;
         request
+    }
+
+    #[test]
+    fn hermetic_shadow_lifts_all_three_execution_home_gates() {
+        let mut request = targeted_request("linux");
+        request.executor = None;
+        request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+
+        let shadow = hermetic_shadow_request(&request).expect("a pinned request has a shadow");
+
+        assert_eq!(shadow.pinned_executor_id, None);
+        assert_eq!(shadow.placement_mobility, PlacementMobility::SpillEligible);
+        assert!(matches!(
+            shadow.repository,
+            RepositoryLocator::ManagedObjects { .. }
+        ));
+        assert_eq!(shadow.base_commit, request.base_commit);
+    }
+
+    #[tokio::test]
+    async fn production_placement_records_shadow_without_changing_dispatch() {
+        let pool = Fleet::default();
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(&mut local, 0.95, 8_000_000_000, 8_000_000_000);
+        let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
+        measured(&mut remote, 0.01, 8_000_000_000, 8_000_000_000);
+        *pool.connections.lock().unwrap() = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let mut request = spillable_request();
+        request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(placement.selected.executor_id, COLOCATED_EXECUTOR_ID);
+        assert_eq!(
+            placement.decision.unpinned_winner.unwrap().executor_id,
+            "remote"
+        );
+    }
+
+    #[tokio::test]
+    async fn unavailable_home_refusal_keeps_the_hermetic_winner() {
+        let pool = Fleet::default();
+        let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
+        measured(&mut remote, 0.01, 8_000_000_000, 8_000_000_000);
+        *pool.connections.lock().unwrap() = HashMap::from([(remote_id, remote)]);
+        let mut request = spillable_request();
+        request.pinned_executor_id = Some("missing-home".into());
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+
+        let refusal = pool
+            .select_executor_once_with(
+                &request,
+                None,
+                &ActivePlacementPolicy::default_profile(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            refusal.decision.unpinned_winner.unwrap().executor_id,
+            "remote"
+        );
+    }
+
+    #[test]
+    fn unpinned_shadow_can_choose_a_remote_machine_without_changing_dispatch() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(&mut local, 0.95, 8_000_000_000, 8_000_000_000);
+        let (remote_id, mut remote) = fleet_entry("remote", "linux", 0, &[]);
+        measured(&mut remote, 0.01, 8_000_000_000, 8_000_000_000);
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let mut request = spillable_request();
+        request.pinned_executor_id = Some(COLOCATED_EXECUTOR_ID.into());
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+
+        let actual = place(&connections, &request).unwrap();
+        let shadow = place(&connections, &hermetic_shadow_request(&request).unwrap()).unwrap();
+
+        assert_eq!(chosen(&actual).executor_id, COLOCATED_EXECUTOR_ID);
+        assert_eq!(chosen(&shadow).executor_id, "remote");
     }
 
     fn place(
@@ -11499,6 +13877,7 @@ mod tests {
                     memory_budget_bytes: None,
                     sandbox: None,
                     toolchain_detection: None,
+                    build_prerequisites: None,
                 },
             ),
             None,
@@ -12439,6 +14818,69 @@ mod tests {
         ));
     }
 
+    /// The executor's own brake going blind is an earlier, narrower signal than
+    /// the telemetry cache going stale: the pressure tracker stops advancing the
+    /// moment its sampler does, while the cache is refreshed by any admission
+    /// attempt that reads it. A machine in that state is not a machine with
+    /// headroom, however good the numbers it last managed to report look.
+    #[test]
+    fn a_machine_whose_cpu_brake_went_blind_loses_to_one_that_can_still_see() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(
+            &mut local,
+            0.85,
+            8 * 1024 * 1024 * 1024,
+            500 * 1024 * 1024 * 1024,
+        );
+        local.health.host.cpu_admission = cairn_common::executor_protocol::CpuAdmissionHealth {
+            state: CpuAdmissionState::Accepting,
+            utilization: Some(0.85),
+            state_since_unix_ms: Some(NOW),
+            measured_at_unix_ms: Some(NOW),
+        };
+
+        // Idler, roomier, and its machine telemetry is fresh enough that the
+        // placement staleness gate has nothing to say about it. Only its
+        // sampler stopped.
+        let (remote_id, mut remote) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        measured(
+            &mut remote,
+            0.01,
+            48 * 1024 * 1024 * 1024,
+            900 * 1024 * 1024 * 1024,
+        );
+        let went_quiet = NOW - CPU_ADMISSION_BLIND_AFTER_MS - 1;
+        remote.health.host.cpu_admission = cairn_common::executor_protocol::CpuAdmissionHealth {
+            state: CpuAdmissionState::Accepting,
+            utilization: Some(0.01),
+            state_since_unix_ms: Some(went_quiet),
+            measured_at_unix_ms: Some(went_quiet),
+        };
+        // The control: with that same machine still sampling, its numbers win.
+        // Asserting only the blind case would pass on any fixture that happened
+        // to favour the colocated machine for unrelated reasons.
+        let mut seeing = remote.clone();
+        seeing.health.host.cpu_admission.measured_at_unix_ms = Some(NOW);
+        seeing.health.host.cpu_admission.state_since_unix_ms = Some(NOW);
+        let control = HashMap::from([
+            (local_id.clone(), local.clone()),
+            (remote_id.clone(), seeing),
+        ]);
+        assert_eq!(
+            chosen(&place(&control, &spillable_request()).unwrap()).executor_id,
+            remote_id,
+            "control: a sampling remote with better numbers should win"
+        );
+
+        let connections = HashMap::from([(local_id, local), (remote_id, remote)]);
+        let draft = place(&connections, &spillable_request()).unwrap();
+        assert_eq!(
+            chosen(&draft).executor_id,
+            COLOCATED_EXECUTOR_ID,
+            "a machine that stopped measuring its own load must not outrank one that has not"
+        );
+    }
+
     /// A gap that describes the daemon rather than the machine says nothing
     /// about whether the machine can take work, and must not exclude it.
     #[test]
@@ -13028,6 +15470,232 @@ mod tests {
         assert_eq!(failed[0].link, RemoteLinkState::AttachFailed);
         assert_eq!(attempt.attempted_at_unix_ms, 5_000);
         assert!(attempt.summary.contains("no published artifact"));
+    }
+
+    /// The defect this whole seam exists for: a drain must be settable on a
+    /// machine that is answering nothing, because that is when an operator
+    /// reaches for it. The write records the refusal and says plainly that the
+    /// machine has not been told.
+    #[tokio::test]
+    async fn a_machine_that_is_not_attached_can_still_be_drained() {
+        let fleet = Fleet::default();
+        fleet.declare_enrolled_remote("bglab-sp1", "bglab-sp1", "linux", "x86_64");
+
+        let application = fleet.set_executor_drain_mode("bglab-sp1", true).await;
+
+        assert!(matches!(
+            application,
+            DrainApplication::HeldWithoutMachine { .. }
+        ));
+        assert!(fleet.is_drained("bglab-sp1"));
+        assert!(
+            fleet.unattached_enrolled_remotes()[0].drained,
+            "the fleet surface has to show a drain the runner is holding, or an operator cannot tell it took"
+        );
+    }
+
+    /// The durability half. A drained machine that comes back — a power cycle,
+    /// a supervisor respawn, a new generation — is still drained, and is told
+    /// so as part of attaching. Before this, the drain evaporated on reconnect
+    /// and the fleet re-dogpiled the machine it had just crushed.
+    #[tokio::test]
+    async fn a_drain_outlives_the_connection_it_was_set_on() {
+        let fleet = Fleet::default();
+        let (first_sender, _first) = mpsc::unbounded_channel();
+        let first_generation = fleet.attach_executor(first_sender);
+
+        fleet
+            .set_executor_drain_mode(COLOCATED_EXECUTOR_ID, true)
+            .await;
+        fleet.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, first_generation);
+
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        let second_generation = fleet.attach_executor(sender);
+        assert!(second_generation > first_generation);
+        assert_eq!(drain_told(&mut executor), Some(true));
+        assert!(fleet.is_drained(COLOCATED_EXECUTOR_ID));
+    }
+
+    /// The other direction, and the one that inverts the fleet if it is missed.
+    ///
+    /// Drain mode is executor-PROCESS state, and a process outlives a link
+    /// bounce. Clearing a drain while the machine is detached — the path this
+    /// change exists to allow — has to reach that process when its link comes
+    /// back, or the executor keeps refusing work the runner has started placing
+    /// again: each side correct about itself, opposite about the fleet.
+    #[tokio::test]
+    async fn clearing_a_drain_while_detached_reaches_the_same_process_on_reconnect() {
+        let fleet = Fleet::default();
+        // Drained while unreachable, which is the path this change allows.
+        fleet
+            .set_executor_drain_mode(COLOCATED_EXECUTOR_ID, true)
+            .await;
+
+        // Its process was running the whole time; attaching is where it learns.
+        let (first_sender, mut first) = mpsc::unbounded_channel();
+        let first_generation = fleet.attach_executor(first_sender);
+        assert_eq!(drain_told(&mut first), Some(true));
+
+        // The link drops. The process does not.
+        fleet.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, first_generation);
+        fleet
+            .set_executor_drain_mode(COLOCATED_EXECUTOR_ID, false)
+            .await;
+        assert!(!fleet.is_drained(COLOCATED_EXECUTOR_ID));
+
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        fleet.attach_executor(sender);
+
+        assert_eq!(
+            drain_told(&mut executor),
+            Some(false),
+            "the returning process still holds the drain it was last told about, so the clear has to be stated to it"
+        );
+        assert!(
+            !fleet
+                .connections
+                .lock()
+                .unwrap()
+                .get(COLOCATED_EXECUTOR_ID)
+                .unwrap()
+                .drained
+        );
+    }
+
+    /// What the runner told an executor about draining on this connection, if
+    /// anything. Drains the queue rather than reading one message, because an
+    /// attach also carries whatever else the runner has to say.
+    fn drain_told(executor: &mut mpsc::UnboundedReceiver<ExecutorMessage>) -> Option<bool> {
+        let mut told = None;
+        while let Ok(message) = executor.try_recv() {
+            if let ExecutorMessage::DrainModeRequest { enabled, .. } = message {
+                told = Some(enabled);
+            }
+        }
+        told
+    }
+
+    /// Placement is the runner's own decision, so a drained machine is passed
+    /// over here rather than by asking the machine to refuse the admission. A
+    /// machine too wedged to answer is exactly the one whose refusal cannot be
+    /// relied on.
+    #[test]
+    fn placement_passes_over_a_drained_machine_without_asking_it() {
+        let mut connections = HashMap::from([
+            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
+            fleet_entry("bglab-sp1", "linux", 0, &[]),
+        ]);
+        connections
+            .get_mut(COLOCATED_EXECUTOR_ID)
+            .unwrap()
+            .colocated = true;
+        connections.get_mut("bglab-sp1").unwrap().drained = true;
+        let mut request = targeted_request("linux");
+        request.executor = Some(ExecutorSelector {
+            name: Some("bglab-sp1".into()),
+            ..ExecutorSelector::default()
+        });
+
+        let refusal = place(&connections, &request)
+            .expect_err("a fleet whose only matching machine is drained refuses");
+        assert!(refusal.contains("bglab-sp1"), "{refusal}");
+        assert!(refusal.contains("drained by an operator"), "{refusal}");
+        assert!(refusal.contains("Only an operator can clear"), "{refusal}");
+
+        connections.get_mut("bglab-sp1").unwrap().drained = false;
+        assert_eq!(
+            place(&connections, &request)
+                .unwrap()
+                .selected
+                .expect("clearing the drain re-admits it")
+                .0
+                .executor_id,
+            "bglab-sp1"
+        );
+    }
+
+    /// The posts/91 specimen: draining a machine with a live execution home on
+    /// it must not strand that job. A pin is residency established before the
+    /// drain, not a requester choosing the machine for new work. Letting it run
+    /// is what permits the resident work to finish and the machine to empty.
+    #[test]
+    fn a_drain_admits_work_pinned_to_the_execution_home_it_already_hosts() {
+        let (executor_id, mut resident_home) = fleet_entry("bglab-sp1", "linux", 0, &[]);
+        resident_home.drained = true;
+        let connections = HashMap::from([(executor_id, resident_home)]);
+        let mut request = targeted_request("linux");
+        request.pinned_executor_id = Some("bglab-sp1".into());
+
+        let selection = place(&connections, &request)
+            .expect("resident work crosses the drain gate")
+            .selected
+            .expect("the execution home remains the only destination")
+            .0;
+
+        assert_eq!(selection.executor_id, "bglab-sp1");
+        assert_eq!(
+            request.pinned_executor_id.as_deref(),
+            Some(selection.executor_id.as_str()),
+            "admission preserves residency; it does not re-home the job"
+        );
+    }
+
+    /// A matching residency pin bypasses only the drain refusal. It does not
+    /// make a dead link usable, and the diagnostic must preserve that actual
+    /// rejection rather than telling an operator to clear an irrelevant drain.
+    #[test]
+    fn a_pinned_drained_home_with_a_stale_link_reports_liveness_not_drain() {
+        let (executor_id, mut resident_home) = fleet_entry("bglab-sp1", "linux", 0, &[]);
+        resident_home.drained = true;
+        resident_home.last_progress_unix_ms = NOW - EXECUTOR_PROGRESS_FRESHNESS_MS - 1;
+        let connections = HashMap::from([(executor_id, resident_home)]);
+        let mut request = targeted_request("linux");
+        request.pinned_executor_id = Some("bglab-sp1".into());
+
+        let refusal = place(&connections, &request)
+            .expect_err("a residency pin cannot cross a stale connection");
+
+        assert!(refusal.contains("execution home (bglab-sp1)"), "{refusal}");
+        assert!(refusal.contains("liveness bound"), "{refusal}");
+        assert!(!refusal.contains("drained"), "{refusal}");
+        assert!(!refusal.contains("clear the drain"), "{refusal}");
+    }
+
+    /// Adopting durable state at startup must not depend on winning a race with
+    /// the colocated executor's attach, which happens inside the same boot.
+    #[tokio::test]
+    async fn hydrating_a_drain_reaches_a_machine_that_attached_first() {
+        let fleet = Fleet::default();
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        fleet.attach_executor(sender);
+        assert_eq!(
+            drain_told(&mut executor),
+            Some(false),
+            "attaching states this machine's drain either way"
+        );
+
+        fleet.hydrate_drained([COLOCATED_EXECUTOR_ID.to_string()]);
+
+        assert_eq!(
+            drain_told(&mut executor),
+            Some(true),
+            "a machine already up is told about the drain it is under"
+        );
+        assert!(
+            fleet
+                .connections
+                .lock()
+                .unwrap()
+                .get(COLOCATED_EXECUTOR_ID)
+                .unwrap()
+                .drained
+        );
+
+        // And an adoption holding no drain says so, because a runner restart's
+        // settings are not evidence about what a surviving executor process is
+        // still doing to its own admission.
+        fleet.hydrate_drained(Vec::<String>::new());
+        assert_eq!(drain_told(&mut executor), Some(false));
     }
 
     #[test]
@@ -13708,7 +16376,7 @@ mod tests {
             owner: None,
             command_class: cairn_common::executor_protocol::CellCommandClass::CargoTest,
             command: command.into(),
-            started_at_unix_ms: unix_time_ms(),
+            started_at_unix_ms: NOW,
             process_ids: Vec::new(),
             priority: None,
             subscriber_count: 1,
@@ -13769,11 +16437,10 @@ mod tests {
         }
     }
 
-    /// A forecast is taken against the wall clock, so the milliseconds between
-    /// placing a fixture's occupant and reading it are real elapsed time and
-    /// come off the prediction. The assertion is about WHICH machine spoke, and
-    /// the two candidates here are two orders of magnitude apart, so a second of
-    /// tolerance distinguishes them without pinning a clock.
+    /// Forecast fixtures share one synthetic instant for connection freshness,
+    /// occupant start time, and occupancy evaluation. Exact relief therefore
+    /// identifies which machine spoke without elapsed wall time making the
+    /// assertion scheduler-dependent.
     #[track_caller]
     fn assert_relief_near(
         occupancy: &occupancy::MachineOccupancy,
@@ -13783,10 +16450,9 @@ mod tests {
         let occupancy::MachineOccupancy::Predicted(forecast) = occupancy else {
             panic!("{because}: expected a prediction, got {occupancy:?}");
         };
-        assert!(
-            expected_ms.abs_diff(forecast.relief_ms) <= 1_000,
-            "{because}: expected relief near {expected_ms}ms, got {}ms",
-            forecast.relief_ms
+        assert_eq!(
+            forecast.relief_ms, expected_ms,
+            "{because}: expected relief at {expected_ms}ms"
         );
     }
 
@@ -13810,12 +16476,12 @@ mod tests {
             ..ExecutorSelector::default()
         };
         assert_relief_near(
-            &pool.occupancy_for(scope(Some(&linux))),
+            &pool.occupancy_for_at(scope(Some(&linux)), NOW),
             300_000,
             "only the machine that can run it speaks for it",
         );
         assert_relief_near(
-            &pool.occupancy_for(scope(None)),
+            &pool.occupancy_for_at(scope(None), NOW),
             4_000,
             "an unconstrained batch is genuinely relieved by whichever frees first",
         );
@@ -13825,7 +16491,7 @@ mod tests {
             ..ExecutorSelector::default()
         };
         assert_relief_near(
-            &pool.occupancy_for(scope(Some(&named))),
+            &pool.occupancy_for_at(scope(Some(&named)), NOW),
             300_000,
             "naming a machine is asking about that machine",
         );
@@ -13835,7 +16501,7 @@ mod tests {
             ..ExecutorSelector::default()
         };
         assert_eq!(
-            pool.occupancy_for(scope(Some(&unsatisfiable))),
+            pool.occupancy_for_at(scope(Some(&unsatisfiable)), NOW),
             occupancy::MachineOccupancy::Unforecastable,
             "no eligible machine is no knowledge, never an accidental prediction"
         );
@@ -13884,7 +16550,7 @@ mod tests {
         let scope = forecast_scope(&repository, None, PlacementMobility::SpillEligible);
 
         assert_relief_near(
-            &two_remotes().occupancy_for(scope),
+            &two_remotes().occupancy_for_at(scope, NOW),
             4_000,
             "with both eligible, the sooner relief is the honest answer",
         );
@@ -13900,7 +16566,7 @@ mod tests {
             .capabilities
             .projects_served = vec!["another-project".into()];
         assert_relief_near(
-            &unserved.occupancy_for(scope),
+            &unserved.occupancy_for_at(scope, NOW),
             300_000,
             "a machine that does not serve this project cannot relieve it",
         );
@@ -13913,7 +16579,7 @@ mod tests {
             connections.get_mut("fast").unwrap().sender = sender;
         }
         assert_relief_near(
-            &disconnected.occupancy_for(scope),
+            &disconnected.occupancy_for_at(scope, NOW),
             300_000,
             "a machine whose link has closed cannot relieve anything",
         );
@@ -13931,11 +16597,10 @@ mod tests {
         let pool = occupied_fleet();
         let repository = forecast_repository();
         assert_relief_near(
-            &pool.occupancy_for(forecast_scope(
-                &repository,
-                None,
-                PlacementMobility::PinnedOrColocated,
-            )),
+            &pool.occupancy_for_at(
+                forecast_scope(&repository, None, PlacementMobility::PinnedOrColocated),
+                NOW,
+            ),
             4_000,
             "untargeted conservative work stays on the machine holding the checkout",
         );
@@ -13945,11 +16610,14 @@ mod tests {
             ..ExecutorSelector::default()
         };
         assert_relief_near(
-            &pool.occupancy_for(forecast_scope(
-                &repository,
-                Some(&named),
-                PlacementMobility::PinnedOrColocated,
-            )),
+            &pool.occupancy_for_at(
+                forecast_scope(
+                    &repository,
+                    Some(&named),
+                    PlacementMobility::PinnedOrColocated,
+                ),
+                NOW,
+            ),
             300_000,
             "naming a machine is the permission to leave home, for placement and forecast alike",
         );
@@ -13966,11 +16634,10 @@ mod tests {
             absolute_path: "/repo".into(),
         };
         assert_relief_near(
-            &occupied_fleet().occupancy_for(forecast_scope(
-                &repository,
-                None,
-                PlacementMobility::SpillEligible,
-            )),
+            &occupied_fleet().occupancy_for_at(
+                forecast_scope(&repository, None, PlacementMobility::SpillEligible),
+                NOW,
+            ),
             4_000,
             "a checkout that cannot travel keeps the forecast at home",
         );
@@ -14254,13 +16921,22 @@ mod tests {
         ));
         let answering_fleet = orch.fleet.clone();
         let answer = tokio::spawn(async move {
-            let Some(ExecutorMessage::ResidencyRequest {
-                correlation_id,
-                config: ResidencyRuntimeConfig::Install(config),
-                operation: ResidencyOperation::Acquire { .. },
-            }) = replacement_executor.recv().await
-            else {
-                panic!("a restarted executor must receive config atomically with re-acquire");
+            // Attach states the runner's drain posture before any work arrives,
+            // so the re-acquire is not necessarily the first frame. Skipping
+            // what attach says keeps this test about atomicity of config with
+            // re-acquire rather than about frame position.
+            let (correlation_id, config) = loop {
+                match replacement_executor.recv().await {
+                    Some(ExecutorMessage::DrainModeRequest { .. }) => continue,
+                    Some(ExecutorMessage::ResidencyRequest {
+                        correlation_id,
+                        config: ResidencyRuntimeConfig::Install(config),
+                        operation: ResidencyOperation::Acquire { .. },
+                    }) => break (correlation_id, config),
+                    other => panic!(
+                        "a restarted executor must receive config atomically with re-acquire, got {other:?}"
+                    ),
+                }
             };
             assert_eq!(config.project_id, "p");
             assert_eq!(config.project_key, "p");
@@ -14285,6 +16961,101 @@ mod tests {
         assert!(matches!(result, ResidencyResult::State { .. }));
     }
 
+    /// The incident end to end at the fleet's own entry point: a job whose
+    /// environment was on a machine that is no longer connected acquires again,
+    /// lands on a live machine, and leaves the route authority naming only that
+    /// machine. Before this, the same call returned `Admission` — "the executor
+    /// holding this execution environment is disconnected" — on every batch for
+    /// the rest of the job's life (CAIRN-4332).
+    #[tokio::test]
+    async fn a_job_whose_machine_is_gone_acquires_again_on_a_live_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let repository_path = temp.path().join("repository");
+        std::fs::create_dir_all(&repository_path).unwrap();
+        orch.db
+            .local
+            .execute_script(&format!(
+                "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at) \
+                 VALUES ('p', 'default', 'Project', 'p', '{}', 1, 1);",
+                repository_path.to_string_lossy()
+            ))
+            .await
+            .unwrap();
+        let holder = ResidencyHolder::Job {
+            job_id: "stranded-by-a-departed-machine".into(),
+        };
+        let repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "p".into(),
+            absolute_path: repository_path.to_string_lossy().into_owned(),
+        };
+        orch.fleet.residency_routes.lock().unwrap().insert(
+            ("departed".into(), holder.storage_key()),
+            ResidencyRoute {
+                holder: holder.clone(),
+                repository: repository.clone(),
+                executor_id: "departed".into(),
+                pending: false,
+            },
+        );
+        machine_left(&orch.fleet, "departed");
+
+        let (sender, mut executor) = mpsc::unbounded_channel();
+        let generation = orch.fleet.attach_executor(sender);
+        assert!(matches!(
+            executor.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
+        let mut cell = materialization_read_cell("rebuilt-cell", "stranded-by-a-departed-machine");
+        cell.project_id = "p".into();
+        cell.residency.as_mut().unwrap().repository = repository.clone();
+        let answering_fleet = orch.fleet.clone();
+        let answered = cell.clone();
+        let answer = tokio::spawn(async move {
+            let Some(ExecutorMessage::ResidencyRequest {
+                correlation_id,
+                operation: ResidencyOperation::Acquire { .. },
+                ..
+            }) = executor.recv().await
+            else {
+                panic!("a rebuilt environment must be acquired on the live executor");
+            };
+            answering_fleet.handle_executor_message(
+                COLOCATED_EXECUTOR_ID,
+                generation,
+                ExecutorMessage::ResidencyResponse {
+                    correlation_id,
+                    result: ResidencyResult::State { cell: answered },
+                },
+            );
+        });
+
+        let mut request = fleet_residency_request(holder.clone());
+        request.repository = repository;
+        request.wait_horizon_unix_ms = unix_time_ms().saturating_add(5_000);
+        let result = orch
+            .fleet
+            .operate_residency(&orch, ResidencyOperation::Acquire { request })
+            .await;
+        answer.await.unwrap();
+
+        assert!(matches!(result, ResidencyResult::State { .. }));
+        let routes = orch.fleet.residency_routes.lock().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes.values().next().unwrap().executor_id,
+            COLOCATED_EXECUTOR_ID
+        );
+        drop(routes);
+        assert_eq!(
+            orch.fleet.take_environment_eviction(&holder),
+            Some(EnvironmentEviction {
+                executor: "departed".into()
+            })
+        );
+    }
+
     #[tokio::test]
     async fn executor_restart_configures_a_cell_in_the_submission_that_consumes_it() {
         let temp = tempfile::tempdir().unwrap();
@@ -14299,13 +17070,24 @@ mod tests {
 
         let answering_fleet = orch.fleet.clone();
         let answer = tokio::spawn(async move {
-            let Some(ExecutorMessage::Submit {
-                config,
-                request,
-                batch: None,
-            }) = replacement_executor.recv().await
-            else {
-                panic!("a cell must carry runtime config in its submission");
+            // Attach states the runner's drain posture before any work is sent,
+            // so the submission is not necessarily the first frame. Skipping
+            // what attach says rather than asserting on frame position keeps
+            // this test about the claim it makes — that a submission carries the
+            // runtime config for the cell that consumes it — and keeps a future
+            // attach frame from turning it red again.
+            let (config, request) = loop {
+                match replacement_executor.recv().await {
+                    Some(ExecutorMessage::DrainModeRequest { .. }) => continue,
+                    Some(ExecutorMessage::Submit {
+                        config,
+                        request,
+                        batch: None,
+                    }) => break (config, request),
+                    other => {
+                        panic!("a cell must carry runtime config in its submission, got {other:?}")
+                    }
+                }
             };
             assert_eq!(config.project_id, request.project_id);
             answering_fleet.handle_executor_message(
@@ -14331,8 +17113,16 @@ mod tests {
         assert!(matches!(result, CellOutcome::Cancelled { .. }));
     }
 
+    /// A pending route records that an acquisition may have reached an executor
+    /// the runner never heard back from, and while that executor answers, the
+    /// record is worth honoring: the cell might be there, and placing a second
+    /// one would split the owner across two environments.
+    ///
+    /// Once the connection is gone the record names a session that ended. Holding
+    /// the owner to it is what left jobs unable to run anywhere at all, because
+    /// nothing else ever removes such a route.
     #[test]
-    fn lost_acquire_response_keeps_pending_route_on_original_executor() {
+    fn a_pending_route_binds_its_owner_only_while_that_executor_answers() {
         let pool = Fleet::default();
         pool.connections.lock().unwrap().extend([
             fleet_entry("first", "linux", 10, &[]),
@@ -14346,22 +17136,97 @@ mod tests {
             pending: true,
         })
         .unwrap();
+        assert_eq!(
+            pool.resolve_residency_acquire_route(&mut request)
+                .unwrap()
+                .unwrap()
+                .executor_id,
+            "first"
+        );
 
         // Dispatch was accepted, but neither a response nor an occupant snapshot
-        // arrived before the owning connection disappeared.
+        // arrived before the owning connection disappeared for good.
         pool.connections.lock().unwrap().remove("first");
-        assert!(matches!(
-            pool.resolve_residency_acquire_route(&mut request),
-            Err(ResidencyResult::Failed {
-                kind: ResidencyFailureKind::Admission,
-                ..
-            })
-        ));
-        assert_eq!(pool.residency_routes.lock().unwrap().len(), 1);
+        machine_left(&pool, "first");
+        assert!(pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap()
+            .is_none());
+        assert!(pool.residency_routes.lock().unwrap().is_empty());
     }
 
+    /// Put an executor's link outage far enough in the past that the runner has
+    /// stopped reading it as a flap.
+    fn machine_left(pool: &Fleet, executor_id: &str) {
+        pool.link_absence_since.lock().unwrap().insert(
+            executor_id.into(),
+            unix_time_ms().saturating_sub(ENVIRONMENT_LEASE_GRACE_MS + 1),
+        );
+    }
+
+    /// The mistake the grace exists to prevent, and the reason absence alone
+    /// cannot decide this: a transport that dropped leaves the executor process
+    /// running and its cells intact, so rebuilding on the first missed
+    /// connection would spend an agent's uncommitted files on a network blip.
+    /// The environment is held and the caller waits; only a machine still
+    /// unreachable when the grace runs out is treated as gone.
     #[test]
-    fn runner_restart_preserves_ambiguous_pending_lifetime_route() {
+    fn a_link_that_dropped_is_not_yet_a_machine_that_left() {
+        let pool = Fleet::default();
+        pool.connections.lock().unwrap().extend([
+            fleet_entry("first", "linux", 0, &[]),
+            fleet_entry("second", "linux", 0, &[]),
+        ]);
+        let mut request = fleet_residency_request(ResidencyHolder::Job {
+            job_id: "flapping".into(),
+        });
+        pool.residency_routes.lock().unwrap().insert(
+            ("first".into(), request.holder.storage_key()),
+            ResidencyRoute {
+                holder: request.holder.clone(),
+                repository: request.repository.clone(),
+                executor_id: "first".into(),
+                pending: false,
+            },
+        );
+
+        // The link goes down the way an ordinary peer or I/O close takes it.
+        assert!(pool.disconnect_advertised_executor("first", 1));
+        let refusal = pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap_err();
+        let ResidencyResult::Failed {
+            kind, cell_outcome, ..
+        } = &refusal
+        else {
+            panic!("a machine that may still answer must refuse with a classified failure");
+        };
+        assert!(placement::classify_residency_failure(
+            kind,
+            cell_outcome.as_deref(),
+            pool.residency_link_restoration(&request.holder)
+        )
+        .is_capacity());
+        assert_eq!(pool.residency_routes.lock().unwrap().len(), 1);
+        assert!(pool.take_environment_eviction(&request.holder).is_none());
+
+        // The same outage, once it has outlasted the grace.
+        machine_left(&pool, "first");
+        assert!(pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap()
+            .is_none());
+        assert!(pool.residency_routes.lock().unwrap().is_empty());
+        assert!(pool.take_environment_eviction(&request.holder).is_some());
+    }
+
+    /// A runner restart carries the route authority forward into a process where
+    /// nothing is connected yet, which is exactly when a route is a claim about
+    /// the past rather than a fact about the present. It binds an owner only
+    /// while the machine it names is there to hold the environment, and the
+    /// eviction is persisted so the next restart does not resurrect it.
+    #[test]
+    fn runner_restart_does_not_bind_an_owner_to_a_machine_that_never_returns() {
         let temp = tempfile::tempdir().unwrap();
         let route_path = temp.path().join("lifetime-routes.json");
         let first = Fleet::with_residency_route_path(route_path.clone());
@@ -14376,36 +17241,42 @@ mod tests {
             .unwrap();
         drop(first);
 
-        let replacement = Fleet::with_residency_route_path(route_path);
+        let replacement = Fleet::with_residency_route_path(route_path.clone());
         replacement
             .connections
             .lock()
             .unwrap()
             .insert("second".into(), fleet_entry("second", "linux", 0, &[]).1);
         let mut retry = request;
-        assert!(matches!(
-            replacement.resolve_residency_acquire_route(&mut retry),
-            Err(ResidencyResult::Failed {
-                kind: ResidencyFailureKind::Admission,
-                ..
-            })
-        ));
-        let routes = replacement.residency_routes.lock().unwrap();
-        assert_eq!(routes.len(), 1);
-        assert!(routes.values().next().unwrap().pending);
-        assert_eq!(routes.values().next().unwrap().executor_id, "first");
+        machine_left(&replacement, "first");
+        assert!(replacement
+            .resolve_residency_acquire_route(&mut retry)
+            .unwrap()
+            .is_none());
+        assert!(replacement.residency_routes.lock().unwrap().is_empty());
+        assert!(Fleet::with_residency_route_path(route_path)
+            .residency_routes
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
+    /// The whole of CAIRN-4332 in its smallest shape: an owner whose environment
+    /// was on a machine that is gone is placed again on a machine that is here,
+    /// rather than refused for as long as the route survives — which was
+    /// forever, since only that machine's own snapshots could have retired it.
     #[test]
-    fn fleet_lifetime_retry_does_not_rehome_disconnected_lease() {
+    fn an_environment_whose_executor_is_gone_is_rebuilt_rather_than_refused() {
         let pool = Fleet::default();
         pool.connections
             .lock()
             .unwrap()
             .insert("second".into(), fleet_entry("second", "linux", 0, &[]).1);
-        let mut request = dev_instance_request("lease");
+        let mut request = fleet_residency_request(ResidencyHolder::Job {
+            job_id: "stranded".into(),
+        });
         pool.residency_routes.lock().unwrap().insert(
-            ("first".into(), "lease".into()),
+            ("first".into(), request.holder.storage_key()),
             ResidencyRoute {
                 holder: request.holder.clone(),
                 repository: request.repository.clone(),
@@ -14413,13 +17284,153 @@ mod tests {
                 pending: false,
             },
         );
+        machine_left(&pool, "first");
+
+        assert!(pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap()
+            .is_none());
+        assert!(pool.residency_routes.lock().unwrap().is_empty());
+        // The loss is a fact the agent is owed, exactly once: its next batch runs
+        // in a fresh checkout, and anything only the old environment held is gone.
+        assert_eq!(
+            pool.take_environment_eviction(&request.holder),
+            Some(EnvironmentEviction {
+                executor: "first".into()
+            })
+        );
+        assert!(pool.take_environment_eviction(&request.holder).is_none());
+    }
+
+    /// A supervised link that is bouncing is not a machine that is gone, and the
+    /// difference decides opposite answers: the environment is seconds away, so
+    /// the batch waits for it instead of abandoning a cell that is about to
+    /// answer again. Only the runner's own restoration evidence buys that wait,
+    /// and the moment it stops, the environment is rebuilt like any other.
+    #[test]
+    fn an_environment_waits_out_a_colocated_link_the_runner_is_restoring() {
+        let pool = Fleet::default();
+        let mut request = fleet_residency_request(ResidencyHolder::Job {
+            job_id: "bouncing".into(),
+        });
+        pool.residency_routes.lock().unwrap().insert(
+            (COLOCATED_EXECUTOR_ID.into(), request.holder.storage_key()),
+            ResidencyRoute {
+                holder: request.holder.clone(),
+                repository: request.repository.clone(),
+                executor_id: COLOCATED_EXECUTOR_ID.into(),
+                pending: false,
+            },
+        );
+        pool.declare_colocated_substrate(ExecutorSubstrateState::SupervisorRespawning);
+
+        let refusal = pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap_err();
+        let ResidencyResult::Failed {
+            kind, cell_outcome, ..
+        } = &refusal
+        else {
+            panic!("a restoring link must refuse with a classified residency failure");
+        };
+        assert!(placement::classify_residency_failure(
+            kind,
+            cell_outcome.as_deref(),
+            pool.residency_link_restoration(&request.holder)
+        )
+        .is_capacity());
+        assert_eq!(pool.residency_routes.lock().unwrap().len(), 1);
+        assert!(pool.take_environment_eviction(&request.holder).is_none());
+
+        pool.clear_colocated_substrate();
+        machine_left(&pool, COLOCATED_EXECUTOR_ID);
+        assert!(pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap()
+            .is_none());
+        assert!(pool.residency_routes.lock().unwrap().is_empty());
+    }
+
+    /// The other half of re-placement: a machine that comes back still holding an
+    /// owner's old cell must not become a second home for it. Two routes for one
+    /// owner is an ambiguity no acquisition can resolve, so the leftover is
+    /// released and the live environment keeps the owner.
+    #[test]
+    fn a_returning_executor_releases_an_environment_that_moved_while_it_was_away() {
+        let pool = Fleet::default();
+        pool.connections
+            .lock()
+            .unwrap()
+            .insert("second".into(), fleet_entry("second", "linux", 0, &[]).1);
+        let holder = ResidencyHolder::Job {
+            job_id: "moved".into(),
+        };
+        pool.residency_routes.lock().unwrap().insert(
+            ("second".into(), holder.storage_key()),
+            ResidencyRoute {
+                holder: holder.clone(),
+                repository: fleet_residency_request(holder.clone()).repository,
+                executor_id: "second".into(),
+                pending: false,
+            },
+        );
+
+        let (returning, mut inbox) = mpsc::unbounded_channel();
+        let (id, mut entry) = fleet_entry("first", "linux", 0, &[]);
+        entry.sender = returning;
+        let generation = entry.generation;
+        pool.connections.lock().unwrap().insert(id, entry);
+        assert!(pool.set_executor_snapshot(
+            "first",
+            generation,
+            FleetSnapshot {
+                cells: vec![materialization_read_cell("leftover-cell", "moved")],
+                ..FleetSnapshot::default()
+            },
+            ExecutorSubstrateReport::default(),
+        ));
+
+        let routes = pool.residency_routes.lock().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes.values().next().unwrap().executor_id, "second");
+        drop(routes);
         assert!(matches!(
-            pool.resolve_residency_acquire_route(&mut request),
-            Err(ResidencyResult::Failed {
-                kind: ResidencyFailureKind::Admission,
+            inbox.try_recv(),
+            Ok(ExecutorMessage::ResidencyRequest {
+                operation: ResidencyOperation::Release { .. },
                 ..
             })
         ));
+    }
+
+    /// A job home is where the job's work already is, and a machine that is gone
+    /// is not that. Reading a dead route as occupancy is what measured a batch's
+    /// selector against a machine nothing could run on.
+    #[test]
+    fn a_job_home_on_a_departed_machine_is_not_read_as_occupancy() {
+        let pool = Fleet::default();
+        pool.connections.lock().unwrap().extend([fleet_entry(
+            COLOCATED_EXECUTOR_ID,
+            "linux",
+            0,
+            &[],
+        )]);
+        let holder = ResidencyHolder::Job {
+            job_id: "departed".into(),
+        };
+        pool.residency_routes.lock().unwrap().insert(
+            ("first".into(), holder.storage_key()),
+            ResidencyRoute {
+                holder: holder.clone(),
+                repository: fleet_residency_request(holder.clone()).repository,
+                executor_id: "first".into(),
+                pending: false,
+            },
+        );
+        assert_eq!(
+            pool.job_home_executor(&holder).as_deref(),
+            Some(COLOCATED_EXECUTOR_ID)
+        );
     }
 
     #[test]
@@ -14720,7 +17731,7 @@ mod tests {
             project_key: "p".into(),
             default_timeout_seconds: 5,
             setup_commands: Vec::new(),
-            populate: cairn_worktree::PopulateConfig {
+            populate: cairn_cell::PopulateConfig {
                 copy: vec![".env".into()],
                 symlink: Vec::new(),
             },
@@ -14835,6 +17846,14 @@ mod tests {
         let pool = Fleet::default();
         let (executor_tx, mut executor_rx) = mpsc::unbounded_channel();
         let generation = pool.attach_executor(executor_tx);
+        // Attaching states the runner's drain posture, so the channel is not
+        // empty to begin with. What this test guards is that no *cancellation*
+        // is sent while another job still wants the execution, which is a
+        // different claim from the machine hearing nothing at all.
+        assert!(matches!(
+            executor_rx.try_recv(),
+            Ok(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
         let first = ("first".to_string(), "attempt-1".to_string());
         let second = ("second".to_string(), "attempt-2".to_string());
         let (first_tx, _) = oneshot::channel();
@@ -14942,6 +17961,14 @@ mod tests {
         let pool = Fleet::default();
         let (executor_tx, mut executor_rx) = mpsc::unbounded_channel();
         let generation = pool.attach_executor(executor_tx);
+        // Attaching states the runner's drain posture on every connection, so
+        // that frame is already queued ahead of anything this test provokes.
+        // What is asserted below is that the leader is told to cancel, never
+        // that the cancel is the first thing the machine ever hears.
+        assert!(matches!(
+            executor_rx.try_recv(),
+            Ok(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
         let leader = ("leader".to_string(), "attempt-1".to_string());
         let resubmitted = ("resubmitted".to_string(), "attempt-2".to_string());
         let key = result_identity();
@@ -15118,6 +18145,7 @@ mod tests {
             &request,
             unix_time_ms(),
             None,
+            None,
             PlacementOutcome::Refused {
                 diagnostic: "capacity held".into(),
             },
@@ -15157,6 +18185,10 @@ mod tests {
         let pool = Fleet::default();
         let (executor_tx, mut executor_rx) = mpsc::unbounded_channel();
         let generation = pool.attach_executor(executor_tx);
+        assert!(matches!(
+            executor_rx.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
         let identity = ("leader".to_string(), "attempt".to_string());
         let (tx, rx) = oneshot::channel();
         let key = register_held_subscriber(
@@ -15195,6 +18227,10 @@ mod tests {
         let pool = Fleet::default();
         let (executor_tx, mut executor_rx) = mpsc::unbounded_channel();
         let generation = pool.attach_executor(executor_tx);
+        assert!(matches!(
+            executor_rx.recv().await,
+            Some(ExecutorMessage::DrainModeRequest { enabled: false, .. })
+        ));
         let identity = ("leader".to_string(), "attempt".to_string());
         let (tx, rx) = oneshot::channel();
         let key = register_held_subscriber(
@@ -15444,6 +18480,7 @@ mod tests {
             occupancy: CellOccupancy {
                 command: None,
                 command_ownership: None,
+                draining: None,
                 processes: std::collections::BTreeMap::from([(
                     "main".into(),
                     cairn_common::executor_protocol::ResidentProcess {

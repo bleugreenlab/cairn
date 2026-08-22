@@ -24,7 +24,7 @@ use cairn_core::internal::storage::{
     DbError, DbResult, LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS,
 };
 use cairn_db::turso::params;
-use cairn_executor::{AdmissionLimits, ExecutorRuntime, Fleet as ExecutorPool};
+use cairn_exec::{AdmissionLimits, ExecutorRuntime, Fleet as ExecutorPool};
 use serde_json::{json, Value};
 use tempfile::{tempdir, TempDir};
 use tokio::sync::mpsc;
@@ -298,11 +298,13 @@ fn attach_executor(
                 memory_budget_bytes: None,
                 sandbox: None,
                 toolchain_detection: None,
+                build_prerequisites: None,
             },
             current_load: 0,
             warm_roots: Vec::new(),
             observed_at_unix_ms: 0,
             liveness_observed_at_unix_ms: None,
+            facts_stale_refresh_blocked: None,
         },
         tx,
         colocated,
@@ -374,11 +376,13 @@ fn attach_executor(
                                         memory_budget_bytes: None,
                                         sandbox: None,
                                         toolchain_detection: None,
+                                        build_prerequisites: None,
                                     },
                                     current_load: 0,
                                     warm_roots: executor_pool.warm_roots(),
                                     observed_at_unix_ms: unix_time_ms(),
                                     liveness_observed_at_unix_ms: None,
+                                    facts_stale_refresh_blocked: None,
                                 },
                             },
                         );
@@ -423,7 +427,7 @@ fn attach_executor(
                         },
                     );
                 }
-                ExecutorMessage::Shutdown => break,
+                ExecutorMessage::Shutdown { .. } => break,
                 _ => {}
             }
         }

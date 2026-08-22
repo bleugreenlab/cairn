@@ -23,6 +23,7 @@ pub const RESERVED_NODE_SEGMENTS: &[&str] = &[
     "diff",
     "todos",
     "memories",
+    "eras",
     "feed",
     "tasks",
     "wakes",
@@ -580,6 +581,23 @@ pub enum CairnResource {
         node_id: String,
         memory_seq: i32,
     },
+    /// Persisted era summaries for a thread session (collection), newest
+    /// first. An era is minted and summarized at thread-compaction fold time
+    /// and never recomputed on read.
+    NodeEras {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+    },
+    /// A single persisted era addressed by its 1-based sequence within the job.
+    NodeEra {
+        project: String,
+        number: i32,
+        exec_seq: i32,
+        node_id: String,
+        era_seq: i32,
+    },
     /// Contextual recipes collection (workspace + current project).
     Recipes,
     /// A single recipe addressed by id (resolves project-first, then workspace).
@@ -874,6 +892,8 @@ impl CairnResource {
             Self::Label { .. } => ResourceKind::Label,
             Self::NodeMemories { .. } => ResourceKind::NodeMemories,
             Self::NodeMemory { .. } => ResourceKind::NodeMemory,
+            Self::NodeEras { .. } => ResourceKind::NodeEras,
+            Self::NodeEra { .. } => ResourceKind::NodeEra,
             Self::Recipes => ResourceKind::Recipes,
             Self::Recipe { .. } => ResourceKind::Recipe,
             Self::ProjectRecipes { .. } => ResourceKind::ProjectRecipes,

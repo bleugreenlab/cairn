@@ -86,7 +86,7 @@ fn parse_mode(raw: &str) -> Option<ChangeMode> {
 const COMMIT_MSG_GUIDANCE: &str =
     "file-target changes require a commit_msg so the work is committed to git — \
      uncommitted worktree edits are lost permanently if the worktree is cleaned up. \
-     Pass a descriptive commit_msg (or \"^\" to amend the previous commit).";
+     Pass a descriptive commit_msg (or \"^\" to commit with the previous commit's description; on an agent branch this always creates a new commit and never rewrites the previous commit in place).";
 
 /// Validate a raw `write` payload and return **every** blocking problem.
 ///

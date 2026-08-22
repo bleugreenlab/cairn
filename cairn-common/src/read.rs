@@ -166,13 +166,27 @@ pub struct SegmentMeta {
     pub shown_units: usize,
     pub offset: usize,
     pub limit: Option<usize>,
-    /// grep: real matches (not context lines).
+    /// grep: real matches (not context lines) in the COMPLETE result, before
+    /// any `head_limit` window — see [`Self::grep_shown`].
     pub match_count: Option<usize>,
-    /// grep/glob: files.
+    /// grep/glob: files. For grep, files in the complete result.
     pub file_count: Option<usize>,
     /// `Record`/`Turn` unit: the plural noun for the header suffix (`"issues"`,
-    /// `"messages"`, `"turns"`). `None` for other segments.
+    /// `"messages"`, `"turns"`). For a grep segment, the unit its `head_limit`
+    /// window counts (`"matches"`, or `"files"` under
+    /// `files_with_matches`/`count`). `None` for other segments.
     pub unit_noun: Option<String>,
+    /// grep: results the body carries when a `head_limit` window elided some of
+    /// `total_units`, counted in [`Self::unit_noun`]'s unit. `None` when the
+    /// body is the complete result.
+    ///
+    /// A windowed enumeration that reports only its own size is
+    /// indistinguishable from a complete one, which silently turns "every caller
+    /// of this symbol" into "the first few callers of this symbol". This field
+    /// is what makes the header say `8 of 23 matches shown` and what earns the
+    /// continue footer.
+    #[serde(default)]
+    pub grep_shown: Option<usize>,
     /// For line-framed record bodies, the number of leading physical lines that
     /// are metadata rather than records. This lets budget truncation translate
     /// retained lines back into truthful record counts and continuation offsets.
@@ -197,6 +211,7 @@ impl SegmentMeta {
             match_count: None,
             file_count: None,
             unit_noun: None,
+            grep_shown: None,
             record_prelude_lines: None,
             truncated: false,
             char_continuation: false,

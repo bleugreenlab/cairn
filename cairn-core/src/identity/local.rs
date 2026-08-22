@@ -13,10 +13,16 @@ use std::path::Path;
 use super::crypto::{decrypt_credential, encrypt_credential, get_machine_id};
 use super::{
     AccountOverrides, AccountSource, ActualTargetKind, ApiProvider, ClaudeAuth, CodexAuth,
-    GitIdentity, IdentityStore, ProviderAccount, ProviderAuth, RetiredLogin, UserIdentity,
+    CustomHeader, CustomModelPolicy, CustomProtocol, CustomSampling, GitIdentity, IdentityStore,
+    ProviderAccount, ProviderAuth, RetiredLogin, UserIdentity,
 };
+use std::ops::Not;
 
 const IDENTITY_FILENAME: &str = "identity.yaml";
+
+fn default_custom_max_output_tokens() -> i64 {
+    super::DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS
+}
 
 // === V1 (legacy) on-disk format ===
 
@@ -142,6 +148,34 @@ enum AuthFile {
         encrypted_api_key: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cluster_id: Option<String>,
+    },
+    /// One named custom provider. Where to reach it, what it speaks, and how
+    /// its models are known are plain configuration; the bearer key and every
+    /// operator header VALUE are encrypted at rest, because the only reason to
+    /// add a header to an inference endpoint is to authenticate to it.
+    ///
+    /// Header values are sealed together as one JSON blob rather than one
+    /// ciphertext each. Encrypting them individually would publish how many
+    /// there are and how long each one is, and would let a file editor reorder
+    /// or drop one without the seal noticing.
+    #[serde(rename = "custom_endpoint", rename_all = "camelCase")]
+    CustomEndpoint {
+        base_url: String,
+        protocol: CustomProtocol,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_api_key: Option<String>,
+        /// Header names in order, paired positionally with the decrypted
+        /// values. Names are not secret and stay readable so an operator can
+        /// see what a provider sends without decrypting anything.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        header_names: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encrypted_header_values: Option<String>,
+        models: CustomModelPolicy,
+        #[serde(default, skip_serializing_if = "CustomSampling::is_empty")]
+        sampling: CustomSampling,
+        #[serde(default = "default_custom_max_output_tokens")]
+        max_output_tokens: i64,
     },
     #[serde(rename = "local_cli")]
     LocalCli,
@@ -543,6 +577,44 @@ fn store_from_v2_file(
                     .transpose()?,
                 cluster_id,
             },
+            AuthFile::CustomEndpoint {
+                base_url,
+                protocol,
+                encrypted_api_key,
+                header_names,
+                encrypted_header_values,
+                models,
+                sampling,
+                max_output_tokens,
+            } => {
+                let values: Vec<String> = match &encrypted_header_values {
+                    Some(sealed) => serde_json::from_str(&decrypt_credential(sealed, machine_id)?)
+                        .map_err(|error| format!("custom endpoint headers unreadable: {error}"))?,
+                    None => Vec::new(),
+                };
+                if values.len() != header_names.len() {
+                    return Err(format!(
+                        "custom endpoint '{base_url}' has {} header names and {} header values",
+                        header_names.len(),
+                        values.len()
+                    ));
+                }
+                ProviderAuth::CustomEndpoint {
+                    base_url,
+                    protocol,
+                    api_key: encrypted_api_key
+                        .map(|encrypted| decrypt_credential(&encrypted, machine_id))
+                        .transpose()?,
+                    headers: header_names
+                        .into_iter()
+                        .zip(values)
+                        .map(|(name, value)| CustomHeader { name, value })
+                        .collect(),
+                    models,
+                    sampling,
+                    max_output_tokens,
+                }
+            }
             AuthFile::ClaudeProfile => ProviderAuth::ClaudeProfile,
             // Both retired shapes are handled above; a `local_cli` row never
             // reaches here.
@@ -619,6 +691,38 @@ fn store_to_v2_file(store: &IdentityStore, machine_id: &str) -> Result<IdentityS
                     .map(|value| encrypt_credential(value, machine_id))
                     .transpose()?,
                 cluster_id: cluster_id.clone(),
+            },
+            ProviderAuth::CustomEndpoint {
+                base_url,
+                protocol,
+                api_key,
+                headers,
+                models,
+                sampling,
+                max_output_tokens,
+            } => AuthFile::CustomEndpoint {
+                base_url: base_url.clone(),
+                protocol: *protocol,
+                encrypted_api_key: api_key
+                    .as_deref()
+                    .map(|value| encrypt_credential(value, machine_id))
+                    .transpose()?,
+                header_names: headers.iter().map(|header| header.name.clone()).collect(),
+                encrypted_header_values: headers
+                    .is_empty()
+                    .not()
+                    .then(|| {
+                        let values: Vec<&str> =
+                            headers.iter().map(|header| header.value.as_str()).collect();
+                        let json = serde_json::to_string(&values).map_err(|error| {
+                            format!("custom endpoint headers unserializable: {error}")
+                        })?;
+                        encrypt_credential(&json, machine_id)
+                    })
+                    .transpose()?,
+                models: models.clone(),
+                sampling: sampling.clone(),
+                max_output_tokens: *max_output_tokens,
             },
             ProviderAuth::ClaudeProfile => AuthFile::ClaudeProfile,
         };
@@ -744,28 +848,6 @@ mod tests {
         )
     }
 
-    fn oauth_account(
-        id: &str,
-        label: &str,
-        api_provider: ApiProvider,
-        value: &str,
-        sort_order: i32,
-        created_at: i64,
-        last_used_at: Option<i64>,
-    ) -> ProviderAccount {
-        configured_account(
-            id,
-            label,
-            api_provider,
-            ProviderAuth::OAuthToken {
-                value: value.to_string(),
-            },
-            sort_order,
-            created_at,
-            last_used_at,
-        )
-    }
-
     fn git_identity(
         id: &str,
         label: &str,
@@ -840,7 +922,6 @@ mod tests {
                 0,
             )],
         );
-
         let loaded = roundtrip_saved(
             &dir,
             |path| save_identity_store(path, &store),
@@ -1495,6 +1576,180 @@ accounts:
 
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].auth.credential_value(), Some("new-key"));
+    }
+
+    #[test]
+    fn a_custom_endpoint_round_trips_with_its_secrets_sealed() {
+        let machine = "test-machine";
+        let auth = ProviderAuth::custom_endpoint(
+            "http://10.10.10.83:8000",
+            CustomProtocol::OpenAiChatCompletions,
+            Some("sk-secret-value"),
+            &[
+                ("x-tenant".to_string(), "tenant-secret".to_string()),
+                ("x-route".to_string(), "route-secret".to_string()),
+            ],
+            CustomModelPolicy::Explicit {
+                ids: vec!["qwen3.8-27b".into()],
+            },
+            CustomSampling {
+                repetition_penalty: Some(1.1),
+                ..Default::default()
+            },
+            65_536,
+        )
+        .unwrap();
+        let account = configured_account(
+            "acc_spark",
+            "DGX Spark",
+            ApiProvider::Custom,
+            auth,
+            0,
+            0,
+            None,
+        );
+        let store = IdentityStore {
+            user_id: "local-1".to_string(),
+            accounts: vec![account],
+            git_identities: vec![],
+            project_overrides: Default::default(),
+            retired_logins: vec![],
+            config_dir: std::path::PathBuf::new(),
+        };
+
+        let file = store_to_v2_file(&store, machine).unwrap();
+        let yaml = serde_yaml::to_string(&file).unwrap();
+        // Nothing secret is legible on disk; the header NAMES are, so an
+        // operator can see what a provider sends without decrypting anything.
+        assert!(!yaml.contains("sk-secret-value"), "{yaml}");
+        assert!(!yaml.contains("tenant-secret"), "{yaml}");
+        assert!(!yaml.contains("route-secret"), "{yaml}");
+        assert!(yaml.contains("x-tenant"), "{yaml}");
+        assert!(yaml.contains("http://10.10.10.83:8000/v1"), "{yaml}");
+
+        let parsed: IdentityStoreFile = serde_yaml::from_str(&yaml).unwrap();
+        let (restored, _) = store_from_v2_file(parsed, machine).unwrap();
+        let restored = &restored.accounts[0];
+        assert_eq!(restored.label, "DGX Spark");
+        assert_eq!(restored.api_provider, ApiProvider::Custom);
+        let ProviderAuth::CustomEndpoint {
+            base_url,
+            protocol,
+            api_key,
+            headers,
+            models,
+            sampling,
+            max_output_tokens,
+        } = &restored.auth
+        else {
+            panic!("expected a custom endpoint");
+        };
+        assert_eq!(base_url, "http://10.10.10.83:8000/v1");
+        assert_eq!(*protocol, CustomProtocol::OpenAiChatCompletions);
+        assert_eq!(api_key.as_deref(), Some("sk-secret-value"));
+        assert_eq!(
+            headers,
+            &[
+                CustomHeader {
+                    name: "x-tenant".into(),
+                    value: "tenant-secret".into()
+                },
+                CustomHeader {
+                    name: "x-route".into(),
+                    value: "route-secret".into()
+                },
+            ]
+        );
+        assert_eq!(
+            models,
+            &CustomModelPolicy::Explicit {
+                ids: vec!["qwen3.8-27b".into()]
+            }
+        );
+        assert_eq!(sampling.repetition_penalty, Some(1.1));
+        assert_eq!(*max_output_tokens, 65_536);
+    }
+
+    #[test]
+    fn a_custom_endpoint_with_no_credentials_stores_none() {
+        let machine = "test-machine";
+        let account = configured_account(
+            "acc_open",
+            "Laptop",
+            ApiProvider::Custom,
+            ProviderAuth::custom_endpoint(
+                "http://localhost:8000/v1",
+                CustomProtocol::OpenAiChatCompletions,
+                None,
+                &[],
+                CustomModelPolicy::Discover,
+                CustomSampling::default(),
+                super::default_custom_max_output_tokens(),
+            )
+            .unwrap(),
+            0,
+            0,
+            None,
+        );
+        let store = IdentityStore {
+            user_id: "local-1".to_string(),
+            accounts: vec![account],
+            git_identities: vec![],
+            project_overrides: Default::default(),
+            retired_logins: vec![],
+            config_dir: std::path::PathBuf::new(),
+        };
+        let yaml = serde_yaml::to_string(&store_to_v2_file(&store, machine).unwrap()).unwrap();
+        assert!(!yaml.contains("encryptedApiKey"), "{yaml}");
+        assert!(!yaml.contains("encryptedHeaderValues"), "{yaml}");
+        let parsed: IdentityStoreFile = serde_yaml::from_str(&yaml).unwrap();
+        let (restored, _) = store_from_v2_file(parsed, machine).unwrap();
+        assert!(matches!(
+            &restored.accounts[0].auth,
+            ProviderAuth::CustomEndpoint { api_key: None, headers, models: CustomModelPolicy::Discover, .. }
+                if headers.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_tampered_custom_endpoint_refuses_to_load() {
+        // Header names are readable on disk and their values are sealed as one
+        // blob. Adding a name by hand therefore desynchronizes the pair, and a
+        // provider that silently sent the wrong header value would be worse
+        // than one that refuses to load.
+        let machine = "test-machine";
+        let account = configured_account(
+            "acc_spark",
+            "DGX Spark",
+            ApiProvider::Custom,
+            ProviderAuth::custom_endpoint(
+                "http://host:8000/v1",
+                CustomProtocol::OpenAiChatCompletions,
+                None,
+                &[("x-tenant".to_string(), "tenant-secret".to_string())],
+                CustomModelPolicy::Discover,
+                CustomSampling::default(),
+                super::default_custom_max_output_tokens(),
+            )
+            .unwrap(),
+            0,
+            0,
+            None,
+        );
+        let store = IdentityStore {
+            user_id: "local-1".to_string(),
+            accounts: vec![account],
+            git_identities: vec![],
+            project_overrides: Default::default(),
+            retired_logins: vec![],
+            config_dir: std::path::PathBuf::new(),
+        };
+        let mut file = store_to_v2_file(&store, machine).unwrap();
+        if let AuthFile::CustomEndpoint { header_names, .. } = &mut file.accounts[0].auth {
+            header_names.push("x-injected".to_string());
+        }
+        let error = store_from_v2_file(file, machine).expect_err("mismatched pairing");
+        assert!(error.contains("header names"), "{error}");
     }
 
     #[test]

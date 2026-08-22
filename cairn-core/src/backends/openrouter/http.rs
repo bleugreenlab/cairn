@@ -70,8 +70,8 @@ pub(super) fn post_chat_completion(
     body["provider"] = provider.clone();
     apply_output_schema(&mut body, config.output_schema.as_ref());
     let endpoint = Endpoint {
-        provider_name: super::OPENROUTER_BACKEND_NAME,
-        backend_key: OPENROUTER_BACKEND_KEY,
+        provider_name: super::OPENROUTER_BACKEND_NAME.to_string(),
+        backend_key: OPENROUTER_BACKEND_KEY.to_string(),
         chat_url: CHAT_URL.to_string(),
         headers: openrouter_headers(api_key)?,
         extra_body: None,

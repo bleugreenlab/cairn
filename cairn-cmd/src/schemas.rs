@@ -3,13 +3,6 @@
 //! plus `validate_run_input`; no I/O.
 use serde::{Deserialize, Serialize};
 
-/// Agent info for tool description
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AgentInfo {
-    pub(crate) name: String,
-    pub(crate) description: String,
-}
-
 /// One change item as received from the MCP client.
 ///
 /// Every field is optional and `skip_serializing_if` so serde never hard-rejects
@@ -90,7 +83,7 @@ impl schemars::JsonSchema for ChangeInput {
                 },
                 "commit_msg": {
                     "type": "string",
-                    "description": "Git commit message. REQUIRED when the batch contains any file-target change (the edits are committed so they survive worktree cleanup); omit it for resource-only batches. Use '^' to amend the previous commit. Without a commit_msg, a batch that dirties the worktree is restored to HEAD."
+                    "description": "Git commit message. REQUIRED when the batch contains any file-target change (the edits are committed so they survive worktree cleanup); omit it for resource-only batches. Use '^' to commit with the previous commit's description instead of a new one; on an agent branch this always creates a new commit, and the previous commit is never rewritten in place. Without a commit_msg, a batch that dirties the worktree is restored to HEAD."
                 },
                 "preview": {
                     "type": "boolean",
@@ -102,7 +95,7 @@ impl schemars::JsonSchema for ChangeInput {
                 },
                 "conflict_markers_reason": {
                     "type": "string",
-                    "description": "A short written reason for committing content that contains literal Git conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at the start of a line). By default such a commit is REFUSED, because conflict scaffolding must never become durable history — during a conflict resolution the markers belong in your working tree, not in a commit. Set this only for a deliberate literal example in documentation or a test fixture; the reason is recorded with the commit."
+                    "description": "A short written reason for committing content that contains literal Git conflict markers (lines starting `<<<<<<<`/`=======`/`>>>>>>>`); without it such a commit is REFUSED. Only for a deliberate literal example in documentation or a test fixture; the reason is recorded with the commit."
                 }
             }
         }))
@@ -309,10 +302,8 @@ pub(crate) struct RunInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) executor: Option<RunExecutorSelectorInput>,
     /// A short written reason for committing files that contain literal Git
-    /// conflict markers (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>` at the start
-    /// of a line). By default such a commit is REFUSED and the working tree is
-    /// left intact, because conflict scaffolding must never become durable
-    /// history. Set this only for a deliberate literal example in documentation
+    /// conflict markers; without it such a commit is REFUSED and the working
+    /// tree left intact. Only for a deliberate literal example in documentation
     /// or a test fixture; the reason is recorded with the commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) conflict_markers_reason: Option<String>,
@@ -329,13 +320,9 @@ pub(crate) struct RunInput {
     pub(crate) constraints: Option<serde_json::Value>,
 }
 
-/// Which machine a batch is asking for.
-///
-/// `name` and `os` are mutually exclusive: naming a machine already settles its
-/// platform, so a request stating both is contradicting itself rather than
-/// narrowing. Unknown keys are refused rather than ignored — a caller reaching
-/// for the retired `executorId`, `deviceId`, or `arch` needs to be told those
-/// are gone, not to have its placement silently dropped.
+/// Which machine a batch is asking for: `name` for one executor, or `os` for
+/// any machine on a platform (never both), optionally refined by
+/// `requiredToolchains`. Unknown keys are refused rather than ignored.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct RunExecutorSelectorInput {
@@ -375,14 +362,9 @@ pub(crate) struct RunItemInput {
     /// Structured args for a `target` skill script.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     payload: Option<RunItemPayloadInput>,
-    /// Inline source to execute, the default way to run code that isn't a CLI
-    /// invocation. Mutually exclusive with `command`/`target`; requires
-    /// `interpreter`. The interpreter execs the source directly (no shell, no
-    /// quoting): typescript/javascript via bun with the worktree `node_modules`
-    /// and `@cairn/sdk`, which Cairn provides in every project whether or not it
-    /// depends on the SDK, python via the bundled `uv` with PEP 723
-    /// dependency blocks and automatic project-env pickup, or MATLAB via
-    /// `matlab -batch`.
+    /// Inline source to execute — the default way to run code that isn't a CLI
+    /// invocation (the interpreter execs it directly; no shell, no quoting).
+    /// Mutually exclusive with `command`/`target`; requires `interpreter`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) code: Option<String>,
     /// Language for an inline `code` item: `typescript`/`ts` or `javascript`/`js`
@@ -391,23 +373,17 @@ pub(crate) struct RunItemInput {
     /// `code` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) interpreter: Option<String>,
-    /// Route this item's inline `code` into a live stateful REPL session (by
-    /// slug) instead of a fresh process, so variables/imports/defs persist
-    /// across `run` calls. Requires `code` + `interpreter` (matching the REPL's
-    /// language); rejects `command`/`target`/`payload`. Create the REPL first
-    /// with `write cairn:~/repl/<slug> {interpreter:"python", deps:["pandas"]}`
-    /// (`deps` preloads python packages via uv — use it instead of installing
-    /// from inside the session).
+    /// Route this item's inline `code` into the live stateful REPL session with
+    /// this slug, so variables/imports/defs persist across `run` calls. Requires
+    /// `code` + `interpreter` matching the REPL's language; create the REPL
+    /// first with a `write` to `cairn:~/repl/<slug>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repl: Option<String>,
     /// Suspend this turn without polling until a duration elapses, a terminal
-    /// exits/prints a phrase, or a node's project check lanes settle. This must
-    /// be the sole item in the batch. Examples:
-    /// `{waitFor:{duration:"3m"}}`,
-    /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/tests",on:"exit"}}`,
+    /// exits/prints a phrase, or another node's project check lanes settle. Must
+    /// be the sole item in the batch. Examples: `{waitFor:{duration:"3m"}}`,
     /// `{waitFor:{kind:"terminal",ref:"cairn:~/terminal/dev",on:"output",phrase:"ready"}}`,
-    /// `{waitFor:{kind:"checks",ref:"cairn://p/CAIRN/3427/1/builder/checks",on:"settled"}}`,
-    /// `{waitFor:{kind:"checks",ref:"cairn://p/CAIRN/3427/1/builder/checks",on:"verdict",suite:"rust-tests"}}`.
+    /// `{waitFor:{kind:"checks",ref:"cairn://p/CAIRN/123/1/builder/checks",on:"settled"}}`.
     #[serde(default, rename = "waitFor", skip_serializing_if = "Option::is_none")]
     pub(crate) wait_for: Option<WaitForInput>,
 }

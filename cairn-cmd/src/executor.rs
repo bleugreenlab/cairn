@@ -36,7 +36,15 @@ pub(crate) enum ExecutorCommand {
         extra_ssh_args: Vec<String>,
     },
     /// Tear down an executor and revoke its enrollment, by public name.
-    Remove { name: String },
+    Remove {
+        name: String,
+        /// Remove even though the machine still counts work on it. What the
+        /// counts describe is stranded; the lanes behind them re-arm elsewhere.
+        /// This is the way past counts a machine that has stopped answering
+        /// will never clear on its own.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Give an executor a different public name.
     ///
     /// The name is the address every placement request is written in, so this
@@ -455,17 +463,40 @@ impl InvokeClient {
         let status = response.status();
         let body = response.text().await.map_err(|error| error.to_string())?;
         if !status.is_success() {
-            return Err(invoke_error_text(&body));
+            return Err(invoke_error_text(command, status.as_u16(), &body));
         }
         serde_json::from_str(&body).map_err(|error| format!("invalid runner response: {error}"))
     }
 }
 
-fn invoke_error_text(body: &str) -> String {
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|value| value.get("error")?.as_str().map(str::to_owned))
-        .unwrap_or_else(|| body.trim().to_owned())
+/// What a refused invoke says to the person who ran the command.
+///
+/// The runner's own sentence is preferred and passed through verbatim: it knows
+/// which step failed and this must not paraphrase it. What this adds is the
+/// floor — a failure with no message is still a failure, and `cairn executor
+/// remove: ` with nothing after the colon told an operator only that something
+/// went wrong twice (CAIRN-4360). An empty body is itself evidence: it means
+/// the runner answered with a status and no account of it, or died mid-request,
+/// and naming the status is what points at the runner log.
+fn invoke_error_text(command: &str, status: u16, body: &str) -> String {
+    let message = match serde_json::from_str::<Value>(body) {
+        // A body that parsed carries the runner's answer or it carries nothing;
+        // rendering the JSON itself would show an operator `{}` where a reason
+        // belongs.
+        Ok(value) => value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        Err(_) => body.trim().to_owned(),
+    };
+    if message.is_empty() {
+        format!(
+            "the runner refused {command} with HTTP {status} and said nothing about why. Its log is the only account of this step; check it before retrying."
+        )
+    } else {
+        message
+    }
 }
 
 fn parse_target(target: &str) -> Result<(String, String), String> {
@@ -539,10 +570,13 @@ pub(crate) async fn run(command: ExecutorCommand) -> bool {
                 Err(error) => Err(("add", error)),
             }
         }
-        ExecutorCommand::Remove { name } => {
+        ExecutorCommand::Remove { name, confirm } => {
             eprintln!("Stopping remote executor, verifying cleanup, and revoking enrollment…");
             client
-                .invoke::<MutationResult>("remove_remote_executor", json!({ "name": name }))
+                .invoke::<MutationResult>(
+                    "remove_remote_executor",
+                    json!({ "name": name, "confirm": confirm }),
+                )
                 .await
                 .map(|result| format_mutation("Removed", &result))
                 .map_err(|error| ("remove", error))
@@ -736,10 +770,24 @@ mod tests {
     fn preserves_stage_specific_invoke_error_verbatim() {
         assert_eq!(
             invoke_error_text(
+                "add_remote_executor",
+                400,
                 r#"{"error":"remote prerequisite preflight failed: binary missing"}"#
             ),
             "remote prerequisite preflight failed: binary missing"
         );
+    }
+
+    /// A failure that carries no message still has to say something. An empty
+    /// body is what produced `cairn executor remove: ` with nothing after it,
+    /// which is indistinguishable from the command having succeeded quietly.
+    #[test]
+    fn a_failure_with_no_message_still_names_the_command_and_the_status() {
+        for body in ["", "   ", "{}", r#"{"error":""}"#] {
+            let text = invoke_error_text("remove_remote_executor", 500, body);
+            assert!(text.contains("remove_remote_executor"), "{text}");
+            assert!(text.contains("500"), "{text}");
+        }
     }
 
     fn failed_ssh_output(stderr: &str) -> Output {

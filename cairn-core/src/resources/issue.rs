@@ -977,6 +977,8 @@ mod routing_render_tests {
                 model: None,
                 resolved_backend: None,
                 extras: None,
+                seed_budget_tokens: None,
+                seed_eras: None,
             },
         );
         let mut snapshot = ExecutionSnapshot::new(
@@ -1140,6 +1142,8 @@ mod execution_snapshot_read_tests {
             model: None,
             resolved_backend: None,
             extras: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
         };
         let mut agents = HashMap::new();
         agents.insert("builder".to_string(), agent);

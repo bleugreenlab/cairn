@@ -297,79 +297,47 @@ pub(crate) async fn build_current_event_uri(
     event_seq: i32,
 ) -> Option<String> {
     let run_id = run_id.to_string();
-    db
-        .read(|conn| {
-            let run_id = run_id.clone();
-            Box::pin(async move {
-                let mut rows = conn
-                    .query(
-                        "SELECT p.key, i.number, e.seq, j.uri_segment, j.id, j.parent_job_id, j.task_index
+    db.read(|conn| {
+        let run_id = run_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT j.id
                          FROM runs r
                          JOIN jobs j ON r.job_id = j.id
-                         JOIN projects p ON j.project_id = p.id
-                         LEFT JOIN issues i ON j.issue_id = i.id
-                         LEFT JOIN executions e ON j.execution_id = e.id
                          WHERE r.id = ?1
                          LIMIT 1",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
-                let Some(row) = rows.next().await? else {
-                    return Ok(None);
-                };
-                let project = row.text(0)?;
-                let Some(number) = row.opt_i64(1)? else {
-                    return Ok(None);
-                };
-                let exec_seq = row.opt_i64(2)?.unwrap_or(1);
-                let node_segment = row.opt_text(3)?.unwrap_or_else(|| row.text(4).unwrap_or_default());
-                let parent_job_id = row.opt_text(5)?;
-                let task_index = row.opt_i64(6)?;
-                let mut run_seq_rows = conn
-                    .query(
-                        "SELECT COUNT(*)
+                    (run_id.as_str(),),
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            let job_id = row.text(0)?;
+            let Some(home_uri) = crate::jobs::queries::home_uri_for_job_conn(conn, &job_id).await?
+            else {
+                return Ok(None);
+            };
+            let mut run_seq_rows = conn
+                .query(
+                    "SELECT COUNT(*)
                          FROM runs prior
                          WHERE prior.job_id = (SELECT job_id FROM runs WHERE id = ?1)
                            AND prior.created_at <= (SELECT created_at FROM runs WHERE id = ?1)",
-                        (run_id.as_str(),),
-                    )
-                    .await?;
-                let run_seq = run_seq_rows
-                    .next()
-                    .await?
-                    .and_then(|row| row.i64(0).ok())
-                    .unwrap_or(1);
-                if let Some(parent_id) = parent_job_id {
-                    let mut parent_rows = conn
-                        .query("SELECT COALESCE(uri_segment, id) FROM jobs WHERE id = ?1 LIMIT 1", (parent_id.as_str(),))
-                        .await?;
-                    let parent_segment = parent_rows
-                        .next()
-                        .await?
-                        .and_then(|parent_row| parent_row.text(0).ok())
-                        .unwrap_or_else(|| "parent".to_string());
-                    let task_segment = if node_segment.is_empty() {
-                        task_index
-                            .map(|idx| format!("task-{}", idx + 1))
-                            .unwrap_or_else(|| "task".to_string())
-                    } else {
-                        node_segment
-                    };
-                    Ok(Some(format!(
-                        "cairn://p/{}/{}/{}/{}/task/{}/chat/{}/{}",
-                        project, number, exec_seq, parent_segment, task_segment, run_seq, event_seq
-                    )))
-                } else {
-                    Ok(Some(format!(
-                        "cairn://p/{}/{}/{}/{}/chat/{}/{}",
-                        project, number, exec_seq, node_segment, run_seq, event_seq
-                    )))
-                }
-            })
+                    (run_id.as_str(),),
+                )
+                .await?;
+            let run_seq = run_seq_rows
+                .next()
+                .await?
+                .and_then(|row| row.i64(0).ok())
+                .unwrap_or(1);
+            Ok(Some(format!("{home_uri}/chat/{run_seq}/{event_seq}")))
         })
-        .await
-        .ok()
-        .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 pub(super) async fn preview_change(

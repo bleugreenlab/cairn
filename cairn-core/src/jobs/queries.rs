@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use crate::config::slugify_resource_segment;
 use crate::db_records::{db_job_from_row, DbJob, JOB_COLUMNS};
 use crate::error::CairnError;
-use crate::models::{ExecutionSnapshot, Job, RecipeNode};
+use crate::models::{ExecutionSnapshot, Job, RecipeNode, Turn};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
 use serde::Serialize;
@@ -229,8 +229,8 @@ pub(crate) async fn job_id_for_node_coordinate(
 /// their parent); a thread's session resolves to `cairn://p/{KEY}/{thread-name}`
 /// and the tasks it spawns nest beneath it the same way. This is the one
 /// canonical job-id → home-URI resolution.
-/// `Ok(None)` when the job can't be resolved (unknown id, or no `uri_segment`
-/// assigned yet).
+/// `Ok(None)` when the job can't be resolved (unknown id, no owning issue or
+/// thread, or no `uri_segment` assigned yet).
 pub async fn home_uri_for_job(db: &LocalDb, job_id: &str) -> Result<Option<String>, DbError> {
     let job_id = job_id.to_string();
     db.read(|conn| {
@@ -289,7 +289,10 @@ pub(crate) async fn home_uri_for_job_conn(
             (false, None) => None,
         });
     }
-    let number = row.i64(1)? as i32;
+    let Some(number) = row.opt_i64(1)? else {
+        return Ok(None);
+    };
+    let number = number as i32;
     let seq = row.i64(2)? as i32;
     let parent_segment = row.opt_text(4)?;
     let is_workflow = row.opt_text(5)?.as_deref() == Some("workflow");
@@ -633,11 +636,12 @@ pub enum NodeActivity {
 
 /// One job's live activity, keyed by job id so the whole strip (top-level nodes
 /// plus task jobs) is computed in a single batched query.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeStatusIndicator {
     job_id: String,
     activity: NodeActivity,
+    head_turn: Option<Turn>,
 }
 
 /// Pure mapping from the three raw facts to a `NodeActivity`. Awaiting-input is
@@ -707,17 +711,10 @@ pub async fn node_status_indicators(
                 .query(
                     &format!(
                         "SELECT
+                        ht.id, ht.session_id, ht.run_id, ht.job_id, ht.sequence,
+                        ht.predecessor_id, ht.state, ht.yield_reason, ht.end_reason,
+                        ht.start_reason, ht.created_at, ht.started_at, ht.ended_at, ht.updated_at,
                         j.id,
-                        COALESCE(
-                            (SELECT ct.state
-                               FROM turns ct
-                              WHERE ct.id = j.current_turn_id),
-                            (SELECT t.state
-                               FROM turns t
-                              WHERE t.job_id = j.id
-                              ORDER BY t.created_at DESC, t.sequence DESC
-                              LIMIT 1)
-                        ) AS head_turn_state,
                         EXISTS (
                             SELECT 1 FROM prompts p
                              WHERE p.turn_id = j.current_turn_id
@@ -730,6 +727,11 @@ pub async fn node_status_indicators(
                                AND pr.status = 'pending'
                         ) AS has_pending_permission
                      FROM jobs j
+                     LEFT JOIN turns ht ON ht.id = COALESCE(
+                         j.current_turn_id,
+                         (SELECT t.id FROM turns t WHERE t.job_id = j.id
+                          ORDER BY t.created_at DESC, t.sequence DESC LIMIT 1)
+                     )
                      WHERE {predicate}"
                     ),
                     params![owner_id.as_str()],
@@ -737,17 +739,25 @@ pub async fn node_status_indicators(
                 .await?;
             let mut out = Vec::new();
             while let Some(row) = rows.next().await? {
-                let job_id = row.text(0)?;
-                let head_turn_state = row.opt_text(1)?;
-                let has_pending_prompt = row.i64(2)? != 0;
-                let has_pending_permission = row.i64(3)? != 0;
+                let head_turn = if row.opt_text(0)?.is_some() {
+                    Some(crate::turns::queries::turn_from_row(&row)?)
+                } else {
+                    None
+                };
+                let job_id = row.text(14)?;
+                let has_pending_prompt = row.i64(15)? != 0;
+                let has_pending_permission = row.i64(16)? != 0;
                 out.push(NodeStatusIndicator {
                     job_id,
                     activity: derive_node_activity(
-                        head_turn_state.as_deref(),
+                        head_turn
+                            .as_ref()
+                            .map(|turn| turn.state.to_string())
+                            .as_deref(),
                         has_pending_prompt,
                         has_pending_permission,
                     ),
+                    head_turn,
                 });
             }
             Ok::<Vec<NodeStatusIndicator>, DbError>(out)
@@ -786,8 +796,8 @@ pub async fn published_thread_status_indicators(
                     return None;
                 }
             };
-            match thread_activity_rows(&db, project_id).await {
-                Ok(rows) => Some(std::sync::Arc::new(rows)),
+            match thread_status_snapshot(&db, project_id).await {
+                Ok(snapshot) => Some(std::sync::Arc::new(snapshot)),
                 Err(error) => {
                     if let Ok(mut slot) = failure.lock() {
                         *slot = Some(error);
@@ -798,43 +808,63 @@ pub async fn published_thread_status_indicators(
         })
         .await;
 
-    let activity = match published {
-        Some(rows) => rows,
-        None => {
-            return Err(failure
-                .lock()
-                .ok()
-                .and_then(|mut slot| slot.take())
-                .unwrap_or_else(|| {
-                    CairnError::Internal("failed to rebuild the thread status rollup".to_string())
-                }))
-        }
-    };
+    match published {
+        Some(snapshot) => Ok(snapshot.indicators.clone()),
+        None => Err(failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_else(|| {
+                CairnError::Internal("failed to rebuild the thread status rollup".to_string())
+            })),
+    }
+}
 
-    // Unread counts are computed fresh on every read rather than snapshotted
-    // alongside the activity. Their dependency is `events`, which inserts orders
-    // of magnitude more often than anything the activity rollup reads and whose
-    // change notification carries no project scope — wiring it into the same
-    // generation would invalidate every project's snapshot on every event, which
-    // is exactly the continuous whole-project rebuild CAIRN-4190 removed.
-    // Recomputing instead is safe because the count is capped: the work is
-    // bounded by threads-in-project x UNREAD_COUNT_CAP no matter how far behind
-    // the operator has fallen.
-    let db = crate::execution::routing::owning_db_for_project(&orch.db, project_id).await?;
-    let unread = thread_unread_counts(&db, project_id).await?;
+/// Everything one project's thread rows show, plus the evidence needed to decide
+/// which later writes could change it.
+///
+/// The two halves are materialized together because they are read together and a
+/// half-fenced projection is not fenced: while the unread count was recomputed on
+/// every read, a warm activity snapshot saved nothing a sidebar poll could feel.
+pub(crate) struct ThreadStatusSnapshot {
+    pub(crate) indicators: Vec<ThreadStatusIndicator>,
+    /// Every job the rollup above actually read.
+    ///
+    /// This is the projection telling its invalidator what it depends on. A
+    /// `turns`, `runs`, or `events` write names the job it belongs to, and a job
+    /// outside this set is an issue node's — it cannot move any row in
+    /// `indicators`, so it must not be allowed to cold this snapshot. In the
+    /// sample workspace behind CAIRN-4331 that distinction is 121 jobs against
+    /// 15,000, and roughly four out of five transcript writes.
+    ///
+    /// Replaced wholesale on every rebuild, so it cannot drift: a job that leaves
+    /// a thread leaves the set at the next rebuild, and a job that joins one
+    /// announces itself through its own `jobs` write before it can produce any.
+    pub(crate) thread_job_ids: HashSet<String>,
+}
 
-    Ok(activity
-        .iter()
-        .map(|row| {
-            let unread = unread.get(&row.thread_id).copied().unwrap_or_default();
-            ThreadStatusIndicator {
-                thread_id: row.thread_id.clone(),
-                activity: row.activity,
-                unread_count: unread.count,
-                latest_event_rowid: unread.latest_event_rowid,
-            }
-        })
-        .collect())
+async fn thread_status_snapshot(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<ThreadStatusSnapshot, CairnError> {
+    let activity = thread_activity_rows(db, project_id).await?;
+    let unread = thread_unread_counts(db, project_id).await?;
+    Ok(ThreadStatusSnapshot {
+        indicators: activity
+            .rows
+            .iter()
+            .map(|row| {
+                let unread = unread.get(&row.thread_id).copied().unwrap_or_default();
+                ThreadStatusIndicator {
+                    thread_id: row.thread_id.clone(),
+                    activity: row.activity,
+                    unread_count: unread.count,
+                    latest_event_rowid: unread.latest_event_rowid,
+                }
+            })
+            .collect(),
+        thread_job_ids: activity.job_ids,
+    })
 }
 
 /// Everything one thread row shows about itself beyond its name: whether work is
@@ -879,6 +909,7 @@ pub struct ThreadActivityRow {
 /// plan test pass while the projection took a different path.
 pub(crate) const THREAD_STATUS_ROWS_SQL: &str = "SELECT
         t.id,
+        j.id AS job_id,
         COALESCE(
             (SELECT ct.state FROM turns ct WHERE ct.id = j.current_turn_id),
             (SELECT tu.state
@@ -902,6 +933,16 @@ pub(crate) const THREAD_STATUS_ROWS_SQL: &str = "SELECT
    LEFT JOIN jobs j ON j.thread_id = t.id
   WHERE t.project_id = ?1";
 
+/// One project's thread activity, and the jobs it was derived from.
+pub struct ThreadActivity {
+    pub rows: Vec<ThreadActivityRow>,
+    /// Every job the statement visited, whatever its state. Collected here
+    /// rather than re-queried because the rollup already joins exactly this set,
+    /// and because a dependency list assembled by a second statement could
+    /// disagree with the one the answer was actually built from.
+    pub job_ids: HashSet<String>,
+}
+
 /// Batched, project-scoped live activity for every thread, one row per thread.
 ///
 /// A thread's status column is permanently `active` and says nothing, so what a
@@ -912,7 +953,7 @@ pub(crate) const THREAD_STATUS_ROWS_SQL: &str = "SELECT
 pub async fn thread_activity_rows(
     db: &LocalDb,
     project_id: &str,
-) -> Result<Vec<ThreadActivityRow>, CairnError> {
+) -> Result<ThreadActivity, CairnError> {
     let project_id = project_id.to_string();
     db.read(|conn| {
         let project_id = project_id.clone();
@@ -923,25 +964,30 @@ pub async fn thread_activity_rows(
             // Every thread gets a row, including one whose LEFT JOIN found no
             // job at all: a thread with no work under it is idle, not absent.
             let mut by_thread: HashMap<String, NodeActivity> = HashMap::new();
+            let mut job_ids: HashSet<String> = HashSet::new();
             while let Some(row) = rows.next().await? {
                 let thread_id = row.text(0)?;
+                if let Some(job_id) = row.opt_text(1)? {
+                    job_ids.insert(job_id);
+                }
                 let activity = derive_node_activity(
-                    row.opt_text(1)?.as_deref(),
-                    row.i64(2)? != 0,
+                    row.opt_text(2)?.as_deref(),
                     row.i64(3)? != 0,
+                    row.i64(4)? != 0,
                 );
                 let entry = by_thread.entry(thread_id).or_insert(NodeActivity::Idle);
                 *entry = rollup_activity([*entry, activity]);
             }
-            Ok::<Vec<ThreadActivityRow>, DbError>(
-                by_thread
+            Ok::<ThreadActivity, DbError>(ThreadActivity {
+                rows: by_thread
                     .into_iter()
                     .map(|(thread_id, activity)| ThreadActivityRow {
                         thread_id,
                         activity,
                     })
                     .collect(),
-            )
+                job_ids,
+            })
         })
     })
     .await
@@ -982,28 +1028,66 @@ pub(crate) const UNREAD_EVENT_SHAPE: &str = "e.parent_tool_use_id IS NULL";
 /// `events.rowid`, which is also the cursor the transcript delta walks, so the
 /// sidebar's notion of "new" and the pane's are the same number.
 ///
-/// The inner `LIMIT` is load-bearing, not decoration: without it this counts every
-/// event since the operator last looked, which for an ignored thread is unbounded
-/// and is re-counted on every sidebar read.
+/// # Why both halves walk one session backwards
+///
+/// Both facts this returns are about the NEWEST end of a transcript, and the only
+/// way to reach that end cheaply is to walk the index down from it. Turso does not
+/// use a rowid range as an index seek bound, so the obvious spellings — `WHERE
+/// e.rowid > watermark ... LIMIT n`, and `MAX(e.rowid)` — both read every entry
+/// the session ever recorded and filter afterwards. Measured over 30 threads of
+/// 1,000 entries each, that is 69.6 ms for the `MAX` alone; the descending walk
+/// below answers the same question in 0.34 ms, and stays there as transcripts grow.
+///
+/// The ordering has to live inside a per-session correlated subquery. Hoisting it
+/// above the `sessions` join makes Turso materialize a sorter over every session's
+/// entries (measured: 126 ms), which is worse than what it replaced.
+///
+/// # Why counting the newest CAP entries is the same answer
+///
+/// Unread entries are by definition the newest ones — the watermark only ever
+/// moves forward — so every entry above it lies within the newest
+/// [`UNREAD_COUNT_CAP`] of its session unless there are more than `CAP` of them,
+/// in which case the count saturates anyway. Taking the newest `CAP` and counting
+/// those above the watermark is therefore identical to counting everything above
+/// the watermark and capping, but it reads a bounded number of index entries
+/// whether the operator is caught up or a month behind.
+///
+/// The per-session counts are summed rather than capped individually: the cap
+/// belongs to the thread's total, and [`thread_unread_counts`] applies it once.
 fn thread_unread_rows_sql() -> String {
     format!(
         "SELECT
         t.id,
-        (SELECT COUNT(*) FROM (
-            SELECT e.rowid
-              FROM sessions s
-              JOIN events e ON e.session_id = s.id
-             WHERE s.job_id = j.id
-               AND {UNREAD_EVENT_SHAPE}
-               AND e.rowid > COALESCE(rp.acknowledged_event_rowid, 0)
-             LIMIT {UNREAD_COUNT_CAP}
-        )) AS unread_count,
         COALESCE((
-            SELECT MAX(e.rowid)
-              FROM sessions s
-              JOIN events e ON e.session_id = s.id
-             WHERE s.job_id = j.id
-               AND {UNREAD_EVENT_SHAPE}
+            SELECT SUM(per_session.unread) FROM (
+                SELECT (
+                    SELECT COUNT(*) FROM (
+                        SELECT e.rowid AS rowid
+                          FROM events e
+                         WHERE e.session_id = s.id
+                           AND {UNREAD_EVENT_SHAPE}
+                         ORDER BY e.rowid DESC
+                         LIMIT {UNREAD_COUNT_CAP}
+                    ) newest
+                     WHERE newest.rowid > COALESCE(rp.acknowledged_event_rowid, 0)
+                ) AS unread
+                  FROM sessions s
+                 WHERE s.job_id = j.id
+            ) per_session
+        ), 0) AS unread_count,
+        COALESCE((
+            SELECT MAX(per_session.newest) FROM (
+                SELECT (
+                    SELECT e.rowid
+                      FROM events e
+                     WHERE e.session_id = s.id
+                       AND {UNREAD_EVENT_SHAPE}
+                     ORDER BY e.rowid DESC
+                     LIMIT 1
+                ) AS newest
+                  FROM sessions s
+                 WHERE s.job_id = j.id
+            ) per_session
         ), COALESCE(rp.acknowledged_event_rowid, 0)) AS latest_event_rowid
    FROM threads t
    LEFT JOIN jobs j ON j.thread_id = t.id AND {session}
@@ -1050,8 +1134,12 @@ pub async fn thread_unread_counts(
                 // A malformed thread with two session-shaped jobs would produce
                 // two rows; the larger of each is the honest answer rather than
                 // whichever arrived last.
+                //
+                // Saturation happens here, once, over the summed per-session
+                // counts the statement returns. The SQL's per-session `LIMIT` is
+                // what bounds the SCAN; this is what bounds the ANSWER.
                 let entry = by_thread.entry(thread_id).or_default();
-                entry.count = entry.count.max(count);
+                entry.count = entry.count.max(count).min(UNREAD_COUNT_CAP);
                 entry.latest_event_rowid = entry.latest_event_rowid.max(latest_event_rowid);
             }
             Ok::<HashMap<String, ThreadUnread>, DbError>(by_thread)
@@ -1500,6 +1588,79 @@ pub async fn issue_status_indicators(
     })
     .await
     .map_err(CairnError::from)
+}
+
+/// Everything one project's issue rows show, plus the jobs the rollup read.
+///
+/// The issue rollup is four project-wide statements that cost the same whether
+/// one issue moved or none did, and unlike the thread rollup it had no fence at
+/// all: in the hour profiled for CAIRN-4331 it spent 756 seconds answering 1,275
+/// reads, nearly all of which were driven by `db-change` traffic rather than by
+/// anyone looking.
+pub(crate) struct IssueStatusSnapshot {
+    pub(crate) indicators: Vec<IssueStatusIndicator>,
+    /// The current-execution jobs the rollup read. See
+    /// [`ThreadStatusSnapshot::thread_job_ids`] for why the projection states
+    /// its own dependency rather than having the invalidator guess at one.
+    pub(crate) job_ids: HashSet<String>,
+}
+
+/// The published issue rollup for one project, materialized once per generation.
+///
+/// `checks_running` stays outside the fence deliberately. It is an in-memory
+/// orchestrator fact with no DB row, so no `db-change` could invalidate it; the
+/// transport command decorates every read from `job_ids`, which means it is
+/// always current even when the rest of the row is being served from a snapshot.
+pub async fn published_issue_status_indicators(
+    orch: &crate::orchestrator::Orchestrator,
+    project_id: &str,
+) -> Result<Vec<IssueStatusIndicator>, CairnError> {
+    let failure: std::sync::Mutex<Option<CairnError>> = std::sync::Mutex::new(None);
+    let published = orch
+        .issue_status_cache
+        .get_or_compute(project_id, || async {
+            let db = match crate::execution::routing::owning_db_for_project(&orch.db, project_id)
+                .await
+            {
+                Ok(db) => db,
+                Err(error) => {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(error);
+                    }
+                    return None;
+                }
+            };
+            match issue_status_indicators(&db, project_id).await {
+                Ok(indicators) => {
+                    let job_ids = indicators
+                        .iter()
+                        .flat_map(|indicator| indicator.job_ids.iter().cloned())
+                        .collect();
+                    Some(std::sync::Arc::new(IssueStatusSnapshot {
+                        indicators,
+                        job_ids,
+                    }))
+                }
+                Err(error) => {
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(error);
+                    }
+                    None
+                }
+            }
+        })
+        .await;
+
+    match published {
+        Some(snapshot) => Ok(snapshot.indicators.clone()),
+        None => Err(failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_else(|| {
+                CairnError::Internal("failed to rebuild the issue status rollup".to_string())
+            })),
+    }
 }
 
 fn node_name_from_snapshot(snapshot_json: &str, node_id: &str) -> Option<String> {
@@ -2042,6 +2203,7 @@ mod tests {
         let by_thread: HashMap<String, NodeActivity> = thread_activity_rows(&db, "p")
             .await
             .unwrap()
+            .rows
             .into_iter()
             .map(|row| (row.thread_id, row.activity))
             .collect();
@@ -2453,9 +2615,22 @@ mod tests {
     }
 
     /// The unread rollup's plan, held to the same bar as the activity rollup's:
-    /// every access path is a named index. The counted range is
-    /// `events(session_id, rowid > ack)`, which `idx_events_session_id` answers
-    /// directly because a SQLite index is ordered by (key, rowid).
+    /// every access path is a named index, and nothing sorts.
+    ///
+    /// This is the guard on the whole cost argument, because both properties it
+    /// asserts are ones Turso will abandon SILENTLY and only a plan can witness:
+    ///
+    /// - The partial index is substituted only while the query's predicate
+    ///   implies the index's. Rewording [`UNREAD_EVENT_SHAPE`] on either side
+    ///   drops the rollup back to `idx_events_session_id`, which cannot answer
+    ///   `parent_tool_use_id IS NULL` without fetching every candidate row.
+    /// - The descending walk terminates early only while the ordering lives
+    ///   inside a per-session correlated subquery. Hoisting it above the
+    ///   `sessions` join makes Turso materialize a sorter over the whole
+    ///   transcript instead — measured at 126 ms against 0.34 ms.
+    ///
+    /// Both regressions keep every unread count correct, which is exactly why
+    /// no behavioral test would catch them.
     #[tokio::test]
     async fn thread_unread_rows_use_indexed_access_paths() {
         let db = test_db().await;
@@ -2485,8 +2660,16 @@ mod tests {
             "the thread->session-job join must reach jobs through jobs(thread_id):\n{plan_text}"
         );
         assert!(
-            plan_text.contains("idx_events_session_id"),
-            "the counted event range must be seeked through events(session_id):\n{plan_text}"
+            plan_text.contains("idx_events_session_top_level"),
+            "the counted entries must be reached through the partial index over \
+             top-level events; falling back to a full events index means every \
+             candidate row is fetched from the table to test the predicate:\n{plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SORTER"),
+            "a sorter means the descending walk was hoisted above the sessions \
+             join and now materializes every entry instead of stopping at the \
+             newest few:\n{plan_text}"
         );
     }
 
@@ -2594,6 +2777,88 @@ mod tests {
         let counters = orch.thread_status_cache.counters();
         assert_eq!(counters.misses, 1, "one rebuild served every read");
         assert_eq!(counters.hits, 10);
+    }
+
+    /// The whole fix, end to end through the real orchestrator wiring: an agent
+    /// working on an ISSUE writes a transcript, and the thread sidebar does not
+    /// notice.
+    ///
+    /// The unit tests in `generation_cache` assert the invalidation RULE against
+    /// a hand-built snapshot. This asserts that the rule is actually reached
+    /// from a real emit, over a real rollup that derived its own job set from
+    /// SQL — which is the part that would break silently if the projection and
+    /// its invalidator ever disagreed about what a job id means.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_issue_agents_transcript_leaves_the_thread_sidebar_warm() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+             VALUES ('i', 'p', 1, 'T', 'active', 1, 1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO jobs(id, issue_id, project_id, node_name, status, created_at, updated_at)
+             VALUES ('issue-job', 'i', 'p', 'builder', 'running', 1, 1)",
+        )
+        .await;
+        let orch = orchestrator_over(db);
+
+        published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(orch.thread_status_cache.counters().misses, 1);
+
+        for _ in 0..500 {
+            let _ = orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "events",
+                    "projectId": "p",
+                    "jobId": "issue-job",
+                }),
+            );
+            published_thread_status_indicators(&orch, "p")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            orch.thread_status_cache.counters().misses,
+            1,
+            "an issue node's transcript must not cost the thread sidebar a single \
+             census, however long the agent runs"
+        );
+    }
+
+    /// The other half of the same contract: the thread's OWN transcript is not
+    /// ignored. It waits out the coalescing floor rather than being dropped, and
+    /// the structural write that follows it is never deferred at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_threads_own_work_still_reaches_the_sidebar() {
+        let db = test_db().await;
+        seed_one_quiet_thread(&db).await;
+        let orch = orchestrator_over(db);
+
+        published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+
+        // The thread's own session job is 'j', which the rollup above read.
+        let _ = orch.services.emitter.emit(
+            "db-change",
+            serde_json::json!({"table": "turns", "projectId": "p", "jobId": "j"}),
+        );
+        published_thread_status_indicators(&orch, "p")
+            .await
+            .unwrap();
+        assert_eq!(
+            orch.thread_status_cache.counters().misses,
+            2,
+            "a turn on the thread's own job is a lifecycle write and rebuilds at once"
+        );
     }
 
     /// A concurrent cold burst produces one rebuild between them, not one each.
@@ -3219,5 +3484,205 @@ mod tests {
         assert_eq!(ids.len(), 2, "only the project's active + waiting issues");
         assert!(ids.contains_key("i-active"));
         assert!(ids.contains_key("i-waiting"));
+    }
+
+    // ========================================================================
+    // Cost of the sidebar census at production scale
+    // ========================================================================
+
+    /// Seed one project shaped like a long-lived workspace: a few dozen threads
+    /// with real transcripts behind them, and an order of magnitude more
+    /// issue-node jobs whose writes must not be able to move a thread row.
+    ///
+    /// The proportions come from the sample in CAIRN-4331 (32 threads / 15,119
+    /// jobs / 1.5M events, of which ~45k are top-level thread-session entries),
+    /// scaled down to keep the seed under a few seconds while preserving the one
+    /// property that drives cost: transcript length per thread.
+    async fn census_fixture(threads: usize, events_per_thread: usize) -> LocalDb {
+        census_fixture_read(threads, events_per_thread, true).await
+    }
+
+    /// `caught_up` decides which side of the watermark the transcript sits on.
+    /// It is the whole difference between the two cost regimes: a thread the
+    /// operator has read has NOTHING above its watermark, so a count that filters
+    /// on the watermark finds no match and never terminates early, while a thread
+    /// nobody has opened satisfies the filter immediately. Production is mostly
+    /// the first kind, so a benchmark that only seeds the second measures the
+    /// easy case and reports a win that does not exist.
+    async fn census_fixture_read(
+        threads: usize,
+        events_per_thread: usize,
+        caught_up: bool,
+    ) -> LocalDb {
+        let db = test_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p', 'default', 'T', 'cairn', '/tmp/r', 1, 1)",
+        )
+        .await;
+        db.write(move |conn| {
+            Box::pin(async move {
+                for thread in 0..threads {
+                    let thread_id = format!("th{thread}");
+                    let job_id = format!("th{thread}-session");
+                    let session_id = format!("s{thread}");
+                    let run_id = format!("r{thread}");
+                    conn.execute(
+                        "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+                         VALUES (?1, 'p', ?1, 'active', 'none', 1, 1)",
+                        params![thread_id.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO jobs(id, thread_id, project_id, node_name, status, created_at, updated_at, uri_segment)
+                         VALUES (?1, ?2, 'p', 'thread', 'idle', 1, 1, 'thread')",
+                        params![job_id.as_str(), thread_id.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO sessions(id, job_id, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
+                        params![session_id.as_str(), job_id.as_str()],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO runs(id, job_id, created_at, updated_at) VALUES (?1, ?2, 1, 1)",
+                        params![run_id.as_str(), job_id.as_str()],
+                    )
+                    .await?;
+                    for seq in 0..events_per_thread {
+                        conn.execute(
+                            "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type,
+                                                data, created_at, parent_tool_use_id)
+                             VALUES (?1, ?2, ?3, ?4, 1, 'assistant', '{}', 1, NULL)",
+                            params![
+                                format!("e{thread}-{seq}"),
+                                run_id.as_str(),
+                                session_id.as_str(),
+                                seq as i64
+                            ],
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        if caught_up {
+            for thread in 0..threads {
+                let thread_id = format!("th{thread}");
+                let latest = latest_rowid_for(&db, &thread_id).await;
+                mark_thread_viewed(&db, &thread_id, latest, 1)
+                    .await
+                    .unwrap();
+            }
+        }
+        db
+    }
+
+    /// Seed in-progress issues alongside the threads, each with a current
+    /// execution and a handful of jobs under it. The issue rollup's cost tracks
+    /// this, not transcript length: it reads no events at all.
+    async fn seed_issues(db: &LocalDb, issues: usize, jobs_per_issue: usize) {
+        db.write(move |conn| {
+            Box::pin(async move {
+                for issue in 0..issues {
+                    let issue_id = format!("i{issue}");
+                    let execution_id = format!("x{issue}");
+                    conn.execute(
+                        "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+                         VALUES (?1, 'p', ?2, 'T', 'active', 1, 1)",
+                        params![issue_id.as_str(), issue as i64 + 1],
+                    )
+                    .await?;
+                    conn.execute(
+                        "INSERT INTO executions(id, recipe_id, issue_id, project_id, seq, status, started_at)
+                         VALUES (?1, 'r', ?2, 'p', 1, 'running', 1)",
+                        params![execution_id.as_str(), issue_id.as_str()],
+                    )
+                    .await?;
+                    for job in 0..jobs_per_issue {
+                        conn.execute(
+                            "INSERT INTO jobs(id, issue_id, execution_id, project_id, node_name,
+                                              status, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, 'p', 'builder', 'running', 1, 1)",
+                            params![
+                                format!("i{issue}-j{job}"),
+                                issue_id.as_str(),
+                                execution_id.as_str()
+                            ],
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// What the sidebar census costs, printed rather than asserted.
+    ///
+    /// Ignored by default: it is a measurement, and a wall-clock threshold in CI
+    /// would be a flake. Run it deliberately when changing either rollup's SQL or
+    /// its indexes:
+    ///
+    /// ```text
+    /// cargo test -p cairn-core --lib census_cost -- --ignored --nocapture
+    /// ```
+    ///
+    /// The property it exists to expose is SHAPE, not absolute milliseconds:
+    /// doubling `events_per_thread` must not double the reported cost. A rollup
+    /// whose cost tracks transcript length is one that re-reads the whole
+    /// transcript per sidebar poll, which is the defect CAIRN-4331 fixed.
+    #[tokio::test]
+    #[ignore = "measurement, not an assertion; run with --ignored --nocapture"]
+    async fn census_cost_at_production_scale() {
+        for caught_up in [true, false] {
+            for events_per_thread in [500usize, 1000, 2000] {
+                let db = census_fixture_read(30, events_per_thread, caught_up).await;
+                // One untimed pass so the comparison is between warm page caches.
+                thread_activity_rows(&db, "p").await.unwrap();
+                thread_unread_counts(&db, "p").await.unwrap();
+
+                let started = std::time::Instant::now();
+                for _ in 0..5 {
+                    thread_activity_rows(&db, "p").await.unwrap();
+                }
+                let activity = started.elapsed() / 5;
+
+                let started = std::time::Instant::now();
+                for _ in 0..5 {
+                    thread_unread_counts(&db, "p").await.unwrap();
+                }
+                let unread = started.elapsed() / 5;
+
+                let regime = if caught_up { "read " } else { "unread" };
+                println!(
+                    "[{regime}] 30 threads x {events_per_thread} events: activity {activity:?}, unread {unread:?}"
+                );
+            }
+        }
+
+        // The issue rollup, whose cost tracks in-progress issues rather than
+        // transcript length. It has no coalescing floor, so this number is what
+        // a cold-generation read costs outright.
+        for issues in [25usize, 50, 100] {
+            let db = census_fixture_read(4, 200, true).await;
+            seed_issues(&db, issues, 3).await;
+            issue_status_indicators(&db, "p").await.unwrap();
+
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                issue_status_indicators(&db, "p").await.unwrap();
+            }
+            println!(
+                "[issues] {issues} active issues x 3 jobs: {:?}",
+                started.elapsed() / 5
+            );
+        }
     }
 }

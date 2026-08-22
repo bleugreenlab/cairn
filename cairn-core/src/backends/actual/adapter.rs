@@ -33,8 +33,8 @@ impl ActualAdapter {
 
     pub(super) fn for_target(target: Target) -> Self {
         let endpoint = Endpoint {
-            provider_name: ACTUAL_BACKEND_NAME,
-            backend_key: ACTUAL_BACKEND_KEY,
+            provider_name: ACTUAL_BACKEND_NAME.to_string(),
+            backend_key: ACTUAL_BACKEND_KEY.to_string(),
             chat_url: target.url("/v1/chat/completions"),
             headers: target.headers(),
             extra_body: None,
@@ -153,11 +153,11 @@ fn completion_body(request: &CompletionRequest) -> Result<serde_json::Value, Com
 impl WireAdapter for ActualAdapter {
     type Message = ChatMessage;
 
-    fn backend_key(&self) -> &'static str {
+    fn backend_key(&self) -> &str {
         ACTUAL_BACKEND_KEY
     }
 
-    fn backend_name(&self) -> &'static str {
+    fn backend_name(&self) -> &str {
         ACTUAL_BACKEND_NAME
     }
 

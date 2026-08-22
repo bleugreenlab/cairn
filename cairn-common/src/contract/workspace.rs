@@ -342,3 +342,34 @@ pub(crate) const NODE_MEMORY_CONTRACT: ResourceContract = ResourceContract {
         },
     ],
 };
+
+pub(crate) const NODE_ERAS_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeEras,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/eras",
+    name: "Thread eras",
+    description: "Persisted era summaries for a thread session, newest first — sequence, turn range, written summary, resolved children, and a live-derived .../chat range URI. Read-only: an era is minted and summarized at thread-compaction fold time, never composed here.",
+    read_projections: &[
+        ProjectionSpec {
+            key: "limit",
+            values: "max eras returned (default 50, max 200)",
+        },
+        ProjectionSpec {
+            key: "offset",
+            values: "pagination offset, newest-first (default 0)",
+        },
+    ],
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
+pub(crate) const NODE_ERA_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::NodeEra,
+    uri_template: "cairn://p/{project}/{number}/{exec}/{node}/eras/{era_seq}",
+    name: "Thread era",
+    description: "A single persisted era: its full written summary, the children its span resolved (with issue URIs), and a live-derived .../chat range URI. Read-only.",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};

@@ -3,34 +3,29 @@
 //! An ordinary issue reseeds from its whole transcript at full fidelity, which
 //! is right for work with an objective and an ending. A thread has neither, so
 //! the same digest gets more expensive every week while carrying less of what
-//! matters. This composer replaces it with three parts, in this order:
+//! matters. This composer bounds every generated part of a rebuilt seed while
+//! leaving the authored arc verbatim and budget-exempt. It renders, in order:
 //!
-//! 1. **The authored arc** — the thread's own record of intent: rulings with
-//!    provenance, open questions, current intent. Read from the `arc` artifact
-//!    and copied, never summarized and never generated. An unprovenanced ruling
-//!    gets relitigated, and a generated summary of one's own decisions is
-//!    strictly worse than the version the thread wrote.
-//! 2. **A generated census of the children** — where every child issue stands
-//!    *right now*, read from live state at composition time. Same split as the
-//!    arc, applied to the other half of a thread's memory: the arc is inherited
-//!    verbatim, so any census authored into it is stale by construction, and a
-//!    resumed thread that cannot trust it spends its first turn re-reading every
-//!    child to rebuild what Cairn already knows.
-//! 3. **A generated table of contents** — mechanical. A chapter is usually a
-//!    child issue: it has a beginning, an end, a subject, and a URI. Everything
-//!    else is bounded at user-turn boundaries. Every line carries a one-line
-//!    overview *and* an address, because a bare address invites a defensive
-//!    re-fetch, which costs more than never having dropped the range.
-//! 4. **The recency window** — the last [`RECENCY_TURNS`] turns verbatim, plus
-//!    any older turn that still touches an unresolved child.
+//! 1. the authored arc;
+//! 2. a live, bounded children census;
+//! 3. recent persisted era summaries with an address to older eras; and
+//! 4. a V5-token-budgeted verbatim selection with an unconditional recency floor,
+//!    bounded unresolved-child priority, and addressable markers for omitted runs.
 //!
-//! Nothing here decides *when* to compact; that is the trigger's job in
-//! `execution::jobs::lifecycle`. Composition is pure enough to run on every
-//! continuation of a thread, because its result is also what prices the
-//! decision: `source_bytes` is what the compacted turns weigh verbatim, and
-//! `candidate_bytes` is what they weigh as chapters.
+//! Two of those rules are richer than a budget can promise on its own: every
+//! open child renders in full, and the newest turns survive whatever they weigh.
+//! Either input, large enough, exceeds the whole budget before any arithmetic
+//! runs. So the bound is made true at final composition, where an oversized body
+//! is recomposed under an inverted priority — the newest turn at the center,
+//! every child collapsed to the line that addresses it, and a tokenizer cut as
+//! the last boundary. The authored arc stays verbatim and exempt.
+//!
+//! Chapters remain internal natural fold boundaries. They never render, and eras
+//! replace their lifetime accumulation with generation-independent summaries.
+//! Nothing here decides *when* to rotate; that remains the lifecycle trigger's job.
 
 use cairn_db::turso::params;
+use cairn_tokenize::{count, Family};
 
 use crate::storage::{LocalDb, RowExt};
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
@@ -46,7 +41,53 @@ use super::transcript::{
 /// all — halving a prefix takes ~20 turns to pay back its cache write, cutting
 /// it to a tenth pays back in ~3 — and children are re-fetchable, which is what
 /// makes cutting hard safe.
-pub(crate) const RECENCY_TURNS: usize = 10;
+const RECENCY_FLOOR_TURNS: usize = 3;
+const UNRESOLVED_CHILD_SHARE: usize = 50;
+const ERA_MIN_SOURCE_TOKENS: usize = 8_000;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeedPolicy {
+    pub budget_tokens: usize,
+    pub inline_eras: usize,
+}
+
+impl Default for SeedPolicy {
+    fn default() -> Self {
+        Self {
+            budget_tokens: 12_000,
+            inline_eras: 3,
+        }
+    }
+}
+
+fn seed_tokens(text: &str) -> usize {
+    // One deterministic family makes the configured bound stable even when the
+    // consuming model changes. Precision across model tokenizers is not the goal.
+    count(text, Family::V5) as usize
+}
+
+/// Where to end `text` so that `seed_tokens` measures the prefix at or under
+/// `budget`. The returned offset is a UTF-8 boundary in the source, so the
+/// prefix is directly sliceable.
+///
+/// `cut` budgets content tokens and deliberately excludes message framing,
+/// while `seed_tokens` counts a string as a message and charges that framing on
+/// top. Charging the framing before cutting gets close, but tokenization is not
+/// additive at that boundary, so the chosen prefix is measured and retreated
+/// until it actually fits. A budget below the framing itself cannot be met by any
+/// string, the empty one included.
+fn seed_cut(text: &str, budget: usize) -> usize {
+    let mut content = budget.saturating_sub(seed_tokens(""));
+    loop {
+        let offset = cairn_tokenize::cut(text, content.min(u32::MAX as usize) as u32, Family::V5)
+            .byte_offset;
+        let tokens = seed_tokens(&text[..offset]);
+        if tokens <= budget || offset == 0 {
+            return offset;
+        }
+        content = content.saturating_sub((tokens - budget).max(1));
+    }
+}
 
 /// The artifact a thread authors its arc into.
 const ARC_ARTIFACT_NAME: &str = "arc";
@@ -59,6 +100,14 @@ const NO_HISTORY_NOTICE: &str =
 /// Framing for the children census. It says where the lines came from, because
 /// a resumed thread that reads them as prose it once wrote will re-verify them.
 const CHILDREN_NOTICE: &str = "_Read from live state as this seed was composed — not authored, not inherited. Trust it over anything the arc says about where a child stands, and re-read a child only when you need detail this line does not carry._";
+
+/// The census's framing once the budget forces it to collapse. It keeps the
+/// provenance claim in a fraction of the tokens and adds the one fact only a
+/// degraded seed carries: the detail is not here, the address for it is.
+const CHILDREN_COLLAPSED_NOTICE: &str = "_Live state at composition, one line per child; an open child's detail is at its URI. This seed exceeded its budget, so it carries addresses where it would otherwise carry detail._";
+
+const NO_CHILDREN_NOTICE: &str = "_This thread has no children._\n\n";
+const CENSUS_TERMINAL_CHILDREN: usize = 30;
 
 /// A composed thread seed, and the two measurements that price it.
 pub(crate) struct ThreadSeed {
@@ -80,16 +129,29 @@ pub(crate) struct ThreadSeed {
     /// stays pending until the job leaves that session, which is what makes a
     /// failed rotation retryable.
     pub source_session_id: String,
+    pub minted_eras: Vec<crate::threads::compaction::EraMint>,
+    pub arc_bytes: i64,
+    pub eras_through_seq: Option<i64>,
 }
 
 /// Compose the seed for `job`'s next thread session.
 ///
 /// Fails rather than returning a partial seed: the caller preserves the existing
 /// session on any error, exactly as the ordinary reseed path does.
+#[cfg(test)]
 pub(crate) async fn compose_thread_seed(
     db: &LocalDb,
     job_id: &str,
     now: i64,
+) -> Result<ThreadSeed, String> {
+    compose_thread_seed_with_policy(db, job_id, now, SeedPolicy::default()).await
+}
+
+pub(crate) async fn compose_thread_seed_with_policy(
+    db: &LocalDb,
+    job_id: &str,
+    now: i64,
+    policy: SeedPolicy,
 ) -> Result<ThreadSeed, String> {
     let conn = connect_for_read(db).await?;
     let events = load_job_events_ordered(
@@ -116,9 +178,25 @@ pub(crate) async fn compose_thread_seed(
     let marks = compaction::unconsumed_marks(db, job_id, &source_session_id)
         .await
         .map_err(|error| format!("Failed to load thread compaction marks: {error}"))?;
-    let prior_entries = compaction::applied_entries(db, job_id, &source_session_id)
+    let mut prior_entries = compaction::applied_entries(db, job_id, &source_session_id)
         .await
-        .map_err(|error| format!("Failed to load the prior thread table of contents: {error}"))?;
+        .map_err(|error| format!("Failed to load the prior thread fold boundaries: {error}"))?;
+    let existing_eras = crate::threads::eras::list_eras(db, job_id, i64::MAX, 0)
+        .await
+        .map_err(|error| format!("Failed to load thread eras: {error}"))?;
+    let era_end = existing_eras.iter().map(|era| era.end_block).max();
+    if let Some(end) = era_end {
+        prior_entries.push(TocEntry {
+            source: EntrySource::Interstitial,
+            overview: String::new(),
+            content_uri: "era:covered".to_string(),
+            child_issue_id: None,
+            start_block: 0,
+            end_block: end,
+            start_turn_id: None,
+            end_turn_id: None,
+        });
+    }
     let children = load_children(&conn, job_id)
         .await
         .map_err(|error| format!("Failed to resolve this thread's children: {error}"))?;
@@ -137,7 +215,10 @@ pub(crate) async fn compose_thread_seed(
         .map(|chapter| build_entry(chapter, &blocks, &marks, &chat_uri))
         .collect();
 
-    let mut entries = prior_entries;
+    let mut entries: Vec<TocEntry> = prior_entries
+        .into_iter()
+        .filter(|entry| entry.content_uri != "era:covered")
+        .collect();
     for entry in new_entries.iter() {
         if entries
             .iter()
@@ -156,51 +237,204 @@ pub(crate) async fn compose_thread_seed(
         status: &coordinates.status,
     };
 
-    let verbatim = render_blocks(&blocks, &plan.verbatim, &chat_uri, &meta);
-    let dropped = render_blocks(&blocks, &plan.compacted, &chat_uri, &meta);
-    let history = render_history(&entries);
-    let candidate = render_history_lines(&new_entries);
-
     let arc = render_arc(db, job_id).await;
-    let carried_older = plan
-        .verbatim
-        .iter()
-        .any(|index| *index < plan.recency_start);
+    let census = render_children(&children, now);
+
+    let mut era_text = String::from("## Eras\n\n");
+    let inline_count = policy.inline_eras.min(existing_eras.len());
+    if existing_eras.len() > inline_count {
+        era_text.push_str(&format!(
+            "_{} older eras → `cairn:~/eras`._\n\n",
+            existing_eras.len() - inline_count
+        ));
+    }
+    for era in existing_eras.iter().take(inline_count).rev() {
+        let range_uri = format!(
+            "{chat_uri}?offset={}&limit={}",
+            era.start_block,
+            era.end_block - era.start_block + 1
+        );
+        era_text.push_str(&format!(
+            "- **Era {}.** {} → {}\n",
+            era.seq,
+            era.summary.trim(),
+            range_uri
+        ));
+    }
+    if existing_eras.is_empty() {
+        era_text.push_str(NO_HISTORY_NOTICE);
+        era_text.push('\n');
+    }
+    era_text.push('\n');
+
+    let framing_tokens = seed_tokens(&census) + seed_tokens(&era_text);
+    let verbatim_budget = policy.budget_tokens.saturating_sub(framing_tokens);
+    let floor_start = blocks.len().saturating_sub(RECENCY_FLOOR_TURNS);
+    let live_start = era_end.map_or(0, |end| (end + 1).max(0) as usize);
+    let live_tokens: usize = (live_start..blocks.len())
+        .map(|index| seed_tokens(&block_text(&blocks[index])))
+        .sum();
+
+    let mut minted_eras = Vec::new();
+    let mut covered_through = era_end;
+    if live_tokens > verbatim_budget && live_start < floor_start {
+        let target = ERA_MIN_SOURCE_TOKENS.max(live_tokens.saturating_sub(verbatim_budget / 2));
+        let mut taken_tokens = 0usize;
+        let mut end = live_start;
+        while end < floor_start && taken_tokens < target {
+            taken_tokens += seed_tokens(&block_text(&blocks[end]));
+            end += 1;
+        }
+        if end > live_start {
+            let end_index = end - 1;
+            let span_text = (live_start..=end_index)
+                .map(|index| block_text(&blocks[index]))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let era_children: Vec<ChildMark> = marks
+                .iter()
+                .filter(|mark| mentions_uri(&span_text, &mark.child_issue_uri))
+                .cloned()
+                .collect();
+            let child_text = if era_children.is_empty() {
+                "no child resolutions".to_string()
+            } else {
+                era_children
+                    .iter()
+                    .map(|child| format!("{} ({})", child.child_title, child.child_issue_uri))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let start_at = blocks[live_start]
+                .events
+                .first()
+                .map_or(now, |event| event.created_at);
+            let end_at = blocks[end_index]
+                .events
+                .last()
+                .map_or(now, |event| event.created_at);
+            let summary = format!(
+                "Turns {}–{} ({} to {}) covered {}; the source remains addressable in this era's chat range.",
+                live_start + 1,
+                end_index + 1,
+                start_at,
+                end_at,
+                child_text
+            );
+            minted_eras.push(crate::threads::compaction::EraMint {
+                start_block: live_start as i64,
+                end_block: end_index as i64,
+                started_at: start_at,
+                ended_at: end_at,
+                summary,
+                source_tokens: taken_tokens as i64,
+                children: era_children,
+            });
+            covered_through = Some(end_index as i64);
+        }
+    }
+
+    // Selection priority differs from render order: preserve immediate recency,
+    // then unresolved-child turns within half the window, then fill newest-first.
+    let mut selected: Vec<usize> = (floor_start..blocks.len()).collect();
+    let pinned_cap = verbatim_budget * UNRESOLVED_CHILD_SHARE / 100;
+    let mut pinned_tokens = 0usize;
+    for index in (0..floor_start).rev() {
+        if !open_children
+            .iter()
+            .any(|uri| mentions_uri(&block_text(&blocks[index]), uri))
+        {
+            continue;
+        }
+        let weight = seed_tokens(&block_text(&blocks[index]));
+        if pinned_tokens + weight <= pinned_cap {
+            selected.push(index);
+            pinned_tokens += weight;
+        }
+    }
+    for index in (0..floor_start).rev() {
+        if selected.contains(&index) || covered_through.is_some_and(|end| index as i64 <= end) {
+            continue;
+        }
+        let mut trial = selected.clone();
+        trial.push(index);
+        trial.sort_unstable();
+        if recent_section_tokens(&blocks, &trial, &chat_uri, &meta) <= verbatim_budget {
+            selected = trial;
+        }
+    }
+    selected.sort_unstable();
+    while recent_section_tokens(&blocks, &selected, &chat_uri, &meta) > verbatim_budget {
+        let Some(position) = selected.iter().position(|index| *index < floor_start) else {
+            break;
+        };
+        selected.remove(position);
+    }
+    if let Some(end) = covered_through {
+        entries.retain(|entry| entry.end_block > end);
+    }
+
+    let mut body = String::new();
+    body.push_str(&census);
+    body.push_str(&era_text);
+    body.push_str("## Recent\n\n");
+    body.push_str(&render_gap_markers(&selected, blocks.len(), &chat_uri));
+    body.push_str(&render_blocks(&blocks, &selected, &chat_uri, &meta));
+
+    // Where the configured bound becomes true rather than merely intended.
+    // Everything above budgets the parts it is free to choose, around two it is
+    // not: the whole open-child census and the recency floor. Measuring the
+    // composed body is the only check that sees what those two actually cost.
+    let mut recency_start = floor_start;
+    if seed_tokens(&body) > policy.budget_tokens {
+        let degraded = degrade_to_budget(
+            policy.budget_tokens,
+            &children,
+            existing_eras.len(),
+            &coordinates.base_uri,
+            &blocks,
+            &chat_uri,
+            &meta,
+        );
+        body = degraded.body;
+        selected = degraded.selected;
+        recency_start = selected.first().copied().unwrap_or(blocks.len());
+    }
+
+    let dropped_indices: Vec<usize> = (0..blocks.len())
+        .filter(|index| !selected.contains(index))
+        .collect();
+    let dropped = render_blocks(&blocks, &dropped_indices, &chat_uri, &meta);
 
     let mut content = String::new();
     content.push_str("## Arc\n\n");
     content.push_str(arc.trim());
     content.push_str("\n\n");
-    content.push_str(&render_children(&children, now));
-    content.push_str("## History\n\n");
-    content.push_str(&history);
-    content.push_str("\n## Recent\n\n");
-    if carried_older {
-        content.push_str(
-            "_Older turns that still reference an unresolved child are kept verbatim below alongside the recent ones._\n\n",
-        );
-    }
-    content.push_str(&verbatim);
+    content.push_str(&body);
 
-    let consumed_child_issue_ids = plan
-        .chapters
+    let consumed_child_issue_ids = minted_eras
         .iter()
-        .filter_map(|chapter| match chapter.kind {
-            ChapterKind::Child(mark) => Some(marks[mark].child_issue_id.clone()),
-            ChapterKind::Interstitial => None,
+        .flat_map(|era| {
+            era.children
+                .iter()
+                .map(|child| child.child_issue_id.clone())
         })
         .collect::<Vec<_>>();
+    let eras_through_seq = existing_eras.first().map(|era| era.seq as i64);
 
     Ok(ThreadSeed {
         content,
         source_bytes: dropped.len() as i64,
-        candidate_bytes: candidate.len() as i64,
+        candidate_bytes: era_text.len() as i64,
         new_entries: new_entries.len(),
         entries,
-        compacted_through_block: plan.compacted.last().map(|index| *index as i64),
-        recency_start_block: plan.recency_start as i64,
+        compacted_through_block: covered_through,
+        recency_start_block: recency_start as i64,
         consumed_child_issue_ids,
         source_session_id,
+        minted_eras,
+        arc_bytes: arc.len() as i64,
+        eras_through_seq,
     })
 }
 
@@ -236,11 +470,6 @@ struct Chapter {
 
 struct ChapterPlan {
     chapters: Vec<Chapter>,
-    /// Blocks rendered verbatim, in order.
-    verbatim: Vec<usize>,
-    /// Blocks this composition drops into chapters, in order.
-    compacted: Vec<usize>,
-    recency_start: usize,
 }
 
 /// Decide, per turn, whether it is dropped into a chapter or kept verbatim.
@@ -255,7 +484,7 @@ fn plan_chapters(
     open_children: &[String],
     prior_entries: &[TocEntry],
 ) -> ChapterPlan {
-    let recency_start = blocks.len().saturating_sub(RECENCY_TURNS);
+    let recency_start = blocks.len().saturating_sub(RECENCY_FLOOR_TURNS);
     let already_compacted = |index: usize| {
         prior_entries
             .iter()
@@ -263,8 +492,6 @@ fn plan_chapters(
     };
 
     let mut chapters: Vec<Chapter> = Vec::new();
-    let mut verbatim: Vec<usize> = Vec::new();
-    let mut compacted: Vec<usize> = Vec::new();
     let mut open: Option<Chapter> = None;
 
     for (index, block) in blocks.iter().enumerate() {
@@ -280,7 +507,6 @@ fn plan_chapters(
             if let Some(chapter) = open.take() {
                 chapters.push(chapter);
             }
-            verbatim.push(index);
             continue;
         }
 
@@ -290,7 +516,6 @@ fn plan_chapters(
             if let Some(chapter) = open.take() {
                 chapters.push(chapter);
             }
-            verbatim.push(index);
             continue;
         }
 
@@ -301,8 +526,6 @@ fn plan_chapters(
             Some(mark) => ChapterKind::Child(mark),
             None => ChapterKind::Interstitial,
         };
-        compacted.push(index);
-
         let extends = match (&open, kind) {
             // Adjacent turns coalesce only when they are about the same child.
             (Some(current), ChapterKind::Child(mark)) => current.kind == ChapterKind::Child(mark),
@@ -330,12 +553,7 @@ fn plan_chapters(
         chapters.push(chapter);
     }
 
-    ChapterPlan {
-        chapters,
-        verbatim,
-        compacted,
-        recency_start,
-    }
+    ChapterPlan { chapters }
 }
 
 fn build_entry(
@@ -376,30 +594,6 @@ fn build_entry(
 
 // ── Rendering ───────────────────────────────────────────────────────────────
 
-fn render_history(entries: &[TocEntry]) -> String {
-    if entries.is_empty() {
-        return format!("{NO_HISTORY_NOTICE}\n");
-    }
-    render_history_lines(entries)
-}
-
-fn render_history_lines(entries: &[TocEntry]) -> String {
-    let mut out = String::new();
-    for entry in entries {
-        out.push_str(&render_history_line(entry));
-    }
-    out
-}
-
-fn render_history_line(entry: &TocEntry) -> String {
-    let range = if entry.start_block == entry.end_block {
-        format!("turn {}", entry.start_block + 1)
-    } else {
-        format!("turns {}–{}", entry.start_block + 1, entry.end_block + 1)
-    };
-    format!("- {range} · {} → {}\n", entry.overview, entry.content_uri)
-}
-
 /// Render a set of turns through the ordinary transcript renderer at reseed
 /// fidelity, so kept turns read exactly as they would have without compaction.
 ///
@@ -407,6 +601,46 @@ fn render_history_line(entry: &TocEntry) -> String {
 /// their position in the rendered subset, so "turns 1–4" in the table of
 /// contents and "Turn 5" in the verbatim section describe one numbering. A
 /// subset-relative label would tell a thread its oldest kept turn is turn 1.
+fn render_gap_markers(selected: &[usize], total: usize, chat_uri: &str) -> String {
+    let mut out = String::new();
+    let mut start = None;
+    for index in 0..total {
+        if selected.contains(&index) {
+            if let Some(gap_start) = start.take() {
+                out.push_str(&format!(
+                    "_Turns {}–{} omitted → `{chat_uri}?offset={gap_start}&limit={}`._\n\n",
+                    gap_start + 1,
+                    index,
+                    index - gap_start
+                ));
+            }
+        } else if start.is_none() {
+            start = Some(index);
+        }
+    }
+    if let Some(gap_start) = start {
+        out.push_str(&format!(
+            "_Turns {}–{} omitted → `{chat_uri}?offset={gap_start}&limit={}`._\n\n",
+            gap_start + 1,
+            total,
+            total - gap_start
+        ));
+    }
+    out
+}
+
+fn recent_section_tokens(
+    blocks: &[TurnBlock<'_>],
+    selected: &[usize],
+    chat_uri: &str,
+    meta: &DigestMeta<'_>,
+) -> usize {
+    let mut section = String::from("## Recent\n\n");
+    section.push_str(&render_gap_markers(selected, blocks.len(), chat_uri));
+    section.push_str(&render_blocks(blocks, selected, chat_uri, meta));
+    seed_tokens(&section)
+}
+
 fn render_blocks(
     blocks: &[TurnBlock<'_>],
     selected: &[usize],
@@ -442,6 +676,226 @@ fn render_blocks(
             inline_diffs: true,
         },
     )
+}
+
+// ── The budget's last boundary ──────────────────────────────────────────────
+
+/// A non-arc body recomposed to fit, and the turns that survived into it.
+struct DegradedBody {
+    body: String,
+    selected: Vec<usize>,
+}
+
+/// Recompose the non-arc body when the ordinary policy does not fit `budget`.
+///
+/// Trimming that policy would not help: what fails to fit is its shape, not its
+/// margin. A thread with sixty open children pays their detail blocks whatever
+/// the budget says, and one turn carrying a large file read outweighs the budget
+/// by itself. So this composes a smaller shape under an inverted priority. The
+/// newest turn is the center, because it is the only part of a seed that no
+/// other address carries as cheaply; every child collapses to the one line that
+/// addresses it; and nothing is dropped without leaving the URI that reaches it.
+fn degrade_to_budget(
+    budget: usize,
+    children: &[ChildStatus],
+    era_count: usize,
+    thread_uri: &str,
+    blocks: &[TurnBlock<'_>],
+    chat_uri: &str,
+    meta: &DigestMeta<'_>,
+) -> DegradedBody {
+    let eras = collapsed_eras(era_count);
+    // What the newest turn actually costs, capped at half the budget. The census
+    // may take everything that reserve does not: children are usually the bulk
+    // of a seed, and holding a fixed half open for a two-line turn would drop
+    // children to protect space nothing uses. The cap is what keeps the reverse
+    // true — a thread with sixty children cannot crowd out its own present.
+    let reserve = blocks
+        .len()
+        .checked_sub(1)
+        .map(|newest| recent_section_tokens(blocks, &[newest], chat_uri, meta).min(budget / 2))
+        .unwrap_or_default();
+    let census = collapsed_census(
+        children,
+        thread_uri,
+        budget.saturating_sub(reserve + seed_tokens(&eras)),
+    );
+    let framing = seed_tokens(&census) + seed_tokens(&eras);
+    let recent = bounded_recent(blocks, budget.saturating_sub(framing), chat_uri, meta);
+
+    let body = format!("{census}{eras}{}", recent.section);
+    if seed_tokens(&body) <= budget {
+        return DegradedBody {
+            body,
+            selected: recent.selected,
+        };
+    }
+
+    // A budget smaller than the framing that introduces it. The census and the
+    // eras each have an address of their own and the turn does not, so the turn
+    // takes what is left and the cut makes that literally true.
+    let recent = bounded_recent(blocks, budget, chat_uri, meta);
+    let mut body = recent.section;
+    if seed_tokens(&body) > budget {
+        body.truncate(seed_cut(&body, budget));
+    }
+    DegradedBody {
+        body,
+        selected: recent.selected,
+    }
+}
+
+/// The eras as a single address. An era summary is a sentence and three of them
+/// render inline; under pressure the collection URI carries all of it.
+fn collapsed_eras(count: usize) -> String {
+    let mut out = String::from("## Eras\n\n");
+    match count {
+        0 => out.push_str(NO_HISTORY_NOTICE),
+        1 => out.push_str("_1 era → `cairn:~/eras`._"),
+        count => out.push_str(&format!("_{count} eras → `cairn:~/eras`._")),
+    }
+    out.push_str("\n\n");
+    out
+}
+
+/// Every child on one line, fitted to `budget`, with an address for the rest.
+///
+/// Open children lose their detail blocks here, and terminal ones lose the
+/// separate cap they carry in an ordinary census — the fit is the only bound
+/// this needs. Dropping detail before dropping children is the right order:
+/// detail is live state one read away at the URI still on the line, while a
+/// child that vanishes from the census is a child the thread does not know it
+/// has.
+fn collapsed_census(children: &[ChildStatus], thread_uri: &str, budget: usize) -> String {
+    let (open, mut terminal): (Vec<_>, Vec<_>) = children.iter().partition(|child| child.is_open());
+    terminal.sort_by_key(|child| std::cmp::Reverse(child.last_activity_at.unwrap_or(0)));
+    let lines: Vec<String> = open
+        .into_iter()
+        .chain(terminal)
+        .map(ChildStatus::census_line)
+        .collect();
+
+    // The longest prefix that fits, found by binary search over the measured
+    // section. Only a measured candidate is ever accepted, so the bound holds
+    // whatever the search converges on, and the marker standing for the rest is
+    // inside every measurement rather than added to a section already sized.
+    let (mut low, mut high) = (0usize, lines.len());
+    let mut best = 0usize;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if seed_tokens(&render_collapsed_census(&lines, mid, thread_uri)) <= budget {
+            best = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    render_collapsed_census(&lines, best, thread_uri)
+}
+
+fn render_collapsed_census(lines: &[String], take: usize, thread_uri: &str) -> String {
+    let mut out = String::from("## Children\n\n");
+    out.push_str(CHILDREN_COLLAPSED_NOTICE);
+    out.push_str("\n\n");
+    if lines.is_empty() {
+        out.push_str(NO_CHILDREN_NOTICE);
+        return out;
+    }
+    for line in lines.iter().take(take) {
+        out.push_str(line);
+    }
+    if take < lines.len() {
+        out.push_str(&format!(
+            "- _… and {} more children → `{thread_uri}`._\n",
+            lines.len() - take
+        ));
+    }
+    out.push('\n');
+    out
+}
+
+/// The `## Recent` section and the turns it carries.
+struct BoundedRecent {
+    section: String,
+    selected: Vec<usize>,
+}
+
+/// The newest turns that fit `budget`, never fewer than one.
+///
+/// The recency floor is a ceiling here. Degradation happens because something
+/// did not fit, so this takes newest-first and stops at the first turn that
+/// would not — and when even the newest turn is bigger than the budget, keeps
+/// its head and says where the rest of it is. An over-budget seed and an empty
+/// one are both worse than a turn a thread can see was cut.
+fn bounded_recent(
+    blocks: &[TurnBlock<'_>],
+    budget: usize,
+    chat_uri: &str,
+    meta: &DigestMeta<'_>,
+) -> BoundedRecent {
+    let Some(newest) = blocks.len().checked_sub(1) else {
+        return BoundedRecent {
+            section: String::from("## Recent\n\n"),
+            selected: Vec::new(),
+        };
+    };
+
+    let mut selected = vec![newest];
+    for index in (blocks.len().saturating_sub(RECENCY_FLOOR_TURNS)..newest).rev() {
+        let mut trial = selected.clone();
+        trial.push(index);
+        trial.sort_unstable();
+        if recent_section_tokens(blocks, &trial, chat_uri, meta) > budget {
+            break;
+        }
+        selected = trial;
+    }
+
+    let mut section = String::from("## Recent\n\n");
+    section.push_str(&render_gap_markers(&selected, blocks.len(), chat_uri));
+    section.push_str(&render_blocks(blocks, &selected, chat_uri, meta));
+    if seed_tokens(&section) <= budget {
+        return BoundedRecent { section, selected };
+    }
+
+    BoundedRecent {
+        section: cut_newest_turn(blocks, newest, budget, chat_uri, meta),
+        selected: vec![newest],
+    }
+}
+
+/// The head of one turn, under `budget`, followed by the address of the whole.
+fn cut_newest_turn(
+    blocks: &[TurnBlock<'_>],
+    index: usize,
+    budget: usize,
+    chat_uri: &str,
+    meta: &DigestMeta<'_>,
+) -> String {
+    let mut head = String::from("## Recent\n\n");
+    head.push_str(&render_gap_markers(&[index], blocks.len(), chat_uri));
+    let marker = format!(
+        "\n_Turn {} continues → `{chat_uri}?offset={index}&limit=1`._\n\n",
+        index + 1
+    );
+    let rendered = render_blocks(blocks, &[index], chat_uri, meta);
+
+    // A cut prefix does not cost what the same tokens cost mid-document, so the
+    // allowance is corrected against the assembled section rather than trusted.
+    let mut allowance = budget.saturating_sub(seed_tokens(&head) + seed_tokens(&marker));
+    loop {
+        let section = format!(
+            "{head}{}{marker}",
+            &rendered[..seed_cut(&rendered, allowance)]
+        );
+        let tokens = seed_tokens(&section);
+        if tokens <= budget || allowance == 0 {
+            return section;
+        }
+        allowance = allowance.saturating_sub((tokens - budget).max(1));
+    }
 }
 
 async fn render_arc(db: &LocalDb, job_id: &str) -> String {
@@ -791,6 +1245,18 @@ impl ChildStatus {
         !TERMINAL_ISSUE_STATUSES.contains(&self.status.as_str())
     }
 
+    /// The one line that addresses a child: where it lives, where it stands,
+    /// what it is. Every census renders this; what a census decides is whether
+    /// an open child also gets its detail block underneath.
+    fn census_line(&self) -> String {
+        format!(
+            "- `{}` **{}** · {}\n",
+            self.uri,
+            self.status,
+            one_line(&self.title)
+        )
+    }
+
     /// The facets of a live child, in the order a thread asks about them: who is
     /// working it, whether a PR is out, whether the checks are green, whether it
     /// is blocked on the user, and when it last moved. An absent facet is
@@ -859,26 +1325,34 @@ impl ChildStatus {
 /// forty merged children would pay two lines each, forever, for state nothing
 /// acts on.
 fn render_children(children: &[ChildStatus], now: i64) -> String {
-    if children.is_empty() {
-        return String::new();
-    }
     let mut out = String::from("## Children\n\n");
     out.push_str(CHILDREN_NOTICE);
     out.push_str("\n\n");
-    for child in children {
+    if children.is_empty() {
+        out.push_str(NO_CHILDREN_NOTICE);
+        return out;
+    }
+
+    let (open, mut terminal): (Vec<_>, Vec<_>) = children.iter().partition(|child| child.is_open());
+    terminal.sort_by_key(|child| std::cmp::Reverse(child.last_activity_at.unwrap_or(0)));
+
+    for child in open
+        .into_iter()
+        .chain(terminal.iter().take(CENSUS_TERMINAL_CHILDREN).copied())
+    {
+        out.push_str(&child.census_line());
+        if child.is_open() {
+            let detail = child.detail_line(now);
+            if !detail.is_empty() {
+                out.push_str(&format!("  {detail}\n"));
+            }
+        }
+    }
+    if terminal.len() > CENSUS_TERMINAL_CHILDREN {
         out.push_str(&format!(
-            "- `{}` **{}** · {}\n",
-            child.uri,
-            child.status,
-            one_line(&child.title)
+            "- _… and {} earlier resolved children. Their work is summarized in the eras above and listed at `cairn:~/eras`._\n",
+            terminal.len() - CENSUS_TERMINAL_CHILDREN
         ));
-        if !child.is_open() {
-            continue;
-        }
-        let detail = child.detail_line(now);
-        if !detail.is_empty() {
-            out.push_str(&format!("  {detail}\n"));
-        }
     }
     out.push('\n');
     out
@@ -905,7 +1379,7 @@ async fn load_children(
             "SELECT child.id, p.key, child.number, child.title, child.status
              FROM issues child
              JOIN projects p ON p.id = child.project_id
-             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
              ORDER BY child.number ASC",
             params![job_id],
         )
@@ -939,7 +1413,7 @@ async fn load_children(
              FROM jobs j
              JOIN executions e ON e.id = j.execution_id
              JOIN issues child ON child.id = j.issue_id
-             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
                AND j.parent_job_id IS NULL
                AND e.seq = (SELECT MAX(latest.seq) FROM executions latest WHERE latest.issue_id = j.issue_id)
              ORDER BY j.created_at ASC",
@@ -966,7 +1440,7 @@ async fn load_children(
             "SELECT m.issue_id, m.github_pr_number, m.status
              FROM merge_requests m
              JOIN issues child ON child.id = m.issue_id
-             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
                AND m.github_pr_number > 0
              ORDER BY m.opened_at ASC",
             params![job_id],
@@ -991,7 +1465,7 @@ async fn load_children(
              FROM prompts p
              JOIN runs r ON r.id = p.run_id
              JOIN issues child ON child.id = r.issue_id
-             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
                AND p.answered_at IS NULL
              GROUP BY r.issue_id",
             params![job_id],
@@ -1016,7 +1490,7 @@ async fn load_children(
              FROM check_result_observations o
              JOIN jobs j ON j.id = o.job_id
              JOIN issues child ON child.id = j.issue_id
-             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
              ORDER BY o.ran_at ASC",
             params![job_id],
         )
@@ -1045,7 +1519,7 @@ async fn load_children(
              FROM events e
              JOIN runs r ON r.id = e.run_id
              JOIN issues child ON child.id = r.issue_id
-             WHERE child.parent_issue_id = (SELECT issue_id FROM jobs WHERE id = ?1)
+             WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
              GROUP BY r.issue_id",
             params![job_id],
         )
@@ -1110,14 +1584,16 @@ mod tests {
                VALUES ('p','default','P','prj','/tmp/p',1,1);
              INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at)
                VALUES ('i-thread','p',1,'Platform thread','active','none',1,1);
-             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_issue_id)
-               VALUES ('i-done','p',20,'Running panel for the executor fleet','merged','none',1,1,'i-thread');
-             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_issue_id)
-               VALUES ('i-open','p',21,'Lease renewal backoff','active','none',1,1,'i-thread');
-             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-               VALUES ('e','recipe','i-thread','p','running',1,1);
-             INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, current_session_id, created_at, updated_at)
-               VALUES ('job-thread','e','i-thread','p','running','thread','thread','sess-1',1,1);
+             INSERT INTO threads(id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('t-thread','p','platform','active','none',1,1);
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+               VALUES ('i-done','p',20,'Running panel for the executor fleet','merged','none',1,1,'t-thread');
+             INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+               VALUES ('i-open','p',21,'Lease renewal backoff','active','none',1,1,'t-thread');
+             INSERT INTO executions(id, recipe_id, project_id, status, started_at, seq)
+               VALUES ('e','recipe','p','running',1,1);
+             INSERT INTO jobs(id, execution_id, thread_id, project_id, status, uri_segment, node_name, current_session_id, created_at, updated_at)
+               VALUES ('job-thread','e','t-thread','p','running','thread','thread','sess-1',1,1);
              INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
                VALUES ('sess-1','job-thread','claude','open',1,1,1);
              INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
@@ -1267,74 +1743,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_composed_seed_keeps_the_arc_the_open_child_and_ten_turns() {
+    async fn a_composed_seed_uses_eras_and_a_token_budget_without_rendering_chapters() {
         let db = thread_fixture("thread-seed-compose.db").await;
         mark_done_child(&db).await;
         write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
 
-        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        // A budget the composed seed can actually honor. At 300 this fixture
+        // costs more than the bound it is given, so what it demonstrated was the
+        // gap that bound had rather than the policy inside it.
+        let seed = compose_thread_seed_with_policy(
+            &db,
+            THREAD_JOB,
+            NOW,
+            SeedPolicy {
+                budget_tokens: 600,
+                inline_eras: 3,
+            },
+        )
+        .await
+        .unwrap();
 
-        // The arc is copied, not summarized: every authored string survives.
         assert!(seed
             .content
             .contains("Getting the fleet onto lease-based residency."));
         assert!(seed.content.contains("Do not rebuild the fleet view"));
-        assert!(seed
-            .content
-            .contains("premature until residency leases settle"));
-        assert!(seed.content.contains("**rejected**"));
         assert!(seed.content.contains("Who owns lease renewal?"));
-
-        // The merged child became one chapter: title as overview, its own URI as
-        // the address, and its turns are gone from the body.
-        let child = seed
-            .entries
+        assert!(seed.content.contains("OPEN_CHILD_TURN_FOUR"));
+        assert!(seed.content.contains("## Turn 14 ·"));
+        assert!(!seed.content.contains("## History"));
+        assert!(!seed.content.contains("- turn 1 ·"));
+        assert_eq!(seed.recency_start_block, 11);
+        assert_eq!(seed.minted_eras.len(), 1);
+        assert!(seed.minted_eras[0]
+            .children
             .iter()
-            .find(|entry| entry.source == EntrySource::Child)
-            .expect("a child chapter");
-        assert_eq!(child.overview, "Running panel for the executor fleet");
-        assert_eq!(child.content_uri, DONE_CHILD);
-        assert_eq!((child.start_block, child.end_block), (1, 2));
-        assert!(!seed.content.contains("MERGED_CHILD_TURN_TWO"));
-        assert!(!seed.content.contains("MERGED_CHILD_TURN_THREE"));
-
-        // The turn touching an unresolved child is never dropped, even though it
-        // sits behind the recency window.
-        assert!(
-            seed.content.contains("OPEN_CHILD_TURN_FOUR"),
-            "a turn referencing an open child was compacted away: {}",
-            seed.content
-        );
-
-        // Interstitial conversation keeps an overview AND an address.
-        let interstitial = seed
-            .entries
-            .iter()
-            .find(|entry| entry.source == EntrySource::Interstitial)
-            .expect("an interstitial chapter");
-        assert_eq!(interstitial.overview, "Shape of the executor protocol");
-        assert!(
-            interstitial.content_uri.contains("/chat?offset=0&limit=1"),
-            "interstitial chapter is not re-readable: {}",
-            interstitial.content_uri
-        );
-
+            .any(|child| child.child_issue_id == "i-done"));
         assert_eq!(seed.consumed_child_issue_ids, vec!["i-done".to_string()]);
-        assert_eq!(seed.recency_start_block, 4);
-        assert!(seed.source_bytes > seed.candidate_bytes);
-
-        // The table of contents and the verbatim section share one numbering:
-        // chapters cover turns 1–3, the kept turns run 4–14.
-        assert!(
-            seed.content.contains("- turn 1 ·") && seed.content.contains("- turns 2–3 ·"),
-            "chapter ranges are not turn-numbered: {}",
-            seed.content
-        );
-        assert!(
-            seed.content.contains("## Turn 4 ·") && seed.content.contains("## Turn 14 ·"),
-            "kept turns are numbered relative to the subset instead of the thread: {}",
-            seed.content
-        );
     }
 
     /// Give the open child everything a live child accumulates: a running
@@ -1423,14 +1867,196 @@ mod tests {
             seed.content
         );
 
-        // The census sits between authored intent and generated history.
+        // The census sits between authored intent and persisted eras.
         let arc = seed.content.find("## Arc").expect("an arc section");
         let children = seed
             .content
             .find("## Children")
             .expect("a children section");
-        let history = seed.content.find("## History").expect("a history section");
-        assert!(arc < children && children < history);
+        let eras = seed.content.find("## Eras").expect("an eras section");
+        assert!(arc < children && children < eras);
+    }
+
+    /// The part of a composed seed the budget governs. The authored arc is
+    /// copied verbatim and is deliberately exempt, so measuring it here would be
+    /// measuring the one thing the bound does not claim.
+    fn non_arc_body(content: &str) -> &str {
+        // Whichever generated section comes first. Under a budget too small for
+        // the census the body opens at a later header, or is empty outright.
+        ["## Children", "## Eras", "## Recent"]
+            .iter()
+            .filter_map(|header| content.find(header))
+            .min()
+            .map_or("", |at| &content[at..])
+    }
+
+    /// Live open children, each carrying the facets a live child accumulates.
+    /// A census line without them is not the line that costs anything.
+    async fn many_live_open_children(db: &LocalDb, count: i64) {
+        for n in 0..count {
+            let issue = format!("i-many-{n}");
+            let number = 100 + n;
+            db.execute_script(&format!(
+                "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+                   VALUES ('{issue}','p',{number},'Lease renewal backoff for executor {number}, with the retry curve still unsettled','active','none',1,1,'t-thread');
+                 INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                   VALUES ('e-{issue}','build','{issue}','p','running',1,1);
+                 INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
+                   VALUES ('job-{issue}','e-{issue}','{issue}','p','running','builder','builder',1,1);
+                 INSERT INTO runs(id, job_id, issue_id, status, created_at, updated_at)
+                   VALUES ('run-{issue}','job-{issue}','{issue}','running',1,1);
+                 INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch, target_branch, status, opened_at, updated_at, github_pr_number)
+                   VALUES ('mr-{issue}','job-{issue}','p','{issue}','Lease renewal backoff','feat/lease','main','open',10,10,{number});
+                 INSERT INTO events(id, run_id, sequence, timestamp, event_type, data, created_at)
+                   VALUES ('ev-{issue}','run-{issue}',1,9100,'assistant','{{}}',9100);"
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_census_too_large_for_the_budget_collapses_without_losing_a_child() {
+        // The census is framing every rebuilt turn pays for, so an unbounded one
+        // is unbounded forever. Twenty live children in full detail outweigh
+        // this budget; the same twenty as one addressable line each do not.
+        let db = thread_fixture("thread-seed-oversized-census.db").await;
+        many_live_open_children(&db, 20).await;
+        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+
+        let policy = SeedPolicy {
+            budget_tokens: 1_500,
+            inline_eras: 3,
+        };
+        let seed = compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy)
+            .await
+            .unwrap();
+        let body = non_arc_body(&seed.content);
+
+        // Measured the way production measures, not by a bytes-over-four guess.
+        assert!(
+            seed_tokens(body) <= policy.budget_tokens,
+            "the composed seed exceeded its own budget at {} tokens:\n{body}",
+            seed_tokens(body)
+        );
+        // Collapsing costs detail, never a child: each one still carries the URI
+        // the detail is one read away at.
+        for number in 100..120 {
+            assert!(
+                body.contains(&format!("`cairn://p/prj/{number}`")),
+                "child {number} lost its address in the collapsed census:\n{body}"
+            );
+        }
+        assert!(body.contains("carries addresses where it would otherwise carry detail"));
+        assert!(
+            !body.contains("PR #100 open"),
+            "a collapsed child kept the detail block the budget could not afford"
+        );
+
+        // Without this, a fixture that was never oversized would pass silently.
+        let generous = compose_thread_seed_with_policy(
+            &db,
+            THREAD_JOB,
+            NOW,
+            SeedPolicy {
+                budget_tokens: 100_000,
+                inline_eras: 3,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            seed_tokens(non_arc_body(&generous.content)) > policy.budget_tokens,
+            "the fixture fits the budget on its own, so the boundary went untested"
+        );
+        assert!(
+            generous.content.contains("PR #100 open"),
+            "a seed that fits must keep the richer census exactly as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newest_turn_larger_than_the_budget_is_cut_rather_than_dropped() {
+        // One turn carrying a large read outweighs the whole budget. The recency
+        // floor would pass it straight through, and dropping it would hand the
+        // thread a seed with no present in it.
+        let db = thread_fixture("thread-seed-oversized-turn.db").await;
+        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+        turn(
+            &db,
+            15,
+            "read the fleet snapshot",
+            Some(&format!(
+                "SNAPSHOT_HEAD\n{}",
+                "lease residency row for one executor. ".repeat(2_000)
+            )),
+        )
+        .await;
+
+        let policy = SeedPolicy {
+            budget_tokens: 800,
+            inline_eras: 3,
+        };
+        let seed = compose_thread_seed_with_policy(&db, THREAD_JOB, NOW, policy)
+            .await
+            .unwrap();
+        let body = non_arc_body(&seed.content);
+
+        assert!(
+            seed_tokens(body) <= policy.budget_tokens,
+            "one oversized turn carried the seed past its budget at {} tokens",
+            seed_tokens(body)
+        );
+        assert!(
+            body.contains("SNAPSHOT_HEAD"),
+            "the turn this seed is centered on is not in it:\n{body}"
+        );
+        assert!(
+            body.contains("Turn 15 continues → "),
+            "the cut left no address for the rest of the turn:\n{body}"
+        );
+        assert_eq!(
+            seed.recency_start_block, 14,
+            "the recorded window must describe the turns the seed actually kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_budget_below_its_own_framing_falls_back_and_still_holds() {
+        // The terminal boundary, reached when the section headers that introduce
+        // a seed do not themselves fit. Nothing here survives as content worth
+        // reading, which is exactly why the only thing asserted is the bound: it
+        // is the one property that must hold for every input, including inputs no
+        // caller should ever pass.
+        let db = thread_fixture("thread-seed-budget-below-framing.db").await;
+        make_open_child_live(&db).await;
+        write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
+
+        // Below the tokenizer's own message framing no string can qualify, the
+        // empty one included, so the sweep starts where the claim is meaningful.
+        for budget in [seed_tokens(""), 12, 30, 60, 120, 240] {
+            let seed = compose_thread_seed_with_policy(
+                &db,
+                THREAD_JOB,
+                NOW,
+                SeedPolicy {
+                    budget_tokens: budget,
+                    inline_eras: 3,
+                },
+            )
+            .await
+            .unwrap();
+            let body = non_arc_body(&seed.content);
+            assert!(
+                seed_tokens(body) <= budget,
+                "a budget of {budget} composed a {}-token body:\n{body}",
+                seed_tokens(body)
+            );
+            // The arc is exempt, so it survives a budget that leaves nothing else.
+            assert!(seed
+                .content
+                .contains("Getting the fleet onto lease-based residency."));
+        }
     }
 
     #[tokio::test]
@@ -1461,9 +2087,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_thread_with_no_children_carries_no_census() {
-        // An empty heading is not information, and this seed is composed on every
-        // continuation of every thread.
+    async fn a_thread_with_no_children_carries_an_explicit_empty_census() {
+        // Silence made the production join bug unfalsifiable. Empty is data.
         let db = migrated_test_db("thread-seed-childless.db").await;
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
@@ -1485,7 +2110,8 @@ mod tests {
 
         let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
 
-        assert!(!seed.content.contains("## Children"));
+        assert!(seed.content.contains("## Children"));
+        assert!(seed.content.contains("This thread has no children"));
     }
 
     #[tokio::test]
@@ -1498,7 +2124,17 @@ mod tests {
         mark_done_child(&db).await;
         write_arc(&db, 1, "Getting the fleet onto lease-based residency.").await;
 
-        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        let seed = compose_thread_seed_with_policy(
+            &db,
+            THREAD_JOB,
+            NOW,
+            SeedPolicy {
+                budget_tokens: 300,
+                inline_eras: 3,
+            },
+        )
+        .await
+        .unwrap();
         let preview = DigestPreview::of(&seed.content);
 
         // Cairn's ~4-characters-per-token convention, rounded up so a short seed
@@ -1648,6 +2284,9 @@ mod tests {
                 compacted_through_block: first.compacted_through_block,
                 recency_start_block: first.recency_start_block,
                 consumed_child_issue_ids: first.consumed_child_issue_ids.clone(),
+                minted_eras: first.minted_eras.clone(),
+                arc_bytes: first.arc_bytes,
+                eras_through_seq: first.eras_through_seq,
             },
             1_000,
         )
@@ -1695,6 +2334,9 @@ mod tests {
                 compacted_through_block: first.compacted_through_block,
                 recency_start_block: first.recency_start_block,
                 consumed_child_issue_ids: first.consumed_child_issue_ids.clone(),
+                minted_eras: first.minted_eras.clone(),
+                arc_bytes: first.arc_bytes,
+                eras_through_seq: first.eras_through_seq,
             },
             1_000,
         )

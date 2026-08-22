@@ -110,6 +110,8 @@ pub(crate) async fn delete_owned_jobs(
         "thread_compaction_entries",
         "thread_compactions",
         "thread_compaction_marks",
+        "thread_eras",
+        "thread_era_children",
     ] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE job_id IN ({jobs})"),

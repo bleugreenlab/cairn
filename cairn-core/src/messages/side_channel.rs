@@ -502,6 +502,23 @@ mod tests {
         child_uri: &str,
         content: &str,
     ) -> SideChannelNotice {
+        insert_notice_at_for_test(
+            db,
+            parent_job_id,
+            child_uri,
+            content,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+    }
+
+    async fn insert_notice_at_for_test(
+        db: &LocalDb,
+        parent_job_id: &str,
+        child_uri: &str,
+        content: &str,
+        created_at: i64,
+    ) -> SideChannelNotice {
         seed_parent_job(db, parent_job_id).await;
         let rendered =
             format!("[Side-channel] the user messaged your child {child_uri}:\n{content}");
@@ -521,8 +538,8 @@ mod tests {
                         "INSERT INTO suppressed_wakes
                            (id, subscription_id, job_id, source_kind, source_ref, fact_kind,
                             occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at)
-                         VALUES (?1, NULL, ?2, 'issue', ?3, 'message', 1, ?3, ?4, 1, 1, NULL)",
-                        params![id.as_str(), parent.as_str(), child.as_str(), rendered.as_str()],
+                         VALUES (?1, NULL, ?2, 'issue', ?3, 'message', 1, ?3, ?4, ?5, ?5, NULL)",
+                        params![id.as_str(), parent.as_str(), child.as_str(), rendered.as_str(), created_at],
                     )
                     .await?;
                     Ok(())
@@ -541,11 +558,33 @@ mod tests {
             occurrences: 1,
             latest_detail_uri: Some(child_uri.to_string()),
             content: Some(rendered),
-            created_at: 1,
-            updated_at: 1,
+            created_at,
+            updated_at: created_at,
             delivered_at: None,
         };
         notice_from_wake(wake)
+    }
+
+    async fn delivered_at_for_test(db: &LocalDb, id: &str) -> Option<i64> {
+        let id = id.to_string();
+        db.read(|conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT delivered_at FROM suppressed_wakes WHERE id = ?1",
+                        params![id.as_str()],
+                    )
+                    .await?;
+                Ok(rows
+                    .next()
+                    .await?
+                    .expect("seeded notice should exist")
+                    .get::<Option<i64>>(0)?)
+            })
+        })
+        .await
+        .unwrap()
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -796,5 +835,106 @@ mod tests {
             1,
             "peek must not stamp delivered_at, so the notice is still claimable"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notice_past_the_horizon_stops_being_pending_without_being_stamped() {
+        let db = migrated_db().await;
+        let stale = insert_notice_at_for_test(
+            &db,
+            "parent-a",
+            "cairn://p/p/1/1/child",
+            "stale",
+            chrono::Utc::now().timestamp() - 24 * 60 * 60 - 60,
+        )
+        .await;
+
+        assert!(peek_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(claim_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(delivered_at_for_test(&db, &stale.id).await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn notice_inside_the_horizon_still_delivers() {
+        let db = migrated_db().await;
+        let recent = insert_notice_at_for_test(
+            &db,
+            "parent-a",
+            "cairn://p/p/1/1/child",
+            "recent",
+            chrono::Utc::now().timestamp() - 5 * 60,
+        )
+        .await;
+
+        let peeked = peek_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap();
+        assert_eq!(peeked.len(), 1);
+        assert_eq!(peeked[0].id, recent.id);
+
+        let claimed = claim_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, recent.id);
+        assert!(delivered_at_for_test(&db, &recent.id).await.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peek_and_claim_agree_across_a_mixed_age_fixture() {
+        let db = migrated_db().await;
+        let now = chrono::Utc::now().timestamp();
+        let stale = insert_notice_at_for_test(
+            &db,
+            "parent-a",
+            "cairn://p/p/1/1/stale",
+            "stale",
+            now - 24 * 60 * 60 - 1,
+        )
+        .await;
+        insert_notice_at_for_test(&db, "parent-a", "cairn://p/p/1/1/older", "older", now - 60)
+            .await;
+        insert_notice_at_for_test(&db, "parent-a", "cairn://p/p/1/1/newer", "newer", now - 30)
+            .await;
+
+        let peeked = peek_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap();
+        let claimed = claim_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap();
+        assert_eq!(
+            peeked.iter().map(|notice| &notice.id).collect::<Vec<_>>(),
+            claimed.iter().map(|notice| &notice.id).collect::<Vec<_>>()
+        );
+        assert_eq!(peeked.len(), 2);
+        assert_eq!(delivered_at_for_test(&db, &stale.id).await, None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn manual_dismiss_still_stamps_one_row() {
+        let db = migrated_db().await;
+        let dismissed =
+            insert_notice_for_test(&db, "parent-a", "cairn://p/p/1/1/first", "first").await;
+        let sibling =
+            insert_notice_for_test(&db, "parent-a", "cairn://p/p/1/1/second", "second").await;
+
+        stamp_delivered_by_id_async(&db, &dismissed.id)
+            .await
+            .unwrap();
+
+        assert!(delivered_at_for_test(&db, &dismissed.id).await.is_some());
+        assert_eq!(delivered_at_for_test(&db, &sibling.id).await, None);
+        let pending = peek_pending_side_channel_for_job_async(&db, "parent-a")
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, sibling.id);
     }
 }

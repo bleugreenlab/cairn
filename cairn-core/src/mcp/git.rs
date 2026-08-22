@@ -51,11 +51,8 @@ fn git_stdout(
 pub struct CommitResult {
     pub sha: String,
     pub(crate) pr_number: Option<i32>,
-    /// Set when a `^` amend was CONVERTED into a regular child commit because the
-    /// commit it would have rewritten is shared with a sibling bookmark. Carries a
-    /// human-readable note the barrier/commit report surfaces so the agent's `^`
-    /// intent visibly landed as a child commit instead of silently rewriting
-    /// shared history. `None` for every ordinary seal/amend.
+    /// Human-readable account of how a `^` amend landed: either the commit it
+    /// rewrote in place or why it was converted to a child commit.
     pub(crate) amend_note: Option<String>,
 }
 

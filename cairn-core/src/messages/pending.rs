@@ -174,6 +174,53 @@ mod tests {
         assert_eq!(items[0].kind, "checks");
     }
 
+    #[tokio::test]
+    async fn stale_pending_deliveries_do_not_survive_a_reboot() {
+        let db = crate::storage::migrated_test_db("pending-deliveries-reboot.db").await;
+        let path = db.path().to_path_buf();
+        let stale_created_at = chrono::Utc::now().timestamp() - 24 * 60 * 60 - 60;
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                               created_at, updated_at)
+              VALUES('i','p',1,'Issue','active','active','none',1,1);
+            INSERT INTO jobs(id, project_id, issue_id, status, created_at, updated_at)
+              VALUES('job-1','p','i','running',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO suppressed_wakes
+               (id, subscription_id, job_id, source_kind, source_ref, fact_kind,
+                occurrences, latest_detail_uri, content, created_at, updated_at, delivered_at)
+             VALUES ('stale', NULL, 'job-1', 'issue', 'cairn://p/proj/1', 'message',
+                     1, 'cairn://p/proj/1', 'old comment', ?1, ?1, NULL)",
+            [stale_created_at],
+        )
+        .await
+        .unwrap();
+        drop(db);
+
+        let reopened = LocalDb::open(path).await.unwrap();
+        let items = list_pending_deliveries(&reopened, "job-1").await.unwrap();
+
+        assert!(items.is_empty(), "{items:?}");
+        let delivered_at = reopened
+            .query_opt(
+                "SELECT delivered_at FROM suppressed_wakes WHERE id = 'stale'",
+                (),
+                |row| Ok(row.get::<Option<i64>>(0)?),
+            )
+            .await
+            .unwrap()
+            .flatten();
+        assert_eq!(delivered_at, None);
+    }
+
     #[test]
     fn source_parse_accepts_frontend_wire_values() {
         assert_eq!(

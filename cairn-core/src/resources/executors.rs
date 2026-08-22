@@ -30,8 +30,9 @@ use cairn_common::executor_protocol::{
 // fleet-visibility types on a separate line means two branches working on this
 // file do not collide on one line neither of them cares about.
 use cairn_common::executor_protocol::{
-    EnrolledRemote, ExecutorCapabilities, RemoteConnectionPhase, RemoteConnectionTransition,
-    RemoteLinkState,
+    BuildPrerequisiteStatus, CpuAdmissionHealth, CpuAdmissionState, EnrolledRemote,
+    ExecutorCapabilities, RemoteArtifactFault, RemoteAttachAttempt, RemoteConnectionPhase,
+    RemoteConnectionTransition, RemoteLinkState, CPU_ADMISSION_BLIND_AFTER_MS,
 };
 
 use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
@@ -81,8 +82,12 @@ pub(crate) fn render_attach_log(remote: &EnrolledRemote, captured_at_unix_ms: u6
         "- Attempted: {}\n",
         age(captured_at_unix_ms.saturating_sub(attempt.attempted_at_unix_ms))
     ));
-    if let Some(held) = attempt.held_for_ms {
-        out.push_str(&format!("- Link held: {}\n", duration_ms(held)));
+    // The same helper the summary line uses. `duration_ms` renders a decimal
+    // minute, so one uptime read as "7m" beside the machine and "7.0m" in its
+    // own log — two spellings of one quantity, which this test has been failing
+    // on. Uptime has one rendering.
+    if let Some(uptime) = attempt.held_for_ms {
+        out.push_str(&format!("- Link held: {}\n", held(uptime)));
     }
     out.push_str(&format!("- Cause: {}\n\n", attempt.summary));
     match &attempt.detail {
@@ -139,6 +144,7 @@ fn connection_phase_label(phase: RemoteConnectionPhase) -> &'static str {
         RemoteConnectionPhase::ProtocolReady => "protocol ready",
         RemoteConnectionPhase::ProtocolReadyTimedOut => "protocol Ready timed out",
         RemoteConnectionPhase::HeartbeatLost => "heartbeat lost",
+        RemoteConnectionPhase::TelemetryStalled => "telemetry stalled",
         RemoteConnectionPhase::Disconnected => "protocol disconnected",
         RemoteConnectionPhase::SshExited => "SSH carrier exited",
         RemoteConnectionPhase::RemoteProcessExited => "remote executor exited",
@@ -146,8 +152,16 @@ fn connection_phase_label(phase: RemoteConnectionPhase) -> &'static str {
     }
 }
 
-fn is_artifact_publish_wait(reason: &str) -> bool {
-    reason.starts_with("waiting for v") && reason.ends_with(" artifact publish")
+/// A machine waiting on a publication is not a machine with a problem, and the
+/// two get different registers below.
+///
+/// Read off the attempt's own fault rather than matched out of its summary. The
+/// old shape looked for `waiting for v… artifact publish`, which meant every
+/// improvement to that sentence silently reclassified the state, and a target
+/// with genuinely nothing published — which reported a bare mismatch — was
+/// painted as a fault needing a person.
+fn is_artifact_publish_wait(attempt: &RemoteAttachAttempt) -> bool {
+    attempt.artifact_fault == Some(RemoteArtifactFault::Unpublished)
 }
 
 /// Render the fleet collection: one line per machine, plus the toolchains and
@@ -209,7 +223,13 @@ pub(crate) fn render_executors(
             "- Toolchains: {}\n",
             toolchain_summary(capabilities)
         ));
+        if let Some(summary) = build_prerequisite_summary(capabilities) {
+            out.push_str(&format!("- Build prerequisites: {summary}\n"));
+        }
         out.push_str(&format!("- Link: {}\n", link_summary(executor)));
+        if executor.health.drain_mode {
+            out.push_str("- Draining: yes (refusing new work)\n");
+        }
         out.push_str(&format!(
             "- Running now: {} (queued {})\n",
             executor.occupancy.executing_requests.len(),
@@ -226,6 +246,9 @@ pub(crate) fn render_executors(
             out.push_str(&format!("### {}\n", remote.name));
             out.push_str(&format!("- Platform: {} / {}\n", remote.os, remote.arch));
             out.push_str(&format!("- Link: {}\n", enrolled_link_summary(remote)));
+            if remote.drained {
+                out.push_str("- Draining: yes (held by the runner)\n");
+            }
             out.push_str(&format!(
                 "- Last seen: {}\n",
                 last_seen(remote, captured_at_unix_ms)
@@ -320,6 +343,12 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
 
     out.push_str("## Link\n");
     out.push_str(&format!("- Status: {}\n", enrolled_link_summary(remote)));
+    // Draining is runner-side state, so it is one of the few things worth
+    // saying about a machine that is reporting nothing: it decides what happens
+    // when this one comes back.
+    if remote.drained {
+        out.push_str("- Draining: yes — held by the runner; when this machine attaches it will be told, and no new work is placed here until it is cleared\n");
+    }
     out.push_str(&format!(
         "- Last seen: {}\n",
         last_seen(remote, captured_at_unix_ms)
@@ -352,7 +381,7 @@ pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_m
             if remote
                 .last_attempt
                 .as_ref()
-                .is_some_and(|attempt| is_artifact_publish_wait(&attempt.summary)) =>
+                .is_some_and(is_artifact_publish_wait) =>
         {
             "This machine is enrolled and waiting for the runner's checksummed CLI sidecar release. Retries continue on a backoff and attachment resumes without intervention when publication completes.\n"
         }
@@ -386,8 +415,8 @@ fn enrolled_link_summary(remote: &EnrolledRemote) -> String {
         RemoteLinkState::Unreachable => summary
             .map(|summary| format!("unreachable — {summary}"))
             .unwrap_or_else(|| "unreachable — the host did not answer".to_string()),
-        RemoteLinkState::AttachFailed if summary.is_some_and(is_artifact_publish_wait) => {
-            summary.unwrap().to_string()
+        RemoteLinkState::AttachFailed if attempt.is_some_and(is_artifact_publish_wait) => {
+            summary.unwrap_or_default().to_string()
         }
         RemoteLinkState::AttachFailed => match attempt
             .and_then(|attempt| Some((attempt.held_for_ms?, attempt.summary.as_str())))
@@ -463,6 +492,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         list_or(&capabilities.toolchains, "none advertised")
     ));
     out.push_str(&render_toolchain_probes(capabilities));
+    out.push_str(&render_build_prerequisites(capabilities));
     out.push_str(&format!(
         "- Projects served: {}\n\n",
         list_or(&capabilities.projects_served, "every project")
@@ -492,6 +522,22 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             None => "not reported by this executor".to_string(),
         }
     ));
+    // A freeze the machine explains and one it does not are different facts,
+    // and the difference is why this link is still up: the runner stops reading
+    // an explained freeze as a dead transport, so this line is what keeps it
+    // from becoming invisible instead.
+    if let Some(blocked) = &health.advertisement.facts_stale_refresh_blocked {
+        out.push_str(&format!(
+            "- Telemetry blocked: the refresh pass has been {} for {} (pass began {} ago) — every number above stands still until it returns\n",
+            blocked.phase.label(),
+            age(executor
+                .captured_at_unix_ms
+                .saturating_sub(blocked.phase_entered_unix_ms)),
+            age(executor
+                .captured_at_unix_ms
+                .saturating_sub(blocked.pass_started_unix_ms)),
+        ));
+    }
     out.push_str(&format!(
         "- Connection generation: {}\n",
         health.connection_generation
@@ -503,7 +549,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str(&format!(
         "- Draining: {}\n",
         if health.drain_mode {
-            "yes (refusing new work)"
+            "yes — the runner refuses new work here and leaves resident work alone. It holds across reconnects and runner restarts until it is cleared"
         } else {
             "no"
         }
@@ -629,6 +675,14 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
         "- Accepted {} / rejected {} / timed out {}\n",
         admission.accepted_count, admission.rejected_count, admission.timed_out_count
     ));
+    // The measured-CPU brake is the only thing standing between a saturated
+    // machine and more work, so whether it can currently see is a fact the
+    // Admission section owes its reader. A machine that stopped measuring reads
+    // as idle everywhere else on this page.
+    out.push_str(&format!(
+        "- Measured CPU brake: {}\n",
+        cpu_brake_summary(&health.host.cpu_admission, executor.captured_at_unix_ms)
+    ));
     if health.queues.is_empty() {
         out.push_str("- Queues: empty\n");
     } else {
@@ -661,7 +715,7 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             .unwrap_or_default()
     ));
     out.push_str(&format!(
-        "- Command ownership: {} tracked, {} stale reaped, {} unverified{}\n\n",
+        "- Command ownership: {} tracked, {} stale reaped, {} unverified{}\n",
         health.command_processes.tracked_live_count,
         health.command_processes.reaped_stale_count,
         health.command_processes.unverified_count,
@@ -671,6 +725,37 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             .map(|value| format!(", oldest {}", age(value)))
             .unwrap_or_default()
     ));
+
+    // Only when there are any: an eviction is the one place the fleet destroys
+    // an owner's uncommitted work, and it should be legible here rather than
+    // only in the machine's log, which nobody reads until something is wrong.
+    if !health.evicted_cells.is_empty() {
+        out.push_str("\n## Environments evicted at adoption\n");
+        for evicted in &health.evicted_cells {
+            out.push_str(&format!(
+                "- {} ({}, {}): {}{}\n",
+                evicted.cell_id,
+                if evicted.holder.is_empty() {
+                    "no recorded holder"
+                } else {
+                    evicted.holder.as_str()
+                },
+                age(executor
+                    .captured_at_unix_ms
+                    .saturating_sub(evicted.evicted_at_unix_ms)),
+                evicted.reason,
+                // The worse condition, so it is never left implied: the machine
+                // came up without this cell but did not get rid of it, and every
+                // restart from here meets it again.
+                if evicted.retirement_failed {
+                    " — STILL ON DISK: retirement failed, so this repeats on every restart until an operator clears it"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+    out.push('\n');
 
     out.push_str("## Occupancy\n");
     let occupancy = &executor.occupancy;
@@ -901,6 +986,16 @@ fn render_placement_detail(out: &mut String, decision: &PlacementDecision) {
         }
         PlacementOutcome::Refused { diagnostic } => {
             out.push_str(&format!("  - Refused: {diagnostic}\n"));
+        }
+    }
+    if let Some(winner) = &decision.unpinned_winner {
+        out.push_str(&format!(
+            "  - Without the execution-home constraints: {} because {}\n",
+            winner.executor_name,
+            winner.reason.as_str()
+        ));
+        if let Some(prediction) = &winner.prediction {
+            render_prediction(out, "    Predicted", prediction);
         }
     }
     for rejection in &decision.rejected {
@@ -1216,6 +1311,37 @@ fn render_executor_memory(executor: &ExecutorInspection) -> String {
     out
 }
 
+/// What the executor's own CPU circuit breaker can currently see.
+///
+/// Blindness is judged against the clock here, not read off the reported state,
+/// for the same reason the executor judges it that way: the state only advances
+/// when the sampler runs, and a sampler that has stopped cannot report that it
+/// stopped.
+fn cpu_brake_summary(cpu: &CpuAdmissionHealth, captured_at_unix_ms: u64) -> String {
+    let Some(measured_at) = cpu.measured_at_unix_ms else {
+        return "never measured on this machine — the brake cannot engage".to_string();
+    };
+    let age_ms = captured_at_unix_ms.saturating_sub(measured_at);
+    if age_ms > CPU_ADMISSION_BLIND_AFTER_MS {
+        return format!(
+            "BLIND — last reading {}, past the {}s bound; non-interactive admission is held",
+            age(age_ms),
+            CPU_ADMISSION_BLIND_AFTER_MS / 1_000
+        );
+    }
+    let utilization = match cpu.utilization {
+        Some(value) => format!("{:.0}%", value * 100.0),
+        None => "unreported".to_string(),
+    };
+    match cpu.state {
+        CpuAdmissionState::Pressured => format!(
+            "pressured at {utilization} — holding new non-interactive work (measured {})",
+            age(age_ms)
+        ),
+        _ => format!("accepting at {utilization} (measured {})", age(age_ms)),
+    }
+}
+
 fn link_summary(executor: &ExecutorInspection) -> String {
     match executor.health.status {
         ExecutorHealthStatus::Online => "online".to_string(),
@@ -1311,6 +1437,81 @@ fn toolchain_summary(capabilities: &ExecutorCapabilities) -> String {
         detection.account,
         failures.join("; ")
     )
+}
+
+/// One machine's build-prerequisite verdict for the fleet listing, or nothing
+/// when the machine is equipped and there is no news.
+///
+/// A machine whose executor predates the check is reported rather than passed
+/// over in silence, because "nothing is wrong here" and "nobody asked" are
+/// exactly the pair this listing must not merge — the same rule the memory and
+/// CPU readings follow. Merging them is the whole defect: a Linux machine with
+/// no `libwebkit2gtk-4.1-dev` advertises `rust`, is placed on a lint lane, and
+/// returns an infrastructure exit that names nothing an operator can repair.
+fn build_prerequisite_summary(capabilities: &ExecutorCapabilities) -> Option<String> {
+    let Some(check) = &capabilities.build_prerequisites else {
+        return Some("not reported (this machine's executor predates the check)".to_string());
+    };
+    match check.status {
+        BuildPrerequisiteStatus::Satisfied => None,
+        BuildPrerequisiteStatus::Missing => Some(format!("MISSING — {}", one_line(&check.detail))),
+        BuildPrerequisiteStatus::Unchecked => {
+            Some(format!("not checked — {}", one_line(&check.detail)))
+        }
+    }
+}
+
+/// The machine's prerequisite verdict in full, in the script's own words.
+///
+/// The script's text is reproduced rather than summarized because the summary
+/// is precisely what makes the failure unactionable: `CAIRN_INFRASTRUCTURE_EXIT`
+/// says only that Cairn could not run the check, while the script names the
+/// host, the packages it could not find, and the command that installs them.
+///
+/// The verdict is stamped "at attach" because that is when it was taken and
+/// nothing refreshes it: a machine provisioned while it stays attached goes on
+/// reporting the old answer until it reattaches. Saying so is the difference
+/// between a known seam and a quiet lie.
+fn render_build_prerequisites(capabilities: &ExecutorCapabilities) -> String {
+    let Some(check) = &capabilities.build_prerequisites else {
+        return "- Build prerequisites: not reported by this executor\n".to_string();
+    };
+    let status = match check.status {
+        BuildPrerequisiteStatus::Satisfied => "satisfied",
+        BuildPrerequisiteStatus::Missing => "MISSING",
+        BuildPrerequisiteStatus::Unchecked => "could not be checked",
+    };
+    let source = if check.script.is_empty() {
+        "no script is declared for this platform".to_string()
+    } else {
+        format!("`{}`", check.script)
+    };
+    let mut out =
+        format!("- Build prerequisites: {status} — {source}, as of this machine's last attach\n");
+    for line in check
+        .detail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        out.push_str(&format!("  - {line}\n"));
+    }
+    out
+}
+
+/// Collapse a multi-line diagnostic onto the listing's single line.
+fn one_line(detail: &str) -> String {
+    let joined = detail
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" — ");
+    if joined.is_empty() {
+        "no detail reported".to_string()
+    } else {
+        joined
+    }
 }
 
 /// The full probe record for one machine: what ran, as whom, where the program
@@ -1487,10 +1688,11 @@ mod tests {
 
     use super::*;
     use cairn_common::executor_protocol::{
-        CpuPressure, ExecutorAdvertisement, ExecutorCapabilities, ExecutorHealthSnapshot,
-        ExecutorIdentity, ExecutorSubstrateReport, FleetSnapshot, MachineMemory, MachineVolume,
-        RemoteAttachAttempt, ResidentOccupancyEvidence, ResidentProcessHealth, ResourceReservation,
-        ToolchainDetection, ToolchainProbe,
+        BuildPrerequisiteCheck, CpuPressure, EvictedCellReport, ExecutorAdvertisement,
+        ExecutorCapabilities, ExecutorHealthSnapshot, ExecutorIdentity, ExecutorSubstrateReport,
+        FleetSnapshot, MachineMemory, MachineVolume, RemoteAttachAttempt,
+        ResidentOccupancyEvidence, ResidentProcessHealth, ResourceReservation, ToolchainDetection,
+        ToolchainProbe,
     };
 
     const CAPTURED_AT: u64 = 1_000_000;
@@ -1526,11 +1728,13 @@ mod tests {
                         memory_budget_bytes: None,
                         sandbox: None,
                         toolchain_detection: None,
+                        build_prerequisites: None,
                     },
                     current_load: 0,
                     warm_roots: Vec::new(),
                     observed_at_unix_ms: CAPTURED_AT - 4_000,
                     liveness_observed_at_unix_ms: Some(CAPTURED_AT - 5_000),
+                    facts_stale_refresh_blocked: None,
                 },
                 admission: ExecutorSubstrateReport::default().admission,
                 queues: Vec::new(),
@@ -1543,6 +1747,7 @@ mod tests {
                 drain_mode: false,
                 resident_processes: Default::default(),
                 command_processes: Default::default(),
+                evicted_cells: Vec::new(),
                 build_skew: None,
             },
             executor_build_id: Some("build-abc".into()),
@@ -1733,6 +1938,156 @@ mod tests {
         assert!(rendered.contains("- Toolchains: rust, bun\n"), "{rendered}");
     }
 
+    fn with_prerequisites(name: &str, check: Option<BuildPrerequisiteCheck>) -> ExecutorInspection {
+        let mut executor = inspection(name, false);
+        executor
+            .health
+            .advertisement
+            .capabilities
+            .build_prerequisites = check;
+        executor
+    }
+
+    /// The measurement this whole facility exists for, staged as it was found on
+    /// bglab-sp1: a machine that truthfully advertises `rust`, is eligible for
+    /// the Rust lanes, and dies in a `glib-sys` build script before compiling a
+    /// single first-party crate.
+    fn missing_webkit() -> BuildPrerequisiteCheck {
+        BuildPrerequisiteCheck {
+            script: "scripts/setup-self-hosted-runner-linux.sh --check".into(),
+            status: BuildPrerequisiteStatus::Missing,
+            detail: "Missing Linux self-hosted runner prerequisites on bglab-sp1: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev\nProvision bglab-sp1 once with: sudo scripts/setup-self-hosted-runner-linux.sh".into(),
+        }
+    }
+
+    /// A machine that cannot build has to be legible as that in the listing an
+    /// operator scans, naming the package and the command that repairs it — the
+    /// two things `CAIRN_INFRASTRUCTURE_EXIT` leaves them without.
+    #[test]
+    fn a_machine_that_cannot_build_says_so_beside_the_toolchain_it_advertises() {
+        let rendered = render_executors(
+            &[with_prerequisites("bglab-sp1", Some(missing_webkit()))],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(rendered.contains("- Toolchains: rust, bun\n"), "{rendered}");
+        assert!(
+            rendered.contains("- Build prerequisites: MISSING — Missing Linux self-hosted runner prerequisites on bglab-sp1: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev — Provision bglab-sp1 once with: sudo scripts/setup-self-hosted-runner-linux.sh\n"),
+            "{rendered}"
+        );
+    }
+
+    /// The machine's own page keeps the script's diagnostic intact, line by
+    /// line, and states when the verdict was taken — nothing refreshes it while
+    /// a machine stays attached, so a page that implied otherwise would lie.
+    #[test]
+    fn the_machine_page_reproduces_the_scripts_own_diagnostic() {
+        let rendered = render_executor(&with_prerequisites("bglab-sp1", Some(missing_webkit())));
+        assert!(
+            rendered.contains("- Build prerequisites: MISSING — `scripts/setup-self-hosted-runner-linux.sh --check`, as of this machine's last attach\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - Missing Linux self-hosted runner prerequisites on bglab-sp1: libwebkit2gtk-4.1-dev libayatana-appindicator3-dev\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  - Provision bglab-sp1 once with: sudo scripts/setup-self-hosted-runner-linux.sh\n"),
+            "{rendered}"
+        );
+    }
+
+    /// An equipped machine costs the listing nothing. The evidence stays on the
+    /// machine's page, the same division the toolchain probes already keep.
+    #[test]
+    fn an_equipped_machine_adds_no_line_to_the_listing() {
+        let satisfied = BuildPrerequisiteCheck {
+            script: "scripts/setup-self-hosted-runner-linux.sh --check".into(),
+            status: BuildPrerequisiteStatus::Satisfied,
+            detail: "Linux self-hosted runner prerequisites are installed on fedora.".into(),
+        };
+        let listed = render_executors(
+            &[with_prerequisites("fedora", Some(satisfied.clone()))],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(!listed.contains("Build prerequisites"), "{listed}");
+
+        let detailed = render_executor(&with_prerequisites("fedora", Some(satisfied)));
+        assert!(
+            detailed.contains("- Build prerequisites: satisfied — `scripts/setup-self-hosted-runner-linux.sh --check`, as of this machine's last attach\n"),
+            "{detailed}"
+        );
+        assert!(
+            detailed
+                .contains("  - Linux self-hosted runner prerequisites are installed on fedora.\n"),
+            "{detailed}"
+        );
+    }
+
+    /// The distinction the defect is made of. A machine nobody could ask must
+    /// never read like a machine that answered — in either direction: not as
+    /// equipped, which is what silence would imply, and not as missing packages
+    /// it was never asked about, which would send an operator to install things
+    /// that are already there.
+    #[test]
+    fn a_machine_that_was_never_asked_reads_as_neither_equipped_nor_missing() {
+        let listed = render_executors(
+            &[with_prerequisites("bglab-mac", None)],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(
+            listed.contains(
+                "- Build prerequisites: not reported (this machine's executor predates the check)\n"
+            ),
+            "{listed}"
+        );
+        assert!(!listed.contains("MISSING"), "{listed}");
+
+        let unchecked = BuildPrerequisiteCheck {
+            script: "scripts/setup-self-hosted-runner-windows.ps1 -Check".into(),
+            status: BuildPrerequisiteStatus::Unchecked,
+            detail: "could not run pwsh: program not found".into(),
+        };
+        let listed = render_executors(
+            &[with_prerequisites("bglab-win", Some(unchecked.clone()))],
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(
+            listed.contains(
+                "- Build prerequisites: not checked — could not run pwsh: program not found\n"
+            ),
+            "{listed}"
+        );
+        assert!(!listed.contains("MISSING"), "{listed}");
+
+        let detailed = render_executor(&with_prerequisites("bglab-mac", None));
+        assert!(
+            detailed.contains("- Build prerequisites: not reported by this executor\n"),
+            "{detailed}"
+        );
+
+        let detailed = render_executor(&with_prerequisites("bglab-win", Some(unchecked)));
+        assert!(
+            detailed.contains("- Build prerequisites: could not be checked — `scripts/setup-self-hosted-runner-windows.ps1 -Check`, as of this machine's last attach\n"),
+            "{detailed}"
+        );
+    }
+
     fn measured(executor: &mut ExecutorInspection) {
         executor.health.machine.cpu = Measurement::measured(
             CAPTURED_AT - 2_000,
@@ -1880,6 +2235,48 @@ mod tests {
         assert!(!rendered.contains(&u32::MAX.to_string()), "{rendered}");
     }
 
+    /// A machine that stopped measuring its own load reads as idle everywhere
+    /// else on this page — low utilisation, units free, queues empty — so the
+    /// one line that can contradict that has to be unmistakable.
+    #[test]
+    fn the_admission_section_says_when_the_cpu_brake_has_gone_blind() {
+        let mut executor = inspection("blind", false);
+        let went_quiet = executor.captured_at_unix_ms - CPU_ADMISSION_BLIND_AFTER_MS - 1;
+        executor.health.host.cpu_admission = CpuAdmissionHealth {
+            state: CpuAdmissionState::Accepting,
+            utilization: Some(0.99),
+            state_since_unix_ms: Some(went_quiet),
+            measured_at_unix_ms: Some(went_quiet),
+        };
+
+        let rendered = render_executor(&executor);
+
+        assert!(rendered.contains("Measured CPU brake: BLIND"), "{rendered}");
+        assert!(
+            !rendered.contains("accepting at 99%"),
+            "a frozen reading must not be presented as a current verdict: {rendered}"
+        );
+
+        // Never measured is a different fact and must not read as blindness.
+        executor.health.host.cpu_admission = CpuAdmissionHealth::default();
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("never measured on this machine"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("BLIND"), "{rendered}");
+
+        // And a fresh reading is reported as the verdict it is.
+        executor.health.host.cpu_admission = CpuAdmissionHealth {
+            state: CpuAdmissionState::Pressured,
+            utilization: Some(0.97),
+            state_since_unix_ms: Some(executor.captured_at_unix_ms),
+            measured_at_unix_ms: Some(executor.captured_at_unix_ms),
+        };
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("pressured at 97%"), "{rendered}");
+    }
+
     #[test]
     fn finite_concurrency_capacity_keeps_its_configured_value() {
         let mut executor = inspection("finite", false);
@@ -2010,7 +2407,27 @@ mod tests {
             )),
             last_seen_unix_ms: Some(REMOTE_CAPTURED_AT - 7_200_000),
             connection_timeline: Vec::new(),
+            drained: false,
         }
+    }
+
+    /// A machine that is not reporting still has one operational fact worth
+    /// stating: whether the runner is holding it drained. It decides what
+    /// happens the moment the machine comes back.
+    #[test]
+    fn a_detached_machine_states_the_drain_it_is_under() {
+        let mut remote = enrolled("bglab-sp1", RemoteLinkState::Unreachable);
+        assert!(
+            !render_enrolled_remote(&remote, REMOTE_CAPTURED_AT).contains("Draining"),
+            "a machine under no drain says nothing about one"
+        );
+        remote.drained = true;
+        let rendered = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(rendered.contains("Draining: yes"), "{rendered}");
+        assert!(
+            rendered.contains("when this machine attaches"),
+            "the drain has to say what it will do, not just that it exists: {rendered}"
+        );
     }
 
     fn enrolled_after(name: &str, link: RemoteLinkState, account: &str) -> EnrolledRemote {
@@ -2158,19 +2575,44 @@ mod tests {
 
     #[test]
     fn an_expected_artifact_publish_wait_uses_the_calm_register() {
+        let account =
+            "no aarch64-apple-darwin cairn-cmd artifact published for executor protocol v48";
         let mut waiting = enrolled("bglab-mac", RemoteLinkState::AttachFailed);
-        waiting.last_attempt = Some(RemoteAttachAttempt::bootstrap_failure(
-            REMOTE_CAPTURED_AT - 120_000,
-            "waiting for v48 artifact publish",
-        ));
+        waiting.last_attempt = Some(
+            RemoteAttachAttempt::bootstrap_failure(REMOTE_CAPTURED_AT - 120_000, account)
+                .with_artifact_fault(Some(RemoteArtifactFault::Unpublished)),
+        );
         let rendered = render_enrolled_remote(&waiting, REMOTE_CAPTURED_AT);
 
         assert!(
-            rendered.contains("Status: waiting for v48 artifact publish"),
+            rendered.contains(&format!("Status: {account}")),
             "{rendered}"
         );
         assert!(!rendered.contains("Status: attach failed"), "{rendered}");
         assert!(!rendered.contains("until the cause is fixed"), "{rendered}");
+    }
+
+    /// The calm register is earned by the FAULT, not by the wording. A machine
+    /// whose release is broken has a problem someone must fix, and it must not
+    /// inherit the reassuring text just because its message also mentions an
+    /// artifact — which is exactly what a substring rule could not distinguish.
+    #[test]
+    fn a_broken_release_is_not_painted_as_a_publication_wait() {
+        let account = "cairn-cmd artifact 0.12.32 for x86_64-unknown-linux-gnu size mismatch: manifest declares 11837192 bytes, found 11828496 bytes";
+        let mut broken = enrolled("bglab-ub", RemoteLinkState::AttachFailed);
+        broken.last_attempt = Some(
+            RemoteAttachAttempt::bootstrap_failure(REMOTE_CAPTURED_AT - 120_000, account)
+                .with_artifact_fault(Some(RemoteArtifactFault::Integrity)),
+        );
+        let rendered = render_enrolled_remote(&broken, REMOTE_CAPTURED_AT);
+
+        assert!(rendered.contains("until the cause is fixed"), "{rendered}");
+        assert!(
+            !rendered.contains("resumes without intervention"),
+            "{rendered}"
+        );
+        // The evidence a person needs survives into the rendered line.
+        assert!(rendered.contains("11828496"), "{rendered}");
     }
 
     /// Nothing on an unattached machine was measured, so nothing about its load
@@ -2277,6 +2719,33 @@ mod tests {
         );
     }
 
+    /// A freeze the machine explains has to be visible somewhere, or the
+    /// runner's decision not to bounce it becomes the same silence reached by a
+    /// different route.
+    #[test]
+    fn a_blocked_refresh_pass_names_its_phase_and_its_age() {
+        let mut executor = inspection("fedora", false);
+        executor.health.telemetry_stale = true;
+        executor.health.liveness_age_ms = Some(400_000);
+        executor.health.advertisement.facts_stale_refresh_blocked =
+            Some(cairn_common::executor_protocol::LivenessRefreshBlocked {
+                phase: cairn_common::executor_protocol::LivenessRefreshPhase::Snapshot,
+                pass_started_unix_ms: CAPTURED_AT - 400_000,
+                phase_entered_unix_ms: CAPTURED_AT - 400_000,
+            });
+
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("Status: online"), "{rendered}");
+        assert!(
+            rendered.contains("Telemetry blocked: the refresh pass has been reading pool state"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("stands still until it returns"),
+            "{rendered}"
+        );
+    }
+
     /// Nothing internal escapes into either representation: not the opaque
     /// executor or device identity, not a path on the machine's disk. An address
     /// an agent cannot discover is not an address, and one it must not know is
@@ -2306,6 +2775,49 @@ mod tests {
             assert!(!rendered.contains("credential"), "{rendered}");
         }
         assert!(render_executor(&executor).contains("Resident processes: 2"));
+    }
+
+    /// Eviction is the one moment the fleet destroys an owner's uncommitted
+    /// work. A machine's own log is not where the owner looks, so the loss is
+    /// named here: which environment, whose it was, and why it could not be
+    /// taken.
+    #[test]
+    fn an_evicted_environment_names_its_holder_and_the_reason() {
+        let mut executor = inspection("bglab-mac", false);
+        assert!(
+            !render_executor(&executor).contains("evicted"),
+            "a machine that evicted nothing says nothing"
+        );
+
+        executor.health.evicted_cells = vec![EvictedCellReport {
+            project_id: "cairn".into(),
+            cell_id: "slot-42".into(),
+            holder: "job:wedged".into(),
+            reason: "checkout stands on commit fc46de87, which this machine's object store cannot supply".into(),
+            evicted_at_unix_ms: CAPTURED_AT - 60_000,
+            retirement_failed: false,
+        }];
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("## Environments evicted at adoption"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "- slot-42 (job:wedged, 1m ago): checkout stands on commit fc46de87, which this machine's object store cannot supply"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("STILL ON DISK"), "{rendered}");
+
+        // A cell that was refused but would not retire is the worse of the two
+        // and must not read as the ordinary one.
+        executor.health.evicted_cells[0].retirement_failed = true;
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("STILL ON DISK: retirement failed"),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -2354,6 +2866,7 @@ mod tests {
             mobility: PlacementMobility::SpillEligible,
             selector: None,
             pinned_executor_id: None,
+            unpinned_winner: None,
             policy: None,
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 prediction: None,

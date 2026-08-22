@@ -154,18 +154,20 @@ async fn scope_project_path(
     }
 }
 
-/// Resolve a home-relative (`cairn:~/...`) change target to its canonical URI.
-/// The dispatch path resolves this itself, but blocking-append classification
-/// runs on the raw target BEFORE dispatch, so the write handler resolves up
-/// front to classify uniformly. A canonical or `file:` target is returned
-/// unchanged. Clients forward `cairn:~/` raw so the authenticated run remains
-/// the single live authority for its home.
-pub(crate) async fn resolve_change_target_uri(
-    orch: &Orchestrator,
-    request: &McpCallbackRequest,
-    target: &str,
-) -> Result<String, String> {
-    super::common::resolve_home_relative_resource_uri(&orch.db, request, target).await
+/// Whether a change target is written using either run-relative shorthand.
+pub(crate) fn is_home_relative_target(target: &str) -> bool {
+    super::common::home_relative_suffix(target).is_some()
+        || super::common::project_relative_suffix(target).is_some()
+}
+
+/// Join a home-relative change target onto an already-resolved home URI,
+/// returning `None` for a target that is not home-relative.
+///
+/// The write handler resolves its home once per batch and may have to move it
+/// mid-batch, so it needs the join without paying for — or being pinned to — the
+/// database lookup [`target_resource_for_request`] performs per item.
+pub(crate) fn resolve_change_target_against_home(home_uri: &str, target: &str) -> Option<String> {
+    super::common::resolve_home_relative_against(home_uri, target)
 }
 
 pub(super) async fn target_resource_for_request(

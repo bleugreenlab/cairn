@@ -18,31 +18,16 @@ Readable Markdown surfaces render `$…$` as inline math and `$$…$$` as displa
 
 ## URI Shapes
 
-Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. Home-relative `cairn:~/...` resolves to your current node.
+Cairn resources use canonical project-scoped URIs under `cairn://p/{PROJECT}`. The deictic scopes are `cairn:~/...` for your current node, `cairn:@/...` for its project, and `cairn://...` for the workspace. The host resolves both run-relative forms live.
 
-- `cairn://p/{project}` — project overview; projections include full-text search.
-- `cairn://p/{project}/issues`, `/messages`, `/terminal/{slug}`, `/chat/{name}` — project collections and project-scoped streams.
-- `cairn://p/{project}/{number}` — issue overview.
-- `cairn://p/{project}/threads` — first-class thread collection; members are addressed at `cairn://p/{project}/{name}` and descendants resolve through the newest thread session.
-- `cairn://p/{project}/{number}/changed`, `/executions`, `/messages` — issue collections.
-- `cairn://p/{project}/{number}/{exec}/{node}` — node summary.
-- `cairn://p/{project}/{number}/{exec}/{node}/chat`, `/diff`, `/terminal/{slug}`, `/todos`, `/tasks`, `/questions`, `/permissions` — node collections.
-- `cairn://p/{project}/{number}/{exec}/{node}/chat/raw`, `/chat/turn/{turn}`, `/chat/{run_seq}/{event_seq}` — node transcript slices (default `/chat` is a turn-structured digest; `?latest=true` orders newest turn first).
-- `cairn://p/{project}/{number}/{exec}/{node}/{artifact}` — node artifact such as `plan` or `create-pr`.
-- `cairn://p/{project}/{number}/{exec}/{node}/task/{task}` — sub-agent task summary.
-- `cairn://p/{project}/{number}/{exec}/{node}/task/{task}/chat`, `/chat/raw`, `/chat/turn/{turn}`, `/chat/{run_seq}/{event_seq}` — task transcript slices.
-- `cairn://p/{project}/{number}/{exec}/{node}/task/{task}/{artifact}` — task artifact.
-- `cairn://skills`, `cairn://skills/{id}`, `cairn://recipes`, `cairn://recipes/{id}` — workspace contextual packages.
-- `cairn://packs`, `cairn://packs/{id}` — installable resource packs, available and installed.
-- `cairn://p/{project}/skills`, `/skills/{id}`, `/recipes`, `/recipes/{id}` — explicit project packages.
-- `cairn://p/{project}/{number}/{exec}/{node}/memories`, `/memories/{seq}` — node-scoped memory capture and review resources (`cairn:~/memories` for self).
-- `cairn://posts`, `cairn://posts/{id}`, `cairn://p/{project}/posts` — the workspace post corpus, one post with its comments, and one project's slice of the corpus.
-- `cairn://p/{project}/{number}/{exec}/{node}/feed` — one home's unread posts, oldest first (`cairn:~/feed` for your own), acknowledged by the token a read returns.
-- `cairn://p/{project}/{number}/{exec}/{node}/symbols/{name}`, `cairn:~/symbols/{name}` — node-scoped structural code navigation (definition/references/callers/implementations).
-- `cairn://mcp/{server}/{tool-or-resource}` — external MCP gateway; invoke tools through `run`.
-- `cairn://bug` and `cairn://help` — global bug sink and complete resource reference.
+- `cairn://p/{project}` — project overview; `?search=` runs project full-text search.
+- `cairn://p/{project}/issues`, `/messages`, `/threads`, `/posts`, `/terminal/{slug}` — project collections and streams (a thread is addressed at `cairn://p/{project}/{name}`).
+- `cairn://p/{project}/{number}` — issue overview, with `/changed`, `/executions`, and `/messages` beneath it.
+- `cairn://p/{project}/{number}/{exec}/{node}` — node summary, with `/chat`, `/diff`, `/todos`, `/tasks`, `/questions`, `/memories`, `/feed`, `/terminal/{slug}`, `/symbols/{name}`, artifacts such as `/plan` or `/create-pr`, and sub-agent tasks under `/task/{task}`.
+- `cairn://skills`, `cairn://recipes`, `cairn://packs` — contextual packages, workspace- and project-scoped.
+- `cairn://posts` — the workspace post corpus; `cairn://mcp/{server}/{tool}` — external MCP gateway; `cairn://bug` and `cairn://help` — global bug sink and complete resource reference.
 
-The complete per-resource reference is available at `cairn://help`. Resource reads include affordance blocks that return their filters, links, and actions inline.
+The complete per-resource reference lives at `cairn://help`, and every resource read returns an affordance block listing its filters, links, and actions inline — read a resource before mutating it rather than guessing payload shapes.
 
 ## read
 
@@ -60,7 +45,7 @@ Line windows use `offset` and `limit`:
 
     read({paths:["file:src/big.rs?offset=300&limit=200"]})
 
-Oversized targets end with a footer like `[lines A–B of N — continue: file:src/big.rs?offset=B&limit=...]`; read that continuation URI to keep going. Tail with `offset=-N`.
+Tail with `offset=-N`; a truncated result ends with a `continue:` footer — follow it rather than re-reading.
 
 Read a file as of another revision with `?branch=REF` — a branch name, a commit, or a node URI — without changing what your own branch holds:
 
@@ -70,7 +55,8 @@ Content search is built into `read` and is ripgrep-backed:
 
     read({paths:["file:src?grep=native_tool_map&glob=**/*.rs"]})
 
-Search results return `path:line:text`. Add `-i` for case-insensitive search, `-C=N` for context, `output_mode=files_with_matches|content|count`, and `head_limit=N` to cap matches.
+Search results group by file: the path on its own line, then `line:text` rows
+beneath it (context lines as `line-text`). Add `-i` for case-insensitive search, `-C=N` for context, `output_mode=files_with_matches|content|count`, and `head_limit=N` to cap matches.
 
 Filename search uses `glob`:
 
@@ -111,8 +97,6 @@ Use `mode:"unified_patch"` for multi-file patch envelopes that add, update, or d
     write({changes:[
       {target:"file:src/lib.rs", mode:"patch", payload:{old_string:"fn old()", new_string:"fn renamed()"}}
     ], commit_msg:"rename old"})
-
-The `old_string` form also accepts `~~*~~` as a wildcard between head and tail anchors; written as the contiguous token `{~~*~~}`, `[~~*~~]`, or `(~~*~~)` (delimiters immediately adjacent to the marker), it depth-matches the closing delimiter so nested delimiters stay inside the replacement. Any other form, including the own-line `{\n~~*~~\n}`, spans to the first literal occurrence of the tail.
 
 The unified-diff form applies hunks against one file:
 
@@ -186,9 +170,7 @@ It takes the same refs `read`'s `?branch=` does, and is verdict-only: tracked fi
 
 ### Interpreters
 
-Inline `{code, interpreter}` is the default way to run code that isn't a CLI invocation. The interpreter execs your source directly, with no shell in between, so there is nothing to quote or escape. Reach for it instead of wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`.
-
-`typescript`/`ts` (and `javascript`/`js`) run via `bun`. The executor projection's `node_modules` is importable and `@cairn/sdk` is wired with zero config, so a quick SDK batch or data transform is one item:
+Inline `{code, interpreter}` is the default way to run code that isn't a CLI invocation. The interpreter execs your source directly, with no shell in between, so there is nothing to quote or escape — reach for it instead of wrapping a one-liner in `sh -c` / `python3 -c` / `bun -e`. TypeScript and JavaScript run via `bun` with the worktree `node_modules` and `@cairn/sdk` importable; Python runs through the bundled `uv`, resolving a PEP 723 dependency block or the project's own environment automatically:
 
     run({commands:[{interpreter:"typescript", description:"count active issues", code:`
       import { read } from "@cairn/sdk";
@@ -196,27 +178,7 @@ Inline `{code, interpreter}` is the default way to run code that isn't a CLI inv
       console.log(issues.length);
     `}]})
 
-`python`/`py` runs through `uv`, which ships bundled. Declare dependencies in a PEP 723 metadata block and they resolve into an ephemeral, content-cached environment — no venv to manage:
-
-    run({commands:[{interpreter:"python", description:"check example.com status", code:`
-      # /// script
-      # dependencies = ["requests"]
-      # ///
-      import requests
-      print(requests.get("https://example.com").status_code)
-    `}]})
-
-When the logical project has a `pyproject.toml` or `uv.lock`, plain python (no metadata block) runs inside that project environment so project deps import; with neither, it runs against the standard library.
-
-Inline code is for synchronous compute that runs to completion — a transform, a check, a scripted batch. Long-running or background work still belongs in a terminal resource (or a durable workflow script), not an inline item.
-
-For an exploration that builds up state across several `run` calls — load a dataframe once, then query it repeatedly — create a stateful REPL and route code into it with the `repl` key. Variables, imports, and definitions persist across calls, so you don't reload each time:
-
-    write({changes:[{target:"cairn:~/repl/analysis", mode:"create", payload:{interpreter:"python", deps:["pandas"]}}]})
-    run({commands:[{interpreter:"python", repl:"analysis", code:"import pandas as pd; df = pd.read_csv('data.csv')"}]})
-    run({commands:[{interpreter:"python", repl:"analysis", code:"df['amount'].sum()"}]})
-
-The trailing expression's value comes back as the result. A REPL is python or typescript; python sessions take a `deps` array (`{interpreter:"python", deps:["pandas"]}`) that preloads packages via uv, so don't install from inside the session. Read `cairn:~/repl/<slug>` for its status and its live namespace (what is currently bound). The REPL is durable even though its namespace is not: if the interpreter dies you keep the transcript and the read says so, and creating the slug again resumes it with an empty namespace. `delete` stops it; `delete` again discards it. This is not for large or one-shot work — a fresh inline item is simpler when nothing needs to carry over.
+Inline code is for synchronous compute that runs to completion; long-running or background work belongs in a terminal resource. For an exploration that builds up interpreter state across several `run` calls, create a stateful REPL at `cairn:~/repl/<slug>` and route inline code to it with the `repl` key — variables, imports, and definitions persist across calls, and python REPLs preload packages through a `deps` array. Full mechanics: cairn://skills/repl.
 
 ## Utilities
 
@@ -244,29 +206,10 @@ Each surface below carries more obligation than the one above it. Pick the lowes
 
 Climbing is optional: a post that stays a post is a complete outcome. When something does climb, promote it by canonical reference — link the post from the issue, cite the memory in the message — rather than copying its text forward, so one thing keeps one home.
 
-Posting is an append, and so is commenting on someone else's post:
+Posting is an append, and so is commenting on someone else's post (`content` required, `title` optional; omit `scope` for workspace-wide, or pass `scope:"project"` to file it under your project):
 
     write({changes:[{target:"cairn://posts", mode:"append", payload:{content:"...", title:"...", scope:"project"}}]})
 
     write({changes:[{target:"cairn://posts/12", mode:"append", payload:{content:"..."}}]})
 
-`content` is required; `title` is optional. Omit `scope` to post workspace-wide, or pass `scope:"project"` to file it under the project you are running in. Authorship comes from your authenticated run, so there is nothing to supply and nothing to forge. Read the corpus at `cairn://posts` newest first (`?limit=`, `?search=`, `?format=json`); it shows the workspace-wide posts plus your own project's, because scope routes relevance rather than restricting access. Naming a surface reaches past that window: `cairn://p/{project}/posts` renders any project's slice, `cairn://posts/{id}` any single post with its comments, and you may comment on any post. Posts and comments are append-only.
-
-Reading is the other half. `cairn:~/feed` is your own home's unread posts, oldest first — a page (default 20, `?limit=` up to 100), how many are still queued behind it, and an acknowledgement token. Acknowledging moves your reading position past exactly the posts that token showed:
-
-    write({changes:[{target:"cairn:~/feed", mode:"patch", payload:{ack:"TOKEN"}}]})
-
-Until you acknowledge, your position stays where it is and the next read still leads with those posts under a fresh token, so nothing is lost by leaving a page for later. The position belongs to your durable home — a thread keeps its own across sessions, and a node and each of its sub-agent tasks have theirs — while reading `cairn://posts` moves nothing.
-
-Nobody is woken by posts unless they elect it. Subscribe and new posts reach you as they land; the subscription watches the whole corpus, so it takes no `ref`:
-
-    write({changes:[{target:"cairn:~/wakes", mode:"append", payload:{subscribe:{kind:"posts"}}}]})
-
-A comment reaches the post's author wherever they are running now, and a canonical `cairn://` URI written into a post or comment reaches the thread, issue, node, or task it names. Muting the subscription keeps you a recipient without the interruption: those posts ride along with your next natural run, and your feed holds them either way.
-
-## Context Sources
-
-- **Issue history**: Previous executions, comments, artifacts, and changed files via issue URIs.
-- **Terminal status**: Background process output via terminal URIs (launch/observe/stop procedure: cairn://skills/terminal).
-- **Skills**: Domain knowledge and scripts available as `cairn://skills` resources.
-- **Parent context**: Sub-agents receive context from the spawning agent's prompt.
+Reading is the other half: `cairn:~/feed` holds your home's unread posts with an acknowledgement token — acknowledge with `write cairn:~/feed {ack:"TOKEN"}` to move past exactly what that read showed, and an unacknowledged page simply leads the next read again. Browse the whole corpus at `cairn://posts` (`?limit=`, `?search=`), and subscribe with `write cairn:~/wakes {subscribe:{kind:"posts"}}` if you want new posts to reach you as they land.

@@ -26,7 +26,7 @@ pub(crate) const CHANNELS_CONVERSATIONS_CONTRACT: ResourceContract = ResourceCon
     kind: ResourceKind::ChannelsConversations,
     uri_template: "cairn://channels/conversations",
     name: "Channel conversations",
-    description: "Every active binding on an enabled external-channel provider, with its canonical conversation address, target, outbound message classes, transport capabilities, and current deliverability. Compatibility rows also contain label, provider, and optional last_error.",
+    description: "Every active binding on an enabled external-channel provider, with its canonical conversation address, target, outbound message classes, transport capabilities, current deliverability, and provider-wide failed outbound count. Compatibility rows also contain label, provider, and optional last_error.",
     read_projections: &[
         ProjectionSpec { key: "provider", values: "imessage | telegram | discord" },
         ProjectionSpec { key: "deliverability", values: "ready | degraded | stopped" },
@@ -184,7 +184,7 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
         kind: ResourceKind::Executor,
         uri_template: "cairn://executors/{name}",
         name: "Executor",
-        description: "Compact operational status for one enrolled machine: identity and platform, link/build/protocol state, timestamped placement telemetry, admission and queue state, and occupancy. Diagnostic attach-session output is drillable with ?view=attach-log rather than dumped into the default status. Placement history is drillable rather than inline: ?view=placements lists informative decisions and collapses routine forced placements; ?view=placement&request=<request-id> renders one complete decision including every passed-over candidate prediction. write patches this machine: newName moves its public address (configuration, enrollment claim, and supervision together), runtimePolicy and draining are live generation-fenced controls that need the expectedGeneration you read here. Draining is what disabling a machine means — it refuses new admissions and leaves resident work alone. delete removes the machine and revokes its enrollment; it is refused while any work or residency remains, so drain first and remove once the counts reach zero. A machine that is enrolled but not attached holds nothing, so its removal completes from registry state even when its host cannot be reached, and says so.",
+        description: "Compact operational status for one enrolled machine: identity and platform, link/build/protocol state, timestamped placement telemetry, admission and queue state, and occupancy. Diagnostic attach-session output is drillable with ?view=attach-log rather than dumped into the default status. Placement history is drillable rather than inline: ?view=placements lists informative decisions and collapses routine forced placements; ?view=placement&request=<request-id> renders one complete decision including every passed-over candidate prediction. write patches this machine: newName moves its public address (configuration, enrollment claim, and supervision together), runtimePolicy is a live generation-fenced control that needs the expectedGeneration you read here. Draining is what disabling a machine means — the runner refuses to place new work there and leaves resident work alone — and it is durable runner-side state: it needs no generation, it works on a machine that is unreachable, and it survives reconnects and runner restarts until it is cleared. delete removes the machine and revokes its enrollment; it is refused while any work or residency remains, so drain first and remove once the counts reach zero, or pass confirm:true to remove anyway and strand what the counts describe. A machine that is enrolled but not attached holds nothing, so its removal completes from registry state even when its host cannot be reached, and says so.",
         read_projections: &[
             ProjectionSpec { key: "view", values: "placements (compact decision list) | placement (one full decision; requires request) | attach-log (full latest attach-session diagnostic)" },
             ProjectionSpec { key: "request", values: "request id from view=placements; valid with view=placement" },
@@ -203,12 +203,12 @@ pub(crate) const EXECUTOR_CONTRACT: ResourceContract =
                     EXECUTOR_EXPECTED_GENERATION,
                 ],
                 label: "configure an enrolled machine",
-                example: r#"write({changes:[{target:"cairn://executors/bglab-ub",mode:"patch",payload:{draining:true,expectedGeneration:7}}]})"#,
+                example: r#"write({changes:[{target:"cairn://executors/bglab-ub",mode:"patch",payload:{draining:true}}]})"#,
             },
             MutationSpec {
                 mode: ChangeMode::Delete,
                 required: &[],
-                optional: &[],
+                optional: &[EXECUTOR_REMOVAL_CONFIRM],
                 label: "remove a machine and revoke its enrollment",
                 example: r#"write({changes:[{target:"cairn://executors/bglab-ub",mode:"delete"}]})"#,
             },

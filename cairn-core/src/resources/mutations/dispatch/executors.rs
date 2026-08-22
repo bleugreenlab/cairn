@@ -117,12 +117,17 @@ pub(super) async fn dispatch(
             // or not the write would have had an effect.
             management::resolve_executor_reference(orch, name)
                 .map_err(|error| build_failure(index, item, error))?;
-            let fenced = request.runtime_policy.is_some() || request.draining.is_some();
-            if fenced && request.expected_generation.is_none() {
+            // Only the runtime policy is fenced. It is configuration applied to
+            // a running process, so it must not land on a replacement of the
+            // one the caller read. Draining is the runner's own refusal to
+            // place work and is deliberately not fenced: requiring a live
+            // generation for it made the control unusable at the only moment it
+            // matters, when the machine has stopped answering (CAIRN-4360).
+            if request.runtime_policy.is_some() && request.expected_generation.is_none() {
                 return Err(build_failure(
                     index,
                     item,
-                    "runtimePolicy and draining are live controls: send the expectedGeneration you read from cairn://executors/<name>, so an edit cannot land on a connection that has since been replaced",
+                    "runtimePolicy is a live control: send the expectedGeneration you read from cairn://executors/<name>, so an edit cannot land on a connection that has since been replaced",
                 ));
             }
             if dry_run {
@@ -188,19 +193,10 @@ pub(super) async fn dispatch(
                     applied.push("runtime policy applied".to_string());
                 }
                 if let Some(draining) = request.draining {
-                    management::set_drain_mode(
-                        orch,
-                        name,
-                        request.expected_generation.unwrap_or_default(),
-                        draining,
-                    )
-                    .await
-                    .map_err(|error| build_failure(index, item, error))?;
-                    applied.push(if draining {
-                        "draining: new work is refused, resident work is left alone".to_string()
-                    } else {
-                        "draining stopped; new work is admitted again".to_string()
-                    });
+                    let outcome = management::set_drain_mode(orch, name, draining)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                    applied.push(outcome.summary());
                 }
                 // Renaming last: it moves the address the other controls were
                 // just addressed by, so doing it first would strand them.
@@ -219,18 +215,29 @@ pub(super) async fn dispatch(
         (CairnResource::Executor { name }, ChangeMode::Delete) => {
             let executor_id = management::resolve_executor_reference(orch, name)
                 .map_err(|error| build_failure(index, item, error))?;
+            let acknowledged = item
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("confirm"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             if dry_run {
-                let occupancy = management::occupancy(orch, &executor_id);
-                if occupancy.is_empty() {
+                let reading = management::occupancy(orch, &executor_id);
+                if reading.is_empty() || acknowledged {
                     format!("Would remove {name} and revoke its enrollment")
                 } else {
                     format!(
-                        "Would refuse to remove {name}: it still has {}",
-                        occupancy.summary()
+                        "Would refuse to remove {name}: it still has {}{}",
+                        reading.summary(),
+                        if reading.is_current() {
+                            ""
+                        } else {
+                            " as of the last time it reported"
+                        }
                     )
                 }
             } else {
-                let result = management::remove(orch, name)
+                let result = management::remove(orch, name, acknowledged)
                     .await
                     .map_err(|error| build_failure(index, item, error))?;
                 if result.config.is_none() {

@@ -1,0 +1,13 @@
+data: {"id":"chatcmpl-1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"chatcmpl-1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"reasoning":"The user asked for a "}}]}
+
+data: {"id":"chatcmpl-1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"reasoning":"greeting, so I will greet them."}}]}
+
+data: {"id":"chatcmpl-1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+
+data: {"id":"chatcmpl-1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"content":", world."}}]}
+
+data: {"id":"chatcmpl-1","model":"qwen3.8-27b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":31,"completion_tokens":9}}
+
+data: [DONE]

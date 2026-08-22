@@ -700,7 +700,9 @@ fn build_messaging_context(
                     let recent = recent_messages_for_run(
                         conn,
                         &project_key,
-                        issue_key.as_deref(),
+                        issue_key
+                            .as_deref()
+                            .map_or(ChannelScope::ProjectOnly, ChannelScope::Issue),
                         job_id.as_deref(),
                         cursor,
                         20,
@@ -900,17 +902,37 @@ async fn find_peer_agents(
     Ok(peers)
 }
 
+/// Which channel a run's messages come from, keyed by the job's OWNER.
+///
+/// One job is never both: `thread_id` is set only by inheritance from a
+/// delegating parent, and a thread's children are linked by
+/// `issues.parent_thread_id` while their own jobs carry `issue_id` with
+/// `thread_id` NULL. Modelling that as a pair of `Option`s let a caller pass
+/// both and silently receive whichever arm the query tested first — and let a
+/// thread job pass neither and read only the project channel, which is the
+/// silence this sweep exists to remove.
+enum ChannelScope<'a> {
+    /// The owner could not be resolved, so only the project channel is in scope.
+    ProjectOnly,
+    Issue(&'a str),
+    Thread(&'a str),
+}
+
 async fn recent_messages_for_run(
     conn: &cairn_db::turso::Connection,
     project_key: &str,
-    issue_key: Option<&str>,
+    scope: ChannelScope<'_>,
     exclude_job_id: Option<&str>,
     cursor: Option<i64>,
     limit: i64,
     include_system: bool,
 ) -> DbResult<Vec<PromptMessage>> {
     let include_system = if include_system { 1_i64 } else { 0_i64 };
-    let mut rows = if let Some(issue_key) = issue_key {
+    let thread_id = match scope {
+        ChannelScope::Thread(thread_id) => Some(thread_id),
+        _ => None,
+    };
+    let mut rows = if let ChannelScope::Issue(issue_key) = scope {
         conn.query(
             "SELECT rowid, sender_name, content, created_at
              FROM messages
@@ -943,12 +965,19 @@ async fn recent_messages_for_run(
                     OR ?1 IS NULL
                     OR sender_run_id NOT IN (SELECT id FROM runs WHERE job_id = ?1))
                AND (?5 = 1 OR sender_name != 'system')
-               AND channel_type = 'project'
-               AND channel_id = ?2
+               AND ((channel_type = 'project' AND channel_id = ?2)
+                    OR (channel_type = 'thread' AND channel_id = ?6))
                AND (?4 IS NULL OR rowid > ?4)
              ORDER BY rowid DESC
              LIMIT ?3",
-            params![exclude_job_id, project_key, limit, cursor, include_system],
+            params![
+                exclude_job_id,
+                project_key,
+                limit,
+                cursor,
+                include_system,
+                thread_id
+            ],
         )
         .await?
     };
@@ -981,10 +1010,10 @@ pub(crate) async fn pending_channel_messages_for_job(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT p.key, i.id, i.number, j.current_session_id
+                    "SELECT p.key, i.number, j.current_session_id, j.thread_id
                      FROM jobs j
-                     JOIN issues i ON i.id = j.issue_id
-                     JOIN projects p ON p.id = i.project_id
+                     LEFT JOIN issues i ON i.id = j.issue_id
+                     JOIN projects p ON p.id = COALESCE(i.project_id, j.project_id)
                      WHERE j.id = ?1
                      LIMIT 1",
                     params![job_id.as_str()],
@@ -994,17 +1023,25 @@ pub(crate) async fn pending_channel_messages_for_job(
                 return Ok(Vec::new());
             };
             let project_key = row.text(0)?;
-            let issue_number = row.i64(2)?;
-            let session_id = row.opt_text(3)?;
+            let issue_number = row.opt_i64(1)?;
+            let session_id = row.opt_text(2)?;
+            let thread_id = row.opt_text(3)?;
             let Some(session_id) = session_id else {
                 return Ok(Vec::new());
             };
-            let issue_key = format!("{project_key}/{issue_number}");
+            let issue_key = issue_number.map(|number| format!("{project_key}/{number}"));
             let cursor = read_channel_cursor(conn, &session_id).await?;
+            // Owner-keyed, not null-inferred: an issue job reads its issue
+            // channel, a thread job its thread channel.
+            let scope = match (issue_key.as_deref(), thread_id.as_deref()) {
+                (Some(issue_key), _) => ChannelScope::Issue(issue_key),
+                (None, Some(thread_id)) => ChannelScope::Thread(thread_id),
+                (None, None) => ChannelScope::ProjectOnly,
+            };
             recent_messages_for_run(
                 conn,
                 &project_key,
-                Some(&issue_key),
+                scope,
                 Some(&job_id),
                 cursor,
                 limit,
@@ -1544,38 +1581,22 @@ pub fn start_agent_session(
         by_id.into_values().collect::<Vec<_>>()
     };
 
-    let agents_json = {
-        let mut agent_infos: Vec<serde_json::Value> = selected_file_agents
-            .iter()
-            .map(|agent| serde_json::json!({"name": agent.name, "description": agent.description}))
-            .collect();
-        agent_infos.sort_by(|a, b| {
-            let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            a_name.cmp(b_name)
-        });
-        (!agent_infos.is_empty())
-            .then(|| serde_json::to_string(&agent_infos).ok())
-            .flatten()
-    };
     let mut event = crate::resume_timing::ResumeTimingEvent::new("contextual_packages_ready")
         .elapsed(contextual_ready);
     event.run_id = Some(run_id);
     event.session_id = Some(&session_id_for_timing);
     event.count = Some(selected_file_agents.len());
-    event.bytes = Some(agents_json.as_ref().map_or(0, String::len));
     event.emit();
 
     // Build the MCP config inline (passed per-run to the backend, never written
     // to a shared file) so concurrent sessions can't clobber each other's
-    // `CAIRN_HOME_URI` / `--agents` payload.
+    // `CAIRN_HOME_URI`.
     let cairn_home = cairn_common::paths::cairn_home();
     let cairn_home_str = cairn_home.to_string_lossy();
     let log_level = crate::config::settings::load_log_level(&orch.config_dir);
     let mcp_config_json = crate::config::mcp_setup::build_mcp_config_string(
         &orch.mcp_binary_path,
         orch.mcp_callback_port,
-        agents_json.as_deref(),
         Some(home_uri.as_str()),
         cairn_common::paths::env_str(),
         Some(cairn_home_str.as_ref()),
@@ -3116,7 +3137,7 @@ mod tests {
                 recent_messages_for_run(
                     conn,
                     "proj",
-                    Some(&issue_key),
+                    ChannelScope::Issue(&issue_key),
                     exclude_job_id.as_deref(),
                     cursor,
                     20,
@@ -3224,6 +3245,50 @@ mod tests {
         let next = fetch_recent(&db, "proj/1", Some("j"), cursor).await;
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].content, "same-second later");
+    }
+
+    #[tokio::test]
+    async fn pending_channel_messages_include_thread_messages_for_thread_jobs() {
+        let db = migrated_db().await;
+        let fixture = crate::test_support::seed_thread_session(&db).await;
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+             VALUES('thread-session', 'thread-session-job', 'claude', 'open', 1, 1, 1);
+             UPDATE jobs SET current_session_id='thread-session'
+              WHERE id='thread-session-job';",
+        )
+        .await
+        .unwrap();
+        insert_msg(
+            &db,
+            "thread-system",
+            "thread",
+            fixture.thread_id,
+            None,
+            "system",
+            "task finished",
+            1000,
+        )
+        .await;
+        insert_msg(
+            &db,
+            "thread-agent",
+            "thread",
+            fixture.thread_id,
+            None,
+            "builder",
+            "thread-scoped handoff",
+            2000,
+        )
+        .await;
+
+        let pending = pending_channel_messages_for_job(&db, fixture.session_job_id, 20)
+            .await
+            .unwrap();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sender_name, "builder");
+        assert_eq!(pending[0].content, "thread-scoped handoff");
     }
 
     #[tokio::test]

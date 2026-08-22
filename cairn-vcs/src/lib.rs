@@ -421,7 +421,6 @@ async fn publish_logical_head_inner(
 
     let mut amend_note = None;
     let mut tx = repo.start_transaction();
-    let mut rewrote_head = false;
     let published = match mode {
         // Both signatures come from `settings` (jj's commit builder stamps the
         // author and committer of a new commit from the same identity), so no
@@ -442,39 +441,27 @@ async fn publish_logical_head_inner(
                 })
                 .map(|(name, _)| name.as_str().to_string())
                 .collect::<Vec<_>>();
-            if foreign.is_empty() {
-                rewrote_head = true;
-                tx.repo_mut()
-                    .rewrite_commit(&head)
-                    .set_tree(tree.clone())
-                    .write()
-                    .await
-                    .map_err(|error| format!("rewrite logical-head commit: {error}"))?
+            let description = if head.description().trim().is_empty() {
+                "amend".to_string()
             } else {
-                let description = if head.description().trim().is_empty() {
-                    "amend".to_string()
-                } else {
-                    head.description().to_string()
-                };
-                amend_note = Some(format!(
+                head.description().to_string()
+            };
+            amend_note = Some(if foreign.is_empty() {
+                "amend converted to a new commit because managed branch history is never rewritten in place".to_string()
+            } else {
+                format!(
                     "amend converted to a new commit: the previous commit is shared with {}",
                     foreign.join(", ")
-                ));
-                tx.repo_mut()
-                    .new_commit(vec![expected_id.clone()], tree)
-                    .set_description(description)
-                    .write()
-                    .await
-                    .map_err(|error| format!("write guarded logical-head amend: {error}"))?
-            }
+                )
+            });
+            tx.repo_mut()
+                .new_commit(vec![expected_id.clone()], tree)
+                .set_description(description)
+                .write()
+                .await
+                .map_err(|error| format!("write guarded logical-head amend: {error}"))?
         }
     };
-    if rewrote_head {
-        tx.repo_mut()
-            .rebase_descendants()
-            .await
-            .map_err(|error| format!("rebase logical-head descendants after amend: {error}"))?;
-    }
     tx.repo_mut()
         .set_local_bookmark_target(bookmark_name, RefTarget::normal(published.id().clone()));
     tx.commit(format!("publish logical head `{bookmark}`"))
@@ -493,9 +480,9 @@ pub enum PublicationMode {
     Child {
         description: String,
     },
-    /// Rewrite the bookmark's own commit in place. jj preserves a rewritten
-    /// commit's author and re-stamps only its committer, so the identity still
-    /// has to be supplied for this mode.
+    /// Apply amend content as a child commit carrying the previous description.
+    /// Managed branch history is never rewritten in place because the repository
+    /// view used to detect sharing may be stale.
     Amend,
 }
 
@@ -845,6 +832,10 @@ mod tests {
         // empty committer is rendered as `JJ_EMPTY_STRING` on git export and
         // refused outright by `jj git push` ("no author and/or committer set"),
         // making the whole branch unpushable.
+        // `child-seed` is a separate ref created only to prove publication does
+        // not rewrite unrelated descendants. Production callers publish one
+        // complete proposed tree against the bookmark's exact expected head and
+        // do not stack commits that depend on descendant rebasing.
         assert_eq!(
             command(
                 "git",
@@ -1303,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_head_amend_preserves_change_id_and_foreign_guard_creates_child() {
+    fn logical_head_amend_always_creates_child_and_preserves_shared_history() {
         let (dir, expected, _, _) = fixture();
         let delta = delta_commit(dir.path(), &expected, "amended\n");
         let child_before = delta_commit(dir.path(), &expected, "stacked child\n");
@@ -1319,17 +1310,6 @@ mod tests {
         );
         import_git_refs(dir.path());
         let expected_change = bookmark_change_id(dir.path(), "feature");
-        let head_author = command(
-            "git",
-            &[
-                "-C",
-                dir.path().to_str().unwrap(),
-                "show",
-                "-s",
-                "--format=%an|%ae",
-                &expected,
-            ],
-        );
         let amended = publish_logical_head(
             dir.path(),
             "feature",
@@ -1342,10 +1322,13 @@ mod tests {
             PublicationMode::Amend,
         )
         .unwrap();
-        assert_eq!(amended.change_id, expected_change);
-        // A rewrite keeps the original author and re-stamps only the committer,
-        // so the amend path needs the identity just as much as a child commit
-        // does — without it the committer is empty and the branch stops pushing.
+        assert_ne!(amended.change_id, expected_change);
+        assert_eq!(
+            amended.amend_note.as_deref(),
+            Some(
+                "amend converted to a new commit because managed branch history is never rewritten in place"
+            )
+        );
         assert_eq!(
             command(
                 "git",
@@ -1358,25 +1341,16 @@ mod tests {
                     &amended.head,
                 ],
             ),
-            format!("{head_author}|Amend Committer|amend@cairn.local")
+            "Amend Committer|amend@cairn.local|Amend Committer|amend@cairn.local"
         );
+        // Child commits still require the supplied identity for both signatures;
+        // without it the committer is empty and the branch cannot be pushed.
         let child_after = runtime()
             .block_on(resolve_coordinate(dir.path(), "child-seed"))
             .unwrap();
-        assert_ne!(child_after, child_before);
         assert_eq!(
-            command(
-                "git",
-                &[
-                    "-C",
-                    dir.path().to_str().unwrap(),
-                    "show",
-                    "-s",
-                    "--format=%P",
-                    &child_after,
-                ],
-            ),
-            amended.head
+            child_after, child_before,
+            "no descendant history was rewritten"
         );
         let guarded_delta = delta_commit(dir.path(), &amended.head, "guarded\n");
         set_bookmark(dir.path(), "sibling", &amended.head);
@@ -1393,8 +1367,7 @@ mod tests {
         )
         .unwrap();
         assert_ne!(guarded.change_id, amended.change_id);
-        // The foreign-bookmark guard writes a CHILD instead of rewriting, a
-        // third commit-writing path that must also be signed.
+        // The shared-target child path must also carry the publication identity.
         assert_eq!(
             command(
                 "git",

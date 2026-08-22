@@ -1,0 +1,7 @@
+data: {"id":"chatcmpl-3","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"id":"chatcmpl-3","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"reasoning":"Let me work through this carefully. First I need to"}}]}
+
+data: {"id":"chatcmpl-3","model":"qwen3.8-27b","choices":[{"index":0,"delta":{"content":null},"finish_reason":"length"}],"usage":{"prompt_tokens":31,"completion_tokens":64}}
+
+data: [DONE]

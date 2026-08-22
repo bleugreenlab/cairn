@@ -63,28 +63,17 @@ pub struct GrepLine {
     pub text: String,
 }
 
-/// Render collected grep lines into the output contract for `output_mode`.
-/// This is the single definition of ripgrep parity:
+/// Put collected grep lines in render order and collapse duplicate coordinates:
+/// ordered by path, then line number, with a match kept over a context line at
+/// the same coordinate (a line that is both a match and another match's context
+/// renders as the match).
 ///
-/// - each `(path, line_number)` coordinate appears exactly once, and a line
-///   that is both a match and some other match's context renders as the match.
-///   Overlapping context windows therefore cannot double-print;
-/// - lines are ordered by path, then line number, so merged results from more
-///   than one source come out correctly ordered by construction;
-/// - `--` separates context groups when context was requested, both across a
-///   line-number gap within a file and at a file boundary;
-/// - `files_with_matches` projects to unique matching paths and `count` to
-///   `path:count`.
-///
-/// `native_output` selects ripgrep's own `path-N-text` context form over
-/// Cairn's `path:N-text`.
-pub fn render_grep_lines(
-    mut lines: Vec<GrepLine>,
-    output_mode: &str,
-    show_line_numbers: bool,
-    native_output: bool,
-    context_requested: bool,
-) -> String {
+/// [`render_grep_lines`] applies this itself, and it is idempotent. It is public
+/// because a caller that windows lines BEFORE rendering — a `head_limit` that
+/// caps matches — has to select over the same order and the same deduplication
+/// the reader will see, and that ordering needs one definition rather than two
+/// that agree by inspection.
+pub fn order_grep_lines(lines: &mut Vec<GrepLine>) {
     lines.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
@@ -96,6 +85,38 @@ pub fn render_grep_lines(
     lines.dedup_by(|later, earlier| {
         later.path == earlier.path && later.line_number == earlier.line_number
     });
+}
+
+/// Render collected grep lines into the output contract for `output_mode`.
+/// This is the single definition of ripgrep parity:
+///
+/// - each `(path, line_number)` coordinate appears exactly once, and a line
+///   that is both a match and some other match's context renders as the match.
+///   Overlapping context windows therefore cannot double-print;
+/// - lines are ordered by path, then line number, so merged results from more
+///   than one source come out correctly ordered by construction;
+/// - a body with a path dimension is laid out the way ripgrep's `--heading`
+///   renders: each path appears once as a heading above its file's rows, every
+///   row beneath it is `N:text` (match) / `N-text` (context), and a blank line
+///   opens each new file group. A path-less body (a materialized in-memory
+///   read) has no heading and renders bare rows;
+/// - `--` separates context groups within a file across a line-number gap when
+///   context was requested; a file boundary is marked by the blank line and the
+///   next heading instead, so a gap and a file change never look alike;
+/// - `files_with_matches` projects to unique matching paths and `count` to
+///   `path:count`.
+///
+/// `native_output` renders the way piped ripgrep does instead — every row
+/// carrying its own path prefix, context as `path-N-text` — because that body
+/// is handed back as ripgrep's own output to a translated shell search.
+pub fn render_grep_lines(
+    mut lines: Vec<GrepLine>,
+    output_mode: &str,
+    show_line_numbers: bool,
+    native_output: bool,
+    context_requested: bool,
+) -> String {
+    order_grep_lines(&mut lines);
 
     match output_mode {
         "files_with_matches" => {
@@ -123,10 +144,25 @@ pub fn render_grep_lines(
         }
         // "content" and any already-validated mode fall here.
         _ => {
-            let mut rendered: Vec<String> = Vec::with_capacity(lines.len());
+            // The path is a heading over its file's rows rather than a prefix
+            // on each one: with context requested a long path was repeated on
+            // every line of every window, and after its first appearance in a
+            // group it carries no information. `native_output` is the one
+            // caller that must stay byte-identical to piped ripgrep, so it
+            // keeps the per-row prefix.
+            let heading_style = !native_output;
+            let mut rendered: Vec<String> = Vec::with_capacity(lines.len() + 2);
             let mut previous: Option<(&str, u64)> = None;
             for line in &lines {
-                if context_requested
+                let headed = heading_style && !line.path.is_empty();
+                if headed && previous.is_none_or(|(path, _)| path != line.path) {
+                    // A blank line before every heading but the first keeps a
+                    // heading from reading as a row of the group above it.
+                    if !rendered.is_empty() {
+                        rendered.push(String::new());
+                    }
+                    rendered.push(line.path.clone());
+                } else if context_requested
                     && previous.is_some_and(|(path, number)| {
                         path != line.path || line.line_number > number + 1
                     })
@@ -135,7 +171,7 @@ pub fn render_grep_lines(
                 }
                 let separator = if line.is_match { ':' } else { '-' };
                 rendered.push(format_grep_line(
-                    &line.path,
+                    if headed { "" } else { line.path.as_str() },
                     show_line_numbers.then_some(line.line_number),
                     separator,
                     &line.text,
@@ -148,11 +184,13 @@ pub fn render_grep_lines(
     }
 }
 
-/// Format one grep content line. With a non-empty `relative` label this is the
-/// directory/single-file form `path:N:text` (match) / `path:N-text` (context);
-/// with an empty label the path prefix is dropped entirely, yielding `N:text` /
-/// `N-text`. `native_output` swaps the context form for ripgrep's own
-/// `path-N-text`. Every form collapses to bare `text` when line numbers are off.
+/// Format one grep content row. An empty `relative` label drops the path prefix
+/// entirely, yielding `N:text` / `N-text` — the form every row takes under a
+/// heading, and the form a path-less in-memory body takes throughout. A
+/// non-empty label prefixes the row (`path:N:text` / `path:N-text`), which is
+/// what `native_output` needs; `native_output` further swaps the context form
+/// for ripgrep's own `path-N-text`. Every form collapses to bare `text` when
+/// line numbers are off.
 fn format_grep_line(
     relative: &str,
     line_number: Option<u64>,
@@ -208,8 +246,7 @@ mod tests {
         ];
         assert_eq!(
             render_grep_lines(lines, "content", true, false, true),
-            "a.rs:1-one\na.rs:2-two\na.rs:3:MATCH\na.rs:4-four\na.rs:5-five\n\
-             a.rs:6:MATCH\na.rs:7-seven\na.rs:8-eight"
+            "a.rs\n1-one\n2-two\n3:MATCH\n4-four\n5-five\n6:MATCH\n7-seven\n8-eight"
         );
     }
 
@@ -225,41 +262,50 @@ mod tests {
         ];
         assert_eq!(
             render_grep_lines(lines, "content", true, false, true),
-            "a.rs:1:MATCH one\na.rs:2:MATCH two"
+            "a.rs\n1:MATCH one\n2:MATCH two"
         );
     }
 
     #[test]
-    fn separators_mark_line_gaps_and_file_boundaries() {
+    fn a_path_appears_once_per_file_group_with_gaps_separated_inside_it() {
         let lines = vec![
             line("a.rs", 5, true, "first"),
             line("a.rs", 6, false, "adjacent"),
-            // Gap: 6 -> 20 needs a separator.
+            // Gap: 6 -> 20 is a `--` separator WITHIN the file.
             line("a.rs", 20, true, "second"),
-            // File boundary needs one too.
+            // A file boundary is the blank line and the next heading instead.
             line("b.rs", 1, true, "third"),
         ];
         assert_eq!(
             render_grep_lines(lines.clone(), "content", true, false, true),
-            "a.rs:5:first\na.rs:6-adjacent\n--\na.rs:20:second\n--\nb.rs:1:third"
+            "a.rs\n5:first\n6-adjacent\n--\n20:second\n\nb.rs\n1:third"
         );
-        // Without a context request there are no groups to separate.
+        // Without a context request there are no groups to separate, but the
+        // file grouping (and so the heading) is unchanged.
         assert_eq!(
             render_grep_lines(lines, "content", true, false, false),
-            "a.rs:5:first\na.rs:6-adjacent\na.rs:20:second\nb.rs:1:third"
+            "a.rs\n5:first\n6-adjacent\n20:second\n\nb.rs\n1:third"
         );
     }
 
     #[test]
-    fn native_output_uses_ripgrep_context_separators() {
+    fn native_output_keeps_ripgrep_path_prefixes_and_separators() {
+        // A translated shell search hands this body back as ripgrep's own, so
+        // it stays in piped-rg form: no headings, a path on every row, and `--`
+        // at the file boundary.
+        let lines = vec![
+            line("src/a.txt", 3, false, "before"),
+            line("src/a.txt", 4, true, "match"),
+            line("src/b.txt", 1, true, "other"),
+        ];
+        assert_eq!(
+            render_grep_lines(lines.clone(), "content", true, true, true),
+            "src/a.txt-3-before\nsrc/a.txt:4:match\n--\nsrc/b.txt:1:other"
+        );
         let lines = vec![
             line("src/a.txt", 3, false, "before"),
             line("src/a.txt", 4, true, "match"),
         ];
-        assert_eq!(
-            render_grep_lines(lines.clone(), "content", true, true, true),
-            "src/a.txt-3-before\nsrc/a.txt:4:match"
-        );
         assert_eq!(
             render_grep_lines(lines, "content", false, true, true),
             "src/a.txt-before\nsrc/a.txt:match"

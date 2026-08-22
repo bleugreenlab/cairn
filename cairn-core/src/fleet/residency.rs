@@ -310,10 +310,14 @@ async fn acquire_with_logging(
             diagnostic,
             cell_outcome,
         } => {
+            // The link this failure came from is the one holding this
+            // environment, which for a job placed on a remote is not the
+            // colocated one. Reading the wrong link is how a machine that is
+            // simply reconnecting produced a refusal instead of a wait.
             let verdict = classify_residency_failure(
                 &kind,
                 cell_outcome.as_deref(),
-                orch.fleet.link_restoration(),
+                orch.fleet.residency_link_restoration(&holder),
             );
             if log_failure {
                 tracing::warn!(%holder, ?kind, ?verdict, %diagnostic, "residency acquisition failed");

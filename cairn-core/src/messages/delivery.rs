@@ -806,7 +806,7 @@ fn collect_pending_for_flush(db: &LocalDb, run_id: &str) -> Option<PendingFlush>
 /// never resumes it. `continue_job_impl` claims, injects, renders, and atomically
 /// stamps every pending item (notices, queued messages, pushes); this function
 /// only decides whether to resume and carries no prompt of its own.
-pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
+pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
     let timing_started = std::time::Instant::now();
     let db = match run_db_blocking({
         let dbs = orch.db.clone();
@@ -820,7 +820,9 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
         Ok(db) => db,
         Err(error) => {
             log::warn!("flush-on-idle: failed to route run {run_id}: {error}");
-            return;
+            return Err(format!(
+                "flush-on-idle could not route run {run_id}: {error}"
+            ));
         }
     };
     let Some(pending) = collect_pending_for_flush(&db, run_id) else {
@@ -829,7 +831,7 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
         event.run_id = Some(run_id);
         event.mode = Some("skip");
         event.emit();
-        return;
+        return Ok(());
     };
 
     let mut event =
@@ -849,13 +851,14 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) {
             pending.notice_count,
             pending.queued_count
         ),
-        Err(e) => log::warn!("flush-on-idle: failed to resume job {}: {}", short, e),
+        Err(e) => return Err(format!("flush-on-idle failed to resume job {short}: {e}")),
     }
     let mut event = crate::resume_timing::ResumeTimingEvent::new("continue_job_handoff")
         .elapsed(handoff_started);
     event.run_id = Some(run_id);
     event.job_id = Some(&pending.job_id);
     event.emit();
+    Ok(())
 }
 
 /// Nudge a job after a pending row has been durably persisted according to the
@@ -877,7 +880,7 @@ pub fn nudge_job_for_urgency(
         return Ok(());
     }
 
-    let db = match run_db_blocking({
+    let db = run_db_blocking({
         let dbs = orch.db.clone();
         let job_id = job_id.to_string();
         move || async move {
@@ -885,45 +888,53 @@ pub fn nudge_job_for_urgency(
                 .await
                 .map_err(|e| e.to_string())
         }
-    }) {
-        Ok(db) => db,
-        Err(error) => {
-            log::warn!("nudge_job_for_urgency: failed to route job {job_id}: {error}");
-            return Ok(());
-        }
-    };
+    })
+    .map_err(|error| format!("failed to route job {job_id}: {error}"))?;
 
-    let Some(run_id) = latest_run_for_job(&db, job_id) else {
-        return Ok(());
-    };
-
-    let active = orch.process_state.is_active(&run_id) || head_turn_active_sync(&db, job_id);
-    if active && urgency != DeliveryUrgency::Interrupt {
+    let live_run_id = crate::orchestrator::lifecycle::live_run_id_for_job(orch, job_id);
+    let head_active = head_turn_active_sync(&db, job_id);
+    if head_active && urgency != DeliveryUrgency::Interrupt {
         return Ok(());
     }
 
-    if urgency == DeliveryUrgency::Interrupt && active {
-        // Match the validated manual flow: the message is already queued, so
-        // Stop the active turn and let the existing turn-end/abort flush be the
-        // single owner that resumes with the pending row. Calling
-        // continue_job_impl here races that flush and can start a duplicate
-        // successor with the generic "Continue where you left off." prompt.
+    if urgency == DeliveryUrgency::Interrupt && head_active {
+        let run_id = live_run_id.ok_or_else(|| {
+            "the active turn has not attached to a stoppable run yet; retry interrupt shortly"
+                .to_string()
+        })?;
         crate::orchestrator::lifecycle::stop_session(orch, &run_id)?;
+
+        // The backend abort acknowledgement remains the fast path, but it is not
+        // the owner: stop_session has already made the turn terminal and the run
+        // idle synchronously, so this idempotent flush guarantees the queued row
+        // is claimed even when the backend never acknowledges the interrupt.
+        // A concurrent acknowledgement-driven flush either wins the claim or
+        // observes no pending rows; continue_job_impl also joins an in-flight
+        // launch, so neither ordering can create a duplicate successor.
+        flush_pending_directs_on_idle(orch, &run_id)?;
         return Ok(());
     }
 
-    flush_pending_directs_on_idle(orch, &run_id);
+    if let Some(run_id) = live_run_id.or_else(|| latest_run_for_job(&db, job_id)) {
+        flush_pending_directs_on_idle(orch, &run_id)?;
+    } else {
+        crate::execution::jobs::continue_job_impl(orch, job_id, None, None, None)
+            .map(|_| ())
+            .map_err(|error| format!("could not resume queued delivery: {error}"))?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_process::process::{wrap_plain_stdin, RunHandle};
     use crate::db::DbState;
     use crate::services::testing::{RecordingProcessSpawner, TestServicesBuilder};
     use crate::storage::SearchIndex;
     use cairn_db::turso::params;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     async fn migrated_db() -> LocalDb {
         crate::storage::migrated_test_db("delivery-flush.db").await
@@ -1370,5 +1381,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_pending.len(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_target_prefers_process_holding_run_over_newest_row() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_run(&db, "run-process", "job-1").await;
+        db.execute(
+            "INSERT INTO runs(id, project_id, job_id, status, created_at, updated_at) VALUES('run-newest','proj-1','job-1','live',2,2)",
+            (),
+        )
+        .await
+        .unwrap();
+        let handle = RunHandle::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(wrap_plain_stdin(Box::new(
+                Vec::<u8>::new(),
+            ))))),
+            Some("sess-process".to_string()),
+            Some("job-1".to_string()),
+        );
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-process".to_string(), handle);
+
+        assert_eq!(
+            crate::orchestrator::lifecycle::live_run_id_for_job(&orch, "job-1").as_deref(),
+            Some("run-process")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interrupt_owns_flush_without_backend_ack_and_delivers_once_in_same_session() {
+        let orch = test_orchestrator(migrated_db().await);
+        let db = orch.db.local.clone();
+        seed_thread_session_run(&db).await;
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('sess-1','job-thread','claude','open',1,1,1);
+             UPDATE jobs SET current_session_id='sess-1' WHERE id='job-thread';
+             UPDATE runs SET session_id='sess-1' WHERE id='run-1';
+             INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, started_at, updated_at)
+               VALUES('turn-1','sess-1','run-1','job-thread',1,'running','initial',1,1,1);
+             UPDATE jobs SET current_turn_id='turn-1' WHERE id='job-thread';",
+        )
+        .await
+        .unwrap();
+        let mut handle = RunHandle::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Some(wrap_plain_stdin(Box::new(
+                Vec::<u8>::new(),
+            ))))),
+            Some("sess-1".to_string()),
+            Some("job-thread".to_string()),
+        );
+        handle.begin_turn("turn-1");
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .register("run-1".to_string(), handle);
+
+        crate::messages::queued::enqueue_async(
+            &db,
+            "job-thread",
+            "interrupt now",
+            DeliveryUrgency::Interrupt,
+        )
+        .await
+        .unwrap();
+
+        nudge_job_for_urgency(&orch, "job-thread", DeliveryUrgency::Interrupt)
+            .expect("synchronous interrupt flush should resume without an abort acknowledgement");
+        let delivered = count(
+            &db,
+            "SELECT COUNT(*) FROM queued_messages WHERE job_id='job-thread' AND delivered_at IS NOT NULL",
+        )
+        .await;
+        assert_eq!(delivered, 1);
+        assert_eq!(
+            db.query_one(
+                "SELECT current_session_id FROM jobs WHERE id='job-thread'",
+                (),
+                |row| row.text(0)
+            )
+            .await
+            .unwrap(),
+            "sess-1"
+        );
+        let event_count = count(
+            &db,
+            "SELECT COUNT(*) FROM events WHERE json_extract(data, '$.queued_message_id') IS NOT NULL",
+        )
+        .await;
+        nudge_job_for_urgency(&orch, "job-thread", DeliveryUrgency::Interrupt).unwrap();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT COUNT(*) FROM events WHERE json_extract(data, '$.queued_message_id') IS NOT NULL"
+            )
+            .await,
+            event_count
+        );
     }
 }

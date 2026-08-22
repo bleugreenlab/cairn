@@ -1934,11 +1934,51 @@ fn compile_cache_service(
 /// Whether the service's launch program resolves (on PATH or an absolute path).
 /// The built-in default sccache entry uses this to stay inert unless `sccache`
 /// is actually installed.
+///
+/// Resolving a bare program name runs `which` as a subprocess, so this belongs
+/// to reconciliation and to the settings screen — the two callers that are
+/// deliberately on demand — and never to a read that renders a panel. What a
+/// panel needs is the answer reconciliation already found; see
+/// [`ObservedCompileCacheService`].
 fn service_on_path(cfg: &BuildServiceConfig) -> bool {
     match cfg.start.first() {
         Some(prog) => Path::new(prog).is_absolute() || crate::env::find_binary(prog).is_ok(),
         None => false,
     }
+}
+
+/// What reconciliation last found out about this machine's compile-cache
+/// service, as distinct from what the supervisor has since observed the daemon
+/// *doing* (which lives in [`BuildServiceRuntimeDiagnostic`]).
+///
+/// These are configuration facts, and establishing them costs a settings-file
+/// parse and a PATH-resolution subprocess. They change when a person edits
+/// settings or installs a binary, never on the cadence a substrate-health read
+/// happens at, so reconciliation establishes them on every pass and the read
+/// path consumes what it published. Reconciliation runs at startup, on every
+/// settings write, and on the supervisor's fifteen-second tick — the same
+/// cadence the cache statistics themselves are sampled at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedCompileCacheService {
+    pub(crate) name: String,
+    pub(crate) enabled: bool,
+    /// Whether the launch program resolved, by [`service_on_path`].
+    pub(crate) installed: bool,
+}
+
+/// Read the compile-cache service out of a loaded settings map.
+///
+/// Free-standing and taking the map rather than the config dir, so the caller
+/// that has already loaded settings does not load them twice and so the
+/// resolution rule can be tested without a filesystem.
+fn observe_compile_cache_service(
+    services: &HashMap<String, BuildServiceConfig>,
+) -> Option<ObservedCompileCacheService> {
+    compile_cache_service(services).map(|(name, cfg)| ObservedCompileCacheService {
+        name,
+        enabled: cfg.enabled,
+        installed: service_on_path(&cfg),
+    })
 }
 
 impl Orchestrator {
@@ -1976,11 +2016,44 @@ impl Orchestrator {
     }
 
     /// Enabled services whose launch program is installed.
-    fn launchable_services(&self) -> Vec<(String, BuildServiceConfig)> {
-        settings::load_build_services(&self.config_dir)
+    fn launchable_services(
+        services: HashMap<String, BuildServiceConfig>,
+    ) -> Vec<(String, BuildServiceConfig)> {
+        services
             .into_iter()
             .filter(|(_, c)| c.enabled && service_on_path(c))
             .collect()
+    }
+
+    /// Publish what settings and PATH currently say about the compile-cache
+    /// service, for readers that must not go and find out for themselves.
+    /// See [`ObservedCompileCacheService`].
+    fn publish_compile_cache_service(&self, services: &HashMap<String, BuildServiceConfig>) {
+        let observation = observe_compile_cache_service(services);
+        if let Ok(mut published) = self.compile_cache_service.write() {
+            *published = observation;
+        }
+    }
+
+    /// The compile-cache service as reconciliation last observed it.
+    ///
+    /// A read never establishes this itself, and the absence of an observation
+    /// is reported as an absent compile cache rather than repaired on the spot.
+    /// That is the whole point: establishing it parses settings and resolves the
+    /// launch program on PATH, which shells out, and the substrate-health
+    /// snapshot that consumes it is rebuilt on every fleet change. A lazy repair
+    /// here would make the invariant "a read does no I/O" true only after some
+    /// unspecified earlier call, which is not an invariant at all.
+    ///
+    /// Nothing real reports an absent cache for long: every runner and non-inert
+    /// server reconciles during startup, so this is the boot gap rather than a
+    /// steady state. A host that genuinely never reconciles also never launches a
+    /// build service, and reporting no compile cache is the honest answer there.
+    pub(crate) fn observed_compile_cache_service(&self) -> Option<ObservedCompileCacheService> {
+        self.compile_cache_service
+            .read()
+            .ok()
+            .and_then(|published| published.clone())
     }
 
     /// Startup entry point: bring every enabled, installed user-configured build
@@ -2004,6 +2077,12 @@ impl Orchestrator {
     /// health round-trip as a subprocess, so call it off the async runtime
     /// (`spawn_blocking` / a dedicated thread), never on a hot path.
     pub fn ensure_build_services_ready(&self) {
+        // Republish first, ahead of every early return below. What is configured
+        // and installed is true regardless of whether this host can confine a
+        // service or whether another reconcile currently holds the lock, and the
+        // panel that reports it must not be made stale by either.
+        let services = settings::load_build_services(&self.config_dir);
+        self.publish_compile_cache_service(&services);
         if !sandbox::is_available() {
             // No service sandbox on this host; clients run uncached (the
             // cache-wrapper guard never auto-starts a confined server).
@@ -2021,7 +2100,7 @@ impl Orchestrator {
         };
         let templates = self.build_service_templates();
         let deny_read = self.sandbox_deny_read();
-        for (name, cfg) in self.launchable_services() {
+        for (name, cfg) in Self::launchable_services(services) {
             // Then serialize across processes. Without this the in-process lock
             // above only stops one runner from racing itself, while the four
             // runners this machine actually runs race each other for the same
@@ -2619,14 +2698,19 @@ impl Orchestrator {
 
     /// This machine's compile cache as the Substrate snapshot reads it.
     ///
-    /// Read-only and non-blocking by construction: it consumes what the
-    /// supervisor already sampled and never probes, launches, or runs
-    /// `--show-stats` itself. Sampling belongs to the supervisor alone, so the
-    /// panel cannot be made slow (or made to auto-start a server) by the
-    /// condition it exists to report.
+    /// Read-only and non-blocking by construction: every fact here was
+    /// established by the supervisor, and this only assembles them. It is a
+    /// hot read — the substrate-health snapshot is rebuilt on every fleet
+    /// change — so it must touch neither the daemon nor the filesystem.
+    /// Sampling belongs to the supervisor alone, so the panel cannot be made
+    /// slow (or made to auto-start a server) by the condition it exists to
+    /// report; the same reason its statistics come from the supervisor's
+    /// `--show-stats` round trip is why its configuration comes from
+    /// reconciliation's [`ObservedCompileCacheService`] rather than from a
+    /// settings parse and a `which` subprocess run per read.
     pub fn compile_cache_health(&self) -> Option<CompileCacheHealth> {
-        let services = settings::load_build_services(&self.config_dir);
-        let (name, cfg) = compile_cache_service(&services)?;
+        let observed = self.observed_compile_cache_service()?;
+        let name = observed.name;
         let now_ms = unix_ms();
         let runtime = self
             .build_service_runtime
@@ -2636,7 +2720,7 @@ impl Orchestrator {
             .cloned()
             .unwrap_or_default();
 
-        let (state, unsupervised) = if !cfg.enabled {
+        let (state, unsupervised) = if !observed.enabled {
             (CompileCacheState::Disabled, None)
         } else if !sandbox::is_available() {
             // No service sandbox means Cairn deliberately runs no confined
@@ -2646,7 +2730,7 @@ impl Orchestrator {
                 CompileCacheState::Disabled,
                 Some("this host has no service sandbox, so builds compile uncached by design"),
             )
-        } else if !service_on_path(&cfg) {
+        } else if !observed.installed {
             (CompileCacheState::NotInstalled, None)
         } else {
             match runtime.lifecycle.as_deref() {
@@ -2765,7 +2849,10 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::testing::{MockChildProcess, MockProcessSpawner};
+    use crate::db::DbState;
+    use crate::services::testing::{MockChildProcess, MockProcessSpawner, TestServicesBuilder};
+    use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use std::sync::Arc;
 
     const BUILD_SERVICE_CLIENT_ENV: &str = "CAIRN_BUILD_SERVICE_CLIENT";
 
@@ -4419,5 +4506,145 @@ Max cache size                       50 GiB
         assert!(!corrupt.exists());
         assert!(healthy.exists());
         assert!(metadata.exists());
+    }
+
+    async fn test_orchestrator(config_dir: &Path) -> Orchestrator {
+        let local = LocalDb::open(config_dir.join("build-services.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+        Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir.to_path_buf(),
+        )
+        .build()
+    }
+
+    /// Settings naming one compile-cache service whose launch program is an
+    /// absolute path, which [`service_on_path`] reads as installed without
+    /// consulting PATH.
+    fn write_sccache_settings(config_dir: &Path, enabled: bool) {
+        std::fs::write(
+            crate::config::settings::get_settings_path(config_dir),
+            format!(
+                "buildServices:\n  sccache:\n    enabled: {enabled}\n    start:\n      - /opt/sccache\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The substrate-health snapshot is rebuilt on every fleet change, so the
+    /// compile-cache section of it must be assembled from what the supervisor
+    /// published and nothing else. Establishing it independently costs a
+    /// settings parse and a `which` subprocess, which is what made
+    /// `get_substrate_health` a ~30ms blocking call (CAIRN-4397).
+    ///
+    /// Pinned by contradiction: the observation says the service is missing
+    /// while the settings file on disk says it is installed. A read that went
+    /// and found out for itself could not report `NotInstalled`.
+    #[tokio::test]
+    async fn compile_cache_health_answers_from_the_published_observation() {
+        let config_dir = tempfile::tempdir().unwrap();
+        write_sccache_settings(config_dir.path(), true);
+        let orch = test_orchestrator(config_dir.path()).await;
+
+        *orch.compile_cache_service.write().unwrap() = Some(ObservedCompileCacheService {
+            name: "sccache".to_string(),
+            enabled: true,
+            installed: false,
+        });
+
+        let health = orch
+            .compile_cache_health()
+            .expect("a configured compile cache must be reported");
+        assert_eq!(health.service, "sccache");
+        assert_eq!(health.state, CompileCacheState::NotInstalled);
+
+        // And the read survives the settings file it never consults.
+        std::fs::remove_file(crate::config::settings::get_settings_path(
+            config_dir.path(),
+        ))
+        .unwrap();
+        assert_eq!(
+            orch.compile_cache_health().map(|health| health.state),
+            Some(CompileCacheState::NotInstalled)
+        );
+    }
+
+    /// Reconciliation republishes before it can bail out. A host with no service
+    /// sandbox, or one whose reconcile lock is already held, still changed
+    /// nothing about what is configured and installed — so a panel must not be
+    /// left reporting a settings state that has since been edited away.
+    ///
+    /// The held reconcile lock is the reachable early return here: it is the one
+    /// that does not depend on the host.
+    #[tokio::test]
+    async fn reconcile_publishes_what_it_observed_before_it_can_bail_out() {
+        let config_dir = tempfile::tempdir().unwrap();
+        write_sccache_settings(config_dir.path(), true);
+        let orch = test_orchestrator(config_dir.path()).await;
+
+        let reconciling = orch.build_service_reconcile.lock().unwrap();
+        orch.ensure_build_services_ready();
+        assert_eq!(
+            orch.observed_compile_cache_service(),
+            Some(ObservedCompileCacheService {
+                name: "sccache".to_string(),
+                enabled: true,
+                installed: true,
+            })
+        );
+
+        write_sccache_settings(config_dir.path(), false);
+        orch.ensure_build_services_ready();
+        drop(reconciling);
+        assert_eq!(
+            orch.observed_compile_cache_service()
+                .map(|service| service.enabled),
+            Some(false),
+            "a settings edit must reach the panel through the next reconcile"
+        );
+        assert_eq!(
+            orch.compile_cache_health().map(|health| health.state),
+            Some(CompileCacheState::Disabled)
+        );
+    }
+
+    /// The non-blocking boundary, pinned from the other side: a read must not
+    /// establish the observation it is missing.
+    ///
+    /// Settings on disk name a compile cache, and this orchestrator has never
+    /// reconciled. Reading reports nothing — not because there is nothing to
+    /// report, but because finding out would mean parsing that file and resolving
+    /// its launch program on PATH, which shells out. A read that repaired its own
+    /// gap would make "a read does no I/O" contingent on some earlier call having
+    /// paid for it, so the property is written as an absolute here.
+    ///
+    /// Real hosts do not sit in this state: every runner and non-inert server
+    /// reconciles during startup. What this fixes in place is the boot gap.
+    #[tokio::test]
+    async fn a_read_never_establishes_the_observation_it_is_missing() {
+        let config_dir = tempfile::tempdir().unwrap();
+        write_sccache_settings(config_dir.path(), true);
+        let orch = test_orchestrator(config_dir.path()).await;
+
+        assert_eq!(orch.compile_cache_health(), None);
+        assert_eq!(
+            orch.observed_compile_cache_service(),
+            None,
+            "reading must leave the observation unestablished, not fill it in"
+        );
+
+        // The same settings, once reconciliation has actually looked at them.
+        orch.ensure_build_services_ready();
+        assert_eq!(
+            orch.compile_cache_health().map(|health| health.service),
+            Some("sccache".to_string())
+        );
     }
 }

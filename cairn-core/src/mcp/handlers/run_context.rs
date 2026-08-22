@@ -99,7 +99,7 @@ pub(crate) async fn lookup_run_by_id(db: &LocalDb, run_id: &str) -> Result<RunCo
                     "
                     SELECT r.id, r.job_id, j.execution_id, j.recipe_node_id,
                            r.issue_id, i.number, j.project_id, p.key, j.node_name,
-                           e.seq, j.agent_config_id
+                           e.seq, j.agent_config_id, j.thread_id
                     FROM runs r
                     JOIN jobs j ON r.job_id = j.id
                     LEFT JOIN issues i ON r.issue_id = i.id
@@ -134,6 +134,7 @@ fn run_context_from_row(row: &cairn_db::turso::Row) -> DbResult<RunContext> {
         exec_seq,
         issue_id: row.opt_text(4)?,
         issue_number,
+        thread_id: row.opt_text(11)?,
         project_id: row.text(6)?,
         project_key: row.text(7)?,
         job_name,
@@ -247,6 +248,14 @@ mod tests {
                 .await
                 .unwrap(),
             "cairn://p/prj/design"
+        );
+        assert_eq!(
+            lookup_run_by_id(&dbs.local, "r-thread")
+                .await
+                .unwrap()
+                .thread_id
+                .as_deref(),
+            Some("t")
         );
 
         dbs.local

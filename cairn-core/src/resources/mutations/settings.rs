@@ -36,6 +36,8 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "maxOpenTriageIssuesPerScope",
     "pendingMemoryThreshold",
     "threadCompactThreshold",
+    "seedBudgetTokens",
+    "seedEras",
     "externalReplies",
     "subscriptionFees",
     "tierDefaults",

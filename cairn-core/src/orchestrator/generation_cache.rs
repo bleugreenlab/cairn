@@ -22,7 +22,7 @@
 //! and nothing else should. Reaching for a broad "invalidate on any change"
 //! rule reintroduces exactly the amplification this exists to remove.
 
-use crate::jobs::queries::ThreadActivityRow;
+use crate::jobs::queries::{IssueStatusSnapshot, ThreadStatusSnapshot};
 use crate::services::EventEmitter;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -31,7 +31,56 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-pub(crate) type ThreadStatusCache = GenerationCache<Arc<Vec<ThreadActivityRow>>>;
+pub(crate) type ThreadStatusCache = GenerationCache<Arc<ThreadStatusSnapshot>>;
+pub(crate) type IssueStatusCache = GenerationCache<Arc<IssueStatusSnapshot>>;
+
+/// How long a published thread rollup may keep being served after a TRANSCRIPT
+/// EVENT lands.
+///
+/// Scoping removes the writes that cannot move a thread row, but not the ones
+/// that matter most: an agent running IN a thread writes its transcript many
+/// times a second, and that is exactly when someone is watching the row. Those
+/// events are three quarters of what remains, and every one of them colds a
+/// whole-project census to move a badge that saturates at 99+.
+///
+/// The floor applies to `events` and to nothing else, which is what makes it
+/// safe. An event can only change how MUCH transcript went by; it cannot change
+/// whether work is happening, whether input is wanted, or whether a thread
+/// exists. Every input that can change one of those advances the generation
+/// immediately.
+///
+/// That distinction is load-bearing, not tidiness. The sidebar query holds
+/// `staleTime: Infinity` and refetches only when a `db-change` tells it to, so a
+/// deferred rebuild is settled by a later READ or not at all. Deferring a
+/// lifecycle transition would therefore risk stranding one: the write that ends
+/// an agent's work is the last write it makes, so the read it triggers would
+/// serve the pre-transition value and nothing would ever ask again. A transcript
+/// event is never the last word on anything — the turn that produced it always
+/// closes, immediately — so a deferred count always has a later structural
+/// write to settle behind it.
+pub(crate) const THREAD_STATUS_COALESCE_FLOOR: Duration = Duration::from_secs(2);
+
+/// The tables the issue rollup reads.
+///
+/// Wider than the thread rollup's because an issue row says more: `executions`
+/// selects which jobs count as current, `merge_requests` and `action_runs` carry
+/// the PR facts, and `artifacts` carries the awaiting-confirmation glyph.
+///
+/// `events` is deliberately absent, and that absence is load-bearing rather than
+/// an oversight: the issue rollup reads no transcript at all, so the single
+/// highest-volume table in the workspace cannot touch it.
+const ISSUE_STATUS_INPUT_TABLES: &[&str] = &[
+    "issues",
+    "executions",
+    "jobs",
+    "turns",
+    "prompts",
+    "permission_requests",
+    "runs",
+    "merge_requests",
+    "action_runs",
+    "artifacts",
+];
 
 /// The tables the thread activity rollup actually reads.
 ///
@@ -53,13 +102,18 @@ pub(crate) type ThreadStatusCache = GenerationCache<Arc<Vec<ThreadActivityRow>>>
 /// state and execution rows cannot move this answer, and routing them here would
 /// rebuild a whole-project rollup to reach the value it already held.
 ///
-/// `events` is absent for a stronger reason than irrelevance. A thread row also
-/// carries an unread transcript count, which every durable event moves — but an
-/// event's `db-change` payload carries no project id, so routing it here would
-/// take the unscoped path and invalidate EVERY project's activity snapshot on
-/// every event, which is precisely the continuous whole-project rebuild
-/// CAIRN-4190 removed. The unread count is therefore computed fresh per read and
-/// capped, rather than snapshotted; see `jobs::queries::thread_unread_counts`.
+/// `events` is here because the snapshot now covers the unread count as well
+/// (CAIRN-4331). It was previously excluded on the grounds that an event's
+/// `db-change` payload carried no project id, which would have forced the
+/// unscoped path and rebuilt every project on every event. That is no longer
+/// true: `notify::event_db_change_scoped` resolves and carries `projectId` and
+/// `jobId`. Leaving the count outside the fence instead meant re-running a
+/// whole-project statement on every sidebar poll, which cost more than the
+/// rebuild it was avoiding.
+///
+/// Membership here only says a table CAN move the projection. Which individual
+/// writes actually can is a second question, answered per frame by
+/// [`ProjectionInvalidatingEmitter::touches_a_thread`].
 const THREAD_STATUS_INPUT_TABLES: &[&str] = &[
     "threads",
     "jobs",
@@ -67,6 +121,7 @@ const THREAD_STATUS_INPUT_TABLES: &[&str] = &[
     "prompts",
     "permission_requests",
     "runs",
+    "events",
 ];
 
 /// Advances projection generations at the one boundary every durable mutation
@@ -80,13 +135,19 @@ const THREAD_STATUS_INPUT_TABLES: &[&str] = &[
 pub(crate) struct ProjectionInvalidatingEmitter {
     inner: Arc<dyn EventEmitter>,
     thread_status: Arc<ThreadStatusCache>,
+    issue_status: Arc<IssueStatusCache>,
 }
 
 impl ProjectionInvalidatingEmitter {
-    pub(crate) fn new(inner: Arc<dyn EventEmitter>, thread_status: Arc<ThreadStatusCache>) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn EventEmitter>,
+        thread_status: Arc<ThreadStatusCache>,
+        issue_status: Arc<IssueStatusCache>,
+    ) -> Self {
         Self {
             inner,
             thread_status,
+            issue_status,
         }
     }
 
@@ -94,25 +155,109 @@ impl ProjectionInvalidatingEmitter {
         let Some(table) = payload.get("table").and_then(Value::as_str) else {
             return;
         };
-        if !THREAD_STATUS_INPUT_TABLES.contains(&table) {
+        let thread_input = THREAD_STATUS_INPUT_TABLES.contains(&table);
+        let issue_input = ISSUE_STATUS_INPUT_TABLES.contains(&table);
+        if !thread_input && !issue_input {
             return;
         }
-        match payload
+        let Some(project_id) = payload
             .get("projectId")
             .or_else(|| payload.get("project_id"))
             .and_then(Value::as_str)
-        {
-            Some(project_id) => {
-                self.thread_status.invalidate(project_id, "thread-input");
-            }
+        else {
             // A scope-less emit is a multi-row recovery sweep, which really can
             // have moved any project. Rebuilding all of them is the honest
             // answer; the alternative is serving a snapshot a sweep invalidated.
-            None => self
-                .thread_status
-                .invalidate_matching("thread-input-unscoped", |_| true),
+            if thread_input {
+                self.thread_status
+                    .invalidate_matching("thread-input-unscoped", |_| true);
+            }
+            if issue_input {
+                self.issue_status
+                    .invalidate_matching("issue-input-unscoped", |_| true);
+            }
+            return;
+        };
+        if thread_input && self.touches_a_thread(project_id, table, payload) {
+            if table == "events" {
+                // The only input allowed to wait. See
+                // [`THREAD_STATUS_COALESCE_FLOOR`] for why it is the only one
+                // that safely can.
+                self.thread_status
+                    .invalidate_coalesced(project_id, "thread-transcript");
+            } else {
+                self.thread_status.invalidate(project_id, "thread-input");
+            }
+        }
+        if issue_input && self.touches_an_issue(project_id, table, payload) {
+            // Every issue input is a lifecycle fact — the rollup reads no
+            // transcript at all — so there is nothing here to coalesce. The
+            // fence and the job scoping are the whole saving.
+            self.issue_status.invalidate(project_id, "issue-input");
         }
     }
+
+    /// Whether one committed write could have changed the thread rollup this
+    /// project has already published.
+    ///
+    /// The rollup reads threads and the jobs hanging off them. In a real
+    /// workspace those jobs are a small minority of all jobs (121 of 15,119 in
+    /// the sample behind CAIRN-4331), so treating every write to an input TABLE
+    /// as a write to the projection charged every agent, on every issue, for a
+    /// census of rows it could not touch.
+    ///
+    /// The published snapshot names the jobs it read, which is what makes this
+    /// answerable without a query. Anything not placeable against that set is
+    /// treated as relevant: this decides whether to skip work, so uncertainty
+    /// has to fall on the side of rebuilding.
+    fn touches_a_thread(&self, project_id: &str, table: &str, payload: &Value) -> bool {
+        match table {
+            "threads" => true,
+            // A job frame names its owner outright, and does so before the job
+            // can produce any rows of its own, which is what lets a job that has
+            // never appeared in a snapshot still cold it the moment it joins a
+            // thread.
+            "jobs" => payload.get("threadId").and_then(Value::as_str).is_some(),
+            // Everything else is a row UNDER a job.
+            _ => self
+                .thread_status
+                .published(project_id)
+                .is_none_or(|snapshot| frame_could_touch(payload, &snapshot.thread_job_ids)),
+        }
+    }
+
+    /// The same question for the issue rollup.
+    ///
+    /// Scoping buys less here than it does for threads — most agent work IS on
+    /// issues, so most frames land inside the set — but the two cases it does
+    /// exclude are worth excluding: a thread's own churn, and a job belonging to
+    /// an execution that is no longer the current one.
+    fn touches_an_issue(&self, project_id: &str, table: &str, payload: &Value) -> bool {
+        match table {
+            "issues" | "executions" => true,
+            // A job that names a thread and no issue is a thread's, and the
+            // issue rollup never reads it.
+            "jobs" => payload.get("issueId").and_then(Value::as_str).is_some(),
+            _ => self
+                .issue_status
+                .published(project_id)
+                .is_none_or(|snapshot| frame_could_touch(payload, &snapshot.job_ids)),
+        }
+    }
+}
+
+/// Whether a frame describing a row under some job could touch a projection
+/// that read exactly `job_ids`.
+///
+/// A frame that names no job cannot be placed, and unplaceable means relevant:
+/// this decides whether to SKIP work, so the only safe answer to "I cannot tell"
+/// is to do it.
+fn frame_could_touch(payload: &Value, job_ids: &std::collections::HashSet<String>) -> bool {
+    payload
+        .get("jobId")
+        .or_else(|| payload.get("job_id"))
+        .and_then(Value::as_str)
+        .is_none_or(|job_id| job_ids.contains(job_id))
 }
 
 impl EventEmitter for ProjectionInvalidatingEmitter {
@@ -157,6 +302,15 @@ struct GenerationCacheState<V> {
     generations: HashMap<String, u64>,
     cells: HashMap<(String, u64), Arc<Cell<V>>>,
     explicit_refresh_admission_until: HashMap<String, Instant>,
+    /// Keys whose inputs have moved but whose published value is still being
+    /// served, with the reason the first deferred invalidation gave. Present
+    /// only for a cache built [`GenerationCache::with_coalescing`].
+    deferred: HashMap<String, &'static str>,
+    /// When the value at each key's current generation was published. The
+    /// coalescing floor is measured from here rather than from the first
+    /// deferred invalidation, so an unbroken write stream cannot push the
+    /// rebuild further and further out.
+    published_at: HashMap<String, Instant>,
 }
 
 impl<V> Default for GenerationCacheState<V> {
@@ -165,6 +319,8 @@ impl<V> Default for GenerationCacheState<V> {
             generations: HashMap::new(),
             cells: HashMap::new(),
             explicit_refresh_admission_until: HashMap::new(),
+            deferred: HashMap::new(),
+            published_at: HashMap::new(),
         }
     }
 }
@@ -175,6 +331,11 @@ impl<V> Default for GenerationCacheState<V> {
 /// the primitive stay distinguishable in one log stream.
 pub(crate) struct GenerationCache<V> {
     label: &'static str,
+    /// Shortest interval between two rebuilds driven by
+    /// [`GenerationCache::invalidate_coalesced`]. `None` means no projection
+    /// using this cache has asked to trade freshness for rebuild rate, and
+    /// every invalidation advances the generation at once.
+    coalesce_floor: Option<Duration>,
     state: Mutex<GenerationCacheState<V>>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -186,12 +347,44 @@ impl<V: Clone> GenerationCache<V> {
     pub(crate) fn new(label: &'static str) -> Self {
         Self {
             label,
+            coalesce_floor: None,
             state: Mutex::new(GenerationCacheState::default()),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             coalesced: AtomicU64::new(0),
             invalidated_during_compute: AtomicU64::new(0),
         }
+    }
+
+    /// A cache that may keep serving a published value for `floor` after one of
+    /// its inputs moves.
+    ///
+    /// Only worth reaching for when the projection is read on a cadence the
+    /// WRITE rate drives, so that invalidations arrive faster than any reader
+    /// could use a fresh answer. It trades a bounded, stated staleness for a
+    /// rebuild rate that no longer tracks how busy the workspace is; a
+    /// projection whose readers are human-paced does not need it.
+    pub(crate) fn with_coalescing(label: &'static str, floor: Duration) -> Self {
+        Self {
+            coalesce_floor: Some(floor),
+            ..Self::new(label)
+        }
+    }
+
+    /// The value currently published for a key, without computing one.
+    ///
+    /// For callers that need to inspect what is already known in order to decide
+    /// whether to invalidate it. A key with nothing published answers `None`,
+    /// which such a caller must read as "cannot tell" rather than as "empty".
+    pub(crate) fn published(&self, key: &str) -> Option<V> {
+        let state = self.state.lock().ok()?;
+        let generation = state.generations.get(key).copied().unwrap_or_default();
+        state
+            .cells
+            .get(&(key.to_string(), generation))?
+            .get()
+            .cloned()
+            .flatten()
     }
 
     #[cfg(test)]
@@ -228,8 +421,66 @@ impl<V: Clone> GenerationCache<V> {
         let generation = *generation;
         state.cells.retain(|(cached_key, _), _| cached_key != key);
         state.explicit_refresh_admission_until.remove(key);
+        // The new generation has nothing published and nothing outstanding
+        // against it. Leaving either behind would let the next reader either
+        // skip a rebuild it owes or measure a floor from a value that is gone.
+        state.deferred.remove(key);
+        state.published_at.remove(key);
         log::debug!("{label} cache invalidated key={key} generation={generation} reason={reason}");
         generation
+    }
+
+    /// Record that an input moved, without necessarily rebuilding yet.
+    ///
+    /// On a cache with no floor this is exactly [`GenerationCache::invalidate`].
+    /// With one, the published value keeps being served until the floor has
+    /// elapsed since it was published, and the generation advances on the first
+    /// read after that. A key with nothing published defers nothing: there would
+    /// be no value to serve in the meantime, so waiting could only make the next
+    /// reader compute the same thing later.
+    ///
+    /// Deferral is bounded by READS, not by a timer. If nobody reads the
+    /// projection again the rebuild never happens, which is correct: the value
+    /// is only observable through a read, and the read that observes it is the
+    /// one that pays for it.
+    pub(crate) fn invalidate_coalesced(&self, key: &str, reason: &'static str) {
+        if self.coalesce_floor.is_none() {
+            self.invalidate(key, reason);
+            return;
+        }
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let generation = state.generations.get(key).copied().unwrap_or_default();
+        let has_published = state
+            .cells
+            .get(&(key.to_string(), generation))
+            .is_some_and(|cell| cell.get().is_some_and(Option::is_some));
+        if !has_published {
+            Self::advance_locked(&mut state, self.label, key, reason);
+            return;
+        }
+        state.deferred.entry(key.to_string()).or_insert(reason);
+    }
+
+    /// Advance the generation if a deferred invalidation is now due. Called with
+    /// `state` held, on the read path, so the decision and the advance cannot be
+    /// split by a concurrent reader making the same one.
+    fn settle_deferred_locked(
+        &self,
+        state: &mut GenerationCacheState<V>,
+        key: &str,
+    ) -> Option<u64> {
+        let floor = self.coalesce_floor?;
+        let reason = *state.deferred.get(key)?;
+        let due = state
+            .published_at
+            .get(key)
+            .is_none_or(|published| published.elapsed() >= floor);
+        if !due {
+            return None;
+        }
+        Some(Self::advance_locked(state, self.label, key, reason))
     }
 
     /// Advance a key's generation and drop everything materialized under the old
@@ -344,6 +595,13 @@ impl<V: Clone> GenerationCache<V> {
             let (generation, cell, state_kind) = {
                 let mut state = self.state.lock().ok()?;
                 let mut generation = *state.generations.entry(key.to_string()).or_default();
+                // A deferred invalidation comes due on the first read past the
+                // floor. Settling it here, under the same lock that picks the
+                // cell, is what keeps a burst of readers from each deciding
+                // independently that the rebuild is theirs to start.
+                if let Some(settled) = self.settle_deferred_locked(&mut state, key) {
+                    generation = settled;
+                }
                 if replace_published {
                     let now = Instant::now();
                     let admission_open = state
@@ -412,12 +670,17 @@ impl<V: Clone> GenerationCache<V> {
 
             let current = self.generation(key);
             if current == generation {
-                if value.is_none() {
-                    // A failed computation is not a fact about the projection.
-                    // Drop the cell so the next reader retries instead of
-                    // inheriting this reader's transient error.
-                    if let Ok(mut state) = self.state.lock() {
+                if let Ok(mut state) = self.state.lock() {
+                    if value.is_none() {
+                        // A failed computation is not a fact about the
+                        // projection. Drop the cell so the next reader retries
+                        // instead of inheriting this reader's transient error.
                         state.cells.remove(&(key.to_string(), generation));
+                    } else if state_kind == "miss" {
+                        // The floor the next deferred invalidation waits out is
+                        // measured from here: the moment this value became the
+                        // one being served.
+                        state.published_at.insert(key.to_string(), Instant::now());
                     }
                 }
                 return value;
@@ -785,27 +1048,434 @@ mod tests {
     }
 
     fn invalidating_emitter() -> (ProjectionInvalidatingEmitter, Arc<ThreadStatusCache>) {
-        let cache = Arc::new(ThreadStatusCache::new("test"));
+        invalidating_emitter_with_floor(Duration::ZERO)
+    }
+
+    fn invalidating_emitter_with_floor(
+        floor: Duration,
+    ) -> (ProjectionInvalidatingEmitter, Arc<ThreadStatusCache>) {
+        let (emitter, threads, _issues) = invalidating_emitter_both(floor);
+        (emitter, threads)
+    }
+
+    fn invalidating_emitter_both(
+        floor: Duration,
+    ) -> (
+        ProjectionInvalidatingEmitter,
+        Arc<ThreadStatusCache>,
+        Arc<IssueStatusCache>,
+    ) {
+        let threads = Arc::new(ThreadStatusCache::with_coalescing("test-threads", floor));
+        let issues = Arc::new(IssueStatusCache::with_coalescing("test-issues", floor));
         (
-            ProjectionInvalidatingEmitter::new(Arc::new(CapturingEmitter::new()), cache.clone()),
-            cache,
+            ProjectionInvalidatingEmitter::new(
+                Arc::new(CapturingEmitter::new()),
+                threads.clone(),
+                issues.clone(),
+            ),
+            threads,
+            issues,
         )
     }
 
+    /// Publish an issue rollup that claims to have read exactly `job_ids`.
+    async fn publish_issue_snapshot(
+        cache: &IssueStatusCache,
+        project: &str,
+        job_ids: &[&str],
+        rebuilds: &AtomicUsize,
+    ) {
+        let ids: std::collections::HashSet<String> =
+            job_ids.iter().map(|id| id.to_string()).collect();
+        cache
+            .get_or_compute(project, || {
+                let ids = ids.clone();
+                async {
+                    rebuilds.fetch_add(1, Ordering::SeqCst);
+                    Some(Arc::new(IssueStatusSnapshot {
+                        indicators: Vec::new(),
+                        job_ids: ids,
+                    }))
+                }
+            })
+            .await;
+    }
+
+    /// The two sidebar projections read overlapping tables but disjoint rows, so
+    /// one project's thread churn must not rebuild its issue rollup, and vice
+    /// versa. Without this they would each pay for the other's traffic and the
+    /// scoping would buy nothing.
+    #[tokio::test]
+    async fn the_two_sidebar_rollups_do_not_rebuild_each_other() {
+        let (emitter, threads, issues) = invalidating_emitter_both(Duration::ZERO);
+        let thread_rebuilds = AtomicUsize::new(0);
+        let issue_rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&threads, "proj", &["thread-job"], &thread_rebuilds).await;
+        publish_issue_snapshot(&issues, "proj", &["issue-job"], &issue_rebuilds).await;
+
+        // A turn on the thread's job.
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "turns", "projectId": "proj", "jobId": "thread-job",
+                }),
+            )
+            .unwrap();
+        // A turn on the issue's job.
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "turns", "projectId": "proj", "jobId": "issue-job",
+                }),
+            )
+            .unwrap();
+
+        publish_snapshot(&threads, "proj", &["thread-job"], &thread_rebuilds).await;
+        publish_issue_snapshot(&issues, "proj", &["issue-job"], &issue_rebuilds).await;
+        assert_eq!(
+            thread_rebuilds.load(Ordering::SeqCst),
+            2,
+            "the thread rollup rebuilt for its own job and nothing else"
+        );
+        assert_eq!(
+            issue_rebuilds.load(Ordering::SeqCst),
+            2,
+            "and the issue rollup for its own"
+        );
+    }
+
+    /// The issue rollup reads no transcript, so the workspace's highest-volume
+    /// table cannot reach it at all.
+    #[tokio::test]
+    async fn transcript_events_never_rebuild_the_issue_rollup() {
+        let (emitter, _threads, issues) = invalidating_emitter_both(Duration::ZERO);
+        let rebuilds = AtomicUsize::new(0);
+        publish_issue_snapshot(&issues, "proj", &["issue-job"], &rebuilds).await;
+
+        for _ in 0..200 {
+            emitter
+                .emit("db-change", events_frame("proj", "issue-job"))
+                .unwrap();
+        }
+        publish_issue_snapshot(&issues, "proj", &["issue-job"], &rebuilds).await;
+
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+    }
+
+    /// Publish a rollup that claims to have read exactly `thread_job_ids`, and
+    /// report how many times the census actually ran.
+    ///
+    /// The counter is the point: every assertion below is about how much work a
+    /// stream of writes causes, and a generation number only tells you that
+    /// something was discarded, not that anything was recomputed.
+    async fn publish_snapshot(
+        cache: &ThreadStatusCache,
+        project: &str,
+        thread_job_ids: &[&str],
+        rebuilds: &AtomicUsize,
+    ) {
+        let ids: std::collections::HashSet<String> =
+            thread_job_ids.iter().map(|id| id.to_string()).collect();
+        cache
+            .get_or_compute(project, || {
+                let ids = ids.clone();
+                async {
+                    rebuilds.fetch_add(1, Ordering::SeqCst);
+                    Some(Arc::new(ThreadStatusSnapshot {
+                        indicators: Vec::new(),
+                        thread_job_ids: ids,
+                    }))
+                }
+            })
+            .await;
+    }
+
+    fn events_frame(project: &str, job: &str) -> Value {
+        serde_json::json!({
+            "table": "events",
+            "action": "insert",
+            "projectId": project,
+            "jobId": job,
+        })
+    }
+
+    /// The defect CAIRN-4331 fixed, asserted as work done: an agent writing a
+    /// transcript on an ISSUE cannot make the thread sidebar recount anything.
+    ///
+    /// This is the regression that matters most, because it is invisible from
+    /// the outside — every indicator stays correct while the runner burns a
+    /// whole-project census per transcript event. In the sample behind the issue
+    /// that was 18,565 event frames in an hour against 32 threads that four out
+    /// of five of them had nothing to do with.
+    #[tokio::test]
+    async fn an_issue_nodes_transcript_cannot_rebuild_the_thread_rollup() {
+        let (emitter, cache) = invalidating_emitter();
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 1, "the initial build");
+        let generation = cache.generation("proj");
+
+        for _ in 0..500 {
+            emitter
+                .emit("db-change", events_frame("proj", "issue-node-job"))
+                .unwrap();
+        }
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            1,
+            "500 transcript events on an issue node must cost zero thread censuses"
+        );
+        assert_eq!(cache.generation("proj"), generation);
+    }
+
+    /// A thread's OWN transcript does move its row, and is allowed to — but at
+    /// the floor's rate, not the writer's.
+    #[tokio::test]
+    async fn a_threads_own_transcript_rebuilds_once_per_floor() {
+        let (emitter, cache) = invalidating_emitter_with_floor(Duration::from_millis(60));
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+
+        for _ in 0..200 {
+            emitter
+                .emit("db-change", events_frame("proj", "thread-job"))
+                .unwrap();
+            publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+        }
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            1,
+            "a burst inside one floor is one rebuild, however many writes it carried"
+        );
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            2,
+            "and the first read past the floor pays for exactly one more"
+        );
+    }
+
+    /// The hazard the narrow floor exists to avoid.
+    ///
+    /// The write that ENDS an agent's work is the last write it makes. If it
+    /// could be deferred, the read it triggers would serve the pre-transition
+    /// value and nothing would ever ask again, so the sidebar would keep
+    /// reading Running for a thread that finished. A transcript burst may wait;
+    /// the turn closing behind it may not.
+    #[tokio::test]
+    async fn the_write_that_ends_the_work_is_never_deferred() {
+        let (emitter, cache) = invalidating_emitter_with_floor(Duration::from_secs(30));
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+
+        for _ in 0..50 {
+            emitter
+                .emit("db-change", events_frame("proj", "thread-job"))
+                .unwrap();
+        }
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            1,
+            "the transcript burst waits out the floor"
+        );
+
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "turns", "projectId": "proj", "jobId": "thread-job",
+                }),
+            )
+            .unwrap();
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            2,
+            "the turn closing reaches the next read regardless of the floor"
+        );
+    }
+
+    /// Coalescing bounds the rate, not the truth: whatever the writes said
+    /// reaches the next reader past the floor.
+    #[tokio::test]
+    async fn a_deferred_invalidation_converges_after_the_floor() {
+        let cache: GenerationCache<u64> =
+            GenerationCache::with_coalescing("test", Duration::from_millis(50));
+        let value = AtomicU64::new(1);
+        let compute = || async { Some(value.load(Ordering::SeqCst)) };
+
+        assert_eq!(cache.get_or_compute("k", compute).await, Some(1));
+        value.store(2, Ordering::SeqCst);
+        cache.invalidate_coalesced("k", "test");
+        assert_eq!(
+            cache.get_or_compute("k", compute).await,
+            Some(1),
+            "inside the floor the published value is still what is served"
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            cache.get_or_compute("k", compute).await,
+            Some(2),
+            "past it, the deferred invalidation comes due"
+        );
+    }
+
+    /// Deferral needs something to defer TO. With nothing published there is no
+    /// value to keep serving, so waiting would only move the same work later.
+    #[tokio::test]
+    async fn a_key_with_nothing_published_does_not_defer() {
+        let cache: GenerationCache<u64> =
+            GenerationCache::with_coalescing("test", Duration::from_secs(30));
+        let value = AtomicU64::new(1);
+        let compute = || async { Some(value.load(Ordering::SeqCst)) };
+
+        cache.invalidate_coalesced("k", "test");
+        value.store(2, Ordering::SeqCst);
+        assert_eq!(cache.get_or_compute("k", compute).await, Some(2));
+    }
+
+    /// An operator action is not something to be smoothed out. A thread
+    /// appearing, being renamed, or being closed reaches the sidebar on the next
+    /// read, floor or no floor.
+    #[tokio::test]
+    async fn a_change_to_the_thread_rows_skips_the_floor() {
+        let (emitter, cache) = invalidating_emitter_with_floor(Duration::from_secs(30));
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &[], &rebuilds).await;
+
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({"table": "threads", "projectId": "proj"}),
+            )
+            .unwrap();
+        publish_snapshot(&cache, "proj", &[], &rebuilds).await;
+
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 2);
+    }
+
+    /// Marking a thread viewed clears its badge on the next read. It goes
+    /// through the orchestrator's direct invalidation rather than the emitter,
+    /// so it is the immediate path by construction — asserted here because the
+    /// badge failing to clear is the most visible way coalescing could go wrong.
+    #[tokio::test]
+    async fn marking_viewed_is_not_deferred() {
+        let cache: ThreadStatusCache =
+            ThreadStatusCache::with_coalescing("test", Duration::from_secs(30));
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &[], &rebuilds).await;
+
+        cache.invalidate("proj", "thread-read-position");
+        publish_snapshot(&cache, "proj", &[], &rebuilds).await;
+
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 2);
+    }
+
+    /// A job that joins a thread announces itself before it can write anything,
+    /// which is what lets the published job set be trusted as a filter: a job
+    /// nobody has seen yet cannot be silently ignored, because its own insert
+    /// carries the thread id.
+    #[tokio::test]
+    async fn a_job_joining_a_thread_colds_the_snapshot_that_has_not_seen_it() {
+        let (emitter, cache) = invalidating_emitter();
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &["old-job"], &rebuilds).await;
+
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "jobs",
+                    "jobId": "new-job",
+                    "threadId": "th",
+                    "projectId": "proj",
+                }),
+            )
+            .unwrap();
+        publish_snapshot(&cache, "proj", &["old-job", "new-job"], &rebuilds).await;
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 2);
+
+        // And now that it is in the set, its transcript reaches the rollup too.
+        emitter
+            .emit("db-change", events_frame("proj", "new-job"))
+            .unwrap();
+        publish_snapshot(&cache, "proj", &["old-job", "new-job"], &rebuilds).await;
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 3);
+    }
+
+    /// An issue node's job insert is not a thread's business.
+    #[tokio::test]
+    async fn a_job_outside_any_thread_does_not_cold_the_snapshot() {
+        let (emitter, cache) = invalidating_emitter();
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &[], &rebuilds).await;
+
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({
+                    "table": "jobs",
+                    "jobId": "issue-node",
+                    "issueId": "i-1",
+                    "threadId": Value::Null,
+                    "projectId": "proj",
+                }),
+            )
+            .unwrap();
+        publish_snapshot(&cache, "proj", &[], &rebuilds).await;
+
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 1);
+    }
+
+    /// A frame that cannot be placed against the job set rebuilds anyway.
+    /// Skipping work is only safe where the projection is CERTAIN the work is
+    /// unnecessary; `permission_requests` carries no job id at all.
+    #[tokio::test]
+    async fn an_unplaceable_frame_still_rebuilds() {
+        let (emitter, cache) = invalidating_emitter();
+        let rebuilds = AtomicUsize::new(0);
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+
+        emitter
+            .emit(
+                "db-change",
+                serde_json::json!({"table": "permission_requests", "projectId": "proj"}),
+            )
+            .unwrap();
+        publish_snapshot(&cache, "proj", &["thread-job"], &rebuilds).await;
+
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 2);
+    }
+
     /// The dependency set, asserted as behavior: a change to one of the rollup's
-    /// five inputs advances its project's generation, and a change to anything
-    /// else — notably a merge request or a check result — does not.
+    /// inputs advances its project's generation, and a change to anything else
+    /// — notably a merge request or a check result — does not.
+    ///
+    /// Every frame here is deliberately unplaceable against a job set, so this
+    /// asserts only which TABLES are inputs. Which individual writes to those
+    /// tables are relevant is a separate contract, covered by the job-scoping
+    /// tests below.
     #[test]
     fn only_the_rollups_own_inputs_advance_its_generation() {
         // `runs` is in the set because the SQL resolves a pending permission's
         // owning job through it when the permission row carries no job id.
+        // `events` is in it because the unread count it moves now lives inside
+        // the same snapshot.
         for table in [
             "threads",
-            "jobs",
             "turns",
             "prompts",
             "permission_requests",
             "runs",
+            "events",
         ] {
             let (emitter, cache) = invalidating_emitter();
             let before = cache.generation("proj");
@@ -826,7 +1496,6 @@ mod tests {
             "check_result_cache",
             "issues",
             "executions",
-            "events",
         ] {
             let (emitter, cache) = invalidating_emitter();
             let before = cache.generation("proj");

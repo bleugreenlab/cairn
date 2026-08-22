@@ -60,11 +60,7 @@ pub(crate) fn opencode_api_key(orch: &Orchestrator) -> Option<String> {
         store
             .accounts_for_provider(ApiProvider::OpenCode, None)
             .into_iter()
-            .find(|account| {
-                account
-                    .compatible_backends()
-                    .contains(&OPENCODE_BACKEND_KEY)
-            })
+            .find(|account| account.serves_backend(OPENCODE_BACKEND_KEY))
             .and_then(|account| match &account.auth {
                 ProviderAuth::ApiKey { value } => Some(value.clone()),
                 _ => None,

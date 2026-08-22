@@ -638,6 +638,8 @@ mod tests {
             extras: None,
             model: None,
             resolved_backend: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 
@@ -1140,6 +1142,8 @@ mod pinned_agent_tests {
             extras: None,
             model: None,
             resolved_backend: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 

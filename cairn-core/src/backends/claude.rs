@@ -58,11 +58,163 @@ const NO_CLAUDE_CREDENTIAL: &str = "No Claude account is available for this sess
 const TOOL_INPUT_PREVIEW_MAX_CHARS: usize = 512;
 const CLAUDE_TURN_NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CLAUDE_TURN_WATCHDOG_POLL: Duration = Duration::from_secs(1);
+const CLAUDE_TURN_WATCHDOG_HEARTBEAT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 struct ClaudeLaunchContract {
     args: Vec<String>,
     env: HashMap<String, String>,
+}
+
+fn replace_claude_watchdog_lease(
+    db: Arc<LocalDb>,
+    slot: &Arc<Mutex<Option<crate::runs::watchdog_ledger::WatchdogIdentity>>>,
+    run_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    runner_boot_id: &str,
+) -> Result<(), String> {
+    let replacement =
+        arm_claude_watchdog_lease(db.clone(), run_id, session_id, turn_id, runner_boot_id)?;
+    let previous = slot
+        .lock()
+        .map_err(|_| "Claude watchdog identity lock was poisoned".to_string())?
+        .replace(replacement);
+    if let Some(previous) = previous {
+        disarm_claude_watchdog_lease(db, &previous, "provider_turn_replaced");
+    }
+    Ok(())
+}
+
+fn heartbeat_claude_watchdog_lease(
+    db: Arc<LocalDb>,
+    identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
+) {
+    let identity = identity.clone();
+    let now = chrono::Utc::now().timestamp();
+    if let Err(error) = run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        crate::runs::watchdog_ledger::heartbeat_watchdog(&db, &identity, now)
+            .await
+            .map_err(|error| error.to_string())
+    }) {
+        log::error!("Failed to heartbeat durable Claude watchdog: {error}");
+    }
+}
+
+fn disarm_claude_watchdog_lease(
+    db: Arc<LocalDb>,
+    identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
+    reason: &str,
+) {
+    let disarmed_identity = identity.clone();
+    let durable_reason = reason.to_string();
+    let now = chrono::Utc::now().timestamp();
+    match run_backend_db(CLAUDE_BACKEND_NAME, {
+        let db = db.clone();
+        async move {
+            crate::runs::watchdog_ledger::disarm_watchdog(
+                &db,
+                &disarmed_identity,
+                &durable_reason,
+                now,
+            )
+            .await
+            .map_err(|error| error.to_string())
+        }
+    }) {
+        Ok(true) => record_claude_watchdog_lifecycle(
+            db,
+            identity,
+            crate::runs::watchdog_ledger::WatchdogLifecycleKind::Disarmed,
+            None,
+            reason,
+        ),
+        Ok(false) => {}
+        Err(error) => log::error!("Failed to durably disarm Claude watchdog: {error}"),
+    }
+}
+
+fn record_claude_watchdog_lifecycle(
+    db: Arc<LocalDb>,
+    identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
+    kind: crate::runs::watchdog_ledger::WatchdogLifecycleKind,
+    phase: Option<crate::runs::watchdog_ledger::WatchdogPhase>,
+    reason: &str,
+) {
+    let event = crate::runs::watchdog_ledger::NewWatchdogLifecycle {
+        id: Uuid::new_v4().to_string(),
+        identity: identity.clone(),
+        kind,
+        phase,
+        reason: Some(reason.to_string()),
+        details: Some(serde_json::json!({ "provider": "claude" })),
+        successor_run_id: None,
+        successor_turn_id: None,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(error) = run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        crate::runs::watchdog_ledger::append_watchdog_lifecycle(&db, event)
+            .await
+            .map_err(|error| error.to_string())
+    }) {
+        log::error!("Failed to persist Claude watchdog lifecycle: {error}");
+    }
+}
+
+fn arm_claude_watchdog_lease(
+    db: Arc<LocalDb>,
+    run_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    runner_boot_id: &str,
+) -> Result<crate::runs::watchdog_ledger::WatchdogIdentity, String> {
+    use crate::runs::watchdog_ledger::{
+        arm_watchdog, NewWatchdogLease, WatchdogIdentity, WatchdogPhase,
+    };
+    let identity = WatchdogIdentity {
+        run_id: run_id.to_string(),
+        session_id: session_id.to_string(),
+        provider_turn_id: turn_id.to_string(),
+        generation: Uuid::new_v4().to_string(),
+    };
+    let now = chrono::Utc::now().timestamp();
+    let armed = identity.clone();
+    let runner_boot_id = runner_boot_id.to_string();
+    run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        arm_watchdog(
+            &db,
+            NewWatchdogLease {
+                identity: armed,
+                runner_boot_id,
+                phase: WatchdogPhase::ProviderProgress,
+                phase_deadline_at: now + CLAUDE_TURN_NO_PROGRESS_TIMEOUT.as_secs() as i64,
+                now,
+            },
+            Uuid::new_v4().to_string(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+    })?
+    .then_some(identity)
+    .ok_or_else(|| "Claude watchdog lease was not armed".to_string())
+}
+
+fn update_claude_watchdog_lease(
+    db: Arc<LocalDb>,
+    identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
+    phase: crate::runs::watchdog_ledger::WatchdogPhase,
+) {
+    use crate::runs::watchdog_ledger::refresh_watchdog_progress;
+    let identity = identity.clone();
+    let now = chrono::Utc::now().timestamp();
+    let deadline = now + CLAUDE_TURN_NO_PROGRESS_TIMEOUT.as_secs() as i64;
+    if let Err(error) = run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        refresh_watchdog_progress(&db, &identity, phase, deadline, now, now)
+            .await
+            .map_err(|error| error.to_string())
+    }) {
+        log::error!("Failed to update durable Claude watchdog lease: {error}");
+    }
 }
 
 fn terminal_result_is_rate_limit(data: &serde_json::Value) -> bool {
@@ -202,13 +354,15 @@ impl ClaudeTurnProgressWatchdog {
         }
     }
 
-    fn observe_turn(&mut self, turn_id: Option<&str>, now: Instant) {
+    fn observe_turn(&mut self, turn_id: Option<&str>, now: Instant) -> bool {
         if self.active_turn_id.as_deref() != turn_id {
             self.active_turn_id = turn_id.map(str::to_owned);
             self.last_forward_progress_at = now;
             self.pending_tool_count = 0;
             self.fired = false;
+            return true;
         }
+        false
     }
 
     fn record_forward_progress(&mut self, now: Instant) {
@@ -335,12 +489,73 @@ struct StreamingState {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_claude_context_snapshot, claude_context_used_tokens, parse_thinking_tokens_estimate,
-        should_confirm_backend_id_after_init, terminal_result_error_message, ClaudeBackend,
+        arm_claude_watchdog_lease, build_claude_context_snapshot, claude_context_used_tokens,
+        disarm_claude_watchdog_lease, message_start_usage, parse_thinking_tokens_estimate,
+        record_claude_watchdog_lifecycle, should_confirm_backend_id_after_init,
+        terminal_result_error_message, update_claude_watchdog_lease, ClaudeBackend,
         ClaudeTurnProgressWatchdog,
     };
     use crate::agent_process::stream::{parse_event, ClaudeEvent, Usage};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn durable_claude_watchdog_records_tool_suppression_and_disarm() {
+        use crate::runs::watchdog_ledger::{
+            get_watchdog_lease, list_watchdog_lifecycle, WatchdogLeaseState, WatchdogLifecycleKind,
+            WatchdogPhase,
+        };
+
+        let db = Arc::new(crate::storage::migrated_test_db("claude-watchdog-lifecycle").await);
+        db.execute_script(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO sessions (id, chat_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('session', 'chat', 'claude', 'open', 1, 1, 1);
+             INSERT INTO runs (id, session_id, status, created_at, updated_at)
+               VALUES ('run', 'session', 'live', 1, 1);
+             PRAGMA foreign_keys = ON;",
+        )
+        .await
+        .unwrap();
+
+        let identity =
+            arm_claude_watchdog_lease(db.clone(), "run", "session", "turn", "boot").unwrap();
+        update_claude_watchdog_lease(db.clone(), &identity, WatchdogPhase::ToolOutstanding);
+        record_claude_watchdog_lifecycle(
+            db.clone(),
+            &identity,
+            WatchdogLifecycleKind::PhaseTransition,
+            Some(WatchdogPhase::ToolOutstanding),
+            "tool_outstanding",
+        );
+
+        let lease = get_watchdog_lease(&db, "run", "session", "turn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.phase, WatchdogPhase::ToolOutstanding);
+        assert!(lease.phase_deadline_at < i64::MAX);
+
+        disarm_claude_watchdog_lease(db.clone(), &identity, "reader_shutdown");
+        let lease = get_watchdog_lease(&db, "run", "session", "turn")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.state, WatchdogLeaseState::Disarmed);
+        assert_eq!(
+            list_watchdog_lifecycle(&db, &identity)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                WatchdogLifecycleKind::Armed,
+                WatchdogLifecycleKind::PhaseTransition,
+                WatchdogLifecycleKind::Disarmed,
+            ]
+        );
+    }
 
     #[test]
     fn silent_resumed_turn_expires_at_the_bounded_window() {
@@ -482,6 +697,24 @@ mod tests {
             "estimated_tokens_delta": 100,
         });
         assert_eq!(parse_thinking_tokens_estimate(&data), Some(150));
+    }
+
+    #[test]
+    fn message_start_usage_reads_prefill_and_cache_tokens() {
+        let message = serde_json::json!({
+            "id": "msg-1",
+            "usage": {
+                "input_tokens": 17,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 23,
+                "cache_creation_input_tokens": 5
+            }
+        });
+
+        let usage = message_start_usage(Some(&message)).expect("message_start usage");
+        assert_eq!(usage.input_tokens, 17);
+        assert_eq!(usage.cache_read_input_tokens, Some(23));
+        assert_eq!(usage.cache_creation_input_tokens, Some(5));
     }
 
     #[test]
@@ -643,6 +876,55 @@ fn extract_tool_start(content_block: &serde_json::Value) -> Option<(Option<Strin
     Some((id, name.to_string()))
 }
 
+fn message_start_usage(message: Option<&serde_json::Value>) -> Option<Usage> {
+    message?
+        .get("usage")
+        .and_then(|usage| serde_json::from_value(usage.clone()).ok())
+}
+
+fn trace_claude_first_nonempty_delta(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: Option<&str>,
+    mode: &str,
+    bytes: usize,
+) {
+    let current_turn = orch.process_state.get_current_turn_id(run_id);
+    let turn_gate = current_turn.as_deref().unwrap_or("untracked");
+    if crate::resume_timing::mark_first(format!("claude-nonempty:{run_id}:{turn_gate}")) {
+        // This marks the first visible prose/thinking payload, not first-token latency:
+        // a tool-first turn may not reach it until after one or more tools finish.
+        let mut timing =
+            crate::resume_timing::ResumeTimingEvent::new("claude_first_nonempty_delta");
+        timing.run_id = Some(run_id);
+        timing.session_id = session_id;
+        timing.turn_id = current_turn.as_deref();
+        timing.mode = Some(mode);
+        timing.bytes = Some(bytes);
+        timing.emit();
+    }
+}
+
+fn trace_claude_first_any_delta(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: Option<&str>,
+    mode: &str,
+    bytes: usize,
+) {
+    let current_turn = orch.process_state.get_current_turn_id(run_id);
+    let turn_gate = current_turn.as_deref().unwrap_or("untracked");
+    if crate::resume_timing::mark_first(format!("claude-any-delta:{run_id}:{turn_gate}")) {
+        let mut timing = crate::resume_timing::ResumeTimingEvent::new("claude_first_any_delta");
+        timing.run_id = Some(run_id);
+        timing.session_id = session_id;
+        timing.turn_id = current_turn.as_deref();
+        timing.mode = Some(mode);
+        timing.bytes = Some(bytes);
+        timing.emit();
+    }
+}
+
 /// Emit a true-delta `streaming-update`: only the newly-produced scalar tail,
 /// plus the current absolute lengths so the frontend can detect gaps and
 /// self-heal against the DB snapshot.
@@ -657,9 +939,11 @@ fn emit_streaming_delta(
     thinking_ms: Option<i64>,
     tool_write: Option<&StreamingToolWrite>,
 ) {
-    if crate::resume_timing::mark_first(format!("claude-streaming-emit:{run_id}")) {
+    if crate::resume_timing::mark_first(format!("claude-streaming-emit:{event_id}")) {
         let mut event = crate::resume_timing::ResumeTimingEvent::new("claude_first_streaming_emit");
+        let current_turn = orch.process_state.get_current_turn_id(run_id);
         event.run_id = Some(run_id);
+        event.turn_id = current_turn.as_deref();
         event.stream_id = Some(event_id);
         event.bytes = Some(
             delta.content_delta.as_ref().map_or(0, String::len)
@@ -667,8 +951,13 @@ fn emit_streaming_delta(
         );
         event.emit();
     }
+    let current_turn = orch.process_state.get_current_turn_id(run_id);
     crate::transcripts::stream_store::trace_first_frontend_delta_emit(
-        run_id, None, event_id, delta,
+        run_id,
+        None,
+        current_turn.as_deref(),
+        event_id,
+        delta,
     );
     let _ = orch.services.emitter.emit(
         "streaming-update",
@@ -1866,8 +2155,6 @@ impl ClaudeBackend {
         let mut first_stdout_logged = false;
         let mut parse_metrics = crate::agent_process::stream::ParseMetrics::default();
         let mut read_failures: usize = 0;
-        let mut first_message_start_logged = false;
-        let mut first_nonempty_delta_logged = false;
         let mut boundary_checker = TurnBoundaryChecker::new();
         let mut terminal_tool_suspended = false;
         // Set when we send the terminal-tool boundary interrupt to end a work
@@ -1885,28 +2172,78 @@ impl ClaudeBackend {
         let progress_watchdog = Arc::new(Mutex::new(ClaudeTurnProgressWatchdog::new(
             CLAUDE_TURN_NO_PROGRESS_TIMEOUT,
         )));
+        let durable_watchdog = Arc::new(Mutex::new(None));
         if let Ok(mut watchdog) = progress_watchdog.lock() {
             let current_turn = orch.process_state.get_current_turn_id(run_id);
             watchdog.observe_turn(current_turn.as_deref(), Instant::now());
+            if let (Some(session_id), Some(turn_id)) =
+                (session_id.as_deref(), current_turn.as_deref())
+            {
+                match arm_claude_watchdog_lease(
+                    run_db.clone(),
+                    run_id,
+                    session_id,
+                    turn_id,
+                    &orch.boot_at.to_string(),
+                ) {
+                    Ok(identity) => *durable_watchdog.lock().unwrap() = Some(identity),
+                    Err(error) => log::error!(
+                        "Failed to initially arm durable Claude watchdog for run {run_id}: {error}; the watchdog worker will retry"
+                    ),
+                }
+            }
         }
         let watchdog_alive = Arc::new(AtomicBool::new(true));
         {
             let watchdog = progress_watchdog.clone();
+            let durable_watchdog = durable_watchdog.clone();
             let alive = watchdog_alive.clone();
             let orch = orch.clone();
             let run_id = run_id.to_string();
             let session_id = session_id.clone();
             let watchdog_run_db = run_db.clone();
             thread::spawn(move || {
+                let mut last_durable_heartbeat = Instant::now();
                 while alive.load(Ordering::Acquire) {
                     thread::sleep(CLAUDE_TURN_WATCHDOG_POLL);
                     if !alive.load(Ordering::Acquire) {
                         break;
                     }
+                    if last_durable_heartbeat.elapsed() >= CLAUDE_TURN_WATCHDOG_HEARTBEAT {
+                        if let Some(identity) =
+                            durable_watchdog.lock().ok().and_then(|guard| guard.clone())
+                        {
+                            heartbeat_claude_watchdog_lease(watchdog_run_db.clone(), &identity);
+                        }
+                        last_durable_heartbeat = Instant::now();
+                    }
                     let current_turn = orch.process_state.get_current_turn_id(&run_id);
                     let expired_turn = watchdog.lock().ok().and_then(|mut guard| {
                         let now = Instant::now();
-                        guard.observe_turn(current_turn.as_deref(), now);
+                        let turn_changed = guard.observe_turn(current_turn.as_deref(), now);
+                        let durable_missing = durable_watchdog
+                            .lock()
+                            .map(|guard| guard.is_none())
+                            .unwrap_or(true);
+                        if turn_changed || durable_missing {
+                            if let (Some(session_id), Some(turn_id)) =
+                                (session_id.as_deref(), current_turn.as_deref())
+                            {
+                                match replace_claude_watchdog_lease(
+                                    watchdog_run_db.clone(),
+                                    &durable_watchdog,
+                                    &run_id,
+                                    session_id,
+                                    turn_id,
+                                    &orch.boot_at.to_string(),
+                                ) {
+                                    Ok(()) => {}
+                                    Err(error) => log::error!(
+                                        "Failed to durably arm Claude watchdog for run {run_id}: {error}"
+                                    ),
+                                }
+                            }
+                        }
                         guard.expired(now)
                     });
                     let Some(turn_id) = expired_turn else {
@@ -1922,60 +2259,52 @@ impl ClaudeBackend {
                         CLAUDE_TURN_NO_PROGRESS_TIMEOUT.as_secs()
                     );
                     insert_error_event(&orch, &run_id, session_id.as_deref(), &diagnosis);
-                    let (job_id, _) = run_job_execution(&watchdog_run_db, &run_id);
-                    let Some(job_id) = job_id else {
-                        let failure = "Cairn could not identify the job for the silent Claude turn, so automatic recovery was not possible.";
-                        insert_error_event(&orch, &run_id, session_id.as_deref(), failure);
-                        let _ = crate::orchestrator::lifecycle::kill_session_with_reason(
-                            &orch, &run_id, "crash",
-                        );
-                        break;
-                    };
-                    if let Err(error) = crate::orchestrator::lifecycle::kill_session_with_reason(
-                        &orch,
-                        &run_id,
-                        crate::orchestrator::lifecycle::PROVIDER_SILENCE_RECOVERY_EXIT_REASON,
-                    ) {
-                        let failure = format!(
-                            "Cairn could not stop the silent Claude turn for recovery: {error}"
-                        );
-                        insert_error_event(&orch, &run_id, session_id.as_deref(), &failure);
-                        crate::orchestrator::lifecycle::report_recovery_launch_failure(
-                            &orch, &run_id,
-                        );
-                        break;
-                    }
-                    let recovery_prompt = format!(
-                        "{diagnosis} Continue from the completed tool result already present in the transcript."
-                    );
-                    match crate::execution::jobs::continue_job_impl(
-                        &orch,
-                        &job_id,
-                        Some(&recovery_prompt),
-                        None,
-                        Some(crate::execution::jobs::ResumeContext {
-                            suppress_user_event: true,
-                            ..Default::default()
-                        }),
-                    ) {
-                        Ok(_) => insert_error_event(
+                    let identity = durable_watchdog.lock().ok().and_then(|guard| guard.clone());
+                    let Some(identity) = identity else {
+                        insert_error_event(
                             &orch,
                             &run_id,
                             session_id.as_deref(),
-                            "Cairn started a recovery turn after the silent Claude continuation.",
-                        ),
-                        Err(error) => {
-                            let failure = format!(
-                                "Cairn could not start the recovery turn after aborting the silent Claude continuation: {error}"
+                            "Cairn could not recover the silent Claude turn because its durable watchdog lease was unavailable.",
+                        );
+                        break;
+                    };
+                    let wall_now = chrono::Utc::now().timestamp();
+                    let expired_identity = identity.clone();
+                    let expired_db = watchdog_run_db.clone();
+                    match run_backend_db(CLAUDE_BACKEND_NAME, async move {
+                        crate::runs::watchdog_ledger::expire_watchdog(
+                            &expired_db,
+                            &expired_identity,
+                            wall_now,
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    }) {
+                        Ok(true) => {
+                            record_claude_watchdog_lifecycle(
+                                watchdog_run_db.clone(),
+                                &identity,
+                                crate::runs::watchdog_ledger::WatchdogLifecycleKind::Expired,
+                                None,
+                                "no_provider_progress",
                             );
-                            log::error!(
-                                "Failed to self-resume silent Claude turn {turn_id} for job {job_id}: {error}"
-                            );
-                            insert_error_event(&orch, &run_id, session_id.as_deref(), &failure);
-                            crate::orchestrator::lifecycle::report_recovery_launch_failure(
-                                &orch, &run_id,
-                            );
+                            if let Err(error) =
+                                crate::orchestrator::lifecycle::recover_provider_watchdog(
+                                    &orch, &identity, wall_now,
+                                )
+                            {
+                                log::error!(
+                                    "Durable Claude watchdog recovery failed for turn {turn_id}: {error}"
+                                );
+                            }
                         }
+                        Ok(false) => log::error!(
+                            "Claude watchdog expiry lost durable lease for turn {turn_id}"
+                        ),
+                        Err(error) => log::error!(
+                            "Failed to persist Claude watchdog expiry for turn {turn_id}: {error}"
+                        ),
                     }
                     break;
                 }
@@ -2057,8 +2386,35 @@ impl ClaudeBackend {
                     if let Ok(mut watchdog) = progress_watchdog.lock() {
                         let now = Instant::now();
                         let current_turn = orch.process_state.get_current_turn_id(run_id);
+                        let changed = watchdog.active_turn_id.as_deref() != current_turn.as_deref();
                         watchdog.observe_turn(current_turn.as_deref(), now);
                         watchdog.record_forward_progress(now);
+                        if changed {
+                            if let (Some(session_id), Some(turn_id)) =
+                                (session_id.as_deref(), current_turn.as_deref())
+                            {
+                                if let Err(error) = replace_claude_watchdog_lease(
+                                    run_db.clone(),
+                                    &durable_watchdog,
+                                    run_id,
+                                    session_id,
+                                    turn_id,
+                                    &orch.boot_at.to_string(),
+                                ) {
+                                    log::error!(
+                                        "Failed to durably replace Claude watchdog for run {run_id}: {error}"
+                                    );
+                                }
+                            }
+                        } else if let Some(identity) =
+                            durable_watchdog.lock().ok().and_then(|guard| guard.clone())
+                        {
+                            update_claude_watchdog_lease(
+                                run_db.clone(),
+                                &identity,
+                                crate::runs::watchdog_ledger::WatchdogPhase::ProviderProgress,
+                            );
+                        }
                     }
                     // A terminal Result seen at any point means the turn completed;
                     // capture it before any branch so a later EOF finalizes Exited.
@@ -2097,32 +2453,30 @@ impl ClaudeBackend {
                     }
 
                     if let ClaudeEvent::System { subtype, data, .. } = &event {
-                        if subtype == "init" {
-                            if validate_claude_init(data, &[]).is_err() {
-                                // Close the child first so both output pipes reach
-                                // EOF, then join stderr. Snapshotting the parallel
-                                // drain here would race the actionable MCP error.
-                                orch.process_state.stop_and_remove(run_id);
-                                let diagnostics = stderr_watch
-                                    .take()
-                                    .map(StderrWatch::settle_with_diagnostics)
-                                    .map(|(_, diagnostics)| diagnostics)
-                                    .unwrap_or_default();
-                                let error = validate_claude_init(data, &diagnostics)
-                                    .expect_err("missing Cairn tools remains invalid");
-                                log::error!(
-                                    "Rejecting Claude launch without Cairn MCP tools for run {}: {}",
-                                    &run_id[..run_id.len().min(8)],
-                                    error
-                                );
-                                insert_error_event(orch, run_id, session_id.as_deref(), &error);
-                                crate::orchestrator::lifecycle::finalize_run(
-                                    orch,
-                                    run_id,
-                                    RunStatus::Crashed,
-                                );
-                                break;
-                            }
+                        if subtype == "init" && validate_claude_init(data, &[]).is_err() {
+                            // Close the child first so both output pipes reach
+                            // EOF, then join stderr. Snapshotting the parallel
+                            // drain here would race the actionable MCP error.
+                            orch.process_state.stop_and_remove(run_id);
+                            let diagnostics = stderr_watch
+                                .take()
+                                .map(StderrWatch::settle_with_diagnostics)
+                                .map(|(_, diagnostics)| diagnostics)
+                                .unwrap_or_default();
+                            let error = validate_claude_init(data, &diagnostics)
+                                .expect_err("missing Cairn tools remains invalid");
+                            log::error!(
+                                "Rejecting Claude launch without Cairn MCP tools for run {}: {}",
+                                &run_id[..run_id.len().min(8)],
+                                error
+                            );
+                            insert_error_event(orch, run_id, session_id.as_deref(), &error);
+                            crate::orchestrator::lifecycle::finalize_run(
+                                orch,
+                                run_id,
+                                RunStatus::Crashed,
+                            );
+                            break;
                         }
                     }
 
@@ -2306,17 +2660,26 @@ impl ClaudeBackend {
                             continue;
                         }
                         match inner {
-                            StreamEventInner::MessageStart { .. } => {
+                            StreamEventInner::MessageStart { message } => {
                                 let current_turn = orch.process_state.get_current_turn_id(run_id);
-                                if !first_message_start_logged {
+                                let turn_gate = current_turn.as_deref().unwrap_or("untracked");
+                                if crate::resume_timing::mark_first(format!(
+                                    "claude-message-start:{run_id}:{turn_gate}"
+                                )) {
                                     let mut timing = crate::resume_timing::ResumeTimingEvent::new(
                                         "claude_first_message_start",
                                     );
                                     timing.run_id = Some(run_id);
                                     timing.session_id = session_id.as_deref();
                                     timing.turn_id = current_turn.as_deref();
+                                    if let Some(usage) = message_start_usage(message.as_ref()) {
+                                        timing.input_tokens = Some(u64::from(usage.input_tokens));
+                                        timing.cache_read_tokens =
+                                            usage.cache_read_input_tokens.map(u64::from);
+                                        timing.cache_creation_tokens =
+                                            usage.cache_creation_input_tokens.map(u64::from);
+                                    }
                                     timing.emit();
-                                    first_message_start_logged = true;
                                 }
                                 if streaming_state.is_some() {
                                     log::warn!("New MessageStart while a stream is still active");
@@ -2378,6 +2741,26 @@ impl ClaudeBackend {
                                 }
                             }
                             StreamEventInner::ContentBlockStart { content_block, .. } => {
+                                if let Some(content_block) = content_block.as_ref() {
+                                    let mode = content_block
+                                        .get("type")
+                                        .and_then(serde_json::Value::as_str)
+                                        .and_then(|kind| match kind {
+                                            "text" => Some("text"),
+                                            "thinking" => Some("thinking"),
+                                            "tool_use" => Some("tool_use"),
+                                            _ => None,
+                                        });
+                                    if let Some(mode) = mode {
+                                        trace_claude_first_any_delta(
+                                            orch,
+                                            run_id,
+                                            session_id.as_deref(),
+                                            mode,
+                                            0,
+                                        );
+                                    }
+                                }
                                 if let (Some(ref mut state), Some(content_block)) =
                                     (streaming_state.as_mut(), content_block.as_ref())
                                 {
@@ -2400,27 +2783,36 @@ impl ClaudeBackend {
                             StreamEventInner::ContentBlockDelta { delta, .. } => {
                                 let delta_trace = match delta {
                                     DeltaContent::TextDelta { text } if !text.is_empty() => {
-                                        Some(("content", text.len()))
+                                        Some(("text", text.len()))
                                     }
                                     DeltaContent::ThinkingDelta { thinking }
                                         if !thinking.is_empty() =>
                                     {
                                         Some(("thinking", thinking.len()))
                                     }
+                                    DeltaContent::InputJsonDelta { partial_json }
+                                        if !partial_json.is_empty() =>
+                                    {
+                                        Some(("tool_use", partial_json.len()))
+                                    }
                                     _ => None,
                                 };
-                                if !first_nonempty_delta_logged {
-                                    if let Some((mode, bytes)) = delta_trace {
-                                        let mut timing =
-                                            crate::resume_timing::ResumeTimingEvent::new(
-                                                "claude_first_nonempty_delta",
-                                            );
-                                        timing.run_id = Some(run_id);
-                                        timing.session_id = session_id.as_deref();
-                                        timing.mode = Some(mode);
-                                        timing.bytes = Some(bytes);
-                                        timing.emit();
-                                        first_nonempty_delta_logged = true;
+                                if let Some((mode, bytes)) = delta_trace {
+                                    trace_claude_first_any_delta(
+                                        orch,
+                                        run_id,
+                                        session_id.as_deref(),
+                                        mode,
+                                        bytes,
+                                    );
+                                    if mode != "tool_use" {
+                                        trace_claude_first_nonempty_delta(
+                                            orch,
+                                            run_id,
+                                            session_id.as_deref(),
+                                            mode,
+                                            bytes,
+                                        );
                                     }
                                 }
                                 if let Some(ref mut state) = streaming_state {
@@ -2633,7 +3025,43 @@ impl ClaudeBackend {
                         }
                     }
                     if let Ok(mut watchdog) = progress_watchdog.lock() {
+                        let was_suppressed = watchdog.pending_tool_count > 0;
                         watchdog.set_pending_tool_count(pending_tool_ids.len());
+                        let is_suppressed = watchdog.pending_tool_count > 0;
+                        if was_suppressed != is_suppressed {
+                            if let Some(identity) =
+                                durable_watchdog.lock().ok().and_then(|guard| guard.clone())
+                            {
+                                record_claude_watchdog_lifecycle(
+                                    run_db.clone(),
+                                    &identity,
+                                    crate::runs::watchdog_ledger::WatchdogLifecycleKind::PhaseTransition,
+                                    Some(if is_suppressed {
+                                        crate::runs::watchdog_ledger::WatchdogPhase::ToolOutstanding
+                                    } else {
+                                        crate::runs::watchdog_ledger::WatchdogPhase::PostToolContinuation
+                                    }),
+                                    if is_suppressed {
+                                        "tool_outstanding"
+                                    } else {
+                                        "tool_result_observed"
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if let Some(identity) =
+                        durable_watchdog.lock().ok().and_then(|guard| guard.clone())
+                    {
+                        update_claude_watchdog_lease(
+                            run_db.clone(),
+                            &identity,
+                            if pending_tool_ids.is_empty() {
+                                crate::runs::watchdog_ledger::WatchdogPhase::PostToolContinuation
+                            } else {
+                                crate::runs::watchdog_ledger::WatchdogPhase::ToolOutstanding
+                            },
+                        );
                     }
 
                     // Handle Assistant events during streaming
@@ -3030,6 +3458,9 @@ impl ClaudeBackend {
         }
 
         watchdog_alive.store(false, Ordering::Release);
+        if let Some(identity) = durable_watchdog.lock().ok().and_then(|guard| guard.clone()) {
+            disarm_claude_watchdog_lease(run_db.clone(), &identity, "reader_shutdown");
+        }
         let mut parse_summary =
             crate::resume_timing::ResumeTimingEvent::new("claude_stream_parse_summary");
         parse_summary.run_id = Some(run_id);

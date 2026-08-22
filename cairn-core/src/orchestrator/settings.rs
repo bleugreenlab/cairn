@@ -2,9 +2,32 @@
 
 use crate::config::keybinds::{self, KeySequence, KeybindsFile};
 use crate::config::settings;
-use crate::models::{Settings, UpdateSettings};
+use crate::models::{ChannelsConfig, Settings, UpdateSettings};
 
 use super::Orchestrator;
+
+// Keep token resolution behind this closure: on macOS, merely reading a stored
+// token can open a keychain authorization dialog and block headless runners.
+fn validate_telegram_channel_update(
+    channels: Option<&ChannelsConfig>,
+    token: impl FnOnce() -> Option<crate::security::broker::BrokeredSecret>,
+) -> Result<(), String> {
+    let Some(channels) = channels else {
+        return Ok(());
+    };
+    let Some(token) = token() else {
+        return Ok(());
+    };
+
+    if let Some(error) = crate::channels::telegram_identity_error_for_brokered_token(
+        &channels.telegram.chat_id,
+        &channels.telegram.allow_from,
+        &token,
+    ) {
+        return Err(error);
+    }
+    Ok(())
+}
 
 impl Orchestrator {
     /// Get current settings from file.
@@ -43,7 +66,6 @@ impl Orchestrator {
                     .accounts
                     .iter()
                     .flat_map(|account| account.compatible_backends())
-                    .map(str::to_string)
                     .collect()
             })
             .unwrap_or_default();
@@ -80,23 +102,14 @@ impl Orchestrator {
 
     /// Update settings with partial input.
     pub fn update_settings(&self, input: UpdateSettings) -> Result<Settings, String> {
-        if let (Some(channels), Some(token)) = (
-            input.channels.as_ref(),
+        validate_telegram_channel_update(input.channels.as_ref(), || {
             crate::security::broker::web_provider_key(
                 "channel/telegram",
                 "BOT_TOKEN",
                 "validate Telegram channel settings",
-            ),
-        ) {
-            if let Some(error) = crate::channels::telegram_identity_error_for_brokered_token(
-                &channels.telegram.chat_id,
-                &channels.telegram.allow_from,
-                &token,
-            ) {
-                return Err(error);
-            }
-        }
-        let current = settings::update_settings(&self.config_dir, input)?;
+            )
+        })?;
+        let current = settings::update_settings(&self.config_dir, input, &self.provider_names())?;
 
         // Emit config-changed event
         let _ = self.services.emitter.emit(
@@ -164,5 +177,31 @@ impl Orchestrator {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_update_without_channels_does_not_request_telegram_token() {
+        validate_telegram_channel_update(None, || {
+            panic!("Telegram token lookup must be lazy when channels are absent")
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn settings_update_with_channels_requests_telegram_token() {
+        let mut requested = false;
+
+        validate_telegram_channel_update(Some(&ChannelsConfig::default()), || {
+            requested = true;
+            None
+        })
+        .unwrap();
+
+        assert!(requested);
     }
 }

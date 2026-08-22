@@ -50,6 +50,7 @@ pub struct ReconcileReport {
     pub inspected: usize,
     pub ambiguous_clock: usize,
     pub claimed: usize,
+    pub lost_claim: usize,
     pub recovered: usize,
     pub recovery_failed: usize,
 }
@@ -98,7 +99,14 @@ pub async fn reconcile_watchdog_leases(
         }
 
         match recovery.recover(&lease).await {
-            Ok(RecoveryOutcome::LostClaim) => {}
+            Ok(RecoveryOutcome::LostClaim) => {
+                report.lost_claim += 1;
+                log::info!(
+                    "watchdog reconciler: recovery claim lost for run {} generation {}",
+                    lease.identity.run_id,
+                    lease.identity.generation
+                );
+            }
             Ok(RecoveryOutcome::Recovered { .. }) => {
                 report.claimed += 1;
                 report.recovered += 1;
@@ -328,6 +336,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(report.ambiguous_clock, 1);
+        assert_eq!(report.claimed, 0);
+    }
+
+    struct LosingRecovery;
+
+    #[async_trait]
+    impl WatchdogRecovery for LosingRecovery {
+        async fn recover(&self, _lease: &WatchdogLease) -> Result<RecoveryOutcome, String> {
+            Ok(RecoveryOutcome::LostClaim)
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_recovery_claim_is_reported() {
+        let (db, _) = fixture("boot-a").await;
+        let report = reconcile_watchdog_leases(
+            &db,
+            ReconcileScope::Periodic,
+            300,
+            DEFAULT_HEARTBEAT_GRACE_SECS,
+            &LosingRecovery,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.inspected, 1);
+        assert_eq!(report.lost_claim, 1);
         assert_eq!(report.claimed, 0);
     }
 }

@@ -244,6 +244,67 @@ async fn count_rows(conn: &Connection, table: &str) -> DbResult<i64> {
         .i64(0)
 }
 
+/// Digits in the version that opens every migration filename stem.
+const VERSION_DIGITS: usize = 4;
+
+/// The `NNNN` version at the head of a migration filename stem.
+///
+/// A migration's identity is written once, as the name of its SQL file. The
+/// `migration!` macro in `storage/migrations.rs` passes that one stem here, to
+/// [`name_from_stem`], and to `include_str!`, so the registered version, the
+/// registered name, and the embedded file cannot disagree with each other. A
+/// stem that is not `NNNN_name` fails the build instead of registering a
+/// migration under a version nobody wrote.
+pub(crate) const fn version_from_stem(stem: &'static str) -> &'static str {
+    split_stem(stem).0
+}
+
+/// The `name` following the version in a migration filename stem.
+///
+/// See [`version_from_stem`] for why both halves come from one string.
+pub(crate) const fn name_from_stem(stem: &'static str) -> &'static str {
+    split_stem(stem).1
+}
+
+/// Splits `NNNN_name` into its version and name, rejecting anything else.
+///
+/// Const so that every rejection is a compile error at the registration site.
+const fn split_stem(stem: &'static str) -> (&'static str, &'static str) {
+    let bytes = stem.as_bytes();
+    assert!(
+        bytes.len() > VERSION_DIGITS + 1,
+        "migration stem must be NNNN_name, for example 0205_wake_schedules"
+    );
+    assert!(
+        bytes[VERSION_DIGITS] == b'_',
+        "migration stem must separate version from name with '_', for example 0205_wake_schedules"
+    );
+
+    let mut digit = 0;
+    while digit < VERSION_DIGITS {
+        assert!(
+            bytes[digit].is_ascii_digit(),
+            "migration stem must open with a four-digit version, for example 0205_wake_schedules"
+        );
+        digit += 1;
+    }
+
+    let (version, rest) = bytes.split_at(VERSION_DIGITS);
+    // `rest` opens with the `_` separator asserted above.
+    let (_, name) = rest.split_at(1);
+    (as_str(version), as_str(name))
+}
+
+/// Reinterprets a stem slice as `str`. Both slices are cut at ASCII boundaries
+/// of an already-valid `str`, so the error arm is unreachable in practice and
+/// exists only because `const` code cannot `unwrap`.
+const fn as_str(bytes: &'static [u8]) -> &'static str {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(_) => panic!("migration stem must be valid UTF-8"),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Migration {
     pub(crate) version: &'static str,
@@ -526,6 +587,38 @@ mod tests {
             Some(row) => row.opt_text(0),
             None => Ok(None),
         }
+    }
+
+    #[test]
+    fn stem_splits_into_version_and_name() {
+        assert_eq!(version_from_stem("0205_wake_schedules"), "0205");
+        assert_eq!(name_from_stem("0205_wake_schedules"), "wake_schedules");
+        // A name may carry any number of further underscores.
+        assert_eq!(
+            name_from_stem("0091_drop_projects_server_id_and_servers"),
+            "drop_projects_server_id_and_servers"
+        );
+    }
+
+    // The rejections below are compile errors at every real call site, where the
+    // split runs in const context. Calling the same functions at runtime is the
+    // only way to observe which rejection fires for which malformed stem.
+    #[test]
+    #[should_panic(expected = "four-digit version")]
+    fn stem_without_a_version_is_rejected() {
+        let _ = version_from_stem("wake_schedules");
+    }
+
+    #[test]
+    #[should_panic(expected = "separate version from name")]
+    fn stem_without_a_separator_is_rejected() {
+        let _ = version_from_stem("02051wake_schedules");
+    }
+
+    #[test]
+    #[should_panic(expected = "NNNN_name")]
+    fn stem_with_no_name_is_rejected() {
+        let _ = name_from_stem("0205_");
     }
 
     #[test]

@@ -105,6 +105,7 @@ mod tests {
                 memory_budget_bytes: None,
                 sandbox: None,
                 toolchain_detection: None,
+                build_prerequisites: None,
             },
             current_load: 1,
             warm_roots: vec![cairn_common::executor_protocol::VerifiedWarmRoot {
@@ -117,6 +118,7 @@ mod tests {
             }],
             observed_at_unix_ms: 1,
             liveness_observed_at_unix_ms: None,
+            facts_stale_refresh_blocked: None,
         };
         upsert_executor(&db, &advertisement, 3, "online").await;
         upsert_executor(&db, &advertisement, 3, "offline").await;

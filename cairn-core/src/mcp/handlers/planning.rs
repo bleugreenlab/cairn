@@ -773,8 +773,7 @@ pub async fn answer_node_question(
     prompt_segment: &str,
     payload: &Value,
 ) -> Result<PromptAnswerOutcome, String> {
-    let actor = format!("cairn://p/{project_key}/{issue_number}/{exec_seq}/{node_segment}");
-    answer_node_question_with_provenance(
+    let (prompt_id, response, home_uri) = resolve_node_question(
         orch,
         project_key,
         issue_number,
@@ -782,12 +781,52 @@ pub async fn answer_node_question(
         node_segment,
         prompt_segment,
         payload,
+    )
+    .await?;
+    // Provenance names the job's CANONICAL home, never the coordinate the
+    // caller happened to address it by. A thread is addressed through the
+    // reserved `(0, 0, thread-name)` coordinate, so reassembling the actor from
+    // these arguments would persist `cairn://p/{key}/0/0/{thread}` — a sentinel
+    // that resolves to nothing — into every resolution receipt a thread ever
+    // writes. The fallback keeps issue behavior identical when a job somehow has
+    // no home to report.
+    let actor = home_uri.unwrap_or_else(|| {
+        format!("cairn://p/{project_key}/{issue_number}/{exec_seq}/{node_segment}")
+    });
+    answer_prompt_id(
+        orch,
+        &prompt_id,
+        response,
         crate::turns::queries::ResolutionProvenance::new(
             cairn_common::identity::AppearanceTransport::ResourcePatch,
             Some(actor),
         ),
     )
     .await
+}
+
+/// Resolve a node-coordinate question to its prompt, its normalized answer, and
+/// the answering job's canonical home URI.
+async fn resolve_node_question(
+    orch: &Orchestrator,
+    project_key: &str,
+    issue_number: i32,
+    exec_seq: i32,
+    node_segment: &str,
+    prompt_segment: &str,
+    payload: &Value,
+) -> Result<(String, String, Option<String>), String> {
+    let (prompt_id, questions_json, home_uri) = lookup_prompt_for_node_question(
+        orch,
+        project_key,
+        issue_number,
+        exec_seq,
+        node_segment,
+        prompt_segment,
+    )
+    .await?;
+    let response = normalize_prompt_answer_payload(&questions_json, payload)?;
+    Ok((prompt_id, response, home_uri))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,16 +840,16 @@ pub async fn answer_node_question_with_provenance(
     payload: &Value,
     provenance: crate::turns::queries::ResolutionProvenance,
 ) -> Result<PromptAnswerOutcome, String> {
-    let (prompt_id, questions_json) = lookup_prompt_for_node_question(
+    let (prompt_id, response, _home_uri) = resolve_node_question(
         orch,
         project_key,
         issue_number,
         exec_seq,
         node_segment,
         prompt_segment,
+        payload,
     )
     .await?;
-    let response = normalize_prompt_answer_payload(&questions_json, payload)?;
     answer_prompt_id(orch, &prompt_id, response, provenance).await
 }
 
@@ -901,7 +940,13 @@ async fn answer_prompt_id_impl(
                 Ok(outcome)
             }
             Err(error) => {
-                crate::channels::ledger::release_ask_action(&gate_db, &lease, &error).await?;
+                crate::channels::ledger::record_ask_action_failure(
+                    &gate_db,
+                    &lease,
+                    &error,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+                .await?;
                 Err(error)
             }
         };
@@ -1066,7 +1111,7 @@ async fn lookup_prompt_for_node_question(
     exec_seq: i32,
     node_segment: &str,
     prompt_segment: &str,
-) -> Result<(String, String), String> {
+) -> Result<(String, String, Option<String>), String> {
     let project_key = project_key.to_string();
     let node_segment = node_segment.to_string();
     let prompt_segment = prompt_segment.to_string();
@@ -1081,6 +1126,18 @@ async fn lookup_prompt_for_node_question(
             let node_segment = node_segment.clone();
             let prompt_segment = prompt_segment.clone();
             Box::pin(async move {
+                let job_id = crate::jobs::queries::job_id_for_node_coordinate_conn(
+                    conn,
+                    &project_key,
+                    issue_number,
+                    exec_seq,
+                    &node_segment,
+                    None,
+                )
+                .await?
+                .ok_or_else(|| DbError::internal(format!(
+                    "node {project_key}-{issue_number}/{exec_seq}/{node_segment} not found"
+                )))?;
                 let mut rows = conn
                     .query(
                         "
@@ -1088,26 +1145,18 @@ async fn lookup_prompt_for_node_question(
                         FROM prompts pr
                         JOIN runs r ON pr.run_id = r.id
                         JOIN jobs j ON COALESCE(pr.job_id, r.job_id) = j.id
-                        JOIN executions e ON j.execution_id = e.id
-                        JOIN issues i ON j.issue_id = i.id
-                        JOIN projects p ON i.project_id = p.id
-                        WHERE p.key = ?1
-                          AND i.number = ?2
-                          AND e.seq = ?3
-                          AND j.uri_segment = ?4
-                          AND pr.uri_segment = ?5
+                        WHERE j.id = ?1
+                          AND pr.uri_segment = ?2
                         LIMIT 1
                         ",
                         params![
-                            project_key.as_str(),
-                            issue_number as i64,
-                            exec_seq as i64,
-                            node_segment.as_str(),
+                            job_id.as_str(),
                             prompt_segment.as_str()
                         ],
                     )
                     .await?;
-                rows.next()
+                let (prompt_id, questions) = rows
+                    .next()
                     .await?
                     .map(|row| Ok::<_, DbError>((row.text(0)?, row.text(1)?)))
                     .transpose()?
@@ -1115,7 +1164,13 @@ async fn lookup_prompt_for_node_question(
                         DbError::internal(format!(
                             "question {prompt_segment} not found for {project_key}-{issue_number}/{exec_seq}/{node_segment}"
                         ))
-                    })
+                    })?;
+                // The job's canonical home, resolved through the same
+                // owner-aware walk that just found it, so provenance can name
+                // the node rather than the coordinate it was addressed by.
+                let home_uri =
+                    crate::jobs::queries::home_uri_for_job_conn(conn, &job_id).await?;
+                Ok((prompt_id, questions, home_uri))
             })
         })
         .await

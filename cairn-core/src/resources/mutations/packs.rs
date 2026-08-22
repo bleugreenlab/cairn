@@ -322,6 +322,7 @@ pub fn export_agent_plugin(
         .collect::<Vec<_>>();
     let servers = pack::mcp::parse_pack_mcp_file(&pack::lock::mcp_path(&orch.config_dir, pack_id))
         .unwrap_or_default()
+        .servers
         .into_iter()
         .map(|(name, config)| (name, pack::agent_plugin::AgentPluginServer { config }))
         .collect();
@@ -377,7 +378,8 @@ pub fn reset_pack_item(
     let baseline = match kind {
         PackItemKind::Mcp => {
             let definitions =
-                pack::mcp::parse_pack_mcp_file(&pack::lock::mcp_path(&orch.config_dir, pack_id))?;
+                pack::mcp::parse_pack_mcp_file(&pack::lock::mcp_path(&orch.config_dir, pack_id))?
+                    .servers;
             let definition = definitions.get(item_id).ok_or_else(|| {
                 format!("Installed pack `{pack_id}` has no MCP definition `{item_id}`")
             })?;

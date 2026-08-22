@@ -56,6 +56,29 @@ pub(crate) fn verbs(spec: &AffordanceSpec) -> Vec<String> {
     spec.actions.iter().map(|a| verb_slug(&a.label)).collect()
 }
 
+/// The shortest readable spelling that selects exactly this action.
+///
+/// Help must only advertise a shorthand the dispatcher will accept. Builtins
+/// are excluded because colon dispatch resolves them before resource actions.
+pub(crate) fn preferred_verb(
+    spec: &AffordanceSpec,
+    action: &ActionSpec,
+    builtins: &[&str],
+) -> String {
+    alias_words(&action.label)
+        .into_iter()
+        .find(|alias| {
+            !builtins.contains(&alias.as_str())
+                && spec
+                    .actions
+                    .iter()
+                    .filter(|candidate| alias_words(&candidate.label).contains(alias))
+                    .count()
+                    == 1
+        })
+        .unwrap_or_else(|| verb_slug(&action.label))
+}
+
 /// Resolve a typed verb against the actions the current resource advertises.
 ///
 /// A canonical slug always wins. Otherwise a single unambiguous word of one
@@ -130,15 +153,28 @@ fn key_info<'a>(action: &'a ActionSpec, key: &str) -> Option<&'a KeyInfo> {
         .find(|info| info.key == key)
 }
 
-/// Split `token` into a canonical key and its value, but only when the head
+/// Split `word` into a canonical key and its value, but only when the head
 /// actually names a key of this action.
 ///
 /// Requiring the head to be a known key is what keeps `:comment shipped x=y in
 /// the end` a comment rather than a malformed keyed payload: prose that happens
 /// to contain `=` is still prose.
-fn split_key<'a>(action: &'a ActionSpec, token: &'a str) -> Option<(&'a str, &'a str)> {
-    let (head, value) = token.split_once('=')?;
+fn split_key<'a>(action: &'a ActionSpec, word: &'a str) -> Option<(&'a str, &'a str)> {
+    let (head, value) = word.split_once('=')?;
     canonical_key(action, head).map(|key| (key, value))
+}
+
+/// Whether the text after a verb is written in the keyed `key=value` form.
+///
+/// Decided on raw whitespace-separated words, *before* any quoting grammar is
+/// applied. Quotes exist so a value may contain spaces, so they mean something
+/// only once the line is known to be carrying values; a bare comment body is not
+/// a value. Reading free text through the quoting grammar is what made
+/// `:comment it's green` die on an apostrophe, and no amount of care inside the
+/// tokenizer fixes that — prose simply must not reach it.
+fn is_keyed(action: &ActionSpec, args: &str) -> bool {
+    args.split_whitespace()
+        .any(|word| split_key(action, word).is_some())
 }
 
 /// Build the payload for `action` from the text typed after its verb.
@@ -148,6 +184,10 @@ fn split_key<'a>(action: &'a ActionSpec, token: &'a str) -> Option<(&'a str, &'a
 /// pairs. The single-required-key rule is what makes `:comment ship it` work,
 /// and it falls out of the contract's key list rather than being written down
 /// for comments specifically.
+///
+/// Keyed-ness is settled first and free text is taken verbatim, so a line is
+/// parsed by exactly one grammar rather than passing through a shared one on its
+/// way to the right answer.
 pub(crate) fn build_payload(action: &ActionSpec, args: &str) -> Result<Value, String> {
     let args = args.trim();
     let mut payload = Map::new();
@@ -163,12 +203,7 @@ pub(crate) fn build_payload(action: &ActionSpec, args: &str) -> Result<Value, St
         return Ok(Value::Object(payload));
     }
 
-    let tokens = tokenize(args)?;
-    let keyed = tokens
-        .iter()
-        .any(|token| split_key(action, token).is_some());
-
-    if !keyed {
+    if !is_keyed(action, args) {
         return match action.required.as_slice() {
             [only] => {
                 payload.insert(only.key.clone(), coerce(&only.ty, args));
@@ -182,7 +217,7 @@ pub(crate) fn build_payload(action: &ActionSpec, args: &str) -> Result<Value, St
         };
     }
 
-    for token in &tokens {
+    for token in &tokenize(args)? {
         let Some((key, value)) = split_key(action, token) else {
             return Err(format!(
                 "expected key=value, got `{token}`. `{}` accepts {}",
@@ -243,6 +278,14 @@ fn coerce(ty: &str, value: &str) -> Value {
             if trimmed.is_empty() {
                 return Value::Array(Vec::new());
             }
+            // A bracketed literal arrives intact, so read it as the JSON it
+            // plainly is. The comma list is the shorthand for the common case,
+            // not the only form an array may be written in.
+            if trimmed.starts_with('[') {
+                if let Ok(value @ Value::Array(_)) = serde_json::from_str::<Value>(trimmed) {
+                    return value;
+                }
+            }
             Value::Array(
                 trimmed
                     .split(',')
@@ -261,13 +304,18 @@ fn coerce(ty: &str, value: &str) -> Value {
     }
 }
 
-/// Split a line into whitespace-separated words, honoring single and double
-/// quotes so a value may contain spaces.
+/// Split a **keyed** line into whitespace-separated words, honoring single and
+/// double quotes so a value may contain spaces.
 ///
 /// This is deliberately not POSIX word splitting: the shell's argument grammar
 /// is `key=value` pairs and free text, and importing globbing, variable
 /// expansion, and `$` semantics would promise a language this prompt does not
-/// speak. Quotes group, a backslash escapes the next character, and that is all.
+/// speak. Quotes group, a backslash escapes the next character, a `{` or `[`
+/// directly after `=` opens a JSON literal, and that is all.
+///
+/// Only a line [`is_keyed`] has already accepted arrives here, so every quote,
+/// backslash, and brace this reads was typed to delimit a value. That is what
+/// makes an unterminated quote a real error rather than an apostrophe in prose.
 fn tokenize(input: &str) -> Result<Vec<String>, String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -283,6 +331,14 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
                     Some(escaped) => current.push(escaped),
                     None => return Err("line ends with a dangling backslash".to_string()),
                 }
+            }
+            // A brace or bracket directly after `=` is the head of a JSON value,
+            // so the run it opens is taken verbatim. Anchoring the rule to `=`
+            // is what keeps a lone bracket in prose ordinary text.
+            '{' | '[' if quote.is_none() && current.ends_with('=') => {
+                started = true;
+                current.push(c);
+                take_json_literal(c, &mut chars, &mut current)?;
             }
             '\'' | '"' if quote.is_none() => {
                 started = true;
@@ -308,6 +364,53 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
         tokens.push(current);
     }
     Ok(tokens)
+}
+
+/// Consume a brace- or bracket-delimited run verbatim, its opener already
+/// emitted, so the literal reaches [`coerce`] as the JSON it was typed as.
+///
+/// Inside the literal the shell's grouping quotes do not apply: `"` is JSON's
+/// own string delimiter, and taking it as grouping is what silently turned
+/// `{"a":1}` into `{a:1}` before it ever reached a parser. Nesting is tracked so
+/// an object inside an object ends where it should, and whitespace is kept, so
+/// `payload={"a": 1}` needs no outer quoting.
+fn take_json_literal(
+    open: char,
+    chars: &mut std::str::Chars<'_>,
+    out: &mut String,
+) -> Result<(), String> {
+    let close = if open == '{' { '}' } else { ']' };
+    let mut depth = 1usize;
+    let mut in_string = false;
+
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if in_string {
+            match c {
+                // JSON owns its escapes; the backslash and whatever it guards
+                // ride through untouched so `{"a":"x\"y"}` ends where it should.
+                '\\' => match chars.next() {
+                    Some(escaped) => out.push(escaped),
+                    None => return Err("line ends with a dangling backslash".to_string()),
+                },
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(format!("unterminated `{open}`"))
 }
 
 #[cfg(test)]
@@ -398,6 +501,25 @@ mod tests {
     }
 
     #[test]
+    fn help_prefers_the_leading_safe_alias_over_an_internal_label() {
+        let action = action(
+            "patch project rename hide attach remote",
+            "patch",
+            Vec::new(),
+            Vec::new(),
+        );
+        let spec = AffordanceSpec {
+            kind: "project".into(),
+            name: "Project".into(),
+            links: Vec::new(),
+            filters: Vec::new(),
+            actions: vec![action],
+        };
+        assert_eq!(preferred_verb(&spec, &spec.actions[0], &["help"]), "patch");
+        assert_eq!(resolve_verb(&spec, "patch").unwrap(), &spec.actions[0]);
+    }
+
+    #[test]
     fn a_word_two_actions_share_names_neither_and_says_so() {
         let spec = issue_spec();
         // `append` heads both `append comment` and `append message`; `issue`
@@ -437,6 +559,53 @@ mod tests {
         assert_eq!(
             build_payload(comment, "set status=closed once this lands").unwrap(),
             serde_json::json!({"content": "set status=closed once this lands"})
+        );
+    }
+
+    #[test]
+    fn free_text_never_passes_through_the_quoting_grammar() {
+        // An apostrophe is the common case and the one that made this a bug:
+        // prose is not a value, so nothing here opens a quote.
+        let spec = issue_spec();
+        let comment = resolve_verb(&spec, "comment").unwrap();
+        assert_eq!(
+            build_payload(comment, "it's green now").unwrap(),
+            serde_json::json!({"content": "it's green now"})
+        );
+        // The tokenizer's other two rejections are just as absent, and its
+        // escapes just as inert: a body reaches the resource byte for byte.
+        assert_eq!(
+            build_payload(comment, "escape it with a trailing \\").unwrap(),
+            serde_json::json!({"content": "escape it with a trailing \\"})
+        );
+        assert_eq!(
+            build_payload(comment, "the payload={\"a\": 1 was wrong").unwrap(),
+            serde_json::json!({"content": "the payload={\"a\": 1 was wrong"})
+        );
+    }
+
+    #[test]
+    fn a_malformed_keyed_line_is_still_rejected_where_quoting_means_something() {
+        let spec = issue_spec();
+        let patch = resolve_verb(&spec, "patch").unwrap();
+        // `title=` names a key, so this line is carrying values and its quote
+        // was typed to delimit one.
+        let error = build_payload(patch, "title=\"unfinished").unwrap_err();
+        assert!(error.contains("unterminated quote"), "{error}");
+
+        let typed = action(
+            "patch todos",
+            "patch",
+            Vec::new(),
+            vec![key("payload", "object")],
+        );
+        let error = build_payload(&typed, "payload={\"a\": 1").unwrap_err();
+        assert!(error.contains("unterminated"), "{error}");
+
+        // And the keyed form keeps its own way to carry an apostrophe.
+        assert_eq!(
+            build_payload(patch, "title=\"it's done\"").unwrap(),
+            serde_json::json!({"title": "it's done"})
         );
     }
 
@@ -507,6 +676,19 @@ mod tests {
     }
 
     #[test]
+    fn an_array_may_be_written_as_a_json_literal_or_a_comma_list() {
+        let typed = action("x", "patch", Vec::new(), vec![key("labels", "array")]);
+        assert_eq!(
+            build_payload(&typed, "labels=[\"bug\", \"ui\"]").unwrap(),
+            serde_json::json!({"labels": ["bug", "ui"]})
+        );
+        assert_eq!(
+            build_payload(&typed, "labels=bug,ui").unwrap(),
+            serde_json::json!({"labels": ["bug", "ui"]})
+        );
+    }
+
+    #[test]
     fn an_uncoercible_value_is_forwarded_for_the_write_gate_to_judge() {
         let typed = action("x", "patch", Vec::new(), vec![key("limit", "int")]);
         assert_eq!(
@@ -532,5 +714,24 @@ mod tests {
         assert_eq!(tokenize("a  b\t c").unwrap(), ["a", "b", "c"]);
         assert_eq!(tokenize("k=''").unwrap(), ["k="]);
         assert_eq!(tokenize("a\\ b").unwrap(), ["a b"]);
+    }
+
+    #[test]
+    fn a_json_literal_after_an_equals_keeps_its_own_quotes_and_spaces() {
+        // Grouping quotes would eat JSON's string delimiters, so the literal is
+        // taken verbatim from its opening brace to the one that balances it.
+        assert_eq!(
+            tokenize("payload={\"a\": 1, \"b\": [2, 3]}").unwrap(),
+            ["payload={\"a\": 1, \"b\": [2, 3]}"]
+        );
+        // Nesting closes at its own depth, and a delimiter inside a JSON string
+        // is text rather than a closer.
+        assert_eq!(
+            tokenize("a={\"x\": {\"y\": \"}\"}} b=1").unwrap(),
+            ["a={\"x\": {\"y\": \"}\"}}", "b=1"]
+        );
+        // The rule is anchored to `=`, so a bracket in prose stays prose.
+        assert_eq!(tokenize("see [the fix").unwrap(), ["see", "[the", "fix"]);
+        assert!(tokenize("payload={\"a\": 1").is_err());
     }
 }

@@ -144,6 +144,8 @@ impl ConfigResource for AgentResource {
             bundles: Vec::new(),
             is_project_scoped,
             file_path: PathBuf::new(),
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 
@@ -197,6 +199,8 @@ impl ConfigResource for AgentResource {
             } else {
                 existing.file_path.clone()
             },
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 
@@ -243,6 +247,8 @@ impl ConfigResource for AgentResource {
             bundles: source.bundles.clone(),
             is_project_scoped,
             file_path: PathBuf::new(),
+            seed_budget_tokens: None,
+            seed_eras: None,
         }
     }
 

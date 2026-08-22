@@ -9,6 +9,7 @@ use super::common::{
     render_affordance, resolve_home_relative_resource_uri,
 };
 use super::diff::read_node_diff;
+use super::eras::{read_node_era, read_node_eras_collection};
 use super::files::{read_issue_changed, read_issue_changed_projection};
 use super::issue::{
     read_issue, read_issue_comment, read_issue_comments, read_issue_execution,
@@ -17,7 +18,7 @@ use super::issue::{
 use super::labels::{read_label, read_labels};
 use super::memories::{read_node_memories_collection, read_node_memory};
 use super::messages::{read_issue_messages, read_node_messages, read_project_messages};
-use super::node::parse_artifact_format;
+use super::node::{parse_artifact_format, ArtifactCoordinates};
 use super::node::{
     read_job_todos, read_node, read_node_artifact, read_node_calls, read_node_chat,
     read_node_chat_event, read_node_chat_raw, read_node_chat_turn, read_node_checks,
@@ -70,9 +71,13 @@ pub(crate) struct RenderedResource {
     /// `Line`: raw line offset (negative = tail). `Record`: item offset (>= 0).
     pub offset: Option<i64>,
     pub limit: Option<usize>,
-    /// `Match`: real matches over the produced body (not context lines). Drives
-    /// the `[N matches]` header suffix for a universal-grep result.
+    /// `Match`: real matches in the COMPLETE grep result (not context lines,
+    /// and not reduced by a `head_limit` window). Drives the `[N matches]`
+    /// header suffix for a universal-grep result.
     pub match_count: Option<usize>,
+    /// `Match`: results the body carries when a `head_limit` window elided some
+    /// of `total_units`. `None` when the body is the whole result.
+    pub grep_shown: Option<usize>,
     pub record_prelude_lines: Option<usize>,
     pub affordance: Option<Affordance>,
     /// Image blocks (e.g. a browser screenshot) lifted into the read envelope
@@ -149,6 +154,7 @@ impl RenderedResource {
             offset,
             limit,
             match_count: None,
+            grep_shown: None,
             record_prelude_lines: None,
             affordance,
             images: Vec::new(),
@@ -156,18 +162,23 @@ impl RenderedResource {
     }
 
     /// A `Match`-unit result: the universal grep already paginated the body by
-    /// `head_limit`, so the view never re-windows it. `match_count` is the real
-    /// match total over the shown body.
-    fn grep(content: String, match_count: usize, affordance: Option<Affordance>) -> Self {
+    /// `head_limit`, so the view never re-windows it. The counts describe the
+    /// COMPLETE result and `grep_shown` says how much of it the body carries,
+    /// so a capped grep is never mistaken for an exhaustive one.
+    fn grep(
+        window: crate::mcp::handlers::search::GrepWindow,
+        affordance: Option<Affordance>,
+    ) -> Self {
         Self {
-            content,
+            content: window.body,
             natural_unit: NaturalUnit::Match,
-            unit_noun: None,
-            total_units: None,
+            unit_noun: Some(window.unit_noun),
+            total_units: Some(window.total_units),
             shown_units: None,
             offset: None,
             limit: None,
-            match_count: Some(match_count),
+            match_count: window.match_count,
+            grep_shown: window.shown,
             record_prelude_lines: None,
             affordance,
             images: Vec::new(),
@@ -192,6 +203,7 @@ impl RenderedResource {
             offset: Some(offset as i64),
             limit,
             match_count: None,
+            grep_shown: None,
             record_prelude_lines: None,
             affordance,
             images: Vec::new(),
@@ -473,6 +485,7 @@ async fn produce_db_sql_resource(
             offset: Some(projection.offset as i64),
             limit: Some(projection.limit),
             match_count: None,
+            grep_shown: None,
             record_prelude_lines: (projection.format == DbSqlFormat::Json).then_some(1),
             affordance,
             images: Vec::new(),
@@ -1261,7 +1274,7 @@ pub(crate) async fn produce_cairn_resource(
             } else {
                 render_resource_body(orch, request, &resource, body_params).await
             };
-            let (content, match_count) = match crate::mcp::handlers::search::grep_materialized_body(
+            let window = match crate::mcp::handlers::search::grep_materialized_body(
                 &rendered_body,
                 &payload,
             ) {
@@ -1270,7 +1283,7 @@ pub(crate) async fn produce_cairn_resource(
                 // would head an error with a match count.
                 Err(error) => return RenderedResource::line(error, affordance, None, None),
             };
-            return RenderedResource::grep(content, match_count, affordance);
+            return RenderedResource::grep(window, affordance);
         }
         Ok(None) => {}
     }
@@ -1332,6 +1345,7 @@ pub(crate) async fn produce_cairn_resource(
                 offset: Some(page.offset as i64),
                 limit: view_limit,
                 match_count: None,
+                grep_shown: None,
                 record_prelude_lines: None,
                 affordance,
                 images: Vec::new(),
@@ -1363,6 +1377,7 @@ pub(crate) async fn produce_cairn_resource(
             offset: None,
             limit: view_limit,
             match_count: None,
+            grep_shown: None,
             record_prelude_lines: None,
             affordance,
             images: Vec::new(),
@@ -1511,8 +1526,10 @@ async fn render_resource_body(
             Some(error) => error,
             None => {
                 let captured_at = crate::fleet::unix_time_ms();
+                let executors = orch.fleet.inspect_executors(captured_at);
+                let warming_up = orch.fleet_warming_up(executors.len(), captured_at);
                 crate::resources::executors::render_executors(
-                    &orch.fleet.inspect_executors(captured_at),
+                    &executors,
                     &orch.fleet.unattached_enrolled_remotes(),
                     &orch.fleet.management().operations().in_flight(),
                     // A process-wide fact established once at boot, read here
@@ -1520,7 +1537,7 @@ async fn render_resource_body(
                     // restart is not a machine's property.
                     cairn_common::abnormal_exit::predecessor(),
                     captured_at,
-                    orch.substrate_health_snapshot().warming_up,
+                    warming_up,
                 )
             }
         },
@@ -1794,10 +1811,12 @@ async fn render_resource_body(
             Ok((format, diff_full)) => {
                 read_node_artifact(
                     orch,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
+                    ArtifactCoordinates {
+                        project_key: &project,
+                        number,
+                        exec_seq,
+                        node_name: &node_id,
+                    },
                     name.as_deref(),
                     format,
                     diff_full,
@@ -1876,10 +1895,12 @@ async fn render_resource_body(
             Ok((format, _)) => {
                 read_task_artifact(
                     db,
-                    &project,
-                    number,
-                    exec_seq,
-                    &node_id,
+                    ArtifactCoordinates {
+                        project_key: &project,
+                        number,
+                        exec_seq,
+                        node_name: &node_id,
+                    },
                     &task_name,
                     name.as_deref(),
                     format,
@@ -2263,6 +2284,25 @@ async fn render_resource_body(
                 error
             } else {
                 read_node_memory(orch, &project, number, exec_seq, &node_id, memory_seq).await
+            }
+        }
+        CairnResource::NodeEras {
+            project,
+            number,
+            exec_seq,
+            node_id,
+        } => read_node_eras_collection(orch, &project, number, exec_seq, &node_id, &params).await,
+        CairnResource::NodeEra {
+            project,
+            number,
+            exec_seq,
+            node_id,
+            era_seq,
+        } => {
+            if let Some(error) = reject_query_params("node era", &params) {
+                error
+            } else {
+                read_node_era(orch, &project, number, exec_seq, &node_id, era_seq).await
             }
         }
         CairnResource::Recipes => {
@@ -3334,10 +3374,10 @@ line2', X'0001020AFF', 2.5),
         let payload = body_grep_payload(&db_params("grep=ERROR"), false)
             .unwrap()
             .unwrap();
-        let (rendered, matches) = grep_materialized_body(&body, &payload).unwrap();
-        assert_eq!(matches, 1);
-        assert!(rendered.contains("boom"));
-        assert!(!rendered.contains("all good"));
+        let window = grep_materialized_body(&body, &payload).unwrap();
+        assert_eq!(window.match_count, Some(1));
+        assert!(window.body.contains("boom"));
+        assert!(!window.body.contains("all good"));
     }
 
     /// End-to-end: reading a thread descendant through the real read router
