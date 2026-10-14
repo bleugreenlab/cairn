@@ -14,6 +14,14 @@ const LIST_KEYS: &[ProjectionSpec] = &[
         values: "EPOCH",
     },
     ProjectionSpec {
+        key: "from",
+        values: "ID (lowest row id, inclusive; a coalesced wake cites from/to)",
+    },
+    ProjectionSpec {
+        key: "to",
+        values: "ID (highest row id, inclusive)",
+    },
+    ProjectionSpec {
         key: "limit",
         values: "N (default 50, max 200)",
     },

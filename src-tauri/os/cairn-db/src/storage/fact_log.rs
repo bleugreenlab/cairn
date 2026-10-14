@@ -6,6 +6,10 @@
 //! in id order through two claims: `indexed_at` (the index lane, which wakes
 //! threads and decides whether any route matches) and `route_state` (the route
 //! lane, which runs matched routes one row at a time).
+//!
+//! Thread wakes do not go out per row: the index lane folds each matching row
+//! into one pending `fact_log_wakes` row per (thread job, source), which the
+//! worker delivers once its settle window closes.
 
 use super::{DbError, DbResult, LocalDb, RowExt};
 use crate::turso::params;
@@ -240,6 +244,8 @@ pub async fn finish(db: &LocalDb, id: i64, state: &str, note: Option<&str>) -> D
 pub struct Recovery {
     pub interrupted: u64,
     pub stale: u64,
+    /// Coalesced wakes that were mid-delivery and are never re-sent.
+    pub interrupted_wakes: u64,
 }
 
 /// Settle rows a previous process left mid-flight. Both lanes are at-most-once:
@@ -247,7 +253,9 @@ pub struct Recovery {
 /// does a row the index lane had claimed (`indexed_at` set) but not settled,
 /// since its thread wakes may already be partly delivered and no claim query
 /// would ever select it again. Unindexed rows older than `stale_before_ms`
-/// become `stale` without being indexed.
+/// become `stale` without being indexed. A coalesced wake claimed for delivery
+/// but never settled becomes `interrupted` for the same reason; a pending wake
+/// is untouched and goes out on the worker's next tick, count intact.
 pub async fn recover_on_start(
     db: &LocalDb,
     now_ms: i64,
@@ -272,7 +280,17 @@ pub async fn recover_on_start(
             params![now_ms, stale_before_ms],
         )
         .await?;
-    Ok(Recovery { interrupted, stale })
+    let interrupted_wakes = db
+        .execute(
+            "UPDATE fact_log_wakes SET delivered_action='interrupted' WHERE delivered_action='delivering'",
+            (),
+        )
+        .await?;
+    Ok(Recovery {
+        interrupted,
+        stale,
+        interrupted_wakes,
+    })
 }
 
 /// Which rows a read covers. A project view holds that project's rows only; the
@@ -288,6 +306,9 @@ pub struct FactFilter {
     pub scope: FactScope,
     pub source: Option<String>,
     pub since_ms: Option<i64>,
+    /// Inclusive row id bounds: the range a coalesced wake cites.
+    pub from_id: Option<i64>,
+    pub to_id: Option<i64>,
     pub limit: i64,
     pub offset: i64,
 }
@@ -299,7 +320,7 @@ pub async fn list_facts(db: &LocalDb, filter: FactFilter) -> DbResult<Vec<FactRo
     };
     db.query_all(
         format!(
-            "SELECT {COLUMNS} FROM fact_log WHERE (?1=0 OR project_id=?2) AND (?3 IS NULL OR source=?3) AND (?4 IS NULL OR minted_at>=?4) ORDER BY id DESC LIMIT ?5 OFFSET ?6"
+            "SELECT {COLUMNS} FROM fact_log WHERE (?1=0 OR project_id=?2) AND (?3 IS NULL OR source=?3) AND (?4 IS NULL OR minted_at>=?4) AND (?7 IS NULL OR id>=?7) AND (?8 IS NULL OR id<=?8) ORDER BY id DESC LIMIT ?5 OFFSET ?6"
         ),
         params![
             scoped,
@@ -307,7 +328,9 @@ pub async fn list_facts(db: &LocalDb, filter: FactFilter) -> DbResult<Vec<FactRo
             filter.source,
             filter.since_ms,
             filter.limit,
-            filter.offset
+            filter.offset,
+            filter.from_id,
+            filter.to_id
         ],
         from_row,
     )
@@ -369,15 +392,10 @@ pub enum PruneSelector {
     Except(Vec<String>),
 }
 
-/// Delete up to `batch` rows minted before `older_than_ms`. A row the route
-/// lane still owns (`queued`, `running`) is never pruned out from under it.
-pub async fn prune(
-    db: &LocalDb,
-    selector: &PruneSelector,
-    older_than_ms: i64,
-    batch: i64,
-) -> DbResult<u64> {
-    let (source_sql, sources) = match selector {
+/// The `source` predicate a selector stands for, and the source it binds as
+/// `?3` (if any).
+fn selector_sql(selector: &PruneSelector) -> (String, Vec<String>) {
+    match selector {
         PruneSelector::Source(source) => ("source=?3".to_string(), vec![source.clone()]),
         PruneSelector::Except(sources) if sources.is_empty() => ("1=1".to_string(), Vec::new()),
         PruneSelector::Except(sources) => {
@@ -388,10 +406,16 @@ pub async fn prune(
                 .join(",");
             (format!("source NOT IN ({quoted})"), Vec::new())
         }
-    };
-    let sql = format!(
-        "DELETE FROM fact_log WHERE id IN (SELECT id FROM fact_log WHERE {source_sql} AND minted_at<?1 AND route_state NOT IN ('queued','running') ORDER BY id LIMIT ?2)"
-    );
+    }
+}
+
+async fn delete_batch(
+    db: &LocalDb,
+    sql: String,
+    sources: &[String],
+    older_than_ms: i64,
+    batch: i64,
+) -> DbResult<u64> {
     match sources.first() {
         Some(source) => {
             db.execute(sql, params![older_than_ms, batch, source.clone()])
@@ -399,6 +423,210 @@ pub async fn prune(
         }
         None => db.execute(sql, params![older_than_ms, batch]).await,
     }
+}
+
+/// Delete up to `batch` rows minted before `older_than_ms`. A row the route
+/// lane still owns (`queued`, `running`) is never pruned out from under it.
+pub async fn prune(
+    db: &LocalDb,
+    selector: &PruneSelector,
+    older_than_ms: i64,
+    batch: i64,
+) -> DbResult<u64> {
+    let (source_sql, sources) = selector_sql(selector);
+    let sql = format!(
+        "DELETE FROM fact_log WHERE id IN (SELECT id FROM fact_log WHERE {source_sql} AND minted_at<?1 AND route_state NOT IN ('queued','running') ORDER BY id LIMIT ?2)"
+    );
+    delete_batch(db, sql, &sources, older_than_ms, batch).await
+}
+
+/// Delete up to `batch` settled coalesced wakes opened before
+/// `older_than_ms`, under the same per-source retention as their rows. A
+/// pending wake is never pruned: it still owes a delivery.
+pub async fn prune_wakes(
+    db: &LocalDb,
+    selector: &PruneSelector,
+    older_than_ms: i64,
+    batch: i64,
+) -> DbResult<u64> {
+    let (source_sql, sources) = selector_sql(selector);
+    let sql = format!(
+        "DELETE FROM fact_log_wakes WHERE id IN (SELECT id FROM fact_log_wakes WHERE {source_sql} AND opened_at<?1 AND delivered_at IS NOT NULL ORDER BY id LIMIT ?2)"
+    );
+    delete_batch(db, sql, &sources, older_than_ms, batch).await
+}
+
+/// One coalesced thread wake: every row of one source that matched one
+/// thread's standing triggers within one settle window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactWake {
+    pub id: i64,
+    pub job_id: String,
+    pub source: String,
+    /// The subscription the wake resolves to: the first matching clause's
+    /// `source_ref`.
+    pub clause_ref: String,
+    /// The rows' shared project, or `None` when they are project-less or span
+    /// projects; either way the workspace view is the one that holds them all.
+    pub project_id: Option<String>,
+    pub first_row_id: i64,
+    pub last_row_id: i64,
+    pub count: i64,
+    pub opened_at: i64,
+    pub deliver_after: i64,
+    /// `None` while pending.
+    pub delivered_at: Option<i64>,
+    /// `delivering` while claimed, then the wake route's outcome
+    /// (`delivered`, `suppressed`, `dropped`, `failed: …`) or `interrupted`.
+    pub delivered_action: Option<String>,
+}
+
+const WAKE_COLUMNS: &str = "id,job_id,source,clause_ref,project_id,first_row_id,last_row_id,count,opened_at,deliver_after,delivered_at,delivered_action";
+
+fn wake_from_row(row: &crate::turso::Row) -> DbResult<FactWake> {
+    Ok(FactWake {
+        id: row.i64(0)?,
+        job_id: row.text(1)?,
+        source: row.text(2)?,
+        clause_ref: row.text(3)?,
+        project_id: row.opt_text(4)?,
+        first_row_id: row.i64(5)?,
+        last_row_id: row.i64(6)?,
+        count: row.i64(7)?,
+        opened_at: row.i64(8)?,
+        deliver_after: row.i64(9)?,
+        delivered_at: row.opt_i64(10)?,
+        delivered_action: row.opt_text(11)?,
+    })
+}
+
+/// One matched row, to be folded into its thread's pending wake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeMatch {
+    pub job_id: String,
+    pub source: String,
+    pub clause_ref: String,
+    pub project_id: Option<String>,
+    pub row_id: i64,
+    /// The row's `minted_at`. Windows are measured on mint time, so a backlog
+    /// the index lane works through late coalesces the way it would have live.
+    pub at_ms: i64,
+}
+
+/// How long a pending wake waits for more rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WakeWindow {
+    /// Quiet time after the latest row before the wake is due (debounce).
+    pub settle_ms: i64,
+    /// The cap: a wake is due no later than this long after its first row,
+    /// so a continuous stream still delivers once per window.
+    pub max_window_ms: i64,
+}
+
+/// Fold one matched row into its (job, source) pending wake, opening one when
+/// none is still open, and return the wake's id. A wake is open while its
+/// `deliver_after` lies beyond the row's time; each joining row pushes
+/// `deliver_after` to `at + settle` but never past `opened_at + max_window`.
+pub async fn coalesce_wake(db: &LocalDb, matched: WakeMatch, window: WakeWindow) -> DbResult<i64> {
+    db.write(move |conn| {
+        let matched = matched.clone();
+        Box::pin(async move {
+            let open = {
+                let mut rows = conn
+                    .query(
+                        "SELECT id FROM fact_log_wakes WHERE job_id=?1 AND source=?2 AND delivered_at IS NULL AND deliver_after>?3 ORDER BY id DESC LIMIT 1",
+                        params![matched.job_id.clone(), matched.source.clone(), matched.at_ms],
+                    )
+                    .await?;
+                match rows.next().await? {
+                    Some(row) => Some(row.i64(0)?),
+                    None => None,
+                }
+            };
+            if let Some(id) = open {
+                conn.execute(
+                    "UPDATE fact_log_wakes SET count=count+1, first_row_id=MIN(first_row_id,?2), last_row_id=MAX(last_row_id,?2), deliver_after=MIN(MAX(deliver_after,?3+?4),opened_at+?5), project_id=CASE WHEN project_id=?6 THEN project_id ELSE NULL END WHERE id=?1",
+                    params![
+                        id,
+                        matched.row_id,
+                        matched.at_ms,
+                        window.settle_ms,
+                        window.max_window_ms,
+                        matched.project_id.clone()
+                    ],
+                )
+                .await?;
+                return Ok(id);
+            }
+            let mut rows = conn
+                .query(
+                    "INSERT INTO fact_log_wakes (job_id,source,clause_ref,project_id,first_row_id,last_row_id,count,opened_at,deliver_after) VALUES (?1,?2,?3,?4,?5,?5,1,?6,?6+MIN(?7,?8)) RETURNING id",
+                    params![
+                        matched.job_id.clone(),
+                        matched.source.clone(),
+                        matched.clause_ref.clone(),
+                        matched.project_id.clone(),
+                        matched.row_id,
+                        matched.at_ms,
+                        window.settle_ms,
+                        window.max_window_ms
+                    ],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.i64(0)?),
+                None => Err(DbError::internal("INSERT RETURNING produced no row")),
+            }
+        })
+    })
+    .await
+}
+
+/// Claim the oldest wake due by `due_by_ms` for delivery, stamping it
+/// `delivering` at `now_ms`. One conditional UPDATE, so a wake is claimed once.
+pub async fn claim_due_wake(
+    db: &LocalDb,
+    due_by_ms: i64,
+    now_ms: i64,
+) -> DbResult<Option<FactWake>> {
+    let sql = format!(
+        "UPDATE fact_log_wakes SET delivered_at=?2, delivered_action='delivering' WHERE id=(SELECT MIN(id) FROM fact_log_wakes WHERE delivered_at IS NULL AND deliver_after<=?1) AND delivered_at IS NULL RETURNING {WAKE_COLUMNS}"
+    );
+    db.write(move |conn| {
+        let sql = sql.clone();
+        Box::pin(async move {
+            let mut rows = conn.query(&sql, params![due_by_ms, now_ms]).await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some(wake_from_row(&row)?)),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+}
+
+/// Record a claimed wake's outcome.
+pub async fn finish_wake(db: &LocalDb, id: i64, action: &str) -> DbResult<()> {
+    db.execute(
+        "UPDATE fact_log_wakes SET delivered_action=?2 WHERE id=?1",
+        params![id, action.to_string()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The wakes with these ids, in id order. Ids a prune removed are absent.
+pub async fn get_wakes(db: &LocalDb, ids: &[i64]) -> DbResult<Vec<FactWake>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    db.query_all(
+        format!("SELECT {WAKE_COLUMNS} FROM fact_log_wakes WHERE id IN ({list}) ORDER BY id"),
+        (),
+        wake_from_row,
+    )
+    .await
 }
 
 pub async fn count_facts(db: &LocalDb) -> DbResult<i64> {
@@ -586,7 +814,8 @@ mod tests {
             recovery,
             Recovery {
                 interrupted: 2,
-                stale: 1
+                stale: 1,
+                interrupted_wakes: 0
             }
         );
         let db = &db;
@@ -621,6 +850,8 @@ mod tests {
             scope,
             source: source.map(str::to_owned),
             since_ms: None,
+            from_id: None,
+            to_id: None,
             limit: 50,
             offset: 0,
         };
@@ -639,6 +870,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(workspace_rows.len(), 2);
+        let ranged = list_facts(
+            &db,
+            FactFilter {
+                from_id: Some(project[2].id),
+                to_id: Some(project[1].id),
+                ..filter(FactScope::Workspace, None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ranged
+                .iter()
+                .map(|r| r.identity.as_str())
+                .collect::<Vec<_>>(),
+            vec!["f", "p1"],
+            "from/to bound the ids inclusively"
+        );
 
         let samples = latest_per_source(&db, &FactScope::Project("p".into()))
             .await
@@ -694,5 +943,121 @@ mod tests {
             "the default retention covers every other source"
         );
         assert_eq!(count_facts(&db).await.unwrap(), 2);
+    }
+
+    fn matched(job: &str, source: &str, row_id: i64, at_ms: i64) -> WakeMatch {
+        WakeMatch {
+            job_id: job.into(),
+            source: source.into(),
+            clause_ref: format!("{{\"fact\":\"{source}\"}}"),
+            project_id: Some("p".into()),
+            row_id,
+            at_ms,
+        }
+    }
+
+    const WINDOW: WakeWindow = WakeWindow {
+        settle_ms: 30,
+        max_window_ms: 100,
+    };
+
+    #[tokio::test]
+    async fn rows_within_the_settle_window_fold_into_one_wake_per_job_and_source() {
+        let db = crate::storage::migrated_test_db("fact-log-coalesce.db").await;
+        let first = coalesce_wake(&db, matched("j", "s", 1, 0), WINDOW)
+            .await
+            .unwrap();
+        assert_eq!(
+            coalesce_wake(&db, matched("j", "s", 2, 20), WINDOW)
+                .await
+                .unwrap(),
+            first
+        );
+        let other_source = coalesce_wake(&db, matched("j", "t", 3, 20), WINDOW)
+            .await
+            .unwrap();
+        let other_job = coalesce_wake(&db, matched("k", "s", 4, 20), WINDOW)
+            .await
+            .unwrap();
+        assert_ne!(other_source, first);
+        assert_ne!(other_job, first);
+        let mut elsewhere = matched("j", "s", 5, 40);
+        elsewhere.project_id = Some("q".into());
+        coalesce_wake(&db, elsewhere, WINDOW).await.unwrap();
+
+        let wake = &get_wakes(&db, &[first]).await.unwrap()[0];
+        assert_eq!((wake.count, wake.first_row_id, wake.last_row_id), (3, 1, 5));
+        assert_eq!(
+            wake.deliver_after, 70,
+            "debounced to the latest row + settle"
+        );
+        assert_eq!(
+            wake.project_id, None,
+            "rows spanning projects cite the workspace view"
+        );
+
+        assert_eq!(
+            claim_due_wake(&db, 49, 1).await.unwrap(),
+            None,
+            "nothing is due before the earliest settle"
+        );
+        let due = claim_due_wake(&db, 70, 1).await.unwrap().unwrap();
+        assert_eq!(due.id, first);
+        assert_eq!(due.delivered_action.as_deref(), Some("delivering"));
+        // A row after the window closed opens a fresh wake.
+        let next = coalesce_wake(&db, matched("j", "s", 6, 75), WINDOW)
+            .await
+            .unwrap();
+        assert_ne!(next, first);
+    }
+
+    #[tokio::test]
+    async fn a_wake_is_due_no_later_than_its_max_window() {
+        let db = crate::storage::migrated_test_db("fact-log-coalesce-cap.db").await;
+        let mut ids = Vec::new();
+        for (row, at) in (0..8).map(|n| (n + 1, n * 20)) {
+            ids.push(
+                coalesce_wake(&db, matched("j", "s", row, at), WINDOW)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let wakes = get_wakes(&db, &ids).await.unwrap();
+        let wakes = wakes
+            .iter()
+            .map(|wake| (wake.count, wake.opened_at, wake.deliver_after))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wakes,
+            vec![(5, 0, 100), (3, 100, 170)],
+            "rows at 0..80 fill the first window, capped at 100; 100 opens the next"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_interrupts_a_wake_caught_mid_delivery_and_keeps_pending_ones() {
+        let db = crate::storage::migrated_test_db("fact-log-wake-recover.db").await;
+        let claimed = coalesce_wake(&db, matched("j", "s", 1, 0), WINDOW)
+            .await
+            .unwrap();
+        claim_due_wake(&db, 1000, 1000).await.unwrap().unwrap();
+        let pending = coalesce_wake(&db, matched("j", "s", 2, 900), WINDOW)
+            .await
+            .unwrap();
+        let recovery = recover_on_start(&db, 1000, 0).await.unwrap();
+        assert_eq!(recovery.interrupted_wakes, 1);
+        let wakes = get_wakes(&db, &[claimed, pending]).await.unwrap();
+        assert_eq!(wakes[0].delivered_action.as_deref(), Some("interrupted"));
+        assert_eq!(
+            (wakes[1].delivered_at, wakes[1].count),
+            (None, 1),
+            "a pending wake survives a restart untouched"
+        );
+        assert_eq!(
+            claim_due_wake(&db, 5000, 5000).await.unwrap().map(|w| w.id),
+            Some(pending),
+            "only the pending wake is still owed"
+        );
+        assert_eq!(claim_due_wake(&db, 5000, 5000).await.unwrap(), None);
     }
 }

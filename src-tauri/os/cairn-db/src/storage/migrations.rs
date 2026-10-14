@@ -171,6 +171,14 @@ macro_rules! private_channel_outbound_last_attempt {
     };
 }
 
+/// CAIRN-4912: pending and delivered coalesced thread wakes, one per
+/// (thread job, source) settle window. Private like the fact log it batches.
+macro_rules! private_fact_log_wakes {
+    () => {
+        migration!("0247_fact_log_wakes")
+    };
+}
+
 macro_rules! shared_tail_merge_attempt_journal {
     () => {
         migration!("0220_merge_attempt_journal")
@@ -1488,6 +1496,7 @@ macro_rules! private_lineage {
             private_drop_route_fact_samples!(),
             private_channel_outbound_last_attempt!(),
             private_executor_preparation_refusals!(),
+            private_fact_log_wakes!(),
         ]
     };
 }
@@ -2112,6 +2121,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // reads cite (0238). Team replication is a follow-on.
     (
         "fact_log",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "fact_log_wakes",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -3119,6 +3132,7 @@ mod tests {
                 "drop_route_fact_samples",
                 "channel_outbound_last_attempt",
                 "executor_preparation_refusals",
+                "fact_log_wakes",
             ]
         );
         assert_eq!(

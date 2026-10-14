@@ -4,7 +4,8 @@
 //! A row is an index entry, so it renders as a pointer: what was minted, the
 //! record it points at (followed, never inlined), the threads it woke, and what
 //! its routes did. Wakes render beside the route outcome so a row that matched
-//! no route but woke a thread never reads as "nothing happened".
+//! no route but woke a thread never reads as "nothing happened". A row that
+//! woke a thread as part of a coalesced batch renders that batch's outcome.
 
 use std::collections::HashMap;
 
@@ -17,7 +18,7 @@ use serde_json::Value;
 
 use crate::orchestrator::Orchestrator;
 use crate::routes::FactRegistry;
-use crate::storage::{FactFilter, FactRow, FactScope, RouteFiringRecord};
+use crate::storage::{FactFilter, FactRow, FactScope, FactWake, RouteFiringRecord};
 
 const DEFAULT_LIMIT: i64 = 50;
 const MAX_LIMIT: i64 = 200;
@@ -26,14 +27,26 @@ const MAX_LIMIT: i64 = 200;
 struct ListQuery {
     source: Option<String>,
     since_ms: Option<i64>,
+    from_id: Option<i64>,
+    to_id: Option<i64>,
     limit: i64,
     offset: i64,
+}
+
+fn row_id_param(key: &str, value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id >= 0)
+        .ok_or_else(|| format!("Query parameter '{key}' must be a non-negative row id"))
 }
 
 fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
     let mut query = ListQuery {
         source: None,
         since_ms: None,
+        from_id: None,
+        to_id: None,
         limit: DEFAULT_LIMIT,
         offset: 0,
     };
@@ -62,6 +75,8 @@ fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
                 })?;
                 query.since_ms = Some(seconds.saturating_mul(1000));
             }
+            "from" => query.from_id = Some(row_id_param(key, &param.value)?),
+            "to" => query.to_id = Some(row_id_param(key, &param.value)?),
             "limit" => {
                 let limit = param.value.parse::<i64>().map_err(|_| {
                     "Query parameter 'limit' must be a positive integer".to_string()
@@ -85,9 +100,16 @@ fn parse_list_query(params: &[QueryParam]) -> Result<ListQuery, String> {
             }
             other => {
                 return Err(format!(
-                    "Unsupported query parameter '{other}' for events (accepted: source, since, limit, offset)"
+                    "Unsupported query parameter '{other}' for events (accepted: source, since, from, to, limit, offset)"
                 ))
             }
+        }
+    }
+    if let (Some(from), Some(to)) = (query.from_id, query.to_id) {
+        if from > to {
+            return Err(format!(
+                "Query parameter 'from' ({from}) must not exceed 'to' ({to})"
+            ));
         }
     }
     Ok(query)
@@ -165,30 +187,105 @@ fn wakes_of(row: &FactRow) -> Vec<Value> {
         .unwrap_or_default()
 }
 
-fn wake_target(wake: &Value) -> String {
+/// The coalesced wakes these rows' wake records point at, read once per render.
+async fn coalesced_wakes(orch: &Orchestrator, rows: &[FactRow]) -> HashMap<i64, FactWake> {
+    let mut ids: Vec<i64> = rows
+        .iter()
+        .flat_map(wakes_of)
+        .filter_map(|wake| wake["wake"].as_i64())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    crate::storage::get_fact_wakes(&orch.db.local, &ids)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|wake| (wake.id, wake))
+        .collect()
+}
+
+fn plural(count: i64, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+/// Where one wake record stands: delivered, still pending in a coalesced
+/// batch, or some other outcome.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WakeStanding {
+    Delivered,
+    Pending,
+    Other,
+}
+
+/// One wake record's standing and how it reads. A coalesced record takes its
+/// batch's outcome, so a row that woke a thread as one of twenty reads as
+/// having woken it.
+fn wake_target(wake: &Value, batches: &HashMap<i64, FactWake>) -> (WakeStanding, String) {
     let target = wake["uri"]
         .as_str()
         .or_else(|| wake["job"].as_str())
         .unwrap_or("?");
     match wake["action"].as_str() {
-        Some("delivered") | None => target.to_string(),
-        Some(action) => format!("{target} ({action})"),
+        Some("delivered") | None => (WakeStanding::Delivered, target.to_string()),
+        Some("coalesced") => {
+            let Some(batch) = wake["wake"].as_i64().and_then(|id| batches.get(&id)) else {
+                return (
+                    WakeStanding::Other,
+                    format!("{target} (coalesced; its wake record was pruned)"),
+                );
+            };
+            match batch.delivered_action.as_deref() {
+                None => (
+                    WakeStanding::Pending,
+                    format!(
+                        "{target} (coalesced, pending: {} so far)",
+                        plural(batch.count, "row")
+                    ),
+                ),
+                Some("delivered") if batch.count == 1 => {
+                    (WakeStanding::Delivered, target.to_string())
+                }
+                Some("delivered") => (
+                    WakeStanding::Delivered,
+                    format!("{target} (coalesced, {})", plural(batch.count, "row")),
+                ),
+                Some(action) => (
+                    WakeStanding::Other,
+                    format!(
+                        "{target} (coalesced, {}, {action})",
+                        plural(batch.count, "row")
+                    ),
+                ),
+            }
+        }
+        Some(action) => (WakeStanding::Other, format!("{target} ({action})")),
     }
 }
 
-fn wakes_segment(row: &FactRow) -> String {
+fn wakes_segment(row: &FactRow, batches: &HashMap<i64, FactWake>) -> String {
     let wakes = wakes_of(row);
     if wakes.is_empty() {
         return "woke no threads".to_string();
     }
-    let delivered = wakes
+    let targets: Vec<_> = wakes
         .iter()
-        .filter(|wake| wake["action"].as_str() == Some("delivered"))
-        .count();
+        .map(|wake| wake_target(wake, batches))
+        .collect();
+    let count = |standing| targets.iter().filter(|(s, _)| *s == standing).count() as i64;
+    let pending = count(WakeStanding::Pending);
     format!(
-        "woke {delivered} thread{}: {}",
-        if delivered == 1 { "" } else { "s" },
-        wakes.iter().map(wake_target).collect::<Vec<_>>().join(", ")
+        "woke {}{}: {}",
+        plural(count(WakeStanding::Delivered), "thread"),
+        if pending > 0 {
+            format!(", {pending} pending")
+        } else {
+            String::new()
+        },
+        targets
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -257,6 +354,8 @@ pub(crate) async fn list(
             scope,
             source: query.source.clone(),
             since_ms: query.since_ms,
+            from_id: query.from_id,
+            to_id: query.to_id,
             limit: query.limit,
             offset: query.offset,
         },
@@ -267,6 +366,7 @@ pub(crate) async fn list(
         Err(error) => return error.to_string(),
     };
     let keys = project_keys(orch).await;
+    let batches = coalesced_wakes(orch, &rows).await;
     let title = match project {
         Some(project) => format!("# Events — {project}"),
         None => "# Events — workspace".to_string(),
@@ -287,7 +387,7 @@ pub(crate) async fn list(
             minted(row.minted_at),
             row.source,
             headline(row),
-            wakes_segment(row),
+            wakes_segment(row, &batches),
             routes_segment(&keys, row, &firings),
             row.record_ref,
         ));
@@ -361,6 +461,7 @@ pub(crate) async fn member(
     let firings = firings_for(orch, &row).await;
     let fields = serde_json::to_string_pretty(&fields_of(&row)).unwrap_or_default();
     let wakes = wakes_of(&row);
+    let batches = coalesced_wakes(orch, std::slice::from_ref(&row)).await;
     let mut out = format!(
         "# Event #{} — {}\n\n{}\n\n",
         row.id,
@@ -404,11 +505,25 @@ pub(crate) async fn member(
         out.push_str("No thread was woken.\n");
     } else {
         for wake in &wakes {
+            let action = wake["action"].as_str().unwrap_or("?");
+            let outcome = match wake["wake"].as_i64().and_then(|id| batches.get(&id)) {
+                Some(batch) => format!(
+                    "coalesced into wake #{} ({}, ids {}\u{2013}{}): {}",
+                    batch.id,
+                    plural(batch.count, "row"),
+                    batch.first_row_id,
+                    batch.last_row_id,
+                    batch.delivered_action.clone().unwrap_or_else(|| format!(
+                        "pending until {}",
+                        minted(batch.deliver_after)
+                    ))
+                ),
+                None => action.to_string(),
+            };
             out.push_str(&format!(
-                "- {} · job {} · {}\n",
+                "- {} · job {} · {outcome}\n",
                 wake["uri"].as_str().unwrap_or("?"),
                 wake["job"].as_str().unwrap_or("?"),
-                wake["action"].as_str().unwrap_or("?")
             ));
         }
     }
@@ -469,6 +584,8 @@ mod tests {
             parse_list_query(&params(&[
                 ("source", "file_changed"),
                 ("since", "10"),
+                ("from", "3"),
+                ("to", "9"),
                 ("limit", "5"),
                 ("offset", "2")
             ]))
@@ -476,10 +593,16 @@ mod tests {
             ListQuery {
                 source: Some("file_changed".into()),
                 since_ms: Some(10_000),
+                from_id: Some(3),
+                to_id: Some(9),
                 limit: 5,
                 offset: 2
             }
         );
+        assert!(parse_list_query(&params(&[("from", "9"), ("to", "3")]))
+            .unwrap_err()
+            .contains("must not exceed"));
+        assert!(parse_list_query(&params(&[("from", "x")])).is_err());
         assert!(parse_list_query(&params(&[("grep", "x")]))
             .unwrap_err()
             .contains("Unsupported query parameter 'grep'"));

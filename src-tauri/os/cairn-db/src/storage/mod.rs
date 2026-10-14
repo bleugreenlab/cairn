@@ -34,10 +34,13 @@ pub use executor_desktop_automation::{
     upsert_executor_desktop_automation, ExecutorDesktopAutomation,
 };
 pub use fact_log::{
-    claim_for_index, claim_next_queued, count_facts, finish as finish_fact, get_fact, insert_fact,
+    claim_due_wake as claim_due_fact_wake, claim_for_index, claim_next_queued,
+    coalesce_wake as coalesce_fact_wake, count_facts, finish as finish_fact,
+    finish_wake as finish_fact_wake, get_fact, get_wakes as get_fact_wakes, insert_fact,
     latest_for_source, latest_per_source, list_facts, prune as prune_facts,
-    recover_on_start as recover_fact_log, route_state, set_index_outcome, FactFilter, FactRow,
-    FactScope, LogDedupe, NewFact, PruneSelector, Recovery,
+    prune_wakes as prune_fact_wakes, recover_on_start as recover_fact_log, route_state,
+    set_index_outcome, FactFilter, FactRow, FactScope, FactWake, LogDedupe, NewFact, PruneSelector,
+    Recovery, WakeMatch, WakeWindow,
 };
 pub use feed::{FeedAck, FeedHome, FeedHomeKind, FeedPage, FEED_PAGE_DEFAULT, FEED_PAGE_MAX};
 pub use local_db::{

@@ -11,8 +11,14 @@
 //! the channel submissions a row produces to the channel routers, choosing
 //! recipients by the sink's destination or the source's [`Audience`].
 //!
+//! Thread wakes are **coalesced**: the index lane folds each matching row into
+//! the thread's pending wake for that source (`fact_log_wakes`), and the
+//! index lane's tick delivers a wake once its settle window closes, so a
+//! 30-file commit is one wake carrying a count and an id range, not 30.
+//!
 //! Dispatch is at-most-once: a row the runner was dispatching when it stopped
-//! becomes `interrupted` on restart and is never re-fired.
+//! becomes `interrupted` on restart and is never re-fired, and so does a
+//! coalesced wake caught mid-delivery.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,7 +31,7 @@ use super::{matches, Audience, Fact, FactRegistry, RouteContext};
 use crate::models::DeliveryUrgency;
 use crate::orchestrator::wakes::{WakeDelivery, WakeEvent, WakeRouteAction, WakeSource};
 use crate::orchestrator::Orchestrator;
-use crate::storage::{route_state, FactRow};
+use crate::storage::{route_state, FactRow, FactWake, WakeMatch, WakeWindow};
 
 const INDEX_TICK: Duration = Duration::from_secs(2);
 const PRUNE_EVERY: Duration = Duration::from_secs(3600);
@@ -40,6 +46,9 @@ pub(crate) struct EventLogPolicy {
     pub(crate) retention_ms: HashMap<String, i64>,
     pub(crate) dispatch_timeout: Duration,
     pub(crate) max_dispatch_age_ms: i64,
+    pub(crate) default_wake_settle_ms: i64,
+    pub(crate) wake_settle_ms: HashMap<String, i64>,
+    pub(crate) wake_max_window_ms: i64,
 }
 
 impl Default for EventLogPolicy {
@@ -49,6 +58,9 @@ impl Default for EventLogPolicy {
             retention_ms: HashMap::from([("file_changed".to_string(), 14 * DAY_MS)]),
             dispatch_timeout: Duration::from_secs(120),
             max_dispatch_age_ms: 15 * 60_000,
+            default_wake_settle_ms: 30_000,
+            wake_settle_ms: HashMap::from([("file_changed".to_string(), 60_000)]),
+            wake_max_window_ms: 5 * 60_000,
         }
     }
 }
@@ -64,15 +76,39 @@ impl EventLogPolicy {
                 None
             }
         };
-        for (source, value) in &settings.retention {
-            let Some(ms) = parse(&format!("retention.{source}"), value) else {
-                continue;
-            };
-            if source == "default" {
-                policy.default_retention_ms = ms;
-            } else {
-                policy.retention_ms.insert(source.clone(), ms);
+        let per_source = |key: &str,
+                          values: &HashMap<String, String>,
+                          default: &mut i64,
+                          by_source: &mut HashMap<String, i64>| {
+            for (source, value) in values {
+                let Some(ms) = parse(&format!("{key}.{source}"), value) else {
+                    continue;
+                };
+                if source == "default" {
+                    *default = ms;
+                } else {
+                    by_source.insert(source.clone(), ms);
+                }
             }
+        };
+        per_source(
+            "retention",
+            &settings.retention,
+            &mut policy.default_retention_ms,
+            &mut policy.retention_ms,
+        );
+        per_source(
+            "wakeSettle",
+            &settings.wake_settle,
+            &mut policy.default_wake_settle_ms,
+            &mut policy.wake_settle_ms,
+        );
+        if let Some(ms) = settings
+            .wake_max_window
+            .as_deref()
+            .and_then(|value| parse("wakeMaxWindow", value))
+        {
+            policy.wake_max_window_ms = ms;
         }
         if let Some(ms) = settings
             .dispatch_timeout
@@ -90,6 +126,18 @@ impl EventLogPolicy {
         }
         policy
     }
+
+    /// The settle window and cap for a coalesced wake on `source`.
+    pub(crate) fn wake_window(&self, source: &str) -> WakeWindow {
+        WakeWindow {
+            settle_ms: self
+                .wake_settle_ms
+                .get(source)
+                .copied()
+                .unwrap_or(self.default_wake_settle_ms),
+            max_window_ms: self.wake_max_window_ms,
+        }
+    }
 }
 
 /// Start both lanes and the hourly prune. Started once per runner.
@@ -104,11 +152,16 @@ pub fn spawn_fact_log_worker(orch: Orchestrator) {
         )
         .await
         {
-            Ok(recovery) if recovery.interrupted + recovery.stale > 0 => log::info!(
-                "fact log recovered {} interrupted and {} stale rows",
-                recovery.interrupted,
-                recovery.stale
-            ),
+            Ok(recovery)
+                if recovery.interrupted + recovery.stale + recovery.interrupted_wakes > 0 =>
+            {
+                log::info!(
+                    "fact log recovered {} interrupted and {} stale rows, and {} interrupted wakes",
+                    recovery.interrupted,
+                    recovery.stale,
+                    recovery.interrupted_wakes
+                )
+            }
             Ok(_) => {}
             Err(error) => log::warn!("fact log recovery failed: {error}"),
         }
@@ -121,9 +174,16 @@ async fn index_loop(orch: Orchestrator, policy: EventLogPolicy) {
     let mut last_prune: Option<std::time::Instant> = None;
     loop {
         let pass_orch = orch.clone();
+        let pass_policy = policy.clone();
+        // Pending wakes persist, so the first pass after a restart delivers
+        // whatever came due while the runner was down.
         let pass = crate::orchestrator::base_advance::supervised_sweep_pass(async move {
-            if let Err(error) = index_pass(&pass_orch).await {
+            if let Err(error) = index_pass(&pass_orch, &pass_policy).await {
                 log::warn!("fact log index pass failed: {error}");
+            }
+            let now = chrono::Utc::now().timestamp_millis();
+            if let Err(error) = flush_due_wakes(&pass_orch, now).await {
+                log::warn!("fact log wake flush failed: {error}");
             }
         });
         if let Err(error) = pass.await {
@@ -162,7 +222,10 @@ async fn route_loop(orch: Orchestrator, policy: EventLogPolicy) {
 }
 
 /// Index every unindexed row. Returns how many rows it indexed.
-pub(crate) async fn index_pass(orch: &Orchestrator) -> Result<usize, String> {
+pub(crate) async fn index_pass(
+    orch: &Orchestrator,
+    policy: &EventLogPolicy,
+) -> Result<usize, String> {
     let mut indexed = 0;
     while let Some(row) =
         crate::storage::claim_for_index(&orch.db.local, chrono::Utc::now().timestamp_millis())
@@ -170,7 +233,7 @@ pub(crate) async fn index_pass(orch: &Orchestrator) -> Result<usize, String> {
             .map_err(|error| error.to_string())?
     {
         let id = row.id;
-        if let Err(error) = index_row(orch, row).await {
+        if let Err(error) = index_row(orch, policy, row).await {
             crate::storage::set_index_outcome(
                 &orch.db.local,
                 id,
@@ -254,7 +317,11 @@ fn wake_action(action: &WakeRouteAction) -> &'static str {
     }
 }
 
-async fn index_row(orch: &Orchestrator, row: FactRow) -> Result<(), String> {
+async fn index_row(
+    orch: &Orchestrator,
+    policy: &EventLogPolicy,
+    row: FactRow,
+) -> Result<(), String> {
     let registry = FactRegistry::default();
     let Some(spec) = registry.source(&row.source) else {
         crate::storage::set_index_outcome(
@@ -316,8 +383,9 @@ async fn index_row(orch: &Orchestrator, row: FactRow) -> Result<(), String> {
         presence,
     };
 
-    let row_uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
-    let summary = row.summary.as_deref().unwrap_or(row.identity.as_str());
+    // One pending wake per (thread, source): a thread whose several clauses
+    // match this row is folded in once, under its first matching clause.
+    let window = policy.wake_window(&row.source);
     let mut woken: Vec<&str> = Vec::new();
     let mut wakes = Vec::new();
     for consumer in &threads {
@@ -328,26 +396,22 @@ async fn index_row(orch: &Orchestrator, row: FactRow) -> Result<(), String> {
             continue;
         }
         woken.push(&consumer.job_id);
-        let action = crate::orchestrator::wakes::route_wake(
-            orch,
-            WakeEvent {
-                source: WakeSource::Fact {
-                    clause_ref: consumer.clause_ref.clone(),
-                },
-                fact_kind: row.source.clone(),
-                detail_uri: Some(row_uri.clone()),
-                delivery: WakeDelivery::Targeted {
-                    subscriber_job_id: consumer.job_id.clone(),
-                    sender_name: None,
-                    message: format!("[Event] {summary} ({}): {row_uri}", row.source),
-                },
-                urgency: DeliveryUrgency::Queue,
+        let coalesced = crate::storage::coalesce_fact_wake(
+            &orch.db.local,
+            WakeMatch {
+                job_id: consumer.job_id.clone(),
+                source: row.source.clone(),
+                clause_ref: consumer.clause_ref.clone(),
+                project_id: row.project_id.clone(),
+                row_id: row.id,
+                at_ms: row.minted_at,
             },
+            window,
         )
         .await;
-        let action = match action {
-            Ok(action) => wake_action(&action).to_string(),
-            Err(error) => format!("failed: {error}"),
+        let (action, wake) = match coalesced {
+            Ok(wake) => ("coalesced".to_string(), Some(wake)),
+            Err(error) => (format!("failed: {error}"), None),
         };
         if wakes.len() < MAX_RECORDED_WAKES {
             let home = crate::jobs::queries::home_uri_for_job(&orch.db.local, &consumer.job_id)
@@ -358,6 +422,7 @@ async fn index_row(orch: &Orchestrator, row: FactRow) -> Result<(), String> {
                 "job": consumer.job_id,
                 "uri": home,
                 "action": action,
+                "wake": wake,
             }));
         }
     }
@@ -389,6 +454,98 @@ async fn index_row(orch: &Orchestrator, row: FactRow) -> Result<(), String> {
         orch.fact_log.route_notify.notify_one();
     }
     Ok(())
+}
+
+/// Deliver every coalesced wake due by `due_by_ms`. Returns how many it
+/// claimed. Each wake is claimed before it is sent, so a wake goes out at
+/// most once even across a restart.
+pub(crate) async fn flush_due_wakes(orch: &Orchestrator, due_by_ms: i64) -> Result<usize, String> {
+    let mut flushed = 0;
+    while let Some(wake) = crate::storage::claim_due_fact_wake(
+        &orch.db.local,
+        due_by_ms,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    {
+        flushed += 1;
+        let action = deliver_wake(orch, &wake).await;
+        crate::storage::finish_fact_wake(&orch.db.local, wake.id, &action)
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(flushed)
+}
+
+async fn deliver_wake(orch: &Orchestrator, wake: &FactWake) -> String {
+    let (message, detail_uri) = wake_message(orch, wake).await;
+    let action = crate::orchestrator::wakes::route_wake(
+        orch,
+        WakeEvent {
+            source: WakeSource::Fact {
+                clause_ref: wake.clause_ref.clone(),
+            },
+            fact_kind: wake.source.clone(),
+            detail_uri: Some(detail_uri),
+            delivery: WakeDelivery::Targeted {
+                subscriber_job_id: wake.job_id.clone(),
+                sender_name: None,
+                message,
+            },
+            urgency: DeliveryUrgency::Queue,
+        },
+    )
+    .await;
+    match action {
+        Ok(action) => wake_action(&action).to_string(),
+        Err(error) => format!("failed: {error}"),
+    }
+}
+
+/// A coalesced wake's message and detail URI. One row reads as one event,
+/// citing the row; several cite the id range of the events view that holds
+/// them all.
+async fn wake_message(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
+    if wake.count == 1 {
+        if let Ok(Some(row)) = crate::storage::get_fact(&orch.db.local, wake.first_row_id).await {
+            let uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
+            let summary = row.summary.as_deref().unwrap_or(row.identity.as_str());
+            return (format!("[Event] {summary} ({}): {uri}", row.source), uri);
+        }
+    }
+    let project = match wake.project_id.clone() {
+        Some(id) => orch
+            .db
+            .local
+            .query_opt_text("SELECT key FROM projects WHERE id = ?1", (id,))
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let (events, scope) = match project.as_deref() {
+        Some(key) => (
+            cairn_common::uri::build_project_events_uri(key),
+            key.to_string(),
+        ),
+        None => (
+            cairn_common::uri::build_workspace_events_uri(),
+            "the workspace".to_string(),
+        ),
+    };
+    let uri = format!(
+        "{events}?source={}&from={}&to={}",
+        wake.source, wake.first_row_id, wake.last_row_id
+    );
+    let rows = if wake.count == 1 { "row" } else { "rows" };
+    (
+        format!(
+            "[Event] {} {} {rows} in {scope} (ids {}\u{2013}{}): {uri}",
+            wake.count, wake.source, wake.first_row_id, wake.last_row_id
+        ),
+        uri,
+    )
 }
 
 /// One standing trigger clause of a thread, evaluated against one row.
@@ -602,11 +759,19 @@ async fn prune_pass(orch: &Orchestrator, policy: &EventLogPolicy) -> Result<(), 
         {
             tokio::task::yield_now().await;
         }
+        while crate::storage::prune_fact_wakes(&orch.db.local, &selector, cutoff, PRUNE_BATCH)
+            .await
+            .map_err(|error| error.to_string())?
+            == PRUNE_BATCH as u64
+        {
+            tokio::task::yield_now().await;
+        }
     }
     Ok(())
 }
 
-/// Run both lanes until neither has work left. Tests mint, then drain.
+/// Run both lanes until neither has work left, delivering every pending wake
+/// as though its window had closed. Tests mint, then drain.
 #[cfg(test)]
 pub(crate) async fn drain_fact_log(orch: &Orchestrator) {
     drain_fact_log_within(orch, EventLogPolicy::default().dispatch_timeout).await;
@@ -620,9 +785,10 @@ pub(crate) async fn drain_fact_log_within(orch: &Orchestrator, dispatch_timeout:
         ..EventLogPolicy::default()
     };
     loop {
-        let indexed = index_pass(orch).await.expect("index pass");
+        let indexed = index_pass(orch, &policy).await.expect("index pass");
         let routed = route_pass(orch, &policy).await.expect("route pass");
-        if indexed == 0 && routed == 0 {
+        let flushed = flush_due_wakes(orch, i64::MAX).await.expect("wake flush");
+        if indexed == 0 && routed == 0 && flushed == 0 {
             return;
         }
     }
@@ -896,8 +1062,9 @@ mod tests {
         assert_eq!(woke.len(), 1);
         assert_eq!(
             (woke[0]["job"].as_str(), woke[0]["action"].as_str()),
-            (Some("watcher"), Some("delivered"))
+            (Some("watcher"), Some("coalesced"))
         );
+        assert!(woke[0]["wake"].is_i64(), "{woke:?}");
         assert_eq!(
             wakes(outside).await,
             None,
@@ -1033,7 +1200,7 @@ mod tests {
         assert!(
             wakes(moved)
                 .await
-                .is_some_and(|wakes| wakes.contains("delivered")),
+                .is_some_and(|wakes| wakes.contains("coalesced")),
             "the edited clause is live"
         );
         assert_eq!(wakes(replaced).await, None, "the replaced clause is gone");
@@ -1136,7 +1303,8 @@ mod tests {
             .await
             .expect("minting never waits on a route")
             .unwrap();
-        index_pass(&orch).await.unwrap();
+        let policy = EventLogPolicy::default();
+        index_pass(&orch, &policy).await.unwrap();
         assert_eq!(row(&db, stuck).await.route_state, route_state::QUEUED);
 
         let lane_orch = orch.clone();
@@ -1153,7 +1321,8 @@ mod tests {
         // While the route lane is stuck, a later row still wakes its thread.
         let later = tokio::time::timeout(Duration::from_secs(5), async {
             let id = agent_write(&orch, &db, "writer", "src/a/x.rs").await;
-            index_pass(&orch).await.unwrap();
+            index_pass(&orch, &policy).await.unwrap();
+            assert_eq!(flush_due_wakes(&orch, i64::MAX).await.unwrap(), 1);
             id
         })
         .await
@@ -1165,12 +1334,19 @@ mod tests {
             )
             .await
             .unwrap()
-            .is_some_and(|wakes| wakes.contains("delivered")));
+            .is_some_and(|wakes| wakes.contains("coalesced")));
+        assert_eq!(
+            db.query_opt_text("SELECT delivered_action FROM fact_log_wakes", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("delivered")
+        );
         lane.abort();
 
         // The route lane's own bound gives up on a hung row.
         let bounded = mint_github(&orch, 2).await.unwrap();
-        index_pass(&orch).await.unwrap();
+        index_pass(&orch, &policy).await.unwrap();
         let policy = EventLogPolicy {
             dispatch_timeout: Duration::from_millis(100),
             ..EventLogPolicy::default()
@@ -1205,7 +1381,8 @@ mod tests {
         let mut jobs: Vec<String> = wakes
             .iter()
             .map(|wake| {
-                assert_eq!(wake["action"], "delivered", "{wake}");
+                assert_eq!(wake["action"], "coalesced", "{wake}");
+                assert!(wake["wake"].is_i64(), "{wake}");
                 wake["job"].as_str().unwrap().to_owned()
             })
             .collect();
@@ -1527,5 +1704,363 @@ mod tests {
             "an unparseable value keeps the default"
         );
         assert_eq!(policy.dispatch_timeout, Duration::from_secs(5));
+        assert_eq!(
+            (
+                policy.wake_window("github_comment"),
+                policy.wake_window("file_changed")
+            ),
+            (
+                WakeWindow {
+                    settle_ms: 30_000,
+                    max_window_ms: 300_000
+                },
+                WakeWindow {
+                    settle_ms: 60_000,
+                    max_window_ms: 300_000
+                }
+            ),
+            "wake windows default to 30s (60s for file changes) under a 5m cap"
+        );
+        std::fs::write(
+            temp.path().join("settings.yaml"),
+            "eventLog:\n  wakeSettle: { default: 10s, attention: 2s }\n  wakeMaxWindow: 1m\n",
+        )
+        .unwrap();
+        let policy = EventLogPolicy::load(temp.path());
+        assert_eq!(policy.wake_window("attention").settle_ms, 2_000);
+        assert_eq!(policy.wake_window("github_comment").settle_ms, 10_000);
+        assert_eq!(policy.wake_window("file_changed").settle_ms, 60_000);
+        assert_eq!(policy.wake_max_window_ms, 60_000);
+    }
+
+    /// Coalesced thread wakes, driven on synthetic mint times so the settle
+    /// window and cap are exact.
+    mod coalescing {
+        use super::*;
+
+        /// Mint time of the first row; any value far from 0 works.
+        const T0: i64 = 1_000_000_000;
+        const SECOND: i64 = 1000;
+
+        /// A second thread, `watcher2`, beside the fixture's `watcher`.
+        async fn second_thread(db: &crate::storage::LocalDb) {
+            db.execute_batch(
+                "INSERT INTO threads(id,project_id,name,status,created_at,updated_at) VALUES('t2','p','other','active',1,1);
+                 INSERT INTO jobs(id,thread_id,project_id,status,uri_segment,created_at,updated_at) VALUES('watcher2','t2','p','running','thread',1,1);
+                 INSERT INTO runs(id,job_id,status,created_at,updated_at) VALUES('watcher2-run','watcher2','running',1,1);",
+            )
+            .await
+            .unwrap();
+        }
+
+        /// Insert one `github_comment` row minted at `at`, by `actor`.
+        async fn row_at(db: &crate::storage::LocalDb, n: i64, at: i64, actor: Option<&str>) -> i64 {
+            crate::storage::insert_fact(
+                db,
+                crate::storage::NewFact {
+                    project_id: Some("p".into()),
+                    source: "github_comment".into(),
+                    identity: format!("github-comment:{n}"),
+                    record_ref: format!("https://github.com/o/r/issues/1#issuecomment-{n}"),
+                    record_id: Some(n.to_string()),
+                    fields_json: serde_json::json!({"project": "cairn", "title": "GitHub mention"})
+                        .to_string(),
+                    summary: Some(format!("GitHub mention {n}")),
+                    presence: "away".into(),
+                    actor_job_id: actor.map(str::to_owned),
+                    origin_principal_json: None,
+                    origin_appearance_json: None,
+                    route_provenance: None,
+                    minted_at: at,
+                },
+                crate::storage::LogDedupe::Unique,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        /// The `[Event]` messages a thread's session received, oldest first.
+        async fn events_received(db: &crate::storage::LocalDb, run: &str) -> Vec<String> {
+            db.query_all(
+                "SELECT content FROM messages WHERE recipient_run_id = ?1 AND content LIKE '[Event]%' ORDER BY rowid",
+                (run.to_string(),),
+                |row| crate::storage::RowExt::text(row, 0),
+            )
+            .await
+            .unwrap()
+        }
+
+        async fn wake_rows(db: &crate::storage::LocalDb) -> Vec<(String, i64, i64, i64)> {
+            db.query_all(
+                "SELECT job_id, count, first_row_id, last_row_id FROM fact_log_wakes ORDER BY id",
+                (),
+                |row| {
+                    Ok((
+                        crate::storage::RowExt::text(row, 0)?,
+                        crate::storage::RowExt::i64(row, 1)?,
+                        crate::storage::RowExt::i64(row, 2)?,
+                        crate::storage::RowExt::i64(row, 3)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        fn query(pairs: &[(&str, String)]) -> Vec<cairn_common::query::QueryParam> {
+            pairs
+                .iter()
+                .map(|(key, value)| cairn_common::query::QueryParam {
+                    key: (*key).into(),
+                    value: value.clone(),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_burst_of_twenty_rows_is_one_wake_carrying_its_count_and_range() {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = orchestrator(temp.path(), &[]).await;
+            standing_triggers(&db, "watcher", r#"[{"fact":"github_comment"}]"#).await;
+            let policy = EventLogPolicy::default();
+            let mut ids = Vec::new();
+            for n in 0..20 {
+                ids.push(row_at(&db, n, T0 + n * SECOND, None).await);
+                index_pass(&orch, &policy).await.unwrap();
+                flush_due_wakes(&orch, T0 + n * SECOND).await.unwrap();
+            }
+            let (first, last) = (ids[0], ids[19]);
+            let quiet_from = T0 + 19 * SECOND;
+
+            let list = crate::resources::events::list(&orch, Some("cairn"), &[]).await;
+            assert!(
+                list.contains("woke 0 threads, 1 pending: ")
+                    && list.contains("(coalesced, pending: 20 rows so far)"),
+                "{list}"
+            );
+            assert_eq!(
+                flush_due_wakes(&orch, quiet_from + 30 * SECOND - 1)
+                    .await
+                    .unwrap(),
+                0,
+                "the wake waits out the settle window after the last row"
+            );
+            assert_eq!(
+                flush_due_wakes(&orch, quiet_from + 30 * SECOND)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(flush_due_wakes(&orch, i64::MAX).await.unwrap(), 0);
+
+            assert_eq!(
+                wake_rows(&db).await,
+                vec![("watcher".to_string(), 20, first, last)]
+            );
+            assert_eq!(
+                events_received(&db, "watcher-run").await,
+                vec![format!(
+                    "[Event] 20 github_comment rows in cairn (ids {first}\u{2013}{last}): cairn://p/cairn/events?source=github_comment&from={first}&to={last}"
+                )],
+                "the thread's session receives the batch once"
+            );
+
+            let list = crate::resources::events::list(&orch, Some("cairn"), &[]).await;
+            assert_eq!(
+                list.matches("(coalesced, 20 rows)").count(),
+                20,
+                "every coalesced row shows the delivered batch: {list}"
+            );
+            assert!(list.contains("woke 1 thread: "), "{list}");
+            let member = crate::resources::events::member(&orch, Some("cairn"), ids[7], &[]).await;
+            assert!(
+                member.contains(&format!(
+                    "coalesced into wake #1 (20 rows, ids {first}\u{2013}{last}): delivered"
+                )),
+                "{member}"
+            );
+
+            let ranged = crate::resources::events::list(
+                &orch,
+                Some("cairn"),
+                &query(&[
+                    ("source", "github_comment".into()),
+                    ("from", (first + 1).to_string()),
+                    ("to", (last - 1).to_string()),
+                ]),
+            )
+            .await;
+            let listed: Vec<i64> = ids
+                .iter()
+                .copied()
+                .filter(|id| ranged.contains(&format!("[#{id}](")))
+                .collect();
+            assert_eq!(listed, ids[1..19].to_vec(), "{ranged}");
+        }
+
+        #[tokio::test]
+        async fn one_isolated_row_wakes_within_one_settle_window_with_its_own_message() {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = orchestrator(temp.path(), &[]).await;
+            standing_triggers(&db, "watcher", r#"[{"fact":"github_comment"}]"#).await;
+            let policy = EventLogPolicy::default();
+            let id = row_at(&db, 1, T0, None).await;
+            index_pass(&orch, &policy).await.unwrap();
+            assert_eq!(
+                flush_due_wakes(&orch, T0 + 30 * SECOND - 1).await.unwrap(),
+                0
+            );
+            assert_eq!(flush_due_wakes(&orch, T0 + 30 * SECOND).await.unwrap(), 1);
+            assert_eq!(
+                events_received(&db, "watcher-run").await,
+                vec![format!(
+                    "[Event] GitHub mention 1 (github_comment): cairn://p/cairn/events/{id}"
+                )],
+                "one event still reads as one event"
+            );
+            let list = crate::resources::events::list(&orch, Some("cairn"), &[]).await;
+            assert!(list.contains("woke 1 thread: "), "{list}");
+            assert!(!list.contains("coalesced, 1 row"), "{list}");
+        }
+
+        #[tokio::test]
+        async fn a_stream_past_the_max_window_wakes_once_per_window_not_once_at_the_end() {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = orchestrator(temp.path(), &[]).await;
+            standing_triggers(&db, "watcher", r#"[{"fact":"github_comment"}]"#).await;
+            let policy = EventLogPolicy::default();
+            // A row every 20s, each inside the previous row's 30s settle, for
+            // ten minutes: the debounce alone would never come due.
+            let mut delivered_during_stream = Vec::new();
+            for n in 0..=30 {
+                let at = T0 + n * 20 * SECOND;
+                row_at(&db, n, at, None).await;
+                index_pass(&orch, &policy).await.unwrap();
+                if flush_due_wakes(&orch, at).await.unwrap() > 0 {
+                    delivered_during_stream.push((at - T0) / SECOND);
+                }
+            }
+            assert_eq!(
+                delivered_during_stream,
+                vec![300, 600],
+                "the stream delivers at each 5m cap"
+            );
+            flush_due_wakes(&orch, i64::MAX).await.unwrap();
+            let counts: Vec<i64> = wake_rows(&db).await.iter().map(|w| w.1).collect();
+            assert_eq!(counts, vec![15, 15, 1]);
+            assert_eq!(events_received(&db, "watcher-run").await.len(), 3);
+        }
+
+        #[tokio::test]
+        async fn a_pending_wake_is_delivered_after_a_restart_with_its_count_and_never_twice() {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = orchestrator(temp.path(), &[]).await;
+            second_thread(&db).await;
+            for job in ["watcher", "watcher2"] {
+                standing_triggers(&db, job, r#"[{"fact":"github_comment"}]"#).await;
+            }
+            let policy = EventLogPolicy::default();
+            let mut ids = Vec::new();
+            for n in 0..5 {
+                ids.push(row_at(&db, n, T0 + n * SECOND, None).await);
+            }
+            index_pass(&orch, &policy).await.unwrap();
+            // The runner stops after claiming watcher's wake for delivery and
+            // before recording what became of it; watcher2's is still pending.
+            let claimed = crate::storage::claim_due_fact_wake(&db, i64::MAX, T0 + 60 * SECOND)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.job_id, "watcher");
+
+            let recovery = crate::storage::recover_fact_log(&db, T0 + 120 * SECOND, 0)
+                .await
+                .unwrap();
+            assert_eq!(recovery.interrupted_wakes, 1);
+            assert_eq!(flush_due_wakes(&orch, T0 + 120 * SECOND).await.unwrap(), 1);
+            assert_eq!(flush_due_wakes(&orch, i64::MAX).await.unwrap(), 0);
+
+            let (first, last) = (ids[0], ids[4]);
+            assert_eq!(
+                events_received(&db, "watcher2-run").await,
+                vec![format!(
+                    "[Event] 5 github_comment rows in cairn (ids {first}\u{2013}{last}): cairn://p/cairn/events?source=github_comment&from={first}&to={last}"
+                )],
+                "the pending wake survives the restart with its count and range"
+            );
+            assert!(
+                events_received(&db, "watcher-run").await.is_empty(),
+                "a wake caught mid-delivery is never re-sent"
+            );
+            let list = crate::resources::events::list(&orch, Some("cairn"), &[]).await;
+            assert!(list.contains("(coalesced, 5 rows, interrupted)"), "{list}");
+        }
+
+        #[tokio::test]
+        async fn the_actors_own_rows_never_wake_it_even_inside_a_batch() {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = orchestrator(temp.path(), &[]).await;
+            standing_triggers(&db, "watcher", r#"[{"fact":"github_comment"}]"#).await;
+            let policy = EventLogPolicy::default();
+            let mut own = Vec::new();
+            for n in 0..6 {
+                let actor = (n % 2 == 0).then_some("watcher");
+                let id = row_at(&db, n, T0 + n * SECOND, actor).await;
+                if actor.is_some() {
+                    own.push(id);
+                }
+            }
+            index_pass(&orch, &policy).await.unwrap();
+            flush_due_wakes(&orch, i64::MAX).await.unwrap();
+            let wakes = wake_rows(&db).await;
+            assert_eq!(
+                wakes.iter().map(|w| w.1).collect::<Vec<_>>(),
+                vec![3],
+                "only the three rows others wrote"
+            );
+            for id in own {
+                assert_eq!(row(&db, id).await.wakes_json, None);
+            }
+            let received = events_received(&db, "watcher-run").await;
+            assert_eq!(received.len(), 1);
+            assert!(
+                received[0].starts_with("[Event] 3 github_comment rows"),
+                "{received:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn each_thread_gets_its_own_wake_and_two_matching_clauses_make_one() {
+            let temp = tempfile::tempdir().unwrap();
+            let (orch, db) = orchestrator(temp.path(), &[]).await;
+            second_thread(&db).await;
+            standing_triggers(
+                &db,
+                "watcher",
+                r#"[{"fact":"github_comment"},{"fact":"github_comment","project":"cairn"}]"#,
+            )
+            .await;
+            standing_triggers(&db, "watcher2", r#"[{"fact":"github_comment"}]"#).await;
+            let policy = EventLogPolicy::default();
+            for n in 0..4 {
+                row_at(&db, n, T0 + n * SECOND, None).await;
+            }
+            index_pass(&orch, &policy).await.unwrap();
+            flush_due_wakes(&orch, i64::MAX).await.unwrap();
+            let wakes = wake_rows(&db).await;
+            assert_eq!(
+                wakes
+                    .iter()
+                    .map(|w| (w.0.as_str(), w.1))
+                    .collect::<Vec<_>>(),
+                vec![("watcher", 4), ("watcher2", 4)]
+            );
+            for run in ["watcher-run", "watcher2-run"] {
+                let received = events_received(&db, run).await;
+                assert_eq!(received.len(), 1, "{run}: {received:?}");
+                assert!(received[0].starts_with("[Event] 4 github_comment rows"));
+            }
+        }
     }
 }

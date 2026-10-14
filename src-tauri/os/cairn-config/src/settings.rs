@@ -331,6 +331,13 @@ pub struct EventLogSettings {
     /// A row older than this when its dispatch would begin is never dispatched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_dispatch_age: Option<String>,
+    /// Per-source quiet time before a coalesced thread wake is delivered,
+    /// keyed like `retention`; `default` covers every source not named.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub wake_settle: HashMap<String, String>,
+    /// The longest a coalesced thread wake waits after its first row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_max_window: Option<String>,
 }
 
 /// The workspace's `eventLog` section, or an empty one when unset.
@@ -2084,7 +2091,7 @@ buildServices:
         assert_eq!(load_event_log_settings(dir), EventLogSettings::default());
         std::fs::write(
             get_settings_path(dir),
-            "logLevel: standard\neventLog:\n  retention: { default: 30d, file_changed: 14d }\n  dispatchTimeout: 120s\n  maxDispatchAge: 15m\n",
+            "logLevel: standard\neventLog:\n  retention: { default: 30d, file_changed: 14d }\n  dispatchTimeout: 120s\n  maxDispatchAge: 15m\n  wakeSettle: { default: 30s, file_changed: 60s }\n  wakeMaxWindow: 5m\n",
         )
         .unwrap();
         save_settings(dir, &load_settings(dir)).unwrap();
@@ -2092,6 +2099,8 @@ buildServices:
         assert_eq!(loaded.retention["file_changed"], "14d");
         assert_eq!(loaded.dispatch_timeout.as_deref(), Some("120s"));
         assert_eq!(loaded.max_dispatch_age.as_deref(), Some("15m"));
+        assert_eq!(loaded.wake_settle["file_changed"], "60s");
+        assert_eq!(loaded.wake_max_window.as_deref(), Some("5m"));
     }
 
     #[test]
