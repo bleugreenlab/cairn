@@ -2564,6 +2564,7 @@ impl ChannelRouter {
             for event in events {
                 if let Some(text) = assistant_text(&event.data) {
                     let detail_uri = format!("{}:event:{}", follow.uri, event.rowid);
+                    let actor_job_id = event.job_id.clone();
                     let fields = std::collections::BTreeMap::from([
                         (
                             "project".into(),
@@ -2604,7 +2605,9 @@ impl ChannelRouter {
                             record_id: Some(event.rowid.to_string()),
                             project_id: Some(&event.project_id),
                             presence: crate::routes::log::operator_presence().await,
-                            actor_job_id: None,
+                            // The thread that said this is its actor, so its own
+                            // standing triggers never wake it on its own words.
+                            actor_job_id: Some(&actor_job_id),
                         },
                     )
                     .await
@@ -6278,6 +6281,99 @@ mod tests {
             .unwrap(),
             Some(2),
             "both utterances are minted and left for the worker"
+        );
+    }
+
+    /// A followed thread's utterance is minted as that thread's own row, so a
+    /// standing trigger it matches wakes every other thread holding it but
+    /// never the thread that said it -- which would otherwise wake itself on
+    /// each reply that cites what it watches.
+    #[tokio::test]
+    async fn a_thread_is_never_woken_by_its_own_followed_utterance() {
+        let temp = tempfile::tempdir().unwrap();
+        let (orch, db) =
+            followed_orchestrator(temp.path(), "channel-router-own-utterance.db", &[]).await;
+        db.execute_batch(
+            "INSERT INTO threads (id, project_id, name, status, created_at, updated_at)
+               VALUES ('t-speaker', 'p', 'speaker', 'active', 1, 1),
+                      ('t-listener', 'p', 'listener', 'active', 1, 1);
+             INSERT INTO jobs (id, thread_id, project_id, status, uri_segment, created_at, updated_at)
+               VALUES ('speaker', 't-speaker', 'p', 'running', 'thread', 1, 1),
+                      ('listener', 't-listener', 'p', 'running', 'thread', 1, 1);
+             INSERT INTO runs (id, job_id, status, created_at, updated_at)
+               VALUES ('speaker-run', 'speaker', 'running', 1, 1);
+             INSERT INTO events (id, run_id, sequence, timestamp, event_type, data, created_at)
+               VALUES ('event-speaker', 'speaker-run', 1, 3, 'assistant', '{\"content\":\"see cairn://posts/7\",\"toolUses\":[]}', 3);",
+        )
+        .await
+        .unwrap();
+        let target = "cairn://p/cairn/speaker";
+        let clause: Vec<crate::routes::TriggerClause> = serde_json::from_value(
+            serde_json::json!([{ "fact": "thread_stream", "threadUri": target }]),
+        )
+        .unwrap();
+        for job in ["speaker", "listener"] {
+            let clause = clause.clone();
+            db.write(move |conn| {
+                let clause = clause.clone();
+                Box::pin(async move {
+                    crate::orchestrator::wakes::rebuild_derived_thread_subscriptions_conn(
+                        conn, job, &clause,
+                    )
+                    .await
+                })
+            })
+            .await
+            .unwrap();
+        }
+        ledger::follow_target(&db, CHANNEL, target, 1, 0)
+            .await
+            .unwrap();
+        let router = ChannelRouter::new(
+            orch,
+            Arc::new(PresentProvider {
+                sends: Mutex::new(Vec::new()),
+                presence_checks: Mutex::new(0),
+                presence: Mutex::new(OperatorPresence::Away),
+            }),
+            IMessageChannelConfig {
+                enabled: true,
+                to: "+15551234567".into(),
+                ..Default::default()
+            },
+        );
+
+        router.sweep_followed_updates().await.unwrap();
+        crate::routes::drain_fact_log(&router.orch).await;
+
+        let (actor, wakes) = db
+            .query_one(
+                "SELECT actor_job_id, wakes_json FROM fact_log WHERE source = 'thread_stream'",
+                (),
+                |row| {
+                    Ok((
+                        crate::storage::RowExt::opt_text(row, 0)?,
+                        crate::storage::RowExt::opt_text(row, 1)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        let woken: Vec<String> =
+            serde_json::from_str::<Vec<serde_json::Value>>(wakes.as_deref().unwrap_or("[]"))
+                .unwrap()
+                .iter()
+                .filter_map(|wake| wake["job"].as_str().map(str::to_owned))
+                .collect();
+        assert_eq!(
+            woken,
+            vec!["listener".to_string()],
+            "the other thread wakes; the speaker does not wake itself"
+        );
+        assert_eq!(
+            actor.as_deref(),
+            Some("speaker"),
+            "the utterance's row names the job that said it"
         );
     }
 
