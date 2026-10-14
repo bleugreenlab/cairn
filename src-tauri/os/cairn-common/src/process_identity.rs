@@ -247,17 +247,16 @@ pub fn process_group_members(process_group_id: u32) -> Result<Vec<ProcessAnchor>
         .collect())
 }
 
+/// `proc_listpids` selector for "members of process group N", from the macOS
+/// SDK's `sys/proc_info.h`. The `libc` crate does not export it.
+#[cfg(target_os = "macos")]
+const PROC_PGRP_ONLY: u32 = 2;
+
 #[cfg(target_os = "macos")]
 pub fn process_group_members(process_group_id: u32) -> Result<Vec<ProcessAnchor>, String> {
     let pid_size = std::mem::size_of::<libc::c_int>();
-    let needed = unsafe {
-        libc::proc_listpids(
-            libc::PROC_PGRP_ONLY,
-            process_group_id,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
+    let needed =
+        unsafe { libc::proc_listpids(PROC_PGRP_ONLY, process_group_id, std::ptr::null_mut(), 0) };
     if needed < 0 {
         return Err(format!(
             "list process group {process_group_id}: {}",
@@ -268,7 +267,7 @@ pub fn process_group_members(process_group_id: u32) -> Result<Vec<ProcessAnchor>
     let mut pids = vec![0 as libc::c_int; needed as usize / pid_size + 64];
     let filled = unsafe {
         libc::proc_listpids(
-            libc::PROC_PGRP_ONLY,
+            PROC_PGRP_ONLY,
             process_group_id,
             pids.as_mut_ptr().cast(),
             (pids.len() * pid_size) as libc::c_int,
