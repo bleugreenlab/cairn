@@ -9,23 +9,20 @@ const SOURCE_KIND_USER: &str = "user";
 pub const SOURCE_KIND_PROCESS: &str = "process";
 const SOURCE_KIND_RESOURCE: &str = "resource";
 pub const SOURCE_KIND_CONDITION: &str = "condition";
-/// The workspace Posts corpus. A row on this kind carries no `source_ref`: it is
-/// the elective feed watch, and which posts actually reach it is decided at
-/// delivery by jurisdiction, not by the row (`posts::post_feed_recipients`).
-pub const SOURCE_KIND_POST: &str = "post";
 /// A thread standing trigger over the fact log. The row's `source_ref` is the
 /// trigger clause's canonical JSON and its fact kinds name the clause's fact
 /// source; the fact log worker delivers a matching row as a targeted wake.
 pub const SOURCE_KIND_FACT: &str = "fact";
+/// The clause-ref namespace of a fact wake owed to a recipient the row itself
+/// names (a mention, a post's author) rather than to a standing trigger. The
+/// full ref is `addressed:{source}.{field}`. No row is stored for it: with no
+/// persisted subscription of the same ref, routing synthesizes an active one
+/// ([`addressed_fact_subscription`]), so a persisted row on the ref is how a
+/// node mutes or refuses one addressee field.
+pub const ADDRESSED_FACT_REF_PREFIX: &str = "addressed:";
 pub const SOURCE_KIND_ISSUE_COMMENT: &str = "issue_comment";
 pub const SOURCE_KIND_ISSUE_MESSAGE: &str = "issue_message";
 pub const FACT_KIND_MESSAGE: &str = "message";
-/// A post was created. Reaches the Posts feed subscribers a post's scope admits.
-pub const FACT_KIND_NEW_POST: &str = "new_post";
-/// A comment was added to a post. Reaches the post author's current home.
-pub const FACT_KIND_POST_COMMENT: &str = "post_comment";
-/// A post or comment named a canonical destination. Reaches that destination.
-pub const FACT_KIND_POST_MENTION: &str = "post_mention";
 pub const FACT_KIND_TERMINAL_EXIT: &str = "terminal_exit";
 pub const FACT_KIND_TERMINAL_OUTPUT: &str = "terminal_output";
 /// A node's project check lanes reaching a state nothing will move further.
@@ -94,6 +91,31 @@ pub fn derived_child_subscription(job_id: &str, issue_uri: &str) -> WakeSubscrip
     }
 }
 
+/// The derived subscription a fact wake carries when the row addresses its
+/// recipient directly (see [`ADDRESSED_FACT_REF_PREFIX`]). Like
+/// [`derived_child_subscription`], it never reaches the database.
+pub fn addressed_fact_subscription(
+    job_id: &str,
+    clause_ref: &str,
+    fact_kind: &str,
+) -> WakeSubscription {
+    WakeSubscription {
+        id: format!("derived:addressed:{job_id}:{clause_ref}"),
+        job_id: job_id.to_string(),
+        source_kind: SOURCE_KIND_FACT.to_string(),
+        source_ref: Some(clause_ref.to_string()),
+        fact_kinds: Some(vec![fact_kind.to_string()]),
+        state: WakeSubscriptionState::Active,
+        mute_until_kind: None,
+        mute_until_ref: None,
+        created_by: CREATED_BY_DERIVED.to_string(),
+        created_at: 0,
+        updated_at: 0,
+        one_shot: false,
+        match_phrase: None,
+    }
+}
+
 /// Typed source taxonomy for every external wake a job can subscribe to.
 ///
 /// Time is deliberately absent: wakes are event-routed, not polled/scheduled.
@@ -116,11 +138,6 @@ pub enum WakeSource {
     Condition {
         reference: String,
     },
-    /// The Posts corpus. `None` is the standing feed watch; a reference names
-    /// one post, which is how a post-sourced fact addresses its subject.
-    Post {
-        reference: Option<String>,
-    },
     /// A fact log row that matched a thread standing trigger. The reference
     /// is the trigger clause's canonical JSON, compared verbatim.
     Fact {
@@ -137,7 +154,6 @@ impl WakeSource {
             Self::Process { .. } => SOURCE_KIND_PROCESS,
             Self::Resource { .. } => SOURCE_KIND_RESOURCE,
             Self::Condition { .. } => SOURCE_KIND_CONDITION,
-            Self::Post { .. } => SOURCE_KIND_POST,
             Self::Fact { .. } => SOURCE_KIND_FACT,
         }
     }
@@ -149,7 +165,7 @@ impl WakeSource {
             | Self::Resource { reference }
             | Self::Condition { reference } => Some(reference.as_str()),
             Self::Fact { clause_ref } => Some(clause_ref.as_str()),
-            Self::Peer { reference } | Self::Post { reference } => reference.as_deref(),
+            Self::Peer { reference } => reference.as_deref(),
             Self::User => None,
         }
     }
@@ -171,11 +187,6 @@ impl WakeSource {
             SOURCE_KIND_PROCESS => Ok(Self::Process { reference: required_ref(kind, reference)? }),
             SOURCE_KIND_RESOURCE => Ok(Self::Resource { reference: required_ref(kind, reference)? }),
             SOURCE_KIND_CONDITION => Ok(Self::Condition { reference: required_ref(kind, reference)? }),
-            SOURCE_KIND_POST => Ok(Self::Post {
-                reference: reference
-                    .filter(|value| !value.is_empty())
-                    .map(cairn_common::uri::canonicalize_uri_identity),
-            }),
             // A clause is JSON, not a URI: it is compared exactly as compiled.
             SOURCE_KIND_FACT => Ok(Self::Fact {
                 clause_ref: reference
@@ -184,7 +195,7 @@ impl WakeSource {
                     .ok_or_else(|| format!("wake source kind '{kind}' requires ref"))?,
             }),
             _ => Err(format!(
-                "unknown wake source kind '{kind}' (expected issue, peer, user, process, resource, condition, post, or fact)"
+                "unknown wake source kind '{kind}' (expected issue, peer, user, process, resource, condition, or fact)"
             )),
         }
     }
@@ -193,14 +204,12 @@ impl WakeSource {
 /// Whether a row of this kind with no `source_ref` is a **standing watch** over
 /// every reference of the kind, rather than an under-specified scope.
 ///
-/// Two kinds say yes, for the same reason: their unscoped row is the only form
-/// the subscription has. A ref-less `peer` row watches every peer, and a
-/// ref-less `post` row watches the whole Posts corpus — so a fact carrying a
-/// concrete reference (a peer's URI, a post's URI) still has to find them.
-/// Every other kind requires a ref at subscribe time, so a NULL there would be a
-/// row that cannot match anything.
+/// Only `peer` says yes: its unscoped row is the only form the subscription
+/// has, and a ref-less `peer` row watches every peer, so a fact carrying a
+/// concrete peer URI still has to find it. Every other kind requires a ref at
+/// subscribe time, so a NULL there would be a row that cannot match anything.
 pub fn unscoped_row_is_a_standing_watch(kind: &str) -> bool {
-    matches!(kind, SOURCE_KIND_PEER | SOURCE_KIND_POST)
+    kind == SOURCE_KIND_PEER
 }
 
 fn required_ref(kind: &str, reference: Option<&str>) -> Result<String, String> {
@@ -231,6 +240,23 @@ pub struct WakeEvent {
     pub detail_uri: Option<String>,
     pub delivery: WakeDelivery,
     pub urgency: DeliveryUrgency,
+    /// What a muted subscription does with this event. The producer decides,
+    /// because it is a property of what the event is, not of who muted it.
+    #[serde(default)]
+    pub muted: MutedDelivery,
+}
+
+/// How a non-interrupt event reaches a subscription its recipient has muted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutedDelivery {
+    /// Not at all. The default for every live caller with no ride-along
+    /// channel of its own (terminal, condition, resource, process, broadcast).
+    #[default]
+    Drop,
+    /// Passively: it rides along with the recipient's next run instead of
+    /// waking it (CAIRN-1900: mute governs how loudly, never whether).
+    RideAlong,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -437,27 +463,4 @@ pub fn suppressed_from_row(row: &cairn_db::turso::Row) -> DbResult<SuppressedWak
         updated_at: row.i64(10)?,
         delivered_at: row.opt_i64(11)?,
     })
-}
-
-/// Push key prefix for a new post reaching a feed subscriber.
-pub const NEW_POST_PUSH_PREFIX: &str = "post";
-/// Push key prefix for a comment reaching the post author.
-pub const POST_COMMENT_PUSH_PREFIX: &str = "post-comment";
-/// Push key prefix for a canonical reference reaching what it names.
-pub const POST_MENTION_PUSH_PREFIX: &str = "post-mention";
-
-/// The `(source kind, fact kind)` a post push key prefix stands for, or `None`
-/// when the prefix is not a post push.
-///
-/// The one place the push-key vocabulary and the wake-subscription vocabulary
-/// are tied together, so the central mute consultation in
-/// [`crate::push::push_with_fingerprint`] can ask the
-/// subscription registry about a post push without restating either.
-pub fn post_push_source(prefix: &str) -> Option<(&'static str, &'static str)> {
-    match prefix {
-        NEW_POST_PUSH_PREFIX => Some((SOURCE_KIND_POST, FACT_KIND_NEW_POST)),
-        POST_COMMENT_PUSH_PREFIX => Some((SOURCE_KIND_POST, FACT_KIND_POST_COMMENT)),
-        POST_MENTION_PUSH_PREFIX => Some((SOURCE_KIND_POST, FACT_KIND_POST_MENTION)),
-        _ => None,
-    }
 }

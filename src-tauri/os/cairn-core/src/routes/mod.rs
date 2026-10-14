@@ -6,6 +6,7 @@ mod graph;
 mod index;
 mod lifecycle;
 pub mod log;
+mod mentions;
 mod predicate;
 mod references;
 mod worker;
@@ -23,13 +24,14 @@ pub use graph::RouteGraph;
 pub use index::{invalidate_trigger_index, FactLogHandle};
 pub use lifecycle::{mint_attention, spawn_attention_minter};
 pub use log::{mint, spawn_mint, spawn_mint_deferred, Mint, MintOwned};
+pub(crate) use mentions::structural_mentions;
 pub use predicate::{
     explain_clause, matches, Audience, Fact, FactFieldShape, FactRegistry, FactSourceShape,
     FieldKind, FieldSpec, FieldVocabulary, LogDedupe, Presence, SourceSpec, TriggerClause,
 };
 pub use references::validate_references;
-pub(crate) use worker::explain_thread_triggers;
 pub use worker::spawn_fact_log_worker;
+pub(crate) use worker::{addressed_via, explain_thread_triggers};
 #[cfg(test)]
 pub(crate) use worker::{drain_fact_log, drain_fact_log_within};
 

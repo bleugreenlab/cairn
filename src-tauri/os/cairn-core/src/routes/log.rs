@@ -92,13 +92,13 @@ fn bound_text(text: &str, limit: usize) -> String {
     bounded
 }
 
-fn bound_value(value: Value, max_chars: usize) -> Value {
+fn bound_value(value: Value, max_chars: usize, max_list: usize) -> Value {
     match value {
         Value::String(text) => Value::String(bound_text(&text, max_chars)),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .take(MAX_STORED_LIST)
+                .take(max_list)
                 .map(|item| match item {
                     Value::String(text) => Value::String(bound_text(&text, max_chars)),
                     other => other,
@@ -114,10 +114,15 @@ fn bound_value(value: Value, max_chars: usize) -> Value {
 /// dropped here, so no producer can widen what the log holds.
 fn stored_fields(spec: &SourceSpec, fields: BTreeMap<String, Value>) -> BTreeMap<String, Value> {
     let max_chars = spec.max_stored_chars.unwrap_or(MAX_STORED_CHARS);
+    let max_list = if spec.whole_lists {
+        usize::MAX
+    } else {
+        MAX_STORED_LIST
+    };
     fields
         .into_iter()
         .filter(|(name, _)| spec.fields.get(name.as_str()).is_some_and(|f| f.stored))
-        .map(|(name, value)| (name, bound_value(value, max_chars)))
+        .map(|(name, value)| (name, bound_value(value, max_chars, max_list)))
         .collect()
 }
 
@@ -358,7 +363,24 @@ mod tests {
 
         let attention = registry.source("attention").unwrap();
         let labels = Value::Array((0..100).map(|n| Value::String(n.to_string())).collect());
-        let stored = stored_fields(attention, BTreeMap::from([("label".to_string(), labels)]));
+        let stored = stored_fields(
+            attention,
+            BTreeMap::from([("label".to_string(), labels.clone())]),
+        );
         assert_eq!(stored["label"].as_array().unwrap().len(), MAX_STORED_LIST);
+
+        // A reference set the lane resolves or matches is never cut.
+        for source in ["thread_stream", "post_created", "post_commented"] {
+            let spec = registry.source(source).unwrap();
+            let stored = stored_fields(
+                spec,
+                BTreeMap::from([("mentions".to_string(), labels.clone())]),
+            );
+            assert_eq!(
+                stored["mentions"].as_array().unwrap().len(),
+                100,
+                "{source}"
+            );
+        }
     }
 }

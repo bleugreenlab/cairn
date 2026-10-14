@@ -244,6 +244,7 @@ async fn a_targeted_wake_to_a_closed_thread_is_dropped_and_spends_nothing() {
             message: "[Process update] build exited.".into(),
         },
         urgency: DeliveryUrgency::Queue,
+        muted: MutedDelivery::Drop,
     };
 
     set_thread_status(&orch.db.local, "closed").await;
@@ -352,6 +353,7 @@ async fn thread_definition_triggers_rebuild_and_route_to_a_new_session() {
                 message: "[Child update] resolved".into(),
             },
             urgency: DeliveryUrgency::Queue,
+            muted: MutedDelivery::Drop,
         },
     )
     .await
@@ -732,6 +734,7 @@ async fn queueable_node_fixture_can_drive_issue_wakes_without_tribal_setup() {
                 message: "child needs review".to_string(),
             },
             urgency: DeliveryUrgency::Queue,
+            muted: MutedDelivery::Drop,
         },
     )
     .await
@@ -1419,6 +1422,7 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
                 message: "routine PR update".to_string(),
             },
             urgency: DeliveryUrgency::Queue,
+            muted: MutedDelivery::Drop,
         },
     )
     .await
@@ -1447,6 +1451,7 @@ async fn muted_non_interrupt_wake_drops_but_interrupt_pierces_mute() {
                 message: "needs answer".to_string(),
             },
             urgency: DeliveryUrgency::Interrupt,
+            muted: MutedDelivery::Drop,
         },
     )
     .await
@@ -1472,6 +1477,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
                 content: "passive note".to_string(),
             },
             urgency: DeliveryUrgency::Passive,
+            muted: MutedDelivery::Drop,
         },
     )
     .await
@@ -1499,6 +1505,7 @@ async fn passive_message_like_wake_respects_subscription_state() {
                 content: "dropped note".to_string(),
             },
             urgency: DeliveryUrgency::Interrupt,
+            muted: MutedDelivery::Drop,
         },
     )
     .await

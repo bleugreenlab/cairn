@@ -1134,7 +1134,10 @@ pub(super) async fn read_node_permissions(
                 request.summary,
             ));
             if request.status != "pending" {
-                output.push_str(&format!("  → {}\n", request.status));
+                output.push_str(&format!(
+                    "  → {}\n",
+                    permission_status_text(&request.status, request.response.as_deref())
+                ));
             }
             if let Some(receipt) = &request.resolution {
                 output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
@@ -1170,12 +1173,36 @@ pub(super) async fn read_node_permission(
     let mut output = format!("# Permission {} — {}\n\n", segment, node_name);
     output.push_str(&format!("Status: {}\n\n", request.status));
     output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
-    match request.response.as_deref().filter(|r| !r.is_empty()) {
+    push_permission_resolution(&mut output, &request.status, request.response.as_deref());
+
+    output
+}
+
+/// A permission's status as a reader should see it: a withdrawn request says
+/// why, since it was never answered and never will be.
+fn permission_status_text(status: &str, response: Option<&str>) -> String {
+    if status == "withdrawn" {
+        let cause = crate::mcp::handlers::permission::withdrawn_cause(response)
+            .map(|cause| cause.sentence())
+            .unwrap_or("its recorded cause could not be read");
+        format!("withdrawn unanswered: {cause}")
+    } else {
+        status.to_string()
+    }
+}
+
+fn push_permission_resolution(output: &mut String, status: &str, response: Option<&str>) {
+    if status == "withdrawn" {
+        output.push_str(&format!(
+            "## Resolution\n\n{}. It accepts no answer.\n\n",
+            permission_status_text(status, response)
+        ));
+        return;
+    }
+    match response.filter(|r| !r.is_empty()) {
         Some(response) => output.push_str(&format!("## Resolution\n\n{}\n\n", response)),
         None => output.push_str("## Resolution\n\n(awaiting answer)\n\n"),
     }
-
-    output
 }
 
 /// Permissions raised by a sub-agent task job. The task analogue of
@@ -1227,7 +1254,10 @@ pub(super) async fn read_task_permissions(
                 request.summary,
             ));
             if request.status != "pending" {
-                output.push_str(&format!("  → {}\n", request.status));
+                output.push_str(&format!(
+                    "  → {}\n",
+                    permission_status_text(&request.status, request.response.as_deref())
+                ));
             }
         }
         output.push('\n');
@@ -1263,12 +1293,28 @@ pub(super) async fn read_task_permission(
     let mut output = format!("# Permission {} — {}/{}\n\n", segment, node_name, task_name);
     output.push_str(&format!("Status: {}\n\n", request.status));
     output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
-    match request.response.as_deref().filter(|r| !r.is_empty()) {
-        Some(response) => output.push_str(&format!("## Resolution\n\n{}\n\n", response)),
-        None => output.push_str("## Resolution\n\n(awaiting answer)\n\n"),
-    }
+    push_permission_resolution(&mut output, &request.status, request.response.as_deref());
 
     output
+}
+
+#[cfg(test)]
+mod withdrawn_permission_rendering_tests {
+    use super::*;
+
+    #[test]
+    fn a_withdrawn_permission_reads_as_retired_with_its_cause() {
+        let response = r#"{"withdrawn":{"cause":"batch_cancelled"}}"#;
+        assert_eq!(
+            permission_status_text("withdrawn", Some(response)),
+            "withdrawn unanswered: the batch that raised it was cancelled"
+        );
+        let mut output = String::new();
+        push_permission_resolution(&mut output, "withdrawn", Some(response));
+        assert!(output.contains("It accepts no answer."), "{output}");
+        assert!(!output.contains("awaiting answer"), "{output}");
+        assert_eq!(permission_status_text("denied", None), "denied");
+    }
 }
 
 pub(super) async fn read_node(

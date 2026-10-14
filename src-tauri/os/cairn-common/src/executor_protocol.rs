@@ -4010,6 +4010,19 @@ pub struct LearnedResourceEstimate {
 /// (the reader decodes every older lifecycle the executor does), and a cell
 /// recorded before resident ownership existed names nothing verifiable, so it
 /// is never signalled.
+///
+/// cairn/4937 changes how long the executor waits on the runner, without a
+/// bump. No frame, field, variant, or meaning changes; [`RunnerCallback`] gains
+/// only an inherent `kind()` used for logging. The executor now takes each
+/// callback's bound from `callback_contract`: a `SandboxDenied` round trip
+/// waits the runner's relayed fence budget plus a margin instead of a flat
+/// 30 s, and the in-cell MCP relay waits per verb above the host's own bound
+/// instead of a flat 120 s. An older executor keeps its flat 30 s; the runner
+/// now answers a relayed fence wait within 20 s, inside that bound, so even an
+/// older executor receives the suspend marker, and withdraws a fence wait whose
+/// batch context has closed rather than parking the turn. A newer executor
+/// against an older runner waits past that runner's 45 s answer, so it
+/// receives the same reply it always did.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 141;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -11823,6 +11836,21 @@ pub enum RunnerCallback {
         timed_out: bool,
         duration_ms: u64,
     },
+}
+
+impl RunnerCallback {
+    /// A stable name for the callback's variant, for logs. Never serialized,
+    /// and deliberately free of the payload: every variant carries the batch's
+    /// `runner_context_id`, which is a capability and must not be logged.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::SandboxDenied { .. } => "sandbox_denied",
+            Self::CacheCheckpoint { .. } => "cache_checkpoint",
+            Self::ProcessEvent { .. } => "process_event",
+            Self::ProcessItemStarted { .. } => "process_item_started",
+            Self::ProcessItemCompleted { .. } => "process_item_completed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -370,6 +370,10 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["posts", id] => Some(CairnResource::Post {
             id: id.parse::<i64>().ok().filter(|id| *id > 0)?,
         }),
+        ["posts", id, "comments", comment] => Some(CairnResource::PostComment {
+            post_id: id.parse::<i64>().ok().filter(|id| *id > 0)?,
+            comment_id: comment.parse::<i64>().ok().filter(|id| *id > 0)?,
+        }),
         ["actions"] => Some(CairnResource::Actions),
         ["actions", action_id] => Some(CairnResource::Action {
             action_id: (*action_id).to_string(),

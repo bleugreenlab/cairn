@@ -176,6 +176,7 @@ pub struct Fact<'a> {
     pub presence: Presence,
 }
 
+pub use crate::orchestrator::wakes::MutedDelivery;
 pub use crate::storage::LogDedupe;
 
 /// Who receives an undirected channel sink (`ChannelDestination::Subscriptions`)
@@ -211,6 +212,25 @@ pub struct SourceSpec {
     /// content sets this, and then to the external record's own limit, so a
     /// route never sees less than the producer observed.
     pub max_stored_chars: Option<usize>,
+    /// Stored fields whose values are canonical URIs naming who the fact is
+    /// addressed to. The index lane expands each to the jobs it reaches now and
+    /// wakes them with no standing trigger, beside the clause consumers and
+    /// under the same actor, jurisdiction, and one-wake-per-row rules. Empty
+    /// for a source whose rows address no one: a field like `mentions` on
+    /// `thread_stream` is then matchable but delivers nothing by itself.
+    pub addressees: &'static [&'static str],
+    /// The stored field naming the home whose own writing a row is, beside
+    /// the minting job. The index lane resolves it when the row is indexed and
+    /// excludes that job too, so a home that rotated sessions between mint and
+    /// indexing is still never woken by its own words.
+    pub actor_home: Option<&'static str>,
+    /// Whether list fields are stored whole rather than cut at the log's list
+    /// bound. Set for sources whose lists are reference sets the lane resolves
+    /// or matches (`mentions`): a cut list would silently drop recipients and
+    /// matches past the bound. Each entry is still bounded.
+    pub whole_lists: bool,
+    /// What a recipient that muted this source's wake still receives.
+    pub muted: MutedDelivery,
 }
 
 /// GitHub's own limit on an issue or pull request comment body.
@@ -258,6 +278,10 @@ impl Default for FactRegistry {
             dedupe: LogDedupe::Transition,
             audience: Audience::AllProviders,
             max_stored_chars: None,
+            addressees: &[],
+            actor_home: None,
+            whole_lists: false,
+            muted: MutedDelivery::Drop,
             fields: fields(&[
                 ("project", Scalar, STORED),
                 ("attention", Scalar, STORED),
@@ -271,6 +295,10 @@ impl Default for FactRegistry {
             dedupe: LogDedupe::Unique,
             audience: Audience::FollowersOf("threadUri"),
             max_stored_chars: None,
+            addressees: &[],
+            actor_home: None,
+            whole_lists: true,
+            muted: MutedDelivery::Drop,
             fields: fields(&[
                 ("project", Scalar, STORED),
                 ("threadUri", Scalar, STORED),
@@ -278,6 +306,7 @@ impl Default for FactRegistry {
                 ("text", Scalar, HYDRATED),
                 ("context", Scalar, STORED),
                 ("jobId", Scalar, STORED),
+                ("mentions", List, STORED),
             ]),
         };
         // The relay holds GitHub events only in memory, so the row is the only
@@ -289,6 +318,10 @@ impl Default for FactRegistry {
             dedupe: LogDedupe::Unique,
             audience: Audience::AllProviders,
             max_stored_chars: Some(GITHUB_COMMENT_MAX_CHARS),
+            addressees: &[],
+            actor_home: None,
+            whole_lists: false,
+            muted: MutedDelivery::Drop,
             fields: fields(&[
                 ("project", Scalar, STORED),
                 ("repository", Scalar, STORED),
@@ -305,6 +338,10 @@ impl Default for FactRegistry {
             dedupe: LogDedupe::Unique,
             audience: Audience::AllProviders,
             max_stored_chars: None,
+            addressees: &[],
+            actor_home: None,
+            whole_lists: false,
+            muted: MutedDelivery::Drop,
             fields: fields(&[
                 ("project", Scalar, STORED),
                 ("path", Scalar, STORED),
@@ -315,12 +352,55 @@ impl Default for FactRegistry {
                 ("deletions", Scalar, STORED),
             ]),
         };
+        // A post row is an index entry: the writing stays in `posts` and
+        // `post_comments` and is rendered into the wake from there. Authors
+        // and mentions are home or resource URIs, resolved to a job only at
+        // delivery, so a thread that rotated sessions receives on the new one.
+        // A muted Posts watch is still told, quietly (CAIRN-1900).
+        let post_created = SourceSpec {
+            dedupe: LogDedupe::Unique,
+            audience: Audience::AllProviders,
+            max_stored_chars: None,
+            addressees: &["mentions"],
+            actor_home: Some("author"),
+            whole_lists: true,
+            muted: MutedDelivery::RideAlong,
+            fields: fields(&[
+                ("project", Scalar, STORED),
+                ("postUri", Scalar, STORED),
+                ("author", Scalar, STORED),
+                ("scope", Scalar, STORED),
+                ("title", Scalar, STORED),
+                ("mentions", List, STORED),
+            ]),
+        };
+        // A comment is not a feed event: it addresses the post's author and
+        // whoever it names, and reaches anyone else only through a trigger.
+        let post_commented = SourceSpec {
+            dedupe: LogDedupe::Unique,
+            audience: Audience::AllProviders,
+            max_stored_chars: None,
+            addressees: &["postAuthor", "mentions"],
+            actor_home: Some("author"),
+            whole_lists: true,
+            muted: MutedDelivery::RideAlong,
+            fields: fields(&[
+                ("project", Scalar, STORED),
+                ("postUri", Scalar, STORED),
+                ("commentUri", Scalar, STORED),
+                ("author", Scalar, STORED),
+                ("postAuthor", Scalar, STORED),
+                ("mentions", List, STORED),
+            ]),
+        };
         Self {
             sources: HashMap::from([
                 ("attention", attention),
                 ("thread_stream", thread),
                 ("github_comment", github_comment),
                 ("file_changed", file_changed),
+                ("post_created", post_created),
+                ("post_commented", post_commented),
             ]),
         }
     }
@@ -498,6 +578,8 @@ mod tests {
                 "attention",
                 "file_changed",
                 "github_comment",
+                "post_commented",
+                "post_created",
                 "thread_stream"
             ]
         );
@@ -586,7 +668,12 @@ mod tests {
         };
         assert_eq!(hydrated("thread_stream"), vec!["text"]);
         assert_eq!(hydrated("github_comment"), vec!["body"]);
-        for source in ["attention", "file_changed"] {
+        for source in [
+            "attention",
+            "file_changed",
+            "post_created",
+            "post_commented",
+        ] {
             assert!(hydrated(source).is_empty(), "{source} hydrates nothing");
         }
         assert_eq!(
@@ -597,6 +684,66 @@ mod tests {
             registry.source("attention").unwrap().dedupe,
             LogDedupe::Transition
         );
+    }
+
+    /// An addressee the registry names must be a stored field, or the index
+    /// lane would expand a value no row ever carries.
+    #[test]
+    fn every_addressee_names_a_stored_field_and_only_posts_address_anyone() {
+        let registry = FactRegistry::default();
+        let mut addressed = Vec::new();
+        for name in registry.source_names() {
+            let spec = registry.source(name).unwrap();
+            for field in spec.addressees {
+                assert!(
+                    spec.fields.get(field).is_some_and(|f| f.stored),
+                    "{name}.{field} is an addressee but not a stored field"
+                );
+                addressed.push(format!("{name}.{field}"));
+            }
+        }
+        assert_eq!(
+            addressed,
+            vec![
+                "post_commented.postAuthor",
+                "post_commented.mentions",
+                "post_created.mentions"
+            ]
+        );
+        assert_eq!(
+            registry.source("thread_stream").unwrap().fields["mentions"].kind,
+            FieldKind::List,
+            "thread_stream mentions are matchable with the same predicate shape"
+        );
+    }
+
+    /// An actor home must be a stored field, or the lane could never resolve it.
+    #[test]
+    fn every_actor_home_names_a_stored_field() {
+        let registry = FactRegistry::default();
+        for name in registry.source_names() {
+            let spec = registry.source(name).unwrap();
+            if let Some(field) = spec.actor_home {
+                assert!(
+                    spec.fields.get(field).is_some_and(|f| f.stored),
+                    "{name}.{field} is an actor home but not a stored field"
+                );
+            }
+        }
+    }
+
+    /// Every source declares what a muted recipient gets. Only the post
+    /// sources ride along; the rest keep the drop that standing triggers
+    /// have always had.
+    #[test]
+    fn every_source_declares_its_muted_delivery() {
+        let registry = FactRegistry::default();
+        let riding: Vec<_> = registry
+            .source_names()
+            .into_iter()
+            .filter(|name| registry.source(name).unwrap().muted == MutedDelivery::RideAlong)
+            .collect();
+        assert_eq!(riding, vec!["post_commented", "post_created"]);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use super::resume::{
     prepare_parent_for_delegated_wait, schedule_deferred_parent_suspend_for_delegated_wait,
 };
 
-const INLINE_TASK_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+use cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET;
 
 /// What a spawning agent reads for a delegated task that outlived its inline
 /// budget, after the summary naming what was spawned.
@@ -666,7 +666,7 @@ async fn wait_for_tasks_completion(
             }
             Ok(())
         };
-        match tokio::time::timeout(INLINE_TASK_WAIT_BUDGET, completion_wait).await {
+        match tokio::time::timeout(INLINE_DURABLE_WAIT_BUDGET, completion_wait).await {
             Ok(Ok(())) => {}
             _ => return suspend_parent_for_tasks(orch, parent_ctx, &materialized).await,
         }

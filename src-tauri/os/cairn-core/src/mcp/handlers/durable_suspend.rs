@@ -126,6 +126,70 @@ pub(crate) async fn relinquish_to_inner_wait(
     }
 }
 
+/// The inverse of [`relinquish_to_inner_wait`], for an inner wait that was
+/// withdrawn rather than answered: the outer run-batch wait owns the call
+/// again, so the batch's own result reaches the agent. Matches only a row that
+/// the transfer itself retired, so it cannot reopen one resolved any other way.
+pub(crate) async fn reclaim_from_inner_wait(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+    tool_use_id: &str,
+) -> DbResult<bool> {
+    let transferred = serde_json::json!({"outcome":"transferred_to_inner_wait"}).to_string();
+    let changed = conn
+        .execute(
+            "UPDATE agent_waits SET state='pending',resolution_json=NULL,resolved_at=NULL \
+             WHERE run_id=?1 AND tool_use_id=?2 AND state='resolved' AND resolution_json=?3 \
+             AND successor_turn_id IS NULL AND result_stored_at IS NULL",
+            params![run_id, tool_use_id, transferred],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
+/// Hold a run-batch resolver whose call a permission took over until that
+/// permission leaves `pending`.
+///
+/// A batch whose item did not come back suspended settled without the
+/// permission's answer, so the permission is about to be withdrawn (its batch
+/// context has closed) and the withdrawal hands this row back. Resolving first
+/// would find the row still transferred and drop the batch's result. The wait
+/// is bounded by the inline budget: a watched permission wait cannot outlive it.
+pub(crate) async fn await_inner_wait_release(db: &LocalDb, record: &Record) {
+    let deadline = tokio::time::Instant::now()
+        + cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET
+        + std::time::Duration::from_secs(5);
+    loop {
+        let (run_id, tool_use_id, id) = (
+            record.run_id.clone(),
+            record.tool_use_id.clone(),
+            record.id.clone(),
+        );
+        let held = db
+            .read(|conn| {
+                let (run_id, tool_use_id, id) = (run_id.clone(), tool_use_id.clone(), id.clone());
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT EXISTS(SELECT 1 FROM agent_waits WHERE id=?1 AND state='resolved' \
+                               AND resolution_json='{\"outcome\":\"transferred_to_inner_wait\"}') \
+                             AND EXISTS(SELECT 1 FROM permission_requests \
+                               WHERE run_id=?2 AND tool_use_id=?3 AND status='pending')",
+                            params![id.as_str(), run_id.as_str(), tool_use_id.as_str()],
+                        )
+                        .await?;
+                    Ok(rows.next().await?.map(|row| row.i64(0)).transpose()?.unwrap_or(0) != 0)
+                })
+            })
+            .await
+            .unwrap_or(false);
+        if !held || tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 impl Condition {
     /// A short, human-readable name for the call this suspension parked.
     ///

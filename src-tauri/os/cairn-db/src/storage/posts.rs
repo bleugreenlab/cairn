@@ -26,10 +26,11 @@ pub(super) const POST_COLUMNS: &str =
 /// drift apart. A function rather than a constant only because those queries
 /// bind their project id at different positions; `param` is that position.
 ///
-/// Attention routing enforces the same rule one layer up, against a job's home
-/// project rather than against a row (`wakes::posts::job_may_see_post`). That is
-/// an equivalence this cannot mechanically hold, so it is stated rather than
-/// assumed: a change here is a change there.
+/// The fact log's index lane enforces the same rule one layer up, against a
+/// job's home project rather than against a row (`routes::predicate::
+/// scope_exclusion`, which every post recipient passes). That is an equivalence
+/// this cannot mechanically hold, so it is stated rather than assumed: a change
+/// here is a change there.
 pub(super) fn visible_to_project(param: u8) -> String {
     format!("(project_id IS NULL OR project_id = ?{param})")
 }

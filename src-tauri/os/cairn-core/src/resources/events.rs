@@ -408,6 +408,8 @@ fn record_id_label(source: &str) -> &'static str {
         "thread_stream" => "transcript events.rowid",
         "github_comment" => "GitHub comment id",
         "file_changed" => "file_changes.id",
+        "post_created" => "posts.id",
+        "post_commented" => "post_comments.id",
         _ => "record id",
     }
 }
@@ -520,8 +522,12 @@ pub(crate) async fn member(
                 ),
                 None => action.to_string(),
             };
+            let via = wake["via"]
+                .as_str()
+                .map(|field| format!("addressed via {field} · "))
+                .unwrap_or_default();
             out.push_str(&format!(
-                "- {} · job {} · {outcome}\n",
+                "- {} · job {} · {via}{outcome}\n",
                 wake["uri"].as_str().unwrap_or("?"),
                 wake["job"].as_str().unwrap_or("?"),
             ));
@@ -542,8 +548,23 @@ async fn explain_segment(orch: &Orchestrator, row: &FactRow, home: &str) -> Stri
     let mut out = format!(
         "\n## Standing triggers of {home}\n\nEvaluated now, against the thread's current triggers. What was actually delivered is under Wakes, and can differ if the triggers changed since or the wake was muted.\n\n"
     );
+    let addressed = match crate::routes::addressed_via(orch, row, home).await {
+        Ok(addressed) => addressed,
+        Err(error) => {
+            out.push_str(&format!(
+                "Could not resolve the row's addressees: {error}\n"
+            ));
+            None
+        }
+    };
+    if let Some(field) = addressed {
+        out.push_str(&format!(
+            "- addressed via {field}: the row names {home}, which wakes it whatever its standing triggers say (unless it is the row's own write or outside its project)\n"
+        ));
+    }
     match crate::routes::explain_thread_triggers(orch, row, home).await {
         Err(error) => out.push_str(&format!("Could not evaluate: {error}\n")),
+        Ok(verdicts) if verdicts.is_empty() && addressed.is_some() => {}
         Ok(verdicts) if verdicts.is_empty() => out.push_str(&format!(
             "{home} has no standing trigger on {}.\n",
             row.source

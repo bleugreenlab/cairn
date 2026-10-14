@@ -539,10 +539,10 @@ fn parse_wake_filter_defaults_output_fields_to_none() {
     assert!(filter.phrase.is_none());
 }
 
-/// `kind:"posts"` is what an agent writes; `post` is what the wake schema
-/// stores. Normalizing at the mutation boundary is what keeps the two from
-/// becoming two vocabularies, so the alias and the stored kind must both land on
-/// the same row.
+/// `kind:"posts"` is what an agent writes; a `{fact: post_created}` clause is
+/// what the wake schema stores. Normalizing at the mutation boundary is what
+/// keeps the two from becoming two vocabularies: the alias, the legacy
+/// singular, and every verb land on the same row.
 #[test]
 fn posts_wake_filter_normalizes_the_agent_facing_alias() {
     let it = item(
@@ -554,9 +554,19 @@ fn posts_wake_filter_normalizes_the_agent_facing_alias() {
         let value = serde_json::json!({ "kind": written });
         let filter = parse_wake_filter(0, &it, &value, "subscribe").unwrap();
         let filter = normalize_posts_filter(0, &it, filter).unwrap();
-        assert_eq!(filter.kind, "post");
-        assert!(filter.reference.is_none());
+        assert_eq!(filter.kind, "fact");
+        assert_eq!(
+            filter.reference.as_deref(),
+            Some(r#"{"fact":"post_created"}"#)
+        );
+        assert_eq!(filter.fact_kinds, Some(vec!["post_created".to_string()]));
     }
+    let comments = serde_json::json!({ "kind": "posts", "factKinds": ["post_commented"] });
+    let filter = parse_wake_filter(0, &it, &comments, "subscribe").unwrap();
+    assert!(
+        normalize_posts_filter(0, &it, filter).is_err(),
+        "comments are not feed events"
+    );
 }
 
 /// A Posts watch governs the whole corpus and decides its reach from the post's

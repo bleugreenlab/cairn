@@ -61,6 +61,7 @@ fn terminal_exit_event(
             message: format_terminal_exit_message(slug, detail_uri, exit_code, runtime_secs, tail),
         },
         urgency: DeliveryUrgency::Queue,
+        muted: MutedDelivery::Drop,
     }
 }
 
@@ -136,6 +137,7 @@ fn terminal_output_event(
             message: format_terminal_output_message(slug, detail_uri, phrase, excerpt),
         },
         urgency: DeliveryUrgency::Queue,
+        muted: MutedDelivery::Drop,
     }
 }
 

@@ -516,21 +516,25 @@ async fn normalize_checks_filter(
     Ok(filter)
 }
 
-/// Normalize the agent-facing `kind:"posts"` alias to the persisted `post`
-/// source kind, and refuse a `ref` on it.
+/// Compile the agent-facing `kind:"posts"` watch to the fact clause it is:
+/// `{fact: post_created}`, persisted as a `fact` subscription on that clause's
+/// canonical reference.
 ///
-/// The plural is what an agent writes — "watch posts" — while the wake schema
-/// stores the singular kind each post fact is carried on. Refusing a `ref` is
-/// not tidiness: a Posts subscription is a standing watch over the whole corpus
-/// whose reach is decided at delivery by the post's scope, so accepting a
-/// caller-supplied reference would either silently do nothing or invite a caller
-/// to name a destination the subscription does not govern. The subscribing job
-/// is always the node the URI addresses, never anything in the payload.
+/// A Posts watch is then an ordinary consumer of the fact log, matched by the
+/// index lane with the one jurisdiction rule every consumer gets (a workspace
+/// post reaches any home, a project post only homes in its project), so there
+/// is no second scope rule for posts. Subscribe, mute, unmute, and unsubscribe
+/// all compile to the same kind, reference, and fact kinds, so they address one
+/// row. A `ref` is refused: the watch covers the whole corpus, and accepting a
+/// caller-supplied reference would either do nothing or look like a way to name
+/// a destination the subscription does not govern. Comments are not feed
+/// events, so a fact kind other than `post_created` is refused too.
 pub(super) fn normalize_posts_filter(
     index: usize,
     item: &ChangeItem,
     mut filter: WakeFilterPayload,
 ) -> ResourceMutationResult<WakeFilterPayload> {
+    use crate::orchestrator::wakes::{fact_clause_ref, POST_CREATED, SOURCE_KIND_FACT};
     if !matches!(filter.kind.as_str(), "posts" | "post") {
         return Ok(filter);
     }
@@ -541,7 +545,25 @@ pub(super) fn normalize_posts_filter(
             "a posts wake watches the whole Posts corpus and does not accept ref",
         ));
     }
-    filter.kind = "post".to_string();
+    if filter
+        .fact_kinds
+        .as_deref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind != POST_CREATED))
+    {
+        return Err(build_failure(
+            index,
+            item,
+            "a posts wake watches new posts (post_created) only; a comment reaches its post's author and whoever it names",
+        ));
+    }
+    let clause = std::collections::BTreeMap::from([(
+        "fact".to_string(),
+        serde_json::Value::String(POST_CREATED.to_string()),
+    )]);
+    filter.kind = SOURCE_KIND_FACT.to_string();
+    filter.reference =
+        Some(fact_clause_ref(&clause).map_err(|error| build_failure(index, item, error))?);
+    filter.fact_kinds = Some(vec![POST_CREATED.to_string()]);
     Ok(filter)
 }
 
@@ -549,7 +571,7 @@ pub(super) fn normalize_posts_filter(
 pub(super) struct WakeFilterPayload {
     pub(super) kind: String,
     pub(super) reference: Option<String>,
-    fact_kinds: Option<Vec<String>>,
+    pub(super) fact_kinds: Option<Vec<String>>,
     /// Terminal subscriptions only: `"exit"` (default) or `"output"`.
     pub(super) on: Option<String>,
     /// Terminal `on:"output"` subscriptions only: the literal phrase to watch for.

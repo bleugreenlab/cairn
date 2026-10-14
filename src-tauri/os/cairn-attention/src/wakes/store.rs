@@ -35,6 +35,22 @@ pub async fn rebuild_derived_thread_subscriptions_conn(
     triggers: &[std::collections::BTreeMap<String, serde_json::Value>],
 ) -> DbResult<()> {
     let scopes = compile_derived_thread_scopes(triggers).map_err(crate::storage::DbError::Row)?;
+    // A rebuild re-derives the same scopes far more often than it changes
+    // them, so a state the node set on a derived row (a mute, an opt-out)
+    // carries over to the row that re-derives its scope.
+    let mut kept_states = std::collections::HashMap::new();
+    {
+        let mut rows = conn
+            .query(
+                "SELECT source_kind, COALESCE(source_ref, ''), COALESCE(fact_kinds_json, ''), state
+                   FROM wake_subscriptions WHERE job_id = ?1 AND id LIKE 'derived:thread:%'",
+                params![job_id],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            kept_states.insert((row.text(0)?, row.text(1)?, row.text(2)?), row.text(3)?);
+        }
+    }
     conn.execute(
         "DELETE FROM wake_subscriptions WHERE job_id = ?1 AND id LIKE 'derived:thread:%'",
         params![job_id],
@@ -45,6 +61,39 @@ pub async fn rebuild_derived_thread_subscriptions_conn(
         let id = format!("{DERIVED_THREAD_ID_PREFIX}{}", uuid::Uuid::new_v4());
         let fact_kinds_json = serde_json::to_string(&scope.fact_kinds)
             .map_err(|error| crate::storage::DbError::Row(error.to_string()))?;
+        // A scope the node already holds as a row of its own (an explicit or
+        // migrated Posts watch is exactly `{fact: post_created}`) is governed
+        // by that row, mute and opt-out included, as an explicit issue row
+        // governs the derived parent watch. Inserting a second would also
+        // violate the unique scope index.
+        let held = {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM wake_subscriptions
+                      WHERE job_id = ?1 AND source_kind = ?2
+                        AND COALESCE(source_ref, '') = ?3 AND COALESCE(fact_kinds_json, '') = ?4
+                      LIMIT 1",
+                    params![
+                        job_id,
+                        scope.source_kind,
+                        scope.source_ref.as_str(),
+                        fact_kinds_json.as_str()
+                    ],
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if held {
+            continue;
+        }
+        let state = kept_states
+            .get(&(
+                scope.source_kind.to_string(),
+                scope.source_ref.clone(),
+                fact_kinds_json.clone(),
+            ))
+            .cloned()
+            .unwrap_or_else(|| "active".to_string());
         // Persisted provenance cannot use created_by=derived: the shipped,
         // team-synced table constrains that field to agent/user/system and cannot
         // be destructively rebuilt without breaking sync triggers. The reserved
@@ -54,14 +103,15 @@ pub async fn rebuild_derived_thread_subscriptions_conn(
             "INSERT INTO wake_subscriptions
              (id, job_id, source_kind, source_ref, fact_kinds_json, state,
               created_by, created_at, updated_at, one_shot)
-             VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'system', ?6, ?6, 0)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?7, 'system', ?6, ?6, 0)",
             params![
                 id.as_str(),
                 job_id,
                 scope.source_kind,
                 scope.source_ref.as_str(),
                 fact_kinds_json.as_str(),
-                now
+                now,
+                state.as_str()
             ],
         )
         .await?;
@@ -118,6 +168,16 @@ fn issue_resolution_watch(
     .then(|| cairn_common::uri::canonicalize_uri_identity(issue))
 }
 
+/// The reference a `fact` subscription is stored and delivered under: the
+/// clause's canonical JSON, keys sorted. One canonicalization, so two
+/// spellings of one clause are one row, and the fact log worker's wake names
+/// exactly the row it matched.
+pub fn fact_clause_ref(
+    clause: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<String, String> {
+    serde_json::to_string(clause).map_err(|error| error.to_string())
+}
+
 fn compile_derived_thread_scopes(
     triggers: &[std::collections::BTreeMap<String, serde_json::Value>],
 ) -> Result<Vec<DerivedThreadScope>, String> {
@@ -135,13 +195,10 @@ fn compile_derived_thread_scopes(
             });
             continue;
         }
-        // Every other clause is a standing trigger over the fact log. Its
-        // canonical JSON (keys sorted) is the subscription's reference, so two
-        // spellings of one clause are one row and the fact log worker's wake
-        // names exactly the row it matched.
+        // Every other clause is a standing trigger over the fact log.
         scopes.push(DerivedThreadScope {
             source_kind: SOURCE_KIND_FACT,
-            source_ref: serde_json::to_string(clause).map_err(|error| error.to_string())?,
+            source_ref: fact_clause_ref(clause)?,
             fact_kinds: vec![fact.to_string()],
         });
     }

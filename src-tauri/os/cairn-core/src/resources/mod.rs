@@ -15,7 +15,7 @@ mod diff;
 mod eras;
 pub(crate) mod events;
 mod executors;
-mod feed;
+pub(crate) mod feed;
 mod files;
 mod grants;
 pub mod home;

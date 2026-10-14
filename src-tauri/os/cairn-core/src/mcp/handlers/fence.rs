@@ -30,7 +30,7 @@ use crate::mcp::types::McpCallbackRequest;
 use crate::models::Fence;
 use crate::orchestrator::Orchestrator;
 
-use super::permission::{await_permission_decision, resolve_fence_policy, PermissionWait};
+use super::permission::{await_permission_decision, resolve_fence_policy, Handoff, PermissionWait};
 
 /// Typed result of resolving the fence attached to a request. Ambient means no
 /// authenticated identity was supplied; unavailable means one was supplied but
@@ -264,6 +264,20 @@ pub async fn raise_fence(
     request: &McpCallbackRequest,
     crossing: Crossing,
 ) -> FenceDecision {
+    raise_fence_with_handoff(orch, run_id, fence, request, crossing, Handoff::Unwatched).await
+}
+
+/// [`raise_fence`] for a crossing relayed from an executor batch, whose
+/// callback can close before the inline wait ends. A closed handoff withdraws
+/// the request rather than parking the turn.
+pub(crate) async fn raise_fence_with_handoff(
+    orch: &Orchestrator,
+    run_id: &str,
+    fence: Fence,
+    request: &McpCallbackRequest,
+    crossing: Crossing,
+    handoff: Handoff,
+) -> FenceDecision {
     // A crossing that names a protected host path is refused outright, ahead of
     // the fence policy and ahead of the session-grant short circuit.
     //
@@ -321,8 +335,15 @@ pub async fn raise_fence(
                 "request": embedded,
             });
 
-            match await_permission_decision(orch, run_id, &tool_use_id, crossing.verb, &tool_input)
-                .await
+            match await_permission_decision(
+                orch,
+                run_id,
+                &tool_use_id,
+                crossing.verb,
+                &tool_input,
+                handoff,
+            )
+            .await
             {
                 PermissionWait::Decided(response) => {
                     if response_is_allow(&response) {
@@ -336,6 +357,10 @@ pub async fn raise_fence(
                 }
                 PermissionWait::Suspended => FenceDecision::Suspended,
                 PermissionWait::Unavailable(error) => FenceDecision::Unavailable(error),
+                PermissionWait::Withdrawn(cause) => FenceDecision::Unavailable(format!(
+                    "the permission for this crossing was withdrawn: {}",
+                    cause.sentence()
+                )),
             }
         }
     }

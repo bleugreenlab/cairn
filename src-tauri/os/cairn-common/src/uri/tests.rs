@@ -178,6 +178,13 @@ fn parses_and_builds_posts_resources() {
         ("cairn://posts", CairnResource::Posts),
         ("cairn://posts/42", CairnResource::Post { id: 42 }),
         (
+            "cairn://posts/1/comments/2",
+            CairnResource::PostComment {
+                post_id: 1,
+                comment_id: 2,
+            },
+        ),
+        (
             "cairn://p/cairn/posts",
             CairnResource::ProjectPosts {
                 project: "cairn".to_string(),
@@ -190,6 +197,8 @@ fn parses_and_builds_posts_resources() {
     }
     assert_eq!(parse_uri("cairn://posts/0"), None);
     assert_eq!(parse_uri("cairn://posts/not-an-integer"), None);
+    assert_eq!(parse_uri("cairn://posts/1/comments/0"), None);
+    assert_eq!(parse_uri("cairn://posts/1/comments"), None);
     assert_eq!(
         parse_uri("cairn://p/cairn/posts"),
         Some(CairnResource::ProjectPosts {

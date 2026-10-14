@@ -237,6 +237,9 @@ pub enum PermissionStatus {
     Pending,
     Allowed,
     Denied,
+    /// Retired unanswered because the handoff that would have carried its
+    /// answer closed first. It accepts no answer.
+    Withdrawn,
 }
 
 impl std::fmt::Display for PermissionStatus {
@@ -245,6 +248,7 @@ impl std::fmt::Display for PermissionStatus {
             PermissionStatus::Pending => write!(f, "pending"),
             PermissionStatus::Allowed => write!(f, "allowed"),
             PermissionStatus::Denied => write!(f, "denied"),
+            PermissionStatus::Withdrawn => write!(f, "withdrawn"),
         }
     }
 }
@@ -257,6 +261,7 @@ impl std::str::FromStr for PermissionStatus {
             "pending" => Ok(PermissionStatus::Pending),
             "allowed" => Ok(PermissionStatus::Allowed),
             "denied" => Ok(PermissionStatus::Denied),
+            "withdrawn" => Ok(PermissionStatus::Withdrawn),
             _ => Err(format!("Unknown permission status: {}", s)),
         }
     }

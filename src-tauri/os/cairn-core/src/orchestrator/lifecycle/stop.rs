@@ -431,6 +431,14 @@ struct ParkSlot {
 #[derive(Default)]
 pub struct ParkSlots(Mutex<HashMap<String, ParkSlot>>);
 
+#[cfg(test)]
+impl ParkSlots {
+    /// Whether any suspension has armed a park for `run_id`.
+    pub(crate) fn armed(&self, run_id: &str) -> bool {
+        self.0.lock().unwrap().contains_key(run_id)
+    }
+}
+
 /// Park a run for a durable wait once its pending tool call has had the handoff
 /// grace to receive the suspension's own result.
 ///

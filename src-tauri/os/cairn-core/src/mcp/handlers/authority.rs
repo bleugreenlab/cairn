@@ -152,7 +152,16 @@ pub async fn raise_authority(
         }
     };
 
-    match await_permission_decision(orch, &run_id, &tool_use_id, verb, &tool_input).await {
+    match await_permission_decision(
+        orch,
+        &run_id,
+        &tool_use_id,
+        verb,
+        &tool_input,
+        super::permission::Handoff::Unwatched,
+    )
+    .await
+    {
         PermissionWait::Decided(response) => {
             // An approval whose grant did not persist is not an approval, and
             // saying so beats letting the pre-persist check refuse with
@@ -176,6 +185,8 @@ pub async fn raise_authority(
         }
         PermissionWait::Suspended => AuthorityGate::Suspended,
         PermissionWait::Unavailable(error) => AuthorityGate::Unavailable(error),
+        // Only an executor-relayed fence wait is watched.
+        PermissionWait::Withdrawn(cause) => AuthorityGate::Unavailable(cause.sentence().into()),
     }
 }
 

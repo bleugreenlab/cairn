@@ -82,6 +82,7 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     projects::PROJECT_ISSUES_CONTRACT,
     posts::POSTS_CONTRACT,
     posts::POST_CONTRACT,
+    posts::POST_COMMENT_CONTRACT,
     posts::PROJECT_POSTS_CONTRACT,
     posts::HOME_FEED_CONTRACT,
     projects::PROJECT_CODEMAP_CONTRACT,

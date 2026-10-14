@@ -4,6 +4,7 @@ pub mod auth;
 pub mod authorization;
 pub mod build_identity;
 pub mod cache_distance;
+pub mod callback_contract;
 pub mod change_validation;
 pub mod companion_protocol;
 pub mod conflict_scaffolding;

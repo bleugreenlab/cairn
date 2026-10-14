@@ -385,6 +385,9 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
                 .with_containment_scope(scope),
             )
             .await?;
+            if let Some(notice) = outcome.withdrawn {
+                return Ok(json!({"outcome": "withdrawn", "message": notice}));
+            }
             Ok(json!({"outcome": if outcome.duplicate {"duplicate"} else {"created"}}))
         }
         (

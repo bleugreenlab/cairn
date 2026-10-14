@@ -3,7 +3,7 @@
 //! The MCP server itself (tool surface, schemas, resolution, output shaping)
 //! lives in the `cairn-mcp-server` crate, shared with the orchestrator's HTTP
 //! endpoint. This binary supplies its stdio transport and HTTP callback sink
-//! (`http_sink`, `timeouts`), the `cairn` CLI subcommands (`cli`), and the
+//! (`http_sink`), the `cairn` CLI subcommands (`cli`), and the
 //! interactive shell (`shell`).
 use anyhow::Result;
 use clap::Parser;
@@ -19,7 +19,6 @@ mod executor;
 mod http_sink;
 mod invoke_client;
 mod shell;
-mod timeouts;
 
 use cli::{default_callback_url, run_cli_change, run_cli_check, run_cli_read, run_cli_watch};
 

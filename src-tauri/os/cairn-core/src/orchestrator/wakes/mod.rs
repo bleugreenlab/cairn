@@ -5,13 +5,12 @@
 //! surface is re-exported here so every `crate::orchestrator::wakes::X` path
 //! resolves unchanged.
 
+mod addressed;
 mod checks;
 mod child;
 pub mod conditions;
 mod matching;
 mod posts;
-#[cfg(test)]
-mod posts_tests;
 mod routing;
 mod schedules;
 mod side_channel;
@@ -22,6 +21,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use addressed::*;
 pub(crate) use checks::*;
 pub use child::*;
 pub use matching::*;

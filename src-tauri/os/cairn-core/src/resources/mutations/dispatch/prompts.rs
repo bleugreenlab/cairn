@@ -200,7 +200,9 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                if outcome.duplicate {
+                if let Some(notice) = outcome.withdrawn {
+                    notice
+                } else if outcome.duplicate {
                     format!("Permission {} was already answered", segment)
                 } else {
                     format!("Answered permission {}: {}", segment, decision_str)
@@ -254,7 +256,9 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                if outcome.duplicate {
+                if let Some(notice) = outcome.withdrawn {
+                    notice
+                } else if outcome.duplicate {
                     format!("Permission {} was already answered", segment)
                 } else {
                     format!("Answered permission {}: {}", segment, decision_str)

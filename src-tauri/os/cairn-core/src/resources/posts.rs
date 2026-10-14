@@ -334,6 +334,42 @@ pub(super) async fn read_post(db: &LocalDb, id: i64, params: &[QueryParam]) -> S
     output
 }
 
+/// One comment on one post, or `None` when either is gone or the comment
+/// belongs to a different post.
+pub(crate) async fn find_post_comment(
+    db: &LocalDb,
+    post_id: i64,
+    comment_id: i64,
+) -> Result<Option<PostComment>, String> {
+    Ok(db
+        .list_post_comments(post_id)
+        .await
+        .map_err(|error| format!("Failed to read post comments: {error}"))?
+        .into_iter()
+        .find(|comment| comment.id == comment_id))
+}
+
+/// `cairn://posts/{id}/comments/{cid}` — one comment, under the header of the
+/// post it answers, so a cited comment reads with its context.
+pub(super) async fn read_post_comment(db: &LocalDb, post_id: i64, comment_id: i64) -> String {
+    let post = match db.get_post(post_id).await {
+        Ok(Some(post)) => post,
+        Ok(None) => return format!("Post {post_id} not found."),
+        Err(error) => return format!("Failed to read post: {error}"),
+    };
+    let comment = match find_post_comment(db, post_id, comment_id).await {
+        Ok(Some(comment)) => comment,
+        Ok(None) => return format!("Comment {comment_id} not found on cairn://posts/{post_id}."),
+        Err(error) => return error,
+    };
+    let context = PostContext::resolve(db, std::slice::from_ref(&post)).await;
+    format!(
+        "# On [{}](cairn://posts/{post_id})\n\n{}",
+        post.title.as_deref().unwrap_or("Untitled"),
+        render_comment(&comment, &context, PostForm::Read)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

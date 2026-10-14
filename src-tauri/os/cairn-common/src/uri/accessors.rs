@@ -278,6 +278,7 @@ impl CairnResource {
             | Self::ProjectIssues { .. }
             | Self::Posts
             | Self::Post { .. }
+            | Self::PostComment { .. }
             | Self::ProjectPosts { .. }
             | Self::ProjectCodemap { .. }
             | Self::ProjectMap { .. }
@@ -480,6 +481,7 @@ impl CairnResource {
             | Self::ProjectSymbols { project, .. } => Some(project),
             Self::Posts
             | Self::Post { .. }
+            | Self::PostComment { .. }
             | Self::Routes
             | Self::Route { .. }
             | Self::RouteHistory { .. }
@@ -595,6 +597,7 @@ impl CairnResource {
             | Self::ProjectIssues { .. }
             | Self::Posts
             | Self::Post { .. }
+            | Self::PostComment { .. }
             | Self::ProjectPosts { .. }
             | Self::ProjectCodemap { .. }
             | Self::ProjectMap { .. }

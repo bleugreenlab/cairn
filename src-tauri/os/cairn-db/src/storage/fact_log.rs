@@ -511,6 +511,11 @@ pub struct WakeMatch {
     /// The row's `minted_at`. Windows are measured on mint time, so a backlog
     /// the index lane works through late coalesces the way it would have live.
     pub at_ms: i64,
+    /// The row names this recipient directly rather than matching one of its
+    /// standing triggers. An addressed match's `clause_ref` replaces the one a
+    /// pending wake already carries, so delivery resolves the more specific
+    /// reason (a mention is not quieted by a muted feed watch folded first).
+    pub addressed: bool,
 }
 
 /// How long a pending wake waits for more rows.
@@ -545,14 +550,16 @@ pub async fn coalesce_wake(db: &LocalDb, matched: WakeMatch, window: WakeWindow)
             };
             if let Some(id) = open {
                 conn.execute(
-                    "UPDATE fact_log_wakes SET count=count+1, first_row_id=MIN(first_row_id,?2), last_row_id=MAX(last_row_id,?2), deliver_after=MIN(MAX(deliver_after,?3+?4),opened_at+?5), project_id=CASE WHEN project_id=?6 THEN project_id ELSE NULL END WHERE id=?1",
+                    "UPDATE fact_log_wakes SET count=count+1, first_row_id=MIN(first_row_id,?2), last_row_id=MAX(last_row_id,?2), deliver_after=MIN(MAX(deliver_after,?3+?4),opened_at+?5), project_id=CASE WHEN project_id=?6 THEN project_id ELSE NULL END, clause_ref=CASE WHEN ?7 THEN ?8 ELSE clause_ref END WHERE id=?1",
                     params![
                         id,
                         matched.row_id,
                         matched.at_ms,
                         window.settle_ms,
                         window.max_window_ms,
-                        matched.project_id.clone()
+                        matched.project_id.clone(),
+                        i64::from(matched.addressed),
+                        matched.clause_ref.clone()
                     ],
                 )
                 .await?;
@@ -953,6 +960,7 @@ mod tests {
             project_id: Some("p".into()),
             row_id,
             at_ms,
+            addressed: false,
         }
     }
 
@@ -1009,6 +1017,34 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(next, first);
+    }
+
+    #[tokio::test]
+    async fn an_addressed_match_claims_the_pending_wake_and_a_trigger_match_does_not() {
+        let db = crate::storage::migrated_test_db("fact-log-coalesce-addressed.db").await;
+        let clause_ref = |id: i64| {
+            let db = &db;
+            async move { get_wakes(db, &[id]).await.unwrap()[0].clause_ref.clone() }
+        };
+        let id = coalesce_wake(&db, matched("j", "s", 1, 0), WINDOW)
+            .await
+            .unwrap();
+        let mut addressed = matched("j", "s", 2, 10);
+        addressed.clause_ref = "addressed:s.mentions".into();
+        addressed.addressed = true;
+        assert_eq!(coalesce_wake(&db, addressed, WINDOW).await.unwrap(), id);
+        assert_eq!(clause_ref(id).await, "addressed:s.mentions");
+        assert_eq!(
+            coalesce_wake(&db, matched("j", "s", 3, 20), WINDOW)
+                .await
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            clause_ref(id).await,
+            "addressed:s.mentions",
+            "a later trigger match does not take the addressed reason back"
+        );
     }
 
     #[tokio::test]

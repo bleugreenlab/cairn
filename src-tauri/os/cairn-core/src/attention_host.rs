@@ -112,9 +112,6 @@ impl AttentionHost for CoreAttentionHost {
                 )
                 .await
             }
-            ContentRequest::Post(push) => {
-                crate::orchestrator::wakes::render_post_push_body(&self.0.db.local, push).await
-            }
         }
     }
     /// Record that a terminal child makes a watching thread's turns compactable.

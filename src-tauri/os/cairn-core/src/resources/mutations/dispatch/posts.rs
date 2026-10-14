@@ -28,37 +28,20 @@ fn content<'a>(
         })
 }
 
-/// Fold a routing outcome into the mutation's summary.
+/// Fold the fact log mint into the mutation's summary.
 ///
 /// The post or comment row is the durable content boundary and is already
-/// committed by the time attention is routed, so a routing failure is reported,
-/// never rolled back into the content. The converse holds too: the summary
-/// counts only pushes that were durably recorded, so it can never claim a wake
-/// that did not land.
-fn attention(
-    created: String,
-    routed: Result<crate::orchestrator::wakes::PostAttention, String>,
-) -> String {
-    match routed {
-        Ok(attention) => {
-            let mut summary = created;
-            if !attention.recorded.is_empty() {
-                summary.push_str(&format!(
-                    " (attention: {} node(s))",
-                    attention.recorded.len()
-                ));
-            }
-            if attention.failed > 0 {
-                summary.push_str(&format!(
-                    " ({} attention notice(s) could not be recorded)",
-                    attention.failed
-                ));
-            }
-            summary
-        }
+/// committed by the time its fact is minted, so a mint failure is reported,
+/// never rolled back into the content. Who the fact reaches is decided later by
+/// the log worker, so the summary claims no wake; it names the event row, whose
+/// `?explain=<home>` says why a given home was or was not woken.
+fn minted(created: String, event: Result<Option<String>, String>) -> String {
+    match event {
+        Ok(Some(event)) => format!("{created} (event {event})"),
+        Ok(None) => created,
         Err(error) => {
-            tracing::warn!(%error, "post attention routing failed");
-            format!("{created} (attention routing failed: {error})")
+            tracing::warn!(%error, "post fact mint failed");
+            format!("{created} (event log mint failed: {error})")
         }
     }
 }
@@ -72,16 +55,19 @@ fn emit_db_change(orch: &Orchestrator, table: &str, action: &str) {
     }
 }
 
+/// The authenticated author, their appearance, their project key, and the job
+/// writing on their behalf.
 async fn identity(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     index: usize,
     item: &ChangeItem,
-) -> ResourceMutationResult<(PrincipalRef, AppearanceSnapshot, String)> {
+) -> ResourceMutationResult<(PrincipalRef, AppearanceSnapshot, String, String)> {
     let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
         .await
         .map_err(|error| build_failure(index, item, error))?;
     let live_run_id = agent.run_id.as_str();
+    let job_id = agent.job_id.clone();
     let node = agent.home;
     let home = cairn_common::uri::parse_uri(&node)
         .ok_or_else(|| build_failure(index, item, "Authenticated run has an invalid home URI"))?;
@@ -116,7 +102,7 @@ async fn identity(
     .map_err(|error| build_failure(index, item, error.to_string()))?;
     let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None)
         .map_err(|error| build_failure(index, item, error.to_string()))?;
-    Ok((author, appearance, project))
+    Ok((author, appearance, project, job_id))
 }
 
 /// Posts and their comments carry no caller-supplied provenance: the author
@@ -157,7 +143,7 @@ pub(super) async fn dispatch(
             if dry_run {
                 format!("Would create post: {}", title.unwrap_or("Untitled"))
             } else {
-                let (author, appearance, own_project) =
+                let (author, appearance, own_project, job_id) =
                     identity(orch, request, index, item).await?;
                 let project_id = match payload.get("scope") {
                     None => None,
@@ -192,9 +178,9 @@ pub(super) async fn dispatch(
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
                 emit_db_change(orch, "posts", "insert");
                 let created = format!("Created post cairn://posts/{}", post.id);
-                attention(
+                minted(
                     created,
-                    crate::orchestrator::wakes::route_new_post(orch, &post).await,
+                    crate::orchestrator::wakes::mint_post_created(orch, &post, Some(&job_id)).await,
                 )
             }
         }
@@ -204,7 +190,7 @@ pub(super) async fn dispatch(
             if dry_run {
                 format!("Would comment on cairn://posts/{id}")
             } else {
-                let (author, appearance, _) = identity(orch, request, index, item).await?;
+                let (author, appearance, _, job_id) = identity(orch, request, index, item).await?;
                 let comment = orch
                     .db
                     .local
@@ -218,19 +204,22 @@ pub(super) async fn dispatch(
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
                 emit_db_change(orch, "post_comments", "insert");
                 let created = format!("Created comment {} on cairn://posts/{id}", comment.id);
-                // The comment routes against the post it landed on, so the
-                // author it replies to is read back from the durable row rather
-                // than trusted from anything the caller supplied.
+                // The comment's fact names the post it landed on, so the author
+                // it replies to is read back from the durable row rather than
+                // trusted from anything the caller supplied.
                 match orch.db.local.get_post(*id).await {
-                    Ok(Some(post)) => attention(
+                    Ok(Some(post)) => minted(
                         created,
-                        crate::orchestrator::wakes::route_post_comment(orch, &post, &comment).await,
+                        crate::orchestrator::wakes::mint_post_commented(
+                            orch,
+                            &post,
+                            &comment,
+                            Some(&job_id),
+                        )
+                        .await,
                     ),
                     Ok(None) => created,
-                    Err(error) => {
-                        tracing::warn!(%error, post = id, "post comment attention routing failed");
-                        format!("{created} (attention routing failed: {error})")
-                    }
+                    Err(error) => minted(created, Err(error.to_string())),
                 }
             }
         }

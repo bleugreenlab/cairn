@@ -78,5 +78,4 @@ pub enum ContentRequest<'a> {
         recipient: &'a str,
         reference: &'a str,
     },
-    Post(&'a crate::push::Push),
 }

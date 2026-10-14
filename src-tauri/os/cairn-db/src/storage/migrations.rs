@@ -179,6 +179,16 @@ macro_rules! private_fact_log_wakes {
     };
 }
 
+/// cairn/4913: a Posts watch becomes the `{fact: post_created}` fact clause.
+/// `wake_subscriptions` is shared schema, so both lineages rewrite their rows;
+/// it is an in-place UPDATE, never a rebuild, because the team replica's sync
+/// triggers ride on that table.
+macro_rules! shared_tail_post_feed_watch_as_fact_clause {
+    () => {
+        migration!("0248_post_feed_watch_as_fact_clause")
+    };
+}
+
 macro_rules! shared_tail_merge_attempt_journal {
     () => {
         migration!("0220_merge_attempt_journal")
@@ -1246,6 +1256,7 @@ macro_rules! team_lineage {
             shared_tail_execution_canonical_lineage!(),
             shared_tail_issue_resolution_generation!(),
             shared_tail_condition_evaluation_outcome!(),
+            shared_tail_post_feed_watch_as_fact_clause!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1497,6 +1508,7 @@ macro_rules! private_lineage {
             private_channel_outbound_last_attempt!(),
             private_executor_preparation_refusals!(),
             private_fact_log_wakes!(),
+            shared_tail_post_feed_watch_as_fact_clause!(),
         ]
     };
 }
@@ -3133,6 +3145,7 @@ mod tests {
                 "channel_outbound_last_attempt",
                 "executor_preparation_refusals",
                 "fact_log_wakes",
+                "post_feed_watch_as_fact_clause",
             ]
         );
         assert_eq!(
@@ -3458,6 +3471,69 @@ mod tests {
             .unwrap(),
             5,
             "suppressing refusals, deliberate rows, and non-derivable sources survive"
+        );
+    }
+
+    /// cairn/4913: every legacy Posts watch becomes the one fact-clause row,
+    /// keeping its state, and dead ref'd rows and duplicates go.
+    #[tokio::test]
+    async fn legacy_posts_watches_become_the_post_created_fact_clause() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("post-feed-watch.turso.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .take_while(|migration| migration.version != "0248")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('project', 'default', 'Project', 'prj', '/repo', 1, 1);
+             INSERT INTO jobs (id, project_id, status, created_at, updated_at)
+             VALUES ('watcher', 'project', 'running', 1, 1), ('quiet', 'project', 'running', 1, 1),
+                    ('twice', 'project', 'running', 1, 1), ('refused', 'project', 'running', 1, 1);
+             INSERT INTO wake_subscriptions
+               (id, job_id, source_kind, source_ref, fact_kinds_json, state, created_by, created_at, updated_at, one_shot)
+             VALUES
+               ('feed', 'watcher', 'post', NULL, NULL, 'active', 'agent', 1, 1, 0),
+               ('one-post', 'watcher', 'post', 'cairn://posts/7', NULL, 'active', 'agent', 1, 1, 0),
+               ('muted-feed', 'quiet', 'post', NULL, '[\"new_post\"]', 'muted', 'agent', 1, 1, 0),
+               ('a', 'twice', 'post', NULL, NULL, 'active', 'agent', 1, 1, 0),
+               ('b', 'twice', 'post', NULL, '[\"new_post\"]', 'active', 'agent', 1, 1, 0),
+               ('refusal', 'refused', 'post', NULL, NULL, 'unsubscribed', 'agent', 1, 1, 0),
+               ('peer', 'watcher', 'peer', NULL, NULL, 'active', 'system', 1, 1, 0);",
+        )
+        .await
+        .unwrap();
+        let rewrite = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == "0248")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(rewrite).run(&db).await.unwrap();
+
+        let rows: Vec<(String, String, String)> = db
+            .query_all(
+                "SELECT id, state, source_kind || ' ' || COALESCE(source_ref, '-') || ' ' || COALESCE(fact_kinds_json, '-')
+                   FROM wake_subscriptions ORDER BY id",
+                (),
+                |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?)),
+            )
+            .await
+            .unwrap();
+        let clause = r#"fact {"fact":"post_created"} ["post_created"]"#.to_string();
+        assert_eq!(
+            rows,
+            vec![
+                ("b".into(), "active".into(), clause.clone()),
+                ("feed".into(), "active".into(), clause.clone()),
+                ("muted-feed".into(), "muted".into(), clause.clone()),
+                ("peer".into(), "active".into(), "peer - -".into()),
+                ("refusal".into(), "unsubscribed".into(), clause),
+            ],
+            "each watch keeps its id and state; the ref'd row and the duplicate are gone"
         );
     }
 
@@ -6190,6 +6266,8 @@ mod tests {
                 // CAIRN-4841: `condition_evaluations` is shared project state,
                 // so the routed/blocked outcome reaches both lineages.
                 "condition_evaluation_outcome",
+                // cairn/4913: Posts watches become a fact clause in both.
+                "post_feed_watch_as_fact_clause",
             ]
         );
         assert_eq!(

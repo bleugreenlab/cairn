@@ -7,7 +7,7 @@ use cairn_common::protocol::{CallbackRequest, CallbackResponse};
 use cairn_mcp_server::output::{http_status_error_message, truncate_chars};
 use cairn_mcp_server::{CairnMcpServer, CallbackOutcome, CallbackSink, Caller};
 
-use crate::timeouts::callback_timeout;
+use cairn_common::callback_contract::socket_timeout;
 
 /// The server one `cairn-cmd` process speaks through: a fixed run identity
 /// from its environment, with every call forwarded over the HTTP callback.
@@ -40,7 +40,7 @@ impl CallbackSink for HttpCallbackSink {
 
     async fn call(&self, request: &CallbackRequest) -> CallbackOutcome {
         let client = match reqwest::Client::builder()
-            .timeout(callback_timeout(request))
+            .timeout(socket_timeout(request))
             .build()
         {
             Ok(client) => client,

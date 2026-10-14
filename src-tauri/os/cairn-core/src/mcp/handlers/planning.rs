@@ -21,8 +21,6 @@ use super::permission::{
 };
 use super::{emit_attention, AttentionEvent};
 
-const INLINE_PROMPT_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
-
 /// What the agent reads for a question that outlived the inline budget.
 ///
 /// This is the whole agent-visible surface of a durably-suspended question, so
@@ -473,25 +471,28 @@ async fn ask_questions_owned(
 
     // Keep a short inline fast-path, then durably suspend the run before the
     // surrounding callback/session budget expires.
-    let result = tokio::time::timeout(INLINE_PROMPT_WAIT_BUDGET, async {
-        loop {
-            match rx.recv().await {
-                Ok((resp_prompt_id, response_text)) => {
-                    if resp_prompt_id == prompt_id_clone {
-                        return Ok(response_text);
+    let result = tokio::time::timeout(
+        cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET,
+        async {
+            loop {
+                match rx.recv().await {
+                    Ok((resp_prompt_id, response_text)) => {
+                        if resp_prompt_id == prompt_id_clone {
+                            return Ok(response_text);
+                        }
+                        // Not our prompt, keep waiting
                     }
-                    // Not our prompt, keep waiting
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    return Err("Channel closed");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    // Missed some messages, keep going
-                    continue;
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("Channel closed");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed some messages, keep going
+                        continue;
+                    }
                 }
             }
-        }
-    })
+        },
+    )
     .await;
 
     match result {

@@ -107,6 +107,7 @@ fn event(job_id: &str) -> WakeEvent {
         fact_kind: "exited".into(),
         detail_uri: None,
         urgency: DeliveryUrgency::Queue,
+        muted: crate::wakes::MutedDelivery::Drop,
         delivery: WakeDelivery::Targeted {
             subscriber_job_id: job_id.into(),
             sender_name: None,

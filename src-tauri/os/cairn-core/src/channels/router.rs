@@ -574,6 +574,47 @@ fn require_command_delivery(delivered: bool, last_error: Option<String>) -> Resu
     })
 }
 
+/// The fields of one `thread_stream` fact: where the utterance was said, and
+/// its own structural references in the same vocabulary a post's carry, so one
+/// `mentions` clause matches both.
+pub(crate) async fn thread_stream_fields(
+    db: &crate::storage::LocalDb,
+    project: &str,
+    thread_uri: &str,
+    detail_uri: &str,
+    text: String,
+    context: String,
+    job_id: String,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mentions = crate::routes::structural_mentions(db, &text).await;
+    std::collections::BTreeMap::from([
+        (
+            "project".into(),
+            serde_json::Value::String(project.to_string()),
+        ),
+        (
+            "threadUri".into(),
+            serde_json::Value::String(thread_uri.to_string()),
+        ),
+        (
+            "detailUri".into(),
+            serde_json::Value::String(detail_uri.to_string()),
+        ),
+        (
+            "mentions".into(),
+            serde_json::Value::Array(
+                mentions
+                    .into_iter()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ),
+        ),
+        ("text".into(), serde_json::Value::String(text)),
+        ("context".into(), serde_json::Value::String(context)),
+        ("jobId".into(), serde_json::Value::String(job_id)),
+    ])
+}
+
 pub(crate) fn assistant_text(data: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(data)
         .ok()?
@@ -2411,7 +2452,7 @@ impl ChannelRouter {
                     winner.resolution_provenance()?,
                 )
                 .await
-                .map(|_| ())
+                .map(|_| None)
             } else {
                 let answer = answers
                     .first()
@@ -2429,21 +2470,24 @@ impl ChannelRouter {
                             recovered,
                         )
                         .await
-                        .map(|_| ())
+                        .map(|outcome| outcome.withdrawn)
                     }
                     Err(error) => Err(error),
                 }
             };
             match result {
-                Ok(()) => {
-                    let receipt_answer = answers
-                        .first()
-                        .map(|(_, answer)| answer.as_str())
-                        .unwrap_or("answered");
+                Ok(withdrawn) => {
+                    let receipt = withdrawn.unwrap_or_else(|| {
+                        let receipt_answer = answers
+                            .first()
+                            .map(|(_, answer)| answer.as_str())
+                            .unwrap_or("answered");
+                        format!("✓ answered: {receipt_answer}")
+                    });
                     ledger::finalize_ask_resolution(
                         self.ledger(),
                         &action_ref,
-                        &format!("✓ answered: {receipt_answer}"),
+                        &receipt,
                         chrono::Utc::now().timestamp_millis(),
                     )
                     .await?;
@@ -2565,23 +2609,16 @@ impl ChannelRouter {
                 if let Some(text) = assistant_text(&event.data) {
                     let detail_uri = format!("{}:event:{}", follow.uri, event.rowid);
                     let actor_job_id = event.job_id.clone();
-                    let fields = std::collections::BTreeMap::from([
-                        (
-                            "project".into(),
-                            serde_json::Value::String(target.project().to_string()),
-                        ),
-                        (
-                            "threadUri".into(),
-                            serde_json::Value::String(follow.uri.clone()),
-                        ),
-                        (
-                            "detailUri".into(),
-                            serde_json::Value::String(detail_uri.clone()),
-                        ),
-                        ("text".into(), serde_json::Value::String(text)),
-                        ("context".into(), serde_json::Value::String(event.context)),
-                        ("jobId".into(), serde_json::Value::String(event.job_id)),
-                    ]);
+                    let fields = thread_stream_fields(
+                        &self.orch.db.local,
+                        target.project(),
+                        &follow.uri,
+                        &detail_uri,
+                        text,
+                        event.context,
+                        event.job_id,
+                    )
+                    .await;
                     let fact = RouteFact {
                         source: "thread_stream".into(),
                         identity: detail_uri.clone(),
@@ -6346,14 +6383,15 @@ mod tests {
         router.sweep_followed_updates().await.unwrap();
         crate::routes::drain_fact_log(&router.orch).await;
 
-        let (actor, wakes) = db
+        let (actor, wakes, fields) = db
             .query_one(
-                "SELECT actor_job_id, wakes_json FROM fact_log WHERE source = 'thread_stream'",
+                "SELECT actor_job_id, wakes_json, fields_json FROM fact_log WHERE source = 'thread_stream'",
                 (),
                 |row| {
                     Ok((
                         crate::storage::RowExt::opt_text(row, 0)?,
                         crate::storage::RowExt::opt_text(row, 1)?,
+                        crate::storage::RowExt::text(row, 2)?,
                     ))
                 },
             )
@@ -6374,6 +6412,12 @@ mod tests {
             actor.as_deref(),
             Some("speaker"),
             "the utterance's row names the job that said it"
+        );
+        let fields: serde_json::Value = serde_json::from_str(&fields).unwrap();
+        assert_eq!(
+            fields["mentions"],
+            serde_json::json!(["cairn://posts/7"]),
+            "the sweep stores the utterance's structural mentions"
         );
     }
 

@@ -36,6 +36,7 @@ pub fn route_child_attention(
         detail_uri: detail_uri.map(ToString::to_string),
         delivery: WakeDelivery::Broadcast { message },
         urgency,
+        muted: MutedDelivery::Drop,
     };
     route_wake_sync(runtime, event).map(|_| ())
 }
@@ -84,6 +85,7 @@ pub fn route_resource_updated(
             message: format!("[Resource update] {resource_uri} was updated. Read {resource_uri}."),
         },
         urgency: DeliveryUrgency::Queue,
+        muted: MutedDelivery::Drop,
     };
     route_wake_sync(runtime, event)
 }
@@ -104,6 +106,7 @@ pub fn route_process_event(
             message: format!("[Process update] {process_ref} emitted {fact_kind}."),
         },
         urgency: DeliveryUrgency::Queue,
+        muted: MutedDelivery::Drop,
     };
     route_wake_sync(runtime, event)
 }
@@ -124,6 +127,7 @@ pub fn route_condition_event(
             message: format!("[Condition update] {condition_ref} emitted {fact_kind}."),
         },
         urgency: DeliveryUrgency::Queue,
+        muted: MutedDelivery::Drop,
     };
     route_wake_sync(runtime, event)
 }
@@ -167,15 +171,31 @@ async fn subscriptions_for_event(
         }
         | WakeDelivery::MessageDigest {
             subscriber_job_id, ..
-        } => matching_subscription(
-            db,
-            subscriber_job_id,
-            event.source.kind(),
-            event.source.reference(),
-            &event.fact_kind,
-        )
-        .await
-        .map(|sub| sub.into_iter().collect()),
+        } => {
+            let persisted = matching_subscription(
+                db,
+                subscriber_job_id,
+                event.source.kind(),
+                event.source.reference(),
+                &event.fact_kind,
+            )
+            .await?;
+            Ok(persisted
+                .or_else(|| match &event.source {
+                    WakeSource::Fact { clause_ref }
+                        if clause_ref.starts_with(ADDRESSED_FACT_REF_PREFIX) =>
+                    {
+                        Some(addressed_fact_subscription(
+                            subscriber_job_id,
+                            clause_ref,
+                            &event.fact_kind,
+                        ))
+                    }
+                    _ => None,
+                })
+                .into_iter()
+                .collect())
+        }
         WakeDelivery::Broadcast { .. } => {
             matching_subscriptions_for_source(
                 runtime.host.clone(),
@@ -229,7 +249,7 @@ async fn route_wake_to_subscription(
     }
     let action = match subscription.state {
         WakeSubscriptionState::Active => {
-            deliver_active_wake(runtime, event, &subscription, None).await?;
+            deliver_active_wake(runtime, event, &subscription, None, event.urgency).await?;
             WakeRouteAction::Delivered
         }
         WakeSubscriptionState::Muted if event.urgency == DeliveryUrgency::Interrupt => {
@@ -238,15 +258,31 @@ async fn route_wake_to_subscription(
                 event,
                 &subscription,
                 Some("[Interrupt wake pierced mute] "),
+                event.urgency,
             )
             .await?;
             WakeRouteAction::Delivered
         }
+        // An event whose producer declared it rides along is still told to a
+        // muted recipient, passively: it lands with the next run rather than
+        // waking this one.
+        WakeSubscriptionState::Muted if event.muted == MutedDelivery::RideAlong => {
+            deliver_active_wake(
+                runtime,
+                event,
+                &subscription,
+                None,
+                DeliveryUrgency::Passive,
+            )
+            .await?;
+            WakeRouteAction::Suppressed
+        }
         // Mute is now downgrade-at-creation for pushes (CAIRN-1900); the legacy
         // suppressed_wakes digest store is gone. A non-interrupt wake to a muted
         // subscription on these live non-push callers (terminal exit, condition,
-        // resource, process, child-attention broadcast) is dropped — there is no
-        // digest to accrue and no ride-along channel for them.
+        // resource, process, child-attention broadcast, and fact sources that
+        // declare `Drop`) is dropped — there is no digest to accrue and no
+        // ride-along channel for them.
         WakeSubscriptionState::Muted => WakeRouteAction::Dropped,
         WakeSubscriptionState::Unsubscribed => WakeRouteAction::Dropped,
     };
@@ -401,6 +437,7 @@ async fn deliver_active_wake(
     event: &WakeEvent,
     subscription: &WakeSubscription,
     prefix: Option<&str>,
+    urgency: DeliveryUrgency,
 ) -> Result<(), String> {
     let operator_message_id = if matches!(&event.source, WakeSource::User) {
         event.detail_uri.as_deref()
@@ -428,13 +465,9 @@ async fn deliver_active_wake(
             return Ok(());
         }
     };
-    runtime.host.deliver(
-        job_id,
-        sender_name,
-        &message,
-        event.urgency,
-        operator_message_id,
-    );
+    runtime
+        .host
+        .deliver(job_id, sender_name, &message, urgency, operator_message_id);
     Ok(())
 }
 

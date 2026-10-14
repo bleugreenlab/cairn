@@ -11,6 +11,12 @@
 //! the channel submissions a row produces to the channel routers, choosing
 //! recipients by the sink's destination or the source's [`Audience`].
 //!
+//! A source may also declare **addressee** fields: URIs naming who a row is
+//! for (a post's mentions, a commented post's author). The index lane expands
+//! them to the jobs they reach now and wakes those first, with no standing
+//! trigger, then runs the clause consumers against the same set of jobs
+//! already woken, so each recipient is woken at most once per row.
+//!
 //! Thread wakes are **coalesced**: the index lane folds each matching row into
 //! the thread's pending wake for that source (`fact_log_wakes`), and the
 //! index lane's tick delivers a wake once its settle window closes, so a
@@ -20,16 +26,19 @@
 //! becomes `interrupted` on restart and is never re-fired, and so does a
 //! coalesced wake caught mid-delivery.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use super::log::{clauses_need_hydration, hydrate, stored_fact, Hydrated};
+use super::predicate::{scope_exclusion, ThreadScope};
 use super::{matches, Audience, Fact, FactRegistry, RouteContext};
 use crate::models::DeliveryUrgency;
-use crate::orchestrator::wakes::{WakeDelivery, WakeEvent, WakeRouteAction, WakeSource};
+use crate::orchestrator::wakes::{
+    MutedDelivery, WakeDelivery, WakeEvent, WakeRouteAction, WakeSource, ADDRESSED_FACT_REF_PREFIX,
+};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{route_state, FactRow, FactWake, WakeMatch, WakeWindow};
 
@@ -359,18 +368,92 @@ async fn index_row(
             .collect()
     };
 
+    let actors = actor_jobs(orch, &row, spec, &stored.fields).await;
+    // One pending wake per (job, source): a job a row reaches by several
+    // routes (two addressee fields, an addressee and a clause, two clauses) is
+    // folded in once, under the first, which is the most specific.
+    let window = policy.wake_window(&row.source);
+    let mut woken: Vec<String> = Vec::new();
+    let mut wakes = Vec::new();
+    let mut unresolved = Vec::new();
+    {
+        let stored = Fact {
+            source: &stored.source,
+            fields: &stored.fields,
+            presence,
+        };
+        for field in spec.addressees {
+            for uri in addressee_uris(stored.fields, field) {
+                let jobs =
+                    match crate::orchestrator::wakes::addressed_jobs(&orch.db.local, &uri).await {
+                        Ok(jobs) => jobs,
+                        Err(error) => {
+                            unresolved.push(format!("{field} {uri}: {error}"));
+                            continue;
+                        }
+                    };
+                for job in jobs {
+                    if actors.contains(&job) || woken.contains(&job) {
+                        continue;
+                    }
+                    let (home_project_id, home_project_key) =
+                        match crate::orchestrator::wakes::job_project(&orch.db.local, &job).await {
+                            Ok(project) => project,
+                            Err(error) => {
+                                unresolved.push(format!("{field} {uri}: {error}"));
+                                continue;
+                            }
+                        };
+                    let scope = ThreadScope {
+                        home_project_id: home_project_id.as_deref(),
+                        home_project_key: home_project_key.as_deref(),
+                        row_project_id: row.project_id.as_deref(),
+                    };
+                    if scope_exclusion(None, &stored, &scope).is_some() {
+                        continue;
+                    }
+                    woken.push(job.clone());
+                    fold_wake(
+                        orch,
+                        &mut wakes,
+                        WakeMatch {
+                            job_id: job,
+                            source: row.source.clone(),
+                            clause_ref: format!(
+                                "{ADDRESSED_FACT_REF_PREFIX}{}.{field}",
+                                row.source
+                            ),
+                            project_id: row.project_id.clone(),
+                            row_id: row.id,
+                            at_ms: row.minted_at,
+                            addressed: true,
+                        },
+                        window,
+                        Some(field),
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+
     let needs_content = clauses_need_hydration(
         spec,
         routes
             .clauses_for(&row.source)
             .chain(threads.iter().map(|consumer| &consumer.clause)),
     );
-    let mut note = None;
+    let mut note = (!unresolved.is_empty())
+        .then(|| format!("unresolved addressees: {}", unresolved.join("; ")));
     let fact = if needs_content {
         match hydrate(orch, &row).await {
             Ok(Hydrated { fact, .. }) => fact,
             Err(error) => {
-                note = Some(format!("matched without hydrated fields: {error}"));
+                let hydration = format!("matched without hydrated fields: {error}");
+                note = Some(match note {
+                    Some(earlier) => format!("{earlier}; {hydration}"),
+                    None => hydration,
+                });
                 stored
             }
         }
@@ -383,21 +466,17 @@ async fn index_row(
         presence,
     };
 
-    // One pending wake per (thread, source): a thread whose several clauses
-    // match this row is folded in once, under its first matching clause.
-    let window = policy.wake_window(&row.source);
-    let mut woken: Vec<&str> = Vec::new();
-    let mut wakes = Vec::new();
     for consumer in &threads {
-        if row.actor_job_id.as_deref() == Some(consumer.job_id.as_str())
-            || woken.contains(&consumer.job_id.as_str())
+        if actors.contains(&consumer.job_id)
+            || woken.contains(&consumer.job_id)
             || !matches(std::slice::from_ref(&consumer.clause), &candidate)
         {
             continue;
         }
-        woken.push(&consumer.job_id);
-        let coalesced = crate::storage::coalesce_fact_wake(
-            &orch.db.local,
+        woken.push(consumer.job_id.clone());
+        fold_wake(
+            orch,
+            &mut wakes,
             WakeMatch {
                 job_id: consumer.job_id.clone(),
                 source: row.source.clone(),
@@ -405,26 +484,12 @@ async fn index_row(
                 project_id: row.project_id.clone(),
                 row_id: row.id,
                 at_ms: row.minted_at,
+                addressed: false,
             },
             window,
+            None,
         )
         .await;
-        let (action, wake) = match coalesced {
-            Ok(wake) => ("coalesced".to_string(), Some(wake)),
-            Err(error) => (format!("failed: {error}"), None),
-        };
-        if wakes.len() < MAX_RECORDED_WAKES {
-            let home = crate::jobs::queries::home_uri_for_job(&orch.db.local, &consumer.job_id)
-                .await
-                .ok()
-                .flatten();
-            wakes.push(serde_json::json!({
-                "job": consumer.job_id,
-                "uri": home,
-                "action": action,
-                "wake": wake,
-            }));
-        }
     }
 
     let state = if fact.is_route_generated() {
@@ -456,6 +521,86 @@ async fn index_row(
     Ok(())
 }
 
+/// The jobs whose own write a row is: the job that minted it, and the job the
+/// source's declared actor home resolves to now. Resolving the home here, as
+/// the recipients are, is what keeps a home that rotated sessions between mint
+/// and indexing from being handed its own writing on the new session.
+async fn actor_jobs(
+    orch: &Orchestrator,
+    row: &FactRow,
+    spec: &super::SourceSpec,
+    fields: &BTreeMap<String, Value>,
+) -> Vec<String> {
+    let mut jobs: Vec<String> = row.actor_job_id.iter().cloned().collect();
+    let home = spec
+        .actor_home
+        .and_then(|field| fields.get(field))
+        .and_then(Value::as_str);
+    if let Some(home) = home {
+        match crate::orchestrator::wakes::addressed_jobs(&orch.db.local, home).await {
+            Ok(found) => {
+                for job in found {
+                    if !jobs.contains(&job) {
+                        jobs.push(job);
+                    }
+                }
+            }
+            Err(error) => log::warn!(
+                "could not resolve actor home {home} of fact {}: {error}",
+                row.id
+            ),
+        }
+    }
+    jobs
+}
+
+/// The URIs one addressee field of a stored fact holds: a scalar or a list.
+fn addressee_uris(fields: &BTreeMap<String, Value>, field: &str) -> Vec<String> {
+    match fields.get(field) {
+        Some(Value::String(uri)) => vec![uri.clone()],
+        Some(Value::Array(uris)) => uris
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Fold one match into its job's pending wake and record it on the row.
+/// `via` names the addressee field that reached the job, when one did.
+async fn fold_wake(
+    orch: &Orchestrator,
+    wakes: &mut Vec<Value>,
+    matched: WakeMatch,
+    window: WakeWindow,
+    via: Option<&str>,
+) {
+    let job = matched.job_id.clone();
+    let (action, wake) =
+        match crate::storage::coalesce_fact_wake(&orch.db.local, matched, window).await {
+            Ok(wake) => ("coalesced".to_string(), Some(wake)),
+            Err(error) => (format!("failed: {error}"), None),
+        };
+    if wakes.len() >= MAX_RECORDED_WAKES {
+        return;
+    }
+    let home = crate::jobs::queries::home_uri_for_job(&orch.db.local, &job)
+        .await
+        .ok()
+        .flatten();
+    let mut record = serde_json::json!({
+        "job": job,
+        "uri": home,
+        "action": action,
+        "wake": wake,
+    });
+    if let Some(via) = via {
+        record["via"] = Value::String(via.to_string());
+    }
+    wakes.push(record);
+}
+
 /// Deliver every coalesced wake due by `due_by_ms`. Returns how many it
 /// claimed. Each wake is claimed before it is sent, so a wake goes out at
 /// most once even across a restart.
@@ -480,6 +625,9 @@ pub(crate) async fn flush_due_wakes(orch: &Orchestrator, due_by_ms: i64) -> Resu
 
 async fn deliver_wake(orch: &Orchestrator, wake: &FactWake) -> String {
     let (message, detail_uri) = wake_message(orch, wake).await;
+    let muted = FactRegistry::default()
+        .source(&wake.source)
+        .map_or(MutedDelivery::Drop, |spec| spec.muted);
     let action = crate::orchestrator::wakes::route_wake(
         orch,
         WakeEvent {
@@ -494,6 +642,7 @@ async fn deliver_wake(orch: &Orchestrator, wake: &FactWake) -> String {
                 message,
             },
             urgency: DeliveryUrgency::Queue,
+            muted,
         },
     )
     .await;
@@ -503,10 +652,36 @@ async fn deliver_wake(orch: &Orchestrator, wake: &FactWake) -> String {
     }
 }
 
-/// A coalesced wake's message and detail URI. One row reads as one event,
+/// A coalesced wake's message and detail URI: its header, then the writing the
+/// newest row points at when its source carries some.
+async fn wake_message(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
+    let (header, uri) = wake_header(orch, wake).await;
+    match wake_body(orch, wake).await {
+        Some(body) => (format!("{header}\n\n{body}"), uri),
+        None => (header, uri),
+    }
+}
+
+/// The content a wake carries inline, rendered from the canonical record the
+/// newest row points at: only that row is certain to be this recipient's
+/// match, since a range can interleave other recipients' rows. One arm per
+/// source whose record is writing a recipient classifies by reading; every
+/// other source's header is its whole message.
+async fn wake_body(orch: &Orchestrator, wake: &FactWake) -> Option<String> {
+    use crate::orchestrator::wakes::{POST_COMMENTED, POST_CREATED};
+    if !matches!(wake.source.as_str(), POST_CREATED | POST_COMMENTED) {
+        return None;
+    }
+    let row = crate::storage::get_fact(&orch.db.local, wake.last_row_id)
+        .await
+        .ok()??;
+    crate::orchestrator::wakes::render_post_wake(&orch.db.local, &row.record_ref).await
+}
+
+/// A coalesced wake's header line and detail URI. One row reads as one event,
 /// citing the row; several cite the id range of the events view that holds
 /// them all.
-async fn wake_message(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
+async fn wake_header(orch: &Orchestrator, wake: &FactWake) -> (String, String) {
     if wake.count == 1 {
         if let Ok(Some(row)) = crate::storage::get_fact(&orch.db.local, wake.first_row_id).await {
             let uri = fact_row_uri(project_key(orch, &row).await.as_deref(), row.id);
@@ -591,6 +766,10 @@ pub(crate) async fn explain_thread_triggers(
     } else {
         stored_fact(row)?
     };
+    let actors = match registry.source(&row.source) {
+        Some(spec) => actor_jobs(orch, row, spec, &stored_fact(row)?.fields).await,
+        None => row.actor_job_id.iter().cloned().collect(),
+    };
     let candidate = Fact {
         source: &fact.source,
         fields: &fact.fields,
@@ -604,7 +783,7 @@ pub(crate) async fn explain_thread_triggers(
                 &candidate,
                 Some(&consumer.scope(row.project_id.as_deref())),
             );
-            if row.actor_job_id.as_deref() == Some(consumer.job_id.as_str()) {
+            if actors.contains(&consumer.job_id) {
                 reasons.insert(
                     0,
                     "the row is the thread's own write, which never wakes it".into(),
@@ -616,6 +795,34 @@ pub(crate) async fn explain_thread_triggers(
             }
         })
         .collect())
+}
+
+/// The addressee field through which `row` names the home at `home_uri`, if
+/// it names it at all. Such a home is woken by the row itself, whatever its
+/// standing triggers say, subject to the same actor and jurisdiction rules.
+pub(crate) async fn addressed_via(
+    orch: &Orchestrator,
+    row: &FactRow,
+    home_uri: &str,
+) -> Result<Option<&'static str>, String> {
+    let registry = FactRegistry::default();
+    let Some(spec) = registry.source(&row.source) else {
+        return Ok(None);
+    };
+    let stored = stored_fact(row)?;
+    for field in spec.addressees {
+        for uri in addressee_uris(&stored.fields, field) {
+            for job in crate::orchestrator::wakes::addressed_jobs(&orch.db.local, &uri).await? {
+                let home = crate::jobs::queries::home_uri_for_job(&orch.db.local, &job)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if home.as_deref() == Some(home_uri) {
+                    return Ok(Some(field));
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Dispatch one claimed row; returns the state and note it settles in.
@@ -915,6 +1122,10 @@ pub(crate) mod fixture {
 
     use std::time::Duration;
 }
+
+#[cfg(test)]
+#[path = "worker_posts_tests.rs"]
+mod posts_tests;
 
 #[cfg(test)]
 mod tests {

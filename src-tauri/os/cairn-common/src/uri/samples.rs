@@ -398,6 +398,7 @@ resource_samples! {
     // ---- Workspace singletons and the fleet ----
     Posts {} => Parser,
     Post { id: 12 } => Parser,
+    PostComment { post_id: 12, comment_id: 3 } => Parser,
     Settings {} => Parser,
     Db {} => Parser,
     Dev {} => Parser,

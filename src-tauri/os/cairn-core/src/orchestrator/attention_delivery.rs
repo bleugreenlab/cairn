@@ -201,12 +201,12 @@ mod tests {
         .unwrap()
     }
 
-    /// A post push is the one referent short enough to carry whole, and its
-    /// recipient was woken to judge whether the writing deserves more attention
-    /// — a judgement no URI supports. The delivery path inlines it instead of
-    /// falling through to the generic "read the URI" line.
+    /// Posts reach their readers through the fact log now, so nothing writes a
+    /// `post:` push any more. One still pending from before the upgrade drains
+    /// like any push whose prefix the engine does not know: a reference-only
+    /// header, never an error.
     #[tokio::test]
-    async fn post_push_carries_the_post_instead_of_an_errand() {
+    async fn a_legacy_post_push_still_drains_with_its_reference() {
         let db = migrated_db().await;
         seed(&db, "active", None, None).await;
         let post = seed_post(&db, "Wake legibility", "Test post to see if the wake works").await;
@@ -223,25 +223,25 @@ mod tests {
             delivered_event_id: None,
         };
 
-        let rendered = render_push_resolved(&orch, &push).await;
-
-        assert!(
-            rendered.contains("Test post to see if the wake works"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Wake legibility"), "{rendered}");
-        assert!(
-            rendered.contains("New post."),
-            "the reason for the wake survives in front of the content: {rendered}"
-        );
-        assert!(
-            rendered.contains(&format!("Attention update (wake): {uri}")),
-            "the canonical URI stays as provenance: {rendered}"
-        );
-        assert!(
-            !rendered.contains("for the current content"),
-            "a post wake never sends its reader somewhere else to read five words: {rendered}"
-        );
+        for key in [
+            format!("post:{uri}"),
+            format!("post-comment:{uri}"),
+            format!("post-mention:{uri}"),
+        ] {
+            let push = crate::orchestrator::attention_push::Push {
+                key,
+                ..push.clone()
+            };
+            let rendered = render_push_resolved(&orch, &push).await;
+            assert!(
+                rendered.contains(&format!("Attention update (wake): {uri}")),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(&format!("Read {uri} for the current content")),
+                "{rendered}"
+            );
+        }
     }
 
     #[tokio::test]

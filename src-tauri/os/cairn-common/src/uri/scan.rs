@@ -7,13 +7,13 @@
 //! of an image URI was encoded in three places and adding a form meant finding
 //! all of them.
 //!
-//! There is no second grammar here. A candidate is any `cairn://p/…` run of URI
+//! There is no second grammar here. A candidate is any `cairn://…` run of URI
 //! characters; [`super::parse_uri`] — the one parser — decides what it names. A
 //! new URI shape therefore reaches every text scanner the moment the parser
-//! learns it.
+//! learns it, workspace-level shapes like `cairn://posts/{id}` included.
 
 use super::parse::parse_uri;
-use super::types::{CairnResource, PROJECT_SCOPE};
+use super::types::CairnResource;
 
 /// One cairn:// URI found in text, with the resource it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,12 +96,12 @@ pub fn scan_stored_images(text: &str) -> Vec<UriMatch> {
         .collect()
 }
 
-/// Every parseable cairn:// project URI written into `text`, in textual order.
+/// Every parseable cairn:// URI written into `text`, in textual order.
 pub fn scan_uris(text: &str) -> Vec<UriMatch> {
-    let prefix = format!("cairn://{PROJECT_SCOPE}/");
+    let prefix = "cairn://";
     let mut found = Vec::new();
     let mut rest = text;
-    while let Some(start) = rest.find(&prefix) {
+    while let Some(start) = rest.find(prefix) {
         let candidate_start = start;
         let tail = &rest[candidate_start..];
         let end = tail
@@ -185,6 +185,31 @@ mod tests {
                     ordinal: 9
                 },
                 AttachmentRef::Hash(hash),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_uris_finds_workspace_shapes_and_skips_what_does_not_parse() {
+        let found: Vec<CairnResource> = scan_uris(
+            "see cairn://posts/7, cairn://posts/7/comments/2 and cairn://p/cairn/42; \
+             cairn:// alone is prose, as is cairn://nonsense/here.",
+        )
+        .into_iter()
+        .map(|found| found.resource)
+        .collect();
+        assert_eq!(
+            found,
+            vec![
+                CairnResource::Post { id: 7 },
+                CairnResource::PostComment {
+                    post_id: 7,
+                    comment_id: 2
+                },
+                CairnResource::Issue {
+                    project: "cairn".into(),
+                    number: 42
+                },
             ]
         );
     }

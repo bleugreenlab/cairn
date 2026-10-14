@@ -945,26 +945,6 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
         .map(|(prefix, _)| prefix)
         .unwrap_or(&push.key);
 
-    // A post push's referent is a short piece of writing whose whole purpose is
-    // to be classified — worth reading further, or not — and a subscriber cannot
-    // classify a URI. The post (or the comment) is carried inline from the
-    // workspace-local corpus, two indexed lookups, the same cheap-and-targeted
-    // bargain the direct-message and check-verdict branches above make.
-    if crate::wakes::post_push_source(prefix).is_some() {
-        if let Some(body) = runtime
-            .host
-            .render_content(ContentRequest::Post(push))
-            .await
-        {
-            // The headline is kept in front of the content because it carries
-            // the one thing the post itself cannot: why this recipient is being
-            // told. Being referenced by a post is not the same event as one
-            // landing in a feed you elected to watch.
-            let (_, headline) = super::push::push_kind_headline(prefix);
-            return format!("{header}\n\n{headline}.\n\n{body}");
-        }
-    }
-
     let (_, headline) = super::push::push_kind_headline(prefix);
     format!(
         "{header}\n\n{headline}. Read {} for the current content.",

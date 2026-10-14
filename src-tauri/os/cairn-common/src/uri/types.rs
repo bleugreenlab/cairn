@@ -136,6 +136,12 @@ pub enum CairnResource {
     Post {
         id: i64,
     },
+    /// One comment on a post. A citation of the comment, never a wake
+    /// destination.
+    PostComment {
+        post_id: i64,
+        comment_id: i64,
+    },
     ProjectPosts {
         project: String,
     },
@@ -921,6 +927,7 @@ impl CairnResource {
             Self::ProjectIssues { .. } => ResourceKind::ProjectIssues,
             Self::Posts => ResourceKind::Posts,
             Self::Post { .. } => ResourceKind::Post,
+            Self::PostComment { .. } => ResourceKind::PostComment,
             Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,

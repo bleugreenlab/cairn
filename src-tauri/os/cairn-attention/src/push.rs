@@ -340,9 +340,6 @@ pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
         "child-stalled" => ("child", "A child node has no viable session"),
         "child-safety" => ("child", "A child node paused for safety"),
         "build-change" => ("system", "Cairn was rebuilt"),
-        "post" => ("post", "New post"),
-        "post-comment" => ("post", "New comment on your post"),
-        "post-mention" => ("post", "A post referenced you"),
         other => (other, "Attention update"),
     }
 }
@@ -490,14 +487,7 @@ async fn source_mute_downgrade(
         crate::push::CHILD_STALL_PUSH_PREFIX => {
             (SOURCE_KIND_ISSUE, crate::wakes::FACT_KIND_CHILD_STALLED)
         }
-        // A post push's suffix is the post's URI, which a ref-less Posts
-        // subscription matches as a standing watch, so a muted Posts watcher's
-        // wake is downgraded here into the same ride-along every other muted
-        // source produces.
-        _ => match crate::wakes::post_push_source(prefix) {
-            Some(source) => source,
-            None => return Ok(requested),
-        },
+        _ => return Ok(requested),
     };
     // An issue-sourced key is matched against an issue subscription's own
     // `source_ref`, so the suffix has to be REDUCED to the issue URI rather than

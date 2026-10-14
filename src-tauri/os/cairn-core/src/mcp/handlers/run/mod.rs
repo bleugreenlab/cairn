@@ -3701,6 +3701,9 @@ async fn suspend_until_batch_settles(
             // admission refuses to race ahead of an existing permission row.
             return;
         }
+        // A permission that took this call over but did not suspend the item is
+        // being withdrawn, and its withdrawal hands this row back.
+        durable_suspend::await_inner_wait_release(&db, &record).await;
         // A suspended batch cannot carry images: only an MCP gateway call
         // produces them, and a batch may not mix gateway items with the process
         // items that are the only thing routed here.

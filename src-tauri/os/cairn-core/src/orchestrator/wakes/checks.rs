@@ -69,6 +69,7 @@ pub(crate) async fn route_checks_settled(
                 message: format_checks_settled_message(label, uri, snapshot),
             },
             urgency: DeliveryUrgency::Queue,
+            muted: MutedDelivery::Drop,
         },
     )
     .await

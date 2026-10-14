@@ -2089,6 +2089,10 @@ async fn render_resource_body(
         // project's issues does.
         CairnResource::Posts => super::posts::read_corpus(orch, request, &params).await,
         CairnResource::Post { id } => super::posts::read_post(&orch.db.local, id, &params).await,
+        CairnResource::PostComment {
+            post_id,
+            comment_id,
+        } => super::posts::read_post_comment(&orch.db.local, post_id, comment_id).await,
         CairnResource::ProjectPosts { project } => {
             super::posts::read_posts(
                 &orch.db.local,

@@ -78,6 +78,7 @@ pub async fn append_thread_message(
                 message: content.to_string(),
             },
             urgency: DeliveryUrgency::Steer,
+            muted: crate::orchestrator::wakes::MutedDelivery::Drop,
         },
     )
     .await?;

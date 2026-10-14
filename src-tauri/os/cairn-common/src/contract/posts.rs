@@ -40,6 +40,18 @@ pub(crate) const POST_CONTRACT: ResourceContract = ResourceContract {
     }],
 };
 
+pub(crate) const POST_COMMENT_CONTRACT: ResourceContract = ResourceContract {
+    kind: ResourceKind::PostComment,
+    uri_template: "cairn://posts/{integer}/comments/{integer}",
+    name: "Post comment",
+    description:
+        "One comment, under the header of the post it answers; append to the post itself to reply",
+    read_projections: NO_PROJECTIONS,
+    related: NO_RELATED,
+    cross_actions: NO_CROSS_ACTIONS,
+    mutations: NO_MUTATIONS,
+};
+
 pub(crate) const HOME_FEED_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::HomeFeed,
     uri_template: "cairn://p/{project}/{number}/{exec}/{node}/feed",

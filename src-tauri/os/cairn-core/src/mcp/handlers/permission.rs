@@ -24,13 +24,8 @@ use cairn_db::turso::params;
 
 use super::{emit_attention, AttentionEvent};
 
-/// Inline budget the permission handlers wait synchronously before durably
-/// suspending the run. Mirrors `planning::INLINE_PROMPT_WAIT_BUDGET`: long
-/// enough that a human or automation answering promptly keeps the CLI process
-/// warm, short enough to suspend before the surrounding callback budget
-/// expires. There is no auto-deny — a fence that no one answers stays pending
-/// and is answerable whenever via the UI or the `permissions` resource.
-const INLINE_PERMISSION_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(45);
+/// The inline wait and every callback bound wrapping it: `cairn_common::callback_contract`.
+use cairn_common::callback_contract::INLINE_DURABLE_WAIT_BUDGET;
 
 /// The two refusals below are terminal until an operator acts, so they are
 /// minted in the vocabulary the ask ledger's retry machinery reads
@@ -52,6 +47,141 @@ pub(crate) enum PermissionWait {
     /// The prompt could not be persisted, so no answerable request exists. This
     /// fails the operation closed without pretending that a human denied it.
     Unavailable(String),
+    /// The handoff that would have carried the answer closed before the inline
+    /// budget, so the request was withdrawn: nothing was parked, and a later
+    /// answer replays nothing.
+    Withdrawn(HandoffClosed),
+}
+
+/// What the runner observed that closed a fence wait's handoff: the executor
+/// batch context the callback arrived under is gone, so nobody is left to
+/// carry a suspend marker back to the agent.
+///
+/// Each value names an observation, never an inference. The runner cannot see
+/// the executor's callback relay give up, so no value claims that it did; only
+/// [`HandoffClosed::sentence`] may say, as prose, what a settled batch implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffClosed {
+    /// The batch was cancelled.
+    BatchCancelled,
+    /// The executor link carrying the batch dropped.
+    ExecutorLinkDropped,
+    /// The batch's outcome landed while the fence wait was still open.
+    BatchSettled,
+    /// The context was dropped by a path that recorded no cause.
+    ContextDropped,
+}
+
+impl HandoffClosed {
+    /// The cause as the operator and the agent read it.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Self::BatchCancelled => "the batch that raised it was cancelled",
+            Self::ExecutorLinkDropped => "the executor link dropped",
+            Self::BatchSettled => {
+                "the batch finished while this was still waiting, which means the executor \
+                 stopped waiting before the inline budget"
+            }
+            Self::ContextDropped => "its batch context was dropped (cause not recorded)",
+        }
+    }
+}
+
+/// The stored `response` of a withdrawn request.
+fn withdrawn_response_json(cause: HandoffClosed) -> String {
+    serde_json::json!({ "withdrawn": { "cause": cause } }).to_string()
+}
+
+/// The cause stored on a withdrawn request, or `None` if it cannot be read.
+pub fn withdrawn_cause(response: Option<&str>) -> Option<HandoffClosed> {
+    let value = serde_json::from_str::<serde_json::Value>(response?).ok()?;
+    serde_json::from_value(value.get("withdrawn")?.get("cause")?.clone()).ok()
+}
+
+/// Seams for tests that must place a withdrawal at an exact point in an
+/// answer's path.
+pub(crate) mod test_hooks {
+    #[cfg(test)]
+    thread_local! {
+        static EARLY_WITHDRAWN_READ_MISSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Make the resolver's first read behave as though it ran before the
+    /// withdrawal committed, so the record transaction is what catches it.
+    #[cfg(test)]
+    pub(crate) fn miss_early_withdrawn_read(miss: bool) {
+        EARLY_WITHDRAWN_READ_MISSES.with(|cell| cell.set(miss));
+    }
+
+    pub(super) fn early_withdrawn_read_misses() -> bool {
+        #[cfg(test)]
+        {
+            EARLY_WITHDRAWN_READ_MISSES.with(|cell| cell.get())
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+/// What every answer surface says to an answer that arrived after withdrawal.
+pub fn withdrawn_notice(cause: Option<HandoffClosed>) -> String {
+    let cause = cause
+        .map(HandoffClosed::sentence)
+        .unwrap_or("its recorded cause could not be read");
+    format!(
+        "This permission was withdrawn before it was answered: {cause}. Your answer was not \
+         recorded, nothing was replayed, and no turn was started."
+    )
+}
+
+/// Whether a permission wait can learn that its handoff closed.
+///
+/// Only the executor-relayed fence wait is watched: every other caller holds
+/// its own callback open for as long as the wait runs.
+pub(crate) enum Handoff {
+    Unwatched,
+    Watched(tokio::sync::watch::Receiver<Option<HandoffClosed>>),
+}
+
+impl Handoff {
+    /// How long to wait inline before suspending. A relayed wait carries a
+    /// callback the runner cannot see, which an older executor abandons at a
+    /// flat 30 s even while its batch keeps running, so it answers inside that
+    /// (`callback_contract::RELAYED_FENCE_WAIT_BUDGET`).
+    fn budget(&self) -> std::time::Duration {
+        match self {
+            Self::Unwatched => INLINE_DURABLE_WAIT_BUDGET,
+            Self::Watched(_) => cairn_common::callback_contract::RELAYED_FENCE_WAIT_BUDGET,
+        }
+    }
+
+    /// The closure observed so far, without waiting.
+    fn observed(&self) -> Option<HandoffClosed> {
+        match self {
+            Self::Unwatched => None,
+            Self::Watched(rx) => *rx.borrow(),
+        }
+    }
+
+    /// Resolve once the handoff closes; never, for an unwatched one.
+    async fn closed(&mut self) -> HandoffClosed {
+        let Self::Watched(rx) = self else {
+            return std::future::pending().await;
+        };
+        loop {
+            if let Some(cause) = *rx.borrow_and_update() {
+                return cause;
+            }
+            if rx.changed().await.is_err() {
+                // The sender always records a cause before it is dropped, so
+                // reaching here means it was dropped without one.
+                return rx.borrow().unwrap_or(HandoffClosed::ContextDropped);
+            }
+        }
+    }
 }
 
 pub(crate) fn recovered_permission_answer(
@@ -97,12 +227,18 @@ pub(crate) fn recovered_permission_answer(
 /// On expiry or channel close it durably suspends the run (no auto-deny) and
 /// returns [`PermissionWait::Suspended`]; the answer arrives later via the UI or
 /// the `permissions` resource and a successor turn resumes the run.
+///
+/// A [`Handoff::Watched`] wait whose handoff closes first is withdrawn instead
+/// ([`PermissionWait::Withdrawn`]), and is never parked: the suspend marker
+/// would have nowhere to go, and parking would interrupt a turn that was told
+/// something else.
 pub(crate) async fn await_permission_decision(
     orch: &Orchestrator,
     run_id: &str,
     tool_use_id: &str,
     tool_name: &str,
     tool_input: &serde_json::Value,
+    mut handoff: Handoff,
 ) -> PermissionWait {
     let services = &orch.services;
     // Intrinsic prefixing (CAIRN-2210): a team run's permission_request is FK'd to
@@ -270,6 +406,19 @@ pub(crate) async fn await_permission_decision(
         }
     };
 
+    // The handoff may have closed while the row was being stored.
+    if let Some(cause) = handoff.observed() {
+        return withdraw_inline_wait(
+            orch,
+            run_id,
+            &request_id,
+            tool_use_id,
+            current_turn_id.as_deref(),
+            cause,
+        )
+        .await;
+    }
+
     // Mark process as awaiting host (NOT GC-safe while holding continuation)
     if let Some(ref turn_id) = current_turn_id {
         orch.process_state.yield_for_host(run_id, turn_id);
@@ -313,7 +462,7 @@ pub(crate) async fn await_permission_decision(
     let request_id_clone = request_id.clone();
 
     // Short inline fast-path; on expiry/close the run durably suspends below.
-    let result = tokio::time::timeout(INLINE_PERMISSION_WAIT_BUDGET, async {
+    let answer = async {
         loop {
             match rx.recv().await {
                 Ok((resp_request_id, response_json)) => {
@@ -327,11 +476,45 @@ pub(crate) async fn await_permission_decision(
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
             }
         }
-    })
-    .await;
+    };
+    tokio::pin!(answer);
+    let budget = tokio::time::sleep(handoff.budget());
+    tokio::pin!(budget);
+    enum Woke {
+        Answer(Result<String, &'static str>),
+        Budget,
+        Closed(HandoffClosed),
+    }
+    // An answer that is already here wins over everything else.
+    let woke = tokio::select! {
+        biased;
+        answer = &mut answer => Woke::Answer(answer),
+        cause = handoff.closed() => Woke::Closed(cause),
+        _ = &mut budget => Woke::Budget,
+    };
+    // Closure never suspends. Re-read it on every path that would, so a
+    // handoff that closed in the same instant as the budget is not parked.
+    let woke = match woke {
+        Woke::Answer(Err(_)) | Woke::Budget => match handoff.observed() {
+            Some(cause) => Woke::Closed(cause),
+            None => woke,
+        },
+        woke => woke,
+    };
 
-    match result {
-        Ok(Ok(response)) => {
+    match woke {
+        Woke::Closed(cause) => {
+            withdraw_inline_wait(
+                orch,
+                run_id,
+                &request_id,
+                tool_use_id,
+                current_turn_id.as_deref(),
+                cause,
+            )
+            .await
+        }
+        Woke::Answer(Ok(response)) => {
             // Create successor turn for the permission response.
             if let Some(ref pred_turn_id) = current_turn_id {
                 match ensure_and_start_successor_turn(
@@ -354,7 +537,7 @@ pub(crate) async fn await_permission_decision(
             }
             PermissionWait::Decided(response)
         }
-        Ok(Err(msg)) => {
+        Woke::Answer(Err(msg)) => {
             log::warn!("Permission wait channel ended for run {}: {}", run_id, msg);
             crate::orchestrator::lifecycle::suspend_run_for_durable_wait_after_handoff(
                 orch,
@@ -366,7 +549,7 @@ pub(crate) async fn await_permission_decision(
             );
             PermissionWait::Suspended
         }
-        Err(_) => {
+        Woke::Budget => {
             // Inline budget expired: durably suspend (no auto-deny). The request
             // stays pending and is answerable whenever via the UI or the
             // `permissions` resource; a successor turn resumes the run.
@@ -391,11 +574,246 @@ pub async fn await_permission_for_test(
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> &'static str {
-    match await_permission_decision(orch, run_id, tool_use_id, tool_name, tool_input).await {
+    match await_permission_decision(
+        orch,
+        run_id,
+        tool_use_id,
+        tool_name,
+        tool_input,
+        Handoff::Unwatched,
+    )
+    .await
+    {
         PermissionWait::Decided(_) => "decided",
         PermissionWait::Suspended => "suspended",
         PermissionWait::Unavailable(_) => "unavailable",
+        PermissionWait::Withdrawn(_) => "withdrawn",
     }
+}
+
+/// Withdraw the request an inline wait raised, and say so to its caller.
+async fn withdraw_inline_wait(
+    orch: &Orchestrator,
+    run_id: &str,
+    request_id: &str,
+    tool_use_id: &str,
+    predecessor_turn_id: Option<&str>,
+    cause: HandoffClosed,
+) -> PermissionWait {
+    match withdraw_permission_request(
+        orch,
+        run_id,
+        request_id,
+        tool_use_id,
+        predecessor_turn_id,
+        cause,
+    )
+    .await
+    {
+        Ok(Withdrawal::Withdrawn { .. }) => PermissionWait::Withdrawn(cause),
+        // An answer landed in the same instant. Its own resume carries it, as
+        // for any answer that arrives after its inline waiter has gone.
+        Ok(Withdrawal::NotPending) => PermissionWait::Unavailable(format!(
+            "permission {request_id} was answered as its handoff closed ({})",
+            cause.sentence()
+        )),
+        Err(error) => {
+            log::warn!("failed to withdraw permission {request_id} for run {run_id}: {error}");
+            PermissionWait::Unavailable(format!(
+                "permission {request_id} could not be withdrawn after its handoff closed: {error}"
+            ))
+        }
+    }
+}
+
+/// What [`withdraw_permission_request`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Withdrawal {
+    /// The request was no longer pending; nothing changed.
+    NotPending,
+    Withdrawn {
+        /// An outer run-batch wait the request had taken over was handed back.
+        restored_outer_wait: bool,
+        hand_back: HandBack,
+    },
+}
+
+/// Who continues the yielded turn once its permission is withdrawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HandBack {
+    /// The request carried no turn.
+    NoTurn,
+    /// Another pending wait still holds the turn; it stays yielded for that
+    /// wait's own resume.
+    HeldByAnotherWait,
+    /// The provider turn was still open, so it was un-yielded in place.
+    Unyielded,
+    /// The provider turn has ended and nothing else owns it. Continuing it
+    /// needs the single successor owner cairn/4936 introduces; until then it
+    /// is left yielded and logged, and nothing is minted here.
+    ProviderTurnEnded,
+}
+
+/// Withdraw a pending permission whose handoff closed, in one transaction:
+/// mark it `withdrawn` with its cause, hand back an outer run-batch wait it had
+/// taken over, recompute owner attention, and un-yield the turn if its
+/// provider turn is still open and no other wait holds it.
+///
+/// Process occupancy is read first: it is the only witness to whether the
+/// provider turn is still open, and it decides between un-yielding and
+/// deferring to a successor owner, never both.
+pub(crate) async fn withdraw_permission_request(
+    orch: &Orchestrator,
+    run_id: &str,
+    request_id: &str,
+    tool_use_id: &str,
+    predecessor_turn_id: Option<&str>,
+    cause: HandoffClosed,
+) -> DbResult<Withdrawal> {
+    use crate::agent_process::process::RunOccupancy;
+
+    let provider_turn_open =
+        predecessor_turn_id.is_some_and(|turn| match orch.process_state.get_occupancy(run_id) {
+            Some(RunOccupancy::AwaitingHost { turn_id }) => turn_id == turn,
+            Some(RunOccupancy::ServingTurn(turn_id)) => turn_id == turn,
+            _ => false,
+        });
+    let response = withdrawn_response_json(cause);
+    let now = chrono::Utc::now().timestamp() as i32;
+    let withdrawal = orch
+        .db
+        .local
+        .write(|conn| {
+            let (run_id, request_id, tool_use_id, response) = (
+                run_id.to_string(),
+                request_id.to_string(),
+                tool_use_id.to_string(),
+                response.clone(),
+            );
+            let predecessor = predecessor_turn_id.map(str::to_string);
+            Box::pin(async move {
+                let changed = conn
+                    .execute(
+                        "UPDATE permission_requests \
+                         SET status = 'withdrawn', response = ?2, responded_at = ?3 \
+                         WHERE id = ?1 AND status = 'pending'",
+                        params![request_id.as_str(), response.as_str(), now],
+                    )
+                    .await?;
+                if changed == 0 {
+                    return Ok(Withdrawal::NotPending);
+                }
+                let restored_outer_wait =
+                    super::durable_suspend::reclaim_from_inner_wait(conn, &run_id, &tool_use_id)
+                        .await?;
+
+                let job_id = {
+                    let mut rows = conn
+                        .query(
+                            "SELECT job_id FROM runs WHERE id = ?1 LIMIT 1",
+                            params![run_id.as_str()],
+                        )
+                        .await?;
+                    match rows.next().await? {
+                        Some(row) => row.opt_text(0)?,
+                        None => None,
+                    }
+                };
+                if let Some(job_id) = job_id.as_deref() {
+                    let issue_id = issue_id_for_run_conn(conn, &run_id).await?;
+                    if let Err(e) = crate::transitions::outcome::recompute_job_owner_attention_conn(
+                        conn,
+                        job_id,
+                        issue_id.as_deref(),
+                    )
+                    .await
+                    {
+                        log::warn!("Failed to recompute owner attention for {job_id}: {e}");
+                    }
+                }
+
+                let hand_back = match predecessor.as_deref() {
+                    None => HandBack::NoTurn,
+                    Some(turn_id) => {
+                        if turn_held_by_another_wait(conn, turn_id, &request_id).await? {
+                            HandBack::HeldByAnotherWait
+                        } else if provider_turn_open {
+                            conn.execute(
+                                "UPDATE turns \
+                                 SET state = 'running', yield_reason = NULL, ended_at = NULL, \
+                                     updated_at = ?2 \
+                                 WHERE id = ?1 AND state = 'yielded'",
+                                params![turn_id, now],
+                            )
+                            .await?;
+                            HandBack::Unyielded
+                        } else {
+                            HandBack::ProviderTurnEnded
+                        }
+                    }
+                };
+                Ok(Withdrawal::Withdrawn {
+                    restored_outer_wait,
+                    hand_back,
+                })
+            })
+        })
+        .await?;
+
+    let Withdrawal::Withdrawn { hand_back, .. } = &withdrawal else {
+        return Ok(withdrawal);
+    };
+    log::info!(
+        "withdrew permission {request_id} for run {run_id}: {} (hand-back: {hand_back:?})",
+        cause.sentence()
+    );
+    let emitter = &*orch.services.emitter;
+    let _ = emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "permission_requests", "action": "update"}),
+    );
+    if let Some(turn_id) = predecessor_turn_id {
+        match hand_back {
+            HandBack::Unyielded => {
+                orch.process_state.begin_turn(run_id, turn_id);
+                let change =
+                    crate::notify::turn_db_change_for_id(&orch.db.local, turn_id, "update").await;
+                let _ = emitter.emit("db-change", change);
+            }
+            HandBack::ProviderTurnEnded => log::warn!(
+                "withdrawn permission {request_id} left turn {turn_id} yielded: its provider \
+                 turn has ended and continuing it needs the single successor owner (cairn/4936)"
+            ),
+            HandBack::NoTurn | HandBack::HeldByAnotherWait => {}
+        }
+    }
+    Ok(withdrawal)
+}
+
+/// Whether some wait other than `request_id` still holds `turn_id` yielded: a
+/// pending permission, an unanswered question, or a durable wait.
+async fn turn_held_by_another_wait(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+    request_id: &str,
+) -> DbResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT EXISTS(SELECT 1 FROM permission_requests \
+                           WHERE turn_id = ?1 AND status = 'pending' AND id <> ?2) \
+                 OR EXISTS(SELECT 1 FROM prompts WHERE turn_id = ?1 AND answered_at IS NULL) \
+                 OR EXISTS(SELECT 1 FROM agent_waits \
+                           WHERE predecessor_turn_id = ?1 AND state IN ('pending', 'resolving'))",
+            params![turn_id, request_id],
+        )
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.i64(0))
+        .transpose()?
+        .unwrap_or(0)
+        != 0)
 }
 
 /// Emit the attention fact for a pending permission request so the UI toast and
@@ -867,9 +1285,24 @@ pub struct PermissionAnswer {
     provenance_provider: Option<String>,
     provenance_conversation: Option<String>,
     provenance_resolution_id: Option<String>,
+    /// Also turn off the requesting agent's containment fence, in the same
+    /// transaction that records this answer. Only [`PermissionAnswer::allow_all`]
+    /// sets it, and that constructor requires the operator capability.
+    allow_all: bool,
 }
 
 impl PermissionAnswer {
+    /// An operator's "Allow all": allow this crossing and turn off the
+    /// requesting agent's containment fence for the rest of the run. The fence
+    /// write rides in the transaction that records the answer, so it lands if
+    /// and only if the answer is accepted; a request withdrawn first changes
+    /// nothing (see [`plan_allow_all`]).
+    pub fn allow_all(approval: OperatorApproval) -> Self {
+        let mut answer = Self::from_operator(PermissionDecision::Allow, approval);
+        answer.allow_all = true;
+        answer
+    }
+
     /// An answer from an authenticated operator.
     pub fn from_operator(decision: PermissionDecision, approval: OperatorApproval) -> Self {
         Self {
@@ -878,6 +1311,7 @@ impl PermissionAnswer {
             lifetime: None,
             expires_at: None,
             answerer: Answerer::Operator(Box::new(approval)),
+            allow_all: false,
             authenticated_appearance: None,
             provenance_actor: None,
             provenance_provider: None,
@@ -894,6 +1328,7 @@ impl PermissionAnswer {
             lifetime: None,
             expires_at: None,
             answerer: Answerer::Surface(surface),
+            allow_all: false,
             authenticated_appearance: None,
             provenance_actor: None,
             provenance_provider: None,
@@ -1037,6 +1472,10 @@ pub struct ResolveOutcome {
     pub duplicate: bool,
     /// Owning issue, for status recompute / wake by the caller.
     pub issue_id: Option<String>,
+    /// The request was withdrawn before this answer arrived: the answer was
+    /// not recorded, nothing was replayed, and no turn was started. Carries
+    /// [`withdrawn_notice`], which every answer surface shows verbatim.
+    pub withdrawn: Option<String>,
 }
 
 /// A `permission_requests` row, loaded for resolution.
@@ -1048,6 +1487,7 @@ pub struct PermissionRequestRecord {
     pub tool_name: String,
     pub tool_input: String,
     pub status: String,
+    pub response: Option<String>,
 }
 
 impl PermissionRequestRecord {
@@ -1059,6 +1499,7 @@ impl PermissionRequestRecord {
             tool_name: row.text(3)?,
             tool_input: row.text(4)?,
             status: row.text(5)?,
+            response: row.opt_text(6)?,
         })
     }
 }
@@ -1136,6 +1577,11 @@ pub struct PermissionResponseResume {
     pub successor_turn_id: Option<String>,
     pub job_id: Option<String>,
     pub duplicate: bool,
+    /// The request had been withdrawn when this answer reached it: what the
+    /// answerer is told instead. Read in the same transaction that would have
+    /// recorded the answer, so a withdrawal that lands after the resolver's
+    /// first look is still caught before any effect.
+    pub withdrawn_notice: Option<String>,
 }
 
 /// Persist an "allow all" decision for the agent that owns a permission request.
@@ -1160,22 +1606,25 @@ pub struct PermissionResponseResume {
 /// would make the authority boundary a function of a switch the agent controls.
 ///
 /// So the capability is required by the signature rather than checked by a
-/// caller, the same way [`PermissionAnswer::from_operator`] carries it across
-/// the resolver boundary. A surface answering a containment prompt with a plain
+/// caller: only [`PermissionAnswer::allow_all`] asks for it, and it takes an
+/// [`OperatorApproval`]. A surface answering a containment prompt with a plain
 /// `allow` is unaffected; only turning the fence off needs an operator.
-pub async fn allow_all_for_request(
-    orch: &Orchestrator,
-    request_id: &str,
-    approval: &OperatorApproval,
-) -> Result<(), String> {
-    // A team execution's executions/jobs rows live in its synced replica, so the
-    // snapshot read+write and the active-job lookup must target the owning
-    // database (CAIRN-2227). Fail-closed (CAIRN-2170 class): an `allowAll` whose
-    // replica is not open errors rather than editing a stale private snapshot.
-    let db = crate::execution::routing::owning_db_for_permission_request(&orch.db, request_id)
-        .await
-        .map_err(|e| e.to_string())?;
+///
+/// It is planned here and written by the record transaction, never on its own:
+/// a fence flip committed separately from the answer could land and then lose
+/// the answer to a withdrawal, leaving a request nobody answered with the
+/// sandbox off.
+pub(crate) struct AllowAllPlan {
+    execution_id: String,
+    agent_id: String,
+    snapshot_json: String,
+}
 
+async fn plan_allow_all(
+    db: &LocalDb,
+    request_id: &str,
+    record: &PermissionRequestRecord,
+) -> Result<AllowAllPlan, String> {
     // "Allow all" is a containment decision, and an authority prompt is not a
     // containment prompt. Flipping the fence here would answer a question the
     // operator was not asked -- they were shown a named capability to approve,
@@ -1183,23 +1632,19 @@ pub async fn allow_all_for_request(
     // escape as a side effect of approving one MCP server. Refuse rather than
     // silently doing the wrong half: the authority answer they want is a
     // lifetime on the prompt itself, which is journaled and revocable.
-    if let Ok(record) = get_permission_request_record(&db, request_id).await {
-        if super::authority::parse_authority_detail(&record.tool_input).is_some() {
-            return Err(
-                "'Allow all' turns off this agent's containment fence, which is a different \
-                 decision from the authority this prompt is asking about. Approve the request \
-                 itself with a lifetime instead; a standing approval is listable and revocable \
-                 where a fence flip is neither."
-                    .to_string(),
-            );
-        }
+    if super::authority::parse_authority_detail(&record.tool_input).is_some() {
+        return Err(
+            "'Allow all' turns off this agent's containment fence, which is a different \
+             decision from the authority this prompt is asking about. Approve the request \
+             itself with a lifetime instead; a standing approval is listable and revocable \
+             where a fence flip is neither."
+                .to_string(),
+        );
     }
-
-    let target = load_permission_snapshot_target(&db, request_id).await?;
+    let target = load_permission_snapshot_target(db, request_id).await?;
     let Some(mut snapshot) = target.snapshot else {
         return Err("Execution has no snapshot".to_string());
     };
-
     let agent = snapshot.agents.get_mut(&target.agent_id).ok_or_else(|| {
         format!(
             "Agent '{}' not found in execution snapshot",
@@ -1207,32 +1652,55 @@ pub async fn allow_all_for_request(
         )
     })?;
     agent.fence = Some(Fence::Allow);
-    let snapshot_json = snapshot.to_json()?;
+    Ok(AllowAllPlan {
+        snapshot_json: snapshot.to_json()?,
+        execution_id: target.execution_id,
+        agent_id: target.agent_id,
+    })
+}
 
-    // A fence flip is neither journaled nor revocable (which is why an authority
-    // prompt refuses it above), so the log line is the only record that it
+/// Carry an accepted "Allow all" to the live processes it governs. Called only
+/// after the record transaction that wrote the snapshot has committed.
+async fn apply_allow_all(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    request_id: &str,
+    plan: &AllowAllPlan,
+    approval: &OperatorApproval,
+) {
+    // A fence flip is neither journaled nor revocable (which is why an
+    // authority prompt refuses it), so the log line is the only record that it
     // happened and who did it. Names the operator and the transport that was
     // actually verified, never anything the payload claimed.
     log::info!(
         "permission {request_id}: operator {} ({}) turned off agent '{}' containment fence for execution {}",
         serde_json::to_string(approval.actor()).unwrap_or_else(|_| "<invalid actor>".to_string()),
         serde_json::to_string(&approval.appearance().evidence().transport).unwrap_or_else(|_| "<invalid transport>".to_string()),
-        target.agent_id,
-        target.execution_id,
+        plan.agent_id,
+        plan.execution_id,
     );
-
-    update_execution_snapshot(&db, &target.execution_id, &snapshot_json).await?;
     // Process-state propagation is host-local (live processes are keyed by
     // session in memory), but the job-session lookup it drives reads the owning
     // database.
-    propagate_fence_allow_to_processes(orch, &db, &target.execution_id, &target.agent_id).await;
-
+    propagate_fence_allow_to_processes(orch, db, &plan.execution_id, &plan.agent_id).await;
     let _ = orch.services.emitter.emit(
         "db-change",
         serde_json::json!({"table": "executions", "action": "update"}),
     );
+}
 
-    Ok(())
+/// What a withdrawn request tells an answer, including an "Allow all" that
+/// therefore changed nothing.
+fn withdrawn_reply(response: Option<&str>, allow_all: bool) -> String {
+    with_allow_all_note(withdrawn_notice(withdrawn_cause(response)), allow_all)
+}
+
+fn with_allow_all_note(notice: String, allow_all: bool) -> String {
+    if allow_all {
+        format!("{notice} 'Allow all' was not applied either: this agent's containment fence is unchanged.")
+    } else {
+        notice
+    }
 }
 
 struct PermissionSnapshotTarget {
@@ -1287,20 +1755,8 @@ async fn load_permission_snapshot_target(
     .map_err(|e| format!("Failed to load permission snapshot target: {e}"))
 }
 
-async fn update_execution_snapshot(
-    db: &LocalDb,
-    execution_id: &str,
-    snapshot_json: &str,
-) -> Result<(), String> {
-    db.execute(
-        "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
-        params![snapshot_json, execution_id],
-    )
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("Failed to update execution snapshot: {e}"))
-}
-
+/// Write the snapshot only while the request that asked for it has not been
+/// withdrawn. `false` means the withdrawal won and nothing was written.
 async fn propagate_fence_allow_to_processes(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1420,6 +1876,35 @@ async fn resolve_permission_request_impl(
     let record = get_permission_request_record(&owning_db, request_id)
         .await
         .map_err(|e| format!("Permission request not found: {}", e))?;
+
+    // Ahead of every claim, grant, and record: a withdrawn request accepts no
+    // answer at all. Its turn has already been handed back. This is the fast
+    // path; the record transaction below is the authority, for a withdrawal
+    // that lands after this read.
+    if record.status == "withdrawn" && !test_hooks::early_withdrawn_read_misses() {
+        return Ok(ResolveOutcome {
+            duplicate: false,
+            issue_id: None,
+            withdrawn: Some(withdrawn_reply(
+                record.response.as_deref(),
+                answer.allow_all,
+            )),
+        });
+    }
+
+    // Turning the fence off is the operator capability that subsumes every
+    // other, so it is refused here, at the canonical boundary, for any answer
+    // that does not carry one -- even though only an operator constructor sets
+    // the flag.
+    if answer.allow_all
+        && (answer.operator_approval().is_none()
+            || !matches!(answer.decision, PermissionDecision::Allow))
+    {
+        return Err(format!(
+            "{OPERATOR_PENDING_REFUSAL} 'Allow all' turns off this agent's containment fence, \
+             which only an operator can do. The request is still pending."
+        ));
+    }
 
     let crossing = parse_crossing_detail(&record.tool_input);
     let authority = super::authority::parse_authority_detail(&record.tool_input);
@@ -1549,6 +2034,7 @@ async fn resolve_permission_request_impl(
             return Ok(ResolveOutcome {
                 duplicate: true,
                 issue_id: None,
+                withdrawn: None,
             });
         };
         let result = Box::pin(resolve_permission_request_impl(
@@ -1560,10 +2046,15 @@ async fn resolve_permission_request_impl(
         .await;
         return match result {
             Ok(outcome) => {
+                // A withdrawal that won the race is what the receipt says.
+                let receipt = outcome
+                    .withdrawn
+                    .clone()
+                    .unwrap_or_else(|| format!("✓ answered: {behavior}"));
                 crate::channels::ledger::finalize_ask_resolution(
                     &owning_db,
                     request_id,
-                    &format!("✓ answered: {behavior}"),
+                    &receipt,
                     chrono::Utc::now().timestamp_millis(),
                 )
                 .await?;
@@ -1593,9 +2084,45 @@ async fn resolve_permission_request_impl(
     let structured = crossing.is_some() || authority.is_some();
     let response_json = build_permission_response_json(&record, behavior, structured);
 
-    let resume = record_permission_response(&owning_db, request_id, status, &response_json, now)
-        .await
-        .map_err(|e| e.to_string())?;
+    // "Allow all" is planned before the record and written BY it, so the fence
+    // turns off exactly when the answer is accepted and never otherwise.
+    let allow_all_plan = if answer.allow_all {
+        Some(plan_allow_all(&owning_db, request_id, &record).await?)
+    } else {
+        None
+    };
+
+    let mut resume = record_permission_response_with(
+        &owning_db,
+        request_id,
+        status,
+        &response_json,
+        now,
+        allow_all_plan
+            .as_ref()
+            .map(|plan| (plan.execution_id.clone(), plan.snapshot_json.clone())),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    // Withdrawn between the first read and the record: nothing below may run,
+    // not the resolution columns, not a session allowance, not the broadcast,
+    // and (written in that same transaction) not an "Allow all".
+    if let Some(notice) = resume.withdrawn_notice.take() {
+        return Ok(ResolveOutcome {
+            duplicate: false,
+            issue_id: None,
+            withdrawn: Some(with_allow_all_note(notice, answer.allow_all)),
+        });
+    }
+
+    // Accepted: the snapshot already says `allow`. Tell the live processes
+    // before the broadcast or the resume re-drives anything under them.
+    if let (Some(plan), false) = (allow_all_plan.as_ref(), resume.duplicate) {
+        if let Some(approval) = answer.operator_approval() {
+            apply_allow_all(orch, &owning_db, request_id, plan, approval).await;
+        }
+    }
 
     if !resume.duplicate {
         owning_db
@@ -1761,6 +2288,7 @@ async fn resolve_permission_request_impl(
     Ok(ResolveOutcome {
         duplicate: resume.duplicate,
         issue_id: resume.issue_id,
+        withdrawn: None,
     })
 }
 
@@ -2333,7 +2861,7 @@ async fn get_permission_request_record(
             let mut rows = conn
                 .query(
                     "
-                    SELECT id, run_id, tool_use_id, tool_name, tool_input, status
+                    SELECT id, run_id, tool_use_id, tool_name, tool_input, status, response
                     FROM permission_requests
                     WHERE id = ?1
                     LIMIT 1
@@ -2358,6 +2886,20 @@ pub async fn record_permission_response(
     response_json: &str,
     responded_at: i32,
 ) -> DbResult<PermissionResponseResume> {
+    record_permission_response_with(db, request_id, status, response_json, responded_at, None).await
+}
+
+/// [`record_permission_response`], also writing an execution snapshot
+/// (`(execution_id, snapshot_json)`) in the same transaction if and only if
+/// this answer is the one recorded.
+async fn record_permission_response_with(
+    db: &LocalDb,
+    request_id: &str,
+    status: &str,
+    response_json: &str,
+    responded_at: i32,
+    snapshot_write: Option<(String, String)>,
+) -> DbResult<PermissionResponseResume> {
     let request_id = request_id.to_string();
     let status = status.to_string();
     let response_json = response_json.to_string();
@@ -2366,11 +2908,13 @@ pub async fn record_permission_response(
             let request_id = request_id.clone();
             let status = status.clone();
             let response_json = response_json.clone();
+            let snapshot_write = snapshot_write.clone();
             Box::pin(async move {
                 let mut rows = conn
                     .query(
                         "
-                        SELECT pr.run_id, r.issue_id, pr.turn_id, r.session_id, r.job_id, pr.status
+                        SELECT pr.run_id, r.issue_id, pr.turn_id, r.session_id, r.job_id, pr.status,
+                               pr.response
                         FROM permission_requests pr
                         JOIN runs r ON pr.run_id = r.id
                         WHERE pr.id = ?1
@@ -2387,6 +2931,9 @@ pub async fn record_permission_response(
                 let session_id = row.opt_text(3)?;
                 let job_id = row.opt_text(4)?;
                 let current_status = row.text(5)?;
+                let withdrawn_notice = (current_status == "withdrawn").then(|| {
+                    withdrawn_notice(withdrawn_cause(row.opt_text(6).ok().flatten().as_deref()))
+                });
                 // CAIRN-2123: a fence crossing raised during the warm-reuse
                 // `Busy`-without-turn window stored `turn_id = NULL`. By the time
                 // the answer arrives (past the inline budget) the job's turn is
@@ -2444,6 +2991,15 @@ pub async fn record_permission_response(
                     .await?
                         == 0
                 };
+                if !duplicate {
+                    if let Some((execution_id, snapshot_json)) = snapshot_write.as_ref() {
+                        conn.execute(
+                            "UPDATE executions SET snapshot = ?1 WHERE id = ?2",
+                            params![snapshot_json.as_str(), execution_id.as_str()],
+                        )
+                        .await?;
+                    }
+                }
 
                 Ok(PermissionResponseResume {
                     run_id,
@@ -2453,6 +3009,7 @@ pub async fn record_permission_response(
                     successor_turn_id: None,
                     job_id,
                     duplicate,
+                    withdrawn_notice,
                 })
             })
         })
@@ -2971,7 +3528,7 @@ async fn start_turn_for_run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
@@ -3019,7 +3576,7 @@ mod tests {
         assert!(OperatorApproval::authenticated(other, approval.appearance().clone()).is_err());
     }
 
-    async fn test_orchestrator() -> Orchestrator {
+    pub(crate) async fn test_orchestrator() -> Orchestrator {
         let root = tempfile::tempdir().unwrap().keep();
         let db_path = root.join("test.db");
         let local = LocalDb::open(db_path).await.unwrap();
@@ -3032,7 +3589,7 @@ mod tests {
         Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build()
     }
 
-    async fn seed_allow_all_permission(orch: &Orchestrator) {
+    pub(crate) async fn seed_allow_all_permission(orch: &Orchestrator) {
         let snapshot = serde_json::json!({
             "recipe": {
                 "id": "recipe-1",
@@ -3134,7 +3691,7 @@ mod tests {
     /// This is deliberately not a test about the invoke boundary. Closing one
     /// switch there left two others open, because the boundary tests pinned the
     /// gate rather than the property.
-    fn desktop_approval() -> OperatorApproval {
+    pub(crate) fn desktop_approval() -> OperatorApproval {
         use cairn_common::identity::{
             Address, AppearanceEvidence, CredentialRef, VerificationMethod, VerificationRecord,
             VerificationStatus, VerificationStrength,
@@ -3749,14 +4306,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_all_for_request_sets_requesting_agent_fence_to_allow() {
+    async fn an_allow_all_answer_sets_requesting_agent_fence_to_allow() {
         let orch = test_orchestrator().await;
         seed_allow_all_permission(&orch).await;
 
-        let approval = desktop_approval();
-        allow_all_for_request(&orch, "perm-request-1", &approval)
-            .await
-            .unwrap();
+        let outcome = resolve_permission_request(
+            &orch,
+            "perm-request-1",
+            PermissionAnswer::allow_all(desktop_approval()),
+        )
+        .await
+        .unwrap();
+        assert!(outcome.withdrawn.is_none());
+        assert_eq!(perm_status(&orch).await.as_deref(), Some("allowed"));
 
         let snapshot = orch
             .db
@@ -3860,6 +4422,7 @@ mod tests {
             successor_turn_id: Some("turn-2".to_string()),
             job_id: Some("job-1".to_string()),
             duplicate: false,
+            withdrawn_notice: None,
         };
 
         assert!(should_resume_permission_response(None, &resume, false));
@@ -3896,6 +4459,7 @@ mod tests {
             successor_turn_id: Some("turn-2".to_string()),
             job_id: Some("job-1".to_string()),
             duplicate: false,
+            withdrawn_notice: None,
         };
 
         assert!(!should_resume_permission_response(
