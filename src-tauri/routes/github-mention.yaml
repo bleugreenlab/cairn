@@ -1,0 +1,15 @@
+name: GitHub mentions
+description: Create actionable Cairn work when a connected repository comment mentions the GitHub App.
+enabled: true
+nodes:
+  - id: mention
+    type: trigger
+    when: { fact: github_comment }
+  - id: work
+    type: sink
+    sink:
+      kind: issue
+      labels: [github]
+edges:
+  - { from: mention, to: work }
+dedupe: 720h

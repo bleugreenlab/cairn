@@ -1,0 +1,31 @@
+-- Look a push up by the ASK it is about, rather than by the recipient it was
+-- minted for.
+--
+-- Every existing index on this table leads with `recipient`, because every
+-- existing reader is a drain: "what is queued for me". The answerability
+-- predicate behind CAIRN-4732 asks the transposed question -- "who, if anyone,
+-- was told about this ask" -- and arrives holding a set of keys and no
+-- recipient at all. Against a recipient-leading index that is a scan.
+--
+-- It cannot borrow the pending partial index either. `idx_attention_pushes_pending`
+-- physically contains only rows where `delivered_event_id IS NULL`, and a push is
+-- stamped delivered the instant the watcher's carrying event is written -- seconds
+-- after the ask is raised, for a parent that is actually alive. Measured on the
+-- live workspace, of 130 currently-unanswered questions holding a watcher push,
+-- 8 were still pending and 76 had been delivered. Delivered is not resolved: the
+-- row is the durable record that the watcher WAS told, which is exactly what
+-- makes it the holder. So the predicate must see delivered rows, which puts it
+-- outside that index's population by construction.
+--
+-- Plain rather than partial, for the same reason: the only term the predicate
+-- can offer is `retired_at IS NULL`, and a partial index is chosen here only when
+-- the query's predicate matches the index's term for term (see the engine notes
+-- in 0196). Left as a residual filter over a key seek it costs a comparison on a
+-- handful of rows.
+--
+-- With it, the read is an `IN (...)` seek proportional to the BATCH of asks the
+-- channel sweep is holding. Without it, every enabled provider scans the whole
+-- push history every five seconds, which is the shape CAIRN-4194 removed from
+-- the review loader next door.
+CREATE INDEX IF NOT EXISTS idx_attention_pushes_key
+    ON attention_pushes ("key");

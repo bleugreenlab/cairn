@@ -1,0 +1,606 @@
+use super::models::{build_catalog, decode_published_metadata, decode_subscription_model_ids};
+use super::{OpenCodeBackend, DEFAULT_MODEL, OPENCODE_BACKEND_KEY};
+use crate::agent_process::stdin::MessageContent;
+use crate::backends::openai_compat::wire::ChatMessage;
+use crate::backends::{AgentBackend, SessionConfig, SessionStart};
+use crate::config::presets::default_presets_config;
+use crate::models::Model;
+use cairn_llm::types::catalog::{DiscoveredModel, DiscoveredWireProtocol};
+use serde_json::json;
+
+/// Shapes taken from the live endpoints on 2026-08-15. The subscription catalog
+/// answers with bare ids; models.dev carries the metadata, including the
+/// per-model SDK package that names the endpoint family serving it.
+const SUBSCRIPTION_BODY: &str = r#"{
+  "object": "list",
+  "data": [
+    {"id": "glm-5.2", "object": "model", "created": 1786821513, "owned_by": "opencode"},
+    {"id": "minimax-m3", "object": "model", "created": 1786821513, "owned_by": "opencode"},
+    {"id": "grok-4.5", "object": "model", "created": 1786821513, "owned_by": "opencode"},
+    {"id": "hy3-preview", "object": "model", "created": 1786821513, "owned_by": "opencode"}
+  ]
+}"#;
+
+const METADATA_BODY: &str = r#"{
+  "anthropic": {"id": "anthropic", "models": {}},
+  "opencode-go": {
+    "id": "opencode-go",
+    "name": "OpenCode Go",
+    "api": "https://opencode.ai/zen/go/v1",
+    "npm": "@ai-sdk/openai-compatible",
+    "models": {
+      "glm-5.2": {
+        "id": "glm-5.2",
+        "name": "GLM-5.2",
+        "description": "Z.ai coding model",
+        "tool_call": true,
+        "reasoning": true,
+        "temperature": true,
+        "structured_output": true,
+        "reasoning_options": [{"type": "effort", "values": ["high", "max"]}],
+        "limit": {"context": 1000000, "output": 131072},
+        "cost": {"input": 1.4, "output": 4.4, "cache_read": 0.26}
+      },
+      "minimax-m3": {
+        "id": "minimax-m3",
+        "name": "MiniMax-M3",
+        "description": "MiniMax multimodal coding model",
+        "tool_call": true,
+        "limit": {"context": 1000000},
+        "cost": {"input": 0.3, "output": 1.2},
+        "provider": {"npm": "@ai-sdk/anthropic"}
+      },
+      "grok-4.5": {
+        "id": "grok-4.5",
+        "name": "Grok 4.5",
+        "tool_call": true,
+        "limit": {"context": 500000},
+        "provider": {"npm": "@ai-sdk/openai"}
+      },
+      "some-future-model": {
+        "id": "some-future-model",
+        "name": "Future",
+        "tool_call": true,
+        "provider": {"npm": "@ai-sdk/google"}
+      },
+      "toolless-model": {
+        "id": "toolless-model",
+        "name": "Toolless",
+        "description": "Completion-only model",
+        "tool_call": false,
+        "temperature": true,
+        "limit": {"context": 128000}
+      }
+    }
+  }
+}"#;
+
+fn catalog() -> Vec<DiscoveredModel> {
+    let ids = decode_subscription_model_ids(SUBSCRIPTION_BODY).expect("subscription body decodes");
+    let published = decode_published_metadata(METADATA_BODY).expect("metadata body decodes");
+    build_catalog(&ids, &published)
+}
+
+fn entry<'a>(catalog: &'a [DiscoveredModel], id: &str) -> &'a DiscoveredModel {
+    catalog
+        .iter()
+        .find(|model| model.id == id)
+        .unwrap_or_else(|| panic!("{id} is present in the catalog"))
+}
+
+#[test]
+fn the_subscription_decides_the_line_up_and_its_order() {
+    let catalog = catalog();
+    let ids: Vec<&str> = catalog.iter().map(|model| model.id.as_str()).collect();
+    // Every id the subscription serves is accounted for, in its order — including
+    // the one models.dev has no entry for.
+    assert_eq!(
+        ids,
+        vec!["glm-5.2", "minimax-m3", "grok-4.5", "hy3-preview"]
+    );
+}
+
+#[test]
+fn a_chat_completions_model_is_offered_with_its_published_metadata() {
+    let catalog = catalog();
+    let glm = entry(&catalog, "glm-5.2");
+
+    assert!(!glm.hidden, "a chat/completions model is selectable");
+    assert_eq!(glm.display_name, "GLM-5.2");
+    assert_eq!(glm.description.as_deref(), Some("Z.ai coding model"));
+    assert_eq!(glm.context_window, Some(1_000_000));
+    // The effort vocabulary is the model's own, not a ladder Cairn imposes.
+    let efforts: Vec<&str> = glm
+        .supported_reasoning_efforts
+        .iter()
+        .map(|effort| effort.reasoning_effort.as_str())
+        .collect();
+    assert_eq!(efforts, vec!["high", "max"]);
+    // `tools` is load-bearing: an agent run is nothing but tool calls.
+    assert!(glm.supported_parameters.contains(&"tools".to_string()));
+    assert!(glm
+        .supported_parameters
+        .contains(&"structured_outputs".to_string()));
+}
+
+#[test]
+fn published_price_per_million_becomes_price_per_token() {
+    let catalog = catalog();
+    let pricing = entry(&catalog, "glm-5.2")
+        .pricing
+        .as_ref()
+        .expect("a priced model carries pricing");
+    // $1.40 per million in, $4.40 out, $0.26 cached read — carried per token, and
+    // parseable as a number rather than in scientific notation.
+    let prompt: f64 = pricing
+        .prompt
+        .as_ref()
+        .expect("input price")
+        .parse()
+        .expect("input price parses");
+    let completion: f64 = pricing
+        .completion
+        .as_ref()
+        .expect("output price")
+        .parse()
+        .expect("output price parses");
+    let cache_read: f64 = pricing
+        .input_cache_read
+        .as_ref()
+        .expect("cache read price")
+        .parse()
+        .expect("cache read price parses");
+    assert!((prompt * 1_000_000.0 - 1.4).abs() < 1e-9);
+    assert!((completion * 1_000_000.0 - 4.4).abs() < 1e-9);
+    assert!((cache_read * 1_000_000.0 - 0.26).abs() < 1e-9);
+}
+
+#[test]
+fn every_recognized_endpoint_family_is_offered_and_records_how_to_reach_it() {
+    // Cairn speaks all three of Go's families, so each is selectable — and each
+    // carries the protocol that decides which endpoint its session will reach.
+    let catalog = catalog();
+
+    let glm = entry(&catalog, "glm-5.2");
+    assert!(!glm.hidden);
+    assert_eq!(
+        glm.wire_protocol,
+        Some(DiscoveredWireProtocol::OpenAiChatCompletions)
+    );
+
+    let minimax = entry(&catalog, "minimax-m3");
+    assert!(!minimax.hidden, "an Anthropic Messages model is offered");
+    assert_eq!(
+        minimax.wire_protocol,
+        Some(DiscoveredWireProtocol::AnthropicMessages)
+    );
+    // Its own published description survives, with no leftover apology about an
+    // endpoint Cairn could not speak.
+    assert_eq!(
+        minimax.description.as_deref(),
+        Some("MiniMax multimodal coding model")
+    );
+
+    let grok = entry(&catalog, "grok-4.5");
+    assert!(!grok.hidden, "an OpenAI Responses model is offered");
+    assert_eq!(
+        grok.wire_protocol,
+        Some(DiscoveredWireProtocol::OpenAiResponses)
+    );
+}
+
+#[test]
+fn the_protocol_survives_a_catalog_round_trip() {
+    // The catalog is persisted and reloaded, so routing tomorrow has to reach
+    // the same endpoint as routing today.
+    let minimax = entry(&catalog(), "minimax-m3").clone();
+    let json = serde_json::to_string(&minimax).expect("a catalog entry serializes");
+    let restored: DiscoveredModel = serde_json::from_str(&json).expect("and deserializes");
+
+    assert_eq!(
+        restored.wire_protocol,
+        Some(DiscoveredWireProtocol::AnthropicMessages)
+    );
+    assert_eq!(restored, minimax);
+}
+
+#[test]
+fn a_catalog_entry_written_before_protocols_existed_claims_none() {
+    // Absence must never read as "chat completions": that guess is what sends a
+    // Messages-only model to an endpoint which cannot answer it.
+    let legacy = r#"{"id":"x","model":"x","displayName":"X","description":null,
+                    "defaultReasoningEffort":null}"#;
+    let restored: DiscoveredModel = serde_json::from_str(legacy).expect("legacy entries load");
+    assert_eq!(restored.wire_protocol, None);
+}
+
+#[test]
+fn an_unrecognized_sdk_package_is_not_assumed_compatible() {
+    // A package Cairn has no mapping for could be any protocol. Guessing
+    // chat/completions would fail in the middle of a session instead of before
+    // one starts, so the model is carried unselectable and says so.
+    let ids = vec!["some-future-model".to_string()];
+    let published = decode_published_metadata(METADATA_BODY).expect("metadata decodes");
+    let catalog = build_catalog(&ids, &published);
+
+    assert!(catalog[0].hidden);
+    assert_eq!(
+        catalog[0].wire_protocol,
+        Some(DiscoveredWireProtocol::Unknown)
+    );
+}
+
+#[test]
+fn a_subscription_id_with_no_published_metadata_is_accounted_for_not_dropped() {
+    let catalog = catalog();
+    let preview = entry(&catalog, "hy3-preview");
+    assert!(preview.hidden);
+    assert_eq!(preview.context_window, None);
+    // No metadata means no published package, so there is no protocol to claim.
+    assert_eq!(preview.wire_protocol, None);
+    assert!(preview
+        .description
+        .as_deref()
+        .unwrap_or_default()
+        .contains("has not published its metadata"));
+}
+
+#[test]
+fn each_family_addresses_its_own_endpoint() {
+    // The three endpoints are the whole reason protocol routing exists; a
+    // transposition here sends a model somewhere that cannot answer it.
+    assert_eq!(
+        super::http::CHAT_URL,
+        "https://opencode.ai/zen/go/v1/chat/completions"
+    );
+    assert_eq!(
+        super::http::messages_endpoint("k").url,
+        "https://opencode.ai/zen/go/v1/messages"
+    );
+    assert_eq!(
+        super::http::responses_endpoint("k").url,
+        "https://opencode.ai/zen/go/v1/responses"
+    );
+}
+
+#[test]
+fn the_messages_endpoint_authenticates_the_way_that_endpoint_actually_requires() {
+    // Verified against the live gateway on 2026-08-16: Go's Messages endpoint
+    // takes Anthropic's own `x-api-key` header and refuses a Bearer token with
+    // "Missing API key", while its other two endpoints take Bearer. Getting this
+    // backwards is a 401 on every Messages turn.
+    let messages = super::http::messages_endpoint("secret");
+    let header = |endpoint: &[(String, String)], name: &str| {
+        endpoint
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(
+        header(&messages.headers, "x-api-key").as_deref(),
+        Some("secret")
+    );
+    assert!(header(&messages.headers, "authorization").is_none());
+    // Mandatory on this protocol: omitting it is an upstream 500, not a default.
+    assert!(messages.max_output_tokens > 0);
+
+    let responses = super::http::responses_endpoint("secret");
+    assert_eq!(
+        header(&responses.headers, "authorization").as_deref(),
+        Some("Bearer secret")
+    );
+    assert!(header(&responses.headers, "x-api-key").is_none());
+}
+
+/// A chat/completions model whose published metadata says it cannot call tools.
+fn toolless_model() -> DiscoveredModel {
+    let published = decode_published_metadata(METADATA_BODY).expect("metadata decodes");
+    build_catalog(&["toolless-model".to_string()], &published)
+        .pop()
+        .expect("the fixture yields one model")
+}
+
+#[test]
+fn a_model_that_cannot_call_tools_stays_available_for_tool_free_completions() {
+    let model = toolless_model();
+    // Not hidden: `complete` sends no tools, so this model is genuinely usable
+    // for one-shot completions. Hiding it would take that away in order to
+    // prevent a different mistake.
+    assert!(!model.hidden);
+    assert_eq!(model.context_window, Some(128_000));
+    assert!(!model.supported_parameters.contains(&"tools".to_string()));
+    assert!(super::unservable_reason(&model, "toolless-model").is_none());
+}
+
+#[test]
+fn a_model_that_cannot_call_tools_cannot_run_an_agent_session() {
+    // An agent run is nothing but tool calls, so a session started here would
+    // either be refused upstream or complete a turn while unable to act. It
+    // fails before the run starts, saying what to do about it.
+    let reason = super::session_blocker(&toolless_model(), "toolless-model")
+        .expect("a model that cannot call tools cannot run a session");
+    assert!(reason.contains("does not support tool calling"), "{reason}");
+    assert!(reason.contains("Assign a tool-calling model"), "{reason}");
+}
+
+#[test]
+fn a_tool_calling_model_on_a_served_endpoint_can_start_a_session() {
+    let catalog = catalog();
+    assert!(super::session_blocker(entry(&catalog, "glm-5.2"), "glm-5.2").is_none());
+}
+
+#[test]
+fn a_session_on_an_unservable_model_is_refused_with_the_catalogs_own_reason() {
+    let published = decode_published_metadata(METADATA_BODY).expect("metadata decodes");
+    let unknown = build_catalog(&["some-future-model".to_string()], &published)
+        .pop()
+        .expect("the fixture yields one model");
+    let reason = super::session_blocker(&unknown, "some-future-model")
+        .expect("a model Cairn cannot place cannot run a session");
+    assert!(reason.contains("no mapping for"), "{reason}");
+}
+
+#[test]
+fn a_model_on_a_recognized_family_can_start_a_session() {
+    // Every family Cairn has an adapter for is now runnable, not just the one it
+    // started with.
+    let catalog = catalog();
+    for model in ["glm-5.2", "minimax-m3", "grok-4.5"] {
+        assert!(
+            super::session_blocker(entry(&catalog, model), model).is_none(),
+            "{model} should be able to start a session"
+        );
+    }
+}
+
+#[test]
+fn metadata_without_the_provider_entry_fails_rather_than_reading_as_empty() {
+    let error = decode_published_metadata(r#"{"anthropic": {"models": {}}}"#)
+        .expect_err("an index with no opencode-go provider is a failure");
+    assert!(error.contains("opencode-go"), "{error}");
+}
+
+fn config_with(
+    reasoning_effort: Option<&str>,
+    output_schema: Option<serde_json::Value>,
+) -> SessionConfig {
+    SessionConfig {
+        run_id: "run-1".to_string(),
+        working_dir: "/tmp".to_string(),
+        project_id: "project".to_string(),
+        project_key: "GO".to_string(),
+        prompt: "hi".to_string(),
+        goal_objective: None,
+        clear_native_goal: false,
+        message_content: MessageContent::text("hi"),
+        system_prompt_content: None,
+        system_prompt_dynamic_tail: None,
+        model: None,
+        session_start: SessionStart::New {
+            session_id: "session-1".to_string(),
+        },
+        allowed_tools: Vec::new(),
+        disallowed_tools: Vec::new(),
+        mcp: crate::config::mcp_setup::stdio_attachment(
+            "cairn-cmd",
+            3849,
+            None,
+            "dev",
+            None,
+            "standard",
+        ),
+        mcp_bearer: None,
+        home_uri: "cairn://p/GO/1/1/builder".to_string(),
+        max_thinking_tokens: None,
+        reasoning_effort: reasoning_effort.map(str::to_string),
+        service_tier: None,
+        permissions: crate::backends::AgentPermissions::new(crate::models::Fence::Allow),
+        bidirectional: false,
+        identity: None,
+        output_schema,
+        ambient: false,
+        is_ephemeral_call: false,
+    }
+}
+
+/// The body of one owned-loop chat generation.
+fn build_body(model: &str, messages: &[ChatMessage], config: &SessionConfig) -> serde_json::Value {
+    use crate::backends::http_loop::{Connection, WireAdapter};
+    use cairn_llm::turn::ProtocolFamily;
+    let family = super::adapter::OpenCodeAdapter
+        .family(&Connection {
+            api_key: Some("test-key".to_string()),
+        })
+        .unwrap();
+    family.body(model, messages, &config.into())
+}
+
+#[test]
+fn a_streamed_turn_asks_for_the_usage_that_meters_the_subscription() {
+    let body = build_body(
+        "glm-5.2",
+        &[ChatMessage::user("hi".to_string())],
+        &config_with(None, None),
+    );
+    assert_eq!(body["stream"], json!(true));
+    // Without this an OpenAI-compatible stream reports no token counts at all,
+    // and a dollar-metered subscription has nothing to account against.
+    assert_eq!(body["stream_options"]["include_usage"], json!(true));
+    assert_eq!(body["tool_choice"], json!("auto"));
+    assert!(body["tools"]
+        .as_array()
+        .is_some_and(|tools| !tools.is_empty()));
+    assert!(body.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn the_configured_effort_reaches_the_provider_as_written() {
+    // Go's models publish different effort vocabularies, so Cairn passes the
+    // configured value through rather than mapping it onto a common ladder.
+    let body = build_body(
+        "kimi-k3",
+        &[ChatMessage::user("hi".to_string())],
+        &config_with(Some("max"), None),
+    );
+    assert_eq!(body["reasoning_effort"], json!("max"));
+}
+
+#[test]
+fn a_schema_constrained_run_carries_the_strict_response_format() {
+    let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+    let body = build_body(
+        "glm-5.2",
+        &[ChatMessage::user("hi".to_string())],
+        &config_with(None, Some(schema.clone())),
+    );
+    assert_eq!(
+        body["response_format"]["json_schema"]["strict"],
+        json!(true)
+    );
+    assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
+}
+
+#[test]
+fn the_backend_runs_its_agentic_loop_in_process() {
+    let backend = OpenCodeBackend;
+    assert_eq!(backend.name(), "OpenCode Go");
+    assert!(backend.supports_resume());
+    assert!(!backend.supports_warm_processes());
+    assert!(matches!(
+        backend.call_batch_capability().shape,
+        crate::backends::CallBatchShape::InProcess
+    ));
+    assert!(matches!(
+        backend.completion_shape(),
+        crate::backends::CompletionShape::InProcess
+    ));
+}
+
+#[test]
+fn the_backend_factory_resolves_the_go_key() {
+    let backend = crate::backends::backend_for_name(Some(OPENCODE_BACKEND_KEY));
+    assert_eq!(backend.name(), "OpenCode Go");
+}
+
+#[test]
+fn default_presets_address_go_models_through_tiers() {
+    // A Go model id carries no provider in its name, so a tier ref is how a Go
+    // model is named to the runtime at all. Every tier must therefore resolve.
+    let config = default_presets_config(None);
+    let presets = config
+        .backends
+        .get(OPENCODE_BACKEND_KEY)
+        .expect("Go defines default presets");
+    for tier in ["sm", "md", "lg"] {
+        let preset = presets
+            .get(tier)
+            .unwrap_or_else(|| panic!("Go defines the {tier} tier"));
+        let resolved = crate::config::presets::resolve_preset(
+            &format!("{OPENCODE_BACKEND_KEY}/{tier}"),
+            &config,
+        )
+        .expect("a qualified Go tier resolves");
+        assert_eq!(resolved.backend, OPENCODE_BACKEND_KEY);
+        assert_eq!(resolved.model, preset.model);
+    }
+    assert_eq!(presets["md"].model, Model::new(DEFAULT_MODEL));
+}
+
+#[test]
+fn no_default_preset_points_at_a_region_gated_model() {
+    // DeepSeek's Go models are the cheapest on offer but are served only from
+    // China-hosted infrastructure behind a per-workspace opt-in, so a default
+    // naming one fails for anyone who has not opted in.
+    let config = default_presets_config(None);
+    for preset in config.backends[OPENCODE_BACKEND_KEY].values() {
+        assert!(
+            !preset.model.as_str().starts_with("deepseek"),
+            "{} is region-gated and cannot be a default",
+            preset.model
+        );
+    }
+}
+
+/// Byte-exact request bodies of OpenCode Go's owned turns, one per protocol
+/// family. See `http_loop::scripted` for how they are recorded.
+mod golden {
+    use super::super::adapter::{messages_adapter, responses_adapter, OpenCodeAdapter};
+    use crate::backends::http_loop::scripted::{
+        answer_schema, assert_golden, chat_text, messages_text, messages_tool_uses, record_turn,
+        responses_function_calls, responses_text, session_config,
+    };
+
+    #[tokio::test]
+    async fn chat_turn_with_effort_and_schema() {
+        let mut config = session_config("glm-5.2");
+        config.reasoning_effort = Some("high".to_string());
+        config.output_schema = Some(answer_schema());
+        let bodies = record_turn(config, vec![chat_text(r#"{"answer":"done"}"#)], |_| {
+            OpenCodeAdapter
+        })
+        .await;
+        assert_golden(
+            &bodies,
+            &[
+                r#"{"messages":[{"content":"SYSTEM","role":"system"},{"content":"hi","role":"user"}],"model":"glm-5.2","reasoning_effort":"high","response_format":{"json_schema":{"name":"cairn_output","schema":{"properties":{"answer":{"type":"string"}},"required":["answer"],"type":"object"},"strict":true},"type":"json_schema"},"stream":true,"stream_options":{"include_usage":true},"tool_choice":"auto","tools":["read","write","run"]}"#,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn messages_turn_with_a_thinking_budget() {
+        let mut config = session_config("minimax-m3");
+        config.max_thinking_tokens = Some(4096);
+        let bodies = record_turn(config, vec![messages_text("done")], |_| messages_adapter()).await;
+        assert_golden(
+            &bodies,
+            &[
+                r#"{"max_tokens":32000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"model":"minimax-m3","stream":true,"system":[{"text":"SYSTEM","type":"text"}],"thinking":{"budget_tokens":4096,"type":"enabled"},"tool_choice":{"type":"auto"},"tools":["read","write","run"]}"#,
+            ],
+        );
+    }
+
+    /// The second request carries both tool results back.
+    #[tokio::test]
+    async fn messages_turn_with_two_tool_calls() {
+        let bodies = record_turn(
+            session_config("minimax-m3"),
+            vec![messages_tool_uses(2), messages_text("done")],
+            |_| messages_adapter(),
+        )
+        .await;
+        // Both results answer one assistant turn, so they share one user
+        // message: the shape replay rebuilds, and the only one the protocol
+        // accepts (it rejects adjacent user messages).
+        assert_golden(
+            &bodies,
+            &[
+                r#"{"max_tokens":32000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"}],"model":"minimax-m3","stream":true,"system":[{"text":"SYSTEM","type":"text"}],"tool_choice":{"type":"auto"},"tools":["read","write","run"]}"#,
+                r#"{"max_tokens":32000,"messages":[{"content":[{"text":"hi","type":"text"}],"role":"user"},{"content":[{"id":"call-1","input":{},"name":"frobnicate","type":"tool_use"},{"id":"call-2","input":{},"name":"frobnicate","type":"tool_use"}],"role":"assistant"},{"content":[{"content":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","tool_use_id":"call-1","type":"tool_result"},{"content":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","tool_use_id":"call-2","type":"tool_result"}],"role":"user"}],"model":"minimax-m3","stream":true,"system":[{"text":"SYSTEM","type":"text"}],"tool_choice":{"type":"auto"},"tools":["read","write","run"]}"#,
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn responses_turn_with_effort_schema_and_two_tool_calls() {
+        let mut config = session_config("grok-4.5");
+        config.reasoning_effort = Some("high".to_string());
+        config.output_schema = Some(answer_schema());
+        let bodies = record_turn(
+            config,
+            vec![
+                responses_function_calls(2),
+                responses_text(r#"{"answer":"done"}"#),
+            ],
+            |_| responses_adapter(),
+        )
+        .await;
+        assert_golden(
+            &bodies,
+            &[
+                r#"{"input":[{"content":[{"text":"hi","type":"input_text"}],"role":"user","type":"message"}],"instructions":"SYSTEM","model":"grok-4.5","reasoning":{"effort":"high"},"stream":true,"text":{"format":{"name":"cairn_output","schema":{"properties":{"answer":{"type":"string"}},"required":["answer"],"type":"object"},"strict":true,"type":"json_schema"}},"tool_choice":"auto","tools":["read","write","run"]}"#,
+                r#"{"input":[{"content":[{"text":"hi","type":"input_text"}],"role":"user","type":"message"},{"arguments":"{}","call_id":"call-1","name":"frobnicate","type":"function_call"},{"arguments":"{}","call_id":"call-2","name":"frobnicate","type":"function_call"},{"call_id":"call-1","output":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","type":"function_call_output"},{"call_id":"call-2","output":"Unsupported OpenRouter tool: \"frobnicate\". Valid tools are: read, write, run.","type":"function_call_output"}],"instructions":"SYSTEM","model":"grok-4.5","reasoning":{"effort":"high"},"stream":true,"text":{"format":{"name":"cairn_output","schema":{"properties":{"answer":{"type":"string"}},"required":["answer"],"type":"object"},"strict":true,"type":"json_schema"}},"tool_choice":"auto","tools":["read","write","run"]}"#,
+            ],
+        );
+    }
+}

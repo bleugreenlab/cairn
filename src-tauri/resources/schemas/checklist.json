@@ -1,0 +1,34 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Checklist title"
+    },
+    "items": {
+      "type": "array",
+      "description": "Checklist items",
+      "items": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "Task description"
+          },
+          "completed": {
+            "type": "boolean",
+            "default": false,
+            "description": "Whether the task is completed"
+          },
+          "notes": {
+            "type": "string",
+            "description": "Additional notes"
+          }
+        },
+        "required": ["task"]
+      }
+    }
+  },
+  "required": ["title", "items"],
+  "additionalProperties": false
+}

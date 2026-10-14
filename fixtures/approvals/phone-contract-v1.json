@@ -1,0 +1,151 @@
+{
+  "version": 1,
+  "note": "Golden vectors for the phone approvals contract. Regenerate with `bun run approvals:fixtures:generate`; verify with `bun run approvals:fixtures:check`.",
+  "baseMergeIntent": {
+    "intent": {
+      "installation_id": "installation-1",
+      "project_id": "project-1",
+      "repository_id": "repository-1",
+      "target_ref": "refs/heads/main",
+      "target_oid": "1111111111111111111111111111111111111111",
+      "source_oid": "2222222222222222222222222222222222222222",
+      "merge_base_oid": "3333333333333333333333333333333333333333",
+      "candidate_oid": "4444444444444444444444444444444444444444",
+      "merge_strategy": "squash",
+      "provider_flags": [
+        "delete_branch",
+        "require_checks"
+      ],
+      "action": "merge_base",
+      "policy_id": "human-base-merge",
+      "policy_version": 1,
+      "merge_plan_id": "plan-1",
+      "initiating_request_id": "request-1",
+      "result_commit_oid": "5555555555555555555555555555555555555555",
+      "result_tree_oid": "6666666666666666666666666666666666666666",
+      "audience": "cairn-runner:runner-1"
+    },
+    "canonicalBytesBase64": "Y2Fpcm4uYXBwcm92YWwuYmFzZV9tZXJnZS52MQAAAAAOaW5zdGFsbGF0aW9uLTEAAAAJcHJvamVjdC0xAAAADHJlcG9zaXRvcnktMQAAAA9yZWZzL2hlYWRzL21haW4AAAAoMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMQAAACgyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyAQAAACgzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzAQAAACg0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0AAAABnNxdWFzaAAAAAIAAAANZGVsZXRlX2JyYW5jaAAAAA5yZXF1aXJlX2NoZWNrcwAAAAptZXJnZV9iYXNlAAAAEGh1bWFuLWJhc2UtbWVyZ2UAAAABAAAABnBsYW4tMQAAAAlyZXF1ZXN0LTEBAAAAKDU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTUBAAAAKDY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjYAAAAVY2Fpcm4tcnVubmVyOnJ1bm5lci0x",
+    "canonicalBytesLength": 498,
+    "digestSha256": "2421b29da1f2789936a4d25809110576ad21c23cbe793ebc799178cd12ab7391"
+  },
+  "phoneAssertion": {
+    "approvalPublicKeySpkiBase64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjY2ElKoN6LerNcp7GxtO+BBwA/QI3YZGU6Nlmd1jRo2Z84YbOmAVVjDKCsFarfTuBkhulqcFKcJdFo7/EWY10g==",
+    "assertion": {
+      "challenge_id": "apr_fixture000000000000000000001",
+      "challenge_nonce": "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f",
+      "intent_digest_sha256": "2421b29da1f2789936a4d25809110576ad21c23cbe793ebc799178cd12ab7391",
+      "decision": "approve",
+      "approval_key_id": "cae_fixture00000000000000000001",
+      "ceremony_id": "ceremony-fixture-1",
+      "algorithm": "p256_ecdsa_sha256_digest",
+      "signature_format": "asn1_der",
+      "signature": "MEUCIGQRqXfXPVVSWU66pLJ1wkkhaecV9jqeyLHI5zPdu1MFAiEA25RoDgnlkk/+47hXUH9geCu8iabDve3s5gsMkKBSyB4="
+    },
+    "signingBytesBase64": "Y2Fpcm4uYXBwcm92YWwucGhvbmVfYXNzZXJ0aW9uLnYxAAAAACBhcHJfZml4dHVyZTAwMDAwMDAwMDAwMDAwMDAwMDAwMQAAAEA5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmOWY5ZjlmAAAAQDI0MjFiMjlkYTFmMjc4OTkzNmE0ZDI1ODA5MTEwNTc2YWQyMWMyM2NiZTc5M2ViYzc5OTE3OGNkMTJhYjczOTEAAAAHYXBwcm92ZQAAAB9jYWVfZml4dHVyZTAwMDAwMDAwMDAwMDAwMDAwMDAxAAAAEmNlcmVtb255LWZpeHR1cmUtMQAAABhwMjU2X2VjZHNhX3NoYTI1Nl9kaWdlc3QAAAAIYXNuMV9kZXJjYWlybi5hcHByb3ZhbC5iYXNlX21lcmdlLnYxAAAAAA5pbnN0YWxsYXRpb24tMQAAAAlwcm9qZWN0LTEAAAAMcmVwb3NpdG9yeS0xAAAAD3JlZnMvaGVhZHMvbWFpbgAAACgxMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExAAAAKDIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIBAAAAKDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMBAAAAKDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQAAAAGc3F1YXNoAAAAAgAAAA1kZWxldGVfYnJhbmNoAAAADnJlcXVpcmVfY2hlY2tzAAAACm1lcmdlX2Jhc2UAAAAQaHVtYW4tYmFzZS1tZXJnZQAAAAEAAAAGcGxhbi0xAAAACXJlcXVlc3QtMQEAAAAoNTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NQEAAAAoNjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NgAAABVjYWlybi1ydW5uZXI6cnVubmVyLTE=",
+    "signingBytesLength": 812,
+    "signingBytesSha256": "3020ce72736c30862ba11eef4dbc1db11dfade6c6e901b9df17712bb789f43ad"
+  },
+  "enrollmentBinding": {
+    "binding": {
+      "purpose": "enroll",
+      "attestation_challenge": "abababababababababababababababababababababababababababababababab",
+      "org_id": "org-fixture-1",
+      "user_id": "user-fixture-1",
+      "installation_id": "installation-1",
+      "app_instance_id": "app-instance-1",
+      "app_attest_key_id": "tzXgaCizdhdMxKV7K59lrK2lDSDQw3Av8/k8QDMSPU4=",
+      "app_attest_environment": "production",
+      "access_control_profile": "user_presence_private_key_usage",
+      "approval_public_key_spki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjY2ElKoN6LerNcp7GxtO+BBwA/QI3YZGU6Nlmd1jRo2Z84YbOmAVVjDKCsFarfTuBkhulqcFKcJdFo7/EWY10g==",
+      "retired_lineage_id": null
+    },
+    "canonicalBytesBase64": "Y2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9iaW5kaW5nLnYxAAAAAAZlbnJvbGwAAABAYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYgAAAA1vcmctZml4dHVyZS0xAAAADnVzZXItZml4dHVyZS0xAAAADmluc3RhbGxhdGlvbi0xAAAADmFwcC1pbnN0YW5jZS0xAAAALHR6WGdhQ2l6ZGhkTXhLVjdLNTlscksybERTRFF3M0F2OC9rOFFETVNQVTQ9AAAACnByb2R1Y3Rpb24AAAAfdXNlcl9wcmVzZW5jZV9wcml2YXRlX2tleV91c2FnZQAAAHxNRmt3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBEQVFjRFFnQUVqWTJFbEtvTjZMZXJOY3A3R3h0TytCQndBL1FJM1laR1U2TmxtZDFqUm8yWjg0WWJPbUFWVmpES0NzRmFyZlR1QmtodWxxY0ZLY0pkRm83L0VXWTEwZz09AA==",
+    "canonicalBytesSha256": "5179f78a0666d9cf050aad7e9364f2de3209a4982740c5610a4a4cf3ad23b3df",
+    "keyPossessionBytesBase64": "Y2Fpcm4uYXBwcm92YWwua2V5X3Bvc3Nlc3Npb24udjEAY2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9iaW5kaW5nLnYxAAAAAAZlbnJvbGwAAABAYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYgAAAA1vcmctZml4dHVyZS0xAAAADnVzZXItZml4dHVyZS0xAAAADmluc3RhbGxhdGlvbi0xAAAADmFwcC1pbnN0YW5jZS0xAAAALHR6WGdhQ2l6ZGhkTXhLVjdLNTlscksybERTRFF3M0F2OC9rOFFETVNQVTQ9AAAACnByb2R1Y3Rpb24AAAAfdXNlcl9wcmVzZW5jZV9wcml2YXRlX2tleV91c2FnZQAAAHxNRmt3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBEQVFjRFFnQUVqWTJFbEtvTjZMZXJOY3A3R3h0TytCQndBL1FJM1laR1U2TmxtZDFqUm8yWjg0WWJPbUFWVmpES0NzRmFyZlR1QmtodWxxY0ZLY0pkRm83L0VXWTEwZz09AA==",
+    "keyPossessionBytesSha256": "6d39f67eddf72df451a69d43aba8a450d9d1cc95ea8fa89df46d7d147cce9983",
+    "keyPossessionSignatureBase64": "MEQCICospvbrA+9fIE0KZM+ixA0wnPfz47ORAQ2mU0LmZOqWAiA5TfSH9VRCCVnnXXEc84Yl2nIhIeyVj1Oxti6axXzxuw==",
+    "successionBytesBase64": "Y2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9zdWNjZXNzaW9uLnYxAGNhaXJuLmFwcHJvdmFsLmVucm9sbG1lbnRfYmluZGluZy52MQAAAAAGZW5yb2xsAAAAQGFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIAAAANb3JnLWZpeHR1cmUtMQAAAA51c2VyLWZpeHR1cmUtMQAAAA5pbnN0YWxsYXRpb24tMQAAAA5hcHAtaW5zdGFuY2UtMQAAACx0elhnYUNpemRoZE14S1Y3SzU5bHJLMmxEU0RRdzNBdjgvazhRRE1TUFU0PQAAAApwcm9kdWN0aW9uAAAAH3VzZXJfcHJlc2VuY2VfcHJpdmF0ZV9rZXlfdXNhZ2UAAAB8TUZrd0V3WUhLb1pJemowQ0FRWUlLb1pJemowREFRY0RRZ0FFalkyRWxLb042TGVyTmNwN0d4dE8rQkJ3QS9RSTNZWkdVNk5sbWQxalJvMlo4NFliT21BVlZqREtDc0ZhcmZUdUJraHVscWNGS2NKZEZvNy9FV1kxMGc9PQA=",
+    "successionBytesSha256": "e532fa422be701012de0e7f6b7d59861931db6609916f27a952bddd946437e68",
+    "successionSignatureBase64": "MEUCIBucKmvxjt8uaJWsR79/xNPjFrU8cbdTgn+HKDqFLgRiAiEA+ZESIUm3rIJxIpooUJMVt+fKUYNi2SCs4k4XVOCvKHQ=",
+    "predecessorPublicKeySpkiBase64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEhDUqVSZFGBNgXb26ie7OwsHzVC4p1+HC+CaIz9MdNVKCwtvT7fSz4KPvUuSIXcTimDGxKjC/AVjnGjwq2K1hdw=="
+  },
+  "resetBinding": {
+    "binding": {
+      "purpose": "reset",
+      "attestation_challenge": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+      "org_id": "org-fixture-1",
+      "user_id": "user-fixture-1",
+      "installation_id": "installation-1",
+      "app_instance_id": "app-instance-1",
+      "app_attest_key_id": "tzXgaCizdhdMxKV7K59lrK2lDSDQw3Av8/k8QDMSPU4=",
+      "app_attest_environment": "production",
+      "access_control_profile": "user_presence_private_key_usage",
+      "approval_public_key_spki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjY2ElKoN6LerNcp7GxtO+BBwA/QI3YZGU6Nlmd1jRo2Z84YbOmAVVjDKCsFarfTuBkhulqcFKcJdFo7/EWY10g==",
+      "retired_lineage_id": "cal_fixture00000000000000000001"
+    },
+    "canonicalBytesBase64": "Y2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9iaW5kaW5nLnYxAAAAAAVyZXNldAAAAEBlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmZWZlZmVmAAAADW9yZy1maXh0dXJlLTEAAAAOdXNlci1maXh0dXJlLTEAAAAOaW5zdGFsbGF0aW9uLTEAAAAOYXBwLWluc3RhbmNlLTEAAAAsdHpYZ2FDaXpkaGRNeEtWN0s1OWxySzJsRFNEUXczQXY4L2s4UURNU1BVND0AAAAKcHJvZHVjdGlvbgAAAB91c2VyX3ByZXNlbmNlX3ByaXZhdGVfa2V5X3VzYWdlAAAAfE1Ga3dFd1lIS29aSXpqMENBUVlJS29aSXpqMERBUWNEUWdBRWpZMkVsS29ONkxlck5jcDdHeHRPK0JCd0EvUUkzWVpHVTZObG1kMWpSbzJaODRZYk9tQVZWakRLQ3NGYXJmVHVCa2h1bHFjRktjSmRGbzcvRVdZMTBnPT0BAAAAH2NhbF9maXh0dXJlMDAwMDAwMDAwMDAwMDAwMDAwMDE=",
+    "canonicalBytesSha256": "172559f1b8aaba3d74d23106998b03f78fbea52f57c6214e22d785bcb1a6d8a2"
+  },
+  "revocationBinding": {
+    "binding": {
+      "attestation_challenge": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "org_id": "org-fixture-1",
+      "user_id": "user-fixture-1",
+      "enrollment_id": "cae_fixture00000000000000000001",
+      "reason": "revoked"
+    },
+    "canonicalBytesBase64": "Y2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9yZXZvY2F0aW9uLnYxAAAAAEBjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkY2RjZGNkAAAADW9yZy1maXh0dXJlLTEAAAAOdXNlci1maXh0dXJlLTEAAAAfY2FlX2ZpeHR1cmUwMDAwMDAwMDAwMDAwMDAwMDAwMQAAAAdyZXZva2Vk",
+    "canonicalBytesSha256": "bca91004a1db9b2fe582518f898296a8b3a3eaa2666007a85c1e4b2eb0f5eb4e"
+  },
+  "p256Vectors": {
+    "messageBase64": "Y2Fpcm4uYXBwcm92YWwua2V5X3Bvc3Nlc3Npb24udjEAY2Fpcm4uYXBwcm92YWwuZW5yb2xsbWVudF9iaW5kaW5nLnYxAAAAAAZlbnJvbGwAAABAYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYgAAAA1vcmctZml4dHVyZS0xAAAADnVzZXItZml4dHVyZS0xAAAADmluc3RhbGxhdGlvbi0xAAAADmFwcC1pbnN0YW5jZS0xAAAALHR6WGdhQ2l6ZGhkTXhLVjdLNTlscksybERTRFF3M0F2OC9rOFFETVNQVTQ9AAAACnByb2R1Y3Rpb24AAAAfdXNlcl9wcmVzZW5jZV9wcml2YXRlX2tleV91c2FnZQAAAHxNRmt3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBEQVFjRFFnQUVqWTJFbEtvTjZMZXJOY3A3R3h0TytCQndBL1FJM1laR1U2TmxtZDFqUm8yWjg0WWJPbUFWVmpES0NzRmFyZlR1QmtodWxxY0ZLY0pkRm83L0VXWTEwZz09AA==",
+    "publicKeySpkiBase64": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEjY2ElKoN6LerNcp7GxtO+BBwA/QI3YZGU6Nlmd1jRo2Z84YbOmAVVjDKCsFarfTuBkhulqcFKcJdFo7/EWY10g==",
+    "vectors": [
+      {
+        "label": "canonical",
+        "signatureDerBase64": "MEQCICospvbrA+9fIE0KZM+ixA0wnPfz47ORAQ2mU0LmZOqWAiA5TfSH9VRCCVnnXXEc84Yl2nIhIeyVj1Oxti6axXzxuw==",
+        "r": "2a2ca6f6eb03ef5f204d0a64cfa2c40d309cf7f3e3b391010da65342e664ea96",
+        "s": "394df487f554420959e75d711cf38625da722121ec958f53b1b62e9ac57cf1bb",
+        "accepted": true,
+        "reason": "canonical DER over the key-possession bytes"
+      },
+      {
+        "label": "trailing_byte",
+        "signatureDerBase64": "MEQCICospvbrA+9fIE0KZM+ixA0wnPfz47ORAQ2mU0LmZOqWAiA5TfSH9VRCCVnnXXEc84Yl2nIhIeyVj1Oxti6axXzxuwA=",
+        "accepted": false,
+        "reason": "a byte after the SEQUENCE would let one signature have many encodings"
+      },
+      {
+        "label": "outer_length_mismatch",
+        "signatureDerBase64": "MEMCICospvbrA+9fIE0KZM+ixA0wnPfz47ORAQ2mU0LmZOqWAiA5TfSH9VRCCVnnXXEc84Yl2nIhIeyVj1Oxti6axXzxuw==",
+        "accepted": false,
+        "reason": "declared SEQUENCE length disagrees with the content"
+      },
+      {
+        "label": "non_minimal_r",
+        "signatureDerBase64": "MEUCIQAqLKb26wPvXyBNCmTPosQNMJz38+OzkQENplNC5mTqlgIgOU30h/VUQglZ511xHPOGJdpyISHslY9TsbYumsV88bs=",
+        "accepted": false,
+        "reason": "a redundant leading zero on r is a second encoding of one scalar"
+      },
+      {
+        "label": "zero_r",
+        "signatureDerBase64": "MAYCAQACAQE=",
+        "accepted": false,
+        "reason": "r = 0 is outside the P-256 scalar range"
+      },
+      {
+        "label": "s_equals_order",
+        "signatureDerBase64": "MCcCAQECIQD/////AAAAAP//////////vOb6racXnoTzucrC/GMlUQ==",
+        "accepted": false,
+        "reason": "s = n is outside the P-256 scalar range"
+      },
+      {
+        "label": "not_a_sequence",
+        "signatureDerBase64": "MUQCICospvbrA+9fIE0KZM+ixA0wnPfz47ORAQ2mU0LmZOqWAiA5TfSH9VRCCVnnXXEc84Yl2nIhIeyVj1Oxti6axXzxuw==",
+        "accepted": false,
+        "reason": "only a DER SEQUENCE is an ECDSA signature"
+      }
+    ]
+  }
+}

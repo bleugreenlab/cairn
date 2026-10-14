@@ -1,0 +1,29 @@
+[package]
+name = "cairn-attention"
+version.workspace = true
+edition = "2021"
+license = "BUSL-1.1"
+description = "Durable agent attention, wake subscriptions and delivery policy"
+
+[dependencies]
+async-trait = "0.1"
+cairn-common = { path = "../cairn-common" }
+cairn-db = { path = "../cairn-db" }
+cairn-models = { path = "../cairn-models" }
+cairn-platform = { path = "../cairn-platform" }
+chrono = "0.4"
+futures-util = "0.3"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+cairn-db = { path = "../cairn-db", features = ["test-utils"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+test-utils = ["cairn-db/test-utils"]

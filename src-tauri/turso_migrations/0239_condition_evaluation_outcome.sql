@@ -1,0 +1,28 @@
+-- What a condition evaluation did: routed to a port, or blocked and routed
+-- nowhere.
+--
+-- Shared across the private and team lineages: `condition_evaluations` is a
+-- project-scoped table both lineages carry, so the column is written once here
+-- and composed into both.
+--
+-- Until now a condition that failed under `onError: block` (or `useDefault`
+-- with no default port, or a broken config) wrote no row at all, so the run
+-- stalled silently with nothing to show or act on. A blocked evaluation is now
+-- a row whose `outcome` is `blocked` and whose `error_message` carries the
+-- reason verbatim.
+--
+-- `result_port` stays NOT NULL. Relaxing it would need a create-copy-swap
+-- rebuild, and synced replica tables must not be rebuilt (see TEAM_TAIL in
+-- migrations.rs). A non-routed row therefore stores `result_port = ''`. That
+-- empty string is a storage concession, never a port: readers map it to no
+-- port, and every query that routes on `result_port` filters
+-- `outcome = 'routed'` first.
+--
+-- Deliberately NOT CHECK-constrained, for the same reason as `issues.kind`
+-- (0138): Turso enforces column CHECK at runtime and ALTER TABLE cannot relax
+-- it, so each new outcome would cost a rebuild. The accepted set lives in Rust
+-- as `ConditionOutcome`.
+--
+-- The NOT NULL default is the backfill: every pre-existing row routed.
+
+ALTER TABLE condition_evaluations ADD COLUMN outcome TEXT NOT NULL DEFAULT 'routed';

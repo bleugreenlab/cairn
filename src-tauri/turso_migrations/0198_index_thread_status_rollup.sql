@@ -1,0 +1,25 @@
+-- Index the one join the per-thread activity rollup drives on, so the rebuild it
+-- still performs after CAIRN-4190's snapshot lands is bounded (CAIRN-4190).
+--
+-- The rollup asks one statement for every thread in a project and the live state
+-- of every job under it, so its outer shape is `threads LEFT JOIN jobs ON
+-- j.thread_id = t.id`. `jobs` had no index on `thread_id` at all, and
+-- EXPLAIN QUERY PLAN against the real schema showed Turso answering the join by
+-- building one for itself, per execution:
+--
+--   SEARCH t USING INDEX sqlite_autoindex_threads_3 (project_id=?)
+--   SEARCH j USING INDEX ephemeral_jobs_t2 (thread_id=?) LEFT-JOIN
+--
+-- An `ephemeral_` index is constructed and thrown away on every run, which is
+-- precisely the VDBE index-insert and B-tree balancing the production sample
+-- found this query burning cores on. Every other access path in the plan already
+-- seeks a real index (idx_turns_job_id, idx_prompts_turn_id,
+-- idx_permission_requests_status), so this one join is the whole gap.
+--
+-- The snapshot is the primary fix: an idle app now runs this statement zero
+-- times instead of continuously. This bounds the cost of the rebuilds that
+-- genuinely have to happen. `jobs::queries`'s
+-- thread_status_rows_use_indexed_access_paths asserts the resulting plan, since
+-- Turso keeps no table statistics and a plan is the only evidence an index is
+-- load-bearing rather than dead weight.
+CREATE INDEX IF NOT EXISTS idx_jobs_thread_id ON jobs(thread_id);

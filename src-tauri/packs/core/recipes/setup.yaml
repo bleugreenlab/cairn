@@ -1,0 +1,52 @@
+cairnVersion: 1
+bundles: [coding]
+name: Setup
+description: Configure Cairn for a new project
+trigger: manual
+system: true
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 240@30
+  config:
+    triggerType: manual
+    scope: issue
+- id: setup-1
+  type: agent
+  name: Setup
+  position: 240@210
+  config:
+    agent: cairn-setup
+- id: pr-1
+  type: pr
+  name: PR
+  position: 240@380
+  config:
+    actionParams: {}
+    inputSchema:
+      name: create-pr
+      schema:
+        properties:
+          body:
+            type: string
+          title:
+            type: string
+        required:
+        - title
+        - body
+        type: object
+      confirmPolicy: auto
+edges:
+- from: trigger-1@control-out
+  to: setup-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: setup-1@context-in
+  type: context
+- from: setup-1@context-out
+  to: pr-1@context-in
+  type: context
+- from: setup-1@control-out
+  to: pr-1@control-in
+  type: control

@@ -1,0 +1,18 @@
+-- Clear the derived session skyline cache so every row rebuilds in the compact
+-- bar shape. A cached bar used to embed the whole transcript event (content,
+-- thinking, tool input, tool result, raw), so bars_json grew with the size of a
+-- session's transcript rather than with its bar count: 1.7GB across 5,474 rows,
+-- single rows reaching 53MB for a session of 116 events, rewritten whole on
+-- every cache refresh and shipped whole on every read. A bar now persists only
+-- what the strip draws and clicks through to (event id, event type, tier, color,
+-- width, error flag, bounded preview).
+--
+-- The cache is keyed only by event/vibe watermarks, which do not change when the
+-- bar shape changes, so the fat rows would otherwise sit on completed sessions
+-- forever. It is purely derived and safe to drop:
+-- load_or_build_session_skyline_bars rebuilds transparently on read.
+--
+-- Deleting frees pages for reuse but does not shrink the database file. No
+-- VACUUM here: an in-place vacuum of a multi-gigabyte live database is long and
+-- locking, and reclaiming the file is a separate, deliberate offline operation.
+DELETE FROM session_skyline_cache;

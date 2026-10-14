@@ -1,0 +1,53 @@
+cairnVersion: 1
+bundles: [coding]
+name: Build
+description: Single stage quick build
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 240@90
+  config:
+    triggerType: manual
+    scope: issue
+- id: builder-1
+  type: agent
+  name: Builder
+  position: 240@260
+  config:
+    agent: build
+- id: pr-1
+  type: pr
+  name: PR
+  position: 240@420
+  config:
+    actionParams: {}
+    inputSchema:
+      name: create-pr
+      schema:
+        properties:
+          body:
+            description: PR description (markdown)
+            type: string
+          title:
+            description: PR title
+            type: string
+        required:
+        - title
+        - body
+        type: object
+      confirmPolicy: auto
+edges:
+- from: trigger-1@control-out
+  to: builder-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: builder-1@context-in
+  type: context
+- from: builder-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: builder-1@context-out
+  to: pr-1@context-in
+  type: context

@@ -1,0 +1,55 @@
+{
+  "type": "object",
+  "properties": {
+    "objective": {
+      "type": "string",
+      "description": "What this work accomplishes"
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Unique task identifier within this list (e.g. 'impl-auth')"
+          },
+          "title": {
+            "type": "string",
+            "description": "Short description for timeline display"
+          },
+          "agent": {
+            "type": "string",
+            "description": "Agent config ID to execute this task (e.g. 'build', 'explore')"
+          },
+          "prompt": {
+            "type": "string",
+            "description": "Detailed instructions for the agent"
+          },
+          "backend": {
+            "type": "string",
+            "description": "Optional backend selection for this task"
+          },
+          "dependencies": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Task IDs that must complete before this task can start"
+          },
+          "tier": {
+            "type": "string",
+            "description": "Optional capability tier override (e.g. 'sm', 'md', 'lg')"
+          }
+        },
+        "required": ["id", "title", "agent", "prompt"]
+      },
+      "description": "Tasks to execute with dependency ordering"
+    },
+    "requirements": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Key constraints and requirements"
+    }
+  },
+  "required": ["objective", "tasks"],
+  "additionalProperties": false
+}

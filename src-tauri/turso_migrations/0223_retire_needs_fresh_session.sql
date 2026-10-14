@@ -1,0 +1,25 @@
+-- Retire the flag that replaced a live conversation to deliver a prompt edit
+-- (CAIRN-4618).
+--
+-- `jobs.needs_fresh_session` was set by two writers and read by two readers, and
+-- both writers have been removed:
+--
+--   * an agent prompt edit set it so the next continuation would rotate to a
+--     fresh session "so the edited system prompt takes effect". Every backend
+--     reassembles the whole instruction stack on every process spawn, resume
+--     included -- Claude passes it as `--system-prompt-file` next to `--resume`,
+--     Codex puts it in `thread/resume`'s own `baseInstructions` -- so the edit
+--     already reached the running session on its next turn. The rotation
+--     delivered nothing and cost the conversation.
+--
+--   * watchdog recovery set it so a successor would start on a replacement
+--     provider session after the provider went silent. CAIRN-4603 established
+--     that silence is uncertainty rather than evidence a native thread is dead;
+--     the successor now resumes the same session, and a provider that truly
+--     cannot resolve it says so on the resume attempt, where the digest-reseed
+--     fallback rebuilds from the transcript with a visible notice.
+--
+-- Nothing reads it now, and leaving the column would leave a flag whose only
+-- possible future use is the behaviour just removed. Dropped in place so Turso
+-- sync triggers on `jobs` remain intact.
+ALTER TABLE jobs DROP COLUMN needs_fresh_session;

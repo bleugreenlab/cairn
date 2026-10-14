@@ -1,0 +1,2728 @@
+use crate::common;
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use cairn_core::internal::backends::replayed_anthropic_context_for_test;
+use cairn_core::internal::db::DbState;
+use cairn_core::internal::jj;
+use cairn_core::internal::mcp::handlers::read::handle_read_file;
+use cairn_core::internal::mcp::handlers::write::handle_write;
+use cairn_core::internal::mcp::handlers::write::replay::gate_settled_delivery;
+use cairn_core::internal::mcp::types::McpCallbackRequest;
+use cairn_core::internal::orchestrator::lifecycle;
+use cairn_core::internal::orchestrator::Orchestrator;
+use cairn_core::internal::services::{testing::TestServicesBuilder, RealGitClient};
+use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_core::memories::db as memory_db;
+use cairn_core::models::{
+    AgentSnapshot, ExecutionSnapshot, Fence, RecipeSnapshot, RecipeTrigger, TriggerContext,
+    TriggerType,
+};
+use cairn_db::turso::params;
+use serde_json::json;
+
+// The change/write path seals and discards through the jj VCS seam, so a
+// file-target test cwd must be a real `.jj` workspace over a shared store. These
+// tests resolve `jj` and self-skip with a note when it is unavailable, mirroring
+// `mcp::vcs`'s jj tests. Resource-only tests never touch the VCS and keep a
+// plain cwd.
+
+fn make_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
+    make_request_as_run(cwd, payload, None)
+}
+
+/// A previous implementation temporarily left every sealed file write pending,
+/// even though only minted writes carry a resumable post-seal continuation. If
+/// the process died in that window, redelivery took ownership and then rejected
+/// the ordinary report for lacking minted-branch state. Preserve compatibility
+/// with such durable rows by settling their already-sealed report as the replay.
+#[tokio::test]
+async fn an_orphaned_ordinary_pending_report_settles_without_a_second_commit() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("ordinary-replay.txt", "tail\n");
+
+    let payload = json!({
+        "changes": [{
+            "target": "file:ordinary-replay.txt",
+            "mode": "patch",
+            "payload": { "old_string": "tail", "new_string": "head\ntail" }
+        }],
+        "commit_msg": "land ordinary write"
+    });
+    let first = repo
+        .change_report_as_tool_use("toolu_ordinary_crash", payload.clone())
+        .await;
+    assert_successful_change(&first, 1);
+    let sealed_head = repo.branch_head();
+
+    // Model the durable state left by a crash of the pending implementation.
+    repo.orch
+        .db
+        .local
+        .execute(
+            "UPDATE write_replay_ledger
+             SET finalized = 0, owner_token = 'crashed-owner', claimed_at = 0
+             WHERE run_id = 'run-change' AND tool_use_id = 'toolu_ordinary_crash'",
+            (),
+        )
+        .await
+        .unwrap();
+
+    let replay = repo
+        .change_report_as_tool_use("toolu_ordinary_crash", payload)
+        .await;
+    assert_eq!(
+        replay["commit"]["sha"], first["commit"]["sha"],
+        "{replay:?}"
+    );
+    assert!(replay["replayed"].is_string(), "{replay:?}");
+    assert_eq!(
+        repo.branch_head(),
+        sealed_head,
+        "redelivery must not seal a second commit"
+    );
+    assert_eq!(repo.read("ordinary-replay.txt"), "head\ntail\n");
+
+    let finalized = repo
+        .orch
+        .db
+        .local
+        .query_one(
+            "SELECT finalized FROM write_replay_ledger
+             WHERE run_id = 'run-change' AND tool_use_id = 'toolu_ordinary_crash'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(finalized, 1, "redelivery must settle the orphaned row");
+}
+
+#[tokio::test]
+async fn failed_post_mint_patch_rolls_back_branch_identity_and_ref() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("thread-rollback.txt", "base\n");
+    repo.seal_base("seed thread rollback specimen");
+    repo.become_a_thread().await;
+
+    let failed = repo.change_report(json!({
+        "changes": [
+            { "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Must roll back", "pr": { "body": "Never opened." } } },
+            { "target": "file:thread-rollback.txt", "mode": "patch", "payload": { "old_string": "missing", "new_string": "changed" } }
+        ],
+        "commit_msg": "must not seal",
+        "atomic": true
+    })).await;
+
+    assert_eq!(failure_count(&failed), 1, "{failed:?}");
+    assert_eq!(
+        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'job-change'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT next_branch_number FROM threads WHERE id = ?1",
+            "issue-change"
+        )
+        .await,
+        1
+    );
+    let jj = jj::environment_with_binary(&repo.jj_bin, repo.config.path());
+    assert_eq!(
+        jj::bookmark_commit(&jj, repo.dir.path(), "agent/change-thread/1"),
+        None
+    );
+    assert_eq!(repo.read("thread-rollback.txt"), "base\n");
+}
+
+#[tokio::test]
+async fn failed_mint_bookmark_creation_rolls_back_only_its_database_allocation() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("thread-bookmark-collision.txt", "base\n");
+    repo.seal_base("seed bookmark collision specimen");
+    repo.become_a_thread().await;
+
+    let jj = jj::environment_with_binary(&repo.jj_bin, repo.config.path());
+    let original_head = repo.branch_head();
+    jj::create_bookmark_at(
+        &jj,
+        repo.dir.path(),
+        "agent/change-thread/1",
+        &original_head,
+    )
+    .unwrap();
+
+    let failed = repo.change_report(json!({
+        "changes": [
+            { "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Collides", "pr": { "body": "Never opened." } } },
+            { "target": "file:thread-bookmark-collision.txt", "mode": "patch", "payload": { "old_string": "base", "new_string": "changed" } }
+        ],
+        "commit_msg": "must not replace existing bookmark",
+        "atomic": true
+    })).await;
+
+    assert_eq!(failure_count(&failed), 1, "{failed:?}");
+    assert_eq!(
+        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'job-change'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT next_branch_number FROM threads WHERE id = ?1",
+            "issue-change"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        jj::bookmark_commit(&jj, repo.dir.path(), "agent/change-thread/1"),
+        Some(original_head),
+        "a failed mint must not delete the bookmark it collided with"
+    );
+    assert_eq!(repo.read("thread-bookmark-collision.txt"), "base\n");
+}
+
+#[tokio::test]
+async fn invalid_utf8_snapshot_after_mint_rolls_back_branch_identity_and_ref() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    std::fs::write(repo.path("invalid-utf8.bin"), [0xff, 0xfe]).unwrap();
+    repo.seal_base("seed invalid UTF-8 specimen");
+    repo.become_a_thread().await;
+
+    let failed = repo.change_report(json!({
+        "changes": [
+            { "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Must roll back", "pr": { "body": "Never opened." } } },
+            { "target": "file:invalid-utf8.bin", "mode": "patch", "payload": { "old_string": "anything", "new_string": "changed" } }
+        ],
+        "commit_msg": "must not seal invalid UTF-8",
+        "atomic": true
+    })).await;
+
+    assert_eq!(failure_count(&failed), 1, "{failed:?}");
+    assert!(failed.to_string().contains("not valid UTF-8"), "{failed:?}");
+    assert_eq!(
+        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM jobs WHERE parent_job_id = 'job-change'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT next_branch_number FROM threads WHERE id = ?1",
+            "issue-change"
+        )
+        .await,
+        1
+    );
+    let jj = jj::environment_with_binary(&repo.jj_bin, repo.config.path());
+    assert_eq!(
+        jj::bookmark_commit(&jj, repo.dir.path(), "agent/change-thread/1"),
+        None
+    );
+    assert_eq!(
+        std::fs::read(repo.path("invalid-utf8.bin")).unwrap(),
+        [0xff, 0xfe]
+    );
+}
+
+#[tokio::test]
+async fn thread_branch_preview_and_invalid_batch_shapes_have_no_mint_side_effects() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("thread-preview.txt", "base\n");
+    repo.seal_base("seed thread preview specimen");
+    repo.become_a_thread().await;
+
+    let mint = || json!({ "target": "cairn:~/branches", "mode": "append", "payload": { "title": "Preview branch", "pr": { "body": "No side effects." } } });
+    let file = || json!({ "target": "file:thread-preview.txt", "mode": "patch", "payload": { "old_string": "base", "new_string": "changed" } });
+
+    let preview = repo.change_report(json!({ "changes": [mint(), file()], "commit_msg": "preview thread branch", "preview": true })).await;
+    assert_eq!(preview["branch"]["number"], 1, "{preview:?}");
+    assert_eq!(preview["branch"]["stage"], "pr-open", "{preview:?}");
+
+    for invalid in [
+        json!({ "changes": [mint(), mint(), file()], "commit_msg": "two mints" }),
+        json!({ "changes": [mint(), file()], "branch": "agent/change-thread/99", "commit_msg": "mint plus destination" }),
+    ] {
+        let refusal = repo.change_raw(invalid).await;
+        assert!(
+            refusal.contains("Refusing") || refusal.contains("refus"),
+            "{refusal}"
+        );
+    }
+
+    assert_eq!(
+        count_rows(&repo.orch.db.local, "SELECT COUNT(*) FROM thread_branches").await,
+        0
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT next_branch_number FROM threads WHERE id = ?1",
+            "issue-change"
+        )
+        .await,
+        1
+    );
+    assert_eq!(repo.read("thread-preview.txt"), "base\n");
+}
+
+#[tokio::test]
+async fn a_thread_mints_a_pr_branch_and_follow_up_writes_stack_on_it() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("thread-branch.txt", "base\n");
+    repo.seal_base("seed thread branch specimen");
+    repo.become_a_thread().await;
+
+    // A repository without a remote exercises the canonical local-PR path. The
+    // PR row and create-pr artifact are still real; only GitHub publication is
+    // intentionally absent from this integration fixture.
+    let output = std::process::Command::new("git")
+        .args(["remote", "remove", "origin"])
+        .current_dir(repo.project.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "remote removal failed: {output:?}");
+
+    let minted = repo
+        .change_report(json!({
+            "changes": [
+                {
+                    "target": "cairn:~/branches",
+                    "mode": "append",
+                    "payload": {
+                        "title": "Thread branch integration",
+                        "pr": { "body": "Exercises the bottom rung." }
+                    }
+                },
+                {
+                    "target": "file:thread-branch.txt",
+                    "mode": "patch",
+                    "payload": { "old_string": "base", "new_string": "minted" }
+                }
+            ],
+            "commit_msg": "mint thread branch"
+        }))
+        .await;
+
+    assert_successful_change(&minted, 2);
+    assert_eq!(minted["branch"]["stage"], "pr-open", "{minted:?}");
+    assert_eq!(minted["branch"]["pr_url"], "local://agent/change-thread/1");
+    let branch_uri = minted["branch"]["uri"].as_str().unwrap();
+    let branch_ref = minted["branch"]["git_ref"].as_str().unwrap();
+    assert_eq!(branch_uri, "cairn://p/chg/change-thread/branches/1");
+    assert_eq!(repo.read_at(branch_ref, "thread-branch.txt"), "minted\n");
+    assert_eq!(
+        common::scalar_text_by_id(
+            &repo.orch.db.local,
+            "SELECT stage FROM thread_branches WHERE job_id = ?1",
+            common::scalar_text_by_id(
+                &repo.orch.db.local,
+                "SELECT job_id FROM thread_branches WHERE thread_id = ?1",
+                "issue-change"
+            )
+            .await
+            .as_deref()
+            .unwrap()
+        )
+        .await
+        .as_deref(),
+        Some("pr-open")
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM artifacts a JOIN thread_branches tb ON tb.job_id = a.job_id WHERE tb.thread_id = ?1 AND a.output_name = 'create-pr'",
+            "issue-change",
+        )
+        .await,
+        1
+    );
+
+    let stacked = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:thread-branch.txt",
+                "mode": "patch",
+                "payload": { "old_string": "minted", "new_string": "stacked" }
+            }],
+            "branch": branch_uri,
+            "commit_msg": "stack on thread branch"
+        }))
+        .await;
+
+    assert_successful_change(&stacked, 1);
+    assert_eq!(repo.read_at(branch_ref, "thread-branch.txt"), "stacked\n");
+}
+
+fn resumed_model_context(repo: &ChangeTestRepo) -> String {
+    replayed_anthropic_context_for_test(
+        &repo.orch,
+        "session-change",
+        "resumed-run",
+        &repo.project_id,
+        "CHG",
+    )
+    .expect("resumed provider context must reconstruct")
+    .to_string()
+}
+
+async fn record_write_call(db: &LocalDb, tool_use_id: &str, payload: &serde_json::Value) {
+    let data = json!({
+        "eventType": "assistant",
+        "sessionId": "session-change",
+        "toolUses": [{"id": tool_use_id, "name": "mcp__cairn__write", "input": payload}],
+        "isError": false
+    })
+    .to_string();
+    db.execute(
+        "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at, turn_id)
+         VALUES (?1, 'run-change', 'session-change', 1, 1, 'assistant', ?2, 1, 'turn-change')",
+        params![format!("event-{tool_use_id}"), data],
+    ).await.unwrap();
+}
+
+async fn stopped_result(db: &LocalDb, tool_use_id: &str) -> String {
+    db.query_one(
+        "SELECT data FROM events WHERE run_id = 'run-change' AND event_type = 'tool_result'
+         AND json_extract(data, '$.toolUseId') = ?1",
+        params![tool_use_id],
+        |row| row.text(0),
+    )
+    .await
+    .expect("stop must reconcile the settled delivery")
+}
+
+#[tokio::test]
+async fn change_create_refuses_existing_tracked_file_without_mutation_or_commit() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("existing.txt", "original tracked bytes\n");
+    repo.seal_base("track existing file");
+    let head_before = repo.branch_head();
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:existing.txt",
+                "mode": "create",
+                "payload": { "content": "destructive overwrite\n" }
+            }],
+            "commit_msg": "must not commit"
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert!(report["applied"].as_array().is_some_and(Vec::is_empty));
+    assert!(report.get("commit").is_none(), "{report:?}");
+    let error = report["failures"][0]["error"].as_str().unwrap();
+    assert!(error.contains("target already exists"), "{error}");
+    assert!(error.contains("mode=patch"), "{error}");
+    assert!(error.contains("mode=replace"), "{error}");
+    assert_eq!(repo.read("existing.txt"), "original tracked bytes\n");
+    assert_eq!(repo.branch_head(), head_before);
+}
+
+#[tokio::test]
+async fn change_create_refuses_existing_logical_target_atomically() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("logical.txt", "original logical bytes\n");
+    let head_before = repo.branch_head();
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                {
+                    "target": "file:logical.txt",
+                    "mode": "create",
+                    "payload": { "content": "overwrite\n" }
+                },
+                {
+                    "target": "file:must-not-exist.txt",
+                    "mode": "create",
+                    "payload": { "content": "sibling\n" }
+                }
+            ],
+            "commit_msg": "must refuse whole file batch",
+            "atomic": true
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert!(report["applied"].as_array().is_some_and(Vec::is_empty));
+    assert_eq!(repo.read("logical.txt"), "original logical bytes\n");
+    assert!(!repo.logical_exists("must-not-exist.txt"));
+    assert_eq!(repo.branch_head(), head_before);
+}
+
+#[tokio::test]
+async fn change_create_adds_absent_target_and_replace_overwrites_deliberately() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let created = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:intent.txt",
+                "mode": "create",
+                "payload": { "content": "created\n" }
+            }],
+            "commit_msg": "create absent target"
+        }))
+        .await;
+    assert_successful_change(&created, 1);
+    assert_eq!(created["applied"][0]["summary"], "+file:intent.txt");
+    assert_eq!(repo.read("intent.txt"), "created\n");
+
+    let replaced = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:intent.txt",
+                "mode": "replace",
+                "payload": { "content": "replaced\n" }
+            }],
+            "commit_msg": "replace existing target"
+        }))
+        .await;
+    assert_successful_change(&replaced, 1);
+    assert_eq!(replaced["applied"][0]["summary"], "~file:intent.txt");
+    assert_eq!(repo.read("intent.txt"), "replaced\n");
+}
+
+fn make_request_as_run(
+    cwd: &str,
+    payload: serde_json::Value,
+    run_id: Option<&str>,
+) -> McpCallbackRequest {
+    McpCallbackRequest {
+        thread_id: None,
+        cwd: cwd.to_string(),
+        run_id: run_id.map(str::to_string),
+        tool: "write".to_string(),
+        payload,
+        tool_use_id: None,
+    }
+}
+
+#[tokio::test]
+async fn logical_write_is_immediately_visible_to_ordinary_read_without_checkout_update() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("coherent.txt", "before\n");
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:coherent.txt",
+                "mode": "patch",
+                "payload": { "old_string": "before", "new_string": "after" }
+            }],
+            "commit_msg": "advance logical head"
+        }))
+        .await;
+    assert_successful_change(&report, 1);
+
+    assert_eq!(
+        std::fs::read_to_string(repo.path("coherent.txt")).unwrap(),
+        "before\n",
+        "the retained checkout intentionally stays behind"
+    );
+    let read = handle_read_file(
+        &repo.orch,
+        &make_read_request(repo.cwd(), "file:coherent.txt"),
+    )
+    .await;
+    assert!(read.contains("after"), "{read}");
+    assert!(!read.contains("before"), "{read}");
+}
+
+fn make_read_request(cwd: &str, path: &str) -> McpCallbackRequest {
+    McpCallbackRequest {
+        thread_id: None,
+        cwd: cwd.to_string(),
+        run_id: Some("run-change".to_string()),
+        tool: "read".to_string(),
+        payload: json!({ "path": path }),
+        tool_use_id: None,
+    }
+}
+
+async fn insert_preview_event(db: &LocalDb, input: serde_json::Value) {
+    let project_id = common::create_project(db, "preview").await;
+    db.write(|conn| {
+        let project_id = project_id.clone();
+        let data = json!({
+            "toolUses": [{
+                "id": "toolu-preview",
+                "name": "mcp__cairn__change",
+                "input": input,
+            }]
+        })
+        .to_string();
+        Box::pin(async move {
+            conn.execute(
+                "INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+                 VALUES ('job-preview', ?1, 'running', 'session-preview', 1, 1)",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('session-preview', 'job-preview', 'active', 1, 1)",
+                (),
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO runs(id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+                 VALUES ('run-preview', ?1, 'job-preview', 'live', 'session-preview', 1, 1, 'resume')",
+                params![project_id.as_str()],
+            )
+            .await?;
+            conn.execute(
+                "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+                 VALUES ('event-preview', 'run-preview', 'session-preview', 1, 1, 'assistant', ?1, 1)",
+                params![data.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn count_rows(db: &LocalDb, sql: &'static str) -> i64 {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn.query(sql, ()).await?;
+            let row = rows.next().await?.expect("missing count row");
+            row.i64(0)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+fn init_git_repo(path: &std::path::Path) {
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test User"],
+        vec!["commit", "--allow-empty", "-m", "initial"],
+    ] {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git setup failed: {output:?}");
+    }
+}
+
+async fn seed_change_run(
+    db: &LocalDb,
+    project_id: &str,
+    _worktree: &Path,
+    branch: &str,
+    base_commit: &str,
+) {
+    let mut agents = HashMap::new();
+    agents.insert(
+        "agent-1".to_string(),
+        AgentSnapshot {
+            edited_at: None,
+            id: "agent-1".to_string(),
+            name: "Builder".to_string(),
+            description: String::new(),
+            prompt: String::new(),
+            tools: Vec::new(),
+            tier: None,
+            backend_preference: None,
+            selection: None,
+            model: None,
+            disallowed_tools: None,
+            skills: None,
+            fence: Some(Fence::default()),
+            sandbox: None,
+            on_escape: None,
+            resolved_backend: None,
+            extras: None,
+            seed_budget_tokens: None,
+            seed_eras: None,
+        },
+    );
+    let snapshot = ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "recipe-1".to_string(),
+            name: "Change test".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        },
+        agents,
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some("issue-change".to_string()),
+            project_id: project_id.to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap();
+    db.write(|conn| {
+        let project_id = project_id.to_string();
+        let branch = branch.to_string();
+        let base_commit = base_commit.to_string();
+        let snapshot = snapshot.clone();
+        Box::pin(async move {
+            conn.execute("INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at) VALUES ('issue-change', ?1, 1, 'Change', 'active', 1, 1)", params![project_id.as_str()]).await?;
+            conn.execute("INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot, triggered_by) VALUES ('exec-change', 'recipe-1', 'issue-change', ?1, 'running', 1, 1, ?2, 'manual')", params![project_id.as_str(), snapshot.as_str()]).await?;
+            conn.execute("INSERT INTO jobs(id, execution_id, agent_config_id, issue_id, project_id, node_name, status, uri_segment, branch, base_commit, created_at, updated_at) VALUES ('job-change', 'exec-change', 'agent-1', 'issue-change', ?1, 'builder', 'running', 'builder', ?2, ?3, 1, 1)", params![project_id.as_str(), branch.as_str(), base_commit.as_str()]).await?;
+            conn.execute("INSERT INTO sessions(id, job_id, status, created_at, updated_at) VALUES ('session-change', 'job-change', 'active', 1, 1)", ()).await?;
+            conn.execute("INSERT INTO runs(id, project_id, issue_id, job_id, status, session_id, created_at, updated_at, start_mode) VALUES ('run-change', ?1, 'issue-change', 'job-change', 'live', 'session-change', 1, 1, 'resume')", params![project_id.as_str()]).await?;
+            conn.execute("INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at) VALUES ('turn-change', 'session-change', 'run-change', 'job-change', 1, 'running', 1, 1)", ()).await?;
+            conn.execute("UPDATE jobs SET current_session_id = 'session-change', current_turn_id = 'turn-change' WHERE id = 'job-change'", ()).await?;
+            Ok(())
+        })
+    }).await.unwrap();
+}
+
+fn make_preview_request(cwd: &str, payload: serde_json::Value) -> McpCallbackRequest {
+    McpCallbackRequest {
+        thread_id: None,
+        cwd: cwd.to_string(),
+        run_id: Some("run-preview".to_string()),
+        tool: "write".to_string(),
+        payload,
+        tool_use_id: Some("toolu-preview".to_string()),
+    }
+}
+
+fn parse_report(result: &str) -> serde_json::Value {
+    serde_json::from_str(result)
+        .unwrap_or_else(|_| panic!("Expected JSON ChangeReport, got: {}", result))
+}
+
+fn failure_count(report: &serde_json::Value) -> usize {
+    report["failures"].as_array().map(Vec::len).unwrap_or(0)
+}
+
+fn assert_successful_change(report: &serde_json::Value, applied_count: usize) {
+    assert_eq!(failure_count(report), 0, "{report:?}");
+    assert_eq!(
+        report["applied"].as_array().unwrap().len(),
+        applied_count,
+        "{report:?}"
+    );
+}
+
+struct ChangeTestRepo {
+    dir: tempfile::TempDir,
+    project: tempfile::TempDir,
+    _origin: tempfile::TempDir,
+    config: tempfile::TempDir,
+    jj_bin: String,
+    orch: Orchestrator,
+    project_id: String,
+}
+
+impl ChangeTestRepo {
+    /// Provision a jj-workspace-backed change test, or `None` to self-skip when
+    /// jj is unavailable. The cwd (`dir`) is a real `.jj` workspace over a shared
+    /// store backed by a throwaway project git repo.
+    async fn try_new() -> Option<Self> {
+        let jj_bin = common::jj_bin()?;
+        let dir = tempfile::tempdir().unwrap();
+        let project = tempfile::Builder::new()
+            .prefix("cairn-change-project-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        init_git_repo(project.path());
+        let origin = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "--bare"])
+            .current_dir(origin.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bare origin setup failed: {output:?}"
+        );
+        let output = std::process::Command::new("git")
+            .args(["remote", "add", "origin", origin.path().to_str().unwrap()])
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "origin setup failed: {output:?}");
+        let config = tempfile::tempdir().unwrap();
+        let orch = orchestrator_with_config(config.path()).await;
+        let branch = "agent/CHG-1-builder-0";
+        common::provision_jj_workspace(config.path(), project.path(), dir.path(), branch);
+        let project_id =
+            common::insert_project_with_repo(&orch.db.local, "chg", project.path()).await;
+        let base_commit = common::head_sha(project.path());
+        seed_change_run(
+            &orch.db.local,
+            &project_id,
+            dir.path(),
+            branch,
+            &base_commit,
+        )
+        .await;
+        Some(Self {
+            dir,
+            project,
+            _origin: origin,
+            config,
+            jj_bin,
+            orch,
+            project_id,
+        })
+    }
+
+    /// Put an open, remote pull request on this branch, which is what makes
+    /// publication to origin mandatory rather than deferred.
+    async fn open_remote_pr_on_branch(&self) {
+        self.orch
+            .db
+            .local
+            .execute(
+                "INSERT INTO merge_requests
+                 (id, job_id, project_id, title, source_branch, target_branch, status, is_local, opened_at, updated_at, github_pr_number)
+                 VALUES ('mr-chg', 'job-chg', ?1, 'PR', 'agent/CHG-1-builder-0', 'main', 'open', 0, 1, 1, 4242)",
+                cairn_db::turso::params![self.project_id.clone()],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Point `origin` at nothing, so the required push fails while the commit
+    /// itself still lands. The remote stays *configured*, so this is a genuine
+    /// publication failure rather than the benign no-remote case.
+    fn break_origin(&self) {
+        let output = std::process::Command::new("git")
+            .args(["remote", "set-url", "origin", "/nonexistent/origin.git"])
+            .current_dir(self.project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "breaking origin failed: {output:?}"
+        );
+    }
+
+    /// Seal the current working copy into a base commit, so a later delete or
+    /// edit operates against committed content rather than un-sealed `@` dirt.
+    fn seal_base(&self, msg: &str) {
+        let jj = jj::environment_with_binary(&self.jj_bin, self.config.path());
+        jj::seal(&jj, self.dir.path(), msg, None).unwrap();
+        let output = std::process::Command::new(&self.jj_bin)
+            .args(["bookmark", "set", "agent/CHG-1-builder-0", "-r", "@"])
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "bookmark advance failed: {output:?}"
+        );
+    }
+
+    fn cwd(&self) -> &str {
+        self.dir.path().to_str().unwrap()
+    }
+
+    fn path(&self, path: &str) -> std::path::PathBuf {
+        self.dir.path().join(path)
+    }
+
+    fn write(&self, path: &str, content: &str) {
+        let path = self.path(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+        let output = std::process::Command::new(&self.jj_bin)
+            .args(["bookmark", "set", "agent/CHG-1-builder-0", "-r", "@"])
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "fixture snapshot failed: {output:?}"
+        );
+    }
+
+    fn read(&self, path: &str) -> String {
+        self.read_at("agent/CHG-1-builder-0", path)
+    }
+
+    fn read_at(&self, rev: &str, path: &str) -> String {
+        let output = std::process::Command::new(&self.jj_bin)
+            .args(["file", "show", "-r", rev, path])
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "jj file show failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn logical_exists(&self, path: &str) -> bool {
+        std::process::Command::new(&self.jj_bin)
+            .args(["file", "show", "-r", "agent/CHG-1-builder-0", path])
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    }
+
+    fn branch_head(&self) -> String {
+        let output = std::process::Command::new(&self.jj_bin)
+            .args([
+                "log",
+                "-r",
+                "agent/CHG-1-builder-0",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ])
+            .current_dir(self.dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "jj log failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    async fn change_report(&self, payload: serde_json::Value) -> serde_json::Value {
+        let mut request = make_request(self.cwd(), payload);
+        request.run_id = Some("run-change".to_string());
+        parse_report(&handle_write(&self.orch, &request).await)
+    }
+
+    /// Drive `handle_write` carrying an explicit `tool_use_id`, the correlation
+    /// key a replayed delivery of the same tool call arrives under.
+    async fn change_report_as_tool_use(
+        &self,
+        tool_use_id: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut request = make_request(self.cwd(), payload);
+        request.run_id = Some("run-change".to_string());
+        request.tool_use_id = Some(tool_use_id.to_string());
+        parse_report(&handle_write(&self.orch, &request).await)
+    }
+
+    async fn preview_report(&self, payload: serde_json::Value) -> serde_json::Value {
+        parse_report(&handle_write(&self.orch, &make_preview_request(self.cwd(), payload)).await)
+    }
+
+    /// `handle_write`'s raw answer. A refusal taken before any mutation applies
+    /// is prose, not a change report, so it cannot go through `change_report`.
+    async fn change_raw(&self, payload: serde_json::Value) -> String {
+        let mut request = make_request(self.cwd(), payload);
+        request.run_id = Some("run-change".to_string());
+        handle_write(&self.orch, &request).await
+    }
+
+    /// Turn this fixture's issue into a thread, changing nothing else, and
+    /// return the thread's id. The kind is then the only difference between the
+    /// two directions asserted below.
+    ///
+    /// `execute_script`, not `execute`: this is several statements and `execute`
+    /// runs only the first. Re-pointing the job at the thread is the statement
+    /// that makes it thread-owned, so losing it left an ordinary issue-owned job
+    /// the fence then correctly declined to refuse (CAIRN-3874).
+    ///
+    /// The run is detached from the issue before the issue is deleted, because
+    /// `runs.issue_id` cascades — and because that IS a thread session's shape:
+    /// a job and a run, with no issue anywhere in the chain.
+    async fn become_a_thread(&self) -> String {
+        self.orch
+            .db
+            .local
+            .execute_script(
+                "INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) SELECT id,project_id,'change-thread','active','none',created_at,updated_at FROM issues WHERE id='issue-change'; UPDATE jobs SET thread_id='issue-change',issue_id=NULL,node_name='Thread',uri_segment='thread' WHERE issue_id='issue-change'; UPDATE runs SET issue_id=NULL WHERE issue_id='issue-change'; UPDATE executions SET issue_id=NULL,seq=NULL,recipe_id='host-thread-session-job' WHERE id='exec-change'; DELETE FROM issues WHERE id='issue-change'",
+            )
+            .await
+            .unwrap();
+        "issue-change".to_string()
+    }
+}
+
+/// The tracked-writes half of the thread posture, at the `write` door.
+///
+/// A thread owns no branch, so its job runs ON the base branch and a commit from
+/// it publishes to the project's default branch with no pull request and no
+/// review surface. Both directions run the same batch against the same fixture,
+/// so the issue's kind is the only variable: an ordinary issue commits and the
+/// content is really on the branch, and the thread is refused before anything
+/// applies — the branch still holds exactly what the ordinary commit left there.
+#[tokio::test]
+async fn a_thread_cannot_commit_a_tracked_file_and_an_ordinary_issue_still_can() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("posture.txt", "before\n");
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:posture.txt",
+                "mode": "patch",
+                "payload": { "old_string": "before", "new_string": "after" }
+            }],
+            "commit_msg": "an ordinary issue lands its work"
+        }))
+        .await;
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("posture.txt"),
+        "after\n",
+        "an ordinary issue's commit must reach the branch unchanged: {report:?}"
+    );
+
+    let thread_id = repo.become_a_thread().await;
+    // The conversion is the whole experiment, so it is asserted rather than
+    // assumed: a fixture that inserts a thread row but leaves the job
+    // issue-owned tests nothing, and every assertion below would pass for the
+    // wrong reason.
+    assert_eq!(
+        common::scalar_text_by_id(
+            &repo.orch.db.local,
+            "SELECT thread_id FROM jobs WHERE id = ?1",
+            "job-change"
+        )
+        .await
+        .as_deref(),
+        Some(thread_id.as_str()),
+        "the job under test must actually belong to the thread"
+    );
+
+    let refusal = repo
+        .change_raw(json!({
+            "changes": [{
+                "target": "file:posture.txt",
+                "mode": "patch",
+                "payload": { "old_string": "after", "new_string": "from a thread" }
+            }],
+            "commit_msg": "should never land"
+        }))
+        .await;
+
+    assert!(
+        refusal.contains("thread-owned job")
+            && refusal.contains("cairn:~/branches")
+            && refusal.contains("write branch:"),
+        "the thread must be told the posture and where the work belongs: {refusal}"
+    );
+    assert_eq!(
+        repo.read("posture.txt"),
+        "after\n",
+        "the refusal must be taken before the mutation applies: {refusal}"
+    );
+}
+
+/// The refusal is keyed on the `commit_msg`, which is the whole surface a
+/// tracked write needs — so a thread keeps every resource mutation it depends on
+/// to do its actual job (arc, children, messages, todos). A guard that fired on
+/// authorship rather than on the commit field would silence the thread.
+#[tokio::test]
+async fn a_thread_still_writes_resources() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.become_a_thread().await;
+
+    // Project messages, not the converted issue's: a first-class thread has no
+    // backing issue, so `cairn://p/chg/1/messages` names a row the conversion
+    // deletes. The target has to be one a thread session genuinely still writes,
+    // or the batch fails on a missing resource and says nothing about the guard.
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "cairn://p/chg/messages",
+                "mode": "append",
+                "payload": { "content": "a thread speaking on its project" }
+            }]
+        }))
+        .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND content = 'a thread speaking on its project'"
+        )
+        .await,
+        1,
+        "the mutation must reach the database, not just the report: {report:?}"
+    );
+}
+
+/// The incident shape: a patch that inserts a block *before* an anchor and
+/// re-emits the anchor verbatim inside `new_string`. Such a patch is not
+/// idempotent — after it applies its `old_string` is still present, so a second
+/// delivery matches again, inserts a second copy, and reports success.
+fn anchor_preserving_insertion(commit_msg: &str) -> serde_json::Value {
+    json!({
+        "changes": [{
+            "target": "file:contracts.rs",
+            "mode": "patch",
+            "payload": {
+                "old_string": "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {",
+                "new_string": "pub const PROJECT_IMAGES_CONTRACT: Contract = Contract {\n    name: \"images\",\n};\n\npub const PROJECT_IMAGE_CONTRACT: Contract = Contract {"
+            }
+        }],
+        "commit_msg": commit_msg
+    })
+}
+
+fn seed_bad_good_files(repo: &ChangeTestRepo) {
+    repo.write("bad.rs", "old bad\n");
+    repo.write("good.rs", "old good\n");
+}
+
+fn bad_good_patch_payload(commit_msg: &str, atomic: bool) -> serde_json::Value {
+    let mut payload = json!({
+        "changes": [
+            { "target": "file:bad.rs", "mode": "patch", "payload": { "old_string": "missing", "new_string": "new bad" } },
+            { "target": "file:good.rs", "mode": "patch", "payload": { "old_string": "old good", "new_string": "new good" } }
+        ],
+        "commit_msg": commit_msg
+    });
+    if atomic {
+        payload["atomic"] = json!(true);
+    }
+    payload
+}
+
+async fn test_file_change_orchestrator() -> Orchestrator {
+    let temp = tempfile::tempdir().unwrap();
+    orchestrator_with_config(&temp.keep()).await
+}
+
+async fn orchestrator_with_config(config_dir: &Path) -> Orchestrator {
+    let (_db_temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    let search_index = Arc::new(SearchIndex::open_or_create(config_dir.join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db, search_index));
+    let services = Arc::new(TestServicesBuilder::new().with_git(RealGitClient).build());
+    Orchestrator::builder(db_state, services, config_dir.to_path_buf()).build()
+}
+
+async fn insert_issue(db: &LocalDb, project_id: &str, number: i64, title: &str) -> String {
+    let id = uuid::Uuid::new_v4().to_string();
+    let project_id = project_id.to_string();
+    let title = title.to_string();
+    db.execute(
+        "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'active', 1, 1)",
+        params![id.as_str(), project_id.as_str(), number, title.as_str()],
+    )
+    .await
+    .unwrap();
+    id
+}
+
+#[tokio::test]
+async fn change_unified_patch_adds_file_with_codex_envelope() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Add File: src/new.rs\n+pub fn new() {}\n*** End Patch\n" }
+            }],
+            "commit_msg": "add file"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        report["applied"][0]["mode"].as_str().unwrap(),
+        "unified_patch"
+    );
+    assert_eq!(repo.read("src/new.rs"), "pub fn new() {}");
+}
+
+/// A file body carrying a real conflict, as an agent mid-resolution would send
+/// it if it forgot to finish.
+const MARKER_BODY: &str =
+    "fn main() {\n<<<<<<< HEAD\n    ours();\n=======\n    theirs();\n>>>>>>> main\n}\n";
+
+/// The durable boundary CAIRN-3197 now guards at the ordinary write carrier:
+/// content containing conflict markers cannot become a commit. The refusal is
+/// whole-batch — the marker file is not published, and neither is its clean
+/// sibling, because half a resolution is not a landable state.
+#[tokio::test]
+async fn change_refuses_to_commit_content_carrying_conflict_markers() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:src/main.rs", "mode": "create", "payload": { "content": MARKER_BODY } },
+                { "target": "file:src/other.rs", "mode": "create", "payload": { "content": "fn other() {}\n" } }
+            ],
+            "commit_msg": "resolve conflict"
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    let error = report["failures"][0]["error"].as_str().unwrap();
+    assert!(error.contains("conflict markers"), "{error}");
+    assert!(
+        error.contains("src/main.rs") && error.contains("2:<<<<<<<"),
+        "the refusal names the file and the line: {error}"
+    );
+    assert!(
+        error.contains("conflict_markers_reason"),
+        "the refusal names its escape: {error}"
+    );
+    assert_eq!(
+        report["commit"]["status"].as_str().unwrap(),
+        "failed",
+        "{report:?}"
+    );
+}
+
+/// The false-positive case the guard must not punish: literal markers in a
+/// document, committed on an explicit written reason. The default is refusal, so
+/// the same batch that fails above succeeds here purely because it explained
+/// itself.
+#[tokio::test]
+async fn change_commits_literal_markers_with_an_explicit_reason() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:docs/conflicts.md", "mode": "create", "payload": { "content": MARKER_BODY } }
+            ],
+            "commit_msg": "document marker syntax",
+            "conflict_markers_reason": "documenting Git conflict-marker syntax"
+        }))
+        .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("docs/conflicts.md").trim_end(),
+        MARKER_BODY.trim_end()
+    );
+}
+
+/// An all-whitespace reason is no reason at all. The escape is audited, so it
+/// has to actually say something; anything else is a silent boolean bypass
+/// wearing a string's clothes.
+#[tokio::test]
+async fn change_treats_a_blank_marker_reason_as_no_reason() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:a.rs", "mode": "create", "payload": { "content": MARKER_BODY } }
+            ],
+            "commit_msg": "sneak it through",
+            "conflict_markers_reason": "   "
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert!(report["failures"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("conflict markers"));
+}
+
+#[tokio::test]
+async fn change_unified_patch_requires_commit_msg_for_file_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_str().unwrap();
+    let orch = test_file_change_orchestrator().await;
+
+    let request = make_request(
+        cwd,
+        json!({
+            "changes": [{
+                "target": "file:",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Add File: new.rs\n+new();\n*** End Patch\n" }
+            }]
+        }),
+    );
+
+    let report = parse_report(&handle_write(&orch, &request).await);
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert!(report["failures"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("commit_msg"));
+    assert!(!dir.path().join("new.rs").exists());
+}
+
+#[tokio::test]
+async fn change_unified_patch_rejects_single_file_target_mismatch() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:expected.rs",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Add File: actual.rs\n+actual();\n*** End Patch\n" }
+            }],
+            "commit_msg": "target mismatch"
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert!(report["failures"][0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("envelope target path does not match change.target"));
+    assert!(!repo.path("actual.rs").exists());
+}
+
+#[tokio::test]
+async fn change_mixed_unified_patch_and_resource_batch_succeeds() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let mut request = make_request(
+        repo.cwd(),
+        json!({
+            "changes": [
+                {
+                    "target": "file:",
+                    "mode": "unified_patch",
+                    "payload": { "patch": "*** Begin Patch\n*** Add File: mixed.rs\n+mixed();\n*** End Patch\n" }
+                },
+                {
+                    "target": "cairn://p/chg/messages",
+                    "mode": "append",
+                    "payload": { "content": "Unified patch landed" }
+                }
+            ],
+            "commit_msg": "mixed batch"
+        }),
+    );
+    request.run_id = Some("run-change".to_string());
+
+    let report = parse_report(&handle_write(&repo.orch, &request).await);
+
+    assert_eq!(report["applied"].as_array().unwrap().len(), 2);
+    assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(repo.read("mixed.rs"), "mixed();");
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND content = 'Unified patch landed'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn change_atomic_promote_amend_rolls_back_decision() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("canon.md", "old canon\n");
+    repo.seal_base("initial canon");
+    let project_id = common::create_project(&repo.orch.db.local, "mcp").await;
+    repo.orch
+        .db
+        .local
+        .execute_script(&format!(
+            "\
+            INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)\
+             VALUES ('issue-atomic-promote', '{project_id}', 1, 'Promote memory', 'active', 1, 1);\
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)\
+             VALUES ('exec-atomic-promote', 'recipe', 'issue-atomic-promote', '{project_id}', 'running', 1, 1);\
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, recipe_node_id, node_name, uri_segment, status, created_at, updated_at)\
+             VALUES ('job-atomic-promote', 'exec-atomic-promote', 'issue-atomic-promote', '{project_id}', 'builder', 'builder', 'builder', 'running', 1, 1);\
+            INSERT INTO memories (id, name, project_id, content, status, scope, scope_value, job_id, node_seq, created_at, updated_at)\
+             VALUES ('atomic-promote-memory', 'atomic promote', '{project_id}', 'promote me', 'claimed', 'project', '{project_id}', 'job-atomic-promote', 1, 1, 1);"
+        ))
+        .await
+        .unwrap();
+
+    let report = repo
+        .change_report(json!({
+            "changes": [
+                {
+                    "target": "file:canon.md",
+                    "mode": "patch",
+                    "payload": { "old_string": "old canon", "new_string": "new canon" }
+                },
+                {
+                    "target": "cairn://p/mcp/1/1/builder/memories/1",
+                    "mode": "patch",
+                    "payload": { "action": "promote", "reason": "ready for canon" }
+                }
+            ],
+            "commit_msg": "^",
+            "atomic": true
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(report["transactional"], true);
+    let error = report["failures"][0]["error"].as_str().unwrap();
+    assert!(
+        error.contains("promote_memory cannot ride an amend"),
+        "{error}"
+    );
+
+    let (status, triage_decision, reason, promoted_commit_sha) = repo
+        .orch
+        .db
+        .local
+        .query_one(
+            "SELECT status, triage_decision, reason, promoted_commit_sha FROM memories WHERE id = 'atomic-promote-memory'",
+            (),
+            |row| {
+                Ok((
+                    row.text(0)?,
+                    row.opt_text(1)?,
+                    row.opt_text(2)?,
+                    row.opt_text(3)?,
+                ))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(status, "claimed");
+    assert!(triage_decision.is_none());
+    assert!(reason.is_none());
+    assert!(promoted_commit_sha.is_none());
+}
+
+#[tokio::test]
+async fn node_memory_append_uses_target_node_and_scope_owner() {
+    let orch = test_file_change_orchestrator().await;
+    orch.db
+        .local
+        .execute(
+            "INSERT OR IGNORE INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at, is_workspace)
+             VALUES ('workspace', 'default', 'Workspace', 'WS', '/tmp/workspace', 1, 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    let issue_id = insert_issue(&orch.db.local, &project_id, 1, "Memory target").await;
+    orch.db
+        .local
+        .execute_script(&format!(
+            "\
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)\
+             VALUES ('exec-memory-target', 'recipe', '{issue_id}', '{project_id}', 'running', 1, 1);\
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, recipe_node_id, node_name, uri_segment, status, created_at, updated_at)\
+             VALUES ('job-builder', 'exec-memory-target', '{issue_id}', '{project_id}', 'builder', 'builder', 'builder', 'running', 1, 1);\
+            INSERT INTO jobs(id, execution_id, issue_id, project_id, recipe_node_id, node_name, uri_segment, status, created_at, updated_at)\
+             VALUES ('job-reviewer', 'exec-memory-target', '{issue_id}', '{project_id}', 'reviewer', 'reviewer', 'reviewer', 'running', 1, 1);"
+        ))
+        .await
+        .unwrap();
+
+    let request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/1/1/reviewer/memories",
+                "mode": "append",
+                "payload": {
+                    "name": "workspace fact",
+                    "content": "Workspace-scoped memory should live with workspace canon",
+                    "scope": "workspace"
+                }
+            }]
+        }),
+    );
+
+    let report = parse_report(&handle_write(&orch, &request).await);
+    assert_successful_change(&report, 1);
+    let summary = report["applied"][0]["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("cairn://p/mcp/1/1/reviewer/memories/1"),
+        "{summary}"
+    );
+    let resolved = memory_db::resolve_node_memory_id(&orch.db.local, "mcp", 1, 1, "reviewer", 1)
+        .await
+        .unwrap();
+    let memory_id = resolved.expect("returned node URI resolves");
+    let (job_id, project_id, scope, scope_value) = orch
+        .db
+        .local
+        .query_one(
+            "SELECT job_id, project_id, scope, scope_value FROM memories WHERE id = ?1",
+            params![memory_id.as_str()],
+            |row| Ok((row.text(0)?, row.text(1)?, row.text(2)?, row.text(3)?)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(job_id, "job-reviewer");
+    assert_eq!(project_id, "workspace");
+    assert_eq!(scope, "workspace");
+    assert_eq!(scope_value, "workspace");
+}
+
+#[tokio::test]
+async fn change_default_non_atomic_resource_batch_continues_after_failure() {
+    let orch = test_file_change_orchestrator().await;
+    common::create_project(&orch.db.local, "mcp").await;
+
+    let request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [
+                { "target": "cairn://p/missing/messages", "mode": "append", "payload": { "content": "Lost" } },
+                { "target": "cairn://p/mcp/messages", "mode": "append", "payload": { "content": "Applied after failure" } }
+            ]
+        }),
+    );
+
+    let report = parse_report(&handle_write(&orch, &request).await);
+
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1);
+    assert_eq!(report["applied"][0]["index"], 1);
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(report["failures"][0]["index"], 0);
+    assert_eq!(
+        count_rows(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'mcp' AND content = 'Applied after failure'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn change_default_non_atomic_failures_are_reported_with_blocking_appends() {
+    let orch = test_file_change_orchestrator().await;
+
+    let request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [
+                { "target": "cairn://p/missing/messages", "mode": "append", "payload": { "content": "Lost" } },
+                { "target": "cairn://p/mcp/1/1/builder/tasks", "mode": "append", "payload": { "subagentType": "Explore", "description": "noop", "prompt": "noop" } }
+            ]
+        }),
+    );
+
+    let result = handle_write(&orch, &request).await;
+    let report = parse_report(result.split("\n\n").next().unwrap());
+
+    assert_eq!(report["applied"].as_array().unwrap().len(), 0);
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(report["failures"][0]["index"], 0);
+    assert!(result.contains("No project found with key 'missing'"));
+}
+
+#[tokio::test]
+async fn change_rejects_file_target_without_commit_msg() {
+    // A file-target change with no commit_msg must be rejected before anything is
+    // written — uncommitted worktree edits are lost if the worktree is cleaned up.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_str().unwrap();
+    let orch = test_file_change_orchestrator().await;
+
+    let request = make_request(
+        cwd,
+        json!({
+            "changes": [{
+                "target": "file:new.rs",
+                "mode": "create",
+                "content": "let x = 1;\n"
+            }]
+        }),
+    );
+
+    let result = handle_write(&orch, &request).await;
+    let report = parse_report(&result);
+
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    let error = report["failures"][0]["error"].as_str().unwrap();
+    assert!(error.contains("commit_msg"), "{error}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 0);
+    // Nothing should have been written to disk.
+    assert!(!dir.path().join("new.rs").exists());
+}
+
+#[tokio::test]
+async fn change_allows_resource_only_batch_without_commit_msg() {
+    // Resource-only batches never touch git, so they must still work without a
+    // commit_msg.
+    let orch = test_file_change_orchestrator().await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    common::seed_authenticated_thread_run(
+        &orch.db.local,
+        &project_id,
+        "fixture",
+        "run-resource-write",
+    )
+    .await;
+
+    let request = make_request_as_run(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/issues",
+                "mode": "append",
+                "payload": { "title": "No commit msg needed" }
+            }]
+        }),
+        Some("run-resource-write"),
+    );
+
+    let result = handle_write(&orch, &request).await;
+    let report = parse_report(&result);
+
+    assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn change_creates_issue_resource_without_nested_runtime_panic() {
+    let orch = test_file_change_orchestrator().await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    common::seed_authenticated_thread_run(
+        &orch.db.local,
+        &project_id,
+        "fixture",
+        "run-resource-write",
+    )
+    .await;
+
+    let request = make_request_as_run(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/issues",
+                "mode": "append",
+                "payload": {
+                    "title": "Created through change",
+                    "description": "Created by regression test"
+                }
+            }]
+        }),
+        Some("run-resource-write"),
+    );
+
+    let result = handle_write(&orch, &request).await;
+    let report = parse_report(&result);
+
+    assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
+    assert!(report["applied"][0]["summary"]
+        .as_str()
+        .unwrap()
+        .contains("Created issue mcp/"));
+    assert_eq!(
+        count_rows(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM issues WHERE title = 'Created through change'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn change_appends_issue_comment_without_nested_runtime_panic() {
+    let orch = test_file_change_orchestrator().await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    insert_issue(&orch.db.local, &project_id, 1, "Comment target").await;
+
+    let request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/1",
+                "mode": "append",
+                "payload": { "content": "Regression comment" }
+            }]
+        }),
+    );
+
+    let result = handle_write(&orch, &request).await;
+    let report = parse_report(&result);
+
+    assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
+    assert_eq!(
+        report["applied"][0]["summary"].as_str().unwrap(),
+        "Appended comment to issue mcp/1"
+    );
+    assert_eq!(
+        count_rows(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM comments c JOIN issues i ON c.issue_id = i.id WHERE i.number = 1 AND c.content = 'Regression comment'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn change_appends_project_and_issue_messages_without_nested_runtime_panic() {
+    let orch = test_file_change_orchestrator().await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    insert_issue(&orch.db.local, &project_id, 1, "Message target").await;
+
+    let project_request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/messages",
+                "mode": "append",
+                "payload": { "content": "Project regression message" }
+            }]
+        }),
+    );
+    let issue_request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/1/messages",
+                "mode": "append",
+                "payload": { "content": "Issue regression message" }
+            }]
+        }),
+    );
+
+    let project_report = parse_report(&handle_write(&orch, &project_request).await);
+    let issue_report = parse_report(&handle_write(&orch, &issue_request).await);
+
+    assert_eq!(failure_count(&project_report), 0, "{project_report:?}");
+    assert_eq!(failure_count(&issue_report), 0, "{issue_report:?}");
+    assert_eq!(
+        count_rows(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = 'mcp' AND content = 'Project regression message'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'issue' AND channel_id = 'mcp/1' AND content = 'Issue regression message'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn change_patches_issue_resource_without_nested_runtime_panic() {
+    let orch = test_file_change_orchestrator().await;
+    let project_id = common::create_project(&orch.db.local, "mcp").await;
+    insert_issue(&orch.db.local, &project_id, 1, "Patch target").await;
+
+    let request = make_request(
+        "/tmp/test-repo",
+        json!({
+            "changes": [{
+                "target": "cairn://p/mcp/1",
+                "mode": "patch",
+                "payload": { "title": "Patched through change" }
+            }]
+        }),
+    );
+
+    let result = handle_write(&orch, &request).await;
+    let report = parse_report(&result);
+
+    assert_eq!(failure_count(&report), 0, "{report:?}");
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{report:?}");
+    assert_eq!(
+        report["applied"][0]["summary"].as_str().unwrap(),
+        "Patched issue mcp/1"
+    );
+    assert_eq!(
+        count_rows(
+            &orch.db.local,
+            "SELECT COUNT(*) FROM issues WHERE number = 1 AND title = 'Patched through change'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn change_atomic_true_preserves_file_group_fail_fast() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    seed_bad_good_files(&repo);
+
+    let report = repo
+        .change_report(bad_good_patch_payload("atomic fail fast", true))
+        .await;
+
+    assert_eq!(report["applied"].as_array().unwrap().len(), 0);
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(report["transactional"], true);
+    assert_eq!(repo.read("bad.rs"), "old bad\n");
+    assert_eq!(repo.read("good.rs"), "old good\n");
+}
+
+#[tokio::test]
+async fn change_patches_file_with_codex_patch_envelope() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "let x = 1;\n");
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:lib.rs",
+                "mode": "patch",
+                "payload": {
+                    "diff": "*** Begin Patch
+*** Update File: file:lib.rs
+@@ -1,1 +1,1 @@
+-let x = 1;
++let x = 2;
+*** End Patch
+"
+                }
+            }],
+            "commit_msg": "apply codex patch"
+        }))
+        .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(report["commit"]["status"], "committed", "{report:?}");
+    assert_eq!(repo.read("lib.rs"), "let x = 2;\n");
+}
+
+#[tokio::test]
+async fn change_default_non_atomic_applies_matching_file_items() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    seed_bad_good_files(&repo);
+
+    let report = repo
+        .change_report(bad_good_patch_payload("apply matching only", false))
+        .await;
+
+    assert_eq!(report["applied"].as_array().unwrap().len(), 1);
+    assert_eq!(report["applied"][0]["index"], 1);
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(report["failures"][0]["index"], 0);
+    assert_eq!(report["partial_success"], true);
+    // The successful item still commits even though a sibling failed.
+    assert_eq!(report["commit"]["status"], "committed", "{report:?}");
+    assert_eq!(repo.read("bad.rs"), "old bad\n");
+    assert_eq!(repo.read("good.rs"), "new good\n");
+}
+
+#[tokio::test]
+async fn change_default_non_atomic_commits_only_applied_files() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    seed_bad_good_files(&repo);
+
+    let report = repo
+        .change_report(bad_good_patch_payload("commit good only", false))
+        .await;
+
+    assert_eq!(report["commit"]["status"], "committed");
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    // Only the applied file is sealed; the failed sibling is unchanged on disk
+    // (and so absent from the commit).
+    assert_eq!(repo.read("good.rs"), "new good\n");
+    assert_eq!(repo.read("bad.rs"), "old bad\n");
+}
+
+#[tokio::test]
+async fn change_rejects_malformed_diff_before_apply() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "let x = 1;\n");
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:lib.rs",
+                "mode": "patch",
+                "payload": {
+                    "diff": "*** Begin Patch\n*** Update File: file:lib.rs\n-let x = 1;\n+let x = 2;\n*** End Patch\n"
+                }
+            }],
+            "commit_msg": "malformed diff"
+        }))
+        .await;
+
+    assert_eq!(failure_count(&report), 1);
+    let error = report["failures"][0]["error"].as_str().unwrap();
+    assert!(error.contains("Invalid diff"));
+    assert!(error.contains("unified diff") || error.contains("single-file envelope"));
+    assert!(!error.contains("No hunks found in diff"));
+}
+
+#[tokio::test]
+async fn change_default_non_atomic_chained_file_items_compose() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("other.rs", "old other\n");
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [
+                { "target": "file:chain.rs", "mode": "create", "payload": { "content": "first\n" } },
+                { "target": "file:chain.rs", "mode": "patch", "payload": { "old_string": "first", "new_string": "second" } },
+                { "target": "file:other.rs", "mode": "patch", "payload": { "old_string": "missing", "new_string": "new other" } }
+            ],
+            "commit_msg": "chain compose"
+        }),
+    )
+    .await;
+
+    assert_eq!(report["applied"].as_array().unwrap().len(), 2);
+    assert_eq!(failure_count(&report), 1, "{report:?}");
+    assert_eq!(repo.read("chain.rs"), "second\n");
+    assert_eq!(repo.read("other.rs"), "old other\n");
+}
+
+#[tokio::test]
+async fn change_unified_patch_applies_native_contextual_hunk() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "fn example() {\n    old();\n}\n\nfn other() {}\n");
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:lib.rs",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Update File: lib.rs\n@@ fn example() {\n fn example() {\n-    old();\n+    new();\n }\n*** End Patch\n" }
+            }],
+            "commit_msg": "native hunk"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("lib.rs"),
+        "fn example() {\n    new();\n}\n\nfn other() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn change_unified_patch_native_add_only_context_header_inserts_after_anchor() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "fn first() {\n}\n\nfn second() {\n}\n");
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:lib.rs",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Update File: lib.rs\n@@ fn second() {\n+    inserted();\n*** End Patch\n" }
+            }],
+            "commit_msg": "insert after anchor"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("lib.rs"),
+        "fn first() {\n}\n\nfn second() {\n    inserted();\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn change_unified_patch_preview_hashes_expanded_targets() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "old();\n");
+    let payload = json!({
+        "changes": [{
+            "target": "file:",
+            "mode": "unified_patch",
+            "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** End Patch\n" }
+        }],
+        "commit_msg": "add files",
+        "preview": true
+    });
+    insert_preview_event(&repo.orch.db.local, payload.clone()).await;
+
+    let report = repo.preview_report(payload).await;
+
+    assert_successful_change(&report, 2);
+    assert_eq!(repo.read("lib.rs"), "old();\n");
+    assert!(!repo.path("add.rs").exists());
+    let targets = report["target_hashes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|hash| hash["target"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(targets, vec!["file:add.rs", "file:lib.rs"]);
+}
+
+#[tokio::test]
+async fn change_unified_patch_accepts_bare_native_header() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "README.md",
+        "- [Algolia Autocomplete](https://www.algolia.com/doc/ui-libraries/autocomplete/introduction/what-is-autocomplete/) - the official Algolia Autocomplete documentation\n- [FlexSearch](https://github.com/nextapps-de/flexsearch) - the official FlexSearch documentation\n- [Zustand](https://docs.pmnd.rs/zustand/getting-started/introduction) - the official Zustand documentation\n",
+    );
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Update File: README.md\n@@\n - [Algolia Autocomplete](https://www.algolia.com/doc/ui-libraries/autocomplete/introduction/what-is-autocomplete/) - the official Algolia Autocomplete documentation\n - [FlexSearch](https://github.com/nextapps-de/flexsearch) - the official FlexSearch documentation\n-- [Zustand](https://docs.pmnd.rs/zustand/getting-started/introduction) - the official Zustand documentation\n+- [Zustand](https://docs.pmnd.rs/zustand/getting-started/introduction) - the official Zustand documentation\n+\n+## Unified Patch Test\n+\n+Temporary change to validate Cairn `change` with unified patch style in this throwaway worktree.\n*** End Patch" }
+            }],
+            "commit_msg": "bare native header"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(report["commit"]["status"], "committed", "{report:?}");
+    assert!(repo.read("README.md").contains("## Unified Patch Test"));
+}
+
+#[tokio::test]
+async fn change_unified_patch_applies_multi_file_envelope() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "old();\n");
+    repo.write("delete.rs", "delete();\n");
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Add File: add.rs\n+add();\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-old();\n+new();\n*** Delete File: delete.rs\n*** End Patch\n" }
+            }],
+            "commit_msg": "multi-file envelope"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 3);
+    assert_eq!(repo.read("add.rs"), "add();");
+    assert_eq!(repo.read("lib.rs"), "new();\n");
+    assert!(!repo.logical_exists("delete.rs"));
+}
+
+#[tokio::test]
+async fn change_unified_patch_native_context_header_scopes_repeated_old_lines() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "lib.rs",
+        "fn first() {\n    old();\n}\n\nfn second() {\n    old();\n}\n",
+    );
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:lib.rs",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Update File: lib.rs\n@@ fn second() {\n-    old();\n+    new();\n*** End Patch\n" }
+            }],
+            "commit_msg": "scoped hunk"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        repo.read("lib.rs"),
+        "fn first() {\n    old();\n}\n\nfn second() {\n    new();\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn change_unified_patch_deletes_file_with_codex_envelope() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("old.rs", "old();\n");
+    // Seal old.rs into the base so deleting it is a real, committable change.
+    repo.seal_base("seed old.rs");
+
+    let report = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:old.rs",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Delete File: old.rs\n*** End Patch\n" }
+            }],
+            "commit_msg": "delete file"
+        }))
+        .await;
+
+    assert_successful_change(&report, 1);
+    assert!(!repo.logical_exists("old.rs"));
+}
+
+#[tokio::test]
+async fn change_unified_patch_updates_file_with_codex_envelope() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lib.rs", "let x = 1;\n");
+
+    let report = repo
+        .change_report(
+        json!({
+            "changes": [{
+                "target": "file:lib.rs",
+                "mode": "unified_patch",
+                "payload": { "patch": "*** Begin Patch\n*** Update File: lib.rs\n@@ -1,1 +1,1 @@\n-let x = 1;\n+let x = 2;\n*** End Patch\n" }
+            }],
+            "commit_msg": "update file"
+        }),
+    )
+    .await;
+
+    assert_successful_change(&report, 1);
+    assert_eq!(repo.read("lib.rs"), "let x = 2;\n");
+}
+
+// ---------------------------------------------------------------------------
+// Write replay (the edit-echo)
+//
+// A single `handle_write` cannot double-apply: it snapshots the logical head,
+// computes whole-file replacement content, and publishes under a compare-and-swap
+// inside one store-lock epoch. The echo comes from a *second delivery* of the
+// same tool call — a socket that fired while the host went on to land the
+// commit, a provider-level retry, anything that re-issues the payload. These
+// tests pin the guard that makes the second delivery a no-op.
+// ---------------------------------------------------------------------------
+
+/// PHASE 1 REPRODUCTION, now the guard's headline test. Two byte-identical
+/// deliveries of one anchor-preserving insertion under the same `tool_use_id`
+/// apply once. Without the guard the second delivery matches the re-emitted
+/// anchor and inserts a second copy, which is exactly the CAIRN-3242 incident.
+#[tokio::test]
+async fn an_anchor_preserving_insertion_is_not_applied_twice_by_a_replay() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "contracts.rs",
+        "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {\n    name: \"image\",\n};\n",
+    );
+
+    let first = repo
+        .change_report_as_tool_use(
+            "toolu_echo",
+            anchor_preserving_insertion("add images contract"),
+        )
+        .await;
+    assert_successful_change(&first, 1);
+
+    let replay = repo
+        .change_report_as_tool_use(
+            "toolu_echo",
+            anchor_preserving_insertion("add images contract"),
+        )
+        .await;
+    assert_successful_change(&replay, 1);
+
+    let landed = repo.read("contracts.rs");
+    assert_eq!(
+        landed.matches("PROJECT_IMAGES_CONTRACT").count(),
+        1,
+        "a replayed insertion must land one copy, not two: {landed}"
+    );
+}
+
+/// The replay returns the first delivery's report verbatim, so the agent that
+/// re-issued the call sees the same commit it already acted on rather than a
+/// second sha for a commit that never happened.
+#[tokio::test]
+async fn a_replayed_write_applies_once_and_returns_the_first_report() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "tail\n");
+
+    let payload = json!({
+        "changes": [{
+            "target": "file:notes.txt",
+            "mode": "patch",
+            "payload": { "old_string": "tail", "new_string": "head\ntail" }
+        }],
+        "commit_msg": "prepend head"
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_same", payload.clone())
+        .await;
+    assert_successful_change(&first, 1);
+    let replay = repo.change_report_as_tool_use("toolu_same", payload).await;
+
+    assert_eq!(
+        replay["commit"]["sha"], first["commit"]["sha"],
+        "the replay must report the commit the first delivery landed: {replay:?}"
+    );
+    assert_eq!(repo.read("notes.txt"), "head\ntail\n");
+}
+
+/// The replay ledger claims its row inside the store lock, BEFORE the
+/// publication ladder's remaining rungs have run. So the report it records says
+/// `committed` even when the export or the required origin push then fails and
+/// the call actually answers `sealed locally; unpublished`.
+///
+/// A redelivery must not be handed that stale success. The row is deliberately
+/// immutable to competing deliveries, so if the claiming delivery does not
+/// correct it, nothing ever will, and the agent is told a head nobody outside
+/// Cairn can see has been published — the exact inversion the fail-closed
+/// publication contract exists to prevent.
+#[tokio::test]
+async fn a_write_whose_publication_failed_is_not_replayed_as_committed() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("notes.txt", "tail\n");
+    repo.open_remote_pr_on_branch().await;
+    repo.break_origin();
+
+    let payload = json!({
+        "changes": [{
+            "target": "file:notes.txt",
+            "mode": "patch",
+            "payload": { "old_string": "tail", "new_string": "head\ntail" }
+        }],
+        "commit_msg": "prepend head"
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_unpublished", payload.clone())
+        .await;
+    assert_eq!(
+        first["commit"]["status"], "sealed locally; unpublished",
+        "a commit whose required push failed must not report as committed: {first:?}"
+    );
+
+    let replay = repo
+        .change_report_as_tool_use("toolu_unpublished", payload)
+        .await;
+    assert_eq!(
+        replay["commit"]["status"], "sealed locally; unpublished",
+        "the redelivery must be answered with what actually happened: {replay:?}"
+    );
+    assert_eq!(
+        replay["commit"]["sha"], first["commit"]["sha"],
+        "and with the commit the first delivery landed, not a second one"
+    );
+    assert_eq!(
+        repo.read("notes.txt"),
+        "head\ntail\n",
+        "the redelivery must still not re-apply the patch"
+    );
+}
+
+/// The guard keys on the tool call, not on the payload: a genuine second edit
+/// the agent meant to make carries its own `tool_use_id` and must still apply.
+#[tokio::test]
+async fn distinct_tool_use_ids_still_apply_independently() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "contracts.rs",
+        "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {\n    name: \"image\",\n};\n",
+    );
+
+    let first = repo
+        .change_report_as_tool_use("toolu_one", anchor_preserving_insertion("first insert"))
+        .await;
+    assert_successful_change(&first, 1);
+    let second = repo
+        .change_report_as_tool_use("toolu_two", anchor_preserving_insertion("second insert"))
+        .await;
+    assert_successful_change(&second, 1);
+
+    let landed = repo.read("contracts.rs");
+    assert_eq!(
+        landed.matches("PROJECT_IMAGES_CONTRACT").count(),
+        2,
+        "distinct tool calls are distinct edits: {landed}"
+    );
+    assert_ne!(first["commit"]["sha"], second["commit"]["sha"]);
+}
+
+/// A delivery with no `tool_use_id` cannot be correlated to a prior one, so it
+/// applies as it always has rather than being keyed under an invented identity.
+#[tokio::test]
+async fn a_write_without_a_tool_use_id_applies_as_today() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write(
+        "contracts.rs",
+        "pub const PROJECT_IMAGE_CONTRACT: Contract = Contract {\n    name: \"image\",\n};\n",
+    );
+
+    assert_successful_change(
+        &repo
+            .change_report(anchor_preserving_insertion("unkeyed first"))
+            .await,
+        1,
+    );
+    assert_successful_change(
+        &repo
+            .change_report(anchor_preserving_insertion("unkeyed second"))
+            .await,
+        1,
+    );
+
+    let landed = repo.read("contracts.rs");
+    assert_eq!(
+        landed.matches("PROJECT_IMAGES_CONTRACT").count(),
+        2,
+        "an unkeyed write is not deduplicated: {landed}"
+    );
+}
+
+/// Resource-only writes claim replay identity before dispatch, so a transport
+/// redelivery returns the settled first report without appending twice.
+#[tokio::test]
+async fn stop_after_real_file_write_settlement_replays_authoritative_provider_context() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-stop-file";
+    let payload = json!({
+        "changes": [{"target": "file:stopped.txt", "mode": "create",
+                     "payload": {"content": "durable\n"}}],
+        "commit_msg": "write before stop"
+    });
+    record_write_call(&repo.orch.db.local, tool_use_id, &payload).await;
+    let gate = gate_settled_delivery("run-change", tool_use_id);
+    let mut request = make_request(repo.cwd(), payload);
+    request.run_id = Some("run-change".to_string());
+    request.tool_use_id = Some(tool_use_id.to_string());
+
+    let (delivered, ()) = tokio::join!(handle_write(&repo.orch, &request), async {
+        gate.entered().await;
+        lifecycle::stop_session(&repo.orch, "run-change").unwrap();
+        gate.release();
+    });
+
+    let report: serde_json::Value = serde_json::from_str(&delivered).unwrap();
+    let sha = report["commit"]["sha"].as_str().unwrap();
+    assert_eq!(sha, repo.branch_head());
+    assert_eq!(repo.read("stopped.txt"), "durable\n");
+    let stopped = stopped_result(&repo.orch.db.local, tool_use_id).await;
+    let resumed = resumed_model_context(&repo);
+    assert!(stopped.contains(sha), "{stopped}");
+    assert!(resumed.contains(sha), "{resumed}");
+    assert!(resumed.contains("Do not retry"), "{resumed}");
+    assert!(
+        !resumed.to_ascii_lowercase().contains("not written"),
+        "{resumed}"
+    );
+}
+
+#[tokio::test]
+async fn stop_after_real_resource_write_settlement_replays_exactly_once_provider_context() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let tool_use_id = "tool-stop-resource";
+    let payload = json!({
+        "changes": [{"target": "cairn://p/chg/messages", "mode": "append",
+                     "payload": {"content": "settled once"}}]
+    });
+    record_write_call(&repo.orch.db.local, tool_use_id, &payload).await;
+    let gate = gate_settled_delivery("run-change", tool_use_id);
+    let mut request = make_request(repo.cwd(), payload);
+    request.run_id = Some("run-change".to_string());
+    request.tool_use_id = Some(tool_use_id.to_string());
+
+    let (delivered, ()) = tokio::join!(handle_write(&repo.orch, &request), async {
+        gate.entered().await;
+        lifecycle::stop_session(&repo.orch, "run-change").unwrap();
+        gate.release();
+    });
+
+    let report = parse_report(&delivered);
+    assert_successful_change(&report, 1);
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND channel_id = (SELECT key FROM projects WHERE id = ?1) AND content = 'settled once'",
+            &repo.project_id,
+        )
+        .await,
+        1
+    );
+    let stopped = stopped_result(&repo.orch.db.local, tool_use_id).await;
+    let resumed = resumed_model_context(&repo);
+    let stopped_event = parse_report(&stopped);
+    let stopped_report = parse_report(stopped_event["toolResult"].as_str().unwrap());
+    assert_eq!(stopped_report["applied"], report["applied"]);
+    let summary = report["applied"][0]["summary"].as_str().unwrap();
+    assert!(!summary.is_empty(), "{report}");
+    assert!(resumed.contains(summary), "{resumed}");
+    assert!(resumed.contains("Do not retry"), "{resumed}");
+    assert!(
+        !resumed.to_ascii_lowercase().contains("not written"),
+        "{resumed}"
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 AND event_type = 'tool_result'",
+            "run-change",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_resource_only_write_is_deduplicated_by_the_replay_guard() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let payload = json!({
+        "changes": [{
+            "target": "cairn://p/chg/messages",
+            "mode": "append",
+            "payload": { "content": "a message" }
+        }]
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_res", payload.clone())
+        .await;
+    let second = repo.change_report_as_tool_use("toolu_res", payload).await;
+
+    assert_successful_change(&first, 1);
+    assert!(second["replayed"].is_string(), "{second:?}");
+    assert_eq!(second["applied"], first["applied"]);
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM messages WHERE channel_type = 'project' AND content = 'a message'"
+        )
+        .await,
+        1,
+        "the redelivery must not append a second message"
+    );
+}
+
+/// A settled failure is replayed as the same failure. It is not treated as an
+/// empty claim that permits another pass through a partially effectful batch.
+#[tokio::test]
+async fn a_failed_resource_only_write_replays_its_failure() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    let payload = json!({
+        "atomic": true,
+        "changes": [{
+            "target": "cairn://p/missing/messages",
+            "mode": "append",
+            "payload": { "content": "never appended" }
+        }]
+    });
+
+    let first = repo
+        .change_report_as_tool_use("toolu_resource_failure", payload.clone())
+        .await;
+    let replay = repo
+        .change_report_as_tool_use("toolu_resource_failure", payload)
+        .await;
+
+    assert_eq!(failure_count(&first), 1, "{first:?}");
+    assert!(replay["replayed"].is_string(), "{replay:?}");
+    assert_eq!(replay["failures"], first["failures"]);
+}
+
+fn revert_payload(commit: &str) -> serde_json::Value {
+    json!({
+        "changes": [{
+            "target": "file:",
+            "mode": "revert",
+            "payload": { "commit": commit }
+        }],
+        "commit_msg": "revert selected change"
+    })
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn handler_revert_preserves_disjoint_work_reports_paths_and_records_ledger() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let selected = repo
+        .change_report(json!({
+            "changes": [
+                { "target": "file:selected.txt", "mode": "create", "payload": { "content": "selected\n" } },
+                { "target": "file:also-selected.txt", "mode": "create", "payload": { "content": "also\n" } }
+            ],
+            "commit_msg": "selected change"
+        }))
+        .await;
+    assert_successful_change(&selected, 2);
+    let selected_sha = selected["commit"]["sha"].as_str().unwrap();
+
+    let later = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:later.txt",
+                "mode": "create",
+                "payload": { "content": "later\n" }
+            }],
+            "commit_msg": "disjoint later change"
+        }))
+        .await;
+    assert_successful_change(&later, 1);
+
+    let reverted = repo
+        .change_report_as_tool_use("toolu_revert_success", revert_payload(selected_sha))
+        .await;
+    assert_successful_change(&reverted, 1);
+    assert_eq!(reverted["applied"][0]["mode"], "revert");
+    assert_eq!(reverted["applied"][0]["target"], "file:");
+    assert_eq!(
+        reverted["applied"][0]["summary"],
+        format!("Reverted {selected_sha} (2 paths)")
+    );
+    assert!(!repo.logical_exists("selected.txt"));
+    assert!(!repo.logical_exists("also-selected.txt"));
+    assert_eq!(repo.read("later.txt"), "later\n");
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change' AND status = 'deleted' AND file_path IN ('selected.txt', 'also-selected.txt') AND additions = 0 AND deletions = 1"
+        )
+        .await,
+        2,
+        "the handler must ledger the inverse changes, not the original additions"
+    );
+
+    let replay = repo
+        .change_report_as_tool_use("toolu_revert_success", revert_payload(selected_sha))
+        .await;
+    assert!(replay["replayed"].is_string(), "{replay:?}");
+    assert_eq!(replay["commit"]["sha"], reverted["commit"]["sha"]);
+    assert_eq!(replay["applied"], reverted["applied"]);
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change' AND status = 'deleted' AND file_path IN ('selected.txt', 'also-selected.txt')"
+        )
+        .await,
+        2,
+        "a replayed revert must not duplicate the file-change ledger"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn handler_revert_overlap_failure_leaves_head_and_ledger_unchanged() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+
+    let selected = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:shared.txt",
+                "mode": "create",
+                "payload": { "content": "selected\n" }
+            }],
+            "commit_msg": "selected change"
+        }))
+        .await;
+    let selected_sha = selected["commit"]["sha"].as_str().unwrap();
+    let later = repo
+        .change_report(json!({
+            "changes": [{
+                "target": "file:shared.txt",
+                "mode": "replace",
+                "payload": { "content": "later\n" }
+            }],
+            "commit_msg": "overlapping later change"
+        }))
+        .await;
+    assert_successful_change(&later, 1);
+    let ledger_before = count_rows(
+        &repo.orch.db.local,
+        "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change'",
+    )
+    .await;
+
+    let failed = repo
+        .change_report_as_tool_use("toolu_revert_overlap", revert_payload(selected_sha))
+        .await;
+    assert_eq!(failure_count(&failed), 1, "{failed:?}");
+    assert!(
+        failed["failures"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("overlaps later edits at: shared.txt"),
+        "{failed:?}"
+    );
+    assert_eq!(failed["applied"], json!([]), "{failed:?}");
+    assert!(failed.get("partial_success").is_none(), "{failed:?}");
+    assert!(failed.get("commit").is_none(), "{failed:?}");
+    assert_eq!(repo.read("shared.txt"), "later\n");
+    assert_eq!(
+        count_rows(
+            &repo.orch.db.local,
+            "SELECT COUNT(*) FROM file_changes WHERE job_id = 'job-change'",
+        )
+        .await,
+        ledger_before
+    );
+
+    let retry = repo
+        .change_report_as_tool_use("toolu_revert_overlap", revert_payload(selected_sha))
+        .await;
+    assert_eq!(retry["failures"], failed["failures"]);
+    assert!(
+        retry.get("replayed").is_none(),
+        "failed file writes remain retryable"
+    );
+    assert_eq!(retry["applied"], json!([]), "{retry:?}");
+    assert_eq!(repo.read("shared.txt"), "later\n");
+}

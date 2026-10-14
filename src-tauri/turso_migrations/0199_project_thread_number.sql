@@ -1,0 +1,13 @@
+-- A durable per-project counter for allocated thread addresses.
+--
+-- Threads created without a name get a `thread-<n>` placeholder the Thread agent
+-- renames as soon as it has read the opening message. Deriving that `<n>` from
+-- the names currently in the table would make the address RECYCLE: renaming is
+-- the designed path, so `thread-1` would be free again within a minute of being
+-- handed out, and a route or history entry pointing at it would later resolve to
+-- an unrelated conversation.
+--
+-- This is the same shape and the same reasoning as `projects.next_issue_number`,
+-- which is why it lives beside it rather than inventing a second mechanism: an
+-- allocated address is spent when its transaction commits, and stays spent.
+ALTER TABLE projects ADD COLUMN next_thread_number INTEGER DEFAULT 1;

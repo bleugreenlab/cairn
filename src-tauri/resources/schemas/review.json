@@ -1,0 +1,43 @@
+{
+  "type": "object",
+  "properties": {
+    "comments": {
+      "type": "array",
+      "description": "Review comments",
+      "items": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "description": "Comment message"
+          },
+          "file": {
+            "type": "string",
+            "description": "File path"
+          },
+          "line": {
+            "type": "integer",
+            "description": "Line number"
+          },
+          "severity": {
+            "type": "string",
+            "enum": ["info", "warning", "error"],
+            "description": "Comment severity"
+          }
+        },
+        "required": ["message"]
+      }
+    },
+    "approval": {
+      "type": "string",
+      "enum": ["approved", "changes_requested", "needs_discussion"],
+      "description": "Overall review decision"
+    },
+    "summary": {
+      "type": "string",
+      "description": "Review summary"
+    }
+  },
+  "required": ["comments", "approval", "summary"],
+  "additionalProperties": false
+}

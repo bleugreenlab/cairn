@@ -1,0 +1,14 @@
+-- Migration: execution_history.pack_hash pointer (CAIRN-2188)
+--
+-- SHARED across both lineages (private + team) via the SHARED_TAIL macro in
+-- migrations.rs -- the FIRST shared-table change written once and composed into
+-- both `TURSO_MIGRATIONS` and `TEAM_MIGRATIONS`. This file lives in the private
+-- `turso_migrations/` directory but is the single source for both lineages.
+--
+-- For a TEAM run, archive_target offloads the range pack to the shared per-team
+-- content store and records only this pointer: `pack`/`pack_idx` are NULL and
+-- `pack_hash` is the sha-256 (hex) of the framed pack object in the store, so
+-- the synced replica carries rows + git coordinates + the hash pointer, never
+-- the heavy bytes. For a LOCAL run `pack_hash` stays NULL and the pack stays
+-- inline in `pack`/`pack_idx` exactly as before.
+ALTER TABLE execution_history ADD COLUMN pack_hash TEXT;

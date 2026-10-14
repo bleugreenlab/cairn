@@ -1,0 +1,113 @@
+cairnVersion: 1
+bundles: [coding]
+name: Coordinator
+description: >-
+  Drive a feature or a standing mission by spawning child issues and tracking
+  them on a board. On a new branch the coordinator's branch is the feature's
+  integration branch: children merge into it and the coordinator ships one
+  integration PR when the feature is whole. On the base branch it has no branch
+  and no PR of its own — each child bases off and lands its own PR into the base
+  branch, and the coordinator runs until you close the issue.
+trigger: manual
+branchTargets: [new, base]
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 240@90
+  config:
+    triggerType: manual
+    scope: issue
+- id: coordinator-1
+  type: agent
+  name: Coordinator
+  position: 240@260
+  config:
+    agent: coordinator
+- id: pr-1
+  type: pr
+  name: PR
+  position: 240@420
+  config:
+    actionParams: {}
+    inputSchema:
+      name: create-pr
+      description: >-
+        Your branch is the feature's integration branch, and this PR ships it to
+        the default branch. Merged children are already on your branch, so
+        verify the combined result in your worktree (build, test) and fix only
+        integration-level gaps here. Writing this artifact opens the PR and
+        hands the feature off for review — the workflow pushes the branch and
+        opens it, so don't run `gh pr create` yourself. Write it when the
+        feature is whole rather than holding it back.
+      schema:
+        properties:
+          body:
+            description: PR description (markdown)
+            type: string
+          title:
+            description: PR title
+            type: string
+        required:
+        - title
+        - body
+        type: object
+      confirmPolicy: auto
+- id: board-1
+  type: artifact
+  name: Board
+  position: 500@350
+  config:
+    artifactType: board
+    confirmPolicy: auto
+    schema:
+      properties:
+        action_items:
+          description: Planned deliverables, authored up front and revised as understanding changes
+          items:
+            properties:
+              intent:
+                description: Authored status the live child data cannot express — planned but unspawned, deferred, or cancelled
+                enum:
+                - planned
+                - deferred
+                - cancelled
+                type: string
+              issue:
+                description: The child issue number once spawned, binding this intent to its concrete issue
+                type: number
+              note:
+                description: Context or rationale for this item
+                type: string
+              text:
+                description: The intent or deliverable (e.g. "add console and network observability")
+                type: string
+            required:
+            - text
+            type: object
+          type: array
+        scratch:
+          description: Freeform planning prose — decisions, sequencing, and why anything is deferred
+          type: string
+        title:
+          description: The feature this board tracks
+          type: string
+      required:
+      - title
+      type: object
+edges:
+- from: trigger-1@control-out
+  to: coordinator-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: coordinator-1@context-in
+  type: context
+- from: coordinator-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: coordinator-1@context-out
+  to: pr-1@context-in
+  type: context
+- from: coordinator-1@context-self
+  to: board-1@context-in
+  type: context

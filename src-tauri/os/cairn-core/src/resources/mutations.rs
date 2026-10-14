@@ -1,0 +1,273 @@
+//! URI resource mutation dispatch and resource-target preview hashing.
+
+mod actions;
+mod agents;
+mod blocking;
+mod browsers;
+mod dispatch;
+mod hash;
+mod labels;
+mod mcp;
+mod memories;
+pub mod packs;
+mod projects;
+mod recipes;
+mod responses;
+mod routes;
+mod settings;
+mod skills;
+
+pub(crate) use blocking::{
+    blocking_append_kind, run_blocking_group, validate_blocking_group, BlockingResult,
+};
+pub(crate) use dispatch::dispatch_resource_change;
+pub(crate) use hash::hash_resource_target;
+pub(crate) use mcp::workspace_mcp_authority;
+pub(crate) use projects::project_write_crossing_path;
+pub(crate) use settings::workspace_settings_authority;
+
+use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
+use crate::orchestrator::Orchestrator;
+use cairn_common::uri::{parse_uri, CairnResource};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceTargetHash {
+    pub(crate) target: String,
+    pub(crate) kind: String,
+    pub(crate) exists: bool,
+    pub(crate) hash: String,
+}
+
+// `data` carries a structured, machine-readable echo of the post-mutation
+// state for UI renderers (e.g. the todos snapshot). `serde_json::Value` is not
+// `Eq`, so this struct is `PartialEq` only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromotedMemoryRef {
+    pub(crate) memory_id: String,
+    pub(crate) memory_uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ResourceAppliedChange {
+    pub(crate) index: usize,
+    pub(crate) target: String,
+    pub(crate) mode: String,
+    pub(crate) kind: String,
+    pub(crate) summary: String,
+    pub(crate) data: Option<serde_json::Value>,
+    pub(crate) promoted_memory: Option<PromotedMemoryRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResourceMutationFailure {
+    pub(crate) index: usize,
+    pub(crate) target: String,
+    pub(crate) mode: String,
+    pub(crate) kind: String,
+    pub(crate) error: String,
+}
+
+pub(super) type ResourceMutationResult<T> = Result<T, ResourceMutationFailure>;
+
+pub(super) fn mode_name(mode: ChangeMode) -> &'static str {
+    mode.as_str()
+}
+
+pub(super) fn build_failure(
+    index: usize,
+    item: &ChangeItem,
+    error: impl Into<String>,
+) -> ResourceMutationFailure {
+    ResourceMutationFailure {
+        index,
+        target: item.target.clone(),
+        mode: mode_name(item.mode).to_string(),
+        kind: "resource".to_string(),
+        error: error.into(),
+    }
+}
+
+pub(super) fn payload_value<'a>(
+    payload: &'a serde_json::Value,
+    key: &str,
+    aliases: &[&str],
+) -> Option<&'a serde_json::Value> {
+    std::iter::once(key)
+        .chain(aliases.iter().copied())
+        .find_map(|name| payload.get(name))
+}
+
+pub(super) fn payload_str<'a>(
+    payload: &'a serde_json::Value,
+    key: &str,
+    aliases: &[&str],
+) -> Option<&'a str> {
+    payload_value(payload, key, aliases).and_then(|value| value.as_str())
+}
+
+pub(super) fn payload_bool(payload: &serde_json::Value, key: &str) -> Option<bool> {
+    payload_value(payload, key, &[]).and_then(|value| value.as_bool())
+}
+
+pub(super) fn payload_non_empty_str<'a>(
+    payload: &'a serde_json::Value,
+    key: &str,
+    aliases: &[&str],
+) -> Option<&'a str> {
+    payload_str(payload, key, aliases).filter(|value| !value.is_empty())
+}
+
+pub(super) fn payload_trimmed_non_empty_str<'a>(
+    payload: &'a serde_json::Value,
+    key: &str,
+    aliases: &[&str],
+) -> Option<&'a str> {
+    payload_str(payload, key, aliases)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Compose the acknowledgement an agent reads after creating a config resource.
+///
+/// The address is the resource's canonical `cairn://` URI, never a filesystem
+/// path. A project-scoped skill, recipe, or agent is written into whichever
+/// checkout is materialized for the caller at the time, so an absolute path
+/// names a location that is neither stable across executions nor addressable by
+/// the reader. The URI is both, and it is the address a follow-up read or patch
+/// actually takes.
+pub(super) fn created_resource_ack(kind: &str, id: &str, uri: &str) -> String {
+    format!("Created {kind} '{id}' at {uri}")
+}
+
+async fn scope_project_path(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    explicit_project: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    match explicit_project {
+        Some(project) => Ok(Some(
+            crate::mcp::handlers::skills_resources::project_path_by_key(orch, project).await?,
+        )),
+        None => Ok(
+            crate::mcp::handlers::skills_resources::current_run_project(orch, request)
+                .await
+                .and_then(|(_, path)| path),
+        ),
+    }
+}
+
+/// Whether a change target is written using either run-relative shorthand.
+pub(crate) fn is_home_relative_target(target: &str) -> bool {
+    super::common::home_relative_suffix(target).is_some()
+        || super::common::project_relative_suffix(target).is_some()
+}
+
+/// Join a home-relative change target onto an already-resolved home URI,
+/// returning `None` for a target that is not home-relative.
+///
+/// The write handler resolves its home once per batch and may have to move it
+/// mid-batch, so it needs the join without paying for — or being pinned to — the
+/// database lookup [`target_resource_for_request`] performs per item.
+pub(crate) fn resolve_change_target_against_home(home_uri: &str, target: &str) -> Option<String> {
+    super::common::resolve_home_relative_against(home_uri, target)
+}
+
+pub(super) async fn target_resource_for_request(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    item: &ChangeItem,
+) -> Result<CairnResource, String> {
+    let target =
+        super::common::resolve_home_relative_resource_uri(&orch.db, request, &item.target).await?;
+    let routed = match target
+        .strip_prefix("cairn://p/")
+        .and_then(|rest| rest.split('/').next())
+    {
+        Some(project) => orch.db.for_project(project).await,
+        None => orch.db.local.clone(),
+    };
+    let target = match super::threads::resolve_migrated_thread_uri(&routed, &target).await? {
+        Some((resolved, _)) => resolved,
+        None => target,
+    };
+    let resource = parse_uri(&target).ok_or_else(|| {
+        crate::mcp::handlers::resources::resource_uri_hint(&target)
+            .unwrap_or_else(|| format!("Unrecognized URI format: {}", item.target))
+    })?;
+    super::delegate_thread_descendant(resource)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn created_resource_ack_addresses_the_resource_by_uri() {
+        let ack = created_resource_ack(
+            "skill",
+            "rust-dev",
+            &cairn_common::uri::build_project_skill_uri("cairn", "rust-dev", &[]),
+        );
+        assert_eq!(
+            ack,
+            "Created skill 'rust-dev' at cairn://p/cairn/skills/rust-dev"
+        );
+    }
+
+    /// The ack is agent-facing text, so its address must stay a URI: a
+    /// materialization path would name the current checkout, which is neither
+    /// stable nor something the reader can address.
+    #[test]
+    fn created_resource_ack_never_carries_a_filesystem_path() {
+        for uri in [
+            cairn_common::uri::build_skill_uri("local", &[]),
+            cairn_common::uri::build_project_recipe_uri("cairn", "coordinator"),
+            cairn_common::uri::build_agent_uri("build"),
+            cairn_common::uri::build_project_agent_uri("cairn", "build"),
+        ] {
+            let ack = created_resource_ack("resource", "id", &uri);
+            let address = ack
+                .split(" at ")
+                .nth(1)
+                .expect("ack names an address after ' at '");
+            assert!(
+                address.starts_with("cairn://"),
+                "ack must address the resource by URI, got: {ack}"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_string_helpers_handle_aliases_and_trimming() {
+        let payload = serde_json::json!({
+            "name": "  Alpha  ",
+            "snake_name": "beta",
+            "empty": "",
+            "number": 42,
+        });
+
+        assert_eq!(
+            payload_value(&payload, "missing", &["snake_name"]),
+            payload.get("snake_name")
+        );
+        assert_eq!(payload_str(&payload, "name", &[]), Some("  Alpha  "));
+        assert_eq!(
+            payload_trimmed_non_empty_str(&payload, "name", &[]),
+            Some("Alpha")
+        );
+        assert_eq!(payload_non_empty_str(&payload, "empty", &[]), None);
+        assert_eq!(payload_str(&payload, "number", &[]), None);
+    }
+
+    #[test]
+    fn payload_bool_reads_boolean_values_only() {
+        let payload = serde_json::json!({
+            "submit": false,
+            "string_submit": "false",
+        });
+
+        assert_eq!(payload_bool(&payload, "submit"), Some(false));
+        assert_eq!(payload_bool(&payload, "string_submit"), None);
+        assert_eq!(payload_bool(&payload, "missing"), None);
+    }
+}

@@ -1,0 +1,180 @@
+use super::wire::ChatMessage;
+#[cfg(test)]
+use crate::agent_process::stream::TranscriptEvent;
+use crate::backends::http_loop::transcript::{load_prior_rows, ReplayRow};
+use crate::backends::{SessionConfig, SessionStart};
+use crate::orchestrator::Orchestrator;
+pub(crate) use cairn_llm::wire::openai_compat::conversation::*;
+#[cfg(test)]
+use cairn_session::agent_process::stream::TranscriptJson;
+
+/// Why a wholly empty turn is refused instead of assembled.
+const EMPTY_USER_MESSAGE: &str = "Refusing to start a turn with an empty user message: an empty text block is rejected by the provider and would poison every later replay of this conversation.";
+
+/// Concatenate assembled prompt segments into the full system prompt. This is
+/// byte-identical to what `persist_system_prompt_event` records, so the wire
+/// system message equals the persisted/displayed prompt with no drift.
+pub(crate) fn build_conversation_messages(
+    orch: &Orchestrator,
+    config: &SessionConfig,
+    session_id: &str,
+    system_prompt: &str,
+) -> Result<Vec<ChatMessage>, String> {
+    if config.message_content.is_blank() {
+        return Err(EMPTY_USER_MESSAGE.to_string());
+    }
+    let mut messages = vec![ChatMessage::system(system_prompt.to_string())];
+    if !matches!(config.session_start, SessionStart::New { .. }) {
+        messages.extend(load_prior_chat_messages(
+            orch,
+            session_id,
+            &config.run_id,
+            &config.project_id,
+            &config.project_key,
+        )?);
+    }
+    messages.push(ChatMessage::user_content(&config.message_content));
+    Ok(messages)
+}
+
+fn load_prior_chat_messages(
+    orch: &Orchestrator,
+    session_id: &str,
+    current_run_id: &str,
+    project_id: &str,
+    project_key: &str,
+) -> Result<Vec<ChatMessage>, String> {
+    let rows = load_prior_rows(orch, session_id, current_run_id, project_id, project_key)?;
+    let messages = rows
+        .into_iter()
+        .filter_map(|row| match row {
+            ReplayRow::User(content) => Some(ChatMessage::user_content(&content)),
+            ReplayRow::Event { event_type, event } => {
+                transcript_event_to_chat_message(&event_type, *event)
+            }
+        })
+        .collect();
+    Ok(normalize_tool_call_groups(messages))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{LocalDb, SearchIndex};
+    use std::sync::Arc;
+
+    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+        let services = Arc::new(TestServicesBuilder::new().build());
+        OrchestratorBuilder::new(db_state, services, config_dir).build()
+    }
+
+    /// One session, one prior run: the launch prompt that opened the job, then
+    /// the assistant's reply.
+    async fn seed_prior_run(db: &LocalDb, launch_type: &str) {
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at) VALUES('w','W',1,1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p','w','Project','proj','/tmp/repo',1,1);
+            INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+              VALUES('job-1','p','running','sess-1',1,1);
+            INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+              VALUES('sess-1','job-1','active',1,1);
+            INSERT INTO runs(id, project_id, job_id, session_id, status, created_at, updated_at)
+              VALUES('run-1','p','job-1','sess-1','exited',1,1);
+            ",
+        )
+        .await
+        .unwrap();
+        // Serialized from the same struct the storage path builds, so the
+        // fixture cannot drift from what actually lands in `data`.
+        let event_data = |event_type: &str, content: &str| {
+            TranscriptEvent {
+                event_type: event_type.to_string(),
+                session_id: Some("sess-1".to_string()),
+                parent_tool_use_id: None,
+                content: Some(content.to_string()),
+                thinking: None,
+                tool_name: None,
+                tool_input: None,
+                tool_uses: None,
+                tool_use_id: None,
+                tool_result: None,
+                is_error: false,
+                thinking_ms: None,
+                queued_message_id: None,
+                raw: None,
+            }
+            .observed()
+            .to_event_json()
+        };
+        let launch = event_data(launch_type, THE_TASK);
+        let reply = event_data("assistant", "on it");
+        let launch_type = launch_type.to_string();
+        db.write(move |conn| {
+            let launch = launch.clone();
+            let reply = reply.clone();
+            let launch_type = launch_type.clone();
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES('e1','run-1','sess-1',0,1,?1,?2,1)",
+                    cairn_db::turso::params![launch_type.as_str(), launch.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "INSERT INTO events(id, run_id, session_id, sequence, timestamp, event_type, data, created_at)
+                     VALUES('e2','run-1','sess-1',1,2,'assistant',?1,2)",
+                    cairn_db::turso::params![reply.as_str()],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    const THE_TASK: &str = "Fix the panic in the CLI logger before touching anything else.";
+
+    /// A second run on the same session must rebuild a conversation that still
+    /// states the task (CAIRN-3408).
+    ///
+    /// The first request never exercises this path — it carries its prompt
+    /// directly — so a launch prompt missing from replay stays invisible until
+    /// some later turn continues with no idea what it was asked to do. Asserting
+    /// against the old `user` type in the same test proves the reconstruction is
+    /// equivalent, not merely non-empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_run_replays_the_launch_prompt_it_was_started_on() {
+        for launch_type in ["user", crate::transcripts::LAUNCH_EVENT_TYPE] {
+            let db = crate::storage::migrated_test_db("openai-compat-replay.db").await;
+            seed_prior_run(&db, launch_type).await;
+            let orch = test_orchestrator(db);
+
+            let replayed = load_prior_chat_messages(&orch, "sess-1", "run-2", "p", "proj").unwrap();
+
+            assert_eq!(
+                replayed.len(),
+                2,
+                "expected the launch prompt and the reply ({launch_type}): {replayed:?}"
+            );
+            assert_eq!(replayed[0].role, "user", "({launch_type})");
+            assert!(
+                format!("{:?}", replayed[0].content).contains(THE_TASK),
+                "a rebuilt conversation must still state the task ({launch_type}): {replayed:?}"
+            );
+            assert_eq!(replayed[1].role, "assistant", "({launch_type})");
+        }
+    }
+}

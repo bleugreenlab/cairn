@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "parser": "rust-lint",
+  "complete": true,
+  "selection": "unknown",
+  "tests": [],
+  "undeclaredSkips": 0,
+  "failures": [
+    {
+      "name": "src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2811 clippy::cloned_ref_to_slice_refs",
+      "message": "this call to `clone` can be replaced with `std::slice::from_ref`"
+    },
+    {
+      "name": "src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2805 rustfmt",
+      "message": "formatting drift — run `bun run fmt`"
+    }
+  ],
+  "report": "❌ clippy: 1 new finding(s) in your diff\n  src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2811  clippy::cloned_ref_to_slice_refs  this call to `clone` can be replaced with `std::slice::from_ref`\n  ℹ 15 pre-existing finding(s) on the base (not gating; run `CAIRN_CHECK_RAW=1 bun run <check>` to see them all)\n❌ rustfmt: formatting drift in 1 file(s) — run `bun run fmt` to fix.\n  src-tauri/os/cairn-core/src/execution/checks_turn_end.rs:2805\nℹ️  scoped lint: 3 crate(s) — cairn-core, cairn-exec, cairn-app"
+}

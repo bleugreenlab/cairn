@@ -1,0 +1,26 @@
+-- Migration: what a row in `issues` IS (CAIRN-3387)
+--
+-- Shared across the private and team lineages: `issues` is a project-scoped
+-- table both lineages carry, so the column is written once here and composed
+-- into both.
+--
+-- Until now every row in `issues` was the same thing: a unit of work that
+-- branches, produces a pull request, and terminates by merging. A thread is the
+-- other shape -- a durable, objective-free session anchor that owns no branch
+-- and never terminates via PR. The two live in one table because they share
+-- identity (the project-scoped issue number), children, comments, and
+-- executions; `kind` is what tells them apart, and it is the fact every later
+-- surface keys on (branch derivation, attention projection, the issue table).
+--
+-- Deliberately NOT CHECK-constrained. Turso enforces column CHECK at runtime
+-- and ALTER TABLE cannot relax it, so a CHECK here would make every future kind
+-- a full create-copy-swap rebuild of a synced replica table. The accepted set
+-- lives in Rust instead, as `IssueKind`, whose exhaustive matches catch a new
+-- kind at compile time -- a stronger guarantee than the constraint would give.
+--
+-- A plain ADD COLUMN with a NOT NULL default keeps this sync-safe and makes
+-- every pre-existing row read as `issue` with no backfill statement: the
+-- default IS the backfill (see TEAM_TAIL in migrations.rs for why synced
+-- replica tables must not be rebuilt).
+
+ALTER TABLE issues ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue';

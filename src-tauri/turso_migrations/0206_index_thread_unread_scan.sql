@@ -1,0 +1,39 @@
+-- Bound the per-thread unread transcript count so its cost stops tracking
+-- transcript length (CAIRN-4331).
+--
+-- The sidebar's unread badge counts TOP-LEVEL entries after the operator's
+-- watermark, saturating at 100. The cap bounds the ANSWER, but before this index
+-- it did not bound the SCAN: `idx_events_session_id` orders a session's entries
+-- by rowid, so seeking past the watermark is cheap, but `parent_tool_use_id IS
+-- NULL` is not in the index, so every candidate row had to be fetched from the
+-- `events` table just to decide whether it counted. The same predicate sits on
+-- the `MAX(rowid)` that produces the acknowledgeable position, which has no cap
+-- at all and therefore fetched every entry the thread ever recorded.
+--
+-- Measured with `census_cost_at_production_scale` (30 threads, one project):
+--
+--   events/thread     500      1000      2000
+--   unread rollup    24.8ms   48.0ms    97.4ms
+--
+-- Perfectly linear in transcript length, re-paid on every sidebar poll — which
+-- during agent work arrives every 2-3 seconds and never stops.
+--
+-- A partial index carrying exactly the rows the count is allowed to see turns
+-- both halves into index-only work: the count seeks to (session_id, watermark)
+-- and walks at most 100 entries, and the newest position is the last entry in
+-- the session's range. Neither touches the table, and neither can be made
+-- slower by a thread that has been ignored for a month.
+--
+-- The predicate must stay written exactly as `jobs::queries::UNREAD_EVENT_SHAPE`
+-- spells it. Turso only substitutes a partial index when the query's WHERE terms
+-- imply the index's predicate, so a rewording on either side silently drops the
+-- optimization back to a full transcript scan. `thread_unread_rows_use_indexed_access_paths`
+-- asserts the resulting plan, since Turso keeps no table statistics and the plan
+-- is the only evidence the index is load-bearing.
+--
+-- Building this index the first time reads the existing `events` table once. On
+-- the sample workspace behind CAIRN-4331 that is ~1.5M rows and a few seconds of
+-- one-time startup work, against a read cost repaid every few seconds forever.
+CREATE INDEX IF NOT EXISTS idx_events_session_top_level
+    ON events(session_id)
+    WHERE parent_tool_use_id IS NULL;

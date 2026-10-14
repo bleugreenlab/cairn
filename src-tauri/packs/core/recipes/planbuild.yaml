@@ -1,0 +1,100 @@
+cairnVersion: 1
+bundles: [coding]
+name: PlanBuild
+description: Standard plan → implement → PR workflow
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 60@50
+  config:
+    triggerType: manual
+    scope: issue
+- id: planner-1
+  type: agent
+  name: Planner
+  position: 60@220
+  config:
+    agent: planner
+- id: plan-1
+  type: artifact
+  name: Plan
+  position: 190@390
+  config:
+    artifactType: plan
+    schema:
+      properties:
+        content:
+          description: Implementation plan (markdown)
+          type: string
+        summary:
+          description: 1-2 sentence summary
+          type: string
+        title:
+          description: Plan title
+          type: string
+      required:
+      - title
+      - content
+      type: object
+    confirmPolicy: user
+- id: builder-1
+  type: agent
+  name: Builder
+  position: 60@610
+  config:
+    agent: build
+- id: pr-1
+  type: pr
+  name: PR
+  position: 60@760
+  config:
+    actionParams: {}
+    inputSchema:
+      name: create-pr
+      schema:
+        properties:
+          body:
+            description: PR description (markdown)
+            type: string
+          title:
+            description: PR title
+            type: string
+        required:
+        - title
+        - body
+        type: object
+      confirmPolicy: auto
+- id: review-1
+  type: agent
+  name: Review
+  position: 60@970
+  config:
+    agent: pr-review
+    branchMode: inherit
+edges:
+- from: trigger-1@control-out
+  to: planner-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: planner-1@context-in
+  type: context
+- from: planner-1@context-out
+  to: plan-1@context-in
+  type: context
+- from: plan-1@context-out
+  to: builder-1@context-in
+  type: context
+- from: builder-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: builder-1@context-out
+  to: pr-1@context-in
+  type: context
+- from: planner-1@control-out
+  to: builder-1@control-in
+  type: control
+- from: pr-1@open
+  to: review-1@control-in
+  type: control

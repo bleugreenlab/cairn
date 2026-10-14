@@ -1,0 +1,1207 @@
+//! Every provider launches through the cairn-llm facet.
+//!
+//! A recording [`LlmRuntime`] replaces the facet's implementations: a
+//! [`Complete`] that records and refuses, Claude and Codex providers that
+//! record and hand back inert sessions, and a host that spawns nothing. Each
+//! provider in the shipped catalog, plus a custom one, is then launched
+//! through the ordinary `backend_for_name(key).start_session` path, and the
+//! recorder must have seen it. A provider added to the catalog without an
+//! adapter here fails, because `plan` has no answer for it.
+
+use std::io::Read;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+use cairn_llm::codex::app_server::AppServerClient;
+use cairn_llm::interface::complete::{
+    Complete, CompletionCall, CompletionError, CompletionReply, Delivery,
+};
+use cairn_llm::interface::session::{
+    Cli, CodexModels, CodexServer, CodexSessionProvider, LaunchedSession, ProviderSpec,
+    ServerLaunch, SessionControl, SessionError, SessionEvents, SessionFacts, SessionHost,
+    SessionInput, SessionProvider, SessionSpec,
+};
+use cairn_llm::interface::Llm;
+use cairn_llm::types::catalog::{
+    claude_models, DiscoveredWireProtocol, ProviderModelCatalog, CUSTOM_KEY_PREFIX,
+    PROVIDER_CATALOG,
+};
+use cairn_llm::wire::MessageContent;
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use serde_json::{json, Value};
+
+use super::llm::tests::seeded_orchestrator;
+use super::llm::LlmRuntime;
+use super::Orchestrator;
+use crate::agent_process::process::PauseIntent;
+use crate::backends::{
+    backend_for_name, AgentPermissions, CompletionMessage, CompletionRequest, CompletionRole,
+    SessionConfig, SessionStart,
+};
+use crate::credentials::{ActualTargetKind, ApiProvider, ClaudeAuth, CodexAuth, ProviderAuth};
+use crate::identity::UserIdentity;
+use crate::models::{Fence, Model};
+
+const CLAUDE_KEY: &str = "sk-ant-coverage-claude-key";
+const CODEX_KEY: &str = "sk-coverage-codex-key";
+const OPENROUTER_KEY: &str = "sk-or-coverage-key";
+const OPENCODE_KEY: &str = "sk-oc-coverage-key";
+const WAIT: Duration = Duration::from_secs(20);
+
+/// Everything the fakes saw, and the gate that holds an HTTP turn open.
+#[derive(Default)]
+struct Recorder {
+    calls: Mutex<Vec<String>>,
+    released: Mutex<bool>,
+    gate: Condvar,
+    /// Senders that keep each fake session's output open until the test ends.
+    open_outputs: Mutex<Vec<Sender<Vec<u8>>>>,
+    open_notifications: Mutex<Vec<Sender<Value>>>,
+    /// The notification stream of the last app-server started, which a
+    /// tool-free Codex turn answers on.
+    server_notifications: Mutex<Option<Sender<Value>>>,
+}
+
+impl Recorder {
+    fn record(&self, call: impl Into<String>) {
+        self.calls.lock().unwrap().push(call.into());
+    }
+
+    fn saw(&self, call: &str) -> bool {
+        self.calls.lock().unwrap().iter().any(|seen| seen == call)
+    }
+
+    fn wait_for(&self, call: &str) {
+        let deadline = Instant::now() + WAIT;
+        while !self.saw(call) {
+            assert!(
+                Instant::now() < deadline,
+                "never saw {call}; saw {:?}",
+                self.calls.lock().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Hold the calling HTTP turn until the test has looked at it.
+    fn hold(&self) {
+        let mut released = self.released.lock().unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !*released && Instant::now() < deadline {
+            released = self
+                .gate
+                .wait_timeout(released, Duration::from_millis(50))
+                .unwrap()
+                .0;
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.gate.notify_all();
+        self.open_outputs.lock().unwrap().clear();
+        self.open_notifications.lock().unwrap().clear();
+        self.server_notifications.lock().unwrap().take();
+    }
+}
+
+/// What the scripted providers answer a tool-free one-shot with.
+const CLAUDE_ANSWER: &str = "claude answer";
+const CODEX_ANSWER: &str = "codex answer";
+const SCHEMA_ANSWER: &str = r#"{"answer":"yes"}"#;
+
+/// A tool-free Claude one-shot's stream-json: one terminal result, with a
+/// structured output when the spec asked for a schema.
+fn claude_one_shot_output(spec: &SessionSpec) -> Vec<u8> {
+    let mut result = json!({
+        "type": "result", "subtype": "success", "session_id": spec.start.session_id(),
+        "is_error": false, "result": CLAUDE_ANSWER, "total_cost_usd": 0.02,
+        "usage": {"input_tokens": 12, "output_tokens": 5,
+                  "cache_creation_input_tokens": 100, "cache_read_input_tokens": 900}
+    });
+    if spec.output_schema.is_some() {
+        result["structured_output"] = serde_json::from_str(SCHEMA_ANSWER).unwrap();
+    }
+    format!("{result}\n").into_bytes()
+}
+
+/// Answers a tool-free Codex turn on the shared server's notification stream,
+/// the way the app-server would: the final message, usage, completion.
+struct ScriptedCodexTurn {
+    recorder: Arc<Recorder>,
+    thread_id: String,
+    answer: &'static str,
+}
+
+impl SessionControl for ScriptedCodexTurn {
+    fn open_turn(&mut self, _content: &MessageContent) -> Result<(), String> {
+        self.recorder.record("codex:open_turn");
+        let notify = self
+            .recorder
+            .server_notifications
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("a shared server was started");
+        let thread = self.thread_id.as_str();
+        let counts = json!({"totalTokens": 70, "inputTokens": 60, "cachedInputTokens": 40,
+            "outputTokens": 10, "reasoningOutputTokens": 0});
+        for message in [
+            json!({"method": "item/completed", "params": {"threadId": thread,
+                "item": {"id": "m", "type": "agentMessage", "text": self.answer}}}),
+            json!({"method": "thread/tokenUsage/updated", "params": {"threadId": thread,
+                "tokenUsage": {"total": counts, "last": counts}}}),
+            json!({"method": "turn/completed", "params": {"threadId": thread,
+                "turn": {"id": "turn-1", "status": "completed"}}}),
+        ] {
+            notify.send(message).map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+    fn send(&mut self, _input: &SessionInput<'_>) -> Result<(), String> {
+        Err("a one-shot takes one turn".to_string())
+    }
+    fn interrupt(&mut self) -> Result<(), String> {
+        self.recorder.record("codex:interrupt");
+        Ok(())
+    }
+    fn set_model(&mut self, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn set_permission_mode(&mut self, _mode: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+struct RecordingComplete(Arc<Recorder>);
+
+impl Complete for RecordingComplete {
+    fn complete(&self, call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+        let delivery = match call.delivery {
+            Delivery::Stream { .. } => "stream",
+            Delivery::Whole { .. } => "whole",
+        };
+        self.0.record(format!(
+            "complete:{}:{}:{delivery}",
+            call.wire.family(),
+            call.wire.backend_key()
+        ));
+        if delivery == "stream" {
+            self.0.hold();
+        }
+        Err(CompletionError::Upstream("recorded, not sent".to_string()))
+    }
+}
+
+struct RecordingControl {
+    recorder: Arc<Recorder>,
+    provider: &'static str,
+}
+
+impl SessionControl for RecordingControl {
+    fn open_turn(&mut self, _content: &MessageContent) -> Result<(), String> {
+        self.recorder.record(format!("{}:open_turn", self.provider));
+        Ok(())
+    }
+    fn send(&mut self, _input: &SessionInput<'_>) -> Result<(), String> {
+        self.recorder.record(format!("{}:send", self.provider));
+        Ok(())
+    }
+    fn interrupt(&mut self) -> Result<(), String> {
+        self.recorder.record(format!("{}:interrupt", self.provider));
+        Ok(())
+    }
+    fn set_model(&mut self, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn set_permission_mode(&mut self, _mode: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+/// Output that stays open until the recorder releases it.
+struct HeldOutput {
+    rx: Receiver<Vec<u8>>,
+}
+
+impl Read for HeldOutput {
+    fn read(&mut self, _out: &mut [u8]) -> std::io::Result<usize> {
+        let _ = self.rx.recv();
+        Ok(0)
+    }
+}
+
+fn facts(
+    spec: &SessionSpec,
+    provider: &str,
+    backend_session_id: &str,
+    host: &dyn SessionHost,
+) -> SessionFacts {
+    SessionFacts {
+        provider: provider.to_string(),
+        backend_session_id: Some(backend_session_id.to_string()),
+        account_id: spec.account_id.clone(),
+        host: host.name().to_string(),
+        model: spec.model.clone(),
+    }
+}
+
+struct RecordingClaude(Arc<Recorder>);
+
+impl SessionProvider for RecordingClaude {
+    fn open(
+        &self,
+        host: &dyn SessionHost,
+        spec: SessionSpec,
+    ) -> Result<LaunchedSession, SessionError> {
+        self.0.record("claude:open");
+        if spec.secrets.contains_value(CLAUDE_KEY) {
+            self.0.record("claude:credential");
+        }
+        if spec.mcp.is_none() {
+            let ProviderSpec::Claude(claude) = &spec.provider else {
+                panic!("a Claude launch opened a {:?}", spec.provider);
+            };
+            assert!(matches!(
+                claude.mode,
+                cairn_llm::interface::session::ClaudeMode::OneShot { .. }
+            ));
+            assert!(
+                claude.allowed_tools.is_empty(),
+                "a tool-free session allows nothing"
+            );
+            assert!(claude.disallowed_tools.contains(&"Bash".to_string()));
+            assert!(claude.hook_settings.is_none());
+            self.0.record("claude:tool_free");
+            if spec.secrets.names().any(|name| name == "CLAUDE_CONFIG_DIR") {
+                self.0.record("claude:managed_home");
+            }
+            return Ok(LaunchedSession {
+                control: Box::new(RecordingControl {
+                    recorder: self.0.clone(),
+                    provider: "claude",
+                }),
+                events: SessionEvents::ClaudeStream {
+                    stdout: Box::new(std::io::Cursor::new(claude_one_shot_output(&spec))),
+                    stderr: None,
+                },
+                process: Arc::new(Mutex::new(None)),
+                facts: facts(&spec, "claude", "claude-one-shot", host),
+            });
+        }
+        let (tx, rx) = unbounded();
+        self.0.open_outputs.lock().unwrap().push(tx);
+        Ok(LaunchedSession {
+            control: Box::new(RecordingControl {
+                recorder: self.0.clone(),
+                provider: "claude",
+            }),
+            events: SessionEvents::ClaudeStream {
+                stdout: Box::new(std::io::BufReader::new(HeldOutput { rx })),
+                stderr: None,
+            },
+            process: Arc::new(Mutex::new(None)),
+            facts: facts(&spec, "claude", "claude-session", host),
+        })
+    }
+}
+
+struct RecordingCodex(Arc<Recorder>);
+
+impl SessionProvider for RecordingCodex {
+    fn open(
+        &self,
+        host: &dyn SessionHost,
+        spec: SessionSpec,
+    ) -> Result<LaunchedSession, SessionError> {
+        self.0.record("codex:open");
+        let ProviderSpec::Codex(codex) = &spec.provider else {
+            panic!("a Codex launch opened a {:?}", spec.provider);
+        };
+        let (client, notifications) = match &codex.server {
+            CodexServer::Dedicated(client) => {
+                self.0.record("codex:dedicated");
+                let (tx, rx) = unbounded();
+                self.0.open_notifications.lock().unwrap().push(tx);
+                (client.clone(), Some(rx))
+            }
+            CodexServer::Shared(client) => {
+                self.0.record("codex:shared");
+                (client.clone(), None)
+            }
+        };
+        if spec.mcp.is_none() {
+            assert!(
+                matches!(codex.server, CodexServer::Shared(_)),
+                "a Codex one-shot runs on the pool"
+            );
+            self.0.record("codex:tool_free");
+            return Ok(LaunchedSession {
+                control: Box::new(ScriptedCodexTurn {
+                    recorder: self.0.clone(),
+                    thread_id: "codex-one-shot".to_string(),
+                    answer: if spec.output_schema.is_some() {
+                        SCHEMA_ANSWER
+                    } else {
+                        CODEX_ANSWER
+                    },
+                }),
+                events: SessionEvents::CodexAppServer {
+                    client,
+                    notifications,
+                    current_turn: Arc::new(Mutex::new(None)),
+                },
+                process: Arc::new(Mutex::new(None)),
+                facts: facts(&spec, "codex", "codex-one-shot", host),
+            });
+        }
+        Ok(LaunchedSession {
+            control: Box::new(RecordingControl {
+                recorder: self.0.clone(),
+                provider: "codex",
+            }),
+            events: SessionEvents::CodexAppServer {
+                client,
+                notifications,
+                current_turn: Arc::new(Mutex::new(None)),
+            },
+            process: Arc::new(Mutex::new(None)),
+            facts: facts(&spec, "codex", "codex-thread", host),
+        })
+    }
+}
+
+impl CodexSessionProvider for RecordingCodex {
+    fn start_server(
+        &self,
+        _host: &dyn SessionHost,
+        launch: ServerLaunch<'_>,
+    ) -> Result<Arc<AppServerClient>, SessionError> {
+        self.0.record("codex:start_server");
+        if launch
+            .login
+            .is_some_and(|login| login.expose()["apiKey"] == CODEX_KEY)
+        {
+            self.0.record("codex:login");
+        }
+        let (client, notifications) = AppServerClient::for_test_with_notifications(
+            |_| Ok(json!({"result": {}})),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        *self.0.server_notifications.lock().unwrap() = Some(notifications);
+        Ok(Arc::new(client))
+    }
+}
+
+/// A host that runs nothing.
+struct InertHost;
+
+impl SessionHost for InertHost {
+    fn name(&self) -> &str {
+        "coverage-host"
+    }
+    fn resolve_cli(&self, cli: Cli) -> Result<String, SessionError> {
+        Ok(format!("/coverage/{cli:?}"))
+    }
+    fn spawn(
+        &self,
+        _config: cairn_platform::services::process::SpawnConfig,
+    ) -> Result<Box<dyn cairn_platform::services::process::ChildProcess>, String> {
+        Err("a coverage launch must not spawn a process".to_string())
+    }
+    fn place_file(&self, dir: &str, name: &str, _contents: &[u8]) -> Result<String, String> {
+        Ok(format!("{dir}/{name}"))
+    }
+    /// A clean host: no model catalog exists until a signed-in refresh writes
+    /// one, which is what hardening the home needs.
+    fn prepare_codex_home(&self, models: CodexModels<'_>) -> Result<String, SessionError> {
+        match models {
+            CodexModels::Refresh { login: Some(_) } => Ok("/coverage/codex-home".to_string()),
+            _ => Err(SessionError::Setup(
+                "Codex did not produce a model catalog for hardening".to_string(),
+            )),
+        }
+    }
+}
+
+/// The model a provider is launched with, and what its launch must show.
+struct Plan {
+    model: &'static str,
+    /// Recorder calls the launch must produce.
+    launch: Vec<String>,
+    /// The one-shot completion call, for providers that serve one.
+    one_shot: Option<String>,
+    /// Whether the session has a warm writer to send to and interrupt.
+    warm: Option<&'static str>,
+}
+
+fn plan(key: &str) -> Plan {
+    let http = |model: &'static str, key: &str| Plan {
+        model,
+        launch: vec![format!("complete:chat:{key}:stream")],
+        one_shot: Some(format!("complete:chat:{key}:whole")),
+        warm: None,
+    };
+    match key {
+        "claude" => Plan {
+            model: "sonnet",
+            launch: vec![
+                "claude:open".into(),
+                "claude:credential".into(),
+                "claude:open_turn".into(),
+            ],
+            one_shot: None,
+            warm: Some("claude"),
+        },
+        "codex" => Plan {
+            model: "gpt-coverage",
+            launch: vec![
+                "codex:start_server".into(),
+                "codex:login".into(),
+                "codex:open".into(),
+                "codex:dedicated".into(),
+                "codex:open_turn".into(),
+            ],
+            one_shot: None,
+            warm: Some("codex"),
+        },
+        "openrouter" => http("openai/gpt-coverage", key),
+        "opencode-go" => http("glm-coverage", key),
+        "ollama" => http("qwen3:32b", key),
+        "actual" => http("coverage-model", key),
+        custom if custom.starts_with(CUSTOM_KEY_PREFIX) => http("qwen3.8-27b", custom),
+        other => panic!(
+            "provider {other} is in the shipped catalog but has no launch coverage: give it an \
+             adapter over the cairn-llm facet and a plan here"
+        ),
+    }
+}
+
+async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
+    let mut orch = seeded_orchestrator().await;
+    orch.llm_runtime = LlmRuntime {
+        complete: Arc::new(RecordingComplete(recorder.clone())),
+        claude: Arc::new(RecordingClaude(recorder.clone())),
+        codex: Arc::new(RecordingCodex(recorder.clone())),
+        host: Arc::new(InertHost),
+    };
+    for (provider, label, auth) in [
+        (
+            ApiProvider::OpenRouter,
+            "OpenRouter",
+            ProviderAuth::ApiKey {
+                value: OPENROUTER_KEY.into(),
+            },
+        ),
+        (
+            ApiProvider::OpenCode,
+            "OpenCode Go",
+            ProviderAuth::ApiKey {
+                value: OPENCODE_KEY.into(),
+            },
+        ),
+        (
+            ApiProvider::Ollama,
+            "Ollama box",
+            ProviderAuth::BaseUrl {
+                url: "http://127.0.0.1:9".into(),
+            },
+        ),
+        (
+            ApiProvider::Actual,
+            "Actual box",
+            ProviderAuth::ActualTarget {
+                kind: ActualTargetKind::Local,
+                base_url: "http://127.0.0.1:9".into(),
+                api_key: None,
+                cluster_id: None,
+            },
+        ),
+    ] {
+        orch.add_account(provider, label.into(), auth, None)
+            .unwrap();
+    }
+    let mut glm = claude_models().remove(0);
+    glm.id = "glm-coverage".into();
+    glm.model = "glm-coverage".into();
+    glm.supported_parameters = vec!["tools".into()];
+    glm.wire_protocol = Some(DiscoveredWireProtocol::OpenAiChatCompletions);
+    orch.model_catalog.write().unwrap().insert(
+        "opencode-go".to_string(),
+        ProviderModelCatalog {
+            backend: "opencode-go".to_string(),
+            models: vec![glm],
+            options: Vec::new(),
+            refreshed_at: Some(1),
+            error: None,
+        },
+    );
+    let custom = orch
+        .list_accounts(None)
+        .into_iter()
+        .find(|account| account.label == "DGX Spark")
+        .expect("the seeded custom provider")
+        .id;
+    (orch, format!("{CUSTOM_KEY_PREFIX}{custom}"))
+}
+
+fn identity() -> UserIdentity {
+    UserIdentity {
+        user_id: "coverage-user".into(),
+        email: "coverage@example.com".into(),
+        name: "Coverage".into(),
+        claude_auth: Some(ClaudeAuth::ApiKey(CLAUDE_KEY.into())),
+        codex_auth: Some(CodexAuth::ApiKey(CODEX_KEY.into())),
+        github_token: None,
+    }
+}
+
+fn config(run_id: &str, session_id: &str, model: &str, ephemeral: bool) -> SessionConfig {
+    SessionConfig {
+        run_id: run_id.to_string(),
+        working_dir: "/tmp".to_string(),
+        project_id: "project-coverage".to_string(),
+        project_key: "COVERAGE".to_string(),
+        prompt: "hi".to_string(),
+        goal_objective: None,
+        clear_native_goal: false,
+        message_content: MessageContent::text("hi"),
+        system_prompt_content: None,
+        system_prompt_dynamic_tail: None,
+        model: Some(Model::new(model)),
+        session_start: SessionStart::New {
+            session_id: session_id.to_string(),
+        },
+        allowed_tools: Vec::new(),
+        disallowed_tools: Vec::new(),
+        mcp: crate::config::mcp_setup::stdio_attachment(
+            "cairn-cmd",
+            3849,
+            None,
+            "dev",
+            None,
+            "standard",
+        ),
+        mcp_bearer: None,
+        home_uri: "cairn://p/COVERAGE/1/1/builder".to_string(),
+        max_thinking_tokens: None,
+        reasoning_effort: None,
+        service_tier: None,
+        permissions: AgentPermissions::new(Fence::Allow),
+        bidirectional: true,
+        identity: Some(identity()),
+        output_schema: None,
+        ambient: false,
+        is_ephemeral_call: ephemeral,
+    }
+}
+
+async fn seed_run(orch: &Orchestrator, run_id: &str, session_id: &str) {
+    let (run_id, session_id) = (run_id.to_string(), session_id.to_string());
+    orch.db
+        .local
+        .write(move |conn| {
+            let (run_id, session_id) = (run_id.clone(), session_id.clone());
+            Box::pin(async move {
+                conn.execute(
+                    "INSERT INTO runs(id, status, session_id, created_at, updated_at)
+                     VALUES (?1, 'starting', ?2, 1, 1)",
+                    (run_id.as_str(), session_id.as_str()),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+}
+
+/// Every text value the launches could have written: events, runs, sessions.
+async fn stored_text(orch: &Orchestrator) -> String {
+    orch.db
+        .local
+        .read(|conn| {
+            Box::pin(async move {
+                let mut all = String::new();
+                for sql in [
+                    "SELECT COALESCE(group_concat(COALESCE(data, ''), ' '), '') FROM events",
+                    "SELECT COALESCE(group_concat(COALESCE(error_message, '') || ' ' || COALESCE(exit_reason, ''), ' '), '') FROM runs",
+                    "SELECT COALESCE(group_concat(COALESCE(backend_id, '') || ' ' || COALESCE(account_id, ''), ' '), '') FROM sessions",
+                ] {
+                    let mut rows = conn.query(sql, ()).await?;
+                    if let Some(row) = rows.next().await? {
+                        all.push_str(&row.get::<String>(0)?);
+                        all.push(' ');
+                    }
+                }
+                Ok(all)
+            })
+        })
+        .await
+        .unwrap()
+}
+
+fn view(orch: &Orchestrator, run_id: &str) -> cairn_llm::interface::SessionView {
+    orch.sessions()
+        .into_iter()
+        .find(|view| view.run_id == run_id)
+        .unwrap_or_else(|| panic!("no live session for {run_id}"))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_catalog_provider_launches_through_the_facet() {
+    let recorder = Arc::new(Recorder::default());
+    let (orch, custom_key) = orchestrator(&recorder).await;
+    let keys: Vec<String> = PROVIDER_CATALOG
+        .iter()
+        .map(|descriptor| descriptor.key.to_string())
+        .chain(std::iter::once(custom_key.clone()))
+        .collect();
+
+    for key in &keys {
+        let plan = plan(key);
+        let run_id = format!("run-{key}");
+        let session_id = format!("session-{key}");
+        seed_run(&orch, &run_id, &session_id).await;
+        let backend = backend_for_name(Some(key));
+        let (launch_orch, launch_config) = (
+            orch.clone(),
+            config(&run_id, &session_id, plan.model, false),
+        );
+        tokio::task::spawn_blocking(move || backend.start_session(launch_config, &launch_orch))
+            .await
+            .unwrap()
+            .unwrap_or_else(|error| panic!("{key} did not launch: {error}"));
+        for call in &plan.launch {
+            recorder.wait_for(call);
+        }
+
+        if let Some(provider) = plan.warm {
+            let state = orch.process_state.clone();
+            let (run, session) = (run_id.clone(), session_id.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::backends::stdin::send_user_message(
+                    &state,
+                    &run,
+                    &MessageContent::text("warm"),
+                    &session,
+                    None,
+                )
+                .unwrap();
+                crate::backends::stdin::send_interrupt(&state, &run, PauseIntent::Reassert)
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            assert!(recorder.saw(&format!("{provider}:send")), "{key} warm send");
+            assert!(
+                recorder.saw(&format!("{provider}:interrupt")),
+                "{key} interrupt"
+            );
+        }
+
+        if let Some(call) = plan.one_shot {
+            let backend = backend_for_name(Some(key));
+            let (one_shot_orch, model) = (orch.clone(), plan.model.to_string());
+            let outcome = tokio::task::spawn_blocking(move || {
+                backend.complete(
+                    CompletionRequest {
+                        system: None,
+                        messages: vec![CompletionMessage {
+                            role: CompletionRole::User,
+                            content: "hi".to_string(),
+                        }],
+                        model,
+                        project_id: None,
+                        extras: Value::Null,
+                        output_schema: None,
+                        timeout: Duration::from_secs(5),
+                    },
+                    &one_shot_orch,
+                )
+            })
+            .await
+            .unwrap();
+            assert!(outcome.is_err(), "{key}: the recorder refuses every call");
+            assert!(recorder.saw(&call), "{key} one-shot did not reach Complete");
+        }
+    }
+
+    // The pooled Codex call path starts its server and opens its thread
+    // through the same provider, on a shared server.
+    seed_run(&orch, "run-codex-call", "session-codex-call").await;
+    let (call_orch, call_config) = (
+        orch.clone(),
+        config("run-codex-call", "session-codex-call", "gpt-coverage", true),
+    );
+    tokio::task::spawn_blocking(move || {
+        backend_for_name(Some("codex")).start_session(call_config, &call_orch)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    recorder.wait_for("codex:shared");
+
+    // Live sessions report their launch facts, not a database guess.
+    assert_eq!(
+        view(&orch, "run-claude").backend_session_id.as_deref(),
+        Some("claude-session")
+    );
+    orch.process_state
+        .set_backend_session_id("run-claude", "claude-confirmed");
+    assert_eq!(
+        view(&orch, "run-claude").backend_session_id.as_deref(),
+        Some("claude-confirmed"),
+        "the Claude reader's confirmation reaches the view"
+    );
+    let codex = view(&orch, "run-codex");
+    assert_eq!(codex.backend_session_id.as_deref(), Some("codex-thread"));
+    assert_eq!(codex.host, "coverage-host");
+    let custom = view(&orch, &format!("run-{custom_key}"));
+    assert_eq!(
+        custom.account_id.as_deref(),
+        custom_key.strip_prefix(CUSTOM_KEY_PREFIX),
+        "an HTTP session names the account its connection chose"
+    );
+    assert_eq!(
+        custom.backend_session_id.as_deref(),
+        Some(format!("session-{custom_key}").as_str())
+    );
+
+    recorder.release();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Secrets reached the providers (checked above) and nothing stored.
+    let stored = stored_text(&orch).await;
+    for secret in [CLAUDE_KEY, CODEX_KEY, OPENROUTER_KEY, OPENCODE_KEY] {
+        assert!(!stored.contains(secret), "{secret} reached a stored row");
+    }
+}
+
+fn one_shot_request(model: &str, output_schema: Option<Value>) -> CompletionRequest {
+    CompletionRequest {
+        system: None,
+        messages: vec![CompletionMessage {
+            role: CompletionRole::User,
+            content: "hi".to_string(),
+        }],
+        model: model.to_string(),
+        project_id: None,
+        extras: Value::Null,
+        output_schema,
+        timeout: Duration::from_secs(5),
+    }
+}
+
+async fn complete_on(
+    orch: &Orchestrator,
+    key: &'static str,
+    request: CompletionRequest,
+) -> Result<crate::backends::CompletionOutcome, CompletionError> {
+    let orch = orch.clone();
+    tokio::task::spawn_blocking(move || backend_for_name(Some(key)).complete(request, &orch))
+        .await
+        .unwrap()
+}
+
+/// Rows a one-shot must never write.
+async fn session_rows(orch: &Orchestrator) -> i64 {
+    let mut total = 0;
+    for table in ["runs", "sessions", "events"] {
+        total += orch
+            .db
+            .local
+            .query_opt_i64(format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
+            .unwrap()
+            .unwrap_or(0);
+    }
+    total
+}
+
+/// Claude and Codex serve a response as one tool-free round trip through the
+/// facet, on the account Cairn routes to, with the credential only
+/// subscription support presents, and without a run, session, or event.
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_and_codex_serve_responses_through_the_facet() {
+    use cairn_llm::subscription::testing::TempHomes;
+
+    let recorder = Arc::new(Recorder::default());
+    let mut orch = super::llm::tests::bare_orchestrator().await;
+    orch.llm_runtime = LlmRuntime {
+        complete: Arc::new(RecordingComplete(recorder.clone())),
+        claude: Arc::new(RecordingClaude(recorder.clone())),
+        codex: Arc::new(RecordingCodex(recorder.clone())),
+        host: Arc::new(InertHost),
+    };
+    let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
+    orch.subscriptions = Arc::new(homes.clone());
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(vec!["claude".to_string(), "codex".to_string()]),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // With no account, both refuse, naming where to fix it, and nothing opens.
+    for key in ["claude", "codex"] {
+        let backend = backend_for_name(Some(key));
+        let reason = backend
+            .response_completion_availability(&orch, None)
+            .unwrap_err();
+        assert!(reason.contains("Settings → Providers"), "{key}: {reason}");
+        assert!(complete_on(&orch, key, one_shot_request("m", None))
+            .await
+            .is_err());
+    }
+    // The default `sm` tier, the way thread era summaries ask for it.
+    let era = crate::responses::parse_definition(
+        "---\nname: Coverage\ndescription: a coverage response\ntimeout: 30s\n---\nSay hi",
+    )
+    .unwrap();
+    let refused = crate::responses::invoke_definition(
+        &orch,
+        &era,
+        &json!({}),
+        "builtin:coverage",
+        crate::responses::ResponseCaller::Internal {
+            label: "coverage".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            crate::responses::ResponseError::BackendUnavailable(_)
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        recorder.calls.lock().unwrap().is_empty(),
+        "nothing launched"
+    );
+
+    // A signed-in Claude subscription, and an OpenAI API key for Codex.
+    let profile = orch
+        .add_account(
+            ApiProvider::Anthropic,
+            "Max".into(),
+            ProviderAuth::ClaudeProfile { oauth: None },
+            None,
+        )
+        .unwrap();
+    homes.sign_in(&profile.id);
+    let openai = orch
+        .add_account(
+            ApiProvider::OpenAI,
+            "OpenAI key".into(),
+            ProviderAuth::ApiKey {
+                value: CODEX_KEY.into(),
+            },
+            None,
+        )
+        .unwrap();
+    for (key, model) in [("claude", "haiku"), ("codex", "gpt-coverage")] {
+        let backend = backend_for_name(Some(key));
+        backend
+            .response_completion_availability(&orch, None)
+            .unwrap_or_else(|error| panic!("{key}: {error}"));
+        backend
+            .response_model_availability(&orch, None, model)
+            .unwrap_or_else(|error| panic!("{key}: {error}"));
+    }
+    let capabilities = crate::responses::model_capabilities(&orch, None, None, None);
+    let claude = capabilities
+        .backends
+        .iter()
+        .find(|backend| backend.backend == "claude")
+        .unwrap();
+    assert!(claude.runnable, "{:?}", claude.unavailable_reason);
+    assert!(claude
+        .selections
+        .iter()
+        .any(|selection| selection.kind == "tier" && selection.runnable));
+
+    // Claude: text, and a schema's structured output as the answer.
+    let plain = complete_on(&orch, "claude", one_shot_request("haiku", None))
+        .await
+        .unwrap();
+    assert_eq!(plain.text, CLAUDE_ANSWER);
+    assert_eq!(plain.account_id.as_deref(), Some(profile.id.as_str()));
+    assert_eq!(plain.tokens.input, Some(1012), "the whole prompt");
+    assert_eq!(plain.tokens.output, Some(5));
+    assert_eq!(plain.cost, None, "a subscription's cost is notional");
+    let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
+    let structured = complete_on(
+        &orch,
+        "claude",
+        one_shot_request("haiku", Some(schema.clone())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(structured.parsed, Some(json!({"answer": "yes"})));
+    assert_eq!(structured.text, SCHEMA_ANSWER);
+    for call in ["claude:open", "claude:tool_free", "claude:managed_home"] {
+        assert!(recorder.saw(call), "never saw {call}");
+    }
+
+    // Codex: a runless thread on the pool, signed in with the routed key.
+    let codex = complete_on(&orch, "codex", one_shot_request("gpt-coverage", None))
+        .await
+        .unwrap();
+    assert_eq!(codex.text, CODEX_ANSWER);
+    assert_eq!(codex.account_id.as_deref(), Some(openai.id.as_str()));
+    assert_eq!(codex.tokens.input, Some(60));
+    assert_eq!(codex.tokens.output, Some(10));
+    let codex_structured = complete_on(
+        &orch,
+        "codex",
+        one_shot_request("gpt-coverage", Some(schema)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(codex_structured.parsed, Some(json!({"answer": "yes"})));
+    for call in [
+        "codex:start_server",
+        "codex:login",
+        "codex:open",
+        "codex:shared",
+        "codex:tool_free",
+        "codex:open_turn",
+    ] {
+        assert!(recorder.saw(call), "never saw {call}");
+    }
+    assert_eq!(
+        orch.codex_pool
+            .binding_for_thread("codex-one-shot")
+            .map(|b| b.run_id),
+        None,
+        "a one-shot binds no run"
+    );
+
+    // A journaled response names its account, and nothing else was written.
+    let journaled = crate::responses::invoke_definition(
+        &orch,
+        &era,
+        &json!({}),
+        "builtin:coverage",
+        crate::responses::ResponseCaller::Internal {
+            label: "coverage".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let rows = crate::storage::list_response_invocations(
+        &orch.db.local,
+        "workspace",
+        "builtin:coverage",
+        10,
+    )
+    .await
+    .unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.seq == journaled.seq)
+        .expect("the journaled row");
+    assert_eq!(row.status, "ok");
+    assert!(
+        [profile.id.as_str(), openai.id.as_str()]
+            .contains(&row.account_id.as_deref().unwrap_or("")),
+        "the serving account is journaled: {:?}",
+        row.account_id
+    );
+    assert_eq!(session_rows(&orch).await, 0);
+
+    recorder.release();
+}
+
+/// A workflow AI condition is the built-in response `builtin:workflow-condition`:
+/// with no account it refuses without launching anything, and with a Claude
+/// subscription it answers through the facet on that account. Both outcomes are
+/// journaled against the execution's project.
+#[tokio::test(flavor = "multi_thread")]
+async fn workflow_conditions_are_responses_on_a_routed_account() {
+    use cairn_llm::subscription::testing::TempHomes;
+    use cairn_workflow::runtime::AiConditionRequest;
+
+    let recorder = Arc::new(Recorder::default());
+    let mut orch = super::llm::tests::bare_orchestrator().await;
+    orch.llm_runtime = LlmRuntime {
+        complete: Arc::new(RecordingComplete(recorder.clone())),
+        claude: Arc::new(RecordingClaude(recorder.clone())),
+        codex: Arc::new(RecordingCodex(recorder.clone())),
+        host: Arc::new(InertHost),
+    };
+    let homes = TempHomes::new(orch.config_dir.join("claude-profiles"));
+    orch.subscriptions = Arc::new(homes.clone());
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(vec!["claude".to_string()]),
+        ..Default::default()
+    })
+    .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p1', 'default', 'P', 'P', ?1, 1, 1)",
+            (repo.path().to_string_lossy().to_string(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute(
+            "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq)
+             VALUES ('e1', 'r', 'p1', 'running', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+    let request = AiConditionRequest {
+        execution_id: "e1".into(),
+        node_id: "n1".into(),
+        node_name: "Touches the database?".into(),
+        question: "Does the issue mention a database?".into(),
+        ports: vec!["yes".into(), "no".into()],
+        context: "{}".into(),
+        model: None,
+    };
+    let journal = || async {
+        crate::storage::list_response_invocations(
+            &orch.db.local,
+            "project:p1",
+            crate::workflow_condition::RESPONSE_ID,
+            10,
+        )
+        .await
+        .unwrap()
+    };
+
+    let refused = crate::workflow_condition::complete_condition(&orch, request.clone())
+        .await
+        .unwrap_err();
+    assert!(
+        refused.starts_with("AI condition 'Touches the database?' can't run: no configured account can serve the 'sm' tier"),
+        "{refused}"
+    );
+    assert!(refused.contains("Settings → Providers"), "{refused}");
+    assert!(
+        recorder.calls.lock().unwrap().is_empty(),
+        "a refusal launches nothing"
+    );
+    let rows = journal().await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    assert_eq!(rows[0].caller_kind, "workflow");
+    assert_eq!(rows[0].caller_run_id, None);
+    assert_eq!(rows[0].project_id.as_deref(), Some("p1"));
+    assert_eq!(
+        rows[0].backend.as_deref(),
+        Some("claude"),
+        "sm resolves to claude"
+    );
+    assert!(rows[0]
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("Settings → Providers")));
+
+    let profile = orch
+        .add_account(
+            ApiProvider::Anthropic,
+            "Max".into(),
+            ProviderAuth::ClaudeProfile { oauth: None },
+            None,
+        )
+        .unwrap();
+    homes.sign_in(&profile.id);
+    let answer = crate::workflow_condition::complete_condition(&orch, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(answer, CLAUDE_ANSWER);
+    assert!(recorder.saw("claude:open") && recorder.saw("claude:tool_free"));
+    let rows = journal().await;
+    let served = rows
+        .iter()
+        .find(|row| row.status == "ok")
+        .expect("an ok row");
+    assert_eq!(served.backend.as_deref(), Some("claude"));
+    assert_eq!(served.account_id.as_deref(), Some(profile.id.as_str()));
+    assert_eq!(
+        served.caller_label.as_deref(),
+        Some("condition 'Touches the database?' in execution e1")
+    );
+    assert!(served
+        .rendered_prompt
+        .contains("Answer with EXACTLY one word from this list: yes, no"));
+
+    // An exact pin the discovery catalog doesn't list (it lists only the
+    // Claude aliases) still runs: eligibility is the account, not the catalog.
+    let versioned = "claude-sonnet-4-5-20250929";
+    let pinned = crate::workflow_condition::complete_condition(
+        &orch,
+        AiConditionRequest {
+            model: Some(versioned.into()),
+            ..request.clone()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(pinned, CLAUDE_ANSWER);
+    assert!(journal()
+        .await
+        .iter()
+        .any(|row| row.status == "ok" && row.model.as_deref() == Some(versioned)));
+
+    // Removing Claude stops every Claude selection even though the signed-in
+    // account remains: the exact pin and the explicit `claude/sm` refuse, and
+    // the default tier moves to the one provider left (OpenRouter, with no
+    // key) and refuses there. None launches, and each is journaled.
+    orch.update_settings(crate::models::UpdateSettings {
+        enabled_providers: Some(vec!["openrouter".to_string()]),
+        tier_defaults: Some(
+            ["sm", "md", "lg"]
+                .into_iter()
+                .map(|tier| (tier.to_string(), "openrouter".to_string()))
+                .collect(),
+        ),
+        ..Default::default()
+    })
+    .unwrap();
+    let launches = recorder.calls.lock().unwrap().len();
+    for model in [Some(versioned), Some("claude/sm"), None] {
+        let before = journal().await.len();
+        let refused = crate::workflow_condition::complete_condition(
+            &orch,
+            AiConditionRequest {
+                model: model.map(str::to_string),
+                ..request.clone()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.contains("can't run") && refused.contains("Settings → Providers"),
+            "{model:?}: {refused}"
+        );
+        let rows = journal().await;
+        assert_eq!(rows.len(), before + 1, "{model:?} is journaled");
+        let row = rows.iter().max_by_key(|row| row.seq).unwrap();
+        assert_eq!(row.status, "failed", "{model:?}");
+        assert!(row.error.is_some(), "{model:?}");
+    }
+    assert_eq!(
+        recorder.calls.lock().unwrap().len(),
+        launches,
+        "a disabled provider launches nothing"
+    );
+    assert_eq!(session_rows(&orch).await, 0);
+
+    recorder.release();
+}

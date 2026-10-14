@@ -1,0 +1,56 @@
+[package]
+name = "cairn-db"
+version.workspace = true
+edition = "2021"
+description = "Cairn database records, domain conversions, and Turso + Tantivy storage"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "mcp"]
+
+[dependencies]
+cairn-models = { path = "../cairn-models" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+sha2 = "0.10"
+async-trait = "0.1"
+thiserror = "2"
+log = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+# Full-text search index. Descends here from cairn-core so its ~22s compile edge
+# moves out of the core hot path (the whole point of the extraction).
+tantivy = "0.26.1"
+# Embedded Turso — the local DB engine and authoritative revision pin.
+# The test provisioner reads this pin; sync-supervisor must build the same rev
+# (CAIRN-2147 ABI invariant). This revision includes upstream's MVCC checkpoint
+# rollback repair: stage root-map mutations until pager commit and clear pending
+# reads on teardown (CAIRN-3838).
+turso = { git = "https://github.com/tursodatabase/turso", rev = "964faddd16b20ed7d5c090a879a138dbabeee508", default-features = false, features = ["sync"] }
+# Direct rustls handle so `LocalDb::ensure_crypto_provider` can install a
+# process-wide default `CryptoProvider` before turso's sync TLS client is built.
+# See the doc comment on `ensure_crypto_provider` in storage/local_db.rs.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+# Scratch dirs for `migrated_test_db` and the content store. A NORMAL dep (not
+# dev-only) because the `test-utils`-gated `migrated_test_db` helper is compiled
+# into cross-crate test-utils builds where dev-deps are absent (mirrors cairn-codec).
+tempfile = "3"
+cairn-common = { path = "../cairn-common" }
+# The gix + zstd event-codec/object substrate; storage/events re-exports it.
+cairn-codec = { path = "../cairn-codec" }
+# Mints and matches the feed acknowledgement token. Agents copy that token out of
+# a rendered page and back into a mutation, so its form is a cost and a
+# transcription-fidelity question, not merely a uniqueness one.
+unigram = "0.2"
+
+[dev-dependencies]
+cairn-codec = { path = "../cairn-codec", features = ["test-utils"] }
+
+[features]
+# Exposes InMemoryContentStore, event_fixture, events::testutil, reconstruct_fixture,
+# and migrated_test_db for cross-crate test-utils consumers (cairn-core's tests);
+# mirrors cairn-core's / cairn-codec's test-utils gate.
+test-utils = ["cairn-codec/test-utils"]

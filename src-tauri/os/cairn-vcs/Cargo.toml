@@ -1,0 +1,43 @@
+[package]
+name = "cairn-vcs"
+version.workspace = true
+edition = "2021"
+description = "Repository operations and publication transactions for Cairn"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "vcs"]
+
+[features]
+test-utils = ["cairn-platform/test-utils"]
+
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+cairn-platform = { path = "../cairn-platform" }
+log = "0.4"
+# Pure-Rust three-way text merge, for the ADVISORY merge preview `cairn:~/rebase`
+# serves and for the invariant that decides whether taking a branch's committed
+# tip whole would discard incoming work. Chosen over shelling out to
+# `git merge-file` because both live in a read path that must not touch a
+# checkout; neither is more authoritative than the other, since the real replay
+# is judged by jj's own merge.
+diffy = "0.5"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+# The runner must read an unreferenced Git commit by backend ID and rewrite one
+# jj working-copy commit without manufacturing a Git ref. jj-lib owns that
+# transaction here so its gix-heavy graph never enters cairn-core directly.
+# Keep this exactly aligned with the bundled jj sidecar in scripts/fetch-jj.ts.
+jj-lib = "=0.42.0"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "time"] }
+# gix's broad kstring range otherwise selects 2.0.3, whose MSRV is newer than
+# the toolchain supported by jj-lib 0.42/Cairn.
+kstring = "=2.0.2"
+
+[dev-dependencies]
+serde_json = "1"
+cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serial_test = "3"
+libc = "0.2"

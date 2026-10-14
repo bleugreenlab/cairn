@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "content": {
+      "type": "string",
+      "description": "The result or output of the task"
+    }
+  },
+  "required": ["content"]
+}

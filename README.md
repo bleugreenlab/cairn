@@ -1,42 +1,116 @@
 # Cairn
 
-Agent orchestration engine in Rust.
+The Rust crates of [Cairn](https://cairn.computer), an agent orchestration
+engine, published from Cairn's private source repository.
+
+This repository is a path-preserving subset of that one. It holds every crate
+under `src-tauri/os/`, and, at their original paths, exactly the files outside
+`os/` those crates compile in: database migrations, output schemas, bundled
+recipes and routes, two frontend action manifests, and test fixtures. Because
+the paths are the source repository's own, every crate builds here unchanged.
+The workspace root at `src-tauri/Cargo.toml` and its `Cargo.lock` are generated
+for this repository: every crate under `src-tauri/os/` is a member, pinned to
+the dependency versions Cairn ships.
 
 ## Crates
 
-**cairn-core** — Orchestration engine. Recipe-based DAG execution, agent backend process management, Turso-backed database operations, configuration resolution, memory capture, and all business logic.
+**Engine**
 
-**cairn-common** — Shared types. `cairn://` URI parser and serializer, authentication, and the callback protocol types that connect cairn-cmd to cairn-core.
+| Crate | Purpose |
+|---|---|
+| `cairn-core` | Orchestration engine: recipe-based DAG execution, agent backend processes, configuration resolution, memory capture, and the business logic, with no Tauri dependency |
+| `cairn-workflow` | Durable recipe advancement, effect processing, and workflow persistence |
+| `cairn-session` | Agent session runtime and provider process protocols |
+| `cairn-attention` | Durable agent attention, wake subscriptions, and delivery policy |
+| `cairn-db` | Database records, domain conversions, and Turso + Tantivy storage |
+| `cairn-models` | Domain values, serialization, and pure transformations |
+| `cairn-config` | Configuration files, defaults, validation, and preset resolution |
+| `cairn-packs` | Pack schemas, ownership, and filesystem installation |
+| `cairn-channels` | Channel message contracts and Telegram/Discord transport adapters |
+| `cairn-analytics` | Agent-economics SQL aggregates, pricing, and tool extraction |
+| `cairn-mcp-server` | The MCP server: the read/write/run tool surface over stdio and streamable HTTP |
+| `cairn-cmd` | The `cairn` command-line helper agents and scripts use |
+| `cairn-common` | Shared types: the `cairn://` URI parser, the resource contract, authentication, and protocol types |
 
-**cairn-cmd** — MCP server binary. Provides the tool interface agents use during execution: file I/O, shell commands, sub-agent spawning, memory management, and execution history navigation. Stateless — all operations are forwarded to cairn-core via HTTP callbacks.
+**The LLM facet**, hostable outside Cairn
 
-## Building
+| Crate | Purpose |
+|---|---|
+| `cairn-llm` | HTTP protocols, provider vocabulary, accounts and routing, and usage as data |
+| `cairn-llm-wire` | Model wires: HTTP protocol families with generation assembly and replay, and the Claude and Codex CLI streams |
+| `cairn-llm-types` | Facet vocabulary: provider ids, the provider catalog, usage windows and snapshots, pooled capacity |
+| `cairn-credentials` | Provider accounts, credential storage, leases, and selection |
+
+Subscription mechanics (CLI sign-in, account-home placement, token refresh) are
+not published; `cairn-llm` defines the `Subscriptions` seam a host implements.
+
+**Utilities**
+
+| Crate | Purpose |
+|---|---|
+| `cairn-codec` | Tagged event-payload compression, and the in-process git object, packfile, and diff substrate |
+| `cairn-symbols` | Structural code intelligence over ast-grep |
+| `ast-grep-outline` | Code outline model for ast-grep (a vendored subset) |
+| `cairn-tokenize` | Offline Claude token-count estimator derived from ctok |
+| `cairn-vcs` | Repository operations and publication transactions |
+| `cairn-cell` | Shared build-cell policy and filesystem primitives |
+| `cairn-sandbox` | OS-level filesystem sandbox applied where commands are spawned |
+| `cairn-platform` | Filesystem and process support shared by Cairn hosts |
+| `cairn-checkenv` | Check execution provenance and source-sensitive implementation identity |
+
+## Using these crates
+
+Depend on a crate by git, pinned to a commit or a release tag:
+
+```toml
+[dependencies]
+cairn-llm = { git = "https://github.com/bleugreenlab/cairn", rev = "<commit>" }
+```
+
+Cargo finds the crate by name anywhere in the repository. Copying
+`src-tauri/Cargo.lock` into your own workspace pins the versions Cairn builds
+against; Cargo prunes the copy to what you use.
+
+To build everything here:
 
 ```bash
-cargo build
+cargo check --manifest-path src-tauri/Cargo.toml --workspace
 ```
+
+Every library, binary, and test builds, except `cairn-core`'s tests: its fleet
+tests drive Cairn's private executor runtime, and some of its unit tests read
+repository configuration that is not published.
 
 ## Documentation
 
-Engineering documentation for the system lives in the repository's top-level
-`docs/` directory, which is the current source of truth. The most relevant here:
+- [URI System](src-tauri/os/docs/uri-system.md): `cairn://` resource addressing
+  and parser internals.
+- [`src-tauri/os/docs/archive/`](src-tauri/os/docs/archive) holds superseded
+  design documents, kept for history and labeled as retired.
 
-- [State machines](../../docs/state-machines.md) — run, turn, job, execution, and issue status
-- [Execution lifecycle map](../../docs/execution-lifecycle-map.md) — the full control-flow map
-- [Recipe execution](../../docs/recipe-execution.md) — recipes, node types, and DAG advancement
-- [Sessions](../../docs/sessions.md) — session lifecycle and warm-process retention
-- [Backends](../../docs/backends.md) — Claude, Codex, and OpenRouter process management
-- [Memories](../../docs/memories.md) — the memory capture and triage ledger
+Cairn's engineering documentation lives in the private repository and is not
+published here.
 
-This crate keeps one document of its own:
+## How this repository is updated
 
-- [URI System](docs/uri-system.md) — `cairn://` resource addressing and parser internals
-
-[`docs/archive/`](docs/archive) holds superseded design documents. They are kept
-for history, are labeled as retired, and are not current guidance.
+It is mirrored from the private repository's `main` branch on every change to
+the published crates or the files they compile in, so it trails `main` by one
+sync. Each commit's `Source-Commit:` trailer names the private commit it was
+assembled from. Release tags (`v*`) mark the sources of each desktop release.
 
 ## License
 
-Business Source License 1.1, converting to Apache 2.0 on 2030-03-14. See [LICENSE](LICENSE).
+The crates are licensed under the Business Source License 1.1. The Licensor is
+Bleugreen Lab LLC.
 
-[cairn.computer](https://cairn.computer)
+The Additional Use Grant lets you use the code for any purpose, including in
+production, except to provide an Agent Orchestration Service: a product,
+service, or platform that uses the code to offer agent orchestration to third
+parties other than your own employees and contractors. On the Change Date,
+**2029-03-22**, or on the fourth anniversary of a version's first public
+distribution if that comes first, the code becomes available under the Apache
+License, Version 2.0.
+
+The legal text is each crate's `LICENSE` file, and [LICENSE](LICENSE) for the
+repository as a whole. Two exceptions are MIT-licensed: `ast-grep-outline`, and
+the portion of `cairn-tokenize` derived from ctok (`LICENSE-ctok`).

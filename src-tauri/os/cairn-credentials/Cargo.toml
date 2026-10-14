@@ -1,0 +1,33 @@
+[package]
+name = "cairn-credentials"
+version.workspace = true
+edition = "2021"
+description = "Provider accounts, credential storage, leases, and selection"
+license = "BUSL-1.1"
+
+[dependencies]
+cairn-llm-types = { path = "../cairn-llm-types" }
+cairn-models = { path = "../cairn-models" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+log = "0.4"
+url = "2"
+http = "1"
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+sha2 = "0.10"
+hostname = "0.4"
+whoami = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO"] }
+
+[dev-dependencies]
+tempfile = "3"

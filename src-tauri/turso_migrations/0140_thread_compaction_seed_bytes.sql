@@ -1,0 +1,17 @@
+-- Record what a thread compaction's rebuilt prompt actually weighed (CAIRN-3427).
+--
+-- `thread_compactions` already stored the two counts the trigger compared: what
+-- the dropped prefix weighs verbatim and what it weighs as chapter lines. Both
+-- describe the DROPPED RANGE, and a ratio between them is scale-free -- it says
+-- how lopsided the summary is, never whether summarizing was worth a cache
+-- write. Pricing the rotation needs the third number: what the session would
+-- carry AFTER compaction, which is what a cache write is actually paid on.
+--
+-- Its absence is why CAIRN-3404 could rotate three warm sessions in 75 minutes
+-- without the record showing anything wrong; reconstructing it meant joining
+-- each generation against the `user:seed` event it produced. With the column,
+-- calibration is one query over this table.
+--
+-- Nullable rather than defaulted: a row written before this column existed did
+-- not measure the seed, and zero would read as "the rebuilt prompt was empty".
+ALTER TABLE thread_compactions ADD COLUMN seed_bytes INTEGER;

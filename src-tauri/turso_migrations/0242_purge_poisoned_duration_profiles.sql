@@ -1,0 +1,21 @@
+-- cairn/4898: duration and contention windows learned from runs that taught
+-- nothing about their work class.
+--
+-- Until the recorder classified each completion, every run that exited
+-- contributed its duration: lanes that selected no tests and answered in a few
+-- hundred milliseconds, and builds that died seconds in. A lane's window became
+-- bimodal, and its median sat in whichever mode held the majority, which on a
+-- busy machine was the no-op mode. The contention curve divided real loaded
+-- durations by those sub-second baselines and recorded slowdowns in the
+-- thousands.
+--
+-- The window bound would retire these only once real samples outnumbered the
+-- no-ops in every window, per machine, lane, toolchain, and warmth. Emptying
+-- both tables instead returns each pairing to its labelled class prior, which
+-- is what a toolchain change already does, until three successful runs that did
+-- work make it learned again.
+--
+-- `command_resource_profiles` is left alone: its memory and disk high-water
+-- marks rise on the first real observation, so it heals without help.
+DELETE FROM command_duration_profiles;
+DELETE FROM command_contention_profiles;

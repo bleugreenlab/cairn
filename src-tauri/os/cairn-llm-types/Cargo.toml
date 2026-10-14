@@ -1,0 +1,12 @@
+[package]
+name = "cairn-llm-types"
+version.workspace = true
+edition = "2021"
+description = "Cairn LLM facet vocabulary: provider ids, the provider catalog, usage windows and snapshots, and pooled capacity"
+license = "BUSL-1.1"
+
+# A leaf: vocabulary consumers (configuration, workflow, the desktop tray) depend
+# on it without pulling in the token layer or anything heavier.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

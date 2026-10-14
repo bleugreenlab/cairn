@@ -1,0 +1,1 @@
+ALTER TABLE projects ADD COLUMN is_workspace INTEGER NOT NULL DEFAULT 0;

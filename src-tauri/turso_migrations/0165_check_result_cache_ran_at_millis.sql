@@ -1,0 +1,18 @@
+-- CAIRN-3823: `check_result_cache.ran_at` carried two units at once.
+--
+-- The column was born in Unix SECONDS, written by `store_check_result`. When the
+-- immutable observation store became the writer of every verdict, its projection
+-- into this table carried the observation's Unix MILLISECONDS instead, and no
+-- reader was told. The result is a column whose values are only comparable
+-- within a vintage: every recency ranking over it silently sorts every
+-- millisecond row above every second row, and every surface that renders it
+-- renders one of the two families as a wrong date.
+--
+-- Milliseconds wins, because that is what the observation store, the resource
+-- layer's `millis_stamp`, and every row written since already speak. Seconds are
+-- promoted here, once.
+--
+-- The discriminator is unambiguous for any timestamp this table can hold: 1e11
+-- is the year 5138 read as seconds and 1973 read as milliseconds, and this table
+-- did not exist in 1973.
+UPDATE check_result_cache SET ran_at = ran_at * 1000 WHERE ran_at < 100000000000;

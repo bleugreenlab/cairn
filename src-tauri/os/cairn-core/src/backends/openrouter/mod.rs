@@ -1,0 +1,222 @@
+//! Native OpenRouter HTTP backend.
+//!
+//! OpenRouter exposes an OpenAI-compatible chat completions API. Cairn owns the
+//! turn/tool loop for this backend so models receive Cairn's direct read/write/run
+//! tools instead of Codex/Claude host tools. The generic turn/tool driver lives
+//! in `backends/http_loop`; this module is its OpenRouter adapter (`adapter.rs`)
+//! plus its provider-specific request construction. The shared protocol lives in
+//! `backends/openai_compat`.
+
+mod adapter;
+mod http;
+mod models;
+mod usage;
+
+#[cfg(test)]
+mod tests;
+
+pub use usage::collect_openrouter_usage_snapshot;
+
+use crate::backends::{
+    AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionRole,
+    CompletionShape, CompletionTokens, ResolvedTools, SessionConfig,
+};
+use crate::credentials::{ApiProvider, ProviderAuth};
+use crate::orchestrator::Orchestrator;
+use cairn_llm::types::catalog::{
+    DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
+};
+
+pub(crate) const OPENROUTER_BACKEND_NAME: &str = "OpenRouter";
+pub(crate) const OPENROUTER_BACKEND_KEY: &str = "openrouter";
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenRouterBackend;
+
+pub(crate) fn openrouter_api_key(orch: &Orchestrator) -> Option<String> {
+    orch.get_credential_store().and_then(|store| {
+        store
+            .accounts_for_provider(ApiProvider::OpenRouter, None)
+            .into_iter()
+            .find(|account| account.serves_backend(OPENROUTER_BACKEND_KEY))
+            .and_then(|account| match &account.auth {
+                ProviderAuth::ApiKey { value } => Some(value.clone()),
+                _ => None,
+            })
+    })
+}
+
+impl AgentBackend for OpenRouterBackend {
+    fn name(&self) -> &str {
+        OPENROUTER_BACKEND_NAME
+    }
+
+    fn response_completion_availability(
+        &self,
+        orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Result<(), String> {
+        openrouter_api_key(orch)
+            .map(|_| ())
+            .ok_or_else(|| "needs an OpenRouter API key".to_string())
+    }
+
+    fn complete(
+        &self,
+        request: CompletionRequest,
+        orch: &Orchestrator,
+    ) -> Result<CompletionOutcome, CompletionError> {
+        use crate::backends::openai_compat::http::Endpoint;
+        use cairn_llm::interface::complete::{CompletionCall, CompletionReply, CompletionWire};
+        use serde_json::json;
+        use std::time::Instant;
+
+        if request.messages.is_empty() {
+            return Err(CompletionError::InvalidRequest(
+                "at least one message is required".to_string(),
+            ));
+        }
+        let api_key = openrouter_api_key(orch).ok_or(CompletionError::BackendUnavailable)?;
+        let requested_model = request.model.clone();
+        let mut messages = Vec::with_capacity(request.messages.len() + 1);
+        if let Some(system) = request.system {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+        messages.extend(request.messages.into_iter().map(|message| {
+            let role = match message.role {
+                CompletionRole::User => "user",
+                CompletionRole::Assistant => "assistant",
+            };
+            json!({"role": role, "content": message.content})
+        }));
+        let mut body = json!({
+            "model": requested_model,
+            "messages": messages,
+            "stream": false,
+            "provider": {"require_parameters": true},
+        });
+        if let Some(extras) = request.extras.as_object() {
+            body.as_object_mut()
+                .expect("completion body is an object")
+                .extend(extras.clone());
+        } else if !request.extras.is_null() {
+            return Err(CompletionError::InvalidRequest(
+                "extras must be an object or null".to_string(),
+            ));
+        }
+        http::apply_output_schema(&mut body, request.output_schema.as_ref());
+        let endpoint = Endpoint {
+            provider_name: OPENROUTER_BACKEND_NAME.to_string(),
+            backend_key: OPENROUTER_BACKEND_KEY.to_string(),
+            chat_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            headers: http::openrouter_headers(&api_key).map_err(CompletionError::InvalidRequest)?,
+        };
+        let started = Instant::now();
+        let response = orch
+            .llm_runtime()
+            .complete
+            .complete(CompletionCall::whole(
+                CompletionWire::Chat(&endpoint),
+                body,
+                request.timeout,
+            ))
+            .and_then(CompletionReply::into_chat)?;
+        let text = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_ref())
+            .and_then(|content| content.as_text())
+            .ok_or_else(|| CompletionError::InvalidResponse("missing text choice".to_string()))?
+            .to_string();
+        let usage = response.usage.as_ref();
+        Ok(CompletionOutcome {
+            text,
+            parsed: None,
+            model: response.model.unwrap_or(request.model),
+            tokens: CompletionTokens {
+                input: usage.and_then(|usage| usage.prompt_tokens.map(|value| value as u64)),
+                output: usage.and_then(|usage| usage.completion_tokens.map(|value| value as u64)),
+            },
+            cost: usage.and_then(|usage| usage.cost),
+            latency_ms: started.elapsed().as_millis() as u64,
+            account_id: None,
+        })
+    }
+
+    fn completion_shape(&self) -> CompletionShape {
+        CompletionShape::InProcess
+    }
+
+    fn is_available(&self) -> Result<(), String> {
+        // Availability depends on a configured account in the owning orchestrator;
+        // `start_session` performs the authoritative check and records transcript
+        // errors. Keeping this optimistic lets Settings show the provider card and
+        // unauthenticated model catalog fallback.
+        Ok(())
+    }
+
+    fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
+        models::discover_models_blocking(None)
+    }
+
+    fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {
+        vec![ProviderOptionDescriptor {
+            key: ProviderOptionKey::ReasoningEffort,
+            label: "Effort".to_string(),
+            kind: OptionKind::Enum,
+            choices: ["low", "medium", "high"]
+                .into_iter()
+                .map(|value| OptionChoice {
+                    value: value.to_string(),
+                    label: value.to_string(),
+                })
+                .collect(),
+            default: None,
+        }]
+    }
+
+    fn resolve_tools(&self, agent_tools: &[String], _agent_disallowed: &[String]) -> ResolvedTools {
+        use crate::agent_process::toolkits;
+        let mut allowed = toolkits::resolve_tools(agent_tools);
+        toolkits::ensure_core_verbs(&mut allowed);
+        allowed.retain(|tool| tool != "apply_patch");
+        ResolvedTools {
+            allowed,
+            disallowed: Vec::new(),
+        }
+    }
+
+    fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
+        crate::backends::http_loop::start_session(
+            config,
+            orch,
+            adapter::OpenRouterAdapter::new(orch),
+        )
+    }
+
+    fn supports_resume(&self) -> bool {
+        true
+    }
+
+    fn supports_warm_processes(&self) -> bool {
+        false
+    }
+
+    fn runtime_launch_capability(
+        &self,
+        _launch: &crate::backends::RuntimeLaunch,
+    ) -> Result<crate::backends::RuntimeLaunchCapability, String> {
+        Ok(crate::backends::stateless_http_runtime_capability(
+            "openrouter-http",
+        ))
+    }
+
+    fn call_batch_capability(&self) -> crate::backends::CallBatchCapability {
+        // OpenRouter runs the whole agentic loop in-process over async HTTP; a
+        // call spawns no child process. Unbounded today.
+        crate::backends::CallBatchCapability {
+            shape: crate::backends::CallBatchShape::InProcess,
+            max_concurrency: None,
+        }
+    }
+}

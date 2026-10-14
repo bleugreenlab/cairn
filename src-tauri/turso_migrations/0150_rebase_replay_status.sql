@@ -1,0 +1,15 @@
+-- When a store-side replay is outstanding, `cairn:~/rebase` had no way to say
+-- so: the request enqueues durable reconcile work and returns, and the next read
+-- of the page looked identical to one taken before the request. An agent with no
+-- signal that anything is in flight re-requests, or reads the page repeatedly
+-- waiting for a change that only arrives when the worker lands.
+--
+-- Everything else the lifecycle needs is already stored — `jj_reconcile_intents.status`
+-- carries pending/running/completed/superseded and `jj_reconcile_items.status`
+-- carries the item's own progress. The one fact nobody records is that an agent
+-- ASKED, and when. This column is that fact.
+--
+-- Cleared whenever a fresh conflict session is recorded for the branch: a new
+-- conflict means the previous request has resolved into a new situation, so a
+-- surviving timestamp would describe a request nobody is waiting on.
+ALTER TABLE jj_reconcile_items ADD COLUMN replay_requested_at INTEGER;

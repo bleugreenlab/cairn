@@ -1,3 +1,0 @@
-[workspace]
-members = ["cairn-core", "cairn-common", "cairn-cmd", "cairn-symbols", "cairn-codec", "cairn-tokenize", "cairn-vcs", "ast-grep-outline"]
-resolver = "2"

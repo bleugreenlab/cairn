@@ -1,0 +1,459 @@
+//! Artifact query operations.
+
+use crate::turso::params;
+use serde_json::Value;
+
+use crate::models::Artifact;
+use crate::storage::{DbError, LocalDb, RowExt};
+
+pub const ARTIFACT_COLUMNS: &str = "id, job_id, artifact_type, schema_version, data, version,
+    parent_version_id, output_name, created_at, updated_at, seen_at, confirmed";
+
+fn db_error(context: &str, error: DbError) -> String {
+    format!("{context}: {error}")
+}
+
+pub fn artifact_from_row(row: &crate::turso::Row) -> Result<Artifact, DbError> {
+    let data: Value = serde_json::from_str(&row.text(4)?)
+        .map_err(|e| DbError::internal(format!("Invalid artifact data JSON: {e}")))?;
+
+    Ok(Artifact {
+        id: row.text(0)?,
+        job_id: row.opt_text(1)?,
+        artifact_type: row.text(2)?,
+        schema_version: row.i64(3)? as i32,
+        data,
+        version: row.i64(5)? as i32,
+        parent_version_id: row.opt_text(6)?,
+        output_name: row.opt_text(7)?,
+        created_at: row.i64(8)?,
+        updated_at: row.i64(9)?,
+        seen_at: row.opt_i64(10)?,
+        confirmed: row.i64(11)? != 0,
+    })
+}
+
+pub async fn get(db: &LocalDb, artifact_id: &str) -> Result<Artifact, String> {
+    let artifact_id = artifact_id.to_string();
+    db.query_opt(
+        format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE id = ?1"),
+        params![artifact_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .and_then(|artifact| {
+        artifact.ok_or_else(|| DbError::internal(format!("Artifact not found: {artifact_id}")))
+    })
+    .map_err(|e| db_error("Failed to get artifact", e))
+}
+
+pub async fn list(db: &LocalDb, job_id: &str) -> Result<Vec<Artifact>, String> {
+    let job_id = job_id.to_string();
+    db.query_all(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM artifacts
+             WHERE job_id = ?1
+             ORDER BY version DESC"
+        ),
+        params![job_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to list artifacts", e))
+}
+
+/// The job's most recently written artifact, across all output names. `version`
+/// is scoped per `(job_id, output_name)`, so ordering by version would compare
+/// version numbers across unrelated names (a ctx-self living doc patched to v3
+/// would outrank a freshly created terminal output at v1). Order by write
+/// recency instead: `created_at` (seconds) with `rowid` as the monotonic
+/// insertion-order tiebreaker for same-second writes.
+pub async fn get_latest(db: &LocalDb, job_id: &str) -> Result<Option<Artifact>, String> {
+    let job_id = job_id.to_string();
+    db.query_opt(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM artifacts
+             WHERE job_id = ?1
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT 1"
+        ),
+        params![job_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to get latest artifact", e))
+}
+
+/// The latest version within a single name's chain. Unlike [`get_latest`]
+/// (which orders across names by write recency), `version` is scoped per
+/// `(job_id, output_name)`, so within one name the highest version is the
+/// newest — order by `version DESC`. This mirrors the resource-layer
+/// `get_named_artifact_for_job` and lets the frontend address a named artifact
+/// (`.../{node}/board`, `/plan`) even when it is not the node's latest output.
+pub async fn get_named(
+    db: &LocalDb,
+    job_id: &str,
+    output_name: &str,
+) -> Result<Option<Artifact>, String> {
+    let job_id = job_id.to_string();
+    let output_name = output_name.to_string();
+    db.query_opt(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM artifacts
+             WHERE job_id = ?1 AND output_name = ?2
+             ORDER BY version DESC
+             LIMIT 1"
+        ),
+        params![job_id.as_str(), output_name.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to get named artifact", e))
+}
+
+pub async fn mark_seen(db: &LocalDb, artifact_id: &str) -> Result<(), String> {
+    let seen_at = chrono::Utc::now().timestamp();
+    mark_seen_at(db, artifact_id, seen_at).await
+}
+
+pub async fn mark_seen_at(db: &LocalDb, artifact_id: &str, seen_at: i64) -> Result<(), String> {
+    let artifact_id = artifact_id.to_string();
+    db.execute(
+        "UPDATE artifacts SET seen_at = ?1 WHERE id = ?2",
+        params![seen_at, artifact_id.as_str()],
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| db_error("Failed to mark artifact seen", e))
+}
+
+pub async fn list_for_issue(db: &LocalDb, issue_id: &str) -> Result<Vec<Artifact>, String> {
+    let issue_id = issue_id.to_string();
+    db.query_all(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM (
+                SELECT
+                    a.id, a.job_id, a.artifact_type, a.schema_version, a.data,
+                    a.version, a.parent_version_id, a.output_name, a.created_at,
+                    a.updated_at, a.seen_at, a.confirmed,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.job_id, a.output_name
+                        ORDER BY a.version DESC
+                    ) AS artifact_rank
+                FROM artifacts a
+                INNER JOIN jobs j ON j.id = a.job_id
+                WHERE j.issue_id = ?1
+             ) ranked_artifacts
+             WHERE artifact_rank = 1"
+        ),
+        params![issue_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to list artifacts for issue", e))
+}
+
+/// The latest artifact per (job, output name) for every job a thread owns — its
+/// session's `arc` and whatever its tasks returned.
+///
+/// The issue-scoped sibling above is the same query under the other owner
+/// column; a thread's jobs carry no `issue_id`, so it could never see them.
+pub async fn list_for_thread(db: &LocalDb, thread_id: &str) -> Result<Vec<Artifact>, String> {
+    let thread_id = thread_id.to_string();
+    db.query_all(
+        format!(
+            "SELECT {ARTIFACT_COLUMNS}
+             FROM (
+                SELECT
+                    a.id, a.job_id, a.artifact_type, a.schema_version, a.data,
+                    a.version, a.parent_version_id, a.output_name, a.created_at,
+                    a.updated_at, a.seen_at, a.confirmed,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.job_id, a.output_name
+                        ORDER BY a.version DESC
+                    ) AS artifact_rank
+                FROM artifacts a
+                INNER JOIN jobs j ON j.id = a.job_id
+                WHERE j.thread_id = ?1
+             ) ranked_artifacts
+             WHERE artifact_rank = 1"
+        ),
+        params![thread_id.as_str()],
+        artifact_from_row,
+    )
+    .await
+    .map_err(|e| db_error("Failed to list artifacts for thread", e))
+}
+
+/// Raw stored `data` JSON of a node-less call's CONTRACTED return artifact.
+///
+/// The return artifact IS an ephemeral call's completion contract, so the two
+/// result-delivery seams — the synchronous `?wait` behind the harness `agent()`
+/// await (`resources::node::terminal_call_body`) and the replay journal
+/// (`orchestrator::lifecycle::maybe_journal_call_result`) — must read the artifact
+/// the call was contracted to write, keyed on
+/// `output_name = output_contract.artifact_name()`, NOT just any artifact the run
+/// happened to produce. A call that wrote some other named artifact but never its
+/// `return` must resolve to failure, not that unrelated row (CAIRN-2677). Falls
+/// back to the latest artifact overall ONLY when the job carries no
+/// `output_contract` (a legacy/non-call case that never named one).
+pub async fn contracted_return_artifact_data(db: &LocalDb, job_id: &str) -> Option<String> {
+    let required_name = db
+        .query_opt_text(
+            "SELECT output_contract FROM jobs WHERE id = ?1",
+            (job_id.to_string(),),
+        )
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<crate::models::DelegatedOutputContract>(&json).ok())
+        .map(|contract| contract.artifact_name());
+
+    let job_id = job_id.to_string();
+    db.read(|conn| {
+        let job_id = job_id.clone();
+        let required_name = required_name.clone();
+        Box::pin(async move {
+            let mut rows = match required_name {
+                Some(name) => {
+                    conn.query(
+                        "SELECT data FROM artifacts WHERE job_id = ?1 AND output_name = ?2 \
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        params![job_id.as_str(), name.as_str()],
+                    )
+                    .await?
+                }
+                None => {
+                    conn.query(
+                        "SELECT data FROM artifacts WHERE job_id = ?1 \
+                         ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                        params![job_id.as_str()],
+                    )
+                    .await?
+                }
+            };
+            Ok(rows.next().await?.and_then(|row| row.text(0).ok()))
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(test)]
+mod latest_recency_tests {
+    use super::*;
+
+    async fn seed_job(db: &LocalDb) {
+        db.execute_script(
+            "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
+             INSERT INTO issues (id,project_id,number,title,status,attention,created_at,updated_at) VALUES ('i','p',1,'T','active','none',1,1);
+             INSERT INTO jobs (id,issue_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('j','i','p','running','b','b',1,1);",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_artifact(
+        db: &LocalDb,
+        id: &str,
+        output_name: &str,
+        version: i64,
+        created_at: i64,
+    ) {
+        db.execute(
+            "INSERT INTO artifacts (id,job_id,artifact_type,schema_version,data,version,output_name,created_at,updated_at,confirmed)
+             VALUES (?1,'j',?2,1,'{}',?3,?2,?4,?4,1)",
+            params![id, output_name, version, created_at],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn latest_is_most_recent_name_not_highest_version() {
+        // A coordinator-shaped job: a ctx-self `board` patched to v2, then a
+        // terminal `create-pr` written later at v1. `version` is per-name, so the
+        // board outranks create-pr by version number; recency ordering must still
+        // return the newly written create-pr.
+        let db = crate::storage::migrated_test_db("latest-recency-name.db").await;
+        seed_job(&db).await;
+        insert_artifact(&db, "board-1", "board", 1, 10).await;
+        insert_artifact(&db, "board-2", "board", 2, 20).await;
+        insert_artifact(&db, "pr-1", "create-pr", 1, 30).await;
+
+        let latest = get_latest(&db, "j").await.unwrap().expect("an artifact");
+        assert_eq!(latest.output_name.as_deref(), Some("create-pr"));
+        assert_eq!(latest.version, 1);
+    }
+
+    #[tokio::test]
+    async fn rowid_breaks_same_timestamp_ties_by_insertion_order() {
+        // Same-second writes: created_at ties, so the monotonic `rowid` tiebreaker
+        // must pick the last-inserted row (the create-pr), not the highest version.
+        let db = crate::storage::migrated_test_db("latest-recency-tie.db").await;
+        seed_job(&db).await;
+        insert_artifact(&db, "board-1", "board", 1, 5).await;
+        insert_artifact(&db, "board-2", "board", 2, 5).await;
+        insert_artifact(&db, "pr-1", "create-pr", 1, 5).await;
+
+        let latest = get_latest(&db, "j").await.unwrap().expect("an artifact");
+        assert_eq!(latest.output_name.as_deref(), Some("create-pr"));
+    }
+
+    #[tokio::test]
+    async fn get_named_returns_requested_name_not_recency_winner() {
+        // Two names present: a `board` patched to v2, then a `create-pr` written
+        // later. `get_latest` returns create-pr by recency; `get_named` must
+        // return the requested name's latest version regardless of recency.
+        let db = crate::storage::migrated_test_db("get-named.db").await;
+        seed_job(&db).await;
+        insert_artifact(&db, "board-1", "board", 1, 10).await;
+        insert_artifact(&db, "board-2", "board", 2, 20).await;
+        insert_artifact(&db, "pr-1", "create-pr", 1, 30).await;
+
+        let board = get_named(&db, "j", "board")
+            .await
+            .unwrap()
+            .expect("board artifact");
+        assert_eq!(board.output_name.as_deref(), Some("board"));
+        assert_eq!(board.version, 2);
+
+        let pr = get_named(&db, "j", "create-pr")
+            .await
+            .unwrap()
+            .expect("create-pr artifact");
+        assert_eq!(pr.output_name.as_deref(), Some("create-pr"));
+        assert_eq!(pr.version, 1);
+
+        assert!(get_named(&db, "j", "missing").await.unwrap().is_none());
+    }
+
+    /// Persist a node-less call's default `return` output contract on job `j` and
+    /// return the contracted artifact name.
+    async fn set_return_contract(db: &LocalDb) -> String {
+        let contract = crate::models::DelegatedOutputContract {
+            schema_type: crate::models::OutputSchema::Preset("return".to_string()),
+            tool_name: None,
+            description: Some("Submit the task result".to_string()),
+        };
+        let name = contract.artifact_name();
+        let json = serde_json::to_string(&contract).unwrap();
+        db.execute(
+            "UPDATE jobs SET output_contract = ?1 WHERE id = 'j'",
+            params![json.as_str()],
+        )
+        .await
+        .unwrap();
+        name
+    }
+
+    #[tokio::test]
+    async fn contracted_read_returns_the_return_artifact() {
+        // A call under its return contract that wrote `return` resolves with it.
+        let db = crate::storage::migrated_test_db("contracted-return.db").await;
+        seed_job(&db).await;
+        let name = set_return_contract(&db).await;
+        insert_artifact(&db, "a1", &name, 1, 1).await;
+        assert_eq!(
+            contracted_return_artifact_data(&db, "j").await.as_deref(),
+            Some("{}")
+        );
+    }
+
+    #[tokio::test]
+    async fn contracted_read_ignores_a_non_return_artifact() {
+        // A call under its return contract that wrote a DIFFERENT named artifact
+        // (e.g. `plan`) but never `return` must resolve to failure (None here),
+        // not that unrelated row — the review gap this closes (CAIRN-2677).
+        let db = crate::storage::migrated_test_db("contracted-non-return.db").await;
+        seed_job(&db).await;
+        set_return_contract(&db).await;
+        insert_artifact(&db, "a1", "plan", 1, 1).await;
+        assert_eq!(contracted_return_artifact_data(&db, "j").await, None);
+    }
+
+    #[tokio::test]
+    async fn contracted_read_falls_back_when_job_has_no_contract() {
+        // A job with no persisted output_contract falls back to any artifact.
+        let db = crate::storage::migrated_test_db("contracted-fallback.db").await;
+        seed_job(&db).await;
+        insert_artifact(&db, "a1", "answer", 1, 1).await;
+        assert_eq!(
+            contracted_return_artifact_data(&db, "j").await.as_deref(),
+            Some("{}")
+        );
+    }
+
+    #[tokio::test]
+    async fn single_name_chain_returns_highest_version() {
+        // The common single-artifact node is unaffected: recency ordering returns
+        // the latest version of the only name, exactly as version-ordering did.
+        let db = crate::storage::migrated_test_db("latest-recency-single.db").await;
+        seed_job(&db).await;
+        insert_artifact(&db, "plan-1", "plan", 1, 10).await;
+        insert_artifact(&db, "plan-2", "plan", 2, 20).await;
+        insert_artifact(&db, "plan-3", "plan", 3, 30).await;
+
+        let latest = get_latest(&db, "j").await.unwrap().expect("an artifact");
+        assert_eq!(latest.output_name.as_deref(), Some("plan"));
+        assert_eq!(latest.version, 3);
+    }
+
+    /// A thread's artifacts are reachable by the thread, not by an issue: its
+    /// jobs carry no `issue_id`, so the issue-scoped listing could never see the
+    /// session's `arc` or what its tasks returned.
+    #[tokio::test]
+    async fn thread_listing_returns_the_latest_per_name_for_every_job_the_thread_owns() {
+        let db = crate::storage::migrated_test_db("artifacts-for-thread.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces (id,name,created_at,updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES ('p','w','P','prj','/tmp/p',1,1);
+             INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('th','p','roadmap','active','none',1,1);
+             INSERT INTO threads (id,project_id,name,status,attention,created_at,updated_at) VALUES ('other','p','neighbour','active','none',1,1);
+             INSERT INTO jobs (id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('session','th','p','idle','thread','thread',1,1);
+             INSERT INTO jobs (id,thread_id,parent_job_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('task','th','session','p','complete','survey','Survey',1,1);
+             INSERT INTO jobs (id,thread_id,project_id,status,uri_segment,node_name,created_at,updated_at) VALUES ('elsewhere','other','p','idle','thread','thread',1,1);",
+        )
+        .await
+        .unwrap();
+        let insert = |id: &'static str, job: &'static str, name: &'static str, version: i64| {
+            let db = &db;
+            async move {
+                db.execute(
+                    "INSERT INTO artifacts (id,job_id,artifact_type,schema_version,data,version,output_name,created_at,updated_at,confirmed)
+                     VALUES (?1,?2,'arc',1,'{}',?3,?4,1,1,1)",
+                    params![id, job, version, name],
+                )
+                .await
+                .unwrap();
+            }
+        };
+        insert("arc-v1", "session", "arc", 1).await;
+        insert("arc-v2", "session", "arc", 2).await;
+        insert("task-return", "task", "return", 1).await;
+        insert("elsewhere-arc", "elsewhere", "arc", 1).await;
+
+        let mut listed: Vec<(String, String)> = list_for_thread(&db, "th")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|artifact| (artifact.id, artifact.job_id.unwrap_or_default()))
+            .collect();
+        listed.sort();
+
+        assert_eq!(
+            listed,
+            vec![
+                ("arc-v2".to_string(), "session".to_string()),
+                ("task-return".to_string(), "task".to_string()),
+            ],
+            "the latest arc plus the task's return, and nothing from another thread"
+        );
+    }
+}

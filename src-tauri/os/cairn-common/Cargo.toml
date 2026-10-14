@@ -1,0 +1,53 @@
+[package]
+name = "cairn-common"
+version.workspace = true
+edition = "2021"
+description = "Shared types and utilities for Cairn agent orchestration"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+keywords = ["agent", "orchestration", "mcp"]
+
+[dependencies]
+url = "2"
+regex = "1"
+log = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+cairn-cell = { path = "../cairn-cell" }
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+tracing-log = "0.2"
+dirs = "6"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+libc = "0.2"
+sha2 = "0.10"
+hex = "0.4"
+tokio = { version = "1", features = ["fs"] }
+# Scrubbing borrows each needle rather than owning it, so scanning never makes
+# a second, un-zeroized copy of a registered credential.
+memchr = "2"
+thiserror = "2"
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    # HKCU Run-key autostart, the per-user service registration Windows offers.
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    # OpenProcess and GetExitCodeProcess, for `process_identity::process_is_alive`.
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+# Integration tests see only the public API plus these, and the cross-language
+# approvals fixtures are JSON carrying base64 bytes and SHA-256 digests.
+base64 = "0.22"
+serde_json = "1.0"
+sha2 = "0.10"

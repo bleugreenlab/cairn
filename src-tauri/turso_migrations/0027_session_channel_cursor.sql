@@ -1,0 +1,17 @@
+-- Per-session channel-injection cursor (CAIRN-1302).
+--
+-- The "### Recent Messages" block in the agent system prompt is rebuilt on
+-- every cold resume of a session. Without a cursor it re-injects the most
+-- recent project/issue channel messages every time, so task-completion
+-- notices ("X finished successfully") re-report on essentially every turn.
+--
+-- This column records the rowid of the newest channel message already injected
+-- for this session. messages.rowid is monotonic with insertion order, so it is
+-- a reliable "strictly newer" key even for messages that share a one-second
+-- created_at — created_at is seconds and ids are random UUIDs, so neither alone
+-- separates same-second arrivals (a later message with a smaller UUID would be
+-- silently dropped under a (created_at, id) cursor). Each message is injected at
+-- most once per session; a rotated or freshly created session starts with a
+-- NULL cursor and therefore re-injects recent context (correct: it has no prior
+-- transcript of those messages).
+ALTER TABLE sessions ADD COLUMN channel_cursor_rowid INTEGER;

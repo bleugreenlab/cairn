@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "properties": {
+    "current_intent": {
+      "type": "string",
+      "description": "Where this thread is going right now: a few sentences of durable direction, not a status report and never a roll-call of children"
+    },
+    "working": {
+      "type": "string",
+      "description": "Authored sequence or intent in motion — volatile, cheap to overwrite, expected to describe only its moment"
+    }
+  },
+  "required": ["current_intent"],
+  "additionalProperties": false
+}

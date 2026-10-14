@@ -1,0 +1,121 @@
+cairnVersion: 1
+bundles: [coding]
+name: TaskList
+description: Decompose into parallel tasks with dependency ordering
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 250@-40
+  config:
+    triggerType: manual
+    scope: issue
+- id: taskplanner-1
+  type: agent
+  name: TaskPlanner
+  position: 250@130
+  config:
+    agent: task-planner
+- id: tasklist-1
+  type: artifact
+  name: TaskList
+  position: 460@300
+  config:
+    artifactType: tasklist
+    schema:
+      properties:
+        objective:
+          description: What this work accomplishes
+          type: string
+        requirements:
+          description: Key constraints and requirements
+          items:
+            type: string
+          type: array
+        tasks:
+          description: Tasks to execute with dependency ordering
+          items:
+            properties:
+              agent:
+                description: Agent config ID to execute this task (e.g. 'build', 'explore')
+                type: string
+              backend:
+                description: Optional backend selection for this task
+                type: string
+              dependencies:
+                description: Task IDs that must complete before this task can start
+                items:
+                  type: string
+                type: array
+              id:
+                description: Unique task identifier within this list (e.g. 'impl-auth')
+                type: string
+              prompt:
+                description: Detailed instructions for the agent
+                type: string
+              tier:
+                description: Optional capability tier override (e.g. 'sm', 'md', 'lg')
+                type: string
+              title:
+                description: Short description for timeline display
+                type: string
+            required:
+            - id
+            - title
+            - agent
+            - prompt
+            type: object
+          type: array
+      required:
+      - objective
+      - tasks
+      type: object
+    confirmPolicy: user
+- id: executor-1
+  type: agent
+  name: Executor
+  position: 250@580
+  config:
+    agent: executor
+- id: pr-1
+  type: pr
+  name: PR
+  position: 250@730
+  config:
+    actionParams: {}
+    inputSchema:
+      name: create-pr
+      schema:
+        properties:
+          body:
+            type: string
+          title:
+            type: string
+        required:
+        - title
+        - body
+        type: object
+      confirmPolicy: auto
+edges:
+- from: trigger-1@control-out
+  to: taskplanner-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: taskplanner-1@context-in
+  type: context
+- from: taskplanner-1@context-out
+  to: tasklist-1@context-in
+  type: context
+- from: tasklist-1@context-out
+  to: executor-1@context-in
+  type: context
+- from: taskplanner-1@control-out
+  to: executor-1@control-in
+  type: control
+- from: executor-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: executor-1@context-out
+  to: pr-1@context-in
+  type: context

@@ -1,0 +1,19 @@
+[package]
+name = "cairn-packs"
+version.workspace = true
+edition = "2021"
+license = "BUSL-1.1"
+description = "Pack schemas, ownership, and filesystem installation"
+
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+chrono = "0.4"
+url = "2"
+tempfile = "3"
+cairn-platform = { path = "../cairn-platform" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+log = "0.4"
+jsonschema = { version = "0.26", default-features = false }

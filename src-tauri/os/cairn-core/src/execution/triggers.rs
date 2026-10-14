@@ -1,0 +1,950 @@
+//! Recipe matching and event dispatch for event-driven triggers.
+//!
+//! When a job completes or a skill is called, this module:
+//! 1. Checks anti-recursion guards (event-triggered executions don't fire further events)
+//! 2. Finds matching recipes via `EventFilter` criteria
+//! 3. Starts new executions for each matched recipe
+//! 4. Enqueues DAG advancement on the effect queue
+
+use std::future::Future;
+
+use crate::execution::Initiator;
+use crate::models::{
+    ExecutionSnapshot, JobEndedEvent, Recipe, RecipeNodeType, RecipeTrigger, SkillCalledEvent,
+    TriggerScope, TriggerType,
+};
+use crate::orchestrator::Orchestrator;
+use cairn_common::ids;
+
+use super::accumulator;
+use super::recipe::{create_jobs_for_execution, start_event_triggered_execution};
+
+/// Check if a single recipe matches a JobEnded event.
+fn matches_job_ended(recipe: &Recipe, event: &JobEndedEvent) -> bool {
+    if recipe.trigger != RecipeTrigger::JobEnded {
+        return false;
+    }
+
+    // Get event filter from trigger node
+    let filter = recipe
+        .nodes
+        .iter()
+        .find(|n| n.node_type == RecipeNodeType::Trigger)
+        .and_then(|n| n.trigger_config.as_ref())
+        .and_then(|tc| tc.event_filter.as_ref());
+
+    if let Some(filter) = filter {
+        // Check job_status filter (empty list = no filter)
+        if let Some(ref statuses) = filter.job_status {
+            if !statuses.is_empty() && !statuses.contains(&event.status) {
+                return false;
+            }
+        }
+        // Check node_filter (agent allow/exclude list)
+        if let Some(ref agent_filter) = filter.node_filter {
+            if !agent_filter.ids.is_empty() {
+                let agent_id = event.agent_config_id.as_deref().unwrap_or("");
+                let in_list = agent_filter.ids.iter().any(|id| id == agent_id);
+                match agent_filter.mode {
+                    crate::models::AgentFilterMode::Allow => {
+                        if !in_list {
+                            return false;
+                        }
+                    }
+                    crate::models::AgentFilterMode::Exclude => {
+                        if in_list {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    true
+}
+
+/// Find all recipes that match a JobEnded event.
+pub(crate) fn find_recipes_for_job_ended(
+    orch: &Orchestrator,
+    project_id: &str,
+    event: &JobEndedEvent,
+) -> Result<Vec<Recipe>, String> {
+    let recipes = orch.list_recipes_for_context(project_id)?;
+    Ok(recipes
+        .into_iter()
+        .filter(|r| matches_job_ended(r, event))
+        .collect())
+}
+
+/// Check if a single recipe matches a SkillCalled event.
+fn matches_skill_called(recipe: &Recipe, event: &SkillCalledEvent) -> bool {
+    if recipe.trigger != RecipeTrigger::SkillCalled {
+        log::debug!(
+            "trigger-match: recipe '{}' trigger={}, want SkillCalled — skip",
+            recipe.name,
+            recipe.trigger,
+        );
+        return false;
+    }
+
+    let trigger_node = recipe
+        .nodes
+        .iter()
+        .find(|n| n.node_type == RecipeNodeType::Trigger);
+
+    let filter = trigger_node
+        .and_then(|n| n.trigger_config.as_ref())
+        .and_then(|tc| tc.event_filter.as_ref());
+
+    log::info!(
+        "trigger-match: recipe '{}' has_trigger_node={} has_filter={} skill='{}'",
+        recipe.name,
+        trigger_node.is_some(),
+        filter.is_some(),
+        event.skill_id,
+    );
+
+    if let Some(filter) = filter {
+        if let Some(ref skill_ids) = filter.skill_ids {
+            // Empty list = no filter (treat same as None)
+            if !skill_ids.is_empty() && !skill_ids.contains(&event.skill_id) {
+                log::info!(
+                    "trigger-match: recipe '{}' filter rejects skill '{}' (allowed: {:?})",
+                    recipe.name,
+                    event.skill_id,
+                    skill_ids,
+                );
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+/// Find all recipes that match a SkillCalled event.
+pub(crate) fn find_recipes_for_skill_called(
+    orch: &Orchestrator,
+    project_id: &str,
+    event: &SkillCalledEvent,
+) -> Result<Vec<Recipe>, String> {
+    let recipes = orch.list_recipes_for_context(project_id)?;
+    Ok(recipes
+        .into_iter()
+        .filter(|r| matches_skill_called(r, event))
+        .collect())
+}
+
+/// Check if an execution was itself event-triggered (anti-recursion guard).
+///
+/// Event-triggered executions never emit further events. Only `Manual` and
+/// `Schedule` executions are allowed to trigger event-based recipes.
+pub(crate) fn is_event_triggered(snapshot: &ExecutionSnapshot) -> bool {
+    matches!(
+        snapshot.trigger_context.trigger_type,
+        TriggerType::JobEnded | TriggerType::SkillCalled
+    )
+}
+
+/// Dispatch matched recipes for a given event.
+///
+/// For each recipe, starts an execution, creates jobs, and enqueues
+/// `AdvanceDag` so the host effect drainer picks up newly ready jobs.
+pub(crate) fn dispatch_event_recipes(
+    orch: &Orchestrator,
+    recipes: Vec<Recipe>,
+    trigger_type: TriggerType,
+    event_payload: serde_json::Value,
+    event_issue_id: Option<&str>,
+    project_id: &str,
+    initiator: Option<Initiator>,
+) {
+    for recipe in recipes {
+        let effective_payload = if let Some(policy) = accumulator::get_accumulation_policy(&recipe)
+        {
+            let db = orch.db.local.clone();
+            let recipe_id = recipe.id.clone();
+            let payload = event_payload.clone();
+            let project_id = project_id.to_string();
+            let issue_id = event_issue_id.map(str::to_string);
+            match block_on_trigger_db(async move {
+                accumulator::try_accumulate(
+                    &db,
+                    &recipe_id,
+                    &policy,
+                    &payload,
+                    &project_id,
+                    issue_id.as_deref(),
+                )
+                .await
+            }) {
+                Ok(Some(payload)) => payload,
+                Ok(None) => continue,
+                Err(error) => {
+                    log::error!(
+                        "Failed to accumulate event for recipe '{}': {}",
+                        recipe.name,
+                        error
+                    );
+                    continue;
+                }
+            }
+        } else {
+            event_payload.clone()
+        };
+
+        let scope = recipe.scope();
+        let issue_id = match scope {
+            TriggerScope::Issue => {
+                // Issue-scoped recipes require an issue context from the event.
+                // Skip silently when the source event has no issue — starting
+                // without one would create a project-scoped execution that
+                // downstream nodes aren't authored to handle.
+                match event_issue_id {
+                    Some(id) => Some(id),
+                    None => {
+                        log::info!(
+                            "Skipping issue-scoped recipe '{}': source event has no issue_id",
+                            recipe.name
+                        );
+                        continue;
+                    }
+                }
+            }
+            TriggerScope::Project => None,
+        };
+
+        match start_event_triggered_execution(
+            orch,
+            &recipe,
+            trigger_type.clone(),
+            effective_payload.clone(),
+            issue_id,
+            project_id,
+            initiator.clone(),
+        ) {
+            Ok(execution) => {
+                if let Err(error) = record_trigger_sources(orch, &execution.id, &effective_payload)
+                {
+                    log::error!(
+                        "Failed to record trigger sources for execution {}: {}",
+                        &execution.id[..execution.id.len().min(8)],
+                        error
+                    );
+                }
+
+                match create_jobs_for_execution(orch, &execution.id) {
+                    Ok(jobs) => {
+                        log::info!(
+                            "Created {} job(s) for event-triggered execution {}",
+                            jobs.len(),
+                            &execution.id[..execution.id.len().min(8)]
+                        );
+                        // One scoped jobs event per created job (frontend dedupes).
+                        for job in &jobs {
+                            let _ = orch
+                                .services
+                                .emitter
+                                .emit("db-change", crate::notify::job_db_change(job, "insert"));
+                        }
+                    }
+                    Err(error) => {
+                        log::error!(
+                            "Failed to create jobs for event-triggered execution {}: {}",
+                            &execution.id[..execution.id.len().min(8)],
+                            error
+                        );
+                        continue;
+                    }
+                }
+
+                // Notify frontend so execution/job lists refresh
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table": "executions", "action": "insert"}),
+                );
+                // Per-job scoped `jobs` events are emitted in the Ok arm above.
+                let _ = orch.services.emitter.emit(
+                    "db-change",
+                    serde_json::json!({"table": "execution_trigger_sources", "action": "insert"}),
+                );
+
+                if let Some(ref tx) = orch.effect_tx {
+                    let _ = tx.send(crate::effects::types::WorkflowEffect::AdvanceDag {
+                        execution_id: execution.id.clone(),
+                        outbox_entry_id: None,
+                    });
+                } else {
+                    log::error!(
+                        "No effect_tx configured — cannot advance event-triggered execution {}",
+                        &execution.id[..execution.id.len().min(8)]
+                    );
+                }
+
+                log::info!(
+                    "Event-triggered recipe '{}' started (execution {})",
+                    recipe.name,
+                    &execution.id[..8]
+                );
+            }
+            Err(e) => {
+                log::error!(
+                    "Failed to start event-triggered recipe '{}': {}",
+                    recipe.name,
+                    e
+                );
+            }
+        }
+    }
+}
+
+fn block_on_trigger_db<T, Fut>(future: Fut) -> Result<T, String>
+where
+    T: Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    fn run<T>(future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(future)
+    }
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || run(future))
+            .join()
+            .map_err(|_| "event trigger database task panicked".to_string())?
+    } else {
+        run(future)
+    }
+}
+
+fn record_trigger_sources(
+    orch: &Orchestrator,
+    execution_id: &str,
+    payload: &serde_json::Value,
+) -> Result<usize, String> {
+    let source_job_ids = extract_source_job_ids(payload);
+    if source_job_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let db = block_on_trigger_db({
+        let dbs = orch.db.clone();
+        let execution_id = execution_id.to_string();
+        async move {
+            crate::execution::routing::owning_db_for_execution(&dbs, &execution_id)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    })?;
+    let execution_id = execution_id.to_string();
+    block_on_trigger_db(async move {
+        db.write(|conn| {
+            let source_job_ids = source_job_ids.clone();
+            let execution_id = execution_id.clone();
+            Box::pin(async move {
+                let now = chrono::Utc::now().timestamp() as i32;
+                for source_job_id in &source_job_ids {
+                    let id = ids::mint_child(&execution_id);
+                    conn.execute(
+                        "INSERT INTO execution_trigger_sources(
+                            id, source_job_id, triggered_execution_id, created_at
+                         )
+                         VALUES (?1, ?2, ?3, ?4)",
+                        (
+                            id.as_str(),
+                            source_job_id.as_str(),
+                            execution_id.as_str(),
+                            now,
+                        ),
+                    )
+                    .await?;
+                }
+                Ok(source_job_ids.len())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())
+    })
+}
+
+/// Extract source job IDs from an event payload.
+///
+/// Handles both single-event payloads (with `sourceJobId`) and
+/// accumulated payloads (array of events, each with `sourceJobId`).
+fn extract_source_job_ids(payload: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+
+    // Single event: { "sourceJobId": "..." }
+    if let Some(id) = payload.get("sourceJobId").and_then(|v| v.as_str()) {
+        ids.push(id.to_string());
+        return ids;
+    }
+
+    // Accumulated payload: { "events": [{ "sourceJobId": "..." }, ...] }
+    if let Some(events) = payload.get("events").and_then(|v| v.as_array()) {
+        let mut seen = std::collections::HashSet::new();
+        for event in events {
+            if let Some(id) = event.get("sourceJobId").and_then(|v| v.as_str()) {
+                if seen.insert(id.to_string()) {
+                    ids.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{
+        AgentFilter, AgentFilterMode, EventFilter, NodePosition, RecipeNode, TriggerConfig,
+    };
+
+    fn make_job_ended_recipe(name: &str, filter: Option<EventFilter>) -> Recipe {
+        Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
+            id: format!("recipe-{}", name),
+            name: name.to_string(),
+            description: None,
+            trigger: RecipeTrigger::JobEnded,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "trigger-1".to_string(),
+                node_type: RecipeNodeType::Trigger,
+                name: "Trigger".to_string(),
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: Some(TriggerConfig {
+                    trigger_type: RecipeTrigger::JobEnded,
+                    scope: None,
+                    schedule_config: None,
+                    event_filter: filter,
+                }),
+                agent_config: None,
+                action_config: None,
+                checkpoint_config: None,
+                artifact_config: None,
+                condition_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn make_skill_called_recipe(name: &str, filter: Option<EventFilter>) -> Recipe {
+        Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
+            id: format!("recipe-{}", name),
+            name: name.to_string(),
+            description: None,
+            trigger: RecipeTrigger::SkillCalled,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "trigger-1".to_string(),
+                node_type: RecipeNodeType::Trigger,
+                name: "Trigger".to_string(),
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: Some(TriggerConfig {
+                    trigger_type: RecipeTrigger::SkillCalled,
+                    scope: None,
+                    schedule_config: None,
+                    event_filter: filter,
+                }),
+                agent_config: None,
+                action_config: None,
+                checkpoint_config: None,
+                artifact_config: None,
+                condition_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn make_job_ended_event(status: &str, agent_config_id: Option<&str>) -> JobEndedEvent {
+        JobEndedEvent {
+            event_id: "test-job-id".to_string(),
+            source_job_id: "test-job-id".to_string(),
+            project_key: "TST".to_string(),
+            issue_number: Some(1),
+            execution_seq: Some(1),
+            agent_config_id: agent_config_id.map(String::from),
+            node_name: Some("Builder".to_string()),
+            status: status.to_string(),
+            completed_at: 0,
+            transcript_uri: Some("cairn://TST/1/1/Builder/chat".to_string()),
+        }
+    }
+
+    fn make_skill_called_event(skill_id: &str) -> SkillCalledEvent {
+        SkillCalledEvent {
+            event_id: format!("test-run:{}", skill_id),
+            source_job_id: "test-job-id".to_string(),
+            skill_id: skill_id.to_string(),
+            skill_name: "Test Skill".to_string(),
+            project_key: "TST".to_string(),
+            issue_number: Some(1),
+            execution_seq: Some(1),
+            node_name: Some("Builder".to_string()),
+            transcript_uri: Some("cairn://TST/1/1/Builder/chat".to_string()),
+        }
+    }
+
+    // ---- is_event_triggered ----
+
+    #[test]
+    fn test_is_event_triggered() {
+        use crate::models::{RecipeSnapshot, TriggerContext};
+        use std::collections::HashMap;
+
+        let make_snapshot = |tt: TriggerType| ExecutionSnapshot {
+            continuity: Default::default(),
+            branch_target: Default::default(),
+            model_routing: None,
+            recipe: RecipeSnapshot {
+                id: "r".to_string(),
+                name: "R".to_string(),
+                description: None,
+                trigger: RecipeTrigger::Manual,
+                nodes: vec![],
+                edges: vec![],
+            },
+            agents: HashMap::new(),
+            skills: HashMap::new(),
+            trigger_context: TriggerContext {
+                issue_id: None,
+                project_id: "p".to_string(),
+                trigger_type: tt,
+
+                event_payload: None,
+                initiated_via: None,
+            },
+            presets: None,
+            delegated_packets: vec![],
+            created_at: 0,
+        };
+
+        assert!(!is_event_triggered(&make_snapshot(TriggerType::Manual)));
+        assert!(!is_event_triggered(&make_snapshot(TriggerType::Schedule)));
+        assert!(is_event_triggered(&make_snapshot(TriggerType::JobEnded)));
+        assert!(is_event_triggered(&make_snapshot(TriggerType::SkillCalled)));
+    }
+
+    // ---- matches_job_ended ----
+
+    #[test]
+    fn job_ended_no_filter_matches_any_event() {
+        let recipe = make_job_ended_recipe("no-filter", None);
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("failed", None)
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("build"))
+        ));
+    }
+
+    #[test]
+    fn job_ended_status_filter_matches_included_status() {
+        let recipe = make_job_ended_recipe(
+            "status-filter",
+            Some(EventFilter {
+                job_status: Some(vec!["complete".to_string()]),
+                skill_ids: None,
+                node_filter: None,
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+    }
+
+    #[test]
+    fn job_ended_status_filter_rejects_excluded_status() {
+        let recipe = make_job_ended_recipe(
+            "status-filter",
+            Some(EventFilter {
+                job_status: Some(vec!["complete".to_string()]),
+                skill_ids: None,
+                node_filter: None,
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("failed", None)
+        ));
+    }
+
+    #[test]
+    fn job_ended_status_filter_accepts_multiple_statuses() {
+        let recipe = make_job_ended_recipe(
+            "multi-status",
+            Some(EventFilter {
+                job_status: Some(vec!["complete".to_string(), "failed".to_string()]),
+                skill_ids: None,
+                node_filter: None,
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("failed", None)
+        ));
+    }
+
+    #[test]
+    fn job_ended_node_filter_allow_matches_agent_config() {
+        let recipe = make_job_ended_recipe(
+            "node-filter",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec!["build".to_string()],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("build"))
+        ));
+    }
+
+    #[test]
+    fn job_ended_node_filter_allow_rejects_wrong_agent() {
+        let recipe = make_job_ended_recipe(
+            "node-filter",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec!["build".to_string()],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("review"))
+        ));
+    }
+
+    #[test]
+    fn job_ended_node_filter_allow_rejects_missing_agent() {
+        let recipe = make_job_ended_recipe(
+            "node-filter",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec!["build".to_string()],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+    }
+
+    #[test]
+    fn job_ended_node_filter_allow_multiple_ids() {
+        let recipe = make_job_ended_recipe(
+            "multi-allow",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec!["build".to_string(), "review".to_string()],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("build"))
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("review"))
+        ));
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("deploy"))
+        ));
+    }
+
+    #[test]
+    fn job_ended_node_filter_exclude_rejects_listed_agent() {
+        let recipe = make_job_ended_recipe(
+            "exclude",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Exclude,
+                    ids: vec!["build".to_string()],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("build"))
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("review"))
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+    }
+
+    #[test]
+    fn job_ended_node_filter_empty_ids_matches_all() {
+        let recipe = make_job_ended_recipe(
+            "empty-ids",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec![],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("anything"))
+        ));
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+    }
+
+    #[test]
+    fn job_ended_combined_filters_both_must_pass() {
+        let recipe = make_job_ended_recipe(
+            "combined",
+            Some(EventFilter {
+                job_status: Some(vec!["complete".to_string()]),
+                skill_ids: None,
+                node_filter: Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec!["build".to_string()],
+                }),
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        // Both match
+        assert!(matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("build"))
+        ));
+        // Status wrong
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("failed", Some("build"))
+        ));
+        // Node wrong
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", Some("review"))
+        ));
+    }
+
+    #[test]
+    fn manual_recipe_never_matches_job_ended() {
+        let recipe = Recipe {
+            branch_targets: cairn_db::models::default_branch_targets(),
+            id: "manual".to_string(),
+            name: "Manual".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+    }
+
+    // ---- matches_skill_called ----
+
+    #[test]
+    fn skill_called_no_filter_matches_any_skill() {
+        let recipe = make_skill_called_recipe("no-filter", None);
+        assert!(matches_skill_called(
+            &recipe,
+            &make_skill_called_event("anything")
+        ));
+    }
+
+    #[test]
+    fn skill_called_filter_matches_included_skill() {
+        let recipe = make_skill_called_recipe(
+            "skill-filter",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: Some(vec!["code-review".to_string()]),
+                node_filter: None,
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_skill_called(
+            &recipe,
+            &make_skill_called_event("code-review")
+        ));
+    }
+
+    #[test]
+    fn skill_called_filter_rejects_excluded_skill() {
+        let recipe = make_skill_called_recipe(
+            "skill-filter",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: Some(vec!["code-review".to_string()]),
+                node_filter: None,
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(!matches_skill_called(
+            &recipe,
+            &make_skill_called_event("testing")
+        ));
+    }
+
+    #[test]
+    fn skill_called_filter_accepts_multiple_skills() {
+        let recipe = make_skill_called_recipe(
+            "multi-skill",
+            Some(EventFilter {
+                job_status: None,
+                skill_ids: Some(vec!["code-review".to_string(), "testing".to_string()]),
+                node_filter: None,
+                every: None,
+                group_by: None,
+                accumulation_scope: None,
+                time_window_secs: None,
+            }),
+        );
+        assert!(matches_skill_called(
+            &recipe,
+            &make_skill_called_event("code-review")
+        ));
+        assert!(matches_skill_called(
+            &recipe,
+            &make_skill_called_event("testing")
+        ));
+        assert!(!matches_skill_called(
+            &recipe,
+            &make_skill_called_event("deploy")
+        ));
+    }
+
+    #[test]
+    fn job_ended_recipe_never_matches_skill_called() {
+        let recipe = make_job_ended_recipe("je", None);
+        assert!(!matches_skill_called(
+            &recipe,
+            &make_skill_called_event("anything")
+        ));
+    }
+
+    #[test]
+    fn skill_called_recipe_never_matches_job_ended() {
+        let recipe = make_skill_called_recipe("sc", None);
+        assert!(!matches_job_ended(
+            &recipe,
+            &make_job_ended_event("complete", None)
+        ));
+    }
+}

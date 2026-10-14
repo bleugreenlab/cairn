@@ -1,0 +1,231 @@
+use super::super::target::{target_family, TargetFamily};
+use crate::mcp::types::{ChangeItem, ChangeMode};
+use crate::resources::mutations::{
+    BlockingResult, ResourceAppliedChange, ResourceMutationFailure, ResourceTargetHash,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(super) struct ChangeReport {
+    pub(super) applied: Vec<AppliedChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) blocking: Option<BlockingResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) branch: Option<BranchReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) failures: Vec<ChangeFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) commit: Option<CommitReport>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) partial_success: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) transactional: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) preview: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) event_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) apply_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) target_hashes: Vec<TargetHash>,
+    /// Set only on a report returned for a re-delivered `write` call, naming it
+    /// as such. A replay applies nothing, so the agent is told the report it is
+    /// reading came from the first delivery rather than from this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) replayed: Option<String>,
+    /// Durable continuation state for a minted write. It exists only while the
+    /// replay-ledger row is pending and is removed before the agent sees the
+    /// settled report.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "_post_seal"
+    )]
+    pub(super) post_seal: Option<MintedPostSealState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct MintedPostSealState {
+    pub(super) file_changes: Vec<PersistedFileChange>,
+    pub(super) cloud: Option<CloudPublicationInput>,
+    #[serde(default)]
+    pub(super) ledger_recorded: bool,
+    #[serde(default)]
+    pub(super) cloud_published: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PersistedFileChange {
+    pub(super) path: String,
+    pub(super) status: String,
+    pub(super) additions: i32,
+    pub(super) deletions: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct CloudPublicationInput {
+    pub(super) project_id: String,
+    pub(super) repository: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct AppliedChange {
+    pub(super) index: usize,
+    pub(super) target: String,
+    pub(super) mode: String,
+    pub(super) kind: String,
+    pub(super) summary: String,
+    /// Structured echo of the post-mutation state for UI renderers (e.g. the
+    /// todos snapshot). Omitted on the wire when absent, so non-todos results
+    /// are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ChangeFailure {
+    pub(super) index: usize,
+    pub(super) target: String,
+    pub(super) mode: String,
+    pub(super) kind: String,
+    pub(super) error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct BranchReport {
+    pub(super) number: i64,
+    pub(super) git_ref: String,
+    pub(super) uri: String,
+    pub(super) stage: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) pr_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct CommitReport {
+    pub(super) status: String,
+    pub(super) sha: Option<String>,
+    pub(super) pr_number: Option<i32>,
+    pub(super) message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct TargetHash {
+    pub(super) target: String,
+    pub(super) kind: String,
+    pub(super) exists: bool,
+    pub(super) hash: String,
+}
+
+impl From<ResourceAppliedChange> for AppliedChange {
+    fn from(change: ResourceAppliedChange) -> Self {
+        Self {
+            index: change.index,
+            target: change.target,
+            mode: change.mode,
+            kind: change.kind,
+            summary: change.summary,
+            data: change.data,
+        }
+    }
+}
+
+impl From<ResourceTargetHash> for TargetHash {
+    fn from(hash: ResourceTargetHash) -> Self {
+        Self {
+            target: hash.target,
+            kind: hash.kind,
+            exists: hash.exists,
+            hash: hash.hash,
+        }
+    }
+}
+
+pub(super) struct IndexedChange<'a> {
+    pub(super) index: usize,
+    pub(super) item: &'a ChangeItem,
+}
+
+#[derive(Debug)]
+pub(super) struct IndexedFailure {
+    pub(super) failure: ChangeFailure,
+    pub(super) commit: Option<CommitReport>,
+}
+
+pub(super) type IndexedResult<T> = Result<T, Box<IndexedFailure>>;
+
+pub(super) fn resource_failure(failure: ResourceMutationFailure) -> Box<IndexedFailure> {
+    Box::new(IndexedFailure {
+        failure: ChangeFailure {
+            index: failure.index,
+            target: failure.target,
+            mode: failure.mode,
+            kind: failure.kind,
+            error: failure.error,
+        },
+        commit: None,
+    })
+}
+
+pub(super) fn empty_change_report(
+    applied: Vec<AppliedChange>,
+    failures: Vec<ChangeFailure>,
+    commit: Option<CommitReport>,
+    partial_success: bool,
+    transactional: bool,
+) -> ChangeReport {
+    ChangeReport {
+        applied,
+        blocking: None,
+        branch: None,
+        failures,
+        commit,
+        partial_success,
+        transactional,
+        preview: false,
+        event_uri: None,
+        apply_uri: None,
+        target_hashes: Vec::new(),
+        replayed: None,
+        post_seal: None,
+    }
+}
+
+fn change_kind_for_target(target: &str) -> &'static str {
+    match target_family(target) {
+        Ok(TargetFamily::Resource) => "resource",
+        Ok(TargetFamily::File) => "file",
+        Err(_) => "unknown",
+    }
+}
+
+pub(super) fn mode_name(mode: ChangeMode) -> &'static str {
+    match mode {
+        ChangeMode::Create => "create",
+        ChangeMode::Append => "append",
+        ChangeMode::Patch => "patch",
+        ChangeMode::UnifiedPatch => "unified_patch",
+        ChangeMode::Replace => "replace",
+        ChangeMode::Delete => "delete",
+        ChangeMode::Rename => "rename",
+        ChangeMode::Apply => "apply",
+        ChangeMode::Revert => "revert",
+    }
+}
+
+pub(super) fn build_failure(
+    index: usize,
+    item: &ChangeItem,
+    error: impl Into<String>,
+) -> Box<IndexedFailure> {
+    Box::new(IndexedFailure {
+        failure: ChangeFailure {
+            index,
+            target: item.target.clone(),
+            mode: mode_name(item.mode).to_string(),
+            kind: change_kind_for_target(&item.target).to_string(),
+            error: error.into(),
+        },
+        commit: None,
+    })
+}

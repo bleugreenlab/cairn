@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Plan title"
+    },
+    "content": {
+      "type": "string",
+      "description": "Implementation plan (markdown)"
+    },
+    "summary": {
+      "type": "string",
+      "description": "1-2 sentence summary"
+    }
+  },
+  "required": ["title", "content"],
+  "additionalProperties": false
+}

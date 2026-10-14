@@ -1,0 +1,36 @@
+[package]
+name = "cairn-mcp-server"
+version.workspace = true
+edition = "2021"
+description = "Cairn's MCP server: the read/write/run tool surface, served over stdio by cairn-cmd and over streamable HTTP by the orchestrator"
+license = "BUSL-1.1"
+repository = "https://github.com/bleugreenlab/cairn"
+homepage = "https://cairn.computer"
+
+[lib]
+name = "cairn_mcp_server"
+path = "src/lib.rs"
+
+[dependencies]
+rmcp = { version = "3", features = ["server", "macros"] }
+async-trait = "0.1"
+# `http::request::Parts` is the type the streamable-HTTP transport injects into
+# each request's extensions; the per-request caller reads its principal there.
+http = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = "1.0"
+regex = "1"
+url = "2"
+tracing = "0.1"
+cairn-common = { path = "../cairn-common" }
+
+[dev-dependencies]
+rmcp = { version = "3", features = [
+    "client",
+    "transport-streamable-http-server",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"

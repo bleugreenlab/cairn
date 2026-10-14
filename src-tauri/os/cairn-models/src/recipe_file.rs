@@ -1,0 +1,2336 @@
+//! Recipe file format for export/import.
+//!
+//! Provides a portable, human-readable format for sharing recipes.
+//! Supports both YAML (primary) and JSON formats.
+
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use uuid::Uuid;
+
+use super::{
+    default_branch_targets, ActionNodeConfig, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig,
+    BranchMode, BranchTarget, CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig,
+    ConditionType, ConfirmPolicy, ContextNodeConfig, EventFilter, NodePosition, Recipe, RecipeEdge,
+    RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger, ScheduleConfig, SchemaConfig,
+    TriggerConfig, TriggerScope,
+};
+
+/// Generate a slug from a name (lowercase, hyphens, no special chars)
+fn slugify(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// Generate unique readable IDs for nodes (UUID -> "planner-1")
+fn generate_readable_ids(nodes: &[RecipeNode]) -> HashMap<String, String> {
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut slug_counts: HashMap<String, usize> = HashMap::new();
+
+    for node in nodes {
+        let slug = slugify(&node.name);
+        let count = slug_counts.entry(slug.clone()).or_insert(0);
+        *count += 1;
+        let readable_id = format!("{}-{}", slug, count);
+        id_map.insert(node.id.clone(), readable_id);
+    }
+
+    id_map
+}
+
+/// Current format version for future compatibility
+pub const CURRENT_CAIRN_VERSION: u32 = 1;
+
+/// serde skip helper: omit a bool field from output when it is false.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// serde skip helper: omit `branchTargets` when it is the implicit default, so a
+/// recipe file that never mentions it round-trips byte-identically.
+fn is_default_branch_targets(targets: &[BranchTarget]) -> bool {
+    targets == default_branch_targets()
+}
+
+/// Recipe file format for export/import
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeFile {
+    /// Format version for future compatibility
+    cairn_version: u32,
+    /// Recipe name
+    pub name: String,
+    /// Optional description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bundles: Vec<String>,
+    /// When the recipe can be triggered
+    trigger: RecipeTrigger,
+    /// Marks a backend/system recipe: hidden from the issue-create picker but
+    /// still listed in Settings. Only written to YAML when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    system: bool,
+    /// Branch targets this recipe's graph supports (`[new]` when absent). A
+    /// recipe declares `base` only when pruning its terminal `pr` node still
+    /// leaves a coherent workflow.
+    #[serde(
+        default = "default_branch_targets",
+        skip_serializing_if = "is_default_branch_targets"
+    )]
+    pub branch_targets: Vec<BranchTarget>,
+    /// Legacy context field — read during deserialization for migration, never written.
+    /// Value is migrated into the trigger node's scope during into_recipe().
+    #[serde(default, skip_serializing)]
+    context: Option<String>,
+    /// Node definitions
+    nodes: Vec<RecipeFileNode>,
+    /// Edge definitions
+    edges: Vec<RecipeFileEdge>,
+}
+
+/// Compact node representation for file format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeFileNode {
+    /// Node identifier (used for edge references)
+    pub id: String,
+    /// Node type
+    #[serde(rename = "type")]
+    pub node_type: RecipeNodeType,
+    /// Display name
+    pub name: String,
+    /// Position as "x@y" string format (e.g., "60@50")
+    pub position: String,
+    /// Optional parent node reference (for slot nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// Type-specific configuration (flattened for readability)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<NodeFileConfig>,
+}
+
+/// Unified config structure for file format (more readable than separate configs)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeFileConfig {
+    // Trigger config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_type: Option<RecipeTrigger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<TriggerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_config: Option<ScheduleConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_filter: Option<EventFilter>,
+
+    // Agent config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Worktree mode: "own" (default), "inherit", or "none"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_mode: Option<BranchMode>,
+
+    // Action config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_config_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_params: Option<serde_json::Value>,
+
+    // Common nested configs
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<SchemaConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<SchemaConfig>,
+
+    // Standalone checkpoint config (for checkpoint nodes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_config: Option<CheckpointNodeConfig>,
+
+    // Artifact config (typed schema node)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confirm_policy: Option<ConfirmPolicy>,
+
+    // Condition config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_type: Option<ConditionType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<ConditionErrorBehavior>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_port: Option<String>,
+
+    // Context config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// Compact edge representation for file format
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeFileEdge {
+    /// Optional edge ID (auto-generated on import if omitted)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Source node ID with optional handle suffix (e.g., "planner-1@control-out")
+    pub from: String,
+    /// Target node ID with optional handle suffix (e.g., "builder-1@control-in")
+    pub to: String,
+    /// Edge type (control or context)
+    #[serde(rename = "type")]
+    pub edge_type: RecipeEdgeType,
+}
+
+/// Validation result for recipe files
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeFileValidation {
+    /// Whether the file is valid for import
+    pub valid: bool,
+    /// Non-fatal warnings (e.g., unknown agent config references)
+    warnings: Vec<String>,
+    /// Fatal errors that prevent import
+    pub errors: Vec<String>,
+    /// Number of nodes in the file
+    node_count: usize,
+    /// Number of edges in the file
+    edge_count: usize,
+}
+
+// ============================================================================
+// Conversion: Recipe -> RecipeFile (Export)
+// ============================================================================
+
+impl From<Recipe> for RecipeFile {
+    fn from(recipe: Recipe) -> Self {
+        // Generate readable ID mapping (UUID -> "planner-1")
+        let id_map = generate_readable_ids(&recipe.nodes);
+
+        // Convert nodes with readable IDs
+        let nodes: Vec<RecipeFileNode> = recipe
+            .nodes
+            .into_iter()
+            .map(|node| {
+                let readable_id = id_map
+                    .get(&node.id)
+                    .cloned()
+                    .unwrap_or_else(|| node.id.clone());
+                let readable_parent = node
+                    .parent_id
+                    .as_ref()
+                    .and_then(|pid| id_map.get(pid).cloned());
+                RecipeFileNode::from_node(node, readable_id, readable_parent)
+            })
+            .collect();
+
+        // Deduplicate edges by full connection (source@handle, target@handle, type)
+        let mut seen = HashSet::new();
+        let edges: Vec<RecipeFileEdge> = recipe
+            .edges
+            .into_iter()
+            .filter(|edge| {
+                let key = (
+                    edge.source_node_id.clone(),
+                    edge.source_handle.clone(),
+                    edge.target_node_id.clone(),
+                    edge.target_handle.clone(),
+                    edge.edge_type.clone(),
+                );
+                seen.insert(key)
+            })
+            .map(|edge| {
+                let source_node = id_map
+                    .get(&edge.source_node_id)
+                    .cloned()
+                    .unwrap_or(edge.source_node_id);
+                let target_node = id_map
+                    .get(&edge.target_node_id)
+                    .cloned()
+                    .unwrap_or(edge.target_node_id);
+                // Use node@handle format for clarity
+                let from = format!("{}@{}", source_node, edge.source_handle);
+                let to = format!("{}@{}", target_node, edge.target_handle);
+                RecipeFileEdge {
+                    id: None, // Omit edge IDs in export
+                    from,
+                    to,
+                    edge_type: edge.edge_type,
+                }
+            })
+            .collect();
+
+        RecipeFile {
+            cairn_version: CURRENT_CAIRN_VERSION,
+            name: recipe.name,
+            description: recipe.description,
+            bundles: Vec::new(),
+            trigger: recipe.trigger,
+            system: recipe.is_system,
+            branch_targets: recipe.branch_targets,
+            context: None,
+            nodes,
+            edges,
+        }
+    }
+}
+
+impl RecipeFileNode {
+    /// Create RecipeFileNode with explicit readable ID and parent_id
+    fn from_node(node: RecipeNode, id: String, parent_id: Option<String>) -> Self {
+        let config = build_node_file_config(&node);
+        RecipeFileNode {
+            id,
+            node_type: node.node_type,
+            name: node.name,
+            position: format!(
+                "{}@{}",
+                node.position.x.round() as i32,
+                node.position.y.round() as i32
+            ),
+            parent_id,
+            config,
+        }
+    }
+}
+
+/// Build unified config from type-specific configs
+fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
+    let mut config = NodeFileConfig::default();
+    let mut has_config = false;
+
+    // Trigger config
+    if let Some(tc) = &node.trigger_config {
+        config.trigger_type = Some(tc.trigger_type.clone());
+        config.scope = tc.scope.clone();
+        config.schedule_config = tc.schedule_config.clone();
+        config.event_filter = tc.event_filter.clone();
+        has_config = true;
+    }
+
+    // Agent config
+    if let Some(ac) = &node.agent_config {
+        config.agent = ac.agent_config_id.clone();
+        config.output_schema = ac.output_schema.clone();
+        // Export branch_mode if non-default
+        if let Some(ref gc) = ac.git_config {
+            if gc.branch_mode != BranchMode::Isolate {
+                config.branch_mode = Some(gc.branch_mode.clone());
+            }
+        }
+        has_config = true;
+    }
+
+    // Action config
+    if let Some(ac) = &node.action_config {
+        config.action_config_id = ac.action_config_id.clone();
+        if !ac.action.is_empty() {
+            config.action = Some(ac.action.clone());
+        }
+        if !ac.action_params.is_null() {
+            config.action_params = Some(ac.action_params.clone());
+        }
+        config.input_schema = ac.input_schema.clone();
+        // For action nodes, output_schema comes from action_config
+        if config.output_schema.is_none() {
+            config.output_schema = ac.output_schema.clone();
+        }
+        has_config = true;
+    }
+
+    // Standalone checkpoint config (for checkpoint nodes)
+    if let Some(cc) = &node.checkpoint_config {
+        config.checkpoint_config = Some(cc.clone());
+        has_config = true;
+    }
+
+    // Artifact config (typed schema node)
+    if let Some(ac) = &node.artifact_config {
+        config.artifact_type = Some(ac.name.clone());
+        config.schema = ac.schema.clone();
+        if ac.confirm_policy != ConfirmPolicy::default() {
+            config.confirm_policy = Some(ac.confirm_policy);
+        }
+        if ac.content.is_some() {
+            config.content = ac.content.clone();
+        }
+        has_config = true;
+    }
+
+    // Condition config
+    if let Some(cc) = &node.condition_config {
+        config.condition_type = Some(cc.condition_type.clone());
+        config.expression = cc.expression.clone();
+        config.question = cc.question.clone();
+        config.model = cc.model.clone();
+        config.ports = Some(cc.ports.clone());
+        config.on_error = Some(cc.on_error.clone());
+        config.default_port = cc.default_port.clone();
+        has_config = true;
+    }
+
+    // Context config
+    if let Some(cc) = &node.context_config {
+        config.content = Some(cc.content.clone());
+        has_config = true;
+    }
+
+    if has_config {
+        Some(config)
+    } else {
+        None
+    }
+}
+
+// ============================================================================
+// Conversion: RecipeFile -> Recipe (Import)
+// ============================================================================
+
+impl RecipeFile {
+    /// Convert to Recipe for import, generating new IDs.
+    ///
+    /// Handles legacy migration: if a top-level `context` field exists and the trigger
+    /// node has no scope, the context value is copied into the trigger node's scope.
+    pub fn into_recipe(self, workspace_id: Option<String>, project_id: Option<String>) -> Recipe {
+        let mut id_map: HashMap<String, String> = HashMap::new();
+        let legacy_context = self.context.clone();
+
+        // Generate new IDs for all nodes
+        let mut nodes: Vec<RecipeNode> = self
+            .nodes
+            .into_iter()
+            .map(|n| {
+                let new_id = Uuid::new_v4().to_string();
+                id_map.insert(n.id.clone(), new_id.clone());
+                n.into_node(new_id, &id_map)
+            })
+            .collect();
+
+        // Migrate legacy context field into trigger node scope
+        if let Some(ctx) = legacy_context {
+            let scope = ctx.parse::<TriggerScope>().ok();
+            if let Some(scope) = scope {
+                for node in &mut nodes {
+                    if node.node_type == RecipeNodeType::Trigger {
+                        if let Some(ref mut tc) = node.trigger_config {
+                            if tc.scope.is_none() {
+                                tc.scope = Some(scope.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Remap edge references
+        let edges: Vec<RecipeEdge> = self
+            .edges
+            .into_iter()
+            .map(|e| e.into_edge(&id_map))
+            .collect();
+
+        let now = chrono::Utc::now().timestamp();
+
+        Recipe {
+            id: Uuid::new_v4().to_string(),
+            name: self.name,
+            description: self.description,
+            trigger: self.trigger,
+            workspace_id,
+            project_id,
+            is_system: self.system,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes,
+            edges,
+            branch_targets: self.branch_targets,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Validate the recipe file without importing
+    pub fn validate(&self) -> RecipeFileValidation {
+        let mut warnings = Vec::new();
+        let mut errors = Vec::new();
+
+        // Check version compatibility
+        if self.cairn_version > CURRENT_CAIRN_VERSION {
+            errors.push(format!(
+                "Recipe file version {} not supported. Maximum supported: {}",
+                self.cairn_version, CURRENT_CAIRN_VERSION
+            ));
+        }
+
+        // Collect node IDs
+        let node_ids: HashSet<_> = self.nodes.iter().map(|n| n.id.as_str()).collect();
+
+        // Validate edge references (parse node@handle format)
+        for edge in &self.edges {
+            let (source_node, _) = parse_node_handle(&edge.from);
+            let (target_node, _) = parse_node_handle(&edge.to);
+            if !node_ids.contains(source_node) {
+                errors.push(format!(
+                    "Edge references unknown source node: {}",
+                    source_node
+                ));
+            }
+            if !node_ids.contains(target_node) {
+                errors.push(format!(
+                    "Edge references unknown target node: {}",
+                    target_node
+                ));
+            }
+        }
+
+        // Check for trigger node
+        if !self
+            .nodes
+            .iter()
+            .any(|n| n.node_type == RecipeNodeType::Trigger)
+        {
+            errors.push("Recipe must have a trigger node".to_string());
+        }
+
+        // Check for duplicate node IDs
+        let mut seen_ids = HashSet::new();
+        for node in &self.nodes {
+            if !seen_ids.insert(&node.id) {
+                errors.push(format!("Duplicate node ID: {}", node.id));
+            }
+        }
+
+        // Validate parent_id references
+        for node in &self.nodes {
+            if let Some(parent_id) = &node.parent_id {
+                if !node_ids.contains(parent_id.as_str()) {
+                    errors.push(format!(
+                        "Node '{}' references unknown parent node: {}",
+                        node.name, parent_id
+                    ));
+                }
+            }
+        }
+
+        // Warn about agent config references (may not exist in target workspace)
+        // Also validate inherit mode constraints
+        for node in &self.nodes {
+            if let Some(config) = &node.config {
+                if let Some(agent_id) = &config.agent {
+                    warnings.push(format!(
+                        "Node '{}' references agent config '{}' - verify it exists in your workspace",
+                        node.name, agent_id
+                    ));
+                }
+                if let Some(action_id) = &config.action_config_id {
+                    warnings.push(format!(
+                        "Node '{}' references action config '{}' - verify it exists in your workspace",
+                        node.name, action_id
+                    ));
+                }
+                // Check inherit mode has a valid upstream agent
+                if let Some(BranchMode::Inherit) = &config.branch_mode {
+                    // Find incoming control edges to this node
+                    let has_agent_parent = self.edges.iter().any(|edge| {
+                        let (target_node, _) = parse_node_handle(&edge.to);
+                        if target_node != node.id {
+                            return false;
+                        }
+                        if edge.edge_type != RecipeEdgeType::Control {
+                            return false;
+                        }
+                        // Check if source is an agent node
+                        let (source_node, _) = parse_node_handle(&edge.from);
+                        self.nodes
+                            .iter()
+                            .any(|n| n.id == source_node && n.node_type == RecipeNodeType::Agent)
+                    });
+                    if !has_agent_parent {
+                        warnings.push(format!(
+                            "Node '{}' uses branch_mode 'inherit' but has no upstream agent node - ensure it follows an agent with branch_mode 'own'",
+                            node.name
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Validate accumulation settings on event filters
+        for node in &self.nodes {
+            if node.node_type != RecipeNodeType::Trigger {
+                continue;
+            }
+            if let Some(config) = &node.config {
+                if let Some(filter) = &config.event_filter {
+                    if let Some(every) = filter.every {
+                        if every < 1 {
+                            errors.push(format!(
+                                "Node '{}': eventFilter.every must be >= 1, got {}",
+                                node.name, every
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // A node's context-self living-doc names must stay distinct from its
+        // terminal context-out artifact name. The runtime excludes a producer's
+        // ctx-self names from the terminal latest-fallback BY NAME, so a
+        // collision would wrongly drop the terminal artifact (CAIRN-1925/1953).
+        // Catch it at authoring time rather than as a silent runtime mis-resolve.
+        {
+            // node id -> the artifact/contract name it declares (artifact node
+            // name, or a pr/action node's input-schema name).
+            let declared_name: HashMap<&str, String> = self
+                .nodes
+                .iter()
+                .filter_map(|n| {
+                    let config = n.config.as_ref()?;
+                    let name = match n.node_type {
+                        RecipeNodeType::Artifact => config.artifact_type.clone(),
+                        RecipeNodeType::Pr | RecipeNodeType::Action => {
+                            config.input_schema.as_ref().map(|s| s.name.clone())
+                        }
+                        _ => None,
+                    }?;
+                    Some((n.id.as_str(), name))
+                })
+                .collect();
+
+            for node in &self.nodes {
+                let mut ctx_self_names: Vec<&str> = Vec::new();
+                let mut terminal_name: Option<&str> = None;
+                for edge in &self.edges {
+                    let (source_node, source_handle) = parse_node_handle(&edge.from);
+                    if source_node != node.id {
+                        continue;
+                    }
+                    let (target_node, _) = parse_node_handle(&edge.to);
+                    match source_handle {
+                        Some("context-self") => {
+                            if let Some(name) = declared_name.get(target_node) {
+                                ctx_self_names.push(name.as_str());
+                            }
+                        }
+                        Some("context-out") => {
+                            if let Some(name) = declared_name.get(target_node) {
+                                terminal_name = Some(name.as_str());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(terminal) = terminal_name {
+                    if ctx_self_names.contains(&terminal) {
+                        errors.push(format!(
+                            "Node '{}' has a context-self living doc named '{}' that collides with its terminal context-out artifact name; they must be distinct",
+                            node.name, terminal
+                        ));
+                    }
+                }
+            }
+        }
+
+        // An Instruction node injects its content into a consuming AGENT's system
+        // prompt (`resolve_instruction_prompt_conn`). Structurally it may only wire
+        // `context-out -> agent@context-in`; any other target (a PR, action,
+        // artifact, or another producer) silently drops the text at runtime. This
+        // node exists precisely to make recipe prose a validated structure rather
+        // than a magic prompt marker, so reject the mis-wire at authoring time.
+        {
+            let node_type_by_id: HashMap<&str, RecipeNodeType> = self
+                .nodes
+                .iter()
+                .map(|n| (n.id.as_str(), n.node_type.clone()))
+                .collect();
+            for edge in &self.edges {
+                let (source_node, source_handle) = parse_node_handle(&edge.from);
+                if node_type_by_id.get(source_node) != Some(&RecipeNodeType::Instruction) {
+                    continue;
+                }
+                let (target_node, target_handle) = parse_node_handle(&edge.to);
+                let target_is_agent =
+                    node_type_by_id.get(target_node) == Some(&RecipeNodeType::Agent);
+                if source_handle != Some("context-out")
+                    || !target_is_agent
+                    || target_handle != Some("context-in")
+                {
+                    errors.push(format!(
+                        "Instruction node '{}' must connect context-out -> an agent's context-in; its content is injected into that agent's system prompt and is dropped on any other target",
+                        source_node
+                    ));
+                }
+            }
+        }
+
+        // Declaring the `base` branch target means an execution may be launched
+        // with every `pr` node pruned from the snapshot. Pruning a node that
+        // still has downstream control would sever the DAG, so a recipe may only
+        // offer `base` when each of its PR nodes is control-terminal. Catch it
+        // here rather than producing a broken graph at launch.
+        if self.branch_targets.contains(&BranchTarget::Base) {
+            for node in &self.nodes {
+                if node.node_type != RecipeNodeType::Pr {
+                    continue;
+                }
+                let has_outgoing_control = self.edges.iter().any(|edge| {
+                    let (source_node, _) = parse_node_handle(&edge.from);
+                    source_node == node.id && edge.edge_type == RecipeEdgeType::Control
+                });
+                if has_outgoing_control {
+                    errors.push(format!(
+                        "Recipe declares branch target 'base' but PR node '{}' has an outgoing control edge; pruning it would sever the graph, so only a control-terminal PR node may be pruned",
+                        node.id
+                    ));
+                }
+            }
+        }
+
+        RecipeFileValidation {
+            valid: errors.is_empty(),
+            warnings,
+            errors,
+            node_count: self.nodes.len(),
+            edge_count: self.edges.len(),
+        }
+    }
+}
+
+impl RecipeFileNode {
+    /// Convert to RecipeNode with new ID
+    fn into_node(self, new_id: String, id_map: &HashMap<String, String>) -> RecipeNode {
+        let config = self.config.unwrap_or_default();
+
+        // Build type-specific configs
+        let trigger_config = config.trigger_type.map(|t| TriggerConfig {
+            trigger_type: t,
+            scope: config.scope.clone(),
+            schedule_config: config.schedule_config.clone(),
+            event_filter: config.event_filter.clone(),
+        });
+
+        let agent_config = if config.agent.is_some()
+            || config.output_schema.is_some()
+            || config.branch_mode.is_some()
+        {
+            // Only create agent config for agent nodes
+            if self.node_type == RecipeNodeType::Agent {
+                // Build git_config when branch_mode is specified
+                let git_config = if config.branch_mode.is_some() {
+                    Some(AgentGitConfig {
+                        branch_mode: config.branch_mode.clone().unwrap_or_default(),
+                        // Authored recipes keep the degrading inherit ladder; the
+                        // strict grade is set by the delegation edge, which has
+                        // no recipe file.
+                        require_parent_head: false,
+                    })
+                } else {
+                    None
+                };
+                Some(AgentNodeConfig {
+                    agent_config_id: config.agent,
+                    output_schema: config.output_schema.clone(),
+                    git_config,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let action_config = if config.action.is_some()
+            || config.action_config_id.is_some()
+            || (self.node_type == RecipeNodeType::Pr && config.input_schema.is_some())
+        {
+            Some(ActionNodeConfig {
+                action_config_id: config.action_config_id,
+                action: config.action.unwrap_or_default(),
+                action_params: config
+                    .action_params
+                    .unwrap_or(serde_json::Value::Object(Default::default())),
+                input_schema: config.input_schema,
+                output_schema: if self.node_type == RecipeNodeType::Action {
+                    config.output_schema
+                } else {
+                    None
+                },
+            })
+        } else {
+            None
+        };
+
+        let checkpoint_config = config.checkpoint_config;
+
+        // Typed ArtifactNode: carries the artifact name, JSON schema, confirm
+        // policy, and (for the collapsed Context case) inline literal content.
+        let artifact_config = if self.node_type == RecipeNodeType::Artifact {
+            Some(ArtifactNodeConfig {
+                name: config.artifact_type.clone().unwrap_or_default(),
+                schema: config.schema.clone(),
+                confirm_policy: config.confirm_policy.unwrap_or_default(),
+                content: config.content.clone(),
+            })
+        } else {
+            None
+        };
+
+        // Condition config
+        let condition_config = if config.condition_type.is_some() || config.ports.is_some() {
+            Some(ConditionNodeConfig {
+                condition_type: config.condition_type.unwrap_or_default(),
+                expression: config.expression,
+                question: config.question,
+                model: config.model,
+                ports: config.ports.unwrap_or_default(),
+                on_error: config.on_error.unwrap_or_default(),
+                default_port: config.default_port,
+            })
+        } else {
+            None
+        };
+
+        // Context/Instruction node config: both carry a `{ content }` text block
+        // under `config.content`. Context feeds the initial user message (legacy;
+        // new recipes carry literal content on an ArtifactNode instead), while an
+        // Instruction node's content is injected into the system prompt.
+        let context_config = if matches!(
+            self.node_type,
+            RecipeNodeType::Context | RecipeNodeType::Instruction
+        ) {
+            config
+                .content
+                .clone()
+                .map(|content| ContextNodeConfig { content })
+        } else {
+            None
+        };
+
+        // Remap parent_id if present
+        let parent_id = self
+            .parent_id
+            .map(|pid| id_map.get(&pid).cloned().unwrap_or(pid));
+
+        RecipeNode {
+            id: new_id,
+            node_type: self.node_type,
+            name: self.name,
+            position: parse_position(&self.position),
+            parent_id,
+            trigger_config,
+            agent_config,
+            action_config,
+            checkpoint_config,
+            artifact_config,
+            condition_config,
+            context_config,
+        }
+    }
+}
+
+/// Parse "x@y" position format into NodePosition
+fn parse_position(s: &str) -> NodePosition {
+    let parts: Vec<&str> = s.split('@').collect();
+    if parts.len() == 2 {
+        let x = parts[0].parse::<f32>().unwrap_or(0.0);
+        let y = parts[1].parse::<f32>().unwrap_or(0.0);
+        NodePosition { x, y }
+    } else {
+        NodePosition { x: 0.0, y: 0.0 }
+    }
+}
+
+/// Parse "node-id@handle" format, returning (node_id, Some(handle)) or (node_id, None)
+fn parse_node_handle(s: &str) -> (&str, Option<&str>) {
+    match s.rsplit_once('@') {
+        Some((node, handle)) => (node, Some(handle)),
+        None => (s, None),
+    }
+}
+
+impl RecipeFileEdge {
+    /// Convert to RecipeEdge with remapped node references
+    fn into_edge(self, id_map: &HashMap<String, String>) -> RecipeEdge {
+        // Parse node@handle format
+        let (source_node, source_handle_opt) = parse_node_handle(&self.from);
+        let (target_node, target_handle_opt) = parse_node_handle(&self.to);
+
+        // Remap node IDs
+        let source_id = id_map
+            .get(source_node)
+            .cloned()
+            .unwrap_or_else(|| source_node.to_string());
+        let target_id = id_map
+            .get(target_node)
+            .cloned()
+            .unwrap_or_else(|| target_node.to_string());
+
+        // Use parsed handles or defaults based on edge type
+        let source_handle =
+            source_handle_opt
+                .map(String::from)
+                .unwrap_or_else(|| match self.edge_type {
+                    RecipeEdgeType::Control => "control-out".to_string(),
+                    RecipeEdgeType::Context => "context-out".to_string(),
+                });
+        let target_handle =
+            target_handle_opt
+                .map(String::from)
+                .unwrap_or_else(|| match self.edge_type {
+                    RecipeEdgeType::Control => "control-in".to_string(),
+                    RecipeEdgeType::Context => "context-in".to_string(),
+                });
+
+        RecipeEdge {
+            id: Uuid::new_v4().to_string(), // Always generate new UUID
+            edge_type: self.edge_type,
+            source_node_id: source_id,
+            source_handle,
+            target_node_id: target_id,
+            target_handle,
+        }
+    }
+}
+
+// ============================================================================
+// Serialization helpers
+// ============================================================================
+
+impl RecipeFile {
+    /// Serialize to YAML format
+    pub fn to_yaml(&self) -> Result<String, String> {
+        serde_yaml::to_string(self).map_err(|e| format!("YAML serialization error: {}", e))
+    }
+
+    /// Serialize to JSON format
+    pub fn to_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(self).map_err(|e| format!("JSON serialization error: {}", e))
+    }
+
+    /// Parse from YAML format
+    pub fn from_yaml(content: &str) -> Result<Self, String> {
+        serde_yaml::from_str(content).map_err(|e| format!("YAML parse error: {}", e))
+    }
+
+    /// Parse from JSON format
+    pub fn from_json(content: &str) -> Result<Self, String> {
+        serde_json::from_str(content).map_err(|e| format!("JSON parse error: {}", e))
+    }
+
+    /// Parse from either format (auto-detect)
+    pub fn parse(content: &str) -> Result<Self, String> {
+        // Try JSON first (faster, stricter)
+        if let Ok(file) = Self::from_json(content) {
+            return Ok(file);
+        }
+        // Fall back to YAML
+        Self::from_yaml(content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_recipe() -> Recipe {
+        Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "test-recipe-id".to_string(),
+            name: "Test Recipe".to_string(),
+            description: Some("A test recipe".to_string()),
+            trigger: RecipeTrigger::Manual,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![
+                RecipeNode {
+                    id: "trigger-1".to_string(),
+                    node_type: RecipeNodeType::Trigger,
+                    name: "Start".to_string(),
+                    position: NodePosition { x: 0.0, y: 100.0 },
+                    parent_id: None,
+                    trigger_config: Some(TriggerConfig {
+                        trigger_type: RecipeTrigger::Manual,
+                        scope: Some(TriggerScope::Issue),
+                        schedule_config: None,
+                        event_filter: None,
+                    }),
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: None,
+                },
+                RecipeNode {
+                    id: "agent-1".to_string(),
+                    node_type: RecipeNodeType::Agent,
+                    name: "Plan Agent".to_string(),
+                    position: NodePosition { x: 200.0, y: 100.0 },
+                    parent_id: None,
+                    trigger_config: None,
+                    agent_config: Some(AgentNodeConfig {
+                        agent_config_id: Some("plan".to_string()),
+                        output_schema: None,
+                        git_config: None,
+                    }),
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: None,
+                },
+            ],
+            edges: vec![RecipeEdge {
+                id: "edge-1".to_string(),
+                edge_type: RecipeEdgeType::Control,
+                source_node_id: "trigger-1".to_string(),
+                source_handle: "control-out".to_string(),
+                target_node_id: "agent-1".to_string(),
+                target_handle: "control-in".to_string(),
+            }],
+            created_at: 1000000,
+            updated_at: 1000000,
+        }
+    }
+
+    #[test]
+    fn test_export_to_yaml() {
+        let recipe = make_test_recipe();
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+
+        assert!(yaml.contains("cairnVersion: 1"));
+        assert!(yaml.contains("name: Test Recipe"));
+        assert!(yaml.contains("trigger: manual"));
+    }
+
+    #[test]
+    fn test_export_to_json() {
+        let recipe = make_test_recipe();
+        let file: RecipeFile = recipe.into();
+        let json = file.to_json().unwrap();
+
+        assert!(json.contains("\"cairnVersion\": 1"));
+        assert!(json.contains("\"name\": \"Test Recipe\""));
+    }
+
+    #[test]
+    fn test_roundtrip_yaml() {
+        let original = make_test_recipe();
+        let file: RecipeFile = original.clone().into();
+        let yaml = file.to_yaml().unwrap();
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+
+        // Names and structure should match (IDs will differ)
+        assert_eq!(imported.name, original.name);
+        assert_eq!(imported.nodes.len(), original.nodes.len());
+        assert_eq!(imported.edges.len(), original.edges.len());
+    }
+
+    #[test]
+    fn test_roundtrip_json() {
+        let original = make_test_recipe();
+        let file: RecipeFile = original.clone().into();
+        let json = file.to_json().unwrap();
+
+        let parsed = RecipeFile::from_json(&json).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+
+        assert_eq!(imported.name, original.name);
+        assert_eq!(imported.nodes.len(), original.nodes.len());
+        assert_eq!(imported.edges.len(), original.edges.len());
+    }
+
+    #[test]
+    fn system_flag_roundtrips_through_yaml() {
+        // A recipe marked system re-emits `system: true` and parses back as is_system.
+        let mut recipe = make_test_recipe();
+        recipe.is_system = true;
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(yaml.contains("system: true"));
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+        assert!(imported.is_system);
+    }
+
+    #[test]
+    fn system_flag_omitted_from_yaml_when_false() {
+        // The default (non-system) recipe must not write a `system:` key, and a
+        // file without the key loads as is_system == false.
+        let recipe = make_test_recipe();
+        assert!(!recipe.is_system);
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(!yaml.contains("system:"));
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+        assert!(!imported.is_system);
+    }
+
+    #[test]
+    fn test_validation_valid_file() {
+        let recipe = make_test_recipe();
+        let file: RecipeFile = recipe.into();
+        let validation = file.validate();
+
+        assert!(validation.valid);
+        assert!(validation.errors.is_empty());
+        assert_eq!(validation.node_count, 2);
+        assert_eq!(validation.edge_count, 1);
+    }
+
+    #[test]
+    fn test_validation_missing_trigger() {
+        let file = RecipeFile {
+            branch_targets: crate::default_branch_targets(),
+            cairn_version: 1,
+            name: "No Trigger".to_string(),
+            description: None,
+            bundles: Vec::new(),
+            trigger: RecipeTrigger::Manual,
+            context: None,
+            system: false,
+            nodes: vec![RecipeFileNode {
+                id: "agent-1".to_string(),
+                node_type: RecipeNodeType::Agent,
+                name: "Agent".to_string(),
+                position: "0@0".to_string(),
+                parent_id: None,
+                config: None,
+            }],
+            edges: vec![],
+        };
+
+        let validation = file.validate();
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|e| e.contains("trigger node")));
+    }
+
+    #[test]
+    fn test_validation_invalid_edge_reference() {
+        let file = RecipeFile {
+            branch_targets: crate::default_branch_targets(),
+            cairn_version: 1,
+            name: "Bad Edge".to_string(),
+            description: None,
+            bundles: Vec::new(),
+            trigger: RecipeTrigger::Manual,
+            context: None,
+            system: false,
+            nodes: vec![RecipeFileNode {
+                id: "trigger-1".to_string(),
+                node_type: RecipeNodeType::Trigger,
+                name: "Start".to_string(),
+                position: "0@0".to_string(),
+                parent_id: None,
+                config: None,
+            }],
+            edges: vec![RecipeFileEdge {
+                id: None,
+                from: "trigger-1@control-out".to_string(),
+                to: "nonexistent@control-in".to_string(),
+                edge_type: RecipeEdgeType::Control,
+            }],
+        };
+
+        let validation = file.validate();
+        assert!(!validation.valid);
+        assert!(validation.errors.iter().any(|e| e.contains("nonexistent")));
+    }
+
+    #[test]
+    fn test_edge_default_handles() {
+        // Without @handle suffix, defaults are used based on edge type
+        let edge = RecipeFileEdge {
+            id: None,
+            from: "a".to_string(),
+            to: "b".to_string(),
+            edge_type: RecipeEdgeType::Control,
+        };
+
+        let id_map = HashMap::new();
+        let converted = edge.into_edge(&id_map);
+
+        assert_eq!(converted.source_handle, "control-out");
+        assert_eq!(converted.target_handle, "control-in");
+    }
+
+    #[test]
+    fn test_edge_explicit_handles() {
+        // With @handle suffix, explicit handles are used
+        let edge = RecipeFileEdge {
+            id: None,
+            from: "a@custom-out".to_string(),
+            to: "b@custom-in".to_string(),
+            edge_type: RecipeEdgeType::Control,
+        };
+
+        let id_map = HashMap::new();
+        let converted = edge.into_edge(&id_map);
+
+        assert_eq!(converted.source_handle, "custom-out");
+        assert_eq!(converted.target_handle, "custom-in");
+    }
+
+    #[test]
+    fn test_auto_detect_format() {
+        let recipe = make_test_recipe();
+        let file: RecipeFile = recipe.into();
+
+        // JSON
+        let json = file.to_json().unwrap();
+        let parsed_json = RecipeFile::parse(&json).unwrap();
+        assert_eq!(parsed_json.name, "Test Recipe");
+
+        // YAML
+        let yaml = file.to_yaml().unwrap();
+        let parsed_yaml = RecipeFile::parse(&yaml).unwrap();
+        assert_eq!(parsed_yaml.name, "Test Recipe");
+    }
+
+    #[test]
+    fn test_legacy_context_field_migration() {
+        // Old format with top-level context: "issue" should migrate into trigger scope
+        let yaml = r#"cairnVersion: 1
+name: Legacy Recipe
+trigger: issue
+context: issue
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: issue
+edges: []
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).unwrap();
+        let recipe = parsed.into_recipe(None, None);
+        let trigger_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .unwrap();
+        let tc = trigger_node.trigger_config.as_ref().unwrap();
+        assert_eq!(tc.trigger_type, RecipeTrigger::Manual); // "issue" maps to Manual
+        assert_eq!(tc.scope, Some(TriggerScope::Issue)); // context migrated to scope
+    }
+
+    #[test]
+    fn test_legacy_context_does_not_overwrite_existing_scope() {
+        // If trigger node already has a scope, the legacy context should not overwrite it
+        let yaml = r#"cairnVersion: 1
+name: Legacy With Scope
+trigger: manual
+context: issue
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: manual
+      scope: project
+edges: []
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).unwrap();
+        let recipe = parsed.into_recipe(None, None);
+        let trigger_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .unwrap();
+        let tc = trigger_node.trigger_config.as_ref().unwrap();
+        // Existing scope "project" should be preserved, not overwritten by context "issue"
+        assert_eq!(tc.scope, Some(TriggerScope::Project));
+    }
+
+    #[test]
+    fn test_no_context_field_leaves_scope_none() {
+        // Modern format without context field — scope stays as-is from trigger node
+        let yaml = r#"cairnVersion: 1
+name: Modern Recipe
+trigger: manual
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: manual
+edges: []
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).unwrap();
+        let recipe = parsed.into_recipe(None, None);
+        let trigger_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .unwrap();
+        let tc = trigger_node.trigger_config.as_ref().unwrap();
+        assert_eq!(tc.scope, None); // No context → no scope migration
+    }
+
+    #[test]
+    fn test_context_field_not_serialized() {
+        // The context field should never appear in serialized YAML output
+        let recipe = Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(
+            !yaml.contains("context:"),
+            "context field should not appear in serialized YAML, got:\n{}",
+            yaml
+        );
+    }
+
+    #[test]
+    fn test_context_node_roundtrip() {
+        let recipe = Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "test-recipe".to_string(),
+            name: "Context Test".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![
+                RecipeNode {
+                    id: "trigger-1".to_string(),
+                    node_type: RecipeNodeType::Trigger,
+                    name: "Start".to_string(),
+                    position: NodePosition { x: 0.0, y: 0.0 },
+                    parent_id: None,
+                    trigger_config: Some(TriggerConfig {
+                        trigger_type: RecipeTrigger::Manual,
+                        scope: Some(TriggerScope::Issue),
+                        schedule_config: None,
+                        event_filter: None,
+                    }),
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: None,
+                },
+                RecipeNode {
+                    id: "context-1".to_string(),
+                    node_type: RecipeNodeType::Context,
+                    name: "Instructions".to_string(),
+                    position: NodePosition { x: 100.0, y: 200.0 },
+                    parent_id: None,
+                    trigger_config: None,
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: Some(ContextNodeConfig {
+                        content: "This is the context content.\n\nWith multiple lines.".to_string(),
+                    }),
+                },
+            ],
+            edges: vec![],
+            created_at: 1000000,
+            updated_at: 1000000,
+        };
+
+        // Export to YAML
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+
+        // Verify content is in the YAML
+        assert!(yaml.contains("This is the context content"));
+
+        // Import back
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+
+        // Find the context node and verify content
+        let context_node = imported
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Context)
+            .expect("Context node should exist");
+        let context_config = context_node
+            .context_config
+            .as_ref()
+            .expect("Context config should exist");
+        assert_eq!(
+            context_config.content,
+            "This is the context content.\n\nWith multiple lines."
+        );
+    }
+
+    #[test]
+    fn test_instruction_node_roundtrip() {
+        // An Instruction node reuses `context_config` for its `{ content }` block
+        // and must survive the RecipeFile YAML round-trip with both its content
+        // and its `Instruction` node_type intact (distinct from a Context node).
+        let recipe = Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "test-recipe".to_string(),
+            name: "Instruction Test".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: Some("default".to_string()),
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![
+                RecipeNode {
+                    id: "trigger-1".to_string(),
+                    node_type: RecipeNodeType::Trigger,
+                    name: "Start".to_string(),
+                    position: NodePosition { x: 0.0, y: 0.0 },
+                    parent_id: None,
+                    trigger_config: Some(TriggerConfig {
+                        trigger_type: RecipeTrigger::Manual,
+                        scope: Some(TriggerScope::Issue),
+                        schedule_config: None,
+                        event_filter: None,
+                    }),
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: None,
+                },
+                RecipeNode {
+                    id: "instructions-1".to_string(),
+                    node_type: RecipeNodeType::Instruction,
+                    name: "Framing".to_string(),
+                    position: NodePosition { x: 20.0, y: 260.0 },
+                    parent_id: None,
+                    trigger_config: None,
+                    agent_config: None,
+                    action_config: None,
+                    checkpoint_config: None,
+                    artifact_config: None,
+                    condition_config: None,
+                    context_config: Some(ContextNodeConfig {
+                        content: "You drive one feature.\n\n**Finish** when whole.".to_string(),
+                    }),
+                },
+            ],
+            edges: vec![],
+            created_at: 1000000,
+            updated_at: 1000000,
+        };
+
+        let file: RecipeFile = recipe.into();
+        let yaml = file.to_yaml().unwrap();
+        assert!(yaml.contains("You drive one feature"));
+
+        let parsed = RecipeFile::from_yaml(&yaml).unwrap();
+        let imported = parsed.into_recipe(Some("default".to_string()), None);
+
+        let instruction_node = imported
+            .nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Instruction)
+            .expect("Instruction node should survive with its node_type");
+        let context_config = instruction_node
+            .context_config
+            .as_ref()
+            .expect("Instruction config should exist");
+        assert_eq!(
+            context_config.content,
+            "You drive one feature.\n\n**Finish** when whole."
+        );
+    }
+
+    // =========================================================================
+    // Accumulation validation tests
+    // =========================================================================
+
+    fn make_trigger_recipe_with_filter(filter: Option<EventFilter>) -> RecipeFile {
+        RecipeFile {
+            branch_targets: crate::default_branch_targets(),
+            cairn_version: 1,
+            name: "Test".to_string(),
+            description: None,
+            bundles: Vec::new(),
+            trigger: RecipeTrigger::SkillCalled,
+            context: None,
+            system: false,
+            nodes: vec![RecipeFileNode {
+                id: "trigger-1".to_string(),
+                node_type: RecipeNodeType::Trigger,
+                name: "Trigger".to_string(),
+                position: "0@0".to_string(),
+                parent_id: None,
+                config: Some(NodeFileConfig {
+                    trigger_type: Some(RecipeTrigger::SkillCalled),
+                    event_filter: filter,
+                    ..Default::default()
+                }),
+            }],
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_every_zero_is_error() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: None,
+            node_filter: None,
+            every: Some(0),
+            group_by: Some("skillId".to_string()),
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("every must be >= 1")));
+    }
+
+    #[test]
+    fn validate_every_gt1_without_group_by_is_ok() {
+        // groupBy is auto-inferred by the accumulator, so omitting it is fine
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: Some(4),
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_every_1_without_group_by_is_ok() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: Some(1),
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_every_4_with_group_by_is_ok() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: Some(4),
+            group_by: Some("skillId".to_string()),
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn validate_every_negative_is_error() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: None,
+            node_filter: None,
+            every: Some(-1),
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(!result.valid);
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("every must be >= 1")));
+    }
+
+    #[test]
+    fn validate_no_every_is_ok() {
+        let file = make_trigger_recipe_with_filter(Some(EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".to_string()]),
+            node_filter: None,
+            every: None,
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        }));
+        let result = file.validate();
+        assert!(result.valid, "errors: {:?}", result.errors);
+    }
+
+    #[test]
+    fn bundled_recipes_parse_and_validate() {
+        // The bundled recipes drive the confirm-gated artifact workflow; they must
+        // parse and validate after the checkpoint -> confirm_policy cutover.
+        let recipes: &[(&str, &str)] = &[
+            (
+                "planbuild",
+                include_str!("../../../packs/core/recipes/planbuild.yaml"),
+            ),
+            (
+                "build",
+                include_str!("../../../packs/core/recipes/build.yaml"),
+            ),
+            (
+                "coordinator",
+                include_str!("../../../packs/core/recipes/coordinator.yaml"),
+            ),
+            (
+                "task-list",
+                include_str!("../../../packs/core/recipes/task-list.yaml"),
+            ),
+            (
+                "setup",
+                include_str!("../../../packs/core/recipes/setup.yaml"),
+            ),
+            (
+                "memory-triage",
+                include_str!("../../../packs/core/recipes/memory-triage.yaml"),
+            ),
+        ];
+        for (name, yaml) in recipes {
+            let parsed = RecipeFile::from_yaml(yaml)
+                .unwrap_or_else(|e| panic!("{name} failed to parse: {e}"));
+            let validation = parsed.validate();
+            assert!(
+                validation.valid,
+                "{name} failed validation: {:?}",
+                validation.errors
+            );
+        }
+    }
+
+    #[test]
+    fn instruction_edge_to_non_agent_fails_validation() {
+        // An Instruction node wired to a non-agent target (here a PR node) drops
+        // its text at runtime, so validation must reject it. A bundled recipe
+        // whose Instruction edges target an agent's context-in still passes
+        // (bundled_recipes_parse_and_validate).
+        let yaml = r#"
+cairnVersion: 1
+name: Bad Instruction
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: agent-1
+  type: agent
+  name: Agent
+  position: 0@100
+  config:
+    agent: builder
+- id: pr-1
+  type: pr
+  name: PR
+  position: 0@200
+  config:
+    actionParams: {}
+- id: instructions-1
+  type: instruction
+  name: Framing
+  position: 200@100
+  config:
+    content: hello
+edges:
+- from: trigger-1@control-out
+  to: agent-1@control-in
+  type: control
+- from: instructions-1@context-out
+  to: pr-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).unwrap().validate();
+        assert!(!validation.valid, "Instruction -> PR must be rejected");
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|e| e.contains("Instruction node")),
+            "errors: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn instruction_edge_to_agent_context_in_validates() {
+        // The supported wiring: Instruction context-out -> agent context-in.
+        let yaml = r#"
+cairnVersion: 1
+name: Good Instruction
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: agent-1
+  type: agent
+  name: Agent
+  position: 0@100
+  config:
+    agent: builder
+- id: instructions-1
+  type: instruction
+  name: Framing
+  position: 200@100
+  config:
+    content: hello
+edges:
+- from: trigger-1@control-out
+  to: agent-1@control-in
+  type: control
+- from: instructions-1@context-out
+  to: agent-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).unwrap().validate();
+        assert!(validation.valid, "errors: {:?}", validation.errors);
+    }
+
+    #[test]
+    fn coordinator_pr_node_carries_the_integration_branch_framing() {
+        // The single Coordinator recipe authors no Instruction node: the
+        // branch-specific framing rides on the PR node's input-schema
+        // description, which the prompt renders only when that node survives
+        // (the `new` branch target). Under `base` the node is pruned and the
+        // framing disappears with it, so the text must live here and nowhere
+        // else.
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../packs/core/recipes/coordinator.yaml"))
+                .expect("coordinator parses");
+        assert!(
+            !parsed
+                .nodes
+                .iter()
+                .any(|n| n.node_type == RecipeNodeType::Instruction),
+            "framing is derived from topology, not authored on an Instruction node"
+        );
+
+        let description = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "pr-1")
+            .and_then(|n| n.config.as_ref())
+            .and_then(|c| c.input_schema.as_ref())
+            .and_then(|s| s.description.clone())
+            .expect("the PR node carries an input-schema description");
+        assert!(
+            description.contains("integration branch"),
+            "PR framing names the coordinator's branch as the integration branch"
+        );
+        assert!(
+            description.contains("gh pr create"),
+            "PR framing tells the coordinator the workflow opens the PR"
+        );
+    }
+
+    #[test]
+    fn checkpoint_command_chain_parses_and_validates() {
+        // A command-checkpoint gate between an agent and a PR node: the
+        // checkpoint runs a command, exit 0 continues, non-zero blocks (and now
+        // wakes the agent). No bundled recipe exercises a checkpoint node, so
+        // this guards the recipe-file loading path for one.
+        let yaml = r#"
+cairnVersion: 1
+name: Checkpoint Chain
+description: agent -> command checkpoint -> pr
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: builder-1
+  type: agent
+  name: Builder
+  position: 0@100
+  config:
+    agent: build
+- id: ci-1
+  type: checkpoint
+  name: CI
+  position: 0@200
+  config:
+    checkpointConfig:
+      command: bun run ci
+- id: pr-1
+  type: pr
+  name: PR
+  position: 0@300
+  config:
+    inputSchema:
+      name: create-pr
+      confirmPolicy: auto
+      schema:
+        type: object
+        required: [title, body]
+        properties:
+          title: { type: string }
+          body: { type: string }
+edges:
+- from: trigger-1@control-out
+  to: builder-1@control-in
+  type: control
+- from: trigger-1@context-out
+  to: builder-1@context-in
+  type: context
+- from: builder-1@control-out
+  to: ci-1@control-in
+  type: control
+- from: ci-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: builder-1@context-out
+  to: pr-1@context-in
+  type: context
+"#;
+        let parsed = RecipeFile::from_yaml(yaml).expect("checkpoint chain parses");
+        let ci = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "ci-1")
+            .expect("ci-1 node");
+        assert_eq!(ci.node_type, crate::RecipeNodeType::Checkpoint);
+        assert_eq!(
+            ci.config
+                .as_ref()
+                .and_then(|c| c.checkpoint_config.as_ref())
+                .and_then(|cc| cc.command.as_deref()),
+            Some("bun run ci")
+        );
+        let validation = parsed.validate();
+        assert!(
+            validation.valid,
+            "checkpoint chain failed validation: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn task_list_uses_executor_agent_node() {
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../packs/core/recipes/task-list.yaml"))
+                .unwrap();
+        let executor = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "executor-1")
+            .expect("executor-1 node");
+
+        assert_eq!(executor.node_type, crate::RecipeNodeType::Agent);
+        assert_eq!(
+            executor
+                .config
+                .as_ref()
+                .and_then(|config| config.agent.as_deref()),
+            Some("executor")
+        );
+        assert!(parsed.nodes.iter().all(|node| node.id != "executor"));
+    }
+
+    #[test]
+    fn planbuild_plan_artifact_node_carries_user_confirm_gate() {
+        // Under the port model the plan gate lives on the `plan` ArtifactNode
+        // between planner and builder, not on an inline planner outputSchema.
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../packs/core/recipes/planbuild.yaml"))
+                .unwrap();
+
+        // The planner agent carries no inline output schema.
+        let planner = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "planner-1")
+            .expect("planner-1 node");
+        assert!(planner
+            .config
+            .as_ref()
+            .and_then(|c| c.output_schema.as_ref())
+            .is_none());
+
+        // The terminal contract is the `plan` ArtifactNode it feeds.
+        let plan = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "plan-1")
+            .expect("plan-1 artifact node");
+        assert_eq!(plan.node_type, crate::RecipeNodeType::Artifact);
+        let config = plan.config.as_ref().expect("plan config");
+        assert_eq!(config.artifact_type.as_deref(), Some("plan"));
+        assert_eq!(config.confirm_policy, Some(crate::ConfirmPolicy::User));
+
+        // Imported into a Recipe, the ArtifactNode resolves to a typed config.
+        let recipe = parsed.into_recipe(None, None);
+        let plan_node = recipe
+            .nodes
+            .iter()
+            .find(|n| n.node_type == crate::RecipeNodeType::Artifact)
+            .expect("imported plan artifact node");
+        let artifact_config = plan_node.artifact_config.as_ref().expect("artifact config");
+        assert_eq!(artifact_config.name, "plan");
+        assert_eq!(artifact_config.confirm_policy, crate::ConfirmPolicy::User);
+        assert!(artifact_config.schema.is_some());
+    }
+
+    #[test]
+    fn coordinator_and_build_ship_create_pr_terminal() {
+        // Decision 1 of the port model: the producer's `context-out` points
+        // straight at the PR action's typed `create-pr` input — no standalone
+        // create-pr ArtifactNode. This is the terminal output contract for the
+        // coordinator/build agent, and it auto-confirms (the PR lifecycle, not a
+        // pre-PR artifact confirmation, is the human gate).
+        for (recipe_name, yaml, producer) in [
+            (
+                "coordinator",
+                include_str!("../../../packs/core/recipes/coordinator.yaml"),
+                "coordinator-1",
+            ),
+            (
+                "build",
+                include_str!("../../../packs/core/recipes/build.yaml"),
+                "builder-1",
+            ),
+        ] {
+            let parsed = RecipeFile::from_yaml(yaml)
+                .unwrap_or_else(|e| panic!("{recipe_name} failed to parse: {e}"));
+
+            // The producing agent carries no inline output schema: its terminal
+            // contract is defined solely by its single context-out edge target.
+            let producer_node = parsed
+                .nodes
+                .iter()
+                .find(|n| n.id == producer)
+                .unwrap_or_else(|| panic!("{recipe_name}: {producer} node"));
+            assert!(
+                producer_node
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.output_schema.as_ref())
+                    .is_none(),
+                "{recipe_name}: {producer} must carry no inline outputSchema"
+            );
+
+            // Exactly one context-out edge, from the producer to the PR node's
+            // context-in port.
+            let ctx_out: Vec<&RecipeFileEdge> = parsed
+                .edges
+                .iter()
+                .filter(|e| e.from == format!("{producer}@context-out"))
+                .collect();
+            assert_eq!(
+                ctx_out.len(),
+                1,
+                "{recipe_name}: producer ships exactly one terminal output"
+            );
+            assert_eq!(
+                ctx_out[0].to, "pr-1@context-in",
+                "{recipe_name}: context-out targets the PR node's input port"
+            );
+            assert_eq!(ctx_out[0].edge_type, RecipeEdgeType::Context);
+
+            // The PR node's typed input port defines the terminal schema: name
+            // `create-pr`, auto-confirm.
+            let pr = parsed
+                .nodes
+                .iter()
+                .find(|n| n.id == "pr-1")
+                .unwrap_or_else(|| panic!("{recipe_name}: pr-1 node"));
+            assert_eq!(pr.node_type, crate::RecipeNodeType::Pr);
+            let input = pr
+                .config
+                .as_ref()
+                .and_then(|c| c.input_schema.as_ref())
+                .unwrap_or_else(|| panic!("{recipe_name}: pr-1 inputSchema"));
+            assert_eq!(input.name, "create-pr");
+            assert_eq!(input.confirm_policy, crate::ConfirmPolicy::Auto);
+        }
+    }
+
+    #[test]
+    fn coordinator_offers_both_branch_targets_with_a_prunable_pr_node() {
+        // The single Coordinator recipe is the one bundled recipe whose graph is
+        // meaningful under both branch targets, so it declares both. `base`
+        // prunes every PR node, which is only sound when each is
+        // control-terminal — the precondition `validate()` enforces and the
+        // launch-time transform relies on. The transformed topology itself
+        // (agent nodes on `none`, no PR node, long-running derivation) is
+        // asserted in cairn-core's `execution::branch_target` tests, which can
+        // reach `is_long_running_node`.
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../packs/core/recipes/coordinator.yaml"))
+                .expect("coordinator parses");
+        assert_eq!(
+            parsed.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+        assert!(parsed.validate().valid, "coordinator validates");
+
+        let pr_nodes: Vec<&RecipeFileNode> = parsed
+            .nodes
+            .iter()
+            .filter(|n| n.node_type == RecipeNodeType::Pr)
+            .collect();
+        assert_eq!(pr_nodes.len(), 1, "one PR node to prune");
+        assert!(
+            !parsed.edges.iter().any(|e| {
+                let (source, _) = parse_node_handle(&e.from);
+                source == pr_nodes[0].id && e.edge_type == RecipeEdgeType::Control
+            }),
+            "the PR node is control-terminal, so pruning it cannot sever the graph"
+        );
+
+        // Under `new` the coordinator mints its own branch: no authored
+        // branchMode, so it takes the `isolate` default.
+        let coordinator = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "coordinator-1")
+            .expect("coordinator-1 node");
+        assert_eq!(
+            coordinator
+                .config
+                .as_ref()
+                .and_then(|c| c.branch_mode.clone()),
+            None
+        );
+
+        // The living board is wired through the context-self port under both
+        // targets — the transform never touches context-self edges.
+        let ctx_self: Vec<&RecipeFileEdge> = parsed
+            .edges
+            .iter()
+            .filter(|e| e.from == "coordinator-1@context-self")
+            .collect();
+        assert_eq!(ctx_self.len(), 1, "coordinator owns one context-self board");
+        assert_eq!(ctx_self[0].to, "board-1@context-in");
+    }
+
+    #[test]
+    fn branch_targets_default_to_new_and_round_trip() {
+        // Absent means `[new]`, and the default is omitted on write so every
+        // existing recipe file round-trips byte-identically.
+        let base_yaml = r#"
+cairnVersion: 1
+name: Plain
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+edges: []
+"#;
+        let plain = RecipeFile::from_yaml(base_yaml).expect("parses");
+        assert_eq!(plain.branch_targets, vec![BranchTarget::New]);
+        assert!(
+            !plain.to_yaml().unwrap().contains("branchTargets"),
+            "the default target list is not written back out"
+        );
+
+        let declared_yaml = base_yaml.replace(
+            "trigger: manual\nnodes:",
+            "trigger: manual\nbranchTargets: [new, base]\nnodes:",
+        );
+        let declared = RecipeFile::from_yaml(&declared_yaml).expect("parses");
+        assert_eq!(
+            declared.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+        let reparsed = RecipeFile::from_yaml(&declared.to_yaml().unwrap()).expect("reparses");
+        assert_eq!(
+            reparsed.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+
+        // The declaration survives the Recipe round-trip too.
+        let recipe = declared.into_recipe(None, None);
+        assert_eq!(
+            recipe.branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+        assert_eq!(
+            RecipeFile::from(recipe).branch_targets,
+            vec![BranchTarget::New, BranchTarget::Base]
+        );
+    }
+
+    #[test]
+    fn base_branch_target_rejects_a_mid_graph_pr_node() {
+        // Pruning a PR node that still has downstream control would sever the
+        // DAG, so a recipe with one may not offer `base`.
+        let yaml = r#"
+cairnVersion: 1
+name: Mid-graph PR
+trigger: manual
+branchTargets: [new, base]
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+- id: pr-1
+  type: pr
+  name: PR
+  position: 0@100
+  config:
+    actionParams: {}
+- id: builder-1
+  type: agent
+  name: Builder
+  position: 0@200
+  config:
+    agent: builder
+edges:
+- from: trigger-1@control-out
+  to: pr-1@control-in
+  type: control
+- from: pr-1@control-out
+  to: builder-1@control-in
+  type: control
+"#;
+        let validation = RecipeFile::from_yaml(yaml).unwrap().validate();
+        assert!(!validation.valid);
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|e| e.contains("branch target 'base'") && e.contains("pr-1")),
+            "errors: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn coordinator_owns_a_distinct_context_self_board() {
+        // The coordinator carries a living plan/board as a context-self doc,
+        // independent of its terminal `create-pr` output. The board is an
+        // auto-confirm ArtifactNode named `board`, reached by a context-self edge.
+        let parsed =
+            RecipeFile::from_yaml(include_str!("../../../packs/core/recipes/coordinator.yaml"))
+                .expect("coordinator parses");
+
+        let ctx_self: Vec<&RecipeFileEdge> = parsed
+            .edges
+            .iter()
+            .filter(|e| e.from == "coordinator-1@context-self")
+            .collect();
+        assert_eq!(ctx_self.len(), 1, "coordinator owns one context-self board");
+        assert_eq!(ctx_self[0].to, "board-1@context-in");
+        assert_eq!(ctx_self[0].edge_type, RecipeEdgeType::Context);
+
+        let board = parsed
+            .nodes
+            .iter()
+            .find(|n| n.id == "board-1")
+            .expect("board node");
+        assert_eq!(board.node_type, RecipeNodeType::Artifact);
+        let config = board.config.as_ref().expect("board config");
+        assert_eq!(config.artifact_type.as_deref(), Some("board"));
+        // A living doc never gates; it must stay auto-confirm so the job-wide
+        // `validate_confirmable` check is not tripped by the board.
+        assert_eq!(config.confirm_policy, Some(crate::ConfirmPolicy::Auto));
+        assert!(config.schema.is_some(), "board carries an inline schema");
+
+        // The board name is distinct from the terminal `create-pr` contract, the
+        // CAIRN-1953 correctness invariant the runtime relies on.
+        assert_ne!(config.artifact_type.as_deref(), Some("create-pr"));
+        assert!(parsed.validate().valid);
+    }
+
+    #[test]
+    fn context_self_name_colliding_with_terminal_fails_validation() {
+        // A context-self living doc sharing the terminal context-out artifact
+        // name would make the runtime's name-keyed terminal latest-fallback drop
+        // the terminal artifact. Validation must reject it (CAIRN-1925/1953).
+        let yaml = r#"
+cairnVersion: 1
+name: Colliding
+description: ctx-self name collides with terminal output name
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: worker-1
+  type: agent
+  name: Worker
+  position: 0@100
+  config:
+    agent: build
+- id: out-1
+  type: artifact
+  name: Out
+  position: 0@200
+  config:
+    artifactType: summary
+    confirmPolicy: user
+    schema:
+      type: object
+- id: self-1
+  type: artifact
+  name: Self
+  position: 240@100
+  config:
+    artifactType: summary
+    confirmPolicy: auto
+    schema:
+      type: object
+edges:
+- from: trigger-1@control-out
+  to: worker-1@control-in
+  type: control
+- from: worker-1@context-out
+  to: out-1@context-in
+  type: context
+- from: worker-1@context-self
+  to: self-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).expect("parses").validate();
+        assert!(!validation.valid, "collision must fail validation");
+        assert!(
+            validation
+                .errors
+                .iter()
+                .any(|e| e.contains("collides") && e.contains("summary")),
+            "errors name the collision: {:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn distinct_context_self_and_terminal_names_validate() {
+        // The same shape with distinct names is valid — proving the check keys on
+        // a real name collision, not merely on owning both ports.
+        let yaml = r#"
+cairnVersion: 1
+name: Distinct
+description: ctx-self and terminal names differ
+trigger: manual
+nodes:
+- id: trigger-1
+  type: trigger
+  name: Trigger
+  position: 0@0
+  config:
+    triggerType: manual
+    scope: issue
+- id: worker-1
+  type: agent
+  name: Worker
+  position: 0@100
+  config:
+    agent: build
+- id: out-1
+  type: artifact
+  name: Out
+  position: 0@200
+  config:
+    artifactType: summary
+    confirmPolicy: user
+    schema:
+      type: object
+- id: self-1
+  type: artifact
+  name: Self
+  position: 240@100
+  config:
+    artifactType: scratch
+    confirmPolicy: auto
+    schema:
+      type: object
+edges:
+- from: trigger-1@control-out
+  to: worker-1@control-in
+  type: control
+- from: worker-1@context-out
+  to: out-1@context-in
+  type: context
+- from: worker-1@context-self
+  to: self-1@context-in
+  type: context
+"#;
+        let validation = RecipeFile::from_yaml(yaml).expect("parses").validate();
+        assert!(validation.valid, "errors: {:?}", validation.errors);
+    }
+}

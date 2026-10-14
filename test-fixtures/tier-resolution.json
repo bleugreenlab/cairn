@@ -1,0 +1,747 @@
+[
+  {
+    "name": "single provider auto-pins despite the tier default naming another backend",
+    "config": {
+      "tierDefaults": {
+        "sm": "codex",
+        "md": "codex",
+        "lg": "codex",
+        "big": "codex"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg",
+        "big"
+      ],
+      "backends": {
+        "claude": {
+          "big": {
+            "model": "opus"
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          }
+        }
+      }
+    },
+    "tier": "big",
+    "expected": {
+      "backend": "claude",
+      "model": "opus"
+    }
+  },
+  {
+    "name": "single provider auto-pins despite override elsewhere",
+    "config": {
+      "tierDefaults": {
+        "sm": "codex",
+        "md": "codex",
+        "lg": "codex",
+        "big": "codex"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg",
+        "big"
+      ],
+      "backends": {
+        "claude": {
+          "big": {
+            "model": "opus"
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          }
+        }
+      }
+    },
+    "tier": "big",
+    "override": "codex",
+    "expected": {
+      "backend": "claude",
+      "model": "opus"
+    }
+  },
+  {
+    "name": "multi provider override wins",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "md": {
+            "model": "sonnet",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "override": "codex",
+    "preferred": "claude",
+    "expected": {
+      "backend": "codex",
+      "model": "gpt-5.3-codex"
+    }
+  },
+  {
+    "name": "multi provider preferred wins without override",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "md": {
+            "model": "sonnet",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "preferred": "codex",
+    "expected": {
+      "backend": "codex",
+      "model": "gpt-5.3-codex"
+    }
+  },
+  {
+    "name": "multi provider tier default wins without override or preferred",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "md": {
+            "model": "sonnet",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "expected": {
+      "backend": "claude",
+      "model": "sonnet"
+    }
+  },
+  {
+    "name": "non matching override falls to preferred",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "md": {
+            "model": "sonnet"
+          }
+        },
+        "codex": {
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "override": "ghost",
+    "preferred": "codex",
+    "expected": {
+      "backend": "codex",
+      "model": "gpt-5.3-codex"
+    }
+  },
+  {
+    "name": "non matching override falls to first defined",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "md": {
+            "model": "sonnet"
+          }
+        },
+        "codex": {
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "override": "ghost",
+    "preferred": "phantom",
+    "expected": {
+      "backend": "claude",
+      "model": "sonnet"
+    }
+  },
+  {
+    "name": "default sm unchanged",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus"
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        }
+      }
+    },
+    "tier": "sm",
+    "expected": {
+      "backend": "claude",
+      "model": "haiku"
+    }
+  },
+  {
+    "name": "default md unchanged",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus"
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "expected": {
+      "backend": "claude",
+      "model": "sonnet"
+    }
+  },
+  {
+    "name": "default lg unchanged",
+    "config": {
+      "tierDefaults": {
+        "sm": "claude",
+        "md": "claude",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus"
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        }
+      }
+    },
+    "tier": "lg",
+    "expected": {
+      "backend": "claude",
+      "model": "opus"
+    }
+  },
+  {
+    "name": "mixed tier defaults route sm to opencode-go",
+    "config": {
+      "tierDefaults": {
+        "sm": "opencode-go",
+        "md": "codex",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "opencode-go": {
+          "sm": {
+            "model": "kimi"
+          },
+          "md": {
+            "model": "kimi-pro"
+          }
+        }
+      }
+    },
+    "tier": "sm",
+    "expected": {
+      "backend": "opencode-go",
+      "model": "kimi"
+    }
+  },
+  {
+    "name": "mixed tier defaults route md to codex",
+    "config": {
+      "tierDefaults": {
+        "sm": "opencode-go",
+        "md": "codex",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "opencode-go": {
+          "sm": {
+            "model": "kimi"
+          },
+          "md": {
+            "model": "kimi-pro"
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "expected": {
+      "backend": "codex",
+      "model": "gpt-5.3-codex"
+    }
+  },
+  {
+    "name": "mixed tier defaults route lg to claude",
+    "config": {
+      "tierDefaults": {
+        "sm": "opencode-go",
+        "md": "codex",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "opencode-go": {
+          "sm": {
+            "model": "kimi"
+          },
+          "md": {
+            "model": "kimi-pro"
+          }
+        }
+      }
+    },
+    "tier": "lg",
+    "expected": {
+      "backend": "claude",
+      "model": "opus"
+    }
+  },
+  {
+    "name": "tier with no default binding falls to its first defined provider",
+    "config": {
+      "tierDefaults": {
+        "sm": "opencode-go",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "opencode-go": {
+          "sm": {
+            "model": "kimi"
+          },
+          "md": {
+            "model": "kimi-pro"
+          }
+        }
+      }
+    },
+    "tier": "md",
+    "expected": {
+      "backend": "claude",
+      "model": "sonnet"
+    }
+  },
+  {
+    "name": "explicit backend outranks the tier default",
+    "config": {
+      "tierDefaults": {
+        "sm": "opencode-go",
+        "md": "codex",
+        "lg": "claude"
+      },
+      "tiers": [
+        "sm",
+        "md",
+        "lg"
+      ],
+      "backends": {
+        "claude": {
+          "sm": {
+            "model": "haiku"
+          },
+          "md": {
+            "model": "sonnet"
+          },
+          "lg": {
+            "model": "opus",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "codex": {
+          "sm": {
+            "model": "gpt-5.4-mini",
+            "options": {
+              "reasoningEffort": "low"
+            }
+          },
+          "md": {
+            "model": "gpt-5.3-codex",
+            "options": {
+              "reasoningEffort": "medium"
+            }
+          },
+          "lg": {
+            "model": "gpt-5.4",
+            "options": {
+              "reasoningEffort": "high"
+            }
+          }
+        },
+        "opencode-go": {
+          "sm": {
+            "model": "kimi"
+          },
+          "md": {
+            "model": "kimi-pro"
+          }
+        }
+      }
+    },
+    "tier": "lg",
+    "override": "codex",
+    "expected": {
+      "backend": "codex",
+      "model": "gpt-5.4"
+    }
+  }
+]

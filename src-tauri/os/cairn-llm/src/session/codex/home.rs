@@ -1,0 +1,429 @@
+//! The `CODEX_HOME` a host runs Codex sessions in, and the hardened
+//! `config.toml` and model catalog written into it.
+//!
+//! The host owns where the home lives and passes it in; Cairn's is
+//! `~/.cairn/codex`. Every Codex process the host spawns must point at it, so
+//! Codex's config layering never reads the user's native `~/.codex/config.toml`
+//! and its `[mcp_servers]`. That redirection is the only way to isolate a
+//! session to the MCP servers its host gives it: Codex deep-merges
+//! `[mcp_servers]` across layers, so a `-c mcp_servers=...` override cannot
+//! remove native servers, only a clean `CODEX_HOME` does. The generated
+//! `config.toml` defines no server; each process adds its own through `-c`
+//! (see [`crate::session::mcp::McpServers::codex_config_overrides`]).
+
+use serde_json::Value;
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CONFIG_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(not(target_os = "windows"))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), String> {
+    let sequence = CONFIG_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("Invalid Codex config path: {path:?}"))?;
+    let temporary_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| {
+        let mut temporary = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)
+            .map_err(|error| format!("Failed to create temporary Codex config: {error}"))?;
+        temporary
+            .write_all(contents)
+            .map_err(|error| format!("Failed to write temporary Codex config: {error}"))?;
+        temporary
+            .sync_all()
+            .map_err(|error| format!("Failed to sync temporary Codex config: {error}"))?;
+        replace_file(&temporary_path, path)
+            .map_err(|error| format!("Failed to atomically replace Codex config: {error}"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+/// Write the shared, hardened Codex config into `codex_home`, creating it,
+/// and answer the home's path for `CODEX_HOME`.
+///
+/// One home is shared by every session so Codex's thread/state DB persists
+/// across sessions, enabling cross-session resume. The file is identical for
+/// every session, so parallel sessions can share it: it carries only
+/// hardening, and each process receives its MCP servers through `-c`.
+///
+/// Requires `models_cache.json` in the home, which
+/// [`super::models::refresh_codex_model_cache`] publishes.
+pub fn write_codex_config(codex_home: &Path) -> Result<String, String> {
+    std::fs::create_dir_all(codex_home)
+        .map_err(|e| format!("Failed to create codex home: {}", e))?;
+
+    let model_catalog_path = write_codex_model_catalog_override(codex_home)?;
+    let model_catalog_toml = model_catalog_path.as_ref().map_or(String::new(), |path| {
+        format!(
+            "model_catalog_json = \"{}\"\n",
+            path.to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        )
+    });
+
+    let config_toml = render_codex_config_toml(&model_catalog_toml);
+
+    let config_path = codex_home.join("config.toml");
+    atomic_write(&config_path, config_toml.as_bytes())?;
+
+    // Auth is written by the caller from the host's managed identity.
+
+    log::info!("Wrote Codex config to {:?}", config_path);
+    Ok(codex_home.to_string_lossy().to_string())
+}
+
+/// Render the Codex `config.toml` body. It defines no MCP server: each process
+/// adds its own through `-c`, so the user's native `[mcp_servers.*]` are never
+/// loaded. External MCP reaches a Cairn agent only through the cairn gateway,
+/// not as native Codex servers.
+fn render_codex_config_toml(model_catalog_toml: &str) -> String {
+    format!(
+        r#"# Auto-generated by Cairn
+include_apply_patch_tool = false
+{model_catalog_toml}[features]
+goals = true
+apply_patch_freeform = false
+# Disable Codex's ChatGPT Apps/Connectors subsystem. It is on by default for
+# ChatGPT-authed sessions and would expose external connector tools
+# (mcp__codex_apps__github, gmail, linear, stripe, ...) that bypass the cairn
+# gateway. This is separate from [mcp_servers] and is NOT governed by
+# CODEX_HOME; the feature flag is the only lever that removes it.
+apps = false
+# Disable Codex's native shell/exec tools so the agent's only path to the shell
+# is `mcp__cairn__run` (gateway-fenced, commit-aware). The native shell pulls
+# agents out of the Cairn workflow: it runs apply_patch (which never commits)
+# and ad-hoc shell commands that fight Codex's own sandbox fence instead of
+# Cairn's and frequently wedge. `shell_tool = false` makes Codex emit no shell
+# runtime at all (ConfigShellToolType::Disabled); `unified_exec = false` removes
+# the PTY exec tool for defense in depth.
+shell_tool = false
+unified_exec = false
+# Disable Codex's native multi-agent/collab tools (spawn_agent, wait,
+# send_message). Cairn's task delegation (cairn:~/tasks -> child jobs with
+# their own transcripts) is the canonical path; native collab threads run
+# inside the same app-server process and their events would multiplex into
+# the parent session's transcript untagged. `multi_agent` is the current
+# feature key; `collab` is its legacy alias, set for older Codex builds.
+multi_agent = false
+collab = false
+multi_agent_v2 = false
+"#,
+        model_catalog_toml = model_catalog_toml,
+    )
+}
+
+fn write_codex_model_catalog_override(
+    codex_home: &Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let cache_path = codex_home.join("models_cache.json");
+    let source = std::fs::read_to_string(&cache_path).map_err(|error| {
+        format!(
+            "Codex did not produce a model catalog for hardening at {:?}: {}",
+            cache_path, error
+        )
+    })?;
+    let rewritten = harden_codex_model_catalog(&source)?;
+    let catalog_path = codex_home.join("model_catalog.json");
+    std::fs::write(&catalog_path, rewritten)
+        .map_err(|e| format!("Failed to write Codex model catalog override: {}", e))?;
+    Ok(Some(catalog_path))
+}
+
+/// Harden Codex's bundled model catalog before it is handed to a spawned
+/// agent. Two model-level capabilities must be neutralized on every model entry
+/// because a model capability overrides the `[features]` config, not the
+/// other way around:
+///
+/// - `apply_patch_tool_type = null` removes native `apply_patch`, so file edits
+///   flow through `mcp__cairn__run` (gateway-fenced, commit-aware) instead of
+///   Codex's own patch tool, which never commits.
+/// - `multi_agent_version = "disabled"` removes the model's native
+///   multi-agent/collab capability at the higher-precedence model layer:
+///   Codex resolves the turn's collaboration runtime as
+///   `model_info.multi_agent_version.unwrap_or_else(|| config.multi_agent_version_from_features())`
+///   (codex `core/src/session/mod.rs`). A model entry that carries
+///   `"multi_agent_version": "v1"`/`"v2"` is therefore a `Some(_)` that
+///   short-circuits the fallback and registers native `spawn_agent`/collab
+///   tools even though the `multi_agent`/`collab`/`multi_agent_v2` feature
+///   flags are all false. Explicitly disabling the model capability closes that
+///   path directly; the feature flags remain the lower-precedence defense for
+///   models without the field.
+///
+/// All other model metadata is preserved unchanged.
+fn harden_codex_model_catalog(catalog_json: &str) -> Result<String, String> {
+    let mut catalog: Value = serde_json::from_str(catalog_json)
+        .map_err(|e| format!("Failed to parse Codex models catalog: {}", e))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "Codex models catalog missing models array".to_string())?;
+
+    for model in models.iter_mut() {
+        let Some(model_obj) = model.as_object_mut() else {
+            return Err("Codex models catalog contains non-object model entry".to_string());
+        };
+        model_obj.insert("apply_patch_tool_type".to_string(), Value::Null);
+        model_obj.insert(
+            "multi_agent_version".to_string(),
+            Value::String("disabled".to_string()),
+        );
+    }
+
+    serde_json::to_string(&catalog)
+        .map_err(|e| format!("Failed to serialize Codex model catalog override: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_shared_codex_config_defines_no_mcp_server() {
+        // The shared file must define no server: each process adds its own
+        // through `-c`, so no session's transport leaks into another's.
+        let config = render_codex_config_toml("");
+        let parsed: toml::Table = toml::from_str(&config).expect("config is TOML");
+        assert!(
+            parsed.get("mcp_servers").is_none(),
+            "the shared config.toml must not define MCP servers: {config}"
+        );
+    }
+
+    #[test]
+    fn test_codex_config_disables_apps_connectors() {
+        // Codex's ChatGPT Apps/Connectors subsystem is on by default and exposes
+        // external connector tools (mcp__codex_apps__*) outside the cairn
+        // gateway. The generated config must disable it under [features].
+        let config = render_codex_config_toml("");
+        assert!(
+            config.contains("[features]"),
+            "config should have a [features] table"
+        );
+        assert!(
+            config.lines().any(|line| line.trim() == "apps = false"),
+            "config must set `apps = false` to disable Codex connectors, got:\n{}",
+            config
+        );
+    }
+
+    #[test]
+    fn test_codex_config_disables_native_multi_agent() {
+        // Native collab threads share the parent app-server process, so their
+        // events would be persisted into the parent transcript untagged.
+        // Delegation must instead go through Cairn child task jobs.
+        let config = render_codex_config_toml("");
+        for flag in [
+            "goals = true",
+            "multi_agent = false",
+            "collab = false",
+            "multi_agent_v2 = false",
+        ] {
+            assert!(
+                config.lines().any(|line| line.trim() == flag),
+                "config must set `{}` to disable native multi-agent tools, got:\n{}",
+                flag,
+                config
+            );
+        }
+    }
+
+    #[test]
+    fn test_codex_config_disables_native_shell_tools() {
+        // The agent's only shell path must be `mcp__cairn__run`. Codex's native
+        // shell/exec tools (shell_tool, unified_exec) bypass Cairn's fence and
+        // commit flow, so the generated config must turn them off.
+        let config = render_codex_config_toml("");
+        for flag in ["shell_tool = false", "unified_exec = false"] {
+            assert!(
+                config.lines().any(|line| line.trim() == flag),
+                "config must set `{}` to disable native shell, got:\n{}",
+                flag,
+                config
+            );
+        }
+    }
+
+    #[test]
+    fn harden_model_catalog_disables_multi_agent_version_on_every_model() {
+        // The bug in CAIRN-2987 was a model catalog entry carrying an explicit
+        // multi_agent_version, which Codex resolves ahead of the disabled
+        // feature flags. The transform must force that field to disabled on every
+        // model regardless of whether it started as "v1", "v2", null, or absent,
+        // so no model can expose the native collaboration runtime.
+        let source = r#"{
+            "models": [
+                {"slug": "gpt-5.5", "multi_agent_version": "v1", "apply_patch_tool_type": "freeform", "context_window": 272000},
+                {"slug": "gpt-5-codex", "multi_agent_version": "v2", "apply_patch_tool_type": "function"},
+                {"slug": "legacy", "multi_agent_version": null},
+                {"slug": "bare"}
+            ]
+        }"#;
+
+        let rewritten = harden_codex_model_catalog(source).expect("transform should succeed");
+        let parsed: Value = serde_json::from_str(&rewritten).expect("output must be valid JSON");
+        let models = parsed["models"].as_array().expect("models array");
+        assert_eq!(models.len(), 4, "no models may be dropped");
+
+        for model in models {
+            let obj = model.as_object().expect("model object");
+            assert!(
+                obj.contains_key("multi_agent_version"),
+                "every model must carry an explicit multi_agent_version key"
+            );
+            assert_eq!(
+                obj["multi_agent_version"],
+                Value::String("disabled".to_string()),
+                "multi_agent_version must explicitly disable the model capability, got: {}",
+                model
+            );
+            // The existing apply_patch neutralization must also remain intact.
+            assert_eq!(
+                obj["apply_patch_tool_type"],
+                Value::Null,
+                "apply_patch_tool_type must remain null, got: {}",
+                model
+            );
+        }
+    }
+
+    #[test]
+    fn harden_model_catalog_preserves_unrelated_model_metadata() {
+        // Only the two capability fields are rewritten; all other metadata must
+        // survive the transform untouched.
+        let source = r#"{
+            "models": [
+                {"slug": "gpt-5.5", "multi_agent_version": "v2", "apply_patch_tool_type": "freeform", "context_window": 272000, "display_name": "GPT-5.5"}
+            ]
+        }"#;
+
+        let rewritten = harden_codex_model_catalog(source).expect("transform should succeed");
+        let parsed: Value = serde_json::from_str(&rewritten).expect("output must be valid JSON");
+        let model = &parsed["models"][0];
+        assert_eq!(model["slug"], Value::from("gpt-5.5"));
+        assert_eq!(model["context_window"], Value::from(272000));
+        assert_eq!(model["display_name"], Value::from("GPT-5.5"));
+        assert_eq!(
+            model["multi_agent_version"],
+            Value::String("disabled".to_string())
+        );
+        assert_eq!(model["apply_patch_tool_type"], Value::Null);
+    }
+
+    #[test]
+    fn harden_model_catalog_rejects_malformed_catalog() {
+        // A catalog without a models array or with a non-object entry indicates
+        // an upstream format change we must surface loudly rather than silently
+        // ship an un-hardened catalog.
+        assert!(harden_codex_model_catalog("{\"models\": {}}").is_err());
+        assert!(harden_codex_model_catalog("{\"models\": [\"nope\"]}").is_err());
+        assert!(harden_codex_model_catalog("not json").is_err());
+    }
+
+    #[test]
+    fn writes_hardened_catalog_from_installed_runtime_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("models_cache.json"),
+            r#"{"client_version":"9.8.7","fetched_at":"now","models":[{"slug":"current","multi_agent_version":"v2","apply_patch_tool_type":"freeform"}]}"#,
+        )
+        .unwrap();
+        let path = write_codex_model_catalog_override(directory.path())
+            .expect("runtime cache should be hardenable")
+            .expect("catalog path");
+        let parsed: Value = serde_json::from_str(
+            &std::fs::read_to_string(path).expect("written catalog should be readable"),
+        )
+        .expect("written catalog should be valid JSON");
+        assert_eq!(parsed["client_version"], "9.8.7");
+        assert_eq!(parsed["fetched_at"], "now");
+        assert_eq!(parsed["models"][0]["slug"], "current");
+        assert_eq!(parsed["models"][0]["multi_agent_version"], "disabled");
+        assert_eq!(parsed["models"][0]["apply_patch_tool_type"], Value::Null);
+    }
+
+    #[test]
+    fn the_config_is_written_into_the_home_the_host_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("models_cache.json"), r#"{"models":[]}"#).unwrap();
+        let written = write_codex_config(&home).unwrap();
+        assert_eq!(written, home.to_string_lossy());
+        let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(config.contains("model_catalog_json"));
+    }
+
+    #[test]
+    fn concurrent_atomic_config_writes_leave_one_parseable_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = Arc::new(directory.path().join("config.toml"));
+        let writers = (0..16)
+            .map(|index| {
+                let config_path = Arc::clone(&config_path);
+                std::thread::spawn(move || {
+                    let config = render_codex_config_toml(&format!(
+                        "model_catalog_json = \"/catalog-{index}.json\"\n"
+                    ));
+                    atomic_write(&config_path, config.as_bytes()).unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let config = std::fs::read_to_string(config_path.as_ref()).unwrap();
+        let parsed: toml::Value = toml::from_str(&config).expect("config must be complete TOML");
+        assert!(parsed["model_catalog_json"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("/catalog-")));
+        assert_eq!(parsed["features"]["shell_tool"].as_bool(), Some(false));
+    }
+}

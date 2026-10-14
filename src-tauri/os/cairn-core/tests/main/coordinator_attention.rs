@@ -1,0 +1,635 @@
+//! End-to-end coordinator sleep/wake coverage across subscription lookup, durable
+//! push creation, the idle-job nudge, and resumed-prompt delivery.
+
+use crate::common;
+use cairn_core::credentials::{ClaudeAuth, CredentialStore};
+use cairn_core::identity::{CredentialStoreExt, UserIdentity};
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cairn_core::internal::agent_process::process::AgentProcessState;
+use cairn_core::internal::db::DbState;
+use cairn_core::internal::orchestrator::attention_push::list_pending;
+use cairn_core::internal::orchestrator::lifecycle::{evaluate_review_readiness, finalize_run};
+use cairn_core::internal::orchestrator::Orchestrator;
+use cairn_core::internal::services::testing::{
+    MockGitClient, RecordingProcessSpawner, TestServicesBuilder,
+};
+use cairn_core::internal::services::GitOutput;
+use cairn_core::internal::storage::{LocalDb, RowExt, SearchIndex};
+use cairn_core::models::{
+    AgentNodeConfig, ArtifactNodeConfig, ConfirmPolicy, ExecutionSnapshot, IssueStatus,
+    NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeSnapshot,
+    RecipeTrigger, RunStatus, TriggerContext, TriggerType,
+};
+use cairn_db::turso::params;
+use tempfile::TempDir;
+
+const CHILD_URI: &str = "cairn://p/coord/2";
+
+/// A fixture orchestrator whose resumes can reach the process boundary, and the
+/// recorder that observes whether one did.
+///
+/// The launch funnel fails closed twice before it ever spawns: it refuses a
+/// session that has no Cairn-managed credential, and it resolves the backend CLI
+/// off the host's PATH. Neither has anything to do with whether a wake routed
+/// correctly, but both turn "the coordinator was resumed" into an assertion about
+/// the machine running the suite. Supplying an API-key account and a pre-resolved
+/// binary path removes both, so a recorded spawn means what these tests read it
+/// as: the wake reached a launch.
+fn orchestrator(temp: &TempDir, db: Arc<LocalDb>) -> (Orchestrator, RecordingProcessSpawner) {
+    orchestrator_with_credential(temp, db, Some(ClaudeAuth::ApiKey("test-key".to_string())))
+}
+
+/// [`orchestrator`], with the account made optional so one test can exercise a
+/// launch that fails after its attention briefing is already assembled.
+fn orchestrator_with_credential(
+    temp: &TempDir,
+    db: Arc<LocalDb>,
+    claude_auth: Option<ClaudeAuth>,
+) -> (Orchestrator, RecordingProcessSpawner) {
+    let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db, search_index));
+    let recorder = RecordingProcessSpawner::new();
+    let mut git = MockGitClient::new();
+    git.expect_run().times(0..).returning(|_, _| {
+        Ok(GitOutput {
+            success: true,
+            stdout: String::new(),
+            stderr: String::new(),
+        })
+    });
+    let services = Arc::new(
+        TestServicesBuilder::new()
+            .with_process(recorder.clone())
+            .with_git(git)
+            .build(),
+    );
+    let config_dir = temp.path().join("config");
+    std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+    std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+
+    // Pre-resolved so the spawn never shells out to `which claude`. The recording
+    // spawner never executes it, so the path only has to be a path.
+    let process_state = Arc::new(AgentProcessState::default());
+    *process_state.cli_binary_path.lock().unwrap() = Some("/cairn-test/claude".to_string());
+
+    let credential_store = claude_auth.map(|claude_auth| {
+        CredentialStore::from_user_identity(&UserIdentity {
+            user_id: "test-user".to_string(),
+            email: "test@example.com".to_string(),
+            name: "Test User".to_string(),
+            claude_auth: Some(claude_auth),
+            codex_auth: None,
+            github_token: None,
+        })
+    });
+
+    (
+        Orchestrator::builder(db_state, services, config_dir)
+            .process_state(process_state)
+            .credential_store(credential_store)
+            .build(),
+        recorder,
+    )
+}
+
+/// The coordinator half: the project, the parent issue, and the idle coordinator
+/// job that watches its children. Shared by every child shape below.
+async fn seed_coordinator(db: &LocalDb, root: &std::path::Path) {
+    let root = root.to_string_lossy().to_string();
+    let snapshot = ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "coordinator".to_string(),
+            name: "Coordinator".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        },
+        HashMap::new(),
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some("parent".to_string()),
+            project_id: "project".to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap()
+    .replace('\'', "''");
+    db.execute_script(&format!(
+        "
+        INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+          VALUES('project','default','Coordinator','coord','{root}',1,1);
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+          VALUES('parent','project',1,'Parent','active','active','none',1,1);
+        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+          VALUES('parent-exec','coordinator','parent','project','running',1,1,'{snapshot}');
+        INSERT INTO jobs(id, execution_id, project_id, issue_id, status,
+                         uri_segment, node_name, current_session_id, created_at, updated_at)
+          VALUES('coordinator','parent-exec','project','parent','complete',
+                 'coordinator','Coordinator','coord-session',1,1);
+        INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+          VALUES('coord-session','coordinator','claude','claude-session','open',1,2000000000,2000000000);
+        INSERT INTO runs(id, project_id, issue_id, job_id, session_id, status, created_at, updated_at, start_mode)
+          VALUES('coord-run','project','parent','coordinator','coord-session','complete',1,1,'resume');
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+          VALUES('coord-turn','coord-session','coord-run','coordinator',1,'complete','initial',1,1);
+        UPDATE jobs SET current_turn_id='coord-turn' WHERE id='coordinator';
+
+        INSERT INTO issues(id, project_id, number, title, status, progress, attention,
+                           parent_issue_id, parent_job_id, created_at, updated_at)
+          VALUES('child','project',2,'Child','active','waiting','none',
+                 'parent','coordinator',1,1);
+        INSERT INTO wake_subscriptions(id, job_id, source_kind, source_ref, state,
+                                       created_by, created_at, updated_at, one_shot)
+          VALUES('child-sub','coordinator','issue','{CHILD_URI}','active','system',1,1,0);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
+async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
+    seed_coordinator(db, root).await;
+    let child_snapshot = ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "build".to_string(),
+            name: "Build".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: vec![RecipeNode {
+                id: "builder".to_string(),
+                node_type: RecipeNodeType::Agent,
+                name: "Builder".to_string(),
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: None,
+                agent_config: None,
+                action_config: None,
+                checkpoint_config: None,
+                artifact_config: None,
+                condition_config: None,
+                context_config: None,
+            }],
+            edges: Vec::new(),
+        },
+        HashMap::new(),
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some("child".to_string()),
+            project_id: "project".to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap()
+    .replace('\'', "''");
+    db.execute_script(&format!(
+        "
+        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+          VALUES('child-exec','build','child','project','running',1,1,'{child_snapshot}');
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, branch, created_at, updated_at)
+          VALUES('child-builder','child-exec','builder','project','child','complete',
+                 'builder','Builder','child-branch',1,1);
+        INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
+          VALUES('child-run','project','child','child-builder','complete',1,1);
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+          VALUES('child-turn','child-session','child-run','child-builder',1,'complete','initial',1,1);
+        INSERT INTO merge_requests(id, job_id, project_id, issue_id, title, source_branch,
+                                   target_branch, status, head_sha, opened_at, updated_at)
+          VALUES('child-pr','child-builder','project','child','Child PR','child-branch',
+                 'main','open','child-head',1,1);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
+fn agent_node(id: &str) -> RecipeNode {
+    RecipeNode {
+        id: id.to_string(),
+        node_type: RecipeNodeType::Agent,
+        name: id.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: Some(AgentNodeConfig {
+            agent_config_id: Some(id.to_string()),
+            output_schema: None,
+            git_config: None,
+        }),
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: None,
+        condition_config: None,
+        context_config: None,
+    }
+}
+
+fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
+    RecipeNode {
+        id: id.to_string(),
+        node_type: RecipeNodeType::Artifact,
+        name: id.to_string(),
+        position: NodePosition { x: 0.0, y: 0.0 },
+        parent_id: None,
+        trigger_config: None,
+        agent_config: None,
+        action_config: None,
+        checkpoint_config: None,
+        artifact_config: Some(ArtifactNodeConfig {
+            name: name.to_string(),
+            schema: Some(serde_json::json!({"type": "object"})),
+            confirm_policy: policy,
+            content: None,
+        }),
+        condition_config: None,
+        context_config: None,
+    }
+}
+
+fn ctx_edge(id: &str, from: &str, to: &str) -> RecipeEdge {
+    RecipeEdge {
+        id: id.to_string(),
+        edge_type: RecipeEdgeType::Context,
+        source_node_id: from.to_string(),
+        source_handle: "context-out".to_string(),
+        target_node_id: to.to_string(),
+        target_handle: "context-in".to_string(),
+    }
+}
+
+/// A planbuild child parked at its plan gate:
+/// `planner --context-out-> plan(user) --context-out-> builder`, with the
+/// planner's plan artifact written but unconfirmed, its builder still pending,
+/// and no PR anywhere.
+///
+/// This is the topology that made CAIRN-3347 invisible. The planner's
+/// `context-out` terminates in an artifact consumed by the builder, so its branch
+/// ships no PR and the turn-end check cadence skips it; no PR exists, so the
+/// PR-open edge cannot fire either. The recompute review-readiness hook is the
+/// only edge left, and the planner's turn ends by deriving **Blocked** under the
+/// `user` confirm gate rather than any terminal status.
+///
+/// The builder job is seeded exactly as a real execution leaves it — `pending`,
+/// no turn, not DAG-ready behind the blocked planner — so it contributes no
+/// status change of its own. That matters: any sibling transition into a status
+/// the hook already accepted would mask the gate and make this test pass against
+/// the bug.
+async fn seed_plan_gate_child(db: &LocalDb) {
+    let snapshot = ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "planbuild".to_string(),
+            name: "Plan Build".to_string(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: vec![
+                agent_node("planner"),
+                artifact_node("plan-node", "plan", ConfirmPolicy::User),
+                agent_node("builder"),
+            ],
+            edges: vec![
+                ctx_edge("e1", "planner", "plan-node"),
+                ctx_edge("e2", "plan-node", "builder"),
+            ],
+        },
+        HashMap::new(),
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some("child".to_string()),
+            project_id: "project".to_string(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap()
+    .replace('\'', "''");
+    db.execute_script(&format!(
+        "
+        INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+          VALUES('child-exec','planbuild','child','project','running',1,1,'{snapshot}');
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, created_at, updated_at)
+          VALUES('child-planner','child-exec','planner','project','child','running',
+                 'planner','Planner',1,1);
+        INSERT INTO runs(id, project_id, issue_id, job_id, status, created_at, updated_at)
+          VALUES('child-plan-run','project','child','child-planner','complete',1,1);
+        INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason,
+                          created_at, ended_at, updated_at)
+          VALUES('child-plan-turn','child-plan-session','child-plan-run','child-planner',1,
+                 'complete','initial',1,2,2);
+        INSERT INTO artifacts(id, job_id, artifact_type, confirmed, data, version,
+                              output_name, created_at, updated_at)
+          VALUES('child-plan','child-planner','plan',0,'{{}}',1,'plan',1,1);
+        INSERT INTO jobs(id, execution_id, recipe_node_id, project_id, issue_id, status,
+                         uri_segment, node_name, created_at, updated_at)
+          VALUES('child-builder','child-exec','builder','project','child','pending',
+                 'builder','Builder',1,1);
+        "
+    ))
+    .await
+    .unwrap();
+}
+
+/// Poll for the pushes under `key`. The review-readiness hook is detached from
+/// the recompute sweep, so the wake lands shortly after `recompute_job` returns.
+async fn await_push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
+    for _ in 0..100 {
+        let rows = push_rows(db, key).await;
+        if !rows.is_empty() {
+            return rows;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no attention push was created for {key} within the wait window");
+}
+
+async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<String>)> {
+    let key = key.to_string();
+    db.read(|conn| {
+        let key = key.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT recipient, wake, delivered_event_id FROM attention_pushes
+                     WHERE key=?1 ORDER BY created_at, id",
+                    params![key.as_str()],
+                )
+                .await?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await? {
+                out.push((row.text(0)?, row.text(1)?, row.opt_text(2)?));
+            }
+            Ok(out)
+        })
+    })
+    .await
+    .unwrap()
+}
+
+async fn attention_event_count(db: &LocalDb) -> i64 {
+    db.query_one(
+        "SELECT COUNT(*) FROM events WHERE event_type='attention:briefing'",
+        (),
+        |row| row.i64(0),
+    )
+    .await
+    .unwrap()
+}
+
+async fn attention_event_body(db: &LocalDb) -> String {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT data FROM events WHERE event_type='attention:briefing'
+                     ORDER BY created_at DESC, sequence DESC LIMIT 1",
+                    (),
+                )
+                .await?;
+            rows.next().await?.map(|row| row.text(0)).transpose()
+        })
+    })
+    .await
+    .unwrap()
+    .expect("resumed coordinator should persist the delivered attention briefing")
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator_and_child(&db, temp.path()).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+
+    assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
+    evaluate_review_readiness(&orch, "child").await;
+
+    let rows = push_rows(&db, &format!("review:{CHILD_URI}")).await;
+    let resumed_run = cairn_core::messages::delivery::latest_run_for_job(&db, "coordinator")
+        .expect("the coordinator should have a resumed run");
+    assert_ne!(
+        resumed_run, "coord-run",
+        "the nudge must create the coordinator's successor run"
+    );
+    assert_eq!(rows.len(), 1, "one fingerprinted review wake is canonical");
+    assert_eq!(rows[0].0, "coordinator");
+    assert_eq!(rows[0].1, "wake");
+    assert!(
+        rows[0].2.is_some(),
+        "the idle resume must drain and stamp the push"
+    );
+    assert_eq!(
+        recorder.spawn_count(),
+        1,
+        "the idle coordinator must be resumed"
+    );
+
+    let body = attention_event_body(&db).await;
+    assert!(body.contains("Work product ready for review"), "{body}");
+    assert!(body.contains(CHILD_URI), "{body}");
+
+    orch.end_turn_end_checks("child-builder");
+    evaluate_review_readiness(&orch, "child").await;
+    assert_eq!(
+        push_rows(&db, &format!("review:{CHILD_URI}")).await.len(),
+        1,
+        "later check completion must not duplicate an unchanged review"
+    );
+}
+
+/// A child reaching a confirmation gate must wake its coordinator (CAIRN-3347).
+///
+/// The planner writes its plan and its turn ends; the recompute sweep derives
+/// **Blocked** (plan present, unconfirmed, `user` confirm policy) and the
+/// review-readiness hook must treat that transition as settling. Before the fix
+/// the hook only reacted to `Complete`/`Failed`/`Idle`, so every plan gate was
+/// silent: no push was minted for anyone, and coordinators slept through the one
+/// event they exist to arbitrate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_plan_gate_wakes_idle_coordinator() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator(&db, temp.path()).await;
+    seed_plan_gate_child(&db).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator(&temp, db.clone());
+
+    // The production edge: the planner's turn has ended, so its status is
+    // recomputed. Nothing else is invoked — no check cadence, no PR.
+    cairn_core::internal::execution::advancement::recompute_job(&orch, "child-planner").unwrap();
+
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT status FROM jobs WHERE id=?1", "child-planner")
+            .await,
+        Some("blocked".to_string()),
+        "a written-but-unconfirmed plan under a user gate derives Blocked"
+    );
+
+    let rows = await_push_rows(&db, &format!("review:{CHILD_URI}")).await;
+    assert_eq!(rows.len(), 1, "one review wake per gated plan");
+    assert_eq!(rows[0].0, "coordinator");
+    assert_eq!(
+        rows[0].1, "wake",
+        "a gate blocks the child on the coordinator's judgment, so it rouses"
+    );
+
+    let content_ref = common::scalar_text_by_id(
+        &db,
+        "SELECT content_ref FROM attention_pushes WHERE recipient=?1 ORDER BY created_at DESC LIMIT 1",
+        "coordinator",
+    )
+    .await
+    .expect("the review push carries a content_ref");
+    assert!(
+        content_ref.ends_with("/planner/plan"),
+        "the coordinator is pointed at the plan awaiting its confirmation, got {content_ref}"
+    );
+
+    // The nudge trails push creation inside the same detached evaluation, so give
+    // it the same bounded window the push itself got.
+    for _ in 0..100 {
+        if recorder.spawn_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        recorder.spawn_count(),
+        1,
+        "the idle coordinator must actually be resumed, not merely have a row written"
+    );
+}
+
+/// A launch that fails after the briefing is assembled must not spend the wake,
+/// and must not leave the briefing behind either.
+///
+/// The delivery stamp commits with the carrying event, necessarily before any
+/// process exists, because the pushes ride in the prompt the spawn carries. So a
+/// refused launch — the fail-closed credential check here, an expired account or
+/// a missing CLI in production — would leave the push marked delivered to an
+/// agent that never ran. Nothing reports that, and nothing retries it: the
+/// coordinator is simply never woken for this child again. Returning the push to
+/// the queue is what keeps a failed launch recoverable instead of silent.
+///
+/// The event has to go with it. Delivery is defined as "carried by a durable
+/// event", so a requeued push whose old briefing still sits in the transcript is
+/// a half-undone delivery: the next successful resume writes a second briefing
+/// for the same fact, and every surface built from durable events — the
+/// transcript, a reseed digest, the wake card — shows the child update twice, one
+/// of them attributed to a turn no agent ever ran.
+#[tokio::test(flavor = "current_thread")]
+async fn a_refused_launch_returns_the_childs_wake_to_the_queue() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator_and_child(&db, temp.path()).await;
+    let db = Arc::new(db);
+    let (orch, recorder) = orchestrator_with_credential(&temp, db.clone(), None);
+
+    assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
+    evaluate_review_readiness(&orch, "child").await;
+
+    let rows = push_rows(&db, &format!("review:{CHILD_URI}")).await;
+    assert_eq!(rows.len(), 1, "the review wake is still minted");
+    assert_eq!(
+        recorder.spawn_count(),
+        0,
+        "an uncredentialed launch must be refused"
+    );
+    assert_eq!(
+        rows[0].2, None,
+        "a push stamped delivered by a launch that never started is a wake nobody can ever receive"
+    );
+    assert_eq!(
+        list_pending(&db, "coordinator").await.unwrap().len(),
+        1,
+        "so it must still be queued for the coordinator's next resume"
+    );
+    assert_eq!(
+        attention_event_count(&db).await,
+        0,
+        "and no briefing may survive to be replayed beside the requeued push"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_child_finalize_wakes_once_and_delivers_failure_to_idle_coordinator() {
+    let (temp, db) = common::migrated_db().await;
+    seed_coordinator_and_child(&db, temp.path()).await;
+    db.execute_script(
+        "
+        INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+          VALUES('child-session','child-builder','claude','child-backend','open',1,1,1);
+        DELETE FROM merge_requests WHERE id='child-pr';
+        UPDATE issues
+          SET status='failed', progress='failed', attention='none', updated_at=2
+          WHERE id='child';
+        UPDATE executions SET status='failed' WHERE id='child-exec';
+        UPDATE jobs
+          SET status='running', current_session_id='child-session',
+              current_turn_id='child-turn'
+          WHERE id='child-builder';
+        UPDATE runs
+          SET status='live', session_id='child-session'
+          WHERE id='child-run';
+        UPDATE turns SET state='pending' WHERE id='child-turn';
+        ",
+    )
+    .await
+    .unwrap();
+    let db = Arc::new(db);
+    let (orch, _recorder) = orchestrator(&temp, db.clone());
+
+    // This is the production failed-start sequence: finalize marks the turn/run failed,
+    // recompute emits Resolved, then the turn-end edge observes the same terminal
+    // issue and emits Resolved again. Durable fingerprint dedupe must collapse the
+    // second emit.
+    finalize_run(&orch, "child-run", RunStatus::Crashed);
+
+    assert_eq!(
+        common::scalar_text_by_id(&db, "SELECT status FROM issues WHERE id=?1", "child").await,
+        Some(IssueStatus::Failed.to_string())
+    );
+    let rows = push_rows(&db, &format!("resolved:{CHILD_URI}")).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "recompute plus turn-end must create one resolution row"
+    );
+    assert_eq!(rows[0].1, "wake");
+    assert!(rows[0].2.is_some());
+    let resumed_run = cairn_core::messages::delivery::latest_run_for_job(&db, "coordinator")
+        .expect("the failed child should create a resumed coordinator run");
+    assert_ne!(
+        resumed_run, "coord-run",
+        "the failed-child wake must create the coordinator's successor run"
+    );
+
+    let coordinator_run_count = db
+        .query_one(
+            "SELECT COUNT(*) FROM runs WHERE job_id='coordinator'",
+            (),
+            |row| row.i64(0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator_run_count, 2,
+        "failed resolution must create exactly one successor run"
+    );
+    assert!(list_pending(&db, "child-builder").await.unwrap().is_empty());
+
+    let body = attention_event_body(&db).await;
+    assert!(body.contains("Child") && body.contains("failed"), "{body}");
+    assert!(body.contains("retry or delegate a fix"), "{body}");
+    assert!(!body.contains("Successfully"), "{body}");
+    assert!(body.contains(CHILD_URI), "{body}");
+}

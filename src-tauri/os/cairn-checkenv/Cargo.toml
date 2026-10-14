@@ -1,0 +1,15 @@
+[package]
+name = "cairn-checkenv"
+version.workspace = true
+edition = "2021"
+description = "Check execution provenance and source-sensitive implementation identity"
+license = "BUSL-1.1"
+
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+sha2 = "0.10"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

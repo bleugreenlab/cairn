@@ -1,0 +1,22 @@
+-- CAIRN-4767: give an issue's resolution a monotonic identity.
+--
+-- A `resolved:` attention push is deduplicated by a fingerprint naming the
+-- resolution it announces, so that one resolution reaching the funnel from
+-- several emit sites produces one notification. That fingerprint has to change
+-- when, and only when, the issue is genuinely resolved again.
+--
+-- Timestamps cannot carry that identity. `merged_at`/`closed_at`/`completed_at`
+-- are whole seconds, so an issue merged, reopened, and merged again inside one
+-- second presents two real resolutions under one key and the second is
+-- deduplicated away. (The column this replaced as the key, `updated_at`, was
+-- worse still: a mutation clock every recompute rewrote, which made the guard
+-- never match and replayed settled resolutions on every rebuild -- CAIRN-4756.)
+--
+-- This counter is bumped by `issues::crud::unresolve`, which is the only way an
+-- issue returns from a terminal status. An unresolve therefore sits between any
+-- two resolutions by construction, and the generation separates them however
+-- close together they fall.
+--
+-- Existing rows start at 0, which is correct: every resolution recorded before
+-- this migration belongs to the issue's first generation.
+ALTER TABLE issues ADD COLUMN resolution_generation INTEGER NOT NULL DEFAULT 0;

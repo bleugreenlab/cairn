@@ -1,0 +1,15 @@
+-- Remove the `ready` job status.
+--
+-- `Ready` was the resting state between "control-deps satisfied" and "process
+-- spawned" — intended for manual per-job start, which never materialized. It
+-- only created a gap: the status sweep could write a job to `ready` while the
+-- separate DAG-advance scan (which claims `pending` jobs) skipped it, so a
+-- confirmed gate's downstream job was readied but never started.
+--
+-- The model is now `pending → running`: advancement claims a ready job straight
+-- to `running` in its pending-scan, and the projection derives `pending` for any
+-- not-yet-resolved, not-live job (guarded against demoting a claimed job).
+--
+-- Convert any lingering `ready` rows back to `pending` so advancement re-claims
+-- and starts them (this also unsticks jobs left `ready` by the pre-fix build).
+UPDATE jobs SET status = 'pending' WHERE status = 'ready';

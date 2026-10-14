@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "PR title"
+    },
+    "body": {
+      "type": "string",
+      "description": "PR body/description (markdown)"
+    },
+    "summary": {
+      "type": "string",
+      "description": "Brief summary of implementation"
+    }
+  },
+  "required": ["title", "body"],
+  "additionalProperties": false
+}

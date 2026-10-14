@@ -1,0 +1,29 @@
+[package]
+name = "cairn-platform"
+version.workspace = true
+edition = "2021"
+license = "BUSL-1.1"
+description = "Filesystem and process support shared by Cairn hosts"
+
+[dependencies]
+chrono = "0.4"
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
+serde_json = "1"
+cairn-sandbox = { path = "../cairn-sandbox" }
+nix = { version = "0.29", features = ["signal"] }
+cairn-common = { path = "../cairn-common" }
+log = "0.4"
+libc = "0.2"
+reflink-copy = "0.1.30"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v4"] }
+mockall = { version = "0.13", optional = true }
+
+[dev-dependencies]
+mockall = "0.13"
+tempfile = "3"
+
+[features]
+test-utils = ["dep:mockall"]

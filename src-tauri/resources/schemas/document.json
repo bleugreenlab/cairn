@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Document title"
+    },
+    "content": {
+      "type": "string",
+      "description": "Document content (markdown)"
+    },
+    "summary": {
+      "type": "string",
+      "description": "Brief summary"
+    }
+  },
+  "required": ["title", "content"],
+  "additionalProperties": false
+}
