@@ -333,6 +333,7 @@ pub fn push_kind_headline(prefix: &str) -> (&str, &str) {
         "catchup" => ("catch-up", "New chat to catch up on"),
         "direct" => ("message", "Direct message"),
         "schedule" => ("schedule", "Scheduled wake"),
+        "automation" => ("automation", "Thread automation started failing"),
         "resolved" => ("resolved", "Issue resolved"),
         "tasks" => ("tasks", "Tasks need attention"),
         "turn-checks" => ("checks", "Turn-end check results"),

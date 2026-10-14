@@ -223,7 +223,7 @@ pub(crate) const THREAD_AUTOMATIONS_CONTRACT: ResourceContract = ResourceContrac
     kind: ResourceKind::ThreadAutomations,
     uri_template: "cairn://p/{project}/{name}/automations",
     name: "Thread automations",
-    description: "Cron-like collectors that execute a stored procedure without a model call. Unlike wakes, an automation runs work and normally wakes nobody; failures are delivered to the owning thread.",
+    description: "Cron-like collectors that execute a stored procedure without a model call. Unlike wakes, an automation runs work and normally wakes nobody; the first failure of each failure streak is delivered to the owning thread.",
     read_projections: NO_PROJECTIONS,
     related: &[RelatedSpec { label: "procedures", kind: ResourceKind::ThreadProcedures, actions: true }],
     cross_actions: NO_CROSS_ACTIONS,

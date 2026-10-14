@@ -786,6 +786,22 @@ async fn resolved_issue_confirmation(
     .flatten()
 }
 
+/// The newest frozen message behind a keyed system direct push. A stable key
+/// (`schedule:`, `automation:`) supersedes in place, so the fingerprint, not the
+/// key, names the message the push currently carries.
+async fn keyed_direct_message(
+    runtime: &AttentionRuntime,
+    push: &crate::push::Push,
+) -> Option<cairn_models::Message> {
+    let message_id =
+        crate::push::latest_push_fingerprint(&runtime.private_db, &push.recipient, &push.key)
+            .await
+            .ok()
+            .flatten()
+            .flatten()?;
+    runtime.host.message(&runtime.private_db, &message_id).await
+}
+
 /// Render a drained attention push as a compact, reference-first update.
 ///
 /// Direct messages, catch-up digests, terminal resolutions, check verdicts, and
@@ -815,37 +831,40 @@ pub async fn render_push_resolved(runtime: &AttentionRuntime, push: &crate::push
     // Name that reason in the headline: naming only the referent tells the reader
     // nothing they did not already know.
     if push.key.starts_with("schedule:") {
-        let message_id =
-            crate::push::latest_push_fingerprint(&runtime.private_db, &push.recipient, &push.key)
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-        if let Some(message_id) = message_id {
-            if let Some(msg) = runtime.host.message(&runtime.private_db, &message_id).await {
-                let reason = msg.content.lines().find_map(|line| {
-                    let line = line.trim();
-                    (!line.is_empty()).then_some(line)
-                });
-                if let Some(reason) = reason {
-                    let mut chars = reason.chars();
-                    let label: String = chars.by_ref().take(120).collect();
-                    let label = if chars.next().is_some() {
-                        format!("{label}…")
-                    } else {
-                        label
-                    };
-                    let schedule_header = format!(
-                        "Attention update ({}): scheduled wake — {}",
-                        push.wake.as_str(),
-                        label
-                    );
-                    let body = crate::message_render::render_direct_message(&msg);
-                    return format!("{schedule_header}\n\n{body}");
-                }
+        if let Some(msg) = keyed_direct_message(runtime, push).await {
+            let reason = msg.content.lines().find_map(|line| {
+                let line = line.trim();
+                (!line.is_empty()).then_some(line)
+            });
+            if let Some(reason) = reason {
+                let mut chars = reason.chars();
+                let label: String = chars.by_ref().take(120).collect();
+                let label = if chars.next().is_some() {
+                    format!("{label}…")
+                } else {
+                    label
+                };
+                let schedule_header = format!(
+                    "Attention update ({}): scheduled wake — {}",
+                    push.wake.as_str(),
+                    label
+                );
+                let body = crate::message_render::render_direct_message(&msg);
+                return format!("{schedule_header}\n\n{body}");
             }
         }
         return header;
+    }
+    // An automation push's referent is the owning thread itself, which tells
+    // that thread nothing; the whole fact is the frozen failure notice.
+    if push.key.starts_with("automation:") {
+        return match keyed_direct_message(runtime, push).await {
+            Some(msg) => {
+                let body = crate::message_render::render_direct_message(&msg);
+                format!("{header}\n\n{body}")
+            }
+            None => header,
+        };
     }
     if push.key.starts_with("resolved:") {
         return match resolved_issue_confirmation(runtime, &push.content_ref).await {

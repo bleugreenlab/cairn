@@ -95,32 +95,73 @@ pub async fn fire_thread_automation(
     Ok(true)
 }
 
+/// Mint the run an automation fire executes under.
+///
+/// The batch runs AS its thread: "procedures execute with the invoking thread's
+/// identity". The fence and the OS sandbox both resolve through run → job →
+/// execution → snapshot → `agents[agent_config_id]`, so the automation job
+/// carries the session's host execution and the session's own agent. A job that
+/// named an agent no snapshot holds, or no execution at all, resolved to no
+/// fence and every fire was refused before a command ran. The pointers are
+/// re-stamped on every fire rather than only at creation, which also repairs
+/// automation jobs minted before this held, and follows the session onto a new
+/// host if it ever acquires one.
 async fn ensure_automation_run(
     orch: &Orchestrator,
     automation: &ThreadAutomation,
     now: i64,
 ) -> Result<(String, String), String> {
     let thread_id = automation.thread_id.clone();
+    let session_job = orch
+        .db
+        .local
+        .write(move |conn| {
+            let thread_id = thread_id.clone();
+            Box::pin(async move {
+                crate::threads::ensure_thread_session_conn(conn, &thread_id, None).await
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let host_execution = crate::execution::jobs::ensure_job_agent_snapshot(orch, &session_job)
+        .await?
+        .ok_or_else(|| format!("thread session {session_job} has no host execution"))?;
+
+    let thread_id = automation.thread_id.clone();
     orch.db.local.write(move |conn| {
         let thread_id = thread_id.clone();
+        let session_job = session_job.clone();
+        let host_execution = host_execution.clone();
         Box::pin(async move {
-        let session_job = crate::threads::ensure_thread_session_conn(conn, &thread_id, None).await?;
+        let mut session = conn.query("SELECT agent_config_id FROM jobs WHERE id=?1", params![session_job.as_str()]).await?;
+        let agent_config_id = session.next().await?.ok_or_else(|| DbError::Internal(format!("thread session job not found: {session_job}")))?.opt_text(0)?;
+        drop(session);
         let mut rows = conn.query(
             "SELECT id FROM jobs WHERE parent_job_id=?1 AND uri_segment='automations' ORDER BY created_at DESC LIMIT 1",
             params![session_job.as_str()],
         ).await?;
         let existing = rows.next().await?.map(|row| row.text(0)).transpose()?;
         drop(rows);
-        let job_id = existing.clone().unwrap_or_else(|| cairn_common::ids::mint_child(&thread_id));
-        if existing.is_none() {
-            let mut project = conn.query("SELECT project_id FROM threads WHERE id=?1", params![thread_id.as_str()]).await?;
-            let project_id = project.next().await?.ok_or_else(|| DbError::Internal(format!("thread not found: {thread_id}")))?.text(0)?;
-            drop(project);
-            conn.execute(
-                "INSERT INTO jobs (id, thread_id, project_id, parent_job_id, status, agent_config_id, node_name, uri_segment, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'idle', 'automation', 'automations', 'automations', ?5, ?5)",
-                params![job_id.as_str(), thread_id.as_str(), project_id.as_str(), session_job.as_str(), now],
-            ).await?;
-        }
+        let job_id = match existing {
+            Some(job_id) => {
+                conn.execute(
+                    "UPDATE jobs SET execution_id=?1, agent_config_id=?2, updated_at=?3 WHERE id=?4",
+                    params![host_execution.as_str(), agent_config_id.as_deref(), now, job_id.as_str()],
+                ).await?;
+                job_id
+            }
+            None => {
+                let job_id = cairn_common::ids::mint_child(&thread_id);
+                let mut project = conn.query("SELECT project_id FROM threads WHERE id=?1", params![thread_id.as_str()]).await?;
+                let project_id = project.next().await?.ok_or_else(|| DbError::Internal(format!("thread not found: {thread_id}")))?.text(0)?;
+                drop(project);
+                conn.execute(
+                    "INSERT INTO jobs (id, thread_id, project_id, parent_job_id, execution_id, status, agent_config_id, node_name, uri_segment, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'idle', ?6, 'automations', 'automations', ?7, ?7)",
+                    params![job_id.as_str(), thread_id.as_str(), project_id.as_str(), session_job.as_str(), host_execution.as_str(), agent_config_id.as_deref(), now],
+                ).await?;
+                job_id
+            }
+        };
         let run_id = uuid::Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO runs (id, project_id, job_id, status, started_at, created_at, updated_at, start_mode) SELECT ?1, project_id, id, 'live', ?2, ?2, ?2, 'automation' FROM jobs WHERE id=?3",
@@ -172,6 +213,18 @@ async fn execute_procedure(
     Ok(envelope.text)
 }
 
+/// Bound on how much of a failure the streak notice quotes. A procedure failure
+/// carries its whole batch envelope; the automation resource keeps all of it.
+const NOTICE_ERROR_CHARS: usize = 1_500;
+
+/// Record a fire's outcome, and tell the owning thread when a failure streak
+/// BEGINS.
+///
+/// Exactly one notice per streak: an automation fails on a fixed cadence, so a
+/// notice per fire wakes an idle thread every interval to relearn one fact. The
+/// first failure after a success (or ever) is announced; later ones only update
+/// the automation row the notice links to, and the next success ends the streak
+/// so a later failure is news again.
 async fn settle_automation(
     orch: &Orchestrator,
     automation: &ThreadAutomation,
@@ -180,6 +233,7 @@ async fn settle_automation(
     error: Option<&str>,
     now: i64,
 ) -> Result<(), String> {
+    let automation_id = automation.id.clone();
     let automation = automation.clone();
     let run_id = run_id.map(str::to_owned);
     let error = error.map(str::to_owned);
@@ -192,24 +246,50 @@ async fn settle_automation(
         if let Some(run_id) = run_id.as_deref() {
             conn.execute("UPDATE runs SET status=?1, error_message=?2, exited_at=?3, updated_at=?3 WHERE id=?4", params![run_status, error.as_deref(), now, run_id]).await?;
         }
+        let mut prior = conn.query("SELECT consecutive_failures FROM thread_automations WHERE id=?1", params![automation.id.as_str()]).await?;
+        let prior_failures = prior.next().await?.map(|row| row.i64(0)).transpose()?.unwrap_or(0);
+        drop(prior);
         conn.execute(
             "UPDATE thread_automations SET last_run_id=COALESCE(?1, last_run_id), last_status=?2, last_error=?3, consecutive_failures=CASE WHEN ?3 IS NULL THEN 0 ELSE consecutive_failures+1 END, updated_at=?4 WHERE id=?5",
             params![run_id.as_deref(), status, error.as_deref(), now, automation.id.as_str()],
         ).await?;
         let Some(error) = error else { return Ok(None) };
+        if prior_failures > 0 { return Ok(None) }
         let session_job = crate::threads::ensure_thread_session_conn(conn, &automation.thread_id, None).await?;
         let mut rows = conn.query("SELECT id FROM runs WHERE job_id=?1 ORDER BY created_at DESC, id DESC LIMIT 1", params![session_job.as_str()]).await?;
         let recipient_run = rows.next().await?.map(|row| row.text(0)).transpose()?;
         drop(rows);
         let Some(recipient_run) = recipient_run else { return Ok(None) };
+        let mut coordinate = conn.query("SELECT p.key, t.name FROM threads t JOIN projects p ON p.id=t.project_id WHERE t.id=?1", params![automation.thread_id.as_str()]).await?;
+        let status_uri = match coordinate.next().await? {
+            Some(row) => cairn_common::uri::CairnResource::ThreadAutomation { project: row.text(0)?, name: row.text(1)?, id: automation.id.clone() }.to_uri(),
+            None => format!("automation {}", automation.id),
+        };
+        drop(coordinate);
+        let mut quoted: String = error.chars().take(NOTICE_ERROR_CHARS).collect();
+        if error.chars().nth(NOTICE_ERROR_CHARS).is_some() { quoted.push('…'); }
         let run_suffix = run_id.as_deref().map(|id| format!("\n\nRun: {id}")).unwrap_or_default();
-        let content = format!("Automation `{}` running procedure `{}` failed for occurrence {}: {}{}", automation.id, automation.procedure_name, due, error, run_suffix);
+        let content = format!(
+            "Automation `{}` running procedure `{}` started failing at occurrence {}: {}\n\nThis is the only notice for this failure streak: later failures update {} without waking you again, and the next success ends the streak.{}",
+            automation.id, automation.procedure_name, due, quoted, status_uri, run_suffix
+        );
         let key = format!("automation:{}", automation.id);
         crate::messages::delivery::insert_system_direct_push_with_key_conn(conn, &session_job, &recipient_run, &content, DeliveryUrgency::Steer, Some(&key)).await?;
         Ok(Some(session_job))
     })}).await.map_err(|error| error.to_string())?;
+    // The outcome and the notice are durable by now, and the pending push is what
+    // the thread's next idle drain delivers. A wake that cannot be issued this
+    // instant is logged rather than turned into a failed fire, which would make
+    // the scheduler cool down as if nothing had been recorded.
     if let Some(job_id) = nudge {
-        crate::messages::delivery::nudge_job_for_urgency(orch, &job_id, DeliveryUrgency::Steer)?;
+        if let Err(error) =
+            crate::messages::delivery::nudge_job_for_urgency(orch, &job_id, DeliveryUrgency::Steer)
+        {
+            log::warn!(
+                "Recorded automation '{}' failure notice but could not wake thread job {job_id}: {error}",
+                automation_id
+            );
+        }
     }
     Ok(())
 }
@@ -483,6 +563,100 @@ mod tests {
         assert_eq!(settled.last_status.as_deref(), Some("failed"));
         assert_eq!(settled.last_error.as_deref(), Some("boom"));
         assert_eq!(settled.consecutive_failures, 1);
+    }
+
+    async fn count(db: &LocalDb, sql: &'static str) -> i64 {
+        db.query_text(sql, ())
+            .await
+            .unwrap()
+            .and_then(|value| value.parse().ok())
+            .unwrap()
+    }
+
+    /// A five-minute automation that breaks keeps failing every five minutes.
+    /// The owning thread hears about that once, when it starts, and again only
+    /// once a success has ended the streak and a new one begins.
+    #[tokio::test]
+    async fn a_failure_streak_raises_exactly_one_attention_fact_for_the_owning_thread() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let db = Arc::new(crate::storage::migrated_test_db("automation-streak.db").await);
+        // The session holds a running turn, so the notice is recorded without
+        // the nudge relaunching an agent process this test has no spawner for.
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','P','/tmp',1,1);
+             INSERT INTO threads(id,project_id,name,status,attention,created_at,updated_at) VALUES('t','p','desk','active','none',1,1);
+             INSERT INTO jobs(id,thread_id,project_id,status,agent_config_id,current_session_id,node_name,uri_segment,created_at,updated_at) VALUES('session','t','p','running','thread','sess','thread','thread',1,1);
+             INSERT INTO sessions(id,job_id,backend,status,sequence,created_at,updated_at) VALUES('sess','session','claude','open',1,1,1);
+             INSERT INTO runs(id,project_id,job_id,status,created_at,updated_at) VALUES('session-run','p','session','live',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,created_at,updated_at) VALUES('turn','sess','session-run','session',1,'running',1,1);
+             INSERT INTO thread_automations(id,thread_id,procedure_name,args_json,every_ms,anchor_at,created_by,created_at,updated_at) VALUES('a','t','collect','[]',300000,60,'agent',1,1);",
+        )
+        .await
+        .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(db.clone(), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            root,
+        )
+        .build();
+        let automation = get_thread_automation(&db, "t", "a").await.unwrap().unwrap();
+        const NOTICES: &str = "SELECT CAST(COUNT(*) AS TEXT) FROM messages WHERE recipient_run_id='session-run' AND content LIKE 'Automation `a`%'";
+        const PENDING: &str = "SELECT CAST(COUNT(*) AS TEXT) FROM attention_pushes WHERE recipient='session' AND key='automation:a' AND delivered_event_id IS NULL";
+
+        for (due, now) in [(60, 61), (360, 361), (660, 661)] {
+            settle_automation(&orch, &automation, due, None, Some("boom"), now)
+                .await
+                .unwrap();
+        }
+        assert_eq!(count(&db, NOTICES).await, 1, "one notice per streak");
+        assert_eq!(count(&db, PENDING).await, 1);
+        let notice = db
+            .query_text(
+                "SELECT content FROM messages WHERE content LIKE 'Automation `a`%'",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            notice.contains("started failing at occurrence 60: boom"),
+            "{notice}"
+        );
+        assert!(notice.contains("/desk/automations/a"), "{notice}");
+        assert_eq!(
+            get_thread_automation(&db, "t", "a")
+                .await
+                .unwrap()
+                .unwrap()
+                .consecutive_failures,
+            3
+        );
+
+        // Delivered or not, the streak has been announced: coalescing by key
+        // only absorbs repeats while the push is still pending, which is not
+        // what holds the next failure back.
+        db.execute(
+            "UPDATE attention_pushes SET delivered_event_id='delivered'",
+            (),
+        )
+        .await
+        .unwrap();
+        settle_automation(&orch, &automation, 960, None, Some("boom"), 961)
+            .await
+            .unwrap();
+        assert_eq!(count(&db, NOTICES).await, 1);
+        assert_eq!(count(&db, PENDING).await, 0);
+
+        settle_automation(&orch, &automation, 1260, None, None, 1261)
+            .await
+            .unwrap();
+        settle_automation(&orch, &automation, 1560, None, Some("again"), 1561)
+            .await
+            .unwrap();
+        assert_eq!(count(&db, NOTICES).await, 2, "a new streak is news again");
+        assert_eq!(count(&db, PENDING).await, 1);
     }
 
     #[tokio::test]

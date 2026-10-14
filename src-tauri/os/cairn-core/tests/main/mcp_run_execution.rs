@@ -1598,6 +1598,111 @@ async fn thread_procedure_invocation_expands_batch_args_and_refuses_cross_thread
     );
 }
 
+/// A scheduled automation is the thread running its own procedure while nobody
+/// is at the keyboard, so it must execute under the thread's fence exactly as
+/// the interactive invocation above does. It is reached through the scheduler's
+/// fire, not `handle_run` with the session's run: the scheduler mints a run on
+/// the thread's `automations` job, and that job used to name an agent no
+/// snapshot held, with no execution at all. Every fire was then refused by
+/// placement with "authenticated run has no resolvable fence policy", while the
+/// same procedure invoked by hand from the thread ran fine.
+#[tokio::test]
+async fn a_scheduled_automation_runs_its_procedure_under_the_thread_fence() {
+    use cairn_core::internal::orchestrator::automations;
+
+    let (_temp, db, orch, cwd) = setup("run-automation-thread").await;
+    convert_run_to_thread_session(&db, "run-automation-thread", "bug-desk").await;
+    let thread_id = "issue-run-automation-thread";
+
+    let authored = handle_write(
+        &orch,
+        &request(
+            &cwd,
+            Some("run-automation-thread"),
+            json!({"changes": [{
+                "target": "cairn://p/rhg/bug-desk/procedures",
+                "mode": "create",
+                "payload": {
+                    "name": "check-bugs",
+                    "body": {"commands": [{"command": "printf 'checked %s' \"$1\""}]}
+                }
+            }]}),
+        ),
+    )
+    .await;
+    assert!(
+        authored.contains("Created procedure cairn://p/rhg/bug-desk/procedures/check-bugs"),
+        "procedure authoring failed: {authored}"
+    );
+    let automation = automations::create_thread_automation(
+        &db,
+        thread_id,
+        "check-bugs",
+        vec!["backlog".into()],
+        5 * 60 * 1_000,
+        "agent",
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        automations::fire_thread_automation(&orch, &automation, automation.anchor_at)
+            .await
+            .unwrap(),
+        "the due occurrence must be claimed and fired"
+    );
+
+    let settled = automations::get_thread_automation(&db, thread_id, &automation.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled.last_status.as_deref(),
+        Some("ok"),
+        "the scheduled procedure must execute: {:?}",
+        settled.last_error
+    );
+    assert_eq!(settled.consecutive_failures, 0);
+
+    // Under the thread's fence, specifically: the fence walk is run -> job ->
+    // execution -> snapshot -> agents[agent_config_id], and the automation's
+    // run must arrive at the session's own snapshot entry, not a lookalike.
+    let run_id = settled.last_run_id.expect("the fire minted a run");
+    let walked = |sql: &'static str, id: String| {
+        let db = db.clone();
+        async move { common::scalar_text_by_id(&db, sql, &id).await }
+    };
+    let automation_job = walked("SELECT job_id FROM runs WHERE id = ?1", run_id.clone())
+        .await
+        .unwrap();
+    let session_job = "job-run-automation-thread".to_string();
+    assert_eq!(
+        walked(
+            "SELECT parent_job_id FROM jobs WHERE id = ?1",
+            automation_job.clone()
+        )
+        .await,
+        Some(session_job.clone()),
+        "the automation runs on the thread's own automations job"
+    );
+    for column in [
+        "SELECT execution_id FROM jobs WHERE id = ?1",
+        "SELECT agent_config_id FROM jobs WHERE id = ?1",
+    ] {
+        assert_eq!(
+            walked(column, automation_job.clone()).await,
+            walked(column, session_job.clone()).await,
+            "{column}: the automation must resolve through the session's snapshot"
+        );
+    }
+    assert_eq!(
+        walked("SELECT status FROM runs WHERE id = ?1", run_id)
+            .await
+            .as_deref(),
+        Some("completed")
+    );
+}
+
 async fn read_text(orch: &Orchestrator, cwd: &str, run_id: Option<&str>, path: &str) -> String {
     cairn_core::internal::mcp::handlers::read::handle_read_file(
         orch,
