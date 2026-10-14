@@ -3065,6 +3065,19 @@ impl Fleet {
         self.colocated_supervision.lock().unwrap().last_retirement = Some(summary);
     }
 
+    /// Replace what the supervisor is still re-verifying of earlier
+    /// retirements: surviving workload processes, and cells whose workload
+    /// could not be read.
+    pub fn set_colocated_workload_ledger(
+        &self,
+        survivors: Vec<cairn_common::executor_protocol::WorkloadSurvivor>,
+        unresolved_cells: Vec<cairn_common::executor_protocol::UnresolvedCell>,
+    ) {
+        let mut supervision = self.colocated_supervision.lock().unwrap();
+        supervision.workload_survivors = survivors;
+        supervision.unresolved_cells = unresolved_cells;
+    }
+
     /// Tell the colocated executor attached under `generation` to stop, and
     /// detach it as a runner-initiated close. `false` when that generation is
     /// not attached, which is not an error: it may never have reached Ready, or
@@ -24162,6 +24175,7 @@ mod tests {
             total_ms: 7_040,
             outcome: RetirementOutcome::Retired,
             completed_at_unix_ms: unix_time_ms(),
+            workload: Default::default(),
         };
         fleet.record_colocated_retirement(retirement.clone());
         fleet.declare_colocated_generation_held(held_by(12184));

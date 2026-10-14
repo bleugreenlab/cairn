@@ -177,6 +177,171 @@ pub fn process_group_is_alive(process_group_id: u32) -> bool {
     probed == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// An identifier the kernel mints once per boot, or `None` where this platform
+/// cannot say. Two different values prove a restart in between, and so that
+/// no process running before it still runs.
+#[cfg(target_os = "linux")]
+pub fn boot_id() -> Option<String> {
+    let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let id = id.trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+pub fn boot_id() -> Option<String> {
+    let mut buffer = [0_u8; 64];
+    let mut size = buffer.len();
+    let read = unsafe {
+        libc::sysctlbyname(
+            b"kern.bootsessionuuid\0".as_ptr().cast(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
+    }
+    let id = std::str::from_utf8(buffer.get(..size)?)
+        .ok()?
+        .trim_end_matches('\0')
+        .trim();
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn boot_id() -> Option<String> {
+    None
+}
+
+/// A process identified by its pid and kernel start time, kept as evidence
+/// about the process group it was seen in.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcessAnchor {
+    pub pid: u32,
+    pub start_token: String,
+}
+
+/// Every live process now in `process_group_id`. Zombies are left out: they
+/// hold nothing, cannot be signalled into exiting, and leave once reaped.
+#[cfg(target_os = "linux")]
+pub fn process_group_members(process_group_id: u32) -> Result<Vec<ProcessAnchor>, String> {
+    let entries =
+        std::fs::read_dir("/proc").map_err(|error| format!("enumerate /proc: {error}"))?;
+    Ok(entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+            if *fields.first()? == "Z" || fields.get(2)?.parse::<u32>().ok()? != process_group_id {
+                return None;
+            }
+            Some(ProcessAnchor {
+                pid,
+                start_token: (*fields.get(19)?).to_owned(),
+            })
+        })
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_group_members(process_group_id: u32) -> Result<Vec<ProcessAnchor>, String> {
+    let pid_size = std::mem::size_of::<libc::c_int>();
+    let needed = unsafe {
+        libc::proc_listpids(
+            libc::PROC_PGRP_ONLY,
+            process_group_id,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed < 0 {
+        return Err(format!(
+            "list process group {process_group_id}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Room for members that join between the size query and the listing.
+    let mut pids = vec![0 as libc::c_int; needed as usize / pid_size + 64];
+    let filled = unsafe {
+        libc::proc_listpids(
+            libc::PROC_PGRP_ONLY,
+            process_group_id,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * pid_size) as libc::c_int,
+        )
+    };
+    if filled < 0 {
+        return Err(format!(
+            "list process group {process_group_id}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    pids.truncate(filled as usize / pid_size);
+    Ok(pids
+        .into_iter()
+        .filter(|pid| *pid > 0)
+        .filter_map(|pid| {
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            (read == size && info.pbi_status != libc::SZOMB && info.pbi_pgid == process_group_id)
+                .then(|| ProcessAnchor {
+                    pid: pid as u32,
+                    start_token: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+                })
+        })
+        .collect())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn process_group_members(_process_group_id: u32) -> Result<Vec<ProcessAnchor>, String> {
+    Err("process group membership cannot be read on this platform".into())
+}
+
+/// Signal a process group whose leader is gone, but only while one of
+/// `anchors`, processes seen in that group while its leader was verified
+/// alive, is verified to still be in it. Returns the anchor that justified the
+/// signal, or `None` when no anchor remains in the group and nothing was sent.
+///
+/// Without a live leader a group id fences nothing on its own: once the group
+/// empties, the number can be handed out again. But the kernel never hands out
+/// a pid that is still in use as a group id, so a group a recorded member has
+/// stayed in has existed continuously since that member was seen there, and is
+/// the group the leader led.
+#[cfg(unix)]
+pub fn signal_anchored_group(
+    process_group_id: u32,
+    anchors: &[ProcessAnchor],
+    signal: libc::c_int,
+) -> Result<Option<u32>, String> {
+    let Some(anchor) = anchors.iter().find(|anchor| {
+        process_presence(anchor.pid, &anchor.start_token) == ProcessPresence::Present
+            && unsafe { libc::getpgid(anchor.pid as libc::pid_t) }
+                == process_group_id as libc::pid_t
+    }) else {
+        return Ok(None);
+    };
+    if unsafe { libc::kill(-(process_group_id as libc::pid_t), signal) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(format!("signal process group {process_group_id}: {error}"));
+        }
+    }
+    Ok(Some(anchor.pid))
+}
+
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests {
     use super::*;

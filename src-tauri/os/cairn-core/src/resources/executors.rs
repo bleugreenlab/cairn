@@ -90,7 +90,7 @@ use cairn_common::abnormal_exit::{crash_report_for, AbnormalExit};
 use cairn_common::executor_protocol::{
     ColocatedGenerationHold, ColocatedSupervision, ExecutorRetirementSummary,
     ExecutorSubstrateEvidence, ExecutorSubstrateState, GenerationHoldReason, RetirementOrigin,
-    RetirementOutcome,
+    RetirementOutcome, RetirementPhase, WorkloadSurvivor,
 };
 
 use crate::fleet::management::{EnrollmentCleanup, EnrollmentOperation};
@@ -2161,6 +2161,25 @@ pub(crate) fn render_colocated_supervision(
             age(captured_at_unix_ms.saturating_sub(retirement.completed_at_unix_ms))
         ));
     }
+    for survivor in &supervision.workload_survivors {
+        lines.push(format!(
+            "- Survivor: {}",
+            describe_survivor(survivor, captured_at_unix_ms)
+        ));
+    }
+    for cell in &supervision.unresolved_cells {
+        lines.push(format!(
+            "- Unresolved cell: `{}`{}: what ran there is unknown since {} ago, because {}; it clears on its own at the next boot of this host; {}",
+            cell.cell_authority,
+            cell.retired_executor_pid
+                .map(|pid| format!(" (retired executor pid {pid})"))
+                .unwrap_or_default(),
+            age(captured_at_unix_ms.saturating_sub(cell.first_seen_unix_ms))
+                .trim_end_matches(" ago"),
+            cell.reason,
+            next_look(cell.next_verification_unix_ms, captured_at_unix_ms)
+        ));
+    }
     if lines.is_empty() {
         return String::new();
     }
@@ -2193,10 +2212,48 @@ fn generation_hold_cause(hold: &ColocatedGenerationHold, captured_at_unix_ms: u6
         GenerationHoldReason::Unidentified => format!(
             "generation held by {holder}{recorded}, which this runner did not start and will not signal; `local` starts when it exits"
         ),
+        GenerationHoldReason::RetirementStuck {
+            phase: RetirementPhase::Verify,
+        } => format!(
+            "outgoing executor {holder}{recorded} is gone, but work it launched survived SIGKILL (listed below); looking again a few times before starting `local` anyway, since a survivor holds only its own cell"
+        ),
         GenerationHoldReason::RetirementStuck { phase } => format!(
             "outgoing executor {holder}{recorded} is still alive after retirement reached {}; retrying, and starting no successor while it holds the generation",
             phase.label()
         ),
+    }
+}
+
+/// One survivor of a retirement, as the person reading the fleet needs it:
+/// which process, where, since when, what has been done about it, and when it
+/// will be looked at next.
+fn describe_survivor(survivor: &WorkloadSurvivor, captured_at_unix_ms: u64) -> String {
+    let mut line = format!(
+        "pid {} ({}, start token `{}`) outlived its executor's retirement at verification; cell `{}`, lock {}; first seen {}; {} verified SIGKILL{} sent",
+        survivor.pid,
+        survivor.kind.label(),
+        survivor.start_token,
+        survivor.cell_authority,
+        if survivor.cell_lock_held { "still held" } else { "free" },
+        age(captured_at_unix_ms.saturating_sub(survivor.first_seen_unix_ms)),
+        survivor.kill_attempts,
+        if survivor.kill_attempts == 1 { "" } else { "s" },
+    );
+    if let Some(why) = &survivor.unsignalled_because {
+        line.push_str(&format!("; not signalled at the last look: {why}"));
+    }
+    line.push_str("; ");
+    line.push_str(&next_look(
+        survivor.next_verification_unix_ms,
+        captured_at_unix_ms,
+    ));
+    line
+}
+
+fn next_look(next_verification_unix_ms: u64, captured_at_unix_ms: u64) -> String {
+    match next_verification_unix_ms.saturating_sub(captured_at_unix_ms) {
+        0 => "re-verification due now".to_string(),
+        next => format!("next re-verification in {}", duration_ms(next)),
     }
 }
 
@@ -2206,7 +2263,12 @@ fn describe_retirement(retirement: &ExecutorRetirementSummary) -> String {
         RetirementOrigin::PriorRunner => "left running by a previous runner",
     };
     let seconds = |ms: u64| format!("{:.1}s", ms as f64 / 1_000.0);
-    match (retirement.outcome, retirement.escalated_to) {
+    let workload = &retirement.workload;
+    let mut described = match (retirement.outcome, retirement.escalated_to) {
+        (RetirementOutcome::Retired, None) if retirement.graceful_ms == 0 => format!(
+            "retired pid {} ({whose}); it had already exited",
+            retirement.pid
+        ),
         (RetirementOutcome::Retired, None) => format!(
             "retired pid {} ({whose}); it exited {} after being asked",
             retirement.pid,
@@ -2218,12 +2280,66 @@ fn describe_retirement(retirement: &ExecutorRetirementSummary) -> String {
             phase.label(),
             seconds(retirement.graceful_ms)
         ),
+        (
+            RetirementOutcome::Stuck {
+                phase: RetirementPhase::Verify,
+            },
+            _,
+        ) => {
+            let plural = |count: u32, one: &str, many: &str| {
+                format!("{count} {}", if count == 1 { one } else { many })
+            };
+            let mut failures = Vec::new();
+            if !workload.surviving_pids.is_empty() {
+                failures.push(format!(
+                    "workload pids {:?} are still running",
+                    workload.surviving_pids
+                ));
+            }
+            if workload.held_cell_locks > 0 {
+                failures.push(format!(
+                    "{} still held",
+                    plural(workload.held_cell_locks, "cell lock is", "cell locks are")
+                ));
+            }
+            if workload.unreadable_cells > 0 {
+                failures.push(format!(
+                    "{} could not be decoded, so what ran there is unknown",
+                    plural(
+                        workload.unreadable_cells,
+                        "cell state file",
+                        "cell state files"
+                    )
+                ));
+            }
+            if let Some(why) = &workload.ownership_unconfirmed {
+                failures.push(format!("nothing was signalled: {why}"));
+            }
+            format!(
+                "pid {} ({whose}) is gone, but verification failed: {}",
+                retirement.pid,
+                failures.join("; ")
+            )
+        }
         (RetirementOutcome::Stuck { phase }, _) => format!(
             "pid {} ({whose}) is still alive after retirement reached {}",
             retirement.pid,
             phase.label()
         ),
+    };
+    if workload.reaped > 0 {
+        described.push_str(&format!(
+            "; SIGKILLed {} workload process{} it had left running",
+            workload.reaped,
+            if workload.reaped == 1 { "" } else { "es" }
+        ));
     }
+    if let Some(because) = &workload.left_alone_because {
+        described.push_str(&format!(
+            "; its recorded workload was left alone: {because}"
+        ));
+    }
+    described
 }
 
 fn substrate_state_label(state: ExecutorSubstrateState) -> &'static str {
@@ -5268,12 +5384,112 @@ mod supervision_tests {
                 total_ms: 7_030,
                 outcome: RetirementOutcome::Retired,
                 completed_at_unix_ms: NOW - 60_000,
+                workload: Default::default(),
             }),
             ..Default::default()
         };
         let rendered = render_colocated_supervision(None, &supervision, true, NOW);
         assert!(
             rendered.contains("Last handoff: retired pid 12184 (left running by a previous runner); escalated to SIGKILL after a 7.0s graceful window (1m ago)"),
+            "{rendered}"
+        );
+    }
+
+    /// A retirement whose workload outlived it must not read as a clean
+    /// handoff, and each survivor is named with everything needed to act on
+    /// it: which process, which cell, since when, and when it is looked at next.
+    #[test]
+    fn workload_survivors_are_named_with_their_cell_and_next_look() {
+        let supervision = ColocatedSupervision {
+            last_retirement: Some(ExecutorRetirementSummary {
+                pid: 12184,
+                origin: RetirementOrigin::OwnChild,
+                escalated_to: Some(RetirementPhase::Force),
+                graceful_ms: 7_000,
+                force_ms: Some(3_000),
+                total_ms: 10_000,
+                outcome: RetirementOutcome::Stuck {
+                    phase: RetirementPhase::Verify,
+                },
+                completed_at_unix_ms: NOW - 120_000,
+                workload: cairn_common::executor_protocol::RetirementWorkload {
+                    reaped: 2,
+                    surviving_pids: vec![70565],
+                    held_cell_locks: 1,
+                    ..Default::default()
+                },
+            }),
+            workload_survivors: vec![WorkloadSurvivor {
+                pid: 70565,
+                start_token: "1760400000:12".into(),
+                leads_group: Some(70565),
+                kind: cairn_common::executor_generation::WorkloadKind::Command,
+                cell_authority: "/home/build-slots/cairn/.authority/slot-1310".into(),
+                cell_epoch: 4,
+                cell_lock_held: true,
+                first_seen_unix_ms: NOW - 120_000,
+                last_verified_unix_ms: NOW - 15_000,
+                next_verification_unix_ms: NOW + 45_000,
+                kill_attempts: 3,
+                unsignalled_because: None,
+                group_anchors: Vec::new(),
+                retired_executor_pid: Some(12184),
+                ownership_unconfirmed: None,
+                successor_gated: true,
+            }],
+            ..Default::default()
+        };
+        let rendered = render_colocated_supervision(None, &supervision, true, NOW);
+        assert!(
+            rendered.contains("pid 12184 (this runner's executor) is gone, but verification failed: workload pids [70565] are still running; 1 cell lock is still held; SIGKILLed 2 workload processes it had left running"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Survivor: pid 70565 (command, start token `1760400000:12`) outlived its executor's retirement at verification; cell `/home/build-slots/cairn/.authority/slot-1310`, lock still held; first seen 2m ago; 3 verified SIGKILLs sent; next re-verification in 45.0s"),
+            "{rendered}"
+        );
+    }
+
+    /// Unknown workload is a verification failure in its own right, and each
+    /// cell whose workload is unknown is named with why and when it is looked
+    /// at next.
+    #[test]
+    fn unknown_workload_is_named_as_a_failure_with_each_unresolved_cell() {
+        let supervision = ColocatedSupervision {
+            last_retirement: Some(ExecutorRetirementSummary {
+                pid: 12184,
+                origin: RetirementOrigin::PriorRunner,
+                escalated_to: None,
+                graceful_ms: 0,
+                force_ms: None,
+                total_ms: 40,
+                outcome: RetirementOutcome::Stuck {
+                    phase: RetirementPhase::Verify,
+                },
+                completed_at_unix_ms: NOW - 60_000,
+                workload: cairn_common::executor_protocol::RetirementWorkload {
+                    unreadable_cells: 1,
+                    ..Default::default()
+                },
+            }),
+            unresolved_cells: vec![cairn_common::executor_protocol::UnresolvedCell {
+                cell_authority: "/home/build-slots/cairn/.authority/slot-7".into(),
+                reason: "its state still does not decode: unparseable persistent slot state".into(),
+                retired_executor_pid: Some(12184),
+                boot_id: Some("boot".into()),
+                first_seen_unix_ms: NOW - 60_000,
+                last_verified_unix_ms: NOW,
+                next_verification_unix_ms: NOW + 60_000,
+            }],
+            ..Default::default()
+        };
+        let rendered = render_colocated_supervision(None, &supervision, true, NOW);
+        assert!(
+            rendered.contains("pid 12184 (left running by a previous runner) is gone, but verification failed: 1 cell state file could not be decoded, so what ran there is unknown"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Unresolved cell: `/home/build-slots/cairn/.authority/slot-7` (retired executor pid 12184): what ran there is unknown since 1m ago, because its state still does not decode: unparseable persistent slot state; it clears on its own at the next boot of this host; next re-verification in 60.0s"),
             "{rendered}"
         );
     }

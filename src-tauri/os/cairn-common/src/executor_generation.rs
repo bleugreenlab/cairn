@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::executor_protocol::ExecutorGenerationHolder;
+use crate::executor_protocol::{ExecutorGenerationHolder, PersistentCellState};
 use crate::kernel_lock::{read_lock_holder, try_lock_exclusive, unix_time_ms};
 
 /// Where the generation lock lives in a Cairn home.
@@ -108,14 +108,75 @@ pub fn held_cell_authorities(cairn_home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Decode a cell's persisted state exactly as the executor that wrote it does.
+///
+/// Disk-only migration: lifecycle names an older executor wrote are mapped
+/// onto the current ones before the strict decode, while wire decoding stays
+/// strict at the protocol boundary. The executor and the runner share this one
+/// decoder, so a cell the executor would adopt is never one the runner reads
+/// as empty.
+pub fn decode_persistent_cell_state(bytes: &[u8]) -> Result<PersistentCellState, String> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("unparseable persistent slot state: {error}"))?;
+    let lifecycle = value
+        .get("lifecycle")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "persistent slot lifecycle is missing or not a string".to_string())?;
+    let migrated = match lifecycle {
+        "provisioning" | "recovering" | "materializing" => "materializing",
+        "idle" | "queued" | "awaitingReclaim" | "releasing" => "idle",
+        "running" | "active" => "active",
+        "retired" | "deleting" => "deleting",
+        "quarantined" => "quarantined",
+        other => return Err(format!("unknown persistent slot lifecycle: {other:?}")),
+    };
+    value["lifecycle"] = serde_json::Value::String(migrated.into());
+    serde_json::from_value(value).map_err(|error| format!("invalid persistent slot state: {error}"))
+}
+
+/// What one cell authority's state file says right now.
+#[derive(Debug)]
+pub enum CellStateRead {
+    /// No state file: nothing has been recorded in this cell.
+    Absent,
+    /// A state file exists and could not be read or decoded. Its workload is
+    /// unknown, which is never the same as none.
+    Unreadable(String),
+    Recorded(Box<PersistentCellState>),
+}
+
+pub fn read_cell_state(cell_authority: &Path) -> CellStateRead {
+    match std::fs::read(cell_authority.join(CELL_STATE_FILE_NAME)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CellStateRead::Absent,
+        Err(error) => CellStateRead::Unreadable(error.to_string()),
+        Ok(bytes) => match decode_persistent_cell_state(&bytes) {
+            Ok(state) => CellStateRead::Recorded(Box::new(state)),
+            Err(error) => CellStateRead::Unreadable(error),
+        },
+    }
+}
+
 /// What kind of work a recorded process is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum WorkloadKind {
     /// A resident process: a terminal, service, dev instance, or workflow
     /// runtime.
     Resident,
-    /// A member of a command batch, current or draining from a prior epoch.
+    /// A member of the cell's current command batch.
     Command,
+    /// A member of a prior epoch's batch the cell has not yet proven dead.
+    Draining,
+}
+
+impl WorkloadKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::Command => "command",
+            Self::Draining => "draining command",
+        }
+    }
 }
 
 /// One process an executor recorded launching or observing in a cell, as the
@@ -129,6 +190,94 @@ pub struct RecordedWorkloadProcess {
     pub leads_group: Option<u32>,
     pub kind: WorkloadKind,
     pub cell_authority: PathBuf,
+    /// The cell's epoch when this was read. A later generation that adopts the
+    /// cell advances it, which is how its own work is told apart from what the
+    /// previous generation left behind.
+    pub cell_epoch: u64,
+    /// Members of the group it leads, seen while it was verified alive. They
+    /// are what lets that group be signalled once the leader is gone. The
+    /// reader leaves this empty; it is evidence only whoever observed the live
+    /// group can supply.
+    pub group_anchors: Vec<crate::process_identity::ProcessAnchor>,
+}
+
+/// Every process `state` records as live in the cell at `cell_authority`.
+///
+/// Only identities carrying a kernel start token are returned: a resident
+/// recorded before ownership was persisted names nothing that can be verified,
+/// and the executor itself never signals one.
+pub fn cell_workload(
+    cell_authority: &Path,
+    state: &PersistentCellState,
+) -> Vec<RecordedWorkloadProcess> {
+    use crate::executor_protocol::ResidentProcessStatus;
+    let process =
+        |pid: u32, start_token: &str, leads_group: Option<u32>, kind| RecordedWorkloadProcess {
+            pid,
+            start_token: start_token.to_owned(),
+            leads_group,
+            kind,
+            cell_authority: cell_authority.to_path_buf(),
+            cell_epoch: state.cell_epoch,
+            group_anchors: Vec::new(),
+        };
+    let occupancy = &state.occupancy;
+    let mut workload = Vec::new();
+    for resident in occupancy.processes.values() {
+        if let ResidentProcessStatus::Running {
+            ownership: Some(ownership),
+            ..
+        } = &resident.status
+        {
+            workload.push(process(
+                ownership.pid,
+                &ownership.start_token,
+                (ownership.process_group_id == ownership.pid).then_some(ownership.pid),
+                WorkloadKind::Resident,
+            ));
+        }
+    }
+    let batches = [
+        (occupancy.command_ownership.as_ref(), WorkloadKind::Command),
+        (
+            occupancy
+                .draining
+                .as_ref()
+                .map(|draining| &draining.ownership),
+            WorkloadKind::Draining,
+        ),
+    ];
+    for (batch, kind) in batches {
+        for identity in batch
+            .into_iter()
+            .flat_map(|batch| &batch.items)
+            .flat_map(|item| &item.attempts)
+            .flat_map(|attempt| &attempt.processes)
+        {
+            // A session leader also leads its process group.
+            let leads_group = identity
+                .process_group_id
+                .or(identity.session_id)
+                .filter(|group| *group == identity.pid);
+            workload.push(process(
+                identity.pid,
+                &identity.start_token,
+                leads_group,
+                kind,
+            ));
+        }
+    }
+    workload
+}
+
+/// The workload recorded across a Cairn home, and the cells whose record could
+/// not be read.
+#[derive(Debug, Default)]
+pub struct RecordedWorkload {
+    pub processes: Vec<RecordedWorkloadProcess>,
+    /// Cell authorities whose state file exists and could not be decoded, with
+    /// why. What runs in them is unknown.
+    pub unreadable: Vec<(PathBuf, String)>,
 }
 
 /// Every live-recorded workload process in a Cairn home, read from the cell
@@ -140,63 +289,179 @@ pub struct RecordedWorkloadProcess {
 /// that launched them finds them: by the identities that executor recorded,
 /// each of which still has to be checked against the kernel before anything
 /// acts on it.
-pub fn recorded_workload(cairn_home: &Path) -> Vec<RecordedWorkloadProcess> {
-    use crate::executor_protocol::{
-        CommandBatchOwnership, PersistentCellState, ResidentProcessStatus,
-    };
-    let mut workload = Vec::new();
+pub fn recorded_workload(cairn_home: &Path) -> RecordedWorkload {
+    let mut workload = RecordedWorkload::default();
     for authority in cell_authority_dirs(cairn_home) {
-        let Some(state) = std::fs::read(authority.join(CELL_STATE_FILE_NAME))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PersistentCellState>(&bytes).ok())
-        else {
-            continue;
-        };
-        let occupancy = &state.occupancy;
-        for process in occupancy.processes.values() {
-            if let ResidentProcessStatus::Running {
-                ownership: Some(ownership),
-                ..
-            } = &process.status
-            {
-                workload.push(RecordedWorkloadProcess {
-                    pid: ownership.pid,
-                    start_token: ownership.start_token.clone(),
-                    leads_group: (ownership.process_group_id == ownership.pid)
-                        .then_some(ownership.process_group_id),
-                    kind: WorkloadKind::Resident,
-                    cell_authority: authority.clone(),
-                });
-            }
-        }
-        let batches: [Option<&CommandBatchOwnership>; 2] = [
-            occupancy.command_ownership.as_ref(),
-            occupancy
-                .draining
-                .as_ref()
-                .map(|draining| &draining.ownership),
-        ];
-        for batch in batches.into_iter().flatten() {
-            for identity in batch
-                .items
-                .iter()
-                .flat_map(|item| &item.attempts)
-                .flat_map(|attempt| &attempt.processes)
-            {
-                // A session leader also leads its process group.
-                let leads_group = identity
-                    .process_group_id
-                    .or(identity.session_id)
-                    .filter(|group| *group == identity.pid);
-                workload.push(RecordedWorkloadProcess {
-                    pid: identity.pid,
-                    start_token: identity.start_token.clone(),
-                    leads_group,
-                    kind: WorkloadKind::Command,
-                    cell_authority: authority.clone(),
-                });
+        match read_cell_state(&authority) {
+            CellStateRead::Absent => {}
+            CellStateRead::Unreadable(error) => workload.unreadable.push((authority, error)),
+            CellStateRead::Recorded(state) => {
+                workload.processes.extend(cell_workload(&authority, &state))
             }
         }
     }
     workload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cell state file as the executor writes one: a terminal resident with
+    /// its launch ownership, a resident recorded before ownership existed, the
+    /// current batch's session leader and a descendant, and a draining member
+    /// of a prior epoch.
+    fn fixture(lifecycle: &str) -> serde_json::Value {
+        let identity = |pid: u32, session: Option<u32>, token: &str| {
+            let mut identity = serde_json::json!({
+                "pid": pid,
+                "startToken": token,
+                "launchNonce": format!("nonce-{pid}"),
+                "observedAtUnixMs": 5,
+                "parent": {"kind": "leader"},
+            });
+            if let Some(session) = session {
+                identity["processGroupId"] = session.into();
+                identity["sessionId"] = session.into();
+            }
+            identity
+        };
+        let batch = |members: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "executorId": "exec",
+                "cellId": "slot-3",
+                "requestId": "request",
+                "attemptId": "attempt",
+                "batchLaunchNonce": "batch",
+                "launchedAtUnixMs": 4,
+                "items": [{
+                    "itemIndex": 0,
+                    "streamId": "stream",
+                    "attempts": [{
+                        "attemptIndex": 0,
+                        "state": "running",
+                        "launchNonce": "attempt-nonce",
+                        "launchedAtUnixMs": 4,
+                        "processes": members,
+                    }],
+                }],
+            })
+        };
+        serde_json::json!({
+            "executorId": "exec",
+            "projectId": "project",
+            "slotId": "slot-3",
+            "path": "/cells/slot-3",
+            "repository": "/repo",
+            "lifecycle": lifecycle,
+            "cellEpoch": 9,
+            "lastSealedCommit": null,
+            "lastUsedUnixMs": 1,
+            "occupancy": {
+                "commandOwnership": batch(vec![
+                    identity(500, Some(500), "500:1"),
+                    identity(501, None, "501:1"),
+                ]),
+                "draining": {
+                    "cellEpoch": 8,
+                    "releasedAtUnixMs": 3,
+                    "ownership": batch(vec![identity(600, Some(600), "600:1")]),
+                },
+                "processes": {
+                    "shell": {
+                        "generation": 1,
+                        "kind": {"kind": "terminal", "slug": "dev"},
+                        "status": {
+                            "status": "running",
+                            "startedAtUnixMs": 2,
+                            "processGroupId": 400,
+                            "ownership": {
+                                "pid": 400,
+                                "processGroupId": 400,
+                                "launchNonce": "terminal",
+                                "startToken": "400:1",
+                                "launchedAtUnixMs": 2,
+                            },
+                        },
+                    },
+                    "legacy": {
+                        "generation": 1,
+                        "kind": {"kind": "terminal", "slug": "old"},
+                        "status": {
+                            "status": "running",
+                            "startedAtUnixMs": 2,
+                            "processGroupId": 401,
+                        },
+                    },
+                },
+            },
+        })
+    }
+
+    fn home_with(state: &serde_json::Value) -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().unwrap();
+        let authority = home
+            .path()
+            .join("build-slots")
+            .join("project")
+            .join(".authority")
+            .join("slot-3");
+        std::fs::create_dir_all(&authority).unwrap();
+        std::fs::write(
+            authority.join(CELL_STATE_FILE_NAME),
+            serde_json::to_vec(state).unwrap(),
+        )
+        .unwrap();
+        (home, authority)
+    }
+
+    #[test]
+    fn the_recorded_workload_is_every_verifiable_identity_in_the_cell() {
+        let (home, authority) = home_with(&fixture("active"));
+        let workload = recorded_workload(home.path());
+        assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
+        let mut found: Vec<_> = workload
+            .processes
+            .iter()
+            .map(|process| (process.pid, process.leads_group, process.kind))
+            .collect();
+        found.sort_by_key(|(pid, ..)| *pid);
+        assert_eq!(
+            found,
+            vec![
+                (400, Some(400), WorkloadKind::Resident),
+                (500, Some(500), WorkloadKind::Command),
+                // Recorded as a descendant, so it leads nothing and only its own
+                // pid is ever signalled.
+                (501, None, WorkloadKind::Command),
+                (600, Some(600), WorkloadKind::Draining),
+            ],
+            "the resident with no recorded ownership names nothing verifiable"
+        );
+        assert!(workload
+            .processes
+            .iter()
+            .all(|process| process.cell_authority == authority && process.cell_epoch == 9));
+    }
+
+    /// An older executor wrote lifecycle names the strict decode refuses. The
+    /// runner must read that cell the way the executor's adoption does, or its
+    /// workload is silently skipped.
+    #[test]
+    fn a_cell_an_older_executor_wrote_is_still_read() {
+        let (home, _) = home_with(&fixture("running"));
+        let workload = recorded_workload(home.path());
+        assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
+        assert_eq!(workload.processes.len(), 4);
+    }
+
+    #[test]
+    fn an_undecodable_cell_is_reported_unknown_not_empty() {
+        let (home, authority) = home_with(&fixture("active"));
+        std::fs::write(authority.join(CELL_STATE_FILE_NAME), b"{\"lifecycle\":").unwrap();
+        let workload = recorded_workload(home.path());
+        assert!(workload.processes.is_empty());
+        assert_eq!(workload.unreadable.len(), 1);
+        assert_eq!(workload.unreadable[0].0, authority);
+    }
 }

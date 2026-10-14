@@ -3996,6 +3996,20 @@ pub struct LearnedResourceEstimate {
 /// All of it is runner-side bookkeeping about frames that already crossed. No
 /// frame, field, cadence, or meaning changed in either direction, so a runner
 /// talking to an older executor gets nothing wrong.
+///
+/// cairn/4907 changes how the runner retires a colocated executor, without a
+/// bump. The executor's on-disk cell-state decoder moved, unchanged, into
+/// `executor_generation` so the runner reads `cairn-build-slot-state.json` the
+/// way adoption does, and after the executor is gone the runner SIGKILLs the
+/// workload those files record. The retirement summary's new workload fields
+/// and the ledger (survivors and unresolved cells) live in
+/// [`ColocatedSupervision`], which is runner-side
+/// state rendered by `cairn://executors` and never sent to an executor. No
+/// frame or field crossing the link changes. A runner talking to an older
+/// executor gets nothing wrong: that executor persists the same cell state
+/// (the reader decodes every older lifecycle the executor does), and a cell
+/// recorded before resident ownership existed names nothing verifiable, so it
+/// is never signalled.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 141;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -4342,8 +4356,13 @@ pub const EXECUTOR_RESIDENT_STOP_BUDGET_MS: u64 = 3_000;
 /// groups, and those groups are not in the executor's own group.
 pub const EXECUTOR_RETIREMENT_GRACE_MS: u64 = 7_000;
 
-/// How long the runner waits after SIGKILLing an outgoing executor's process
-/// group for the kernel to report it gone.
+/// The one window everything after the graceful wait shares: SIGKILL of the
+/// executor and its own group, the verified SIGKILL of every workload process
+/// it recorded in groups of their own, and waiting for the kernel to report all
+/// of them gone and every cell lock released.
+///
+/// One deadline rather than one per step, so the assertion below bounds the
+/// whole ceremony and not just its first half.
 pub const EXECUTOR_RETIREMENT_FORCE_MS: u64 = 3_000;
 
 /// launchd's default exit timeout, the window between the SIGTERM a service
@@ -6207,6 +6226,101 @@ pub struct ColocatedSupervision {
     /// The most recent retirement of an outgoing colocated executor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_retirement: Option<ExecutorRetirementSummary>,
+    /// Workload processes a retired executor launched that outlived the
+    /// retirement's SIGKILL, still being re-verified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workload_survivors: Vec<WorkloadSurvivor>,
+    /// Cells a retirement could not read, whose workload is still unknown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_cells: Vec<UnresolvedCell>,
+}
+
+/// A process a retired executor recorded launching that is not yet known to be
+/// gone.
+///
+/// Kept until the kernel says it is gone (or its pid names another process
+/// now), or until the cell's current executor generation records it as its
+/// own. Retrying is not death, so nothing else removes it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkloadSurvivor {
+    pub pid: u32,
+    pub start_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leads_group: Option<u32>,
+    pub kind: crate::executor_generation::WorkloadKind,
+    /// The cell authority directory it was recorded in.
+    pub cell_authority: String,
+    /// That cell's epoch when the retirement read it.
+    pub cell_epoch: u64,
+    /// Whether a live process still held the cell's lock at the last look.
+    #[serde(default)]
+    pub cell_lock_held: bool,
+    pub first_seen_unix_ms: u64,
+    pub last_verified_unix_ms: u64,
+    pub next_verification_unix_ms: u64,
+    /// Verified SIGKILLs delivered to it so far.
+    #[serde(default)]
+    pub kill_attempts: u32,
+    /// Why it was not signalled at the last look, when it was not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsignalled_because: Option<String>,
+    /// Members of the group it leads, seen while it was verified alive: what
+    /// lets that group be signalled once the leader itself is gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_anchors: Vec<crate::process_identity::ProcessAnchor>,
+    /// The executor whose retirement found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_executor_pid: Option<u32>,
+    /// Set when it was recorded without knowing whose cells it ran in (the
+    /// generation could not be probed), and why. It is not signalled until the
+    /// generation is found free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_unconfirmed: Option<String>,
+    /// Whether a successor's start has already been held on it. Each survivor
+    /// holds one start, a bounded number of looks long, and never another.
+    #[serde(default)]
+    pub successor_gated: bool,
+}
+
+impl WorkloadSurvivor {
+    /// The recorded identity this survivor names.
+    pub fn recorded(&self) -> crate::executor_generation::RecordedWorkloadProcess {
+        crate::executor_generation::RecordedWorkloadProcess {
+            pid: self.pid,
+            start_token: self.start_token.clone(),
+            leads_group: self.leads_group,
+            kind: self.kind,
+            cell_authority: std::path::PathBuf::from(&self.cell_authority),
+            cell_epoch: self.cell_epoch,
+            group_anchors: self.group_anchors.clone(),
+        }
+    }
+}
+
+/// A cell whose workload a retirement could not learn, because its state file
+/// did not decode.
+///
+/// Unknown is not none, and nothing later written at that path is the record
+/// that could not be read: a successor quarantines such a cell, moving it aside
+/// or rebuilding its state from the cell's identity. So the entry is kept until
+/// the host has restarted since it was recorded, which ends every process
+/// that could have been running there, or until an operator removes it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnresolvedCell {
+    pub cell_authority: String,
+    /// Why its workload is still unknown, as of the last look.
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_executor_pid: Option<u32>,
+    /// The kernel's boot identity when it was recorded, where the platform
+    /// has one ([`crate::process_identity::boot_id`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+    pub first_seen_unix_ms: u64,
+    pub last_verified_unix_ms: u64,
+    pub next_verification_unix_ms: u64,
 }
 
 /// A live process the supervisor found holding the generation lock it needs.
@@ -6246,7 +6360,8 @@ pub enum RetirementPhase {
     Graceful,
     /// SIGKILL to its process group, then waiting for the kernel to reap it.
     Force,
-    /// Confirming the pid is gone and the generation lock is free.
+    /// Confirming the pid is gone, and that every process it recorded
+    /// launching is gone and every cell lock is free.
     Verify,
 }
 
@@ -6296,6 +6411,48 @@ pub struct ExecutorRetirementSummary {
     pub total_ms: u64,
     pub outcome: RetirementOutcome,
     pub completed_at_unix_ms: u64,
+    /// What the verify step found of the workload the executor recorded.
+    #[serde(default)]
+    pub workload: RetirementWorkload,
+}
+
+/// The workload half of a retirement's verification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetirementWorkload {
+    /// Recorded workload processes still running that were SIGKILLed.
+    #[serde(default)]
+    pub reaped: u32,
+    /// Recorded processes not known to be gone when the deadline passed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surviving_pids: Vec<u32>,
+    /// Cell locks a live process still held at the end.
+    #[serde(default)]
+    pub held_cell_locks: u32,
+    /// Cells whose state could not be decoded, so whose workload is unknown.
+    #[serde(default)]
+    pub unreadable_cells: u32,
+    /// Why the workload was left alone, when it was: a live executor other
+    /// than the one retired holds the generation, so every cell in the home is
+    /// that executor's. That is positive evidence, and a clean outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left_alone_because: Option<String>,
+    /// Why whose cells these are could not be established, when it could not
+    /// (the generation could not be probed). Nothing was signalled, and the
+    /// outcome is not clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_unconfirmed: Option<String>,
+}
+
+impl RetirementWorkload {
+    /// Every recorded process is known gone, every cell lock is free, and
+    /// nothing about the workload is unknown.
+    pub fn is_clean(&self) -> bool {
+        self.surviving_pids.is_empty()
+            && self.held_cell_locks == 0
+            && self.unreadable_cells == 0
+            && self.ownership_unconfirmed.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
