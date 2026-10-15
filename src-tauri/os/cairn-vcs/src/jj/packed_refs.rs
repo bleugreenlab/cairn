@@ -72,7 +72,7 @@ impl PackedRefs<'_> {
 /// Resolved by reading rather than by spawning `git rev-parse`: this runs on the
 /// healing path, whose whole premise is that the repository's ref store is
 /// already contended.
-fn git_common_dir(checkout: &Path) -> Option<PathBuf> {
+pub(crate) fn git_common_dir(checkout: &Path) -> Option<PathBuf> {
     let dot_git = checkout.join(".git");
     if dot_git.is_dir() {
         return Some(dot_git);

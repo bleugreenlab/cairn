@@ -583,6 +583,24 @@ async fn resolve_coordinate_inner(
     resolve_symbol_at(&repo, coordinate).map(|id| id.hex())
 }
 
+/// Load a store's workspace through the crate's one settings seam, for the
+/// maintenance pass that rewrites its operation log.
+pub(crate) fn load_workspace(repository_path: &Path) -> Result<Workspace, String> {
+    let settings = jj_settings(None)?;
+    let stores = StoreFactories::default();
+    let mut working_copies: WorkingCopyFactories = HashMap::new();
+    working_copies.insert(
+        LocalWorkingCopy::name().to_string(),
+        Box::new(LocalWorkingCopyFactory {}),
+    );
+    Workspace::load(&settings, repository_path, &stores, &working_copies).map_err(|error| {
+        format!(
+            "load the jj store at {}: {error}",
+            repository_path.display()
+        )
+    })
+}
+
 /// Load a repository at its current operation head for read-only inspection.
 ///
 /// Read-only, but built through the same settings seam as every mutating path

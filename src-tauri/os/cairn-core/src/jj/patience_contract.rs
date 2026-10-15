@@ -29,6 +29,21 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         include_str!("../mcp/handlers/run/mod.rs"),
         "fn strand_conflicted_delta(",
     ),
+    (
+        "logical-head commit write",
+        include_str!("../../../cairn-vcs/src/jj/publish.rs"),
+        "pub async fn publish_logical_head_exported(",
+    ),
+    (
+        "ref-store maintenance retirement",
+        include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
+        "pub fn retire_refs(",
+    ),
+    (
+        "ref-store maintenance keep refs",
+        include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
+        "fn recreate_keep_refs(",
+    ),
 ];
 
 /// The body of a free function, from its signature to the closing brace

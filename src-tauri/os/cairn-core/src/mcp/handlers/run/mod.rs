@@ -1107,7 +1107,7 @@ fn strand_conflicted_delta(
     head: &str,
     paths: &[String],
 ) -> String {
-    let reference = format!("refs/cairn/stranded/{}", request.attempt_id);
+    let reference = stranded_ref_name(request);
     // This ref is the only thing standing between the agent's sealed work and
     // the next prune, and it contends for the repository's one
     // `packed-refs.lock` like every other ref transaction. Patience is what
@@ -1129,6 +1129,22 @@ fn strand_conflicted_delta(
         );
     }
     straddled_conflict_message(head, &delta.delta_commit, paths)
+}
+
+/// Where a stranded delta is kept: `refs/cairn/stranded/<job>/<attempt>` when the
+/// batch names its job, so the ref-store sweep can retire it once that job's
+/// issue has been resolved for the retention window, and the bare
+/// `refs/cairn/stranded/<attempt>` otherwise, which the sweep never retires.
+fn stranded_ref_name(request: &CellRequest) -> String {
+    let job = request
+        .owner
+        .as_ref()
+        .and_then(|owner| owner.job_id.as_deref())
+        .filter(|job| !job.is_empty() && !job.contains('/'));
+    match job {
+        Some(job) => format!("refs/cairn/stranded/{job}/{}", request.attempt_id),
+        None => format!("refs/cairn/stranded/{}", request.attempt_id),
+    }
 }
 
 /// How an agent sees what its straddled batch changed, so it can put that work

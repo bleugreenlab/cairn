@@ -29,6 +29,7 @@ use std::process::Stdio;
 
 use super::export::export_bookmark_advance;
 use super::merge::StoreBookmarkPushError;
+use super::packed_refs::{with_packed_refs_patience, PackedRefs};
 use super::reconcile::{discover_origin_presence, OriginPresence};
 use super::JjEnv;
 
@@ -39,6 +40,7 @@ use super::JjEnv;
 const INTEGRATION_DESCRIPTION: &str = "cairn: integrate straddled delta onto the moved branch head";
 
 /// The tree a batch proposes for its branch's logical head.
+#[derive(Clone)]
 pub enum ProposedPublication {
     /// A validated delta commit whose tree becomes the published tree.
     DeltaCommit(String),
@@ -92,32 +94,27 @@ pub async fn publish_logical_head_exported(
     let branch = branch.to_string();
     let expected_head = expected_head.to_string();
     tokio::task::spawn_blocking(move || {
-        let landed = match proposed {
-            ProposedPublication::DeltaCommit(delta) => {
-                crate::publish_logical_head(&store, &branch, &expected_head, &delta, identity, mode)
-            }
-            ProposedPublication::Mutations(mutations) => crate::publish_logical_mutations(
-                &store,
-                &branch,
-                &expected_head,
-                mutations,
-                identity,
-                mode,
-            ),
-            ProposedPublication::Revert(commit) => {
-                let crate::PublicationMode::Child { description } = mode else {
-                    return Err("logical revert must publish a child commit".to_string());
-                };
-                crate::publish_logical_revert(
+        // jj-lib protects every commit it writes with a `refs/jj/keep/<id>`
+        // ref whose update gix checks against `packed-refs`, so this in-process
+        // transaction contends for `packed-refs.lock` exactly like the export
+        // leg does, and gix gives up after about a second.
+        //
+        // Repeating it is safe: each attempt reloads the operation head and
+        // re-checks the bookmark against `expected_head`, and an attempt that
+        // fails on the keep ref has committed no operation, so the bookmark
+        // moves at most once. The only residue of a failed attempt is an
+        // unreferenced commit object, which git gc reclaims.
+        let landed =
+            with_packed_refs_patience(PackedRefs::JjStore(&store), "publish logical head", || {
+                land_logical_head(
                     &store,
                     &branch,
                     &expected_head,
-                    &commit,
-                    identity,
-                    description,
+                    proposed.clone(),
+                    identity.clone(),
+                    mode.clone(),
                 )
-            }
-        }?;
+            })?;
         let export = export_bookmark_advance(
             &jj,
             &store,
@@ -129,6 +126,44 @@ pub async fn publish_logical_head_exported(
     })
     .await
     .map_err(|error| format!("logical-head publication worker failed: {error}"))?
+}
+
+/// The first rung: one store transaction that writes the commit and moves the
+/// bookmark.
+fn land_logical_head(
+    store: &Path,
+    branch: &str,
+    expected_head: &str,
+    proposed: ProposedPublication,
+    identity: Option<crate::PublicationIdentity>,
+    mode: crate::PublicationMode,
+) -> Result<crate::LogicalHeadPublication, String> {
+    match proposed {
+        ProposedPublication::DeltaCommit(delta) => {
+            crate::publish_logical_head(store, branch, expected_head, &delta, identity, mode)
+        }
+        ProposedPublication::Mutations(mutations) => crate::publish_logical_mutations(
+            store,
+            branch,
+            expected_head,
+            mutations,
+            identity,
+            mode,
+        ),
+        ProposedPublication::Revert(commit) => {
+            let crate::PublicationMode::Child { description } = mode else {
+                return Err("logical revert must publish a child commit".to_string());
+            };
+            crate::publish_logical_revert(
+                store,
+                branch,
+                expected_head,
+                &commit,
+                identity,
+                description,
+            )
+        }
+    }
 }
 
 /// Push an exported branch bookmark to `origin` — the ladder's third rung.

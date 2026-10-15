@@ -1785,6 +1785,31 @@ impl std::fmt::Debug for TemporaryCheckRef {
     }
 }
 
+/// The `refs/cairn/checks/*` refs a check batch in this process still needs.
+///
+/// A check request's id is minted per batch and never persisted, so the
+/// database cannot say whether a check ref is still in use. This set can: a ref
+/// enters it when its batch publishes it and leaves when the batch retires it
+/// or gives up retiring it. The ref-store sweep retires only refs outside it.
+static HELD_CHECK_REFS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+pub(crate) fn hold_check_ref(reference: &str) {
+    HELD_CHECK_REFS
+        .lock()
+        .unwrap()
+        .insert(reference.to_string());
+}
+
+fn release_check_ref(reference: &str) {
+    HELD_CHECK_REFS.lock().unwrap().remove(reference);
+}
+
+/// Whether a check batch in this process still holds `reference`.
+pub(crate) fn check_ref_is_held(reference: &str) -> bool {
+    HELD_CHECK_REFS.lock().unwrap().contains(reference)
+}
+
 impl TemporaryCheckRef {
     async fn delete_locked(&mut self) -> Result<(), String> {
         git_check_ref_write(
@@ -1794,6 +1819,7 @@ impl TemporaryCheckRef {
         )
         .await?;
         self.armed = false;
+        release_check_ref(&self.reference);
         Ok(())
     }
 }
@@ -1830,7 +1856,10 @@ impl Drop for TemporaryCheckRef {
                 )
                 .await
                 {
-                    Ok(_) => return,
+                    Ok(_) => {
+                        release_check_ref(&reference);
+                        return;
+                    }
                     Err(error) => log::warn!(
                         "temporary check ref cleanup attempt {attempt}/{CLEANUP_ATTEMPTS} failed: \
                          reference={reference}, commit={commit}, error={error}"
@@ -1839,14 +1868,14 @@ impl Drop for TemporaryCheckRef {
                 drop(_guard);
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            // Name the leak and how to clear it. The ref pins its sealed commit
-            // against pruning, so an unremoved one is a growing cost, not a
-            // cosmetic one.
-            log::error!(
-                "sealed check ref {reference} leaked after {CLEANUP_ATTEMPTS} cleanup attempts \
-                 and still pins commit {commit}. Remove it with: git -C {} update-ref -d \
-                 {reference} {commit}",
-                repository.display()
+            // Released rather than leaked: once no batch holds the ref, the
+            // ref-store maintenance sweep (`vcs_maintenance`) retires it on its
+            // next prune of this store.
+            release_check_ref(&reference);
+            log::warn!(
+                "sealed check ref {reference} was not removed after {CLEANUP_ATTEMPTS} cleanup \
+                 attempts and still pins commit {commit}; it is left for the ref-store \
+                 maintenance sweep, which retires check refs no batch holds"
             );
         };
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
@@ -1967,6 +1996,7 @@ where
     // Arm the cleanup obligation immediately after publication. Every later
     // error path either deletes under this held store lock or transfers the
     // obligation to Drop's lock-aware retry task.
+    hold_check_ref(&reference);
     let mut temporary_ref = TemporaryCheckRef {
         orch: orch.clone(),
         repository: repository.to_path_buf(),
@@ -9552,6 +9582,34 @@ fi
             !check_ref_exists(&repo, &reference),
             "the patient deletion must still retire the reference"
         );
+    }
+
+    /// A batch that cannot retire its check ref releases it rather than
+    /// holding it forever, so the ref-store sweep can retire it instead.
+    #[tokio::test]
+    async fn a_check_ref_whose_cleanup_gives_up_is_left_for_the_sweep() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let reference = "refs/cairn/checks/cleanup-gave-up".to_string();
+        hold_check_ref(&reference);
+        assert!(check_ref_is_held(&reference));
+
+        // Not a repository at all, so every cleanup attempt fails.
+        drop(TemporaryCheckRef {
+            orch: orch.clone(),
+            repository: temp.path().join("not-a-repository"),
+            store_dir: temp.path().join("store"),
+            reference: reference.clone(),
+            commit: "0".repeat(40),
+            armed: true,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while check_ref_is_held(&reference) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the exhausted cleanup hands the ref to the sweep");
     }
 
     #[tokio::test]

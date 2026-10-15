@@ -963,6 +963,12 @@ pub(crate) const PROJECT_REMOTE_URL: KeySpec = KeySpec::with_aliases(
     KeyType::Str,
     "attach this git remote as origin",
 );
+pub(crate) const PROJECT_REF_STORE_PRUNE: KeySpec = KeySpec::with_aliases(
+    "refStorePrune",
+    &["ref_store_prune"],
+    KeyType::Bool,
+    "true confirms this machine's ref-store prune (the one-time confirmation a store over the size thresholds needs before its first prune, so only with the operator's say-so); false opts the store out: measured, never pruned",
+);
 
 // --- project settings ---
 pub(crate) const PS_SETUP_COMMANDS: KeySpec =

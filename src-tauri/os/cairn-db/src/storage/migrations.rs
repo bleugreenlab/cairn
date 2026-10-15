@@ -67,6 +67,15 @@ macro_rules! private_thread_compaction_unconfirmed_start_trigger {
     };
 }
 
+/// cairn/4975: the measured size of each project's shared ref store and the
+/// operator's per-store prune choice. A ref store is a file on this machine, so
+/// both are private.
+macro_rules! private_ref_store_maintenance {
+    () => {
+        migration!("0253_ref_store_maintenance")
+    };
+}
+
 /// Immutable ordinary-session launch inputs waiting in runner-local admission.
 macro_rules! private_prepared_ordinary_launches {
     () => {
@@ -1551,6 +1560,7 @@ macro_rules! private_lineage {
             shared_tail_permission_resume_error!(),
             private_thread_compaction_unconfirmed_start_trigger!(),
             shared_tail_terminal_exit_reason!(),
+            private_ref_store_maintenance!(),
         ]
     };
 }
@@ -1823,6 +1833,16 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // Execution offers belong to one runner incarnation, never a team replica.
     (
         "execution_queue",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // A project's ref store is a file on this machine: its measured size, what
+    // each maintenance prune removed, and the operator's prune choice here.
+    (
+        "ref_store_samples",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    (
+        "ref_store_maintenance",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     // ── ProjectScoped: the durable shared collaboration surface ──────────────
@@ -3198,6 +3218,7 @@ mod tests {
                 "permission_resume_error",
                 "thread_compaction_unconfirmed_start_trigger",
                 "terminal_exit_reason",
+                "ref_store_maintenance",
             ]
         );
         assert_eq!(

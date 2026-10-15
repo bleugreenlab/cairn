@@ -836,6 +836,19 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         "\nManage references: `{}`\n\n",
         build_project_references_uri(&canonical_key)
     ));
+    if !repo_path.trim().is_empty() {
+        let overview = crate::vcs_maintenance::ref_store_overview(
+            orch,
+            &project_id,
+            std::path::Path::new(&repo_path),
+        )
+        .await;
+        output.push_str(&render_ref_store(
+            &overview,
+            &canonical_key,
+            chrono::Utc::now().timestamp(),
+        ));
+    }
     // Project terminals section (if any)
     if !terminals.is_empty() {
         output.push_str("## Terminals\n\n");
@@ -873,6 +886,280 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
     output.push('\n');
 
     output
+}
+
+/// The `## Repository ref store` section: how big the project's shared ref
+/// store is on this machine, how fast it is growing, and what maintenance last
+/// did about it. Every state is said in words; a prune never renders as a bare
+/// status code.
+pub(super) fn render_ref_store(
+    overview: &crate::vcs_maintenance::RefStoreOverview,
+    project_key: &str,
+    now: i64,
+) -> String {
+    use crate::vcs_maintenance::{
+        PrunePolicy, KEEP_REF_THRESHOLD, PACKED_BYTES_THRESHOLD, PRUNE_INTERVAL, PRUNE_OVERDUE,
+        RETENTION, TRUNCATION_OVERDUE,
+    };
+    const NAMESPACES: [(&str, &str); 8] = [
+        ("jj/keep", "jj keep refs (`refs/jj/keep`)"),
+        ("heads", "branches (`refs/heads`)"),
+        ("remotes", "remote-tracking branches (`refs/remotes`)"),
+        ("tags", "tags (`refs/tags`)"),
+        ("cairn/checks", "check commits (`refs/cairn/checks`)"),
+        ("cairn/stranded", "stranded deltas (`refs/cairn/stranded`)"),
+        ("cairn/rescued", "rescued cell trees (`refs/cairn/rescued`)"),
+        ("other", "other refs"),
+    ];
+    let ago = |at: i64| crate::clock::format_elapsed((now - at).max(0));
+    let mut out = String::from("## Repository ref store\n\n");
+
+    let mut over_threshold = Vec::new();
+    match &overview.latest {
+        None => out.push_str(
+            "Not measured on this machine yet. The maintenance pass measures every project's \
+             ref store within an hour of the runner starting.\n\n",
+        ),
+        Some(latest) => {
+            out.push_str(&format!(
+                "Measured {} ago: `packed-refs` holds {} refs in {}, and {} more refs are loose \
+                 files.\n\n| Refs | Packed | Loose |\n|---|---|---|\n",
+                ago(latest.at),
+                thousands(latest.packed_entries),
+                human_bytes(latest.packed_bytes as i64),
+                thousands(latest.loose_refs),
+            ));
+            for (namespace, label) in NAMESPACES {
+                let (packed, loose) = latest.namespace(namespace);
+                out.push_str(&format!(
+                    "| {label} | {} | {} |\n",
+                    thousands(packed),
+                    thousands(loose)
+                ));
+            }
+            out.push('\n');
+            let keep = |sample: &crate::vcs_maintenance::RefStoreSample| {
+                let (packed, loose) = sample.namespace("jj/keep");
+                packed + loose
+            };
+            let growth = [
+                ("24 hours", &overview.day_ago),
+                ("7 days", &overview.week_ago),
+            ]
+            .into_iter()
+            .filter_map(|(window, sample)| {
+                sample.as_ref().map(|sample| {
+                    format!(
+                        "{} refs ({} keep refs) than {window} ago",
+                        difference(latest.total_refs(), sample.total_refs()),
+                        difference(keep(latest), keep(sample)),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+            if growth.is_empty() {
+                out.push_str(
+                    "Growth appears here once there are 24 hours of measurements to compare \
+                     against.\n\n",
+                );
+            } else {
+                out.push_str(&format!("Growth: {}.\n\n", growth.join(", and ")));
+            }
+            if latest.ref_locks > 0 {
+                out.push_str(&format!(
+                    "{} leftover ref lock files under `refs/` each block every update of their \
+                     ref; the maintenance sweep skips those refs.\n\n",
+                    thousands(latest.ref_locks)
+                ));
+            }
+            if keep(latest) > KEEP_REF_THRESHOLD {
+                over_threshold.push(format!(
+                    "{} jj keep refs is above the {} threshold",
+                    thousands(keep(latest)),
+                    thousands(KEEP_REF_THRESHOLD)
+                ));
+            }
+            if latest.packed_bytes > PACKED_BYTES_THRESHOLD {
+                over_threshold.push(format!(
+                    "a {} `packed-refs` is above the {} threshold",
+                    human_bytes(latest.packed_bytes as i64),
+                    human_bytes(PACKED_BYTES_THRESHOLD as i64)
+                ));
+            }
+        }
+    }
+
+    let confirm = format!(
+        "`write({{changes:[{{target:\"cairn://p/{project_key}\",mode:\"patch\",\
+         payload:{{refStorePrune:true}}}}]}})`"
+    );
+    if overview.policy == PrunePolicy::OptedOut {
+        out.push_str(&format!(
+            "**This store is opted out of pruning on this machine.** It keeps being measured, \
+             and nothing removes old jj keep refs, operations, or finished Cairn refs. To prune \
+             it again: {confirm}.\n\n"
+        ));
+        if !over_threshold.is_empty() {
+            out.push_str(&format!(
+                "This store needs a prune: {}.\n\n",
+                over_threshold.join(", and ")
+            ));
+        }
+        return out;
+    }
+    if overview.policy == PrunePolicy::Default
+        && overview.last_ok_prune_at.is_none()
+        && !over_threshold.is_empty()
+    {
+        out.push_str(&format!(
+            "**The first prune of this store is waiting for confirmation**: {}. A first prune \
+             of a store this size rewrites a large, long-lived ref store and object database in \
+             one go, so it runs only once the operator has confirmed it, with {confirm}. Until \
+             then the store keeps being measured and is never pruned. A store under both \
+             thresholds is pruned without asking.\n\n",
+            over_threshold.join(", and ")
+        ));
+        return out;
+    }
+
+    match &overview.last_prune {
+        None => out.push_str(
+            "Pruning is on (the default). No prune has run yet; the next hourly pass runs one.\n\n",
+        ),
+        Some(prune) => {
+            let took = crate::clock::format_elapsed(prune.duration_ms / 1000);
+            let attempt = format!("The last prune started {} ago", ago(prune.started_at));
+            let removed = [
+                format!(
+                    "{} jj keep refs",
+                    thousands(prune.removed_keep_refs.unwrap_or(0) as u64)
+                ),
+                format!(
+                    "{} finished Cairn refs",
+                    thousands(prune.removed_cairn_refs.unwrap_or(0) as u64)
+                ),
+                format!(
+                    "{} operations",
+                    thousands(prune.ops_abandoned.unwrap_or(0) as u64)
+                ),
+            ]
+            .join(", ");
+            match prune.outcome.split_once(':') {
+                None if prune.outcome == "ok" => {
+                    let truncated = if prune.truncated {
+                        ", and truncated the operation log"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!(
+                        "{attempt} and succeeded in {took}. It removed {removed}{truncated}.\n\n"
+                    ));
+                }
+                Some(("partial", refusal)) => out.push_str(&format!(
+                    "{attempt} and only partly succeeded, in {took}. It removed {removed}, but it \
+                     could not truncate the operation log, so hidden history is not being \
+                     bounded: {refusal}. Forget or remove those workspaces and the next prune \
+                     truncates.\n\n"
+                )),
+                Some(("skipped", reason)) => out.push_str(&format!(
+                    "{attempt} and was skipped because {}. It retries at the next hourly pass.\n\n",
+                    skip_reason(reason)
+                )),
+                Some(("failed", error)) => out.push_str(&format!(
+                    "{attempt} and failed after {took}: {error}. It retries at the next hourly pass.\n\n"
+                )),
+                _ => out.push_str(&format!(
+                    "{attempt} and recorded an outcome this page does not recognize: `{}`.\n\n",
+                    prune.outcome
+                )),
+            }
+        }
+    }
+
+    match overview.last_ok_prune_at {
+        Some(last) if now - last > PRUNE_OVERDUE.as_secs() as i64 => out.push_str(&format!(
+            "**Pruning is overdue:** the last successful prune was {} ago, more than 48 hours.\n\n",
+            ago(last)
+        )),
+        None if overview.last_prune.is_some() => {
+            out.push_str("**No prune of this store has succeeded yet.**\n\n")
+        }
+        _ => {}
+    }
+    // Ref sweeps can keep succeeding while the operation log, and with it every
+    // hidden head it pins, goes untruncated; that is the larger bound.
+    if overview.last_ok_prune_at.is_some() {
+        match overview.last_truncation_at {
+            None => out.push_str(
+                "**The operation log has never been truncated on this machine**, so its hidden \
+                 history keeps growing until a prune truncates it.\n\n",
+            ),
+            Some(last) if now - last > TRUNCATION_OVERDUE.as_secs() as i64 => {
+                out.push_str(&format!(
+                    "**The operation log was last truncated {} ago**, more than 14 days, so its \
+                     hidden history is growing past the retention window.\n\n",
+                    ago(last)
+                ))
+            }
+            _ => {}
+        }
+    }
+    if !over_threshold.is_empty() {
+        out.push_str(&format!(
+            "A prune is due at the next hourly pass: {}.\n\n",
+            over_threshold.join(", and ")
+        ));
+    } else if let Some(last) = overview.last_ok_prune_at {
+        let due = last + PRUNE_INTERVAL.as_secs() as i64;
+        if due > now {
+            out.push_str(&format!(
+                "The next prune is due in {}.\n\n",
+                crate::clock::format_elapsed(due - now)
+            ));
+        } else {
+            out.push_str("A prune is due at the next hourly pass.\n\n");
+        }
+    }
+    out.push_str(&format!(
+        "Hidden history, operations, and unreferenced objects are kept for {} days; an older \
+         commit that nothing references any more stops resolving.\n\n",
+        RETENTION.as_secs() / 86_400
+    ));
+    out
+}
+
+fn skip_reason(reason: &str) -> String {
+    match reason {
+        "reconcile-in-flight" => "a base-advance reconcile was in flight for this store".into(),
+        "operator-git-busy" => {
+            "the operator's git held `index.lock` or `packed-refs.lock` on the checkout".into()
+        }
+        "store-busy" => "the store lock stayed busy for ten minutes".into(),
+        "awaiting-first-prune-confirmation" => {
+            "its first prune is waiting for the operator's confirmation".into()
+        }
+        other => format!("`{other}`"),
+    }
+}
+
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+fn difference(now: u64, then: u64) -> String {
+    match now.cmp(&then) {
+        std::cmp::Ordering::Greater => format!("{} more", thousands(now - then)),
+        std::cmp::Ordering::Less => format!("{} fewer", thousands(then - now)),
+        std::cmp::Ordering::Equal => "the same number of".to_string(),
+    }
 }
 
 // ============================================================================
@@ -1568,5 +1855,245 @@ mod project_issues_query_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ref_store_render_tests {
+    use super::*;
+    use crate::db::DbState;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use crate::vcs_maintenance::{PrunePolicy, PruneSample, RefStoreOverview, RefStoreSample};
+    use cairn_db::turso::params;
+    use std::sync::Arc;
+
+    const NOW: i64 = 1_800_000_000;
+    const HOUR: i64 = 3600;
+
+    fn sample(at: i64, packed_entries: u64, keep: u64) -> RefStoreSample {
+        RefStoreSample {
+            at,
+            packed_bytes: 14_021_377,
+            packed_entries,
+            loose_refs: 68_189,
+            ref_locks: 5,
+            namespaces: vec![
+                ("jj/keep".into(), keep, 66_386),
+                ("cairn/checks".into(), 1_922, 1_001),
+            ],
+        }
+    }
+
+    #[test]
+    fn an_unmeasured_store_says_when_it_will_be_measured() {
+        let text = render_ref_store(&RefStoreOverview::default(), "CAIRN", NOW);
+        assert!(text.starts_with("## Repository ref store"));
+        assert!(text.contains("Not measured on this machine yet"));
+        assert!(text.contains("Pruning is on (the default)"), "{text}");
+    }
+
+    #[test]
+    fn an_opted_out_store_says_it_is_measured_and_never_pruned() {
+        let overview = RefStoreOverview {
+            policy: PrunePolicy::OptedOut,
+            latest: Some(sample(NOW - 600, 147_863, 143_681)),
+            ..Default::default()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(
+            text.contains("**This store is opted out of pruning on this machine.**"),
+            "{text}"
+        );
+        assert!(text.contains("refStorePrune:true"));
+        assert!(text.contains("This store needs a prune"));
+    }
+
+    #[test]
+    fn a_large_unpruned_store_waits_for_its_first_prune_confirmation() {
+        let overview = RefStoreOverview {
+            latest: Some(sample(NOW - 600, 147_863, 143_681)),
+            day_ago: Some(sample(NOW - 25 * HOUR, 143_722, 139_540)),
+            ..Default::default()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(
+            text.contains("`packed-refs` holds 147,863 refs in 13.4 MB"),
+            "{text}"
+        );
+        assert!(text.contains("| jj keep refs (`refs/jj/keep`) | 143,681 | 66,386 |"));
+        assert!(text.contains("4,141 more refs (4,141 more keep refs) than 24 hours ago"));
+        assert!(text.contains("5 leftover ref lock files"));
+        assert!(text.contains("**The first prune of this store is waiting for confirmation**"));
+        assert!(text.contains("refStorePrune:true"));
+        assert!(text.contains("cairn://p/CAIRN"));
+        assert!(text.contains("above the 50,000 threshold"));
+        assert!(text.contains("keeps being measured and is never pruned"));
+
+        // Once the store has been pruned, growth past a threshold needs nothing.
+        let pruned_before = RefStoreOverview {
+            last_ok_prune_at: Some(NOW - 2 * HOUR),
+            last_truncation_at: Some(NOW - 2 * HOUR),
+            ..overview
+        };
+        let text = render_ref_store(&pruned_before, "CAIRN", NOW);
+        assert!(!text.contains("waiting for confirmation"), "{text}");
+        assert!(text.contains("A prune is due at the next hourly pass"));
+    }
+
+    #[test]
+    fn a_successful_prune_is_said_in_words_with_the_next_due_time() {
+        let overview = RefStoreOverview {
+            latest: Some(RefStoreSample {
+                at: NOW - 60,
+                packed_bytes: 540_779,
+                packed_entries: 5_965,
+                loose_refs: 1_200,
+                ref_locks: 0,
+                namespaces: vec![("jj/keep".into(), 1_783, 900)],
+            }),
+            last_prune: Some(PruneSample {
+                started_at: NOW - 3 * HOUR,
+                outcome: "ok".into(),
+                duration_ms: 12 * 60 * 1000,
+                removed_keep_refs: Some(192_364),
+                removed_cairn_refs: Some(2_950),
+                ops_abandoned: Some(146_083),
+                truncated: true,
+            }),
+            last_ok_prune_at: Some(NOW - 3 * HOUR),
+            last_truncation_at: Some(NOW - 3 * HOUR),
+            ..Default::default()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(text.contains("succeeded in 12m"), "{text}");
+        assert!(text.contains("192,364 jj keep refs, 2,950 finished Cairn refs, 146,083 operations, and truncated the operation log"));
+        assert!(!text.contains("never been truncated"));
+        assert!(text.contains("The next prune is due in 21h"));
+        assert!(text.contains("kept for 30 days"));
+        assert!(!text.contains("overdue"));
+        assert!(!text.contains(" Ok"), "never a bare status code");
+    }
+
+    #[test]
+    fn an_overdue_and_skipping_store_says_why() {
+        let overview = RefStoreOverview {
+            latest: Some(sample(NOW - 60, 147_863, 143_681)),
+            last_prune: Some(PruneSample {
+                started_at: NOW - HOUR,
+                outcome: "skipped:reconcile-in-flight".into(),
+                ..Default::default()
+            }),
+            last_ok_prune_at: Some(NOW - 3 * 24 * HOUR),
+            ..Default::default()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(
+            text.contains("was skipped because a base-advance reconcile was in flight"),
+            "{text}"
+        );
+        assert!(text.contains("**Pruning is overdue:** the last successful prune was 3d ago"));
+        assert!(text.contains("A prune is due at the next hourly pass"));
+    }
+
+    /// A truncation a live workspace refused is partial maintenance, never a
+    /// success: the page names the refusal and the workspaces, and says the
+    /// history is not being bounded even though the ref sweeps keep succeeding.
+    #[test]
+    fn a_refused_truncation_is_partial_and_names_the_workspaces() {
+        let refusal = "operation-log truncation refused: workspaces other than the store's own \
+                       still exist and would be left recording rewritten operation ids: \
+                       agent-job (/home/op/.cairn/worktrees/job); nothing was changed";
+        let overview = RefStoreOverview {
+            latest: Some(sample(NOW - 60, 5_965, 1_783)),
+            last_prune: Some(PruneSample {
+                started_at: NOW - HOUR,
+                outcome: format!("partial:{refusal}"),
+                duration_ms: 90_000,
+                removed_keep_refs: Some(12),
+                removed_cairn_refs: Some(3),
+                ops_abandoned: Some(0),
+                truncated: false,
+            }),
+            last_ok_prune_at: Some(NOW - HOUR),
+            last_truncation_at: None,
+            ..Default::default()
+        };
+        let text = render_ref_store(&overview, "CAIRN", NOW);
+        assert!(text.contains("only partly succeeded"), "{text}");
+        assert!(text.contains("could not truncate the operation log"));
+        assert!(text.contains("agent-job (/home/op/.cairn/worktrees/job)"));
+        assert!(text.contains("**The operation log has never been truncated on this machine**"));
+        assert!(!text.contains("and succeeded in"));
+
+        let stale = RefStoreOverview {
+            last_truncation_at: Some(NOW - 20 * 24 * HOUR),
+            ..overview
+        };
+        let text = render_ref_store(&stale, "CAIRN", NOW);
+        assert!(
+            text.contains("**The operation log was last truncated 20d ago**"),
+            "{text}"
+        );
+    }
+
+    /// The section reaches the project page from what the maintenance pass
+    /// recorded, not from a hand-built overview.
+    #[tokio::test]
+    async fn the_project_page_renders_recorded_samples() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalDb::open(temp.path().join("ref-store-page.db"))
+            .await
+            .unwrap();
+        MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&local)
+            .await
+            .unwrap();
+        let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(Arc::new(local), search)),
+            Arc::new(TestServicesBuilder::new().build()),
+            temp.path().to_path_buf(),
+        )
+        .build();
+        let repo = temp.path().join("repo");
+        let db = &orch.db.local;
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('p-page', 'default', 'Page', 'page', ?1, 1, 1)",
+            params![repo.to_string_lossy().into_owned()],
+        )
+        .await
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let store = crate::jj::project_store_dir(temp.path(), &repo);
+        db.execute(
+            "INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome, packed_bytes,
+                packed_entries, loose_refs, ref_locks, namespaces_json, duration_ms)
+             VALUES ('m', 'p-page', ?1, 'measure', ?2, ?2, 'ok', 2048, 12, 3, 0,
+                     '{\"jj/keep\":{\"packed\":9,\"loose\":2}}', 5)",
+            params![store.to_string_lossy().into_owned(), now - 120],
+        )
+        .await
+        .unwrap();
+        crate::vcs_maintenance::set_prune_confirmed(db, "p-page", &store, true)
+            .await
+            .unwrap();
+        db.execute(
+            "INSERT INTO ref_store_samples
+               (id, project_id, store_path, kind, started_at, finished_at, outcome, duration_ms)
+             VALUES ('p', 'p-page', ?1, 'prune', ?2, ?2, 'failed:git gc: out of disk', 9000)",
+            params![store.to_string_lossy().into_owned(), now - 4 * 24 * 3600],
+        )
+        .await
+        .unwrap();
+
+        let page = read_project(&orch, "page").await;
+        assert!(page.contains("## Repository ref store"), "{page}");
+        assert!(page.contains("`packed-refs` holds 12 refs in 2 KB"));
+        assert!(page.contains("| jj keep refs (`refs/jj/keep`) | 9 | 2 |"));
+        assert!(page.contains("failed after 0m: git gc: out of disk"));
+        assert!(page.contains("**No prune of this store has succeeded yet.**"));
     }
 }

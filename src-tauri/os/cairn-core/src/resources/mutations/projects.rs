@@ -264,8 +264,29 @@ pub(super) async fn apply_project_patch(
         ops.push("attach remote");
     }
 
+    if let Some(value) = first_value(payload, &["refStorePrune", "ref_store_prune"]) {
+        let confirmed = value
+            .as_bool()
+            .ok_or("payload.refStorePrune must be a boolean")?;
+        if repo_path.trim().is_empty() {
+            return Err("this project has no repository on this machine to prune".to_string());
+        }
+        if !dry_run {
+            let store = crate::jj::project_store_dir(&orch.config_dir, Path::new(&repo_path));
+            crate::vcs_maintenance::set_prune_confirmed(&orch.db.local, &id, &store, confirmed)
+                .await?;
+        }
+        ops.push(if confirmed {
+            "confirm ref-store prune"
+        } else {
+            "opt out of ref-store prune"
+        });
+    }
+
     if ops.is_empty() {
-        return Err("payload must set at least one of: name, hidden, remoteUrl".to_string());
+        return Err(
+            "payload must set at least one of: name, hidden, remoteUrl, refStorePrune".to_string(),
+        );
     }
     if !dry_run {
         emit_db_change(orch, "update");

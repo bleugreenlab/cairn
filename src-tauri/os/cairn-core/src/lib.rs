@@ -106,6 +106,7 @@ mod resume_timing;
 mod services;
 mod storage;
 mod team_remote_intents;
+mod vcs_maintenance;
 mod voice;
 mod workspace;
 

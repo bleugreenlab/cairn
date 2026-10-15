@@ -8156,6 +8156,136 @@ async fn three_successive_publications_each_reach_the_backing_branch_ref() {
     }
 }
 
+/// A publication's commit write contends for `packed-refs.lock` too: jj-lib
+/// writes a `refs/jj/keep/<commit>` ref for every commit, and gix checks that
+/// update against `packed-refs`. A routine rewrite by any other writer used to
+/// refuse the whole publication after gix's one-second wait.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_publication_waits_out_a_held_then_released_packed_refs_lock() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping publication packed-refs retry test: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/packed-refs-publication";
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    create_bookmark_at(&jj, &store, branch, &base).unwrap();
+    // gix only consults (and locks) `packed-refs` when the file exists.
+    git(proj.path(), &["pack-refs", "--all"]);
+
+    let lock = proj.path().join(".git").join("packed-refs.lock");
+    std::fs::write(&lock, "held by test\n").unwrap();
+    let release = lock.clone();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        std::fs::remove_file(release).unwrap();
+    });
+
+    let started = std::time::Instant::now();
+    let published = publish_logical_head_exported(
+        &jj,
+        &store,
+        branch,
+        &base,
+        ProposedPublication::Mutations(vec![crate::LogicalTreeMutation {
+            path: "patient.rs".to_string(),
+            content: Some(b"patient\n".to_vec()),
+        }]),
+        None,
+        crate::PublicationMode::Child {
+            description: "published through contention".into(),
+        },
+    )
+    .await
+    .expect("the publication must retry until the ordinary Git lock is released");
+    holder.join().unwrap();
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "the fixture must actually have made the commit write wait"
+    );
+    published.export.expect("the export leg lands too");
+
+    // Exactly one commit landed, directly on the base: the failed attempts
+    // moved nothing.
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(published.landed.head.as_str())
+    );
+    assert_eq!(
+        git_stdout(
+            proj.path(),
+            &["rev-parse", &format!("{}^", published.landed.head)]
+        ),
+        base,
+        "the published commit sits directly on the expected head"
+    );
+}
+
+/// Patience is bounded. A lock a live process keeps holding past the whole
+/// wait is never healed, and the publication reports the contention with
+/// nothing published rather than hanging or landing half a write.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_publication_surfaces_a_lock_held_past_patience_with_nothing_published() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping publication packed-refs exhaustion test: jj not resolvable");
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/packed-refs-exhausted";
+    let base = bookmark_commit(&jj, &store, "main").unwrap();
+    create_bookmark_at(&jj, &store, branch, &base).unwrap();
+    git(proj.path(), &["pack-refs", "--all"]);
+
+    // Held open by this process, so `lsof` proves a live holder and the
+    // healer must decline.
+    let lock = proj.path().join(".git").join("packed-refs.lock");
+    std::fs::write(&lock, "held by a live writer\n").unwrap();
+    let held = std::fs::File::open(&lock).unwrap();
+
+    let result = publish_logical_head_exported(
+        &jj,
+        &store,
+        branch,
+        &base,
+        ProposedPublication::Mutations(vec![crate::LogicalTreeMutation {
+            path: "never.rs".to_string(),
+            content: Some(b"never\n".to_vec()),
+        }]),
+        None,
+        crate::PublicationMode::Child {
+            description: "refused by a live lock".into(),
+        },
+    )
+    .await;
+    drop(held);
+    let error = match result {
+        Ok(_) => panic!("a lock held past patience must refuse the publication"),
+        Err(error) => error,
+    };
+    assert!(
+        crate::jj::packed_refs_lock_error(&error),
+        "the refusal names the contention: {error}"
+    );
+    assert!(lock.exists(), "a live writer's lock is never removed");
+    assert_eq!(
+        bookmark_commit(&jj, &store, branch).as_deref(),
+        Some(base.as_str()),
+        "nothing was published"
+    );
+}
+
 /// An export that cannot be repaired is reported, never swallowed. The
 /// transaction has already committed by then, so the commit is real — but a
 /// caller that reads this as success republishes nothing and tells its agent the

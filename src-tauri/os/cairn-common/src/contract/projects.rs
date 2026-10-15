@@ -169,8 +169,13 @@ pub(crate) const PROJECT_CONTRACT: ResourceContract = ResourceContract {
     mutations: &[MutationSpec {
         mode: ChangeMode::Patch,
         required: &[],
-        optional: &[PROJECT_CREATE_NAME, PROJECT_HIDDEN, PROJECT_REMOTE_URL],
-        label: "patch project (rename / hide / attach remote)",
+        optional: &[
+            PROJECT_CREATE_NAME,
+            PROJECT_HIDDEN,
+            PROJECT_REMOTE_URL,
+            PROJECT_REF_STORE_PRUNE,
+        ],
+        label: "patch project (rename / hide / attach remote / ref-store prune)",
         example:
             "write({changes:[{target:\"cairn://p/PROJECT\",mode:\"patch\",payload:{hidden:true}}]})",
     }],
