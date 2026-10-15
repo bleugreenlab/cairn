@@ -383,6 +383,9 @@ struct ConstantEvidence {
     /// Heading versions the branch authored, ascending; always empty for an
     /// arithmetic constant.
     authored: Vec<u64>,
+    /// Heading versions on the tip and not at the fork that the base supplied
+    /// verbatim, so were not counted; always empty for an arithmetic constant.
+    absorbed: Vec<u64>,
     resolved: crate::orchestrator::contended_identifiers::ConstantResolution,
 }
 
@@ -410,13 +413,20 @@ fn constant_evidence(
     let (fork_text, fork_value) = read(fork)?;
     let (branch_text, branch_value) = read(pre_tip)?;
     let (base_text, base_value) = read(base)?;
-    let (authored, resolved) = match constant.evidence.heading_prefix() {
+    let (authored, absorbed, resolved) = match constant.evidence.heading_prefix() {
         Some(prefix) => {
-            let authored = contended::authored_versions(&branch_text, &fork_text, prefix);
+            let authored =
+                contended::authored_versions(&branch_text, &fork_text, &base_text, prefix);
+            let inherited = contended::heading_versions(&fork_text, prefix);
+            let absorbed = contended::heading_versions(&branch_text, prefix)
+                .into_iter()
+                .filter(|version| !inherited.contains(version) && !authored.contains(version))
+                .collect();
             let resolved = contended::resolve_by_evidence(&authored, base_value);
-            (authored, resolved)
+            (authored, absorbed, resolved)
         }
         None => (
+            Vec::new(),
             Vec::new(),
             contended::resolve_monotonic(fork_value, branch_value, base_value, stored_delta),
         ),
@@ -428,6 +438,7 @@ fn constant_evidence(
         base_text,
         base_value,
         authored,
+        absorbed,
         resolved,
     })
 }
@@ -576,14 +587,20 @@ fn plan_post_rebase_resolution(
                     identifier: constant.constant.to_string(),
                     from: current,
                     to: resolved.target,
+                    absorbed: evidence.absorbed,
                 }
             } else {
                 contended::Movement::Advanced {
                     identifier: constant.constant.to_string(),
                     from: current,
                     to: resolved.target,
+                    base: evidence.base_value,
                     delta: resolved.delta,
                     from_floor: resolved.from_floor,
+                    headings: heading_evidence.then(|| contended::HeadingTally {
+                        authored: evidence.authored.clone(),
+                        absorbed: evidence.absorbed,
+                    }),
                 }
             });
         plan.discharged.push(constant.label.to_string());
@@ -7984,7 +8001,7 @@ mod tests {
 #[cfg(test)]
 mod real_store_collision_tests {
     use super::*;
-    use crate::orchestrator::contended_identifiers::{Movement, Obligation};
+    use crate::orchestrator::contended_identifiers::{HeadingTally, Movement, Obligation};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -8288,15 +8305,28 @@ mod real_store_collision_tests {
         assert_eq!(fork, first_base, "the fork is where the branch sits now");
         assert_ne!(fork, fx.fork, "never the archival fork it was cut from");
         assert_eq!(protocol_value(&fx, &pre_tip), 13);
-        // What the archival fork would have claimed: three paragraphs this
-        // branch never wrote.
+        // What the archival fork would have claimed, with nothing to compare the
+        // tip's paragraphs against: three paragraphs this branch never wrote.
+        let archival = text_at(&fx, &fx.fork, PROTOCOL);
         assert_eq!(
             crate::orchestrator::contended_identifiers::authored_versions(
                 &text_at(&fx, &pre_tip, PROTOCOL),
-                &text_at(&fx, &fx.fork, PROTOCOL),
+                &archival,
+                &archival,
                 "Version ",
             ),
             vec![11, 12, 13]
+        );
+        // Each of those paragraphs is main's verbatim, so even an archival fork
+        // charges the branch with none of them once the base is consulted.
+        assert!(
+            crate::orchestrator::contended_identifiers::authored_versions(
+                &text_at(&fx, &pre_tip, PROTOCOL),
+                &archival,
+                &text_at(&fx, &base, PROTOCOL),
+                "Version ",
+            )
+            .is_empty()
         );
 
         let changes = persist_pre_rebase_obligations(
@@ -8412,6 +8442,7 @@ mod real_store_collision_tests {
                 identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
                 from: 28,
                 to: 10,
+                absorbed: vec![],
             }]
         );
         assert_eq!(plan.discharged, vec![PROTOCOL_LABEL.to_string()]);
@@ -8493,9 +8524,22 @@ mod real_store_collision_tests {
                 identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
                 from: 11,
                 to: 12,
+                base: 11,
                 delta: 1,
                 from_floor: false,
+                headings: Some(HeadingTally {
+                    authored: vec![11],
+                    absorbed: vec![],
+                }),
             }]
+        );
+        assert!(
+            plan.describe().contains(
+                "11 → 12: base 11 + delta 1. Authored by this branch: 11 → 12. Absorbed from \
+                 the base and not counted: none."
+            ),
+            "{}",
+            plan.describe()
         );
         apply_resolution_plan(&fx.jj, &fx.store, branch, &rebased, &plan).unwrap();
 
@@ -8517,6 +8561,156 @@ mod real_store_collision_tests {
             )
             .unwrap()
             .is_none()
+        );
+    }
+
+    /// A branch whose own change sits at the end of the protocol file, and which
+    /// also took main's 11 bump by hand — main's paragraph and constant, byte
+    /// for byte — before main advanced to exactly that commit. `own_heading`
+    /// is the branch's own paragraph, if it changes the protocol.
+    fn branch_that_absorbed_mains_bump(
+        fx: &Fixture,
+        name: &str,
+        own_heading: &str,
+    ) -> (String, String, String) {
+        let branch = format!("agent/{name}");
+        let branch_ws = fx.workspaces.path().join(name);
+        let main_ws = main_line(fx);
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, &branch, "main", None).unwrap();
+        let base = bump_with_heading(fx, &main_ws, 11);
+        let path = branch_ws.join(PROTOCOL);
+        std::fs::write(
+            &path,
+            format!(
+                "{}pub const BRANCH_ONLY: u32 = 1;\n{own_heading}",
+                text_at(fx, &base, PROTOCOL)
+            ),
+        )
+        .unwrap();
+        crate::jj::seal(&fx.jj, &branch_ws, "hand-merge main's bump", None).unwrap();
+        set_main(fx, &base);
+        let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        (branch, pre_tip, base)
+    }
+
+    /// Specimens 4906, 4925, 4931, 4907, 4926 and 4982: a branch that changes no
+    /// protocol, measured from a fork that predates main's bump, after it took
+    /// main's paragraph in. The merge gate accepts it as it stands, and the
+    /// replay leaves it on main's number instead of counting main's bump twice.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_no_bump_branch_that_absorbed_mains_bump_stays_on_mains_value() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let (branch, pre_tip, base) = branch_that_absorbed_mains_bump(&fx, "absorbed", "");
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        assert_eq!(fork, fx.fork, "measured from the stale fork at 10");
+        assert_eq!(protocol_value(&fx, &pre_tip), 11);
+        assert_eq!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, &branch, "main"
+            ),
+            Ok(None),
+            "the gate does not charge the branch with main's paragraph"
+        );
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, &branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fork, &pre_tip).unwrap();
+        assert!(changes.contains(PROTOCOL));
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &fork,
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(plan.is_empty(), "{plan:?}");
+        assert_eq!(protocol_value(&fx, &rebased), 11);
+    }
+
+    /// Specimen 4798: a real +1 branch that took main's paragraph for 11 in
+    /// beside its own paragraph for 11. It carries exactly one version onto
+    /// main's 11 — 12, not 13 — and only its own paragraph is renumbered.
+    #[test]
+    #[serial_test::serial(jj)]
+    fn a_real_bump_that_absorbed_mains_bump_lands_one_above_main() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let fx = fixture(&bin);
+        let (branch, pre_tip, base) = branch_that_absorbed_mains_bump(
+            &fx,
+            "absorbed-real",
+            "/// Version 11 adds the branch's change.\n",
+        );
+        let fork = branch_fork_point(&fx.jj, &fx.store, &pre_tip, &base).unwrap();
+        let refusal = crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+            &fx.jj, &fx.store, &branch, "main",
+        )
+        .unwrap()
+        .expect("the branch's own paragraph still takes main's number");
+        assert!(refusal.contains("the next version is 12"), "{refusal}");
+
+        assert_eq!(
+            crate::jj::rebase_branch_onto(&fx.jj, &fx.store, &branch, "main").unwrap(),
+            crate::jj::RebaseOutcome::Rebased
+        );
+        let rebased = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        let changes = registered_changes(&fx.jj, &fx.store, &fork, &pre_tip).unwrap();
+        let plan = plan_post_rebase_resolution(
+            &fx.jj,
+            &fx.store,
+            &fork,
+            &pre_tip,
+            &base,
+            &rebased,
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            plan.movements,
+            vec![Movement::Advanced {
+                identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
+                from: 11,
+                to: 12,
+                base: 11,
+                delta: 1,
+                from_floor: false,
+                headings: Some(HeadingTally {
+                    authored: vec![11],
+                    absorbed: vec![],
+                }),
+            }]
+        );
+        apply_resolution_plan(&fx.jj, &fx.store, &branch, &rebased, &plan).unwrap();
+
+        let resolved = crate::jj::bookmark_commit(&fx.jj, &fx.store, &branch).unwrap();
+        let text = text_at(&fx, &resolved, PROTOCOL);
+        assert!(
+            text.contains("/// Version 11 adds main's change 11.\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("/// Version 12 adds the branch's change.\n"),
+            "{text}"
+        );
+        assert_eq!(protocol_value(&fx, &resolved), 12);
+        assert_eq!(
+            crate::orchestrator::contended_identifiers::protocol_ledger_refusal(
+                &fx.jj, &fx.store, &branch, "main"
+            ),
+            Ok(None)
         );
     }
 

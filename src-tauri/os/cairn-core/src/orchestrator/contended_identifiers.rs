@@ -319,11 +319,16 @@ pub(crate) enum Movement {
         identifier: String,
         from: u64,
         to: u64,
+        /// The new base's value, which `delta` was carried onto.
+        base: u64,
         delta: u64,
         /// The stored recovery floor supplied the delta because the live tree no
         /// longer could. Worth saying out loud: it means an earlier advance
         /// swallowed this increment.
         from_floor: bool,
+        /// Which version paragraphs `delta` counted, for a heading-evidenced
+        /// constant; `None` for an arithmetic one.
+        headings: Option<HeadingTally>,
     },
     /// A heading-evidenced constant was put back on the base's value because
     /// the branch moved it without writing a version paragraph.
@@ -331,7 +336,32 @@ pub(crate) enum Movement {
         identifier: String,
         from: u64,
         to: u64,
+        /// Versions headed on the tip that the base supplied verbatim.
+        absorbed: Vec<u64>,
     },
+}
+
+/// The version paragraphs a heading-evidenced resolution counted and those it
+/// did not, so the note a builder receives can be checked in one read rather
+/// than re-derived from three revisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeadingTally {
+    /// Versions the branch headed itself, ascending; these are the delta.
+    pub authored: Vec<u64>,
+    /// Versions headed on the tip and not at the fork whose every heading line
+    /// is the base's own, verbatim: content the branch merged in, not wrote.
+    pub absorbed: Vec<u64>,
+}
+
+fn version_list(versions: &[u64]) -> String {
+    if versions.is_empty() {
+        return "none".to_string();
+    }
+    versions
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A complete, verified edit set. Computed whole and applied whole: every target
@@ -372,8 +402,10 @@ impl ResolutionPlan {
                     identifier,
                     from,
                     to,
+                    base,
                     delta,
                     from_floor,
+                    headings,
                 } => {
                     let floor = if *from_floor {
                         " (recovered from a stored obligation: an earlier advance absorbed this \
@@ -381,19 +413,49 @@ impl ResolutionPlan {
                     } else {
                         ""
                     };
-                    format!("- `{identifier}` {from} → {to} (carried a delta of {delta}){floor}")
+                    let tally = match headings {
+                        Some(HeadingTally { authored, absorbed }) => {
+                            // The same order-preserving map `rewrite_constant`
+                            // applies: authored headings land on base + 1 ..= to.
+                            let renumbered = authored
+                                .iter()
+                                .zip(base + 1..)
+                                .map(|(version, landed)| {
+                                    if *version == landed {
+                                        version.to_string()
+                                    } else {
+                                        format!("{version} → {landed}")
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            format!(
+                                ". Authored by this branch: {renumbered}. Absorbed from the base \
+                                 and not counted: {}.",
+                                version_list(absorbed)
+                            )
+                        }
+                        None => String::new(),
+                    };
+                    format!(
+                        "- `{identifier}` {from} → {to}: base {base} + delta {delta}{floor}{tally}"
+                    )
                 }
                 Movement::Reset {
                     identifier,
                     from,
                     to,
+                    absorbed,
                 } => {
                     let next = to + 1;
                     format!(
-                        "- `{identifier}` {from} → {to}: put back on the base's value. This branch \
-                         adds no `/// Version N` paragraph, so the number it carried denotes no \
-                         protocol change. If the branch does change the protocol, it takes {next} \
-                         and needs a `/// Version {next} …` paragraph above the constant."
+                        "- `{identifier}` {from} → {to}: base {to} + delta 0, put back on the \
+                         base's value. Authored by this branch: none. Absorbed from the base and \
+                         not counted: {}. This branch adds no `/// Version N` paragraph of its \
+                         own, so the number it carried denotes no protocol change. If the branch \
+                         does change the protocol, it takes {next} and needs a `/// Version \
+                         {next} …` paragraph above the constant.",
+                        version_list(absorbed)
                     )
                 }
             })
@@ -934,21 +996,52 @@ fn heading_digits(line: &str, prefix: &str) -> Option<(std::ops::Range<usize>, u
     Some((start..start + digits, value))
 }
 
-/// Every version a heading in `text` declares.
-pub(crate) fn heading_versions(text: &str, prefix: &str) -> BTreeSet<u64> {
-    text.lines()
-        .filter_map(|line| heading_digits(line, prefix).map(|(_, version)| version))
-        .collect()
+/// Every heading line in `text`, grouped by the version it declares.
+fn heading_lines<'a>(text: &'a str, prefix: &str) -> BTreeMap<u64, BTreeSet<&'a str>> {
+    let mut lines: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+    for line in text.lines() {
+        if let Some((_, version)) = heading_digits(line, prefix) {
+            lines.entry(version).or_default().insert(line);
+        }
+    }
+    lines
 }
 
-/// The versions the branch itself headed: declared by a heading on the tip and
-/// by no heading at the fork, ascending. Comparing versions rather than lines
-/// means rewording an existing paragraph is not mistaken for a new version.
-pub(crate) fn authored_versions(tip_text: &str, fork_text: &str, prefix: &str) -> Vec<u64> {
+/// Every version a heading in `text` declares.
+pub(crate) fn heading_versions(text: &str, prefix: &str) -> BTreeSet<u64> {
+    heading_lines(text, prefix).into_keys().collect()
+}
+
+/// The versions the branch itself headed, ascending: declared by a heading on
+/// the tip, by no heading at the fork, and not merely copied from the base.
+///
+/// The fork comparison is by number, so rewording an inherited paragraph is not
+/// mistaken for a new version. The base comparison is by line. A tip that took
+/// in the base's paragraph — by a hand merge, a union rebase, or a resolved
+/// conflict — carries it byte for byte, and counting it would add the base's
+/// own bump to the branch's: the inflation that put spurious numbers on branch
+/// after branch. A branch that wrote its own paragraph under the number the base
+/// also took never matches the base's line, so it still counts, and is
+/// renumbered above the base. A version is excluded only when every one of its
+/// tip headings is on the base; a tip carrying the base's paragraph and its own
+/// under one number has authored that number.
+pub(crate) fn authored_versions(
+    tip_text: &str,
+    fork_text: &str,
+    base_text: &str,
+    prefix: &str,
+) -> Vec<u64> {
     let inherited = heading_versions(fork_text, prefix);
-    heading_versions(tip_text, prefix)
-        .difference(&inherited)
-        .copied()
+    let base = heading_lines(base_text, prefix);
+    heading_lines(tip_text, prefix)
+        .into_iter()
+        .filter(|(version, lines)| {
+            !inherited.contains(version)
+                && !base
+                    .get(version)
+                    .is_some_and(|base_lines| lines.is_subset(base_lines))
+        })
+        .map(|(version, _)| version)
         .collect()
 }
 
@@ -957,7 +1050,10 @@ pub(crate) fn authored_versions(tip_text: &str, fork_text: &str, prefix: &str) -
 ///
 /// `branch_text`, `fork_text` and `dest_text` are the constant's file at the
 /// branch tip, at its live merge-base with the destination, and at the
-/// destination tip. The rule, for heading-evidenced constants only:
+/// destination tip. A heading is authored by the rule of [`authored_versions`],
+/// with the destination as the base, so a branch that merged in the
+/// destination's own paragraph is not charged with writing it. The rule, for
+/// heading-evidenced constants only:
 ///
 /// - No authored heading: the branch must not move the constant. It may carry
 ///   the fork's value or the destination's; either merges to the destination's.
@@ -992,7 +1088,7 @@ pub(crate) fn ledger_violation(
     };
     let next = dest + 1;
     let heading = prefix.trim_end();
-    let authored = authored_versions(branch_text, fork_text, prefix);
+    let authored = authored_versions(branch_text, fork_text, dest_text, prefix);
     match authored.as_slice() {
         [] if branch == fork || branch == dest => None,
         [] => Some(format!(
@@ -1608,8 +1704,197 @@ mod tests {
         let fork = "/// Version 116 is main's.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 116;\n";
         let tip = "/// Version 116 is main's, reworded.\n/// Version 117 adds x.\n\
                    pub const EXECUTOR_PROTOCOL_VERSION: u32 = 117;\n";
-        assert_eq!(authored_versions(tip, fork, "Version "), vec![117]);
-        assert!(authored_versions(fork, fork, "Version ").is_empty());
+        assert_eq!(authored_versions(tip, fork, fork, "Version "), vec![117]);
+        assert!(authored_versions(fork, fork, fork, "Version ").is_empty());
+    }
+
+    const MAINS_140: &str = "/// Version 140 is main's.\n";
+    const MAINS_141: &str = "/// Version 141 adds main's change.\n";
+
+    fn protocol_file(headings: &[&str], version: u64) -> String {
+        format!(
+            "{}pub const EXECUTOR_PROTOCOL_VERSION: u32 = {version};\n",
+            headings.concat()
+        )
+    }
+
+    /// Specimens 4906, 4925, 4931, 4907, 4926 and 4982. A branch that changes no
+    /// protocol took main's new paragraph in a hand merge, a union rebase or a
+    /// resolved conflict, while the fork it is measured from predates that
+    /// paragraph. The paragraph is main's, byte for byte, so the branch owes no
+    /// version and stays on main's number.
+    #[test]
+    fn a_paragraph_absorbed_verbatim_from_the_base_is_not_authored() {
+        let fork = protocol_file(&[MAINS_140], 140);
+        let base = protocol_file(&[MAINS_141, MAINS_140], 141);
+        let tip = protocol_file(
+            &[
+                MAINS_141,
+                MAINS_140,
+                "/// This branch owes no bump, argued here.\n",
+            ],
+            141,
+        );
+        let authored = authored_versions(&tip, &fork, &base, "Version ");
+        assert!(authored.is_empty(), "{authored:?}");
+        let resolved = resolve_by_evidence(&authored, 141);
+        assert_eq!((resolved.delta, resolved.target), (0, 141));
+        let rewritten = rewrite_constant(
+            &tip,
+            &[&fork, &base],
+            &MONOTONIC_CONSTANTS[0],
+            &authored,
+            141,
+        )
+        .expect("rewritten");
+        assert_eq!(rewritten, tip, "nothing to move");
+        assert_eq!(
+            ledger_violation(&tip, &fork, &base, &MONOTONIC_CONSTANTS[0]),
+            None,
+            "the merge gate accepts the branch for being correct"
+        );
+    }
+
+    /// Specimen 4798. A real +1 branch that also took main's paragraph for the
+    /// number it had claimed: main's line is excluded, the branch's own is
+    /// counted once and moved above main's.
+    #[test]
+    fn an_authored_paragraph_beside_an_absorbed_one_counts_once() {
+        let fork = protocol_file(&[MAINS_140], 140);
+        let base = protocol_file(&[MAINS_141, MAINS_140], 141);
+        let tip = protocol_file(
+            &[
+                MAINS_141,
+                MAINS_140,
+                "/// Version 141 adds the branch's change.\n",
+            ],
+            141,
+        );
+        let authored = authored_versions(&tip, &fork, &base, "Version ");
+        assert_eq!(authored, vec![141]);
+        let resolved = resolve_by_evidence(&authored, 141);
+        assert_eq!((resolved.delta, resolved.target), (1, 142));
+        let moved = rewrite_constant(
+            &tip,
+            &[&fork, &base],
+            &MONOTONIC_CONSTANTS[0],
+            &authored,
+            resolved.target,
+        )
+        .expect("rewritten");
+        assert_eq!(
+            moved,
+            protocol_file(
+                &[
+                    MAINS_141,
+                    MAINS_140,
+                    "/// Version 142 adds the branch's change.\n"
+                ],
+                142
+            )
+        );
+
+        // The same branch after its builder already renumbered by hand.
+        let renumbered = protocol_file(
+            &[
+                MAINS_141,
+                MAINS_140,
+                "/// Version 142 adds the branch's change.\n",
+            ],
+            142,
+        );
+        let authored = authored_versions(&renumbered, &fork, &base, "Version ");
+        assert_eq!(authored, vec![142]);
+        assert_eq!(resolve_by_evidence(&authored, 141).target, 142);
+        assert_eq!(
+            ledger_violation(&renumbered, &fork, &base, &MONOTONIC_CONSTANTS[0]),
+            None
+        );
+    }
+
+    /// A branch's own paragraph under the number main also took is never
+    /// main's line, so excluding by line rather than by number keeps it.
+    #[test]
+    fn a_same_numbered_paragraph_that_differs_from_the_base_is_authored() {
+        let fork = protocol_file(&[MAINS_140], 140);
+        let base = protocol_file(&[MAINS_141, MAINS_140], 141);
+        let tip = protocol_file(&["/// Version 141 adds mine.\n", MAINS_140], 141);
+        let authored = authored_versions(&tip, &fork, &base, "Version ");
+        assert_eq!(authored, vec![141]);
+        assert_eq!(
+            (
+                resolve_by_evidence(&authored, 141).delta,
+                resolve_by_evidence(&authored, 141).target
+            ),
+            (1, 142)
+        );
+    }
+
+    /// After a rebase the fork is the base, which already carries every
+    /// paragraph main wrote; only the branch's own remain.
+    #[test]
+    fn when_the_fork_is_the_base_only_the_branchs_own_paragraphs_count() {
+        let base = protocol_file(&[MAINS_141, MAINS_140], 141);
+        assert!(authored_versions(&base, &base, &base, "Version ").is_empty());
+        let tip = protocol_file(&["/// Version 142 adds mine.\n", MAINS_141, MAINS_140], 142);
+        assert_eq!(authored_versions(&tip, &base, &base, "Version "), vec![142]);
+    }
+
+    #[test]
+    fn the_replay_note_states_base_delta_and_which_paragraphs_counted() {
+        let plan = ResolutionPlan {
+            edits: vec![],
+            movements: vec![
+                Movement::Advanced {
+                    identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
+                    from: 141,
+                    to: 142,
+                    base: 141,
+                    delta: 1,
+                    from_floor: false,
+                    headings: Some(HeadingTally {
+                        authored: vec![141],
+                        absorbed: vec![],
+                    }),
+                },
+                Movement::Reset {
+                    identifier: "EXECUTOR_PROTOCOL_VERSION".into(),
+                    from: 142,
+                    to: 141,
+                    absorbed: vec![141],
+                },
+                Movement::Advanced {
+                    identifier: "SUBSTRATE_HEALTH_SCHEMA_VERSION".into(),
+                    from: 8,
+                    to: 10,
+                    base: 9,
+                    delta: 1,
+                    from_floor: false,
+                    headings: None,
+                },
+            ],
+            discharged: vec![],
+        };
+        let note = plan.describe();
+        assert!(
+            note.contains(
+                "- `EXECUTOR_PROTOCOL_VERSION` 141 → 142: base 141 + delta 1. Authored by this \
+                 branch: 141 → 142. Absorbed from the base and not counted: none."
+            ),
+            "{note}"
+        );
+        assert!(
+            note.contains(
+                "- `EXECUTOR_PROTOCOL_VERSION` 142 → 141: base 141 + delta 0, put back on the \
+                 base's value. Authored by this branch: none. Absorbed from the base and not \
+                 counted: 141."
+            ),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("\n- `SUBSTRATE_HEALTH_SCHEMA_VERSION` 8 → 10: base 9 + delta 1"),
+            "{note}"
+        );
     }
 
     #[test]
@@ -1618,7 +1903,7 @@ mod tests {
         // main sat at 134, with no paragraph for any of the numbers between.
         let fork = "/// Version 116 is main's.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 116;\n";
         let tip = "/// Version 116 is main's.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 222;\n";
-        let authored = authored_versions(tip, fork, "Version ");
+        let authored = authored_versions(tip, fork, fork, "Version ");
         let resolved = resolve_by_evidence(&authored, 134);
         assert_eq!((resolved.delta, resolved.target), (0, 134));
         let reset = rewrite_constant(tip, &[fork], &MONOTONIC_CONSTANTS[0], &authored, 134)
@@ -1633,7 +1918,7 @@ mod tests {
     fn a_number_only_bump_resolves_to_the_base_value() {
         let fork = "pub const EXECUTOR_PROTOCOL_VERSION: u32 = 134;\n";
         let tip = "pub const EXECUTOR_PROTOCOL_VERSION: u32 = 135;\n";
-        let resolved = resolve_by_evidence(&authored_versions(tip, fork, "Version "), 134);
+        let resolved = resolve_by_evidence(&authored_versions(tip, fork, fork, "Version "), 134);
         assert_eq!((resolved.delta, resolved.target), (0, 134));
         assert!(!resolved.from_floor && !resolved.retracted);
     }
@@ -1645,7 +1930,7 @@ mod tests {
         let base = "/// Version 134 is main's.\npub const EXECUTOR_PROTOCOL_VERSION: u32 = 134;\n";
         let rebased = "/// Version 134 is main's.\n/// Version 117 adds x.\n\
                        pub const EXECUTOR_PROTOCOL_VERSION: u32 = 117;\n";
-        let authored = authored_versions(tip, fork, "Version ");
+        let authored = authored_versions(tip, fork, base, "Version ");
         let resolved = resolve_by_evidence(&authored, 134);
         assert_eq!((resolved.delta, resolved.target), (1, 135));
         let moved = rewrite_constant(
