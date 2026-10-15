@@ -15,6 +15,7 @@ use crate::transcripts::stream_store::{
 use cairn_common::ids;
 use cairn_db::storage::LocalDb;
 use cairn_domain::ContextTokenState;
+use cairn_models::session::events::SessionEvent;
 use cairn_models::types::catalog::{claude_context_window, ClaudeContextOptIn};
 use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use cairn_models::wire::claude_stream::{
@@ -1388,12 +1389,20 @@ impl ClaudeRuntime {
                         }
                     }
 
-                    if event.api_retry_status() == Some(401) {
-                        log::info!(
-                            "Claude run {} was refused with a 401 and is retrying",
-                            &run_id[..run_id.len().min(8)]
-                        );
-                        host.host.credential_rejected();
+                    // The facet's one rule for credential events; the host
+                    // routes both into the credential coordinator.
+                    match cairn_models::session::events::claude::credential_event(&event) {
+                        Some(SessionEvent::CredentialRejected) => {
+                            log::info!(
+                                "Claude run {} was refused with a 401 and is retrying",
+                                &run_id[..run_id.len().min(8)]
+                            );
+                            host.host.credential_rejected();
+                        }
+                        Some(SessionEvent::CredentialAcknowledged { generation }) => {
+                            host.host.credential_acknowledged(generation);
+                        }
+                        _ => {}
                     }
 
                     if !backend_id_confirmed {
@@ -1471,13 +1480,6 @@ impl ClaudeRuntime {
                                     &request_id[..request_id.len().min(8)],
                                     &run_id[..run_id.len().min(8)]
                                 );
-                                if let Some(generation) =
-                                    cairn_models::session::claude::credential_push_generation(
-                                        request_id,
-                                    )
-                                {
-                                    host.host.credential_acknowledged(generation);
-                                }
                             }
                             ControlResponseInner::Error { message } => {
                                 log::warn!(

@@ -478,6 +478,13 @@ pub struct SessionInput<'a> {
     pub parent_tool_use_id: Option<&'a str>,
 }
 
+/// A live session's one writer, shared by everything that talks to it. Empty
+/// once the session can no longer be written to.
+pub type SharedControl = Arc<Mutex<Option<Box<dyn SessionControl>>>>;
+
+/// What a [`SharedControl`] that has been emptied answers.
+pub const NO_SESSION_CONTROL: &str = "Session control not available";
+
 /// The only writer to a live session.
 pub trait SessionControl: Send + Any {
     /// The conversation's first turn. It is its own operation because each

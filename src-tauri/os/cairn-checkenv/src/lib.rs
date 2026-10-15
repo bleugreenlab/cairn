@@ -155,7 +155,10 @@ pub fn toolchain_identity() -> &'static str {
         let host = |program: &str, args: &[&str]| {
             probe(Command::new(program).args(args).env("PATH", &path), program)
         };
-        compose_identity(host("rustc", RUSTC_VERSION_ARGS), host("bun", &["--version"]))
+        compose_identity(
+            host("rustc", RUSTC_VERSION_ARGS),
+            host("bun", &["--version"]),
+        )
     })
 }
 
@@ -267,8 +270,10 @@ mod tests {
         std::fs::create_dir_all(&second).unwrap();
         let path = bin.to_str().unwrap();
 
-        let pinned = toolchain_identity_in(&first, [("PATH", path), ("RUSTUP_TOOLCHAIN", "1.97.1")]);
-        let overridden = toolchain_identity_in(&second, [("PATH", path), ("RUSTUP_TOOLCHAIN", "stable")]);
+        let pinned =
+            toolchain_identity_in(&first, [("PATH", path), ("RUSTUP_TOOLCHAIN", "1.97.1")]);
+        let overridden =
+            toolchain_identity_in(&second, [("PATH", path), ("RUSTUP_TOOLCHAIN", "stable")]);
 
         let first = first.canonicalize().unwrap();
         let second = second.canonicalize().unwrap();

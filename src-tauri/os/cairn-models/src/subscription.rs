@@ -368,14 +368,17 @@ pub fn no_pending_sign_in() -> SignInError {
     SignInError::BadRequest("That sign-in session has expired. Start signing in again.".to_string())
 }
 
-/// Test doubles for hosts that exercise account homes without the private
-/// crate.
+/// Test doubles for hosts that exercise account homes, or keep live Claude
+/// sessions fed, without the private crate.
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testing {
     use super::*;
 
     use std::collections::BTreeMap;
     use std::sync::Mutex;
+
+    use crate::accounts::ProviderAuth;
+    use crate::claude::tokens::{stored_claude_oauth, ClaudeOAuth};
 
     /// Places managed Claude homes anywhere under `root`, and answers
     /// "signed in" from a marker file [`TempHomes::sign_in`] writes.
@@ -409,6 +412,195 @@ pub mod testing {
         provisional: bool,
         project_id: Option<String>,
         started_at: i64,
+    }
+
+    /// Stands in for the refresh authority over managed Claude accounts:
+    /// every renewal publishes the next generation (token `at-<generation>`)
+    /// and announces it through [`ModelHost::credentials_published`], the
+    /// way the real one does. A launch renews first, as one below the launch
+    /// floor does; the accounts in `due` are what a sweep finds close to
+    /// expiry; a 401 on the current generation renews, and one on a
+    /// superseded generation is answered with the current one. Every other
+    /// subscription question gets [`Unsubscribed`]'s answer.
+    #[derive(Debug, Clone, Default)]
+    pub struct RotatingClaude {
+        pub due: Vec<String>,
+    }
+
+    impl RotatingClaude {
+        /// Publish the next generation of `account_id`'s stored credential.
+        pub fn rotate(host: &dyn ModelHost, account_id: &str) -> ClaudeOAuth {
+            let now = chrono::Utc::now().timestamp_millis();
+            let next = host
+                .store()
+                .update(|store| {
+                    let account = store
+                        .accounts
+                        .iter_mut()
+                        .find(|account| account.id == account_id)
+                        .ok_or("no such account")?;
+                    let current = stored_claude_oauth(account).ok_or("not harvested")??;
+                    let generation = current.generation() + 1;
+                    let next = current.rotated(
+                        &format!("at-{generation}"),
+                        None,
+                        now + 8 * 60 * 60 * 1000,
+                        None,
+                        now,
+                    );
+                    account.auth = ProviderAuth::ClaudeProfile {
+                        oauth: Some(next.to_json()),
+                    };
+                    Ok(next)
+                })
+                .expect("rotate a stored Claude credential");
+            host.credentials_published();
+            next
+        }
+
+        fn current(host: &dyn ModelHost, account_id: &str) -> Result<ClaudeOAuth, String> {
+            let store = host.store().durable().ok_or("no store")?;
+            let account = store
+                .accounts
+                .iter()
+                .find(|account| account.id == account_id)
+                .ok_or("no such account")?;
+            stored_claude_oauth(account).ok_or("not harvested")?
+        }
+    }
+
+    impl Subscriptions for RotatingClaude {
+        fn claude_home(&self, host: &dyn ModelHost, account_id: &str) -> Option<PathBuf> {
+            Unsubscribed.claude_home(host, account_id)
+        }
+
+        fn prepare_claude_home(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+        ) -> Result<PathBuf, String> {
+            Unsubscribed.prepare_claude_home(host, account_id)
+        }
+
+        fn claude_home_signed_in(&self, host: &dyn ModelHost, account_id: &str) -> bool {
+            Unsubscribed.claude_home_signed_in(host, account_id)
+        }
+
+        fn release_claude_home(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+        ) -> Result<(), String> {
+            Unsubscribed.release_claude_home(host, account_id)
+        }
+
+        fn claude_session_credential(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+        ) -> Result<ClaudeSessionCredential, String> {
+            Ok(ClaudeSessionCredential::for_push(&Self::rotate(
+                host, account_id,
+            )))
+        }
+
+        fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
+            for account_id in &self.due {
+                Self::rotate(host, account_id);
+            }
+            self.due.clone()
+        }
+
+        fn claude_credential_rejected(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+            generation: u64,
+        ) -> Result<ClaudeSessionCredential, String> {
+            let current = Self::current(host, account_id)?;
+            let current = if current.generation() == generation {
+                Self::rotate(host, account_id)
+            } else {
+                current
+            };
+            Ok(ClaudeSessionCredential::for_push(&current))
+        }
+
+        fn migrate_claude_homes(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.migrate_claude_homes(host)
+        }
+
+        fn probe_usage(
+            &self,
+            host: &dyn ModelHost,
+            provider: RoutedProvider,
+            account_id: Option<&str>,
+        ) -> (ProviderUsageSnapshot, Option<String>) {
+            Unsubscribed.probe_usage(host, provider, account_id)
+        }
+
+        fn credential_generation(
+            &self,
+            host: &dyn ModelHost,
+            provider: RoutedProvider,
+            account_id: &str,
+        ) -> Option<String> {
+            Unsubscribed.credential_generation(host, provider, account_id)
+        }
+
+        fn consume_usage_reset(
+            &self,
+            host: &dyn ModelHost,
+            provider: RoutedProvider,
+            account_id: Option<&str>,
+        ) -> Result<ProviderUsageResetResult, String> {
+            Unsubscribed.consume_usage_reset(host, provider, account_id)
+        }
+
+        fn codex_session_login(
+            &self,
+            host: &dyn ModelHost,
+            auth: &CodexAuthState,
+        ) -> Result<Secret<Value>, String> {
+            Unsubscribed.codex_session_login(host, auth)
+        }
+
+        fn refresh_codex(
+            &self,
+            host: &dyn ModelHost,
+            request: CodexRefreshRequest,
+        ) -> Result<(String, CodexAccountRef), CodexRefreshFailure> {
+            Unsubscribed.refresh_codex(host, request)
+        }
+
+        fn start_sign_in(
+            &self,
+            host: Arc<dyn ModelHost>,
+            request: SignInRequest,
+        ) -> SignInFuture<Result<SignInStart, SignInError>> {
+            Unsubscribed.start_sign_in(host, request)
+        }
+
+        fn sign_in_status(&self, sign_in_ref: &str) -> Result<SignInStatus, SignInError> {
+            Unsubscribed.sign_in_status(sign_in_ref)
+        }
+
+        fn submit_sign_in_code(
+            &self,
+            host: Arc<dyn ModelHost>,
+            sign_in_ref: String,
+            code: String,
+        ) -> SignInFuture<Result<SubmitCodeResult, SignInError>> {
+            Unsubscribed.submit_sign_in_code(host, sign_in_ref, code)
+        }
+
+        fn cancel_sign_in(&self, host: &dyn ModelHost, sign_in_ref: &str) -> bool {
+            Unsubscribed.cancel_sign_in(host, sign_in_ref)
+        }
+
+        fn pending_sign_ins(&self) -> Vec<PendingSignIn> {
+            Unsubscribed.pending_sign_ins()
+        }
     }
 
     /// The stand-in PKCE verifier every scripted sign-in holds.

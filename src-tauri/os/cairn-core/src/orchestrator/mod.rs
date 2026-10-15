@@ -452,6 +452,8 @@ impl OrchestratorBuilder {
         let models_runtime = self.models_runtime.unwrap_or_else(|| {
             models::ModelRuntime::local(self.services.process.clone(), self.process_state.clone())
         });
+        let credential_store =
+            CredentialStoreHandle::new(self.config_dir.clone(), self.credential_store);
         let orchestrator = Orchestrator {
             db: self.db,
             services: self.services,
@@ -479,10 +481,10 @@ impl OrchestratorBuilder {
             attention_changed: self.attention_changed,
             session_allowed_tools: self.session_allowed_tools,
             session_allowed_crossings: self.session_allowed_crossings,
-            credential_store: CredentialStoreHandle::new(
-                self.config_dir.clone(),
-                self.credential_store,
+            claude_feeds: cairn_models::claude::feeds::ClaudeCredentialFeeds::new(
+                credential_store.clone(),
             ),
+            credential_store,
             subscriptions: self.subscriptions,
             models_runtime,
             decision_observations: Arc::default(),
@@ -1146,6 +1148,9 @@ pub struct Orchestrator {
     /// Multi-account identity store. None = anonymous/legacy mode.
     /// Populated from local identity store (desktop) or JWT claims (server).
     credential_store: CredentialStoreHandle,
+    /// Keeps live Claude processes on their account's current credential,
+    /// reading `credential_store`. See `claude_credentials.rs`.
+    claude_feeds: cairn_models::claude::feeds::ClaudeCredentialFeeds,
 
     /// Subscription mechanics, installed by the host. See
     /// [`cairn_models::subscription`].

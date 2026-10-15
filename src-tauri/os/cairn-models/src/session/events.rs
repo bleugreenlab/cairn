@@ -96,6 +96,16 @@ pub enum SessionEvent {
         message: String,
         will_retry: bool,
     },
+    /// The Claude CLI was refused with a 401. Launched with its 401 wait set,
+    /// it holds the request and waits for a different token to be pushed in.
+    /// Hand it to [`crate::claude::feeds::ClaudeCredentialFeeds::observe`],
+    /// which answers it, blocking on a renewal when one is needed.
+    CredentialRejected,
+    /// The Claude CLI confirmed it now holds this generation of its account's
+    /// credential, pushed into it with `SessionControl::update_credential`.
+    CredentialAcknowledged {
+        generation: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,11 +154,32 @@ fn content_text(content: &Value) -> String {
 pub mod claude {
     use super::*;
     use crate::wire::claude_stream::{
-        ContentBlock, DeltaContent, MessageContentInner, StreamEventInner,
+        ContentBlock, ControlResponseInner, DeltaContent, MessageContentInner, StreamEventInner,
     };
+
+    /// The credential event one stream-json event is, if any: a 401 retry
+    /// is a rejection, and a successful `control_response` to a credential
+    /// push is its acknowledgement. The one rule every reader of a live
+    /// Claude session applies.
+    pub fn credential_event(event: &ClaudeEvent) -> Option<SessionEvent> {
+        if event.api_retry_status() == Some(401) {
+            return Some(SessionEvent::CredentialRejected);
+        }
+        match event {
+            ClaudeEvent::ControlResponse {
+                request_id,
+                response: ControlResponseInner::Success { .. },
+            } => crate::session::claude::credential_push_generation(request_id)
+                .map(|generation| SessionEvent::CredentialAcknowledged { generation }),
+            _ => None,
+        }
+    }
 
     /// The events one stream-json event carries.
     pub fn map(event: &ClaudeEvent) -> Vec<SessionEvent> {
+        if let Some(credential) = credential_event(event) {
+            return vec![credential];
+        }
         match event {
             ClaudeEvent::System {
                 subtype,
@@ -836,6 +867,62 @@ mod tests {
             seen,
             ["tool_call", "t1", "tool_call", "t2", "turn_complete"]
         );
+    }
+
+    fn claude_line(line: &str) -> Vec<SessionEvent> {
+        claude::map(&claude_stream::parse_event(line).unwrap().0)
+    }
+
+    #[test]
+    fn a_401_retry_is_a_credential_rejection_and_other_retries_are_not() {
+        let rejected = claude_line(
+            r#"{"type":"system","subtype":"api_retry","attempt":1,"error_status":401,"session_id":"s"}"#,
+        );
+        assert_eq!(tags(&rejected), ["credential_rejected"]);
+        for status in [429, 529] {
+            let line = format!(
+                r#"{{"type":"system","subtype":"api_retry","attempt":1,"error_status":{status},"session_id":"s"}}"#
+            );
+            assert!(claude_line(&line).is_empty(), "{status}");
+        }
+    }
+
+    #[test]
+    fn only_a_successful_answer_to_a_credential_push_is_an_acknowledgement() {
+        let acknowledged = claude_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"cairn-credential-7-6f1c2a9e-0d4b-4e8a-9b7c-1f2e3d4c5b6a"}}"#,
+        );
+        let [SessionEvent::CredentialAcknowledged { generation }] = acknowledged.as_slice() else {
+            panic!("{acknowledged:?}");
+        };
+        assert_eq!(*generation, 7);
+        assert!(claude_line(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"req-1234"}}"#
+        )
+        .is_empty());
+        assert!(claude_line(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"cairn-credential-8-x","error":"refused"}}"#
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn credential_events_round_trip() {
+        for (event, shape) in [
+            (
+                SessionEvent::CredentialRejected,
+                json!({"type": "credential_rejected"}),
+            ),
+            (
+                SessionEvent::CredentialAcknowledged { generation: 3 },
+                json!({"type": "credential_acknowledged", "generation": 3}),
+            ),
+        ] {
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(value, shape);
+            let back: SessionEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(serde_json::to_value(&back).unwrap(), shape);
+        }
     }
 
     #[test]

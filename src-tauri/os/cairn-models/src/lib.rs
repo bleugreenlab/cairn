@@ -17,6 +17,8 @@
 //! and host-dispatched tool calls that every HTTP backend runs.
 //! [`continuation`] decides whether a session resumes natively or is rebuilt,
 //! and renders the digest a rebuilt session is seeded with.
+//! [`claude::feeds`] keeps live Claude sessions on their account's current
+//! credential, for Cairn's runtime and any other host alike.
 //!
 //! Subscription mechanics (CLI sign-in, account-home placement, token refresh,
 //! subscription usage probes) are not public; they live in the private

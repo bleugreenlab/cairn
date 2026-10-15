@@ -877,19 +877,23 @@ impl AgentBackend for ClaudeBackend {
             );
             active_process.model = effective_model.clone();
             active_process.account_id = config.account_id.clone();
+            let fed_account = launched.facts.account_id.clone();
             active_process.facts = Some(launched.facts);
             // Only a process with a live stdin can take a renewed credential;
-            // a one-shot runs out its turn on the one it launched with.
-            active_process.credential_feed =
-                credential_generation
-                    .filter(|_| bidirectional)
-                    .map(|generation| {
-                        Arc::new(
-                            cairn_session::agent_process::process::CredentialFeed::launched_on(
-                                generation,
-                            ),
-                        )
-                    });
+            // a one-shot runs out its turn on the one it launched with. If
+            // registering the process fails, the handle and its registration
+            // drop together.
+            active_process.credential_feed = credential_generation
+                .filter(|_| bidirectional)
+                .zip(fed_account)
+                .map(|(generation, account)| {
+                    orch.claude_feeds().register(
+                        config.run_id.clone(),
+                        account,
+                        generation,
+                        control.clone(),
+                    )
+                });
             orch.process_state
                 .register_process(config.run_id.clone(), active_process)?;
         }

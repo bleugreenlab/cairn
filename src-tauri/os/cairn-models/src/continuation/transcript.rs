@@ -216,6 +216,8 @@ impl TranscriptBuilder {
             | SessionEvent::Started { .. }
             | SessionEvent::ServerRequest { .. }
             | SessionEvent::RateLimit { .. }
+            | SessionEvent::CredentialRejected
+            | SessionEvent::CredentialAcknowledged { .. }
             | SessionEvent::ThinkingDelta { .. } => {}
         }
     }

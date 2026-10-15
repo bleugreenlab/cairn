@@ -19,18 +19,16 @@ use nix::sys::signal::{kill, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub use cairn_models::interface::session::{SessionControl, SessionFacts};
+use cairn_models::claude::feeds::FeedRegistration;
+pub use cairn_models::interface::session::{SessionControl, SessionFacts, NO_SESSION_CONTROL};
 
 /// A live session's one writer, shared by everything that talks to it. Empty
 /// once the session can no longer be written to.
-pub type ControlHandle = Arc<Mutex<Option<Box<dyn SessionControl>>>>;
-
-/// What [`GoalControl::with_control`] answers when the session has no writer.
-pub const NO_SESSION_CONTROL: &str = "Session control not available";
+pub type ControlHandle = cairn_models::interface::session::SharedControl;
 
 // ============================================================================
 // Two-axis state model
@@ -315,81 +313,6 @@ impl GoalControl {
     }
 }
 
-/// Which rotation of its account's credential a live process holds.
-///
-/// A process launched on a managed subscription runs on an access token that
-/// Cairn rotates underneath it; each rotation is pushed in over the session's
-/// control. `pushed` is the newest generation sent, `acknowledged` the newest
-/// the process confirmed, and a process is behind while either trails the
-/// store's current generation.
-#[derive(Debug)]
-pub struct CredentialFeed {
-    pushed: AtomicU64,
-    acknowledged: AtomicU64,
-}
-
-impl CredentialFeed {
-    /// A process launched on `generation`.
-    pub fn launched_on(generation: u64) -> Self {
-        Self {
-            pushed: AtomicU64::new(generation),
-            acknowledged: AtomicU64::new(generation),
-        }
-    }
-
-    pub fn pushed(&self) -> u64 {
-        self.pushed.load(Ordering::Acquire)
-    }
-
-    pub fn acknowledged(&self) -> u64 {
-        self.acknowledged.load(Ordering::Acquire)
-    }
-
-    pub fn record_push(&self, generation: u64) {
-        self.pushed.fetch_max(generation, Ordering::AcqRel);
-    }
-
-    pub fn record_ack(&self, generation: u64) {
-        self.acknowledged.fetch_max(generation, Ordering::AcqRel);
-        self.record_push(generation);
-    }
-}
-
-/// One live process fed an account's credential, and how to reach it.
-pub struct FedProcess {
-    pub run_id: String,
-    pub account_id: String,
-    pub feed: Arc<CredentialFeed>,
-    control: ControlHandle,
-}
-
-impl FedProcess {
-    /// Hand the process `generation` of its credential, unless it has already
-    /// been pushed that generation or a newer one. Answers whether anything was
-    /// sent.
-    ///
-    /// The check, the send and the record all happen under the session's
-    /// control lock, so concurrent reconcilers (a sweep, a publish, a 401)
-    /// push each generation to a process once, and a send that failed claims
-    /// nothing.
-    pub fn push(
-        &self,
-        env: &cairn_models::interface::session::SecretEnv,
-        generation: u64,
-    ) -> Result<bool, String> {
-        let mut control = self.control.lock().map_err(|e| e.to_string())?;
-        if self.feed.pushed() >= generation {
-            return Ok(false);
-        }
-        let control = control
-            .as_mut()
-            .ok_or_else(|| NO_SESSION_CONTROL.to_string())?;
-        control.update_credential(env, generation)?;
-        self.feed.record_push(generation);
-        Ok(true)
-    }
-}
-
 /// A live process attachment with the control that writes to its session.
 pub struct RunHandle {
     /// The child process handle
@@ -422,8 +345,10 @@ pub struct RunHandle {
     /// at launch. Warm reuse compares this with the durable session pin.
     pub account_id: Option<String>,
     /// Set for a process that runs on a rotating subscription credential and
-    /// can take a renewed one live; `None` for everything else.
-    pub credential_feed: Option<Arc<CredentialFeed>>,
+    /// can take a renewed one live; `None` for everything else. Its place in
+    /// the credential coordinator, held for as long as this handle is in the
+    /// registry: dropping the handle deregisters the process.
+    pub credential_feed: Option<FeedRegistration>,
     /// Set when a turn-ending artifact/tool should trigger a boundary interrupt.
     pub terminal_tool_called: Arc<AtomicBool>,
     /// cairn:// resources this run has read.
@@ -1353,42 +1278,6 @@ impl AgentProcessState {
         let process = processes.get(run_id)?;
         let mut slot = process.pending_suspend.lock().ok()?;
         slot.take()
-    }
-
-    /// Every live process fed a rotating credential, optionally only those on
-    /// `account_id`.
-    pub fn fed_processes(&self, account_id: Option<&str>) -> Vec<FedProcess> {
-        let Ok(processes) = self.processes.lock() else {
-            return Vec::new();
-        };
-        processes
-            .iter()
-            .filter_map(|(run_id, process)| {
-                let feed = process.credential_feed.clone()?;
-                let account = process.facts.as_ref()?.account_id.clone()?;
-                if account_id.is_some_and(|wanted| wanted != account) {
-                    return None;
-                }
-                Some(FedProcess {
-                    run_id: run_id.clone(),
-                    account_id: account,
-                    feed,
-                    control: process.control.clone(),
-                })
-            })
-            .collect()
-    }
-
-    /// The one process `run_id`, if it is fed a rotating credential.
-    pub fn fed_process(&self, run_id: &str) -> Option<FedProcess> {
-        let processes = self.processes.lock().ok()?;
-        let process = processes.get(run_id)?;
-        Some(FedProcess {
-            run_id: run_id.to_string(),
-            account_id: process.facts.as_ref()?.account_id.clone()?,
-            feed: process.credential_feed.clone()?,
-            control: process.control.clone(),
-        })
     }
 
     /// Find any process (active or warm) by session_id.
