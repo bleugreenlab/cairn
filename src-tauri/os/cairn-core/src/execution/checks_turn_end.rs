@@ -1092,41 +1092,34 @@ async fn run_turn_end_checks_inner(
             .await,
         )
         .collect();
+    // Asked of the fleet out here for the same reason the scopes are.
+    let cache_unplaceable: std::collections::HashSet<String> = plans
+        .iter()
+        .filter(|plan| {
+            let check = cache_checks.get(&plan.name);
+            orch.fleet
+                .unplaceable_reason(
+                    check.and_then(|check| check.executor.as_ref()),
+                    &check
+                        .map(crate::execution::check_identity::verdict_platforms)
+                        .unwrap_or_default(),
+                )
+                .is_some()
+        })
+        .map(|plan| plan.name.clone())
+        .collect();
     let cache_filtered = tokio::task::spawn_blocking(move || {
-        let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
-        let mut suppressed: Vec<String> = Vec::new();
-        for plan in plans {
-            let input_hash = cache_input_hashes
-                .get(&plan.name)
-                .expect("every configured check is keyed at the sealed tree")
-                .clone();
-            // Turn-end checks are fleet-backed. Placement has not happened yet,
-            // so a coordinator-local observation cannot prove the environment of
-            // the executor that will be selected. Preserve infrastructure
-            // suppression, but fail safe by sending every otherwise runnable plan
-            // to fleet admission until selection supplies trusted identity.
-            match crate::execution::cache::get_suppressed_check_result(
-                cache_db.clone(),
-                &cache_project_id,
-                &plan.name,
-                &input_hash,
-                &cache_infra_scopes[&plan.name],
-            ) {
-                Ok(Some(bounded)) => {
-                    crate::execution::checks::record_suppressed_check(
-                        &cache_db,
-                        &cache_tree_hash,
-                        &cache_job_id,
-                        &cache_commit,
-                        &plan.name,
-                        &bounded,
-                    );
-                    suppressed.push(plan.name.clone());
-                }
-                _ => to_run.push((plan, input_hash)),
-            }
-        }
-        (to_run, suppressed)
+        hold_back_suppressed(
+            &cache_db,
+            &cache_project_id,
+            &cache_tree_hash,
+            &cache_job_id,
+            &cache_commit,
+            plans,
+            &cache_input_hashes,
+            &cache_infra_scopes,
+            &cache_unplaceable,
+        )
     })
     .await
     .map_err(|error| format!("turn-end cache planning task failed: {error}"))?;
@@ -1573,6 +1566,64 @@ fn normalized_salient(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+/// The loop-break gate: split a wave's plans into the ones that go on to
+/// submission and the names infrastructure suppression holds back, re-stamping
+/// each held-back lane onto this head.
+///
+/// A lane in `unplaceable` always goes on, whatever its counters say. A bound
+/// describes failures that happened while some machine could take the lane; once
+/// none can, re-stamping that suppression would report a repair that can no
+/// longer happen, and would keep an infrastructure row current for the dormant
+/// re-arm to keep nominating. Submission refuses it as not placeable instead.
+/// The bounded rows themselves are left exactly as they are: they are still the
+/// record of what happened, and still bound the lane if a machine returns.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hold_back_suppressed(
+    db: &std::sync::Arc<LocalDb>,
+    project_id: &str,
+    tree_hash: &str,
+    job_id: &str,
+    commit: &str,
+    plans: Vec<CheckPlan>,
+    input_hashes: &std::collections::HashMap<String, String>,
+    infra_scopes: &std::collections::HashMap<String, crate::execution::cache::InfraScopes>,
+    unplaceable: &std::collections::HashSet<String>,
+) -> (Vec<(CheckPlan, String)>, Vec<String>) {
+    let mut to_run: Vec<(CheckPlan, String)> = Vec::new();
+    let mut suppressed: Vec<String> = Vec::new();
+    for plan in plans {
+        let input_hash = input_hashes
+            .get(&plan.name)
+            .expect("every configured check is keyed at the sealed tree")
+            .clone();
+        if unplaceable.contains(&plan.name) {
+            to_run.push((plan, input_hash));
+            continue;
+        }
+        // Turn-end checks are fleet-backed. Placement has not happened yet,
+        // so a coordinator-local observation cannot prove the environment of
+        // the executor that will be selected. Preserve infrastructure
+        // suppression, but fail safe by sending every otherwise runnable plan
+        // to fleet admission until selection supplies trusted identity.
+        match crate::execution::cache::get_suppressed_check_result(
+            db.clone(),
+            project_id,
+            &plan.name,
+            &input_hash,
+            &infra_scopes[&plan.name],
+        ) {
+            Ok(Some(bounded)) => {
+                crate::execution::checks::record_suppressed_check(
+                    db, tree_hash, job_id, commit, &plan.name, &bounded,
+                );
+                suppressed.push(plan.name.clone());
+            }
+            _ => to_run.push((plan, input_hash)),
+        }
+    }
+    (to_run, suppressed)
+}
+
 /// The wake identity of a settled wave: its sealed tree plus the actionable
 /// verdict of every lane that produced one, `pass` or `fail`.
 ///
@@ -1641,6 +1692,7 @@ fn reports_fresh_infrastructure(outcomes: &[CheckOutcome]) -> bool {
     outcomes.iter().any(|outcome| {
         !outcome.passed
             && outcome.suppressed_after.is_none()
+            && outcome.failure_kind != Some(CheckFailureKind::NotPlaceable)
             && outcome
                 .failure_kind
                 .is_some_and(CheckFailureKind::is_infrastructure)

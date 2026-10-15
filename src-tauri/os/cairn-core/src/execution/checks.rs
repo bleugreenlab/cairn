@@ -764,7 +764,7 @@ impl CheckStatusBoard {
             .lock()
             .unwrap()
             .iter()
-            .all(|entry| entry.state == "passed" || entry.state == "failed")
+            .all(|entry| matches!(entry.state.as_str(), "passed" | "failed" | "unverified"))
         {
             *self.phase.lock().unwrap() = CheckPhaseStatus::default();
         }
@@ -2288,6 +2288,7 @@ pub(crate) async fn execute_job_verdict(
             // refusal carries the rows it was taken on, so this names the real
             // diagnostic instead of pointing at an operator-only log.
             CheckExecutionFailure::Suppressed(suppressed) => suppressed_check_message(&suppressed),
+            CheckExecutionFailure::NotPlaceable(reason) => reason,
         })?;
     Ok(JobVerdictResult {
         coordinate,
@@ -2459,6 +2460,31 @@ pub(crate) fn reserve_batch_items(
     (admitted, refused)
 }
 
+/// Remove every item no machine the fleet knows of could ever take, returning
+/// each one's refusal by index.
+///
+/// Runs ahead of [`reserve_batch_items`] on purpose: nothing will be attempted,
+/// so no retry may be reserved and no counter may move, and offering the item to
+/// placement would only buy a refusal that is already known. The question is
+/// re-asked on every submission, so the first one after a satisfying machine
+/// attaches (or enrolls) runs the lane.
+pub(crate) fn refuse_unplaceable_items(
+    fleet: &crate::fleet::Fleet,
+    items: &mut Vec<PlannedCheckBatchItem>,
+) -> HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>> {
+    let mut refused = HashMap::new();
+    items.retain(|item| {
+        match fleet.unplaceable_reason(item.executor.as_ref(), &item.verdict_platforms) {
+            Some(reason) => {
+                refused.insert(item.index, Err(CheckExecutionFailure::NotPlaceable(reason)));
+                false
+            }
+            None => true,
+        }
+    });
+    refused
+}
+
 /// Pause before re-presenting a request whose selected executor disappeared or
 /// otherwise returned a capacity-shaped outcome instead of keeping its queue entry.
 const CAPACITY_RETRY_BACKOFF_MS: u64 = 2_000;
@@ -2559,11 +2585,13 @@ async fn submit_planned_check_batch_with_topology(
     mut batch: PlannedCheckBatchRequest,
     topology: CheckBatchTopology,
 ) -> Result<PlannedCheckBatchOutcome, String> {
-    let (admitted, refused) = reserve_batch_items(
+    let unplaceable = refuse_unplaceable_items(&orch.fleet, &mut batch.items);
+    let (admitted, mut refused) = reserve_batch_items(
         orch.db.local.clone(),
         &batch.project_id,
         std::mem::take(&mut batch.items),
     );
+    refused.extend(unplaceable);
     batch.items = admitted;
     // Nothing survived the reservation: launch no command and request no cell, so
     // a fully suppressed suite costs no build-slot admission whatsoever.
@@ -3578,6 +3606,12 @@ pub(crate) enum CheckExecutionFailure {
     /// evidence the refusal was taken on travels with it, so every surface that
     /// renders the refusal names the real diagnostic.
     Suppressed(Box<SuppressedCheck>),
+    /// Submission declined to offer this command to placement at all: no machine
+    /// the fleet knows of, attached or enrolled, could ever take it. Like a
+    /// suppression, nothing ran and no retry budget was spent; unlike one, no
+    /// failure preceded it. The sentence names what was asked for and what the
+    /// fleet has instead.
+    NotPlaceable(String),
 }
 
 impl CheckExecutionFailure {
@@ -3719,6 +3753,11 @@ pub enum CheckFailureKind {
     Capacity,
     /// A recognized test runner exited abnormally without assertion failures.
     RunnerError,
+    /// No machine the fleet knows of, attached or enrolled, satisfies the
+    /// check's platform or toolchains, so it was never offered to placement.
+    /// Nothing ran: this is the absence of a verdict until such a machine
+    /// attaches, not a failure of anything.
+    NotPlaceable,
 }
 
 impl CheckFailureKind {
@@ -3737,6 +3776,7 @@ impl CheckFailureKind {
                 | CheckFailureKind::Infrastructure
                 | CheckFailureKind::Capacity
                 | CheckFailureKind::RunnerError
+                | CheckFailureKind::NotPlaceable
         )
     }
 
@@ -3751,6 +3791,7 @@ impl CheckFailureKind {
             CheckFailureKind::Selection => "selection",
             CheckFailureKind::Capacity => "capacity",
             CheckFailureKind::RunnerError => "runner_error",
+            CheckFailureKind::NotPlaceable => "not_placeable",
         }
     }
 
@@ -3768,6 +3809,7 @@ impl CheckFailureKind {
             "selection" => Some(CheckFailureKind::Selection),
             "capacity" => Some(CheckFailureKind::Capacity),
             "runner_error" => Some(CheckFailureKind::RunnerError),
+            "not_placeable" => Some(CheckFailureKind::NotPlaceable),
             _ => None,
         }
     }
@@ -3791,6 +3833,9 @@ impl CheckFailureKind {
             CheckFailureKind::Selection => "test selection matched no tests".to_string(),
             CheckFailureKind::Capacity => "executor capacity unavailable".to_string(),
             CheckFailureKind::RunnerError => "test runner failed".to_string(),
+            CheckFailureKind::NotPlaceable => {
+                "not placeable — no machine in the fleet can run it".to_string()
+            }
         }
     }
 }
@@ -6659,6 +6704,18 @@ where
                         board.transition(index, "failed", summary_annotation(&outcome));
                         return (index, outcome);
                     }
+                    // Never offered to placement: the same absence of a run, with
+                    // the fleet's own words for why.
+                    Err(CheckExecutionFailure::NotPlaceable(reason)) => {
+                        let outcome = record_unplaceable_check(
+                            db, project_id, commit, tree_hash, job_id, &plan.name, input_hash,
+                            &reason,
+                        );
+                        // Terminal, but no verdict: the live board must not draw
+                        // it as a red.
+                        board.transition(index, "unverified", summary_annotation(&outcome));
+                        return (index, outcome);
+                    }
                     other => other,
                 };
 
@@ -6706,8 +6763,11 @@ where
                         None,
                         None,
                     ),
-                    Err(CheckExecutionFailure::Suppressed(_)) => {
-                        unreachable!("a refused reservation returns above")
+                    Err(
+                        CheckExecutionFailure::Suppressed(_)
+                        | CheckExecutionFailure::NotPlaceable(_),
+                    ) => {
+                        unreachable!("a refused submission returns above")
                     }
                 };
                 let duration_ms = authoritative_duration_ms
@@ -7224,6 +7284,76 @@ pub(crate) fn record_suppressed_check(
     }
 }
 
+/// Record a lane submission never offered to placement because no machine the
+/// fleet knows of could take it.
+///
+/// One row per head, written under the head scope so it renders on this commit
+/// alone and is replaced in place by every later wave on the same commit rather
+/// than accumulating. No observation is recorded, because nothing was evaluated,
+/// and no streak moves (see [`crate::execution::cache::CheckResultCacheWrite::infra_streak_op`]):
+/// the lane is not failing, it is waiting for a machine.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_unplaceable_check(
+    db: &Arc<LocalDb>,
+    project_id: &str,
+    commit: CheckRunCommit<'_>,
+    tree_hash: &str,
+    job_id: &str,
+    check_name: &str,
+    input_hash: &str,
+    reason: &str,
+) -> CheckOutcome {
+    let output_tail = format!(
+        "{reason} Not attempted: it runs on the first wave after a machine that satisfies it attaches."
+    );
+    if let Err(error) = store_check_result(
+        db.clone(),
+        CheckResultCacheWrite {
+            project_id: project_id.to_string(),
+            tree_hash: tree_hash.to_string(),
+            input_hash: input_hash.to_string(),
+            check_name: check_name.to_string(),
+            exit_code: -1,
+            passed: false,
+            output_tail: output_tail.clone(),
+            duration_ms: 0,
+            target_results_json: None,
+            job_id: Some(job_id.to_string()),
+            cached: Some(false),
+            failure_kind: Some(CheckFailureKind::NotPlaceable.as_str().to_string()),
+            executor_id: None,
+            executor_device_id: None,
+            executor_connection_generation: None,
+            executor_cell_id: None,
+            executor_lease_epoch: None,
+            executor_started_at_unix_ms: None,
+            executor_finished_at_unix_ms: None,
+            toolchain_fingerprint: None,
+            defined_by_commit_sha: Some(commit.defined_by.to_string()),
+            environment_fingerprint: infra_suppression_scope(job_id, commit.evaluated),
+            verdict_platform: None,
+            verdict_arch: None,
+            verdict_environment_hash: None,
+        },
+    ) {
+        log::warn!("check {check_name:?}: could not record that it is not placeable: {error}");
+    }
+    log::info!("check {check_name:?} is not placeable for job {job_id}; not offered to placement");
+    CheckOutcome {
+        name: check_name.to_string(),
+        passed: false,
+        exit_code: None,
+        failure_kind: Some(CheckFailureKind::NotPlaceable),
+        parsed: None,
+        output_tail,
+        cached: false,
+        duration_ms: 0,
+        suppressed_after: None,
+        recorded: None,
+        not_recorded: None,
+    }
+}
+
 /// Render the inline pass/fail summary appended to the originating tool result.
 /// The first line is the compact per-check status
 /// (`\u{2713} frontend \u{b7} \u{2717} typecheck (exit 1)`); each failing check
@@ -7234,7 +7364,10 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
     let header = results
         .iter()
         .map(|o| {
-            let mark = if !o.passed {
+            let mark = if o.failure_kind == Some(CheckFailureKind::NotPlaceable) {
+                // Nothing ran, so there is no red to mark.
+                '\u{26a0}'
+            } else if !o.passed {
                 '\u{2717}'
             } else if o.parsed.as_ref().is_some_and(|p| p.is_incomplete_lint()) {
                 // An exit zero that measured nothing is not a green.
@@ -7251,7 +7384,10 @@ pub(crate) fn format_check_summary(results: &[CheckOutcome]) -> String {
         .join(" \u{b7} ");
 
     let mut out = header;
-    for o in results.iter().filter(|o| !o.passed) {
+    for o in results
+        .iter()
+        .filter(|o| !o.passed && o.failure_kind != Some(CheckFailureKind::NotPlaceable))
+    {
         if let Some(detail) = format_check_detail(o) {
             out.push_str("\n\n");
             out.push_str(&detail);
@@ -14426,6 +14562,289 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         .expect("the retry observation supersedes future lookup");
         assert_eq!(reused.source_observation_id, retry_observation.id);
         assert_eq!(reused.entry.output_tail, "fresh execution");
+    }
+
+    async fn count_rows(db: &LocalDb, sql: &'static str) -> i64 {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn.query(sql, ()).await?;
+                let row = rows.next().await?.expect("a count returns one row");
+                row.i64(0)
+            })
+        })
+        .await
+        .unwrap()
+    }
+
+    /// cairn/4982. A review lane whose platform no machine the fleet knows of
+    /// runs (the specimen: `executor-windows-check` with no Windows machine
+    /// enrolled) was offered to placement every wave, refused, and recorded as
+    /// a fresh infrastructure failure: 36 observations on two commits in three
+    /// hours. Through the real submission gate and the real engine, many waves
+    /// on one commit now attempt nothing and leave one row for that commit, no
+    /// observation, and no streak; a new commit gets its own one row; and once a
+    /// machine on the platform enrolls, the next wave runs the lane.
+    #[tokio::test]
+    async fn a_lane_no_known_machine_can_take_is_recorded_once_per_commit_until_one_enrolls() {
+        let db = cache_db().await;
+        let fleet = crate::fleet::Fleet::default();
+        // A platform the runner's own executor cannot provide, so the only way
+        // to satisfy it is a machine enrolling.
+        let platform = if std::env::consts::OS == "windows" {
+            "linux"
+        } else {
+            "windows"
+        };
+        let mut lane = plan("executor-windows-check", "cargo check --locked");
+        lane.verdict_platforms = vec![platform.to_string()];
+        let plans = vec![(lane.clone(), "ih-windows".to_string())];
+        let mut item = batch_item(&lane.command, CheckResourceClass::Shared);
+        item.name = lane.name.clone();
+        item.executor = Some(ExecutorSelector {
+            required_toolchains: vec!["rust".into()],
+            ..ExecutorSelector::default()
+        });
+        item.verdict_platforms = lane.verdict_platforms.clone();
+        let executions = Arc::new(AtomicUsize::new(0));
+
+        let snapshots: Arc<std::sync::Mutex<Vec<Vec<CheckStatusEntry>>>> = Arc::default();
+        let wave = |commit: &'static str| {
+            let db = db.clone();
+            let fleet = &fleet;
+            let item = item.clone();
+            let plans = plans.clone();
+            let executions = executions.clone();
+            let snapshots = snapshots.clone();
+            async move {
+                let commit = CheckRunCommit {
+                    evaluated: commit,
+                    defined_by: commit,
+                };
+                let coordinates = sealed_coordinates(commit, "tree-target", &plans);
+                run_planned_checks_with_board(
+                    db,
+                    "project-a",
+                    commit,
+                    "tree-target",
+                    "job-a",
+                    &plans,
+                    &coordinates,
+                    &head_infra_scopes(plans.len(), "job-a", commit.evaluated),
+                    "turn-checks:job-a",
+                    CheckExecMode::Shared,
+                    None,
+                    None,
+                    &[],
+                    false,
+                    move |_index, _command, _stream_id| {
+                        let mut items = vec![item.clone()];
+                        let refusal = refuse_unplaceable_items(fleet, &mut items).remove(&0);
+                        let executions = executions.clone();
+                        async move {
+                            match refusal {
+                                Some(refused) => refused,
+                                None => {
+                                    executions.fetch_add(1, Ordering::SeqCst);
+                                    exec_ok(Some(0), "checked").map_err(Into::into)
+                                }
+                            }
+                        }
+                    },
+                    move |checks| snapshots.lock().unwrap().push(checks),
+                )
+                .await
+                .remove(0)
+            }
+        };
+        const ROWS: &str =
+            "SELECT COUNT(*) FROM check_result_cache WHERE check_name = 'executor-windows-check'";
+        const OBSERVATIONS: &str = "SELECT COUNT(*) FROM check_result_observations \
+             WHERE check_name = 'executor-windows-check'";
+        const STREAKS: &str =
+            "SELECT COALESCE(SUM(infra_failure_streak), 0) FROM check_result_cache \
+             WHERE check_name = 'executor-windows-check'";
+
+        for _ in 0..12 {
+            let outcome = wave("commit-a").await;
+            assert_eq!(outcome.failure_kind, Some(CheckFailureKind::NotPlaceable));
+            assert!(!outcome.is_genuine_failure(), "not placeable is no red");
+            assert!(
+                outcome.output_tail.contains("toolchains rust on"),
+                "{}",
+                outcome.output_tail
+            );
+        }
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "nothing was attempted"
+        );
+        // The live board and the inline summary agree it is no red.
+        let seen = snapshots.lock().unwrap().clone();
+        assert!(
+            seen.iter().flatten().all(|entry| entry.state != "failed"),
+            "never a failed board entry: {seen:?}"
+        );
+        assert_eq!(
+            seen.last().unwrap()[0].state,
+            "unverified",
+            "a terminal non-verdict"
+        );
+        let summary = format_check_summary(&[wave("commit-a").await]);
+        assert!(
+            summary.starts_with("\u{26a0} executor-windows-check (not placeable"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains('\u{2717}'),
+            "no failure marker: {summary}"
+        );
+        assert_eq!(count_rows(&db, ROWS).await, 1, "one row for the commit");
+        assert_eq!(
+            count_rows(&db, OBSERVATIONS).await,
+            0,
+            "nothing was evaluated"
+        );
+        assert_eq!(count_rows(&db, STREAKS).await, 0, "no failure was counted");
+
+        for _ in 0..3 {
+            wave("commit-b").await;
+        }
+        assert_eq!(count_rows(&db, ROWS).await, 2, "one row per commit");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        fleet.declare_enrolled_remote("bgsrv-win", "bgsrv-win", platform, "x86_64");
+        let outcome = wave("commit-b").await;
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the next wave runs it"
+        );
+        assert!(outcome.passed);
+        assert_eq!(outcome.failure_kind, None);
+    }
+
+    /// cairn/4982, the case that starts from history. A lane that reached the
+    /// fleet-domain bound while some machine could still take it (enrolled but
+    /// detached), and that no known machine can take now, must not keep being
+    /// re-stamped as a suppression by the turn-end gate: that would report a
+    /// repair that can no longer happen. It goes on to submission, which refuses
+    /// it as not placeable, and the bounded row is left exactly as it was.
+    #[tokio::test]
+    async fn a_bounded_fleet_suppression_yields_to_not_placeable_without_losing_its_evidence() {
+        use crate::execution::cache::{
+            claim_check_execution, get_suppressed_check_result, infra_fleet_scope,
+            infra_suppression_scope, InfraRepairDomain,
+        };
+        let db = cache_db().await;
+        let lane = plan("executor-windows-check", "cargo check --locked");
+        let plans = vec![(lane.clone(), "ih-windows".to_string())];
+        let commit = CheckRunCommit {
+            evaluated: "commit-a",
+            defined_by: "commit-a",
+        };
+        let scopes = InfraScopes {
+            head: infra_suppression_scope("job-a", "commit-a"),
+            fleet: Some(infra_fleet_scope("empty-eligible-set")),
+            environments: Vec::new(),
+        };
+        let run = |failure: CheckExecutionFailure| {
+            let db = db.clone();
+            let plans = plans.clone();
+            let scopes = scopes.clone();
+            async move {
+                let coordinates = sealed_coordinates(commit, "tree-target", &plans);
+                run_planned_checks_with_board(
+                    db,
+                    "project-a",
+                    commit,
+                    "tree-target",
+                    "job-a",
+                    &plans,
+                    &coordinates,
+                    std::slice::from_ref(&scopes),
+                    "turn-checks:job-a",
+                    CheckExecMode::Shared,
+                    None,
+                    None,
+                    &[],
+                    false,
+                    move |_index, _command, _stream_id| {
+                        let failure = failure.clone();
+                        async move { Err::<CheckExecResult, _>(failure) }
+                    },
+                    |_| {},
+                )
+                .await
+                .remove(0)
+            }
+        };
+
+        // An enrolled-but-detached history: placement found no live match,
+        // which the fleet domain bounds, and two reserved retries spend it.
+        run(CheckExecutionFailure::substrate(
+            SubstrateFailureShape::NoMachine,
+            "no live enrolled executor satisfies toolchains rust on windows",
+        ))
+        .await;
+        for _ in 0..2 {
+            claim_check_execution(db.clone(), "project-a", &lane.name, "ih-windows", &scopes)
+                .unwrap();
+        }
+        let bounded =
+            get_suppressed_check_result(db.clone(), "project-a", &lane.name, "ih-windows", &scopes)
+                .unwrap()
+                .expect("the fleet domain is at its bound");
+        assert_eq!(bounded.domain, InfraRepairDomain::Fleet);
+        assert_eq!(bounded.streak(), 3);
+
+        let input_hashes = HashMap::from([(lane.name.clone(), "ih-windows".to_string())]);
+        let wave_scopes = HashMap::from([(lane.name.clone(), scopes.clone())]);
+        let hold = |unplaceable: std::collections::HashSet<String>| {
+            crate::execution::checks_turn_end::hold_back_suppressed(
+                &db,
+                "project-a",
+                "tree-target",
+                "job-a",
+                "commit-a",
+                vec![lane.clone()],
+                &input_hashes,
+                &wave_scopes,
+                &unplaceable,
+            )
+        };
+        let (to_run, suppressed) = hold(Default::default());
+        assert!(
+            to_run.is_empty(),
+            "while a machine is enrolled, the bound holds"
+        );
+        assert_eq!(suppressed, vec![lane.name.clone()]);
+
+        let (to_run, suppressed) = hold([lane.name.clone()].into());
+        assert!(suppressed.is_empty(), "no known machine: the bound yields");
+        assert_eq!(to_run.len(), 1);
+
+        let outcome = run(CheckExecutionFailure::NotPlaceable(
+            "No machine enrolled in this fleet, attached or not, satisfies toolchains rust on windows."
+                .to_string(),
+        ))
+        .await;
+        assert_eq!(outcome.failure_kind, Some(CheckFailureKind::NotPlaceable));
+        assert_eq!(outcome.suppressed_after, None);
+        let still =
+            get_suppressed_check_result(db.clone(), "project-a", &lane.name, "ih-windows", &scopes)
+                .unwrap()
+                .expect("the bounded row is untouched");
+        assert_eq!(still.domain, InfraRepairDomain::Fleet);
+        assert_eq!(still.streak(), 3);
+        assert!(
+            still
+                .evidence()
+                .output_tail
+                .contains("no live enrolled executor"),
+            "the old diagnostic survives: {}",
+            still.evidence().output_tail
+        );
     }
 
     async fn run_cache_boundary_case(

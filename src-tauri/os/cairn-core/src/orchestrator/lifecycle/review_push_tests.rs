@@ -226,9 +226,11 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
         job_id: "j-prod".to_string(),
         tree_hash,
         ran_at: 1,
+        check_name: "review".to_string(),
+        failure_kind: "infrastructure".to_string(),
     };
     assert!(
-        super::review_push::bounded_candidate_matches_current_tree(&orch, &candidate)
+        super::review_push::bounded_candidate_is_due(&orch, &candidate)
             .await
             .unwrap(),
         "the wave path must derive the managed store and resolve its agent-only branch"
@@ -240,6 +242,111 @@ async fn bounded_rearm_resolves_agent_branch_from_managed_store() {
     assert!(
         wave_scheduled(&orch, "j-prod"),
         "the maintenance cadence must autonomously dispatch a fresh wave"
+    );
+}
+
+/// cairn/4982. A dormant PR owner whose only open lane was recorded as not
+/// placeable has no turn, base advance, or waiter to arm a wave, and a machine
+/// attaching schedules nothing by itself. The maintenance cadence is the
+/// recovery edge: it passes the owner over while no known machine could take
+/// the lane, and dispatches a wave once one enrolls.
+#[tokio::test]
+#[serial_test::serial(jj)]
+async fn a_dormant_not_placeable_lane_is_rearmed_once_a_machine_that_can_take_it_enrolls() {
+    let Some(bin) = crate::jj::tests::jj_bin() else {
+        return;
+    };
+    let db = test_db().await;
+    seed(&db, "initial").await;
+    let orch = test_orchestrator(db);
+    let repository = tempfile::tempdir().unwrap();
+    crate::jj::tests::init_project(repository.path());
+    // The store is backed by the project repository, as in production: the
+    // check contract is read from the project's object database at the sealed
+    // commit, so a store over some other repository would never find it.
+    let store = crate::jj::project_store_dir(&orch.config_dir, repository.path());
+    let jj = crate::jj::environment(&bin, &orch.config_dir);
+    crate::jj::ensure_project_store(&jj, &store, repository.path()).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let workspace = workspaces.path().join("builder");
+    let branch = "agent/cairn-4982-builder-0";
+    crate::jj::add_workspace(&jj, &store, &workspace, branch, "main", None).unwrap();
+    // A platform the runner's own executor cannot provide.
+    let platform = if std::env::consts::OS == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    std::fs::create_dir_all(workspace.join(".cairn")).unwrap();
+    std::fs::write(
+        workspace.join(".cairn/config.yaml"),
+        format!(
+            "checks:\n  executor-windows-check:\n    command: cargo check --locked\n    executor:\n      requiredToolchains:\n      - rust\n    verdictPlatforms:\n    - {platform}\n    when: review\n"
+        ),
+    )
+    .unwrap();
+    crate::jj::seal(&jj, &workspace, "declare a lane no machine runs", None).unwrap();
+    let commit = crate::jj::head_commit(&jj, &workspace).unwrap();
+    let tree_hash = crate::jj::logical_tree_hash(&jj, &store, &commit).unwrap();
+    orch.db
+        .local
+        .execute(
+            "UPDATE projects SET repo_path=?1 WHERE id='p-rev'",
+            (repository.path().to_string_lossy().as_ref(),),
+        )
+        .await
+        .unwrap();
+    insert_artifact(&orch.db.local, "create-pr", 1).await;
+    insert_failed_check(&orch.db.local, "not_placeable", 0).await;
+    attach_planbuild_topology(&orch.db.local, "j-prod", NodeRole::Builder).await;
+    orch.db
+        .local
+        .execute(
+            "UPDATE check_result_cache SET tree_hash=?1, check_name='executor-windows-check' \
+             WHERE job_id='j-prod'",
+            (tree_hash.as_str(),),
+        )
+        .await
+        .unwrap();
+    orch.db
+        .local
+        .execute("UPDATE jobs SET branch=?1 WHERE id='j-prod'", (branch,))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bounded_rearm_candidates(&orch.db).await.unwrap()[0].failure_kind,
+        "not_placeable",
+        "a not-placeable lane is a candidate for the maintenance cadence"
+    );
+    let candidate = &bounded_rearm_candidates(&orch.db).await.unwrap()[0];
+    assert!(
+        crate::execution::checks::load_checks_contract_at_commit(
+            repository.path(),
+            &crate::jj::head_commit(&jj, &workspace).unwrap(),
+        )
+        .await
+        .is_some_and(|loaded| loaded.contract.checks.contains_key(&candidate.check_name)),
+        "the lane's definition is readable where the cadence reads it, so the refusals \
+         below are the fleet's answer and not a missing contract"
+    );
+    for _ in 0..3 {
+        assert!(
+            !rearm_one_bounded_failed_review(&orch).await,
+            "no wave while no known machine could take the lane"
+        );
+    }
+    assert!(!wave_scheduled(&orch, "j-prod"));
+
+    orch.fleet
+        .declare_enrolled_remote("bgsrv-win", "bgsrv-win", platform, "x86_64");
+    assert!(
+        rearm_one_bounded_failed_review(&orch).await,
+        "the first tick after a machine that can take it enrolls nominates the owner"
+    );
+    assert!(
+        wave_scheduled(&orch, "j-prod"),
+        "and dispatches the wave that runs it"
     );
 }
 

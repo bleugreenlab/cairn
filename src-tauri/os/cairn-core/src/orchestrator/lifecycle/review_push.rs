@@ -764,6 +764,8 @@ pub(super) struct BoundedRearmCandidate {
     pub(super) job_id: String,
     pub(super) tree_hash: String,
     pub(super) ran_at: i64,
+    pub(super) check_name: String,
+    pub(super) failure_kind: String,
 }
 
 pub(super) async fn bounded_rearm_candidate_job(
@@ -776,7 +778,7 @@ pub(super) async fn bounded_rearm_candidate_job(
             message,
         })?;
     for candidate in candidates {
-        let matches = bounded_candidate_matches_current_tree(orch, &candidate)
+        let matches = bounded_candidate_is_due(orch, &candidate)
             .await
             .map_err(|message| BoundedRearmLookupError {
                 job_id: Some(candidate.job_id.clone()),
@@ -867,6 +869,7 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                       latest AS (
                         SELECT lj.job_id AS job_id, lj.issue_id AS issue_id,
                                lj.branch AS branch, c.tree_hash AS tree_hash,
+                               c.check_name AS check_name,
                                c.ran_at AS ran_at, c.failure_kind AS failure_kind,
                                c.infra_failure_streak AS infra_failure_streak,
                                ROW_NUMBER() OVER (
@@ -876,10 +879,10 @@ pub(super) const BOUNDED_REARM_CANDIDATES_SQL: &str = "WITH live_job AS (
                           FROM live_job lj
                          CROSS JOIN check_result_cache c ON c.job_id = lj.job_id
                       )
-                      SELECT job_id, tree_hash, ran_at
+                      SELECT job_id, tree_hash, ran_at, check_name, failure_kind
                         FROM latest
                        WHERE recency = 1
-                         AND failure_kind IN ('capacity', 'infrastructure')
+                         AND failure_kind IN ('capacity', 'infrastructure', 'not_placeable')
                          AND (
                            infra_failure_streak < ?1
                            OR ran_at <= (unixepoch() - ?2) * 1000
@@ -931,6 +934,8 @@ async fn bounded_rearm_candidates_in_db(
                     job_id: row.text(0)?,
                     tree_hash: row.text(1)?,
                     ran_at: row.i64(2)?,
+                    check_name: row.text(3)?,
+                    failure_kind: row.text(4)?,
                 });
             }
             Ok::<_, DbError>(candidates)
@@ -940,7 +945,16 @@ async fn bounded_rearm_candidates_in_db(
     .map_err(|error| error.to_string())
 }
 
-pub(super) async fn bounded_candidate_matches_current_tree(
+/// Whether a dormant candidate is worth a wave now: its row still describes the
+/// branch's current tree, and, for a lane recorded as not placeable, a machine
+/// that could take it has since attached or enrolled.
+///
+/// The second half is the recovery edge for not-placeable lanes. Nothing about
+/// a machine attaching schedules a wave for a PR whose agent has gone quiet, so
+/// this cadence asks the fleet on its behalf, using the check's definition at
+/// that same commit. Until the answer changes the candidate is passed over,
+/// which costs a config read and no wave.
+pub(super) async fn bounded_candidate_is_due(
     orch: &Orchestrator,
     candidate: &BoundedRearmCandidate,
 ) -> Result<bool, String> {
@@ -957,7 +971,7 @@ pub(super) async fn bounded_candidate_matches_current_tree(
     let logical_repository = if crate::jj::is_jj_dir(&store_dir) {
         store_dir
     } else {
-        repo_root
+        repo_root.clone()
     };
     let sealed_commit =
         match cairn_vcs::resolve_coordinate(&logical_repository, &coords.branch).await {
@@ -971,13 +985,42 @@ pub(super) async fn bounded_candidate_matches_current_tree(
             }
         };
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    let current_tree = tokio::task::spawn_blocking(move || {
-        crate::jj::logical_tree_hash(&jj, &logical_repository, &sealed_commit)
-    })
-    .await
-    .map_err(|error| format!("capacity re-arm tree-hash task failed: {error}"))?
-    .map_err(|error| error.to_string())?;
-    Ok(current_tree == candidate.tree_hash)
+    let current_tree = {
+        let logical_repository = logical_repository.clone();
+        let sealed_commit = sealed_commit.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::jj::logical_tree_hash(&jj, &logical_repository, &sealed_commit)
+        })
+        .await
+        .map_err(|error| format!("capacity re-arm tree-hash task failed: {error}"))?
+        .map_err(|error| error.to_string())?
+    };
+    if current_tree != candidate.tree_hash {
+        return Ok(false);
+    }
+    if candidate.failure_kind != crate::execution::checks::CheckFailureKind::NotPlaceable.as_str() {
+        return Ok(true);
+    }
+    // Read from the project repository, as the turn-end wave reads it: the
+    // managed store is not a git object database of its own.
+    let Some(loaded) =
+        crate::execution::checks::load_checks_contract_at_commit(&repo_root, &sealed_commit).await
+    else {
+        return Ok(false);
+    };
+    // A check the commit no longer declares has nothing for a wave to run.
+    Ok(loaded
+        .contract
+        .checks
+        .get(&candidate.check_name)
+        .is_some_and(|check| {
+            orch.fleet
+                .unplaceable_reason(
+                    check.executor.as_ref(),
+                    &crate::execution::check_identity::verdict_platforms(check),
+                )
+                .is_none()
+        }))
 }
 
 /// Jobs eligible for the startup review-checks re-arm, as `(job_id, issue_id)`:

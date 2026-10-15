@@ -355,7 +355,9 @@ pub struct CheckStatusEntry {
     /// find this check's live output tail.
     pub(crate) index: usize,
     pub(crate) name: String,
-    /// `"pending"` | `"running"` | `"passed"` | `"failed"`.
+    /// `"pending"` | `"running"` | `"passed"` | `"failed"` | `"unverified"`.
+    /// `"unverified"` is terminal without a verdict: the check was never
+    /// attempted because no machine in the fleet can run it.
     pub(crate) state: String,
     /// The same annotation vocabulary as the final tool-result summary
     /// (`summary_annotation`): `"12 tests"` | `"4.1s"` | `"cached"` |

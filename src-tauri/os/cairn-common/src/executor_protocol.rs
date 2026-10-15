@@ -4124,6 +4124,17 @@ pub struct LearnedResourceEstimate {
 /// [`PRIOR_EPOCH_SURVIVOR_NONCE`], are no longer signalled by the executor's
 /// drain pass (a 142 executor kills them on its next sweep) nor by the runner's
 /// colocated retirement, which skips them in any version's cell state.
+///
+/// cairn/4982 adds a runner-only fleet question without a bump. The runner's
+/// fleet now asks, before submitting a check, whether any machine it knows of
+/// (attached, or enrolled and detached) could ever satisfy the check's
+/// selector and verdict platforms, and refuses the lane as not placeable when
+/// none could. The answer is computed from capabilities executors already
+/// advertise and enrollment records the runner already keeps; nothing new is
+/// sent to an executor and no executor build constructs or decodes anything
+/// the change touches. A refused lane is simply never submitted, which an
+/// executor of any version cannot distinguish from a lane that was not
+/// planned, so a runner talking to an older executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 143;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.

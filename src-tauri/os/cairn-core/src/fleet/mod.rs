@@ -4791,6 +4791,109 @@ impl Fleet {
         self.occupancy_for_at(scope, unix_time_ms())
     }
 
+    /// Why no machine this fleet knows of could ever take work that asks for
+    /// `selector` and counts its verdict from `verdict_platforms`, or `None`
+    /// while one could.
+    ///
+    /// "Knows of" is deliberately wider than "could place right now", which is
+    /// [`candidate_rejection`]'s question. An attached machine counts when what
+    /// it advertises matches. An enrolled machine that is not attached counts
+    /// whenever its platform matches, because what it will advertise is unknown
+    /// until it attaches: a detached machine is something to wait for, never
+    /// proof of absence. The runner's own colocated executor counts on the
+    /// runner's platform until it first attaches, so the attach race after a
+    /// restart cannot read as a gap in the fleet. Everything that comes and goes
+    /// while the fleet's makeup stays the same (staleness, drains, declines,
+    /// load, preparation refusals) is placement's business, not this.
+    ///
+    /// Only work that names where it must run can be unplaceable: untargeted
+    /// work runs anywhere, home included.
+    pub(crate) fn unplaceable_reason(
+        &self,
+        selector: Option<&ExecutorSelector>,
+        verdict_platforms: &[String],
+    ) -> Option<String> {
+        let selector = selector.filter(|selector| !selector.is_empty());
+        if selector.is_none() && verdict_platforms.is_empty() {
+            return None;
+        }
+        let admits_os = |os: &str| {
+            selector
+                .and_then(|selector| selector.os.as_deref())
+                .is_none_or(|wanted| wanted.eq_ignore_ascii_case(os))
+                && (verdict_platforms.is_empty()
+                    || verdict_platforms
+                        .iter()
+                        .any(|platform| platform.eq_ignore_ascii_case(os)))
+        };
+        let admits_name = |name: &str| {
+            selector
+                .and_then(|selector| selector.name.as_deref())
+                .is_none_or(|wanted| executor_names_match(wanted, name))
+        };
+        // Read before the connection lock is taken: it takes that lock and the
+        // enrollment lock one at a time, and must not nest inside either.
+        let unattached = self.unattached_enrolled_remotes();
+        if unattached
+            .iter()
+            .any(|machine| admits_name(&machine.name) && admits_os(&machine.os))
+        {
+            return None;
+        }
+        let connections = self.lock_connections();
+        if connections.values().any(|entry| {
+            selector.is_none_or(|selector| matches_selector(entry, selector))
+                && admits_os(&entry.advertisement.capabilities.os)
+        }) {
+            return None;
+        }
+        if !connections.values().any(|entry| entry.colocated)
+            && admits_name(LOCAL_EXECUTOR_NAME)
+            && admits_os(std::env::consts::OS)
+        {
+            return None;
+        }
+        let wanted = match (selector, verdict_platforms) {
+            (Some(selector), []) => selector.describe(),
+            (Some(selector), platforms) => {
+                format!("{} on {}", selector.describe(), platforms.join(" or "))
+            }
+            (None, platforms) => format!("work on {}", platforms.join(" or ")),
+        };
+        let mut known: Vec<String> = connections
+            .values()
+            .map(|entry| {
+                let capabilities = &entry.advertisement.capabilities;
+                let mut toolchains = capabilities.toolchains.clone();
+                toolchains.sort();
+                format!(
+                    "{} ({}; {})",
+                    executor_public_name(entry),
+                    capabilities.os,
+                    if toolchains.is_empty() {
+                        "no toolchains".to_string()
+                    } else {
+                        toolchains.join(", ")
+                    }
+                )
+            })
+            .chain(
+                unattached
+                    .iter()
+                    .map(|machine| format!("{} ({}; not attached)", machine.name, machine.os)),
+            )
+            .collect();
+        known.sort();
+        let known = if known.is_empty() {
+            "none".to_string()
+        } else {
+            known.join(", ")
+        };
+        Some(format!(
+            "No machine enrolled in this fleet, attached or not, satisfies {wanted}. Known machines: {known}."
+        ))
+    }
+
     /// A stable identity for the capability set this scope can reach right now.
     ///
     /// Routed through [`candidate_rejection`], the same eligibility relation
@@ -26125,6 +26228,110 @@ mod tests {
         );
         let connections = HashMap::from([fleet_entry("bgsrv-mac", "macos", 0, &[])]);
         assert_eq!(absent_enrolled_inventory(&connections, &[], &request), "");
+    }
+
+    /// `executor-windows-check`'s placement question, against a fleet that has
+    /// its colocated executor and a Linux machine attached and nothing on Windows.
+    fn windows_check_fleet() -> Fleet {
+        let fleet = Fleet::default();
+        let mut connections = fleet.lock_connections();
+        connections.extend([
+            fleet_entry(COLOCATED_EXECUTOR_ID, "macos", 0, &[]),
+            fleet_entry("bgsrv-ub", "linux", 0, &[]),
+        ]);
+        drop(connections);
+        fleet
+    }
+
+    fn rust_selector() -> ExecutorSelector {
+        ExecutorSelector {
+            required_toolchains: vec!["rust".into()],
+            ..ExecutorSelector::default()
+        }
+    }
+
+    #[test]
+    fn a_platform_no_known_machine_runs_is_unplaceable() {
+        let fleet = windows_check_fleet();
+        let reason = fleet
+            .unplaceable_reason(Some(&rust_selector()), &["windows".to_string()])
+            .expect("no machine on windows is attached or enrolled");
+        assert!(
+            reason.contains("toolchains rust on windows"),
+            "the reason names what was asked for: {reason}"
+        );
+        assert!(
+            reason.contains("bgsrv-ub (linux; rust)"),
+            "the reason names what the fleet has instead: {reason}"
+        );
+    }
+
+    /// An enrolled machine that is not attached is a wait, not an absence: what it
+    /// will advertise is unknown until it attaches.
+    #[test]
+    fn an_enrolled_but_detached_machine_on_the_platform_is_a_wait() {
+        let fleet = windows_check_fleet();
+        fleet.declare_enrolled_remote("bgsrv-win", "bgsrv-win", "windows", "x86_64");
+        assert_eq!(
+            fleet.unplaceable_reason(Some(&rust_selector()), &["windows".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn an_attached_machine_on_the_platform_without_the_toolchain_leaves_it_unplaceable() {
+        let fleet = windows_check_fleet();
+        let (id, mut windows) = fleet_entry("bgsrv-win", "windows", 0, &[]);
+        windows.advertisement.capabilities.toolchains.clear();
+        fleet.lock_connections().insert(id, windows);
+        let reason = fleet
+            .unplaceable_reason(Some(&rust_selector()), &["windows".to_string()])
+            .expect("the only windows machine advertises no rust");
+        assert!(
+            reason.contains("bgsrv-win (windows; no toolchains)"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn an_attached_machine_that_satisfies_the_lane_makes_it_placeable() {
+        let fleet = windows_check_fleet();
+        let (id, windows) = fleet_entry("bgsrv-win", "windows", 0, &[]);
+        fleet.lock_connections().insert(id, windows);
+        assert_eq!(
+            fleet.unplaceable_reason(Some(&rust_selector()), &["windows".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn untargeted_work_is_never_unplaceable() {
+        let fleet = Fleet::default();
+        assert_eq!(fleet.unplaceable_reason(None, &[]), None);
+        assert_eq!(
+            fleet.unplaceable_reason(Some(&ExecutorSelector::default()), &[]),
+            None
+        );
+    }
+
+    /// Before the runner's own executor first attaches, the runner's platform is
+    /// still reachable: a restart's attach race is not a gap in the fleet.
+    #[test]
+    fn the_colocated_executor_counts_on_its_platform_before_it_attaches() {
+        let fleet = Fleet::default();
+        let host = std::env::consts::OS.to_string();
+        assert_eq!(
+            fleet.unplaceable_reason(Some(&rust_selector()), std::slice::from_ref(&host)),
+            None
+        );
+        let elsewhere = if host == "windows" {
+            "linux"
+        } else {
+            "windows"
+        };
+        assert!(fleet
+            .unplaceable_reason(Some(&rust_selector()), &[elsewhere.to_string()])
+            .is_some());
     }
 
     #[tokio::test]

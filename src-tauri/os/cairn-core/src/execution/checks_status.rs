@@ -551,15 +551,22 @@ fn status_from_row(
         ))
         .filter(|s| !s.trim().is_empty())
     };
+    // A lane never offered to placement holds no verdict either way, so it reads
+    // as unverified rather than as a red, and it has no run to time.
+    let not_placeable = failure_kind == Some(CheckFailureKind::NotPlaceable);
     NodeCheckStatus {
         job_id: job_id.to_string(),
         request_id,
         name: name.to_string(),
-        state: check_state_from_evidence(row.passed, parsed.as_ref()),
+        state: if not_placeable {
+            NodeCheckState::Unverified
+        } else {
+            check_state_from_evidence(row.passed, parsed.as_ref())
+        },
         policy: policy.as_str().to_string(),
         when: when.as_str().to_string(),
         cached: row.cached,
-        duration_ms: Some(row.duration_ms),
+        duration_ms: (!not_placeable).then_some(row.duration_ms),
         ran_at: Some(row.ran_at),
         passed: parsed.as_ref().map(|p| p.passed),
         failed: parsed.as_ref().map(|p| p.failed),
@@ -578,6 +585,11 @@ fn status_from_row(
 }
 
 pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<String> {
+    // Checked ahead of suppression: a head row that was bounded earlier and is
+    // now not placeable at all says the newer, more useful thing.
+    if status.failure_kind.as_deref() == Some(CheckFailureKind::NotPlaceable.as_str()) {
+        return Some(not_placeable_annotation(status.output_tail.as_deref()));
+    }
     // A suppressed check produced no verdict at this tree — Cairn declined to run
     // it. Every arm below describes a verdict, so saying any of them here would
     // dress the absence of a result up as one.
@@ -659,6 +671,21 @@ pub(crate) fn format_status_annotation(status: &NodeCheckStatus) -> Option<Strin
     }
 }
 
+/// The line a not-placeable lane renders as: the fleet's first sentence of why,
+/// and when it will run. The machine inventory after it stays in the stored row.
+fn not_placeable_annotation(output_tail: Option<&str>) -> String {
+    let why = output_tail
+        .and_then(|tail| tail.split(". ").next())
+        .map(|sentence| sentence.trim().trim_end_matches('.'))
+        .filter(|sentence| !sentence.is_empty())
+        .unwrap_or("no machine in the fleet can run it");
+    format!("not placeable — {why}; runs when a machine that satisfies it attaches")
+}
+
+fn is_not_placeable(row: &CheckResultCacheEntry) -> bool {
+    row.failure_kind.as_deref() == Some(CheckFailureKind::NotPlaceable.as_str())
+}
+
 /// Failing lanes that get their own detail line in a wake body before the rest
 /// are rolled up by name. A wake is read at the top of a resume prompt: it names
 /// the reds and stops, and `/checks` holds the complete listing.
@@ -701,8 +728,23 @@ pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<S
     if rows.is_empty() {
         return None;
     }
-    let mut failing: Vec<&CheckResultCacheEntry> = rows.iter().filter(|row| !row.passed).collect();
+    let mut failing: Vec<&CheckResultCacheEntry> = rows
+        .iter()
+        .filter(|row| !row.passed && !is_not_placeable(row))
+        .collect();
     failing.sort_by(|left, right| left.check_name.cmp(&right.check_name));
+    let mut unplaceable: Vec<String> = rows
+        .iter()
+        .filter(|row| is_not_placeable(row))
+        .map(|row| row.check_name.clone())
+        .collect();
+    unplaceable.sort();
+    let unplaceable_line = (!unplaceable.is_empty()).then(|| {
+        format!(
+            "\n- ⚠ not placeable (no machine in the fleet can run them yet): {}",
+            join_capped(&unplaceable, WAKE_ROLLUP_NAMES)
+        )
+    });
     let mut passing: Vec<String> = rows
         .iter()
         .filter(|row| row.passed)
@@ -711,17 +753,21 @@ pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<S
     passing.sort();
 
     if failing.is_empty() {
-        return Some(format!(
+        let mut out = format!(
             "Project checks on this node: all {} passing ({}).",
             passing.len(),
             join_capped(&passing, WAKE_ROLLUP_NAMES)
-        ));
+        );
+        if let Some(line) = unplaceable_line {
+            out.push_str(&line);
+        }
+        return Some(out);
     }
 
     let mut out = format!(
         "Project checks on this node: {} of {} failing.\n",
         failing.len(),
-        rows.len()
+        rows.len() - unplaceable.len()
     );
     for row in failing.iter().take(WAKE_DETAILED_FAILURES) {
         out.push_str(&format!(
@@ -746,6 +792,9 @@ pub(crate) fn format_check_wake_body(rows: &[CheckResultCacheEntry]) -> Option<S
             "\n- \u{2713} passing: {}",
             join_capped(&passing, WAKE_ROLLUP_NAMES)
         ));
+    }
+    if let Some(line) = unplaceable_line {
+        out.push_str(&line);
     }
     Some(out)
 }
@@ -1176,6 +1225,54 @@ mod tests {
             format_check_wake_body(&[]).is_none(),
             "no recorded verdict leaves the caller its reference-only line"
         );
+    }
+
+    /// The row `record_unplaceable_check` writes for `executor-windows-check`
+    /// against a fleet with no Windows machine.
+    fn not_placeable_row() -> CheckResultCacheEntry {
+        let mut row = verdict_row("executor-windows-check", false);
+        row.exit_code = -1;
+        row.duration_ms = 0;
+        row.failure_kind = Some(CheckFailureKind::NotPlaceable.as_str().to_string());
+        row.output_tail = "No machine enrolled in this fleet, attached or not, satisfies \
+             toolchains rust on windows. Known machines: bgsrv-ub (linux; rust). Not attempted: \
+             it runs on the first wave after a machine that satisfies it attaches."
+            .to_string();
+        row
+    }
+
+    /// cairn/4982: a lane no machine can take is not a red. It reads as
+    /// unverified with the fleet's own reason, carries no run duration, and a
+    /// wake lists it apart from the failing lanes rather than among them.
+    #[test]
+    fn a_not_placeable_lane_renders_as_unverified_and_stays_out_of_the_reds() {
+        let (state, annotation) = annotate(&not_placeable_row());
+        assert_eq!(state, NodeCheckState::Unverified);
+        assert_eq!(
+            annotation,
+            "not placeable — No machine enrolled in this fleet, attached or not, satisfies \
+             toolchains rust on windows; runs when a machine that satisfies it attaches"
+        );
+
+        let body =
+            format_check_wake_body(&[not_placeable_row(), verdict_row("lint", true)]).unwrap();
+        assert_eq!(
+            body,
+            "Project checks on this node: all 1 passing (lint).\n- ⚠ not placeable (no machine \
+             in the fleet can run them yet): executor-windows-check"
+        );
+
+        let body = format_check_wake_body(&[
+            not_placeable_row(),
+            verdict_row("lint", true),
+            verdict_row("typecheck", false),
+        ])
+        .unwrap();
+        assert!(
+            body.starts_with("Project checks on this node: 1 of 2 failing."),
+            "{body}"
+        );
+        assert!(!body.contains("✗ executor-windows-check"), "{body}");
     }
 
     /// A suppressed lane produced no verdict at all; the wake must not dress the
