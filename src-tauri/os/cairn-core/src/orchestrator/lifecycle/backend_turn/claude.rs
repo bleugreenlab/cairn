@@ -86,12 +86,12 @@ fn warm_and_emit(
     );
 }
 
-/// The host marks occupancy idle after sending an interrupt. The subsequent
+/// The host parks a process warm after sending an interrupt. The subsequent
 /// error Result or EOF is transport cleanup rather than a new failure.
+///
+/// Warm, not merely `Idle`: a launch whose first turn has not begun yet is
+/// `Idle` as well, and a CLI that dies in that window (a refused start) died on
+/// its own.
 pub(crate) fn was_host_interrupted(orch: &Orchestrator, run_id: &str) -> bool {
-    orch.process_state
-        .get_occupancy(run_id)
-        .is_some_and(|occupancy| {
-            matches!(occupancy, crate::agent_process::process::RunOccupancy::Idle)
-        })
+    orch.process_state.is_warm(run_id)
 }

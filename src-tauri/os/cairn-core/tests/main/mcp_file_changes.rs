@@ -587,6 +587,66 @@ async fn logical_write_is_immediately_visible_to_ordinary_read_without_checkout_
     assert!(!read.contains("before"), "{read}");
 }
 
+/// cairn/4897: a live builder's own branch was removed out from under it
+/// mid-turn. Every read, write, and command then answered "Could not resolve
+/// branch ref", which reads like a typo to retry. The session must instead be
+/// told that its branch is gone, that it did not cause this, and that it should
+/// stop. `run` resolves the same coordinate through the same function
+/// (`resolve_current_for_read`), but its handler needs executor fixtures this
+/// file does not have, so only read and write are driven here.
+#[tokio::test]
+async fn a_live_run_whose_own_branch_is_removed_gets_a_typed_refusal_on_read_and_write() {
+    let Some(repo) = ChangeTestRepo::try_new().await else {
+        eprintln!("skipping: jj not resolvable");
+        return;
+    };
+    repo.write("lost.txt", "work\n");
+    let before =
+        handle_read_file(&repo.orch, &make_read_request(repo.cwd(), "file:lost.txt")).await;
+    assert!(
+        before.contains("work"),
+        "the premise is a branch that resolves: {before}"
+    );
+
+    for args in [
+        vec!["bookmark", "delete", "agent/CHG-1-builder-0"],
+        vec!["git", "export"],
+    ] {
+        let output = std::process::Command::new(&repo.jj_bin)
+            .args(&args)
+            .current_dir(repo.dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "jj {args:?} failed: {output:?}");
+    }
+
+    let read = handle_read_file(&repo.orch, &make_read_request(repo.cwd(), "file:lost.txt")).await;
+    let write = repo
+        .change_raw(json!({
+            "changes": [{
+                "target": "file:lost.txt",
+                "mode": "patch",
+                "payload": { "old_string": "work", "new_string": "more work" }
+            }],
+            "commit_msg": "must not land"
+        }))
+        .await;
+    for (verb, answer) in [("read", &read), ("write", &write)] {
+        assert!(
+            answer.contains("own branch 'agent/CHG-1-builder-0' no longer exists"),
+            "{verb} must name the lost branch: {answer}"
+        );
+        assert!(
+            answer.contains("Stop here"),
+            "{verb} must say stop: {answer}"
+        );
+        assert!(
+            !answer.contains("Could not resolve branch ref"),
+            "{verb} must not answer with the raw ref failure: {answer}"
+        );
+    }
+}
+
 fn make_read_request(cwd: &str, path: &str) -> McpCallbackRequest {
     McpCallbackRequest {
         thread_id: None,

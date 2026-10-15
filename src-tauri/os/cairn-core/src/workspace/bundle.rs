@@ -46,6 +46,7 @@ mod tests {
         write(&root.join("agents/explore.md"), "bundle agent\n");
         write(&root.join("recipes/default.yaml"), "name: default\n");
         write(&root.join("responses/conveyor.md"), "response\n");
+        write(&root.join("routes/followed.yaml"), "name: followed\n");
         write(
             &root.join("skills/example/SKILL.md"),
             "---\nname: Example\ndescription: Example skill\n---\n",
@@ -179,12 +180,20 @@ mod tests {
             "agents/build.md",
             "recipes/build.yaml",
             "responses/conveyor.md",
+            "routes/followed-thread-stream.yaml",
+            "routes/github-mention.yaml",
             "skills/browser/SKILL.md",
             "workflows/fan-out/workflow.yaml",
         ] {
             assert!(repo.join(path).exists(), "core must ship {path}");
         }
-        assert!(pack_lock::read_lock(&repo, "core").is_some());
+        let core = pack_lock::read_lock(&repo, "core").expect("core lock");
+        for id in ["followed-thread-stream", "github-mention"] {
+            assert!(
+                core.item(PackItemKind::Route, id).is_some(),
+                "core must record shipped route `{id}` as a pack item"
+            );
+        }
 
         // The optional packs are offered, not installed.
         assert!(!repo.join("skills/matlab").exists());
@@ -382,6 +391,61 @@ mod tests {
         assert!(!repo.join("skills/matlab").exists());
         assert!(pack_lock::read_lock(&repo, "matlab").is_none());
         assert!(!repo.join("packs/matlab").exists());
+    }
+
+    /// A shipped route is ordinary pack content: a fresh sync materializes it
+    /// under `routes/`, an untouched copy takes the pack's next version in
+    /// place, and a copy the user edited is theirs and survives a re-sync.
+    #[test]
+    fn shipped_routes_sync_in_place_and_a_user_edited_route_is_kept() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("home");
+        let resources = temp.path().join("resources");
+        write_complete_resources(&resources);
+        write(
+            &source_pack(&resources, "core").join("routes/mention.yaml"),
+            "name: mention\n",
+        );
+        let git = RealGitClient;
+        let fs = RealFileSystem;
+
+        sync_workspace_packs(&git, &fs, &resources, &repo, "1.0.0").unwrap();
+        for id in ["followed", "mention"] {
+            assert!(repo.join(format!("routes/{id}.yaml")).is_file());
+            assert!(pack_lock::read_lock(&repo, "core")
+                .unwrap()
+                .item(PackItemKind::Route, id)
+                .is_some());
+        }
+
+        std::fs::write(repo.join("routes/followed.yaml"), "name: mine\n").unwrap();
+        write(
+            &source_pack(&resources, "core").join("routes/followed.yaml"),
+            "name: followed v2\n",
+        );
+        write(
+            &source_pack(&resources, "core").join("routes/mention.yaml"),
+            "name: mention v2\n",
+        );
+        sync_workspace_packs(&git, &fs, &resources, &repo, "2.0.0").unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("routes/followed.yaml")).unwrap(),
+            "name: mine\n",
+            "a user-edited route is theirs and is never overwritten"
+        );
+        assert!(
+            pack_lock::read_lock(&repo, "core")
+                .unwrap()
+                .item(PackItemKind::Route, "followed")
+                .unwrap()
+                .forked
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("routes/mention.yaml")).unwrap(),
+            "name: mention v2\n",
+            "an untouched shipped route takes the pack's update in place"
+        );
     }
 
     #[test]

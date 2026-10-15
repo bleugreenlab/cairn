@@ -10,7 +10,8 @@ use crate::services::{FileSystem, GitClient};
 /// `packs/` holds each installed pack's lock and MCP definitions; `responses/`
 /// holds response templates, which the sync has always materialized but which
 /// were never tracked — leaving them permanently frozen on first install.
-pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/workflows/\n!/packs/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
+/// `routes/` holds route definitions, the shipped ones included.
+pub(crate) const WORKSPACE_GITIGNORE: &str = "# Ignore everything by default; only the curated config below is tracked.\n/*\n!/agents/\n!/skills/\n!/recipes/\n!/responses/\n!/routes/\n!/workflows/\n!/packs/\n!/AGENTS.md\n!/settings.yaml\n!/.gitignore\n.DS_Store\n";
 
 pub(crate) fn ensure_workspace_repo(
     git: &dyn GitClient,
@@ -127,6 +128,7 @@ mod tests {
         // Everything a pack installs must be tracked, or its ownership can
         // never be established and it freezes on first write.
         assert!(WORKSPACE_GITIGNORE.contains("!/responses/"));
+        assert!(WORKSPACE_GITIGNORE.contains("!/routes/"));
         assert!(WORKSPACE_GITIGNORE.contains("!/packs/"));
         assert!(!WORKSPACE_GITIGNORE.contains("!worktrees"));
         assert!(!WORKSPACE_GITIGNORE.contains("!logs"));

@@ -528,6 +528,7 @@ const SECTIONS: &[(&str, &str, &str)] = &[
     ("recipe", "Recipes", "recipe"),
     ("workflow", "Workflows", "workflow"),
     ("response", "Responses", "response"),
+    ("route", "Routes", "route"),
 ];
 
 fn capitalize(value: &str) -> String {

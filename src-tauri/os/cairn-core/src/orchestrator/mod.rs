@@ -2519,6 +2519,12 @@ impl Orchestrator {
         crate::execution::jobs::fail_orphaned_calls_on_startup(self).await;
     }
 
+    /// Warn about open sessions whose provider launch never confirmed. Reads
+    /// only; runs after the stale-run sweep has settled predecessor runs.
+    pub async fn log_unconfirmed_launch_sessions_on_startup(&self) {
+        crate::sessions::log_unconfirmed_launch_sessions_on_startup(self).await;
+    }
+
     /// Terminalize turn-end check attempts whose ephemeral runtime ownership was
     /// lost with the previous host process.
     pub async fn reconcile_turn_end_check_attempts_on_startup(&self) {

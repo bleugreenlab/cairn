@@ -634,7 +634,7 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
 
     let mut output = format!("# Executions for {}/{}\n\n", project_key, number);
     let mut found = false;
-    if let Ok(mut rows) = conn
+    match conn
         .query(
             "SELECT e.seq, e.status, e.triggered_by,
                     (SELECT r.error_message
@@ -643,65 +643,60 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
                        AND r.exit_reason = 'job_preparation_failed'
                        AND r.error_message IS NOT NULL
                      ORDER BY r.created_at DESC LIMIT 1),
-                    e.lifecycle,
-                    (SELECT s.stop_state FROM execution_supersessions s
-                      WHERE s.superseded_execution_id = e.id
-                      ORDER BY s.created_at DESC LIMIT 1)
+                    e.lifecycle
              FROM executions e
              WHERE e.issue_id = ?1 ORDER BY e.seq ASC",
             (issue_id.as_str(),),
         )
         .await
     {
-        while let Ok(Some(row)) = rows.next().await {
-            found = true;
-            let seq = row.opt_i64(0).ok().flatten().unwrap_or(0);
-            let status = row.text(1).unwrap_or_default();
-            let triggered_by = row.opt_text(2).ok().flatten().unwrap_or_default();
-            let error = row.opt_text(3).ok().flatten();
-            // Canonical standing (CAIRN-4665). Secondary evidence, not the
-            // enforcement: the fence refuses a superseded execution's turns and
-            // effects whether or not this line renders.
-            let lifecycle = row.opt_text(4).ok().flatten().unwrap_or_default();
-            let stop_state = row.opt_text(5).ok().flatten();
-            let standing = match lifecycle.as_str() {
-                "superseded" => {
-                    let mut text =
-                        " — superseded; it no longer owns this issue's attempt".to_string();
-                    // An uninterrupted agent is a fact an operator needs.
-                    if stop_state.as_deref() == Some("failed") {
-                        text.push_str(
-                            ", and its agents could NOT be stopped — they may still be running",
-                        );
+        // A failed query must not read as an issue with no executions: that
+        // is how a broken column reference once made every issue look as if
+        // its executions had been deleted.
+        Err(e) => return storage_error("Failed to load executions", e.into()),
+        Ok(mut rows) => {
+            while let Ok(Some(row)) = rows.next().await {
+                found = true;
+                let seq = row.opt_i64(0).ok().flatten().unwrap_or(0);
+                let status = row.text(1).unwrap_or_default();
+                let triggered_by = row.opt_text(2).ok().flatten().unwrap_or_default();
+                let error = row.opt_text(3).ok().flatten();
+                // Canonical standing (CAIRN-4665). Secondary evidence, not the
+                // enforcement: the fence refuses a superseded execution's turns and
+                // effects whether or not this line renders.
+                let lifecycle = row.opt_text(4).ok().flatten().unwrap_or_default();
+                let standing = match lifecycle.as_str() {
+                    "superseded" => {
+                        " — superseded; it no longer owns this issue's attempt".to_string()
                     }
-                    text
-                }
-                "parallel" => {
-                    " — declared parallel alternative; not this issue's implementation".to_string()
-                }
-                _ => String::new(),
-            };
-            output.push_str(&format!(
-                "- execution {} [{}] (triggered: {}){}",
-                seq, status, triggered_by, standing
-            ));
-            if let Some(error) = error {
-                let cause = error
-                    .lines()
-                    .find(|line| !line.trim().is_empty())
-                    .unwrap_or(&error);
-                output.push_str(&format!(" — {}\n", cause.trim()));
-                output.push_str(
-                    "  <details><summary>Full preparation error</summary>\n\n  ```text\n",
-                );
-                for line in error.lines() {
-                    output.push_str("  ");
-                    output.push_str(line);
+                    "parallel" => {
+                        " — declared parallel alternative; not this issue's implementation"
+                            .to_string()
+                    }
+                    _ => String::new(),
+                };
+                output.push_str(&format!(
+                    "- execution {} [{}] (triggered: {}){}",
+                    seq, status, triggered_by, standing
+                ));
+                if let Some(error) = error {
+                    let cause = error
+                        .lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or(&error);
+                    output.push_str(&format!(" — {}\n", cause.trim()));
+                    output.push_str(
+                        "  <details><summary>Full preparation error</summary>\n\n  ```text\n",
+                    );
+                    for line in error.lines() {
+                        output.push_str("  ");
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    output.push_str("  ```\n  </details>\n");
+                } else {
                     output.push('\n');
                 }
-                output.push_str("  ```\n  </details>\n");
-            } else {
-                output.push('\n');
             }
         }
     }
@@ -1582,6 +1577,26 @@ mod execution_snapshot_read_tests {
         let out = read_issue_executions(&db, "cairn", 1).await;
         assert!(!out.contains("provider process exited"), "{out}");
         assert!(!out.contains("Full preparation error"), "{out}");
+    }
+
+    /// cairn/4897's issue listed "no executions yet" while it had two, which
+    /// read as though the execution had been deleted. A superseded execution
+    /// and its canonical successor both list, each with its standing.
+    #[tokio::test]
+    async fn execution_collection_lists_a_superseded_execution_and_its_successor() {
+        let db = test_db().await;
+        seed(&db).await;
+        exec(&db, "UPDATE executions SET lifecycle = 'superseded', status = 'complete' WHERE id = 'exec-1'").await;
+        exec(&db, "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq) VALUES ('exec-2','r','issue-1','proj-1','running',2,4)").await;
+        exec(&db, "INSERT INTO execution_supersessions(id, issue_id, superseded_execution_id, successor_execution_id, reason, actor_kind, actor_ref, created_at) VALUES ('sup-1','issue-1','exec-1','exec-2','successor_created','operator-ui',NULL,2)").await;
+
+        let out = read_issue_executions(&db, "cairn", 1).await;
+        assert!(!out.contains("no executions yet"), "{out}");
+        assert!(
+            out.contains("execution 3 [complete] (triggered: manual) — superseded"),
+            "{out}"
+        );
+        assert!(out.contains("execution 4 [running]"), "{out}");
     }
 
     #[tokio::test]

@@ -140,6 +140,51 @@ fn resolve_full_tree_plans(
         .collect()
 }
 
+/// The plan a manual run of `check_name` executes at a sealed tree, and the key
+/// its verdict is looked up, reused, and recorded under.
+///
+/// A manual run evaluates a sealed tree, not a change set, so it runs the
+/// check's WHOLE suite and keys the verdict by the command it executed — the
+/// same rule main-health applies (see [`key_review_tree_plans`]). A narrower,
+/// diff-derived selection cannot be keyed honestly here: the key is the tree's
+/// input content, which names no base, so a partial verdict recorded under it
+/// would later answer for the same content measured against a different base.
+/// And a `--branch main` baseline diffs main against itself, which selects
+/// nothing. For a placeholder-free check the executed command is the configured
+/// one, so its key equals [`check_input_hash`]; for a selector check it differs,
+/// which keeps a turn-end partial verdict from answering a whole-suite question.
+fn manual_check_plan(
+    checks: &HashMap<String, CheckCommand>,
+    inputs: &ResolvedInputs,
+    entries: Option<&[(String, String)]>,
+    tree_hash: &str,
+    check_name: &str,
+    repo_root: &Path,
+) -> Result<(CheckPlan, String), String> {
+    let check = checks
+        .get(check_name)
+        .ok_or_else(|| format!("configured check {check_name:?} was not found"))?;
+    let one = HashMap::from([(check_name.to_string(), check.clone())]);
+    let plan = resolve_full_tree_plans(plan_checks(&one, inputs, &[], repo_root), &one)
+        .pop()
+        .ok_or_else(|| format!("configured check {check_name:?} could not be planned"))?;
+    if let Some(error) = plan.config_error.as_deref() {
+        return Err(format!(
+            "configured check {check_name:?} is unrunnable: {error}"
+        ));
+    }
+    let key = check_result_key_for_executed_command(
+        check,
+        &plan.command,
+        inputs.for_check(check_name),
+        entries,
+        tree_hash,
+        &check_platform_identity(),
+        check_toolchain_identity(),
+    );
+    Ok((plan, key))
+}
+
 fn producer_failure_marker(lines: &[&str]) -> Option<(usize, CheckFailureKind)> {
     lines.windows(2).enumerate().find_map(|(index, pair)| {
         if pair[1] != "Cause (verbatim):"
@@ -953,21 +998,14 @@ async fn resolve_manual_check_contract_snapshot(
     };
     let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
     let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-    let input_hash = check_input_hash(
-        check,
-        inputs.for_check(check_name),
+    let (plan, input_hash) = manual_check_plan(
+        &checks,
+        &inputs,
         entries.as_deref(),
         &tree_hash,
-    );
-    let plan = plan_checks(&checks, &inputs, &[], &repository)
-        .into_iter()
-        .find(|plan| plan.name == check_name)
-        .ok_or_else(|| format!("configured check {check_name:?} could not be planned"))?;
-    if let Some(error) = plan.config_error.as_deref() {
-        return Err(format!(
-            "configured check {check_name:?} is unrunnable: {error}"
-        ));
-    }
+        check_name,
+        &repository,
+    )?;
     let configured_check = check.clone();
     let timeout_ms =
         resolve_check_timeout_ms(Some(&configured_check), DEFAULT_REVIEW_CHECK_TIMEOUT_MS);
@@ -1564,14 +1602,20 @@ fn fix_is_attributed_to_declared_fixers(paths: &[String], fixers: &[&InputSelect
 /// A fixer's own output is not an invalidation of its own verdict: producing
 /// this tree is what it just did, and re-checking it against that is precisely
 /// the redundant second wave this rule exists to delete.
+///
+/// `fix_landed_on_tested_base` is false when the branch advanced while the wave
+/// ran and the fix was merged onto the newer head. The fixed commit then carries
+/// code no check in the wave executed, so only an unchanged input key carries.
 fn verdict_survives_fix(
+    fix_landed_on_tested_base: bool,
     executed: bool,
     fix_attributed: bool,
     superseded_by_later_fixer: bool,
     key_before: &str,
     key_after: &str,
 ) -> bool {
-    key_before == key_after || (fix_attributed && executed && !superseded_by_later_fixer)
+    key_before == key_after
+        || (fix_landed_on_tested_base && fix_attributed && executed && !superseded_by_later_fixer)
 }
 
 /// The submitted plan indices whose declared fix a LATER declared fixer could
@@ -4155,6 +4199,13 @@ pub(crate) async fn jobs_sharing_branch(db: &LocalDb, job_id: &str) -> Vec<Strin
 /// change set, or no `when:write` check whose impact the change set matches (a
 /// doc-only / non-source commit). A cache hit returns the stored verdict without
 /// re-running.
+///
+/// The wave runs as its own task and the caller waits for it at most
+/// [`WRITE_CHECK_INLINE_WAIT`]. The commit is already sealed when this is
+/// called, so the caller's result must not depend on the checks settling:
+/// a wave that outlives the bound keeps running, keeps `/checks` reporting
+/// it as in flight, and records its verdicts (and publishes any fix commit)
+/// on its own, while the caller returns a pending line in its place.
 pub(crate) async fn run_write_checks_after_seal(
     orch: &Orchestrator,
     run_context: Option<&RunContext>,
@@ -4162,30 +4213,227 @@ pub(crate) async fn run_write_checks_after_seal(
     tool_use_id: &str,
     sealed_resolution: Option<&crate::mcp::handlers::branch::BranchResolution>,
 ) -> Option<String> {
-    let _guard = run_context.map(|context| WriteChecksInFlightGuard::new(orch, &context.job_id));
-    run_write_checks_after_seal_inner(orch, run_context, cwd, tool_use_id, sealed_resolution).await
+    // No run context ⇒ no run id to stream against and no job to anchor the diff.
+    let run_context = run_context?.clone();
+    let guard = WriteChecksInFlightGuard::new(orch, &run_context.job_id);
+    let late_orch = orch.clone();
+    let late_run_id = run_context.run_id.clone();
+    let late_job_id = run_context.job_id.clone();
+    let wave_orch = orch.clone();
+    let cwd = cwd.to_string();
+    let tool_use_id = tool_use_id.to_string();
+    let sealed_resolution = sealed_resolution.cloned();
+    await_write_check_wave(
+        guard,
+        WRITE_CHECK_INLINE_WAIT,
+        async move {
+            run_write_checks_after_seal_inner(
+                &wave_orch,
+                Some(&run_context),
+                &cwd,
+                &tool_use_id,
+                sealed_resolution.as_ref(),
+            )
+            .await
+        },
+        move |summary| {
+            deliver_late_write_check_summary(late_orch, late_run_id, late_job_id, summary)
+        },
+    )
+    .await
 }
 
-struct WriteChecksInFlightGuard<'a> {
-    orch: &'a Orchestrator,
+/// How long a committing `write` or `run` waits inline for its when:write
+/// checks. Stated in the write time contract so the callback layers wrapping
+/// the host can size themselves above it.
+const WRITE_CHECK_INLINE_WAIT: std::time::Duration =
+    std::time::Duration::from_millis(cairn_common::write_contract::WRITE_CHECK_INLINE_WAIT_MS);
+
+/// Detach `wave` and wait for it at most `bound`. The in-flight guard moves
+/// into the detached task, so the job stays "write checks in flight" for
+/// exactly as long as the wave really runs, whether or not anyone is still
+/// waiting on it. Dropping the caller (a transport timeout, an interrupt)
+/// therefore no longer cancels checks for a commit that has already landed.
+///
+/// Some outcomes live only in the wave's return value (a fold conflict and its
+/// recovery patch, a non-convergent fix), so ownership of that value never
+/// rests with the caller. A supervisor owns the wave from the start and offers
+/// its result over a channel; if the caller is no longer receiving (it answered
+/// pending, or was itself dropped before the bound), the supervisor hands the
+/// result to `deliver_late` instead. Exactly one of the two receives it.
+async fn await_write_check_wave<F, D, DF>(
+    guard: WriteChecksInFlightGuard,
+    bound: std::time::Duration,
+    wave: F,
+    deliver_late: D,
+) -> Option<String>
+where
+    F: std::future::Future<Output = Option<String>> + Send + 'static,
+    D: FnOnce(String) -> DF + Send + 'static,
+    DF: std::future::Future<Output = ()> + Send + 'static,
+{
+    let (offer, mut inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
+    tokio::spawn(async move {
+        let outcome = tokio::spawn(async move {
+            let _guard = guard;
+            wave.await
+        })
+        .await;
+        hand_off_wave_outcome(offer, settled_wave_summary(outcome), deliver_late).await;
+    });
+    match tokio::time::timeout(bound, &mut inline).await {
+        Ok(Ok(offered)) => claim_offered_outcome(offered),
+        // The supervisor always sends unless the runtime is shutting down.
+        Ok(Err(_)) => None,
+        Err(_) => {
+            // Close before deciding: a result offered in the instant the bound
+            // elapsed is still ours to return, and anything after the close is
+            // refused and goes to late delivery instead.
+            inline.close();
+            if let Ok(offered) = inline.try_recv() {
+                return claim_offered_outcome(offered);
+            }
+            log::info!(
+                "when:write checks still running after {}s; returning the commit with checks pending",
+                bound.as_secs()
+            );
+            Some(pending_write_checks_summary(bound))
+        }
+    }
+}
+
+/// A wave's final summary as offered to its caller, with the receipt the caller
+/// must return for the offer to count as delivered.
+type OfferedOutcome = (Option<String>, tokio::sync::oneshot::Sender<()>);
+
+/// Offer a wave's outcome to its caller and keep ownership of it until the
+/// caller acknowledges receipt. A successful `send` only means the value was
+/// buffered: a caller cancelled before it polls the receiver drops the value
+/// unread. Only an explicit receipt proves the caller holds it; anything else
+/// (a refused send, a receiver dropped with the value inside) is late delivery.
+async fn hand_off_wave_outcome<D, DF>(
+    offer: tokio::sync::oneshot::Sender<OfferedOutcome>,
+    summary: Option<String>,
+    deliver_late: D,
+) where
+    D: FnOnce(String) -> DF,
+    DF: std::future::Future<Output = ()>,
+{
+    let (receipt, received) = tokio::sync::oneshot::channel::<()>();
+    let claimed = match offer.send((summary.clone(), receipt)) {
+        Ok(()) => received.await.is_ok(),
+        Err(_) => false,
+    };
+    if !claimed {
+        if let Some(summary) = summary {
+            deliver_late(summary).await;
+        }
+    }
+}
+
+/// Take an offered outcome and acknowledge it in the same synchronous step, so
+/// no cancellation point separates holding the value from the supervisor
+/// learning that it is held.
+fn claim_offered_outcome((summary, receipt): OfferedOutcome) -> Option<String> {
+    let _ = receipt.send(());
+    summary
+}
+
+fn settled_wave_summary(outcome: Result<Option<String>, tokio::task::JoinError>) -> Option<String> {
+    match outcome {
+        Ok(summary) => summary,
+        Err(error) => {
+            log::error!("when:write check wave ended abnormally: {error}");
+            Some(format!(
+                "Checks: \u{2717} the write-check wave ended abnormally ({error}). The commit is \
+                 unaffected; no verdict was recorded for it. Read cairn:~/checks for the branch's current verdicts."
+            ))
+        }
+    }
+}
+
+/// Hand a wave's final summary to the agent whose commit it checked, after that
+/// agent's call already returned pending. A failure wakes an idle agent at its
+/// next turn boundary; a pass rides along passively. A superseded node is never
+/// woken (the turn-end cadence's resurrection fence, CAIRN-4665): its message is
+/// still written, passively, so the outcome stays readable.
+async fn deliver_late_write_check_summary(
+    orch: Orchestrator,
+    run_id: String,
+    job_id: String,
+    summary: String,
+) {
+    use crate::messages::queued::DeliveryUrgency;
+    let mut urgency = if summary.contains('\u{2717}') {
+        DeliveryUrgency::Queue
+    } else {
+        DeliveryUrgency::Passive
+    };
+    if urgency != DeliveryUrgency::Passive {
+        let live = match crate::execution::routing::owning_db_for_job(&orch.db, &job_id).await {
+            Ok(db) => crate::execution::canonical::fence_for_job(&db, &job_id)
+                .await
+                .is_ok_and(|fence| !fence.is_superseded()),
+            Err(_) => false,
+        };
+        if !live {
+            urgency = DeliveryUrgency::Passive;
+        }
+    }
+    let content = late_write_check_message(&summary);
+    let delivered = tokio::task::spawn_blocking(move || {
+        crate::messages::delivery::queue_system_direct(&orch, &run_id, &content, urgency)
+    })
+    .await;
+    match delivered {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            log::warn!("late write-check summary for job {job_id} undeliverable: {error}")
+        }
+        Err(error) => {
+            log::warn!("late write-check summary for job {job_id} delivery task failed: {error}")
+        }
+    }
+}
+
+fn late_write_check_message(summary: &str) -> String {
+    format!(
+        "[Write checks] The when:write checks that were still pending when an earlier commit of yours \
+         returned have finished.\n\n{summary}\n\nCurrent verdicts for the branch: cairn:~/checks"
+    )
+}
+
+/// The line a committing call carries when its write checks outlive the inline
+/// wait. It leads with the fact the agent most needs: the commit landed.
+fn pending_write_checks_summary(bound: std::time::Duration) -> String {
+    format!(
+        "Checks: \u{22EF} pending \u{2014} the commit above landed; its when:write checks were still running \
+         after {}s and continue in the background. Their verdicts (and any formatter fix, which lands \
+         as its own commit) appear at cairn:~/checks.",
+        bound.as_secs()
+    )
+}
+
+struct WriteChecksInFlightGuard {
+    orch: Orchestrator,
     job_id: String,
 }
 
-impl<'a> WriteChecksInFlightGuard<'a> {
-    fn new(orch: &'a Orchestrator, job_id: &str) -> Self {
+impl WriteChecksInFlightGuard {
+    fn new(orch: &Orchestrator, job_id: &str) -> Self {
         orch.begin_write_checks(job_id);
         let _ = orch.services.emitter.emit(
             "db-change",
             serde_json::json!({"table": "check_result_cache", "action": "update"}),
         );
         Self {
-            orch,
+            orch: orch.clone(),
             job_id: job_id.to_string(),
         }
     }
 }
 
-impl Drop for WriteChecksInFlightGuard<'_> {
+impl Drop for WriteChecksInFlightGuard {
     fn drop(&mut self) {
         self.orch.end_write_checks(&self.job_id);
         let _ = self.orch.services.emitter.emit(
@@ -4254,6 +4502,7 @@ async fn run_write_checks_after_seal_inner(
     if checks.is_empty() {
         return None;
     }
+    let object_repository = logical.object_repository_path.clone();
     // Structural guard, deliberately a hard assert rather than a log: planning
     // selects, keys, and submits checks that this exact commit declared. If a
     // future edit reintroduces a second contract source, this fails visibly here
@@ -4583,6 +4832,28 @@ async fn run_write_checks_after_seal_inner(
             "db-change",
             serde_json::json!({"table": "check_result_cache", "action": "invalidate"}),
         );
+        // The branch moved while this wave ran (the caller may have answered
+        // pending and committed again), so the fix merged onto a newer head.
+        // Re-verifying there is only meaningful under the contract this wave
+        // planned with; if that commit changed the contract, its own cadence
+        // owns its verdicts and this wave records none.
+        if !published.landed_on_tested_base {
+            let same_contract =
+                load_checks_contract_at_commit(&object_repository, &published.commit)
+                    .await
+                    .is_some_and(|at_fix| {
+                        at_fix.contract.checks == checks
+                            && at_fix.contract.extra_inputs == extra_inputs
+                    });
+            if !same_contract {
+                return Some(format!(
+                    "Checks: \u{22EF} superseded \u{2014} the branch advanced before this wave's fix landed. \
+                     The fix merged onto the newer head as {}, which declares different checks, so this \
+                     wave records no verdicts. Read cairn:~/checks for the branch's current verdicts.",
+                    published.commit.get(..12).unwrap_or(&published.commit)
+                ));
+            }
+        }
         let rekeyed = rekey_wave_onto_fix(
             orch,
             WriteCheckBatchRequest {
@@ -4600,6 +4871,8 @@ async fn run_write_checks_after_seal_inner(
             },
             cwd,
             &published.paths,
+            &published.commit,
+            published.landed_on_tested_base,
         )
         .await;
         let rekeyed = match rekeyed {
@@ -4954,11 +5227,17 @@ type Replan = (Vec<(CheckPlan, String)>, Vec<usize>, String);
 /// slot admission and one execution per check. A fix that no declared fixer
 /// explains, or a check that was answered from the cache before the fix touched
 /// its inputs, falls back to running that check once against the fixed commit.
+///
+/// Planning is bound to `fixed_commit`, the commit the fix was published as,
+/// never to whatever the branch head is by the time this runs: a detached wave
+/// can outlive several later commits.
 async fn rekey_wave_onto_fix(
     orch: &Orchestrator,
     wave: WriteCheckBatchRequest<'_>,
     cwd: &str,
     fixed_paths: &[String],
+    fixed_commit: &str,
+    fix_landed_on_tested_base: bool,
 ) -> Result<FixedWave, String> {
     let logical = crate::mcp::handlers::branch::resolve_current_for_read(
         orch,
@@ -4990,7 +5269,7 @@ async fn rekey_wave_onto_fix(
     let fixed_paths = fixed_paths.to_vec();
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let repository = logical.repository_path.clone();
-    let head = logical.commit_id.clone();
+    let head = fixed_commit.to_string();
     let base = live_base.unwrap_or(logical.default_commit_id);
     let planning_head = head.clone();
     let planning_repository = repository.clone();
@@ -5033,6 +5312,7 @@ async fn rekey_wave_onto_fix(
                     &tree_hash,
                 );
                 if verdict_survives_fix(
+                    fix_landed_on_tested_base,
                     executed.contains(&index),
                     attributed,
                     superseded.contains(&index),
@@ -5889,8 +6169,11 @@ pub(crate) fn check_result_key(
 ///
 /// Every party asking "which verdict answers this check at this head?" must ask
 /// it with the same key: the write and review cadences when they decide whether
-/// to run or reuse, a manual run, and the `/checks` projection when it decides
-/// what a lane shows. When the projection keyed on the whole tree instead, a lane
+/// to run or reuse, and the `/checks` projection when it decides what a lane
+/// shows. A manual run of a placeholder-free check lands on this key too; a
+/// manual or main-health run of a SELECTOR check does not, because it executes
+/// the whole suite and execution breadth is evidence identity (see
+/// `manual_check_plan`). When the projection keyed on the whole tree instead, a lane
 /// answered by reuse — which records only a commit alias, and leaves the cache row
 /// on whichever tree last wrote that input hash — rendered `pending` over a
 /// stored verdict.
@@ -8337,6 +8620,235 @@ mod tests {
         );
     }
 
+    fn ignore_late(_summary: String) -> std::future::Ready<()> {
+        std::future::ready(())
+    }
+
+    /// After the call answered pending, the wave's final word may exist nowhere
+    /// else: a fold conflict, say, with the patch the agent needs to replay. It
+    /// must reach the late-delivery path rather than be dropped with the handle.
+    #[tokio::test]
+    async fn a_wave_that_fails_after_answering_pending_delivers_its_outcome() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (delivered_tx, delivered) = tokio::sync::oneshot::channel::<String>();
+        let fold_failure =
+            "Checks: \u{2717} write-check fold (conflict in src/a.rs)\n```diff\n-x\n+y\n```";
+
+        let summary = await_write_check_wave(
+            guard,
+            std::time::Duration::from_millis(20),
+            async move {
+                let _ = released.await;
+                Some(fold_failure.to_string())
+            },
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        )
+        .await
+        .unwrap();
+        assert!(summary.contains("pending"), "{summary}");
+
+        release.send(()).unwrap();
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), delivered)
+            .await
+            .expect("the late outcome must be delivered")
+            .unwrap();
+        assert_eq!(late, fold_failure);
+        let message = late_write_check_message(&late);
+        assert!(message.contains("conflict in src/a.rs"), "{message}");
+        assert!(message.contains("cairn:~/checks"), "{message}");
+    }
+
+    /// The handoff race: the outcome is buffered in the caller's receiver, and
+    /// the caller is cancelled before it ever polls it. The buffered value dies
+    /// with the receiver, so the supervisor must not count the successful send
+    /// as delivery; without a receipt it delivers late, exactly once.
+    #[tokio::test]
+    async fn an_outcome_buffered_for_a_caller_cancelled_before_reading_it_is_delivered_late() {
+        let (offer, inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let fold_failure = "Checks: \u{2717} write-check fold (conflict in src/a.rs)";
+        let supervisor = tokio::spawn(hand_off_wave_outcome(
+            offer,
+            Some(fold_failure.to_string()),
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        ));
+        // Current-thread runtime: one yield runs the supervisor up to its wait
+        // for the receipt, so the outcome is now buffered and unread.
+        tokio::task::yield_now().await;
+        assert!(!supervisor.is_finished(), "the supervisor awaits a receipt");
+        drop(inline);
+
+        supervisor.await.unwrap();
+        assert_eq!(delivered.recv().await.as_deref(), Some(fold_failure));
+        assert!(delivered.recv().await.is_none(), "delivered exactly once");
+    }
+
+    /// The ordinary path: the caller claims the outcome, and nothing is
+    /// delivered late.
+    #[tokio::test]
+    async fn a_claimed_outcome_is_not_also_delivered_late() {
+        let (offer, inline) = tokio::sync::oneshot::channel::<OfferedOutcome>();
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let supervisor = tokio::spawn(hand_off_wave_outcome(
+            offer,
+            Some("Checks: \u{2713} fmt".to_string()),
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        ));
+        let claimed = claim_offered_outcome(inline.await.unwrap());
+        assert_eq!(claimed.as_deref(), Some("Checks: \u{2713} fmt"));
+        supervisor.await.unwrap();
+        assert!(delivered.recv().await.is_none());
+    }
+
+    /// A wave that answered inside the bound has nothing late to deliver.
+    #[tokio::test]
+    async fn a_wave_that_settles_in_time_delivers_nothing_late() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (delivered_tx, mut delivered) = tokio::sync::oneshot::channel::<String>();
+        await_write_check_wave(
+            guard,
+            std::time::Duration::from_secs(5),
+            async { Some("Checks: \u{2713} fmt".to_string()) },
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert!(delivered.try_recv().is_err());
+    }
+
+    /// A wave that never settles (no lane placed, a hung command) must not hold
+    /// the committing call open: it answers at the bound with the checks pending,
+    /// and the still-running wave keeps the job's checks reported as moving.
+    #[tokio::test]
+    async fn a_write_check_wave_that_never_settles_returns_pending_at_the_bound() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let bound = std::time::Duration::from_millis(50);
+
+        let summary = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            await_write_check_wave(
+                guard,
+                bound,
+                std::future::pending::<Option<String>>(),
+                ignore_late,
+            ),
+        )
+        .await
+        .expect("the committing call must answer within the bound, not when checks settle")
+        .expect("a pending wave still reports a checks line");
+
+        assert!(summary.starts_with("Checks: "), "{summary}");
+        assert!(summary.contains("pending"), "{summary}");
+        assert!(summary.contains("the commit above landed"), "{summary}");
+        assert!(summary.contains("cairn:~/checks"), "{summary}");
+        assert!(
+            orch.write_checks_in_flight("job-a"),
+            "the detached wave still runs, so /checks must keep reporting it in flight",
+        );
+    }
+
+    /// A wave that settles inside the bound returns its verdict line unchanged,
+    /// and its in-flight state clears with it.
+    #[tokio::test]
+    async fn a_write_check_wave_that_settles_in_time_returns_its_verdicts() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+
+        let summary = await_write_check_wave(
+            guard,
+            std::time::Duration::from_secs(5),
+            async { Some("Checks: \u{2713} rust-fmt (0.4s)".to_string()) },
+            ignore_late,
+        )
+        .await;
+
+        assert_eq!(summary.as_deref(), Some("Checks: \u{2713} rust-fmt (0.4s)"));
+        assert!(!orch.write_checks_in_flight("job-a"));
+    }
+
+    /// Dropping the caller before the bound (a transport timeout, an interrupt)
+    /// must not cancel checks for a commit that already landed, and must not
+    /// lose what the wave finally says: the outcome reaches late delivery
+    /// exactly once, and only then does the job's in-flight state clear.
+    #[tokio::test]
+    async fn dropping_the_caller_leaves_the_write_check_wave_running() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let guard = WriteChecksInFlightGuard::new(&orch, "job-a");
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (delivered_tx, mut delivered) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let fold_failure =
+            "Checks: \u{2717} write-check fold (non-convergent: verification mutated again)";
+
+        let caller = tokio::spawn(await_write_check_wave(
+            guard,
+            std::time::Duration::from_secs(60),
+            async move {
+                let _ = released.await;
+                Some(fold_failure.to_string())
+            },
+            move |late: String| async move {
+                let _ = delivered_tx.send(late);
+            },
+        ));
+        tokio::task::yield_now().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(orch.write_checks_in_flight("job-a"));
+
+        release.send(()).unwrap();
+        let late = tokio::time::timeout(std::time::Duration::from_secs(5), delivered.recv())
+            .await
+            .expect("the outcome of a wave whose caller is gone must still be delivered")
+            .expect("one delivery");
+        assert_eq!(late, fold_failure);
+        assert!(
+            delivered.recv().await.is_none(),
+            "the outcome is delivered exactly once"
+        );
+        for _ in 0..100 {
+            if !orch.write_checks_in_flight("job-a") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the finished wave must release the job's in-flight state");
+    }
+
+    #[test]
+    fn the_inline_write_check_wait_sits_inside_the_write_callback_contract() {
+        let write = cairn_common::protocol::CallbackRequest {
+            thread_id: None,
+            cwd: "/tmp".into(),
+            run_id: None,
+            tool: "write".into(),
+            payload: serde_json::json!({ "changes": [{ "target": "file:a", "mode": "create" }] }),
+            tool_use_id: None,
+        };
+        let cairn_common::callback_contract::HostAnswerBound::Bounded(host) =
+            cairn_common::callback_contract::host_answer_bound(&write)
+        else {
+            panic!("a plain write has a bounded host answer");
+        };
+        assert!(host >= WRITE_CHECK_INLINE_WAIT);
+    }
+
     fn git(repo: &Path, args: &[&str]) -> String {
         let output = Command::new("git")
             .args(args)
@@ -8449,19 +8961,15 @@ mod tests {
             };
             let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
             let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
-            let check = checks.get("sealed").unwrap();
-            let input_hash = check_result_key(
-                check,
-                inputs.for_check("sealed"),
+            let (plan, input_hash) = manual_check_plan(
+                &checks,
+                &inputs,
                 entries.as_deref(),
                 &tree_hash,
-                &check_platform_identity(),
-                check_toolchain_identity(),
-            );
-            let plan = plan_checks(&checks, &inputs, &[], repo)
-                .into_iter()
-                .find(|plan| plan.name == "sealed")
-                .expect("sealed check is planned from the sealed contract");
+                "sealed",
+                repo,
+            )
+            .expect("sealed check is planned from the sealed contract");
             (defined_by_commit, tree_hash, input_hash, plan)
         }
 
@@ -8558,6 +9066,290 @@ mod tests {
                 .is_none(),
             "loose-derived identity was never persisted"
         );
+    }
+
+    /// A selector check's runner, standing in for `test-rust-nextest.ts related`:
+    /// handed the literal `{changedFiles}` it selects nothing (the token names no
+    /// file), and handed its whole-suite flag it runs and passes a test.
+    const SELECTOR_FIXTURE_SCRIPT: &str = r#"if [ "$1" = "--all" ]; then
+  echo 'running the whole suite'
+  echo 'CAIRN_CHECK_RESULT_JSON={"schemaVersion":1,"parser":"nextest","complete":true,"selection":"full","undeclaredSkips":0,"tests":[{"id":"fixture sel::passes","status":"passed","attempts":1,"retried":false,"flaky":false}]}'
+else
+  echo "no tests selected for $1"
+  echo 'CAIRN_CHECK_RESULT_JSON={"schemaVersion":1,"parser":"nextest","complete":true,"selection":"empty","undeclaredSkips":0,"tests":[]}'
+fi
+"#;
+
+    /// A manual run of a selector check executes real tests. Planned against an
+    /// empty change set, the configured command used to reach the shell with its
+    /// placeholder unexpanded, so the runner selected nothing and every manual
+    /// verdict was recorded as an empty, non-reusable selection.
+    #[tokio::test]
+    async fn manual_selector_check_executes_its_whole_suite_with_nonzero_tests() {
+        let temp = TempDir::new().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (repo, _) = committed_git_repo(&temp);
+        std::fs::write(repo.join("sel.sh"), SELECTOR_FIXTURE_SCRIPT).unwrap();
+        std::fs::create_dir_all(repo.join(".cairn")).unwrap();
+        std::fs::write(
+            repo.join(".cairn/config.yaml"),
+            "checks:\n  selected:\n    command: sh sel.sh {changedFiles}\n    fullCommand: sh sel.sh --all\n    impact:\n      - sel.sh\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "sel.sh", ".cairn/config.yaml"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Cairn Test",
+                "-c",
+                "user.email=test@cairn.local",
+                "commit",
+                "-q",
+                "-m",
+                "selector check",
+            ],
+        );
+        let commit = git(&repo, &["rev-parse", "HEAD"]);
+        let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+        let CommitChecksContract {
+            contract:
+                ChecksContract {
+                    checks,
+                    extra_inputs,
+                },
+            defined_by_commit,
+        } = load_checks_contract_at_commit(&repo, &commit)
+            .await
+            .expect("the commit declares the selector check");
+        let tree_hash = crate::jj::logical_tree_hash(&jj, &repo, &commit).unwrap();
+        let entries = crate::jj::tree_entries(&jj, &repo, &commit).ok();
+        let blobs = TreeBlobs {
+            jj: &jj,
+            repository: &repo,
+        };
+        let snapshot = TreeSnapshot::new(entries.as_deref(), &blobs);
+        let inputs = ResolvedInputs::resolve(&checks, &extra_inputs, &snapshot);
+        let (plan, key) = manual_check_plan(
+            &checks,
+            &inputs,
+            entries.as_deref(),
+            &tree_hash,
+            "selected",
+            &repo,
+        )
+        .expect("a selector check is runnable manually");
+
+        let db = cache_db().await;
+        let coordinates = vec![crate::execution::cache::SealedCheckCoordinate::new(
+            &commit,
+            &defined_by_commit,
+            &tree_hash,
+            &key,
+        )];
+        let plans = vec![(plan, key)];
+        let workdir = repo.clone();
+        let outcomes = run_planned_checks_at_commit_with_coordinates(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: &commit,
+                defined_by: &defined_by_commit,
+            },
+            &tree_hash,
+            "job-a",
+            &plans,
+            &coordinates,
+            &head_infra_scopes(plans.len(), "job-a", &commit),
+            "manual-check:selected",
+            CheckExecMode::Shared,
+            None,
+            move |_index, command, _stream_id| {
+                let workdir = workdir.clone();
+                async move {
+                    let output = Command::new("sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .current_dir(&workdir)
+                        .output()
+                        .expect("fixture command spawns");
+                    exec_ok(
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stdout).into_owned(),
+                    )
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        let outcome = &outcomes[0];
+        let parsed = outcome
+            .parsed
+            .as_ref()
+            .expect("the fixture runner emits a structured result");
+        assert_ne!(
+            parsed.selection, "empty",
+            "a manual run must not execute the raw placeholder: {}",
+            outcome.output_tail
+        );
+        assert!(parsed.tests_run() > 0, "{}", outcome.output_tail);
+        assert!(outcome.passed, "{}", outcome.output_tail);
+        let recorded = outcome
+            .recorded
+            .as_ref()
+            .expect("the manual verdict is recorded");
+        assert!(
+            recorded.reusable,
+            "a whole-suite pass is reusable evidence: {:?}",
+            outcome.not_recorded
+        );
+    }
+
+    fn rust_tests_shaped_checks() -> HashMap<String, CheckCommand> {
+        let mut configured = check(
+            "bun run test:rust {changedFiles}",
+            Some(&["src-tauri/**"]),
+            CheckWhen::Review,
+        );
+        configured.full_command = Some("bun run test:rust:full".to_string());
+        HashMap::from([("rust-tests".to_string(), configured)])
+    }
+
+    /// A manual run evaluates a sealed tree the way main-health does: it runs the
+    /// whole suite and keys the verdict by the command it executed, so a manual
+    /// `--branch main` run and a main-health run of the same tree answer each
+    /// other, while a turn-end partial verdict never answers for either.
+    #[test]
+    fn manual_rust_tests_plan_runs_the_whole_suite() {
+        let checks = rust_tests_shaped_checks();
+        let resolved = inputs(&checks);
+        let entries = [(
+            "src-tauri/os/cairn-core/src/lib.rs".to_string(),
+            "blob".to_string(),
+        )];
+        let temp = TempDir::new().unwrap();
+        let (plan, key) = manual_check_plan(
+            &checks,
+            &resolved,
+            Some(&entries),
+            "tree",
+            "rust-tests",
+            temp.path(),
+        )
+        .expect("rust-tests is runnable manually");
+        assert_eq!(plan.command, "bun run test:rust:full");
+        assert_eq!(plan.scope, CheckScope::Full);
+        assert!(plan.config_error.is_none());
+
+        let (_, main_health_key) = key_review_tree_plans(
+            vec![plan.clone()],
+            &checks,
+            &resolved,
+            &entries,
+            "tree",
+            &check_platform_identity(),
+            check_toolchain_identity(),
+        )
+        .pop()
+        .unwrap();
+        assert_eq!(key, main_health_key, "one sealed-tree evaluation, one key");
+        assert_ne!(
+            key,
+            check_input_hash(
+                &checks["rust-tests"],
+                resolved.for_check("rust-tests"),
+                Some(&entries),
+                "tree",
+            ),
+            "execution breadth is evidence identity"
+        );
+    }
+
+    /// A command with two selectors has no whole-suite form, so a manual run
+    /// refuses it as unrunnable instead of executing a leftover literal.
+    #[test]
+    fn manual_run_refuses_a_command_with_two_selectors() {
+        let temp = TempDir::new().unwrap();
+        let configured = check(
+            "tool {targets} {changedFiles}",
+            Some(&["src-tauri/**"]),
+            CheckWhen::Review,
+        );
+        let checks = HashMap::from([("mixed".to_string(), configured)]);
+        let error = manual_check_plan(
+            &checks,
+            &inputs(&checks),
+            None,
+            "tree",
+            "mixed",
+            temp.path(),
+        )
+        .expect_err("two selectors have no whole-suite form");
+        assert!(error.contains("is unrunnable"), "{error}");
+    }
+
+    /// A selector check that cannot narrow executes its `fullCommand`, so that
+    /// command keys the verdict: editing it alone must not let a verdict of the
+    /// old command answer for the new one.
+    #[test]
+    fn full_command_is_part_of_a_checks_identity() {
+        let key = |full: Option<&str>| {
+            let mut configured = check(
+                "bun run test:rust {changedFiles}",
+                Some(&["src-tauri/**"]),
+                CheckWhen::Review,
+            );
+            configured.full_command = full.map(str::to_string);
+            check_result_key(
+                &configured,
+                &selector(&configured),
+                None,
+                "tree",
+                TEST_PLATFORM,
+                TEST_TOOLCHAIN,
+            )
+        };
+        assert_ne!(key(Some("tool full-a")), key(Some("tool full-b")));
+        assert_ne!(key(None), key(Some("tool full-a")));
+        assert_eq!(key(Some("tool full-a")), key(Some("tool full-a")));
+    }
+
+    /// For a placeholder-free check the executed command IS the configured one,
+    /// so the manual key stays byte-identical to the lane key and no stored
+    /// verdict is orphaned.
+    #[test]
+    fn manual_key_is_unchanged_for_placeholder_free_checks() {
+        let entries = [(
+            "src-tauri/os/cairn-core/src/lib.rs".to_string(),
+            "blob".to_string(),
+        )];
+        let temp = TempDir::new().unwrap();
+        for impact in [Some(&["src-tauri/**/*.rs"][..]), None] {
+            let configured = check("cargo test", impact, CheckWhen::Review);
+            let checks = HashMap::from([("rust".to_string(), configured.clone())]);
+            let resolved = inputs(&checks);
+            let (plan, key) = manual_check_plan(
+                &checks,
+                &resolved,
+                Some(&entries),
+                "tree",
+                "rust",
+                temp.path(),
+            )
+            .expect("a placeholder-free check is runnable manually");
+            assert_eq!(plan.command, "cargo test");
+            assert_eq!(
+                key,
+                check_input_hash(
+                    &configured,
+                    resolved.for_check("rust"),
+                    Some(&entries),
+                    "tree"
+                ),
+                "impact {impact:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10637,7 +11429,7 @@ cairn-common = { path = "../cairn-common" }
         for (plan, key_before) in &keyed {
             let key_after = format!("key-after-{}", plan.name);
             assert!(
-                verdict_survives_fix(true, true, false, key_before, &key_after),
+                verdict_survives_fix(true, true, true, false, key_before, &key_after),
                 "{} must not run again against a fix it already saw",
                 plan.name
             );
@@ -10649,18 +11441,54 @@ cairn-common = { path = "../cairn-common" }
         // Answered from the cache BEFORE the fix: it never saw the fixed tree, so
         // its verdict cannot be keyed onto it. Re-verifying is the only honest
         // answer; re-keying it would be exactly the false green this forbids.
-        assert!(!verdict_survives_fix(false, true, false, "before", "after"));
+        assert!(!verdict_survives_fix(
+            true, false, true, false, "before", "after"
+        ));
         // Unless the fix left its inputs alone — the same argument the result
         // cache itself rests on.
-        assert!(verdict_survives_fix(false, true, false, "same", "same"));
+        assert!(verdict_survives_fix(
+            true, false, true, false, "same", "same"
+        ));
         // An unattributed fix invalidates even a check that ran: something else
         // rewrote the tree mid-wave and nothing proves this check saw it.
-        assert!(!verdict_survives_fix(true, false, false, "before", "after"));
+        assert!(!verdict_survives_fix(
+            true, true, false, false, "before", "after"
+        ));
         // A fixer another fixer ran after cannot carry: it never saw the output
         // that landed, however well the fold is attributed.
-        assert!(!verdict_survives_fix(true, true, true, "before", "after"));
+        assert!(!verdict_survives_fix(
+            true, true, true, true, "before", "after"
+        ));
         // Unless the later fixer left its inputs alone.
-        assert!(verdict_survives_fix(true, true, true, "same", "same"));
+        assert!(verdict_survives_fix(true, true, true, true, "same", "same"));
+    }
+
+    /// Wave A answered pending, the agent committed B, and A's formatter fix
+    /// then merged onto B. A's suite passed on A's tree; nothing ran B's code.
+    /// That pass must not become B+fix's green: it carries only if B+fix left
+    /// the suite's inputs exactly as A had them.
+    #[test]
+    fn a_fix_merged_onto_a_newer_head_carries_no_executed_verdict() {
+        assert!(!verdict_survives_fix(
+            false,
+            true,
+            true,
+            false,
+            "a-tree",
+            "b-plus-fix"
+        ));
+        assert!(verdict_survives_fix(
+            false, true, true, false, "same", "same"
+        ));
+        // The same pass carries when the fix landed on the tree it ran against.
+        assert!(verdict_survives_fix(
+            true,
+            true,
+            true,
+            false,
+            "a-tree",
+            "a-plus-fix"
+        ));
     }
 
     #[test]
@@ -10748,11 +11576,12 @@ cairn-common = { path = "../cairn-common" }
         let fixers: Vec<&InputSelector> = resolved.iter().collect();
         assert!(fix_is_attributed_to_declared_fixers(&fixed, &fixers));
         assert!(
-            !verdict_survives_fix(true, true, superseded.contains(&0), "p", "p-after"),
+            !verdict_survives_fix(true, true, true, superseded.contains(&0), "p", "p-after"),
             "a green prettier verdict must not be keyed to a tree eslint rewrote"
         );
         // The other two are proven by ordering and carry as before.
         assert!(verdict_survives_fix(
+            true,
             true,
             true,
             superseded.contains(&1),
@@ -10760,6 +11589,7 @@ cairn-common = { path = "../cairn-common" }
             "e-after"
         ));
         assert!(verdict_survives_fix(
+            true,
             true,
             true,
             superseded.contains(&2),
@@ -10799,7 +11629,7 @@ cairn-common = { path = "../cairn-common" }
             &[&selector(&checks["fmt"])]
         ));
         assert!(
-            verdict_survives_fix(true, true, false, "key-before", "key-after"),
+            verdict_survives_fix(true, true, true, false, "key-before", "key-after"),
             "re-checking a fixer against its own output is the loop this removes"
         );
     }

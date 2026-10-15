@@ -471,6 +471,21 @@ fn the_cli_resume_miss_is_recognized_on_stderr() {
 }
 
 #[test]
+fn the_cli_session_id_collision_is_recognized_on_stderr() {
+    // Verbatim from the runner log that opened cairn/4978.
+    assert!(stderr_reports_session_id_in_use(
+        "Error: Session ID 30fb0390-c508-4345-b87a-fd0f2f10f1b5 is already in use."
+    ));
+    // A resume miss and an ordinary mention are different facts.
+    assert!(!stderr_reports_session_id_in_use(
+        "No conversation found with session ID: 30fb0390-c508-4345-b87a-fd0f2f10f1b5"
+    ));
+    assert!(!stderr_reports_session_id_in_use(
+        "Resuming session ID: 30fb0390-c508-4345-b87a-fd0f2f10f1b5"
+    ));
+}
+
+#[test]
 fn stream_evidence_starts_empty() {
     let evidence = StreamEvidence::default();
     assert!(!evidence.saw_terminal_result);

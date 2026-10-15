@@ -59,6 +59,14 @@ macro_rules! private_account_credential_events {
     };
 }
 
+/// cairn/4978: a thread compaction trigger for a session whose first launch
+/// never confirmed. Rebuilds the private-only `thread_compactions` table.
+macro_rules! private_thread_compaction_unconfirmed_start_trigger {
+    () => {
+        migration!("0251_thread_compaction_unconfirmed_start_trigger")
+    };
+}
+
 /// Immutable ordinary-session launch inputs waiting in runner-local admission.
 macro_rules! private_prepared_ordinary_launches {
     () => {
@@ -1531,6 +1539,7 @@ macro_rules! private_lineage {
             shared_tail_post_feed_watch_as_fact_clause!(),
             private_account_credential_events!(),
             shared_tail_permission_resume_error!(),
+            private_thread_compaction_unconfirmed_start_trigger!(),
         ]
     };
 }
@@ -3176,6 +3185,7 @@ mod tests {
                 "post_feed_watch_as_fact_clause",
                 "account_credential_events",
                 "permission_resume_error",
+                "thread_compaction_unconfirmed_start_trigger",
             ]
         );
         assert_eq!(

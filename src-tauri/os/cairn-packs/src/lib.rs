@@ -1,8 +1,8 @@
 //! Resource packs: the unit of offering and installing Cairn resources.
 //!
 //! A pack is a **source-side** grouping. Installing one copies its contents into
-//! the flat `~/.cairn` layout (`agents/`, `recipes/`, `responses/`, `skills/`,
-//! `workflows/`) that discovery and global ids already assume — packs do not
+//! the flat `~/.cairn` layout (`agents/`, `recipes/`, `responses/`, `routes/`,
+//! `skills/`, `workflows/`) that discovery and global ids already assume — packs do not
 //! namespace what they install. That is what makes repacking the shipped tree a
 //! pure file move: an existing workspace's files already sit at exactly the
 //! paths a pack-aware sync would write, so the migration writes nothing.
@@ -73,7 +73,10 @@ pub fn hash_item_path(kind: PackItemKind, root: &Path, path: &Path) -> Result<Co
     match kind {
         PackItemKind::Skill | PackItemKind::Workflow => hash_tree(path),
         PackItemKind::Mcp => Err("MCP items must be hashed from their server definition".into()),
-        PackItemKind::Agent | PackItemKind::Recipe | PackItemKind::Response => {
+        PackItemKind::Agent
+        | PackItemKind::Recipe
+        | PackItemKind::Response
+        | PackItemKind::Route => {
             if !path.exists() {
                 return Ok(ContentHash::Missing);
             }
@@ -110,11 +113,18 @@ fn canonical_json(value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Content directories a pack may ship, and the exact subtrees a workspace
-/// install materializes. Flat dirs (`agents`, `recipes`, `responses`) are
-/// per-file copy-when-missing with in-place pack updates; package dirs
+/// install materializes. Flat dirs (`agents`, `recipes`, `responses`, `routes`)
+/// are per-file copy-when-missing with in-place pack updates; package dirs
 /// (`skills`, `workflows`) are whole-directory copy-when-missing and never
 /// overwritten, so a user's edited package is preserved.
-pub const CONTENT_DIRS: [&str; 5] = ["agents", "recipes", "responses", "skills", "workflows"];
+pub const CONTENT_DIRS: [&str; 6] = [
+    "agents",
+    "recipes",
+    "responses",
+    "routes",
+    "skills",
+    "workflows",
+];
 
 /// Subdirectory of the app's resource directory holding shipped packs.
 pub const PACKS_SOURCE_DIR: &str = "packs";

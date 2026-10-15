@@ -248,6 +248,14 @@ pub trait AgentBackend: Send + Sync {
     /// Whether this backend supports session resume (--resume)
     fn supports_resume(&self) -> bool;
 
+    /// Whether a fresh start hands the provider Cairn's own session id as the
+    /// conversation's id. Such a provider creates the conversation under that
+    /// id at launch, before Cairn confirms a handle, and refuses the same id on
+    /// a second fresh start — so an unconfirmed launch cannot simply be retried.
+    fn fresh_start_claims_session_id(&self) -> bool {
+        false
+    }
+
     /// Whether this backend supports warm process retention
     fn supports_warm_processes(&self) -> bool;
 
@@ -327,19 +335,30 @@ mod backend_failure_tests {
 
     #[test]
     fn exit_reason_round_trips() {
-        let failure = BackendFailure::SessionUnresolvable;
-        assert_eq!(failure.exit_reason(), "session_unresolvable");
-        assert_eq!(
-            BackendFailure::from_exit_reason(failure.exit_reason()),
-            Some(failure)
-        );
+        for (failure, token) in [
+            (BackendFailure::SessionUnresolvable, "session_unresolvable"),
+            (BackendFailure::SessionIdInUse, "session_id_in_use"),
+            (BackendFailure::StartupRejected, "session_start_rejected"),
+        ] {
+            assert_eq!(failure.exit_reason(), token);
+            assert_eq!(
+                BackendFailure::from_exit_reason(failure.exit_reason()),
+                Some(failure)
+            );
+        }
     }
 
     #[test]
     fn existing_exit_reasons_are_not_backend_failures() {
         // `runs.exit_reason` is a shared column; the tokens other paths write
         // must never be read back as a backend diagnosis.
-        for reason in ["capacity_retry", "turn_failed", "", "session unresolvable"] {
+        for reason in [
+            "capacity_retry",
+            "turn_failed",
+            "crash",
+            "",
+            "session unresolvable",
+        ] {
             assert_eq!(
                 BackendFailure::from_exit_reason(reason),
                 None,

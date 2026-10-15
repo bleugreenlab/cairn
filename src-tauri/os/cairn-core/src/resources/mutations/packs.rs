@@ -171,7 +171,7 @@ fn stage_plugin_snapshot(
 
     // Project the extension into the canonical flat source layout consumed by
     // the existing synchronizer. The original portable tree remains intact.
-    for dir in ["agents", "recipes", "responses", "workflows"] {
+    for dir in ["agents", "recipes", "responses", "routes", "workflows"] {
         let source = stage
             .path()
             .join(pack::agent_plugin::CAIRN_EXTENSION)
@@ -627,6 +627,9 @@ pub fn apply_pack_item_removal(
         PackItemKind::Response => {
             crate::config::responses::delete_response(config_dir, item_id, None)?;
         }
+        PackItemKind::Route => {
+            crate::config::routes::delete_route(config_dir, item_id, None)?;
+        }
         PackItemKind::Workflow => {
             crate::config::workflows::delete_workflow(config_dir, item_id, None)?
         }
@@ -743,6 +746,10 @@ mod tests {
         resources.join("packs").join(id)
     }
 
+    /// A loadable, enabled route, so the routing worker's cached route set
+    /// actually holds it.
+    const PING_ROUTE: &str = "name: Ping\ndescription: fixture route\nenabled: true\nnodes:\n  - id: in\n    type: trigger\n    when: { fact: github_comment }\n  - id: out\n    type: sink\n    sink: { kind: issue, labels: [x] }\nedges:\n  - { from: in, to: out }\n";
+
     /// A `core` pack carrying one of every file-backed kind, plus an optional
     /// `matlab` pack whose only content is a connector — between them every
     /// `PackItemKind` is represented.
@@ -755,6 +762,7 @@ mod tests {
         write(&core.join("agents/explore.md"), "bundle agent\n");
         write(&core.join("recipes/default.yaml"), "name: default\n");
         write(&core.join("responses/conveyor.md"), "response\n");
+        write(&core.join("routes/ping.yaml"), PING_ROUTE);
         write(
             &core.join("skills/example/SKILL.md"),
             "---\nname: Example\ndescription: Example skill\n---\n",
@@ -826,7 +834,7 @@ mod tests {
         let ws = workspace().await;
         apply_pack_action(&ws.orch, "install", "matlab").unwrap();
 
-        let cases: [(&str, PackItemKind, &str, &str); 6] = [
+        let cases: [(&str, PackItemKind, &str, &str); 7] = [
             ("core", PackItemKind::Agent, "explore", "agents/explore.md"),
             (
                 "core",
@@ -840,6 +848,7 @@ mod tests {
                 "conveyor",
                 "responses/conveyor.md",
             ),
+            ("core", PackItemKind::Route, "ping", "routes/ping.yaml"),
             ("core", PackItemKind::Skill, "example", "skills/example"),
             ("core", PackItemKind::Workflow, "flow", "workflows/flow"),
             ("matlab", PackItemKind::Mcp, "matlab", ""),
@@ -880,6 +889,7 @@ mod tests {
             "agents/explore.md",
             "recipes/default.yaml",
             "responses/conveyor.md",
+            "routes/ping.yaml",
             "skills/example/SKILL.md",
             "workflows/flow/workflow.yaml",
         ] {
@@ -894,6 +904,76 @@ mod tests {
                 item_state(&ws, pack_id, kind.as_str(), id),
                 Some(PackItemState::PackOwned),
                 "restored {kind:?} `{id}` in pack `{pack_id}` must return to pack ownership"
+            );
+        }
+    }
+
+    /// The routing worker caches each scope's route set. A pack mutation must
+    /// drop that cache when it lands, not when the cache ages out: a removed
+    /// route that kept firing would still run its sinks, and a restored one
+    /// would leave facts unmatched in between.
+    #[tokio::test]
+    async fn pack_mutations_invalidate_the_cached_route_set_immediately() {
+        let ws = workspace().await;
+        let cached = |ws: &Workspace| {
+            ws.orch
+                .fact_log
+                .index
+                .routes(&ws.orch.config_dir, None)
+                .unwrap()
+                .routes_for("github_comment")
+                .count()
+        };
+        assert_eq!(cached(&ws), 1, "the shipped route is loaded and cached");
+
+        apply_pack_item_removal(&ws.orch, "core", PackItemKind::Route, "ping").unwrap();
+        assert_eq!(cached(&ws), 0, "a removed route must stop matching at once");
+
+        apply_pack_action(&ws.orch, "restore", "core").unwrap();
+        assert_eq!(cached(&ws), 1, "a restored route must match at once");
+    }
+
+    /// Deleting a shipped route or response through its `cairn://` resource is a
+    /// user removal like any other: the next pack sync must not copy it back.
+    #[tokio::test]
+    async fn a_resource_delete_of_a_shipped_item_survives_the_next_sync() {
+        let ws = workspace().await;
+        let request = crate::mcp::types::McpCallbackRequest {
+            cwd: "/empty/scratch".to_string(),
+            run_id: None,
+            tool: "write".to_string(),
+            payload: serde_json::Value::Null,
+            tool_use_id: None,
+            thread_id: None,
+        };
+        let events_before = pack_events(&ws);
+        super::super::routes::delete(&ws.orch, &request, "ping", None, false)
+            .await
+            .unwrap();
+        super::super::responses::delete(&ws.orch, &request, "conveyor", None)
+            .await
+            .unwrap();
+        assert_eq!(pack_events(&ws), events_before + 2);
+
+        sync_workspace_packs(
+            &RealGitClient,
+            &RealFileSystem,
+            &ws.resources,
+            &ws.home,
+            "1.0.1",
+        )
+        .unwrap();
+        for (kind, id, path) in [
+            ("route", "ping", "routes/ping.yaml"),
+            ("response", "conveyor", "responses/conveyor.md"),
+        ] {
+            assert!(
+                !ws.home.join(path).exists(),
+                "the sync must not copy back {path}"
+            );
+            assert_eq!(
+                item_state(&ws, "core", kind, id),
+                Some(PackItemState::RemovedByUser)
             );
         }
     }
@@ -1138,7 +1218,7 @@ mod tests {
         assert_eq!(core.source.kind, "bundled");
         assert_eq!(
             core.counts.iter().map(|c| c.count).sum::<usize>(),
-            5,
+            6,
             "one of every file-backed kind"
         );
 

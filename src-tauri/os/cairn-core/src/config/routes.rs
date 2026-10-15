@@ -1,5 +1,9 @@
 //! Tiered route definition loading. Project definitions shadow workspace
-//! definitions, and bundled definitions are the final fallback.
+//! definitions by filename.
+//!
+//! The routes Cairn ships are core-pack content (`packs/core/routes/`), which
+//! the workspace pack sync materializes into `~/.cairn/routes/`. They are
+//! ordinary workspace files from here on: there is no compiled-in tier.
 
 use super::{id_from_path, ConfigResult};
 use crate::routes::{parse_definition, FactRegistry, RouteDefinition};
@@ -11,26 +15,22 @@ pub struct FileRoute {
     pub id: String,
     pub definition: RouteDefinition,
     pub is_project_scoped: bool,
-    pub file_path: Option<PathBuf>,
+    pub file_path: PathBuf,
 }
-
-const FOLLOWED_ID: &str = "followed-thread-stream";
-const FOLLOWED: &str = include_str!("../../../../routes/followed-thread-stream.yaml");
-const GITHUB_MENTION_ID: &str = "github-mention";
-const GITHUB_MENTION: &str = include_str!("../../../../routes/github-mention.yaml");
 
 pub fn list_routes(
     config_dir: &Path,
     project_path: Option<&Path>,
 ) -> Result<Vec<ConfigResult<FileRoute>>, String> {
-    list_route_dirs(
-        super::config_root_subdirs(config_dir, project_path, "routes"),
-        true,
-    )
+    list_route_dirs(super::config_root_subdirs(
+        config_dir,
+        project_path,
+        "routes",
+    ))
 }
 
 pub fn list_project_routes(project_path: &Path) -> Result<Vec<ConfigResult<FileRoute>>, String> {
-    list_route_dirs(vec![(project_path.join(".cairn/routes"), true)], false)
+    list_route_dirs(vec![(project_path.join(".cairn/routes"), true)])
 }
 
 #[cfg(test)]
@@ -40,10 +40,7 @@ thread_local! {
     pub(crate) static ROUTE_DIR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn list_route_dirs(
-    dirs: Vec<(PathBuf, bool)>,
-    include_bundled: bool,
-) -> Result<Vec<ConfigResult<FileRoute>>, String> {
+fn list_route_dirs(dirs: Vec<(PathBuf, bool)>) -> Result<Vec<ConfigResult<FileRoute>>, String> {
     #[cfg(test)]
     ROUTE_DIR_READS.with(|reads| reads.set(reads.get() + 1));
     let registry = FactRegistry::default();
@@ -71,23 +68,39 @@ fn list_route_dirs(
             }
         }
     }
-    if include_bundled && seen.insert(GITHUB_MENTION_ID.into()) {
-        results.push(ConfigResult::Ok(FileRoute {
-            id: GITHUB_MENTION_ID.into(),
-            definition: parse_definition(GITHUB_MENTION, &registry)?,
-            is_project_scoped: false,
-            file_path: None,
-        }));
-    }
-    if include_bundled && seen.insert(FOLLOWED_ID.into()) {
-        results.push(ConfigResult::Ok(FileRoute {
-            id: FOLLOWED_ID.into(),
-            definition: parse_definition(FOLLOWED, &registry)?,
-            is_project_scoped: false,
-            file_path: None,
-        }));
-    }
     Ok(results)
+}
+
+/// Delete a route from the innermost scope that has it: the project's
+/// `.cairn/routes/` when `project_path` holds one, else the workspace's.
+/// Returns the path that was removed, so the caller can commit it.
+///
+/// A workspace-scope delete records the removal against whichever installed
+/// pack ships the route; without that the next sync copies it back, which is
+/// the same copy-when-missing that seeds a fresh workspace.
+pub fn delete_route(
+    config_dir: &Path,
+    id: &str,
+    project_path: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(project_path) = project_path {
+        let path = project_path
+            .join(".cairn")
+            .join("routes")
+            .join(format!("{id}.yaml"));
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| format!("Failed to delete route file: {e}"))?;
+            return Ok(Some(path));
+        }
+    }
+
+    let path = config_dir.join("routes").join(format!("{id}.yaml"));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete route file: {e}"))?;
+        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Route, id);
+        return Ok(Some(path));
+    }
+    Ok(None)
 }
 
 pub fn get_route(
@@ -134,7 +147,7 @@ fn load(
             id,
             definition,
             is_project_scoped: project,
-            file_path: Some(path.to_owned()),
+            file_path: path.to_owned(),
         }),
         Err(error) => fail(error),
     }
@@ -143,29 +156,102 @@ fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::{RealFileSystem, RealGitClient};
     use tempfile::tempdir;
 
-    #[test]
-    fn bundled_route_is_fallback_and_project_shadows_workspace() {
-        let temp = tempdir().unwrap();
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(project.join(".cairn/routes")).unwrap();
-        std::fs::write(
-            project.join(".cairn/routes/followed-thread-stream.yaml"),
-            FOLLOWED.replace("Followed thread stream", "Project route"),
+    const FOLLOWED_ID: &str = "followed-thread-stream";
+    const GITHUB_MENTION_ID: &str = "github-mention";
+
+    /// A workspace config dir synced from the packs this repository ships, so
+    /// the routes under test are the real shipped files as the pack sync
+    /// materializes them, not a copy that could drift.
+    fn synced_workspace(root: &Path) -> PathBuf {
+        crate::config::secrets::mock_keychain::install();
+        let src_tauri = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("cairn-core manifest is nested under src-tauri");
+        let config = root.join("config");
+        crate::workspace::bundle::sync_workspace_packs(
+            &RealGitClient,
+            &RealFileSystem,
+            src_tauri,
+            &config,
+            "1.0.0",
         )
         .unwrap();
-        let routes = list_routes(temp.path(), Some(&project)).unwrap();
-        assert_eq!(routes.len(), 2);
-        let ConfigResult::Ok(route) = routes
+        config
+    }
+
+    fn ok_route<'a>(routes: &'a [ConfigResult<FileRoute>], id: &str) -> &'a FileRoute {
+        routes
             .iter()
-            .find(|route| matches!(route, ConfigResult::Ok(route) if route.id == FOLLOWED_ID))
-            .expect("followed route")
-        else {
-            panic!("valid route")
-        };
+            .find_map(|route| match route {
+                ConfigResult::Ok(route) if route.id == id => Some(route),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("valid route `{id}`"))
+    }
+
+    #[test]
+    fn shipped_routes_load_from_the_synced_workspace_and_project_shadows_them() {
+        let temp = tempdir().unwrap();
+        let config = synced_workspace(temp.path());
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".cairn/routes")).unwrap();
+        let shipped =
+            std::fs::read_to_string(config.join("routes/followed-thread-stream.yaml")).unwrap();
+        std::fs::write(
+            project.join(".cairn/routes/followed-thread-stream.yaml"),
+            shipped.replace("Followed thread stream", "Project route"),
+        )
+        .unwrap();
+
+        let workspace = list_routes(&config, None).unwrap();
+        for id in [FOLLOWED_ID, GITHUB_MENTION_ID] {
+            let route = ok_route(&workspace, id);
+            assert!(!route.is_project_scoped);
+            assert_eq!(
+                route.file_path,
+                config.join("routes").join(format!("{id}.yaml")),
+                "a shipped route is a real workspace file"
+            );
+        }
+
+        let routes = list_routes(&config, Some(&project)).unwrap();
+        assert_eq!(
+            routes.len(),
+            2,
+            "the project copy shadows, never duplicates"
+        );
+        let route = ok_route(&routes, FOLLOWED_ID);
         assert!(route.is_project_scoped);
         assert_eq!(route.definition.name, "Project route");
+        assert!(!ok_route(&routes, GITHUB_MENTION_ID).is_project_scoped);
+    }
+
+    /// Deleting a shipped route must hold across the next sync. The sync is
+    /// copy-when-missing, so without the removal record it would put the file
+    /// straight back.
+    #[test]
+    fn deleting_a_shipped_route_survives_the_next_pack_sync() {
+        let temp = tempdir().unwrap();
+        let config = synced_workspace(temp.path());
+        let removed = delete_route(&config, GITHUB_MENTION_ID, None).unwrap();
+        assert_eq!(
+            removed,
+            Some(config.join("routes/github-mention.yaml")),
+            "the workspace file is what was deleted"
+        );
+        assert!(super::super::pack::lock::read_lock(&config, "core")
+            .unwrap()
+            .is_removed(super::super::pack::PackItemKind::Route, GITHUB_MENTION_ID));
+
+        synced_workspace(temp.path());
+        assert!(get_route(&config, GITHUB_MENTION_ID, None)
+            .unwrap()
+            .is_none());
+        assert!(get_route(&config, FOLLOWED_ID, None).unwrap().is_some());
     }
 
     /// The one route that existed before routes were graphs is a file on disk
@@ -190,16 +276,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_project_routes_exclude_workspace_and_bundled_tiers() {
+    fn explicit_project_routes_exclude_the_workspace_tier() {
         let temp = tempdir().unwrap();
-        let config = temp.path().join("config");
+        let config = synced_workspace(temp.path());
         let project = temp.path().join("project");
-        std::fs::create_dir_all(config.join("routes")).unwrap();
+        let shipped =
+            std::fs::read_to_string(config.join("routes/followed-thread-stream.yaml")).unwrap();
         std::fs::create_dir_all(project.join(".cairn/routes")).unwrap();
-        std::fs::write(config.join("routes/workspace.yaml"), FOLLOWED).unwrap();
+        std::fs::write(config.join("routes/workspace.yaml"), &shipped).unwrap();
         std::fs::write(
             project.join(".cairn/routes/project.yaml"),
-            FOLLOWED.replace("Followed thread stream", "Project only"),
+            shipped.replace("Followed thread stream", "Project only"),
         )
         .unwrap();
 

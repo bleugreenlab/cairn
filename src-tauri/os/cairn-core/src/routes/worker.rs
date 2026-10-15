@@ -1026,14 +1026,9 @@ pub(crate) mod fixture {
         routes: &[(&str, &str)],
     ) -> (Orchestrator, Arc<LocalDb>) {
         let config = temp.join("config");
+        // A bare config dir: no pack sync runs here, so the only routes are
+        // the ones each test declares.
         std::fs::create_dir_all(config.join("routes")).unwrap();
-        // The bundled mention route would turn every test comment into an
-        // issue; tests that route comments declare their own routes.
-        std::fs::write(
-            config.join("routes/github-mention.yaml"),
-            "name: off\ndescription: shadows the bundled mention route\nenabled: false\nnodes:\n  - id: in\n    type: trigger\n    when: { fact: github_comment }\n  - id: out\n    type: sink\n    sink: { kind: issue, labels: [x] }\nedges:\n  - { from: in, to: out }\n",
-        )
-        .unwrap();
         for (name, body) in routes {
             std::fs::write(config.join(format!("routes/{name}.yaml")), body).unwrap();
         }
@@ -1422,14 +1417,12 @@ mod tests {
     #[tokio::test]
     async fn a_long_mention_reaches_its_issue_whole_and_is_stored_once() {
         let temp = tempfile::tempdir().unwrap();
-        let (orch, db) = orchestrator(
-            temp.path(),
-            &[(
-                "github-mention",
-                include_str!("../../../../routes/github-mention.yaml"),
-            )],
+        let shipped = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packs/core/routes/github-mention.yaml"),
         )
-        .await;
+        .expect("the core pack ships the mention route");
+        let (orch, db) = orchestrator(temp.path(), &[("github-mention", &shipped)]).await;
         let text = format!("@cairn {}MARKER-PAST-2000", "a".repeat(2500));
         let comment = crate::github::relay::CommentTrigger {
             comment_id: 88,

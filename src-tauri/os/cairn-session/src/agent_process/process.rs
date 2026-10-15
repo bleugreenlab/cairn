@@ -843,6 +843,19 @@ impl AgentProcessState {
         processes.get(run_id).map(|p| p.occupancy.clone())
     }
 
+    /// Whether the host has parked `run_id`'s process warm between turns.
+    ///
+    /// Not the same as `Idle` occupancy: a freshly registered process is `Idle`
+    /// too until its first turn begins, but still `Starting`, and it has not
+    /// been warmed by anything.
+    pub fn is_warm(&self, run_id: &str) -> bool {
+        self.processes
+            .lock()
+            .ok()
+            .and_then(|processes| processes.get(run_id).map(|p| p.is_warm()))
+            .unwrap_or(false)
+    }
+
     /// Whether this host holds a process handle for `run_id` at all — serving,
     /// awaiting the host, or parked warm — or `None` when the registry could not
     /// be inspected at all.
@@ -1562,6 +1575,25 @@ mod tests {
         state.transition_to_warm("run-1");
         assert_eq!(state.take_admission_claim("run-1"), Some(claim));
         assert_eq!(state.take_admission_claim("run-1"), None);
+    }
+
+    #[test]
+    fn a_launch_whose_turn_has_not_begun_is_not_warm() {
+        let state = AgentProcessState::default();
+        state
+            .register_process(
+                "run-1".into(),
+                RunHandle::test_handle(Some("session-1"), Some("job-1")),
+            )
+            .unwrap();
+        assert_eq!(state.get_occupancy("run-1"), Some(RunOccupancy::Idle));
+        assert!(!state.is_warm("run-1"), "a fresh launch is not warmed");
+
+        state.begin_turn("run-1", "turn-1");
+        assert!(!state.is_warm("run-1"));
+        state.transition_to_warm("run-1");
+        assert!(state.is_warm("run-1"));
+        assert!(!state.is_warm("missing"));
     }
 
     #[test]

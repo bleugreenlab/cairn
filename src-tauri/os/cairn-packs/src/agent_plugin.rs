@@ -287,6 +287,7 @@ fn discover_extension(
         ("agents", PackItemKind::Agent, "md", None),
         ("recipes", PackItemKind::Recipe, "yaml", None),
         ("responses", PackItemKind::Response, "md", None),
+        ("routes", PackItemKind::Route, "yaml", None),
         (
             "workflows",
             PackItemKind::Workflow,
@@ -490,6 +491,9 @@ pub fn export(
                 .join(source.file_name().unwrap()),
             PackItemKind::Response => PathBuf::from(CAIRN_EXTENSION)
                 .join("responses")
+                .join(source.file_name().unwrap()),
+            PackItemKind::Route => PathBuf::from(CAIRN_EXTENSION)
+                .join("routes")
                 .join(source.file_name().unwrap()),
             PackItemKind::Workflow => PathBuf::from(CAIRN_EXTENSION)
                 .join("workflows")

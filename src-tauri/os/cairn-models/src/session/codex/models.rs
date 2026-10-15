@@ -487,7 +487,7 @@ mod tests {
     }
 
     /// A stand-in `codex app-server` that behaves like codex-cli 0.153: a
-    /// `chatgptAuthTokens` login lands asynchronously, writing
+    /// login, whatever its params, lands asynchronously, writing
     /// `models_cache.json` only when it does, while `model/list` answers at
     /// once from whatever has landed so far. `FAKE_LOGIN=reject` makes the
     /// login fail instead.
@@ -527,7 +527,9 @@ done
         // A fresh Codex home: no auth.json and no previously published cache,
         // so only the login message can make Codex write the catalog.
         let home = tempfile::tempdir().unwrap();
-        let login = json!({"type": "chatgptAuthTokens", "accessToken": "token"});
+        // The stand-in never reads the params, so they are not subscription-
+        // shaped: real ones come only from `Subscriptions::codex_session_login`.
+        let login = json!({"type": "scriptedLogin"});
         refresh_codex_model_cache(&codex, home.path(), Some(login), &HashMap::new()).unwrap();
         assert_eq!(
             std::fs::read_to_string(home.path().join("models_cache.json")).unwrap(),

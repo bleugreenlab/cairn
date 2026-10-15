@@ -190,6 +190,15 @@ pub enum BackendFailure {
     /// asked to resume. Cairn's own transcript is intact; only the
     /// provider-side conversation is unreachable.
     SessionUnresolvable,
+    /// The backend refused a fresh start because a conversation already exists
+    /// under the session's id: an earlier, unconfirmed launch created it.
+    /// Distinct from [`BackendFailure::SessionUnresolvable`] — the provider's
+    /// conversation exists, so no digest reseed is owed.
+    SessionIdInUse,
+    /// The backend started but its first handshake proved the launch unusable
+    /// (for Claude, an `init` without Cairn's MCP tools), so the host rejected
+    /// it before the session's provider handle was confirmed.
+    StartupRejected,
 }
 
 impl BackendFailure {
@@ -197,6 +206,8 @@ impl BackendFailure {
     pub fn exit_reason(self) -> &'static str {
         match self {
             BackendFailure::SessionUnresolvable => "session_unresolvable",
+            BackendFailure::SessionIdInUse => "session_id_in_use",
+            BackendFailure::StartupRejected => "session_start_rejected",
         }
     }
 
@@ -205,6 +216,8 @@ impl BackendFailure {
     pub fn from_exit_reason(value: &str) -> Option<Self> {
         match value {
             "session_unresolvable" => Some(BackendFailure::SessionUnresolvable),
+            "session_id_in_use" => Some(BackendFailure::SessionIdInUse),
+            "session_start_rejected" => Some(BackendFailure::StartupRejected),
             _ => None,
         }
     }

@@ -1837,12 +1837,14 @@ async fn render_job_chat_digest(
 /// job — not the node's project/number/exec coordinates. Those are cosmetic
 /// here: under `unabridged` no truncation drill-down links are emitted, so a
 /// best-effort base_uri/meta suffices while the digest *body* stays exact.
-/// Returns the "No runs found" sentinel when the job has no transcript.
-pub(crate) async fn render_reseed_digest(db: &LocalDb, job: &crate::db_records::DbJob) -> String {
-    let conn = match connect_for_read(db).await {
-        Ok(conn) => conn,
-        Err(error) => return error,
-    };
+/// Returns the "No runs found" sentinel when the job has no transcript, and an
+/// error when the database cannot be opened, so a connection failure never
+/// becomes seed content.
+pub(crate) async fn render_reseed_digest(
+    db: &LocalDb,
+    job: &crate::db_records::DbJob,
+) -> Result<String, String> {
+    let conn = connect_for_read(db).await?;
     let label = job
         .node_name
         .as_deref()
@@ -1855,7 +1857,7 @@ pub(crate) async fn render_reseed_digest(db: &LocalDb, job: &crate::db_records::
         coordinate: DigestCoordinate::Unaddressed,
         status: &job.status,
     };
-    render_job_chat_digest(
+    Ok(render_job_chat_digest(
         db,
         &conn,
         &job.id,
@@ -1869,7 +1871,7 @@ pub(crate) async fn render_reseed_digest(db: &LocalDb, job: &crate::db_records::
             inline_diffs: true,
         },
     )
-    .await
+    .await)
 }
 
 /// What this job's transcript weighs verbatim: the baseline a cold native resume

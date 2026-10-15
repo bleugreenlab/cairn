@@ -102,6 +102,12 @@ impl RunStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(self, RunStatus::Exited | RunStatus::Crashed)
     }
+
+    /// Whether the run still owns a live process lifecycle that a death must
+    /// settle (`Starting` or `Live`).
+    pub fn is_active(&self) -> bool {
+        matches!(self, RunStatus::Starting | RunStatus::Live)
+    }
 }
 
 impl std::fmt::Display for RunStatus {
@@ -301,6 +307,14 @@ mod tests {
         assert!(!RunStatus::Live.is_terminal());
         assert!(RunStatus::Exited.is_terminal());
         assert!(RunStatus::Crashed.is_terminal());
+    }
+
+    #[test]
+    fn test_is_active() {
+        assert!(RunStatus::Starting.is_active());
+        assert!(RunStatus::Live.is_active());
+        assert!(!RunStatus::Exited.is_active());
+        assert!(!RunStatus::Crashed.is_active());
     }
 
     #[test]

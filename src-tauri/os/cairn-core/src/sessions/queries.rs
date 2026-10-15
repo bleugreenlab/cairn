@@ -4,7 +4,6 @@ use crate::models::Session;
 #[cfg(test)]
 use crate::models::SessionStatus;
 use crate::services::EventEmitter;
-#[cfg(test)]
 use crate::storage::RowExt;
 use crate::storage::{DbError, LocalDb};
 use cairn_common::ids;
@@ -41,6 +40,11 @@ pub(crate) enum RotationReason {
     /// leaves it alone and this reason is never the one written; it names the
     /// call site rather than an outcome.
     RecoveryReplacement,
+    /// The provider was launched under this session's id and created its
+    /// conversation there, but the launch never confirmed the handle. The
+    /// provider refuses that id on a second fresh start, so the job continues
+    /// on a successor with a fresh id (cairn/4978).
+    UnconfirmedStart,
 }
 
 impl RotationReason {
@@ -53,8 +57,96 @@ impl RotationReason {
             RotationReason::Compaction => "rotated_compaction",
             RotationReason::CacheExpiry => "rotated_cache_expiry",
             RotationReason::RecoveryReplacement => "rotated_after_recovery",
+            RotationReason::UnconfirmedStart => "rotated_unconfirmed_start",
         }
     }
+}
+
+/// The durable mark of a session whose provider launch went out under its id
+/// and never came back confirmed: no `backend_id`, and a run that crashed after
+/// `started_at` was stamped. `started_at` is written only by the post-spawn
+/// `starting -> live` transition, so a launch that failed before spawning (job
+/// preparation, attach) leaves it NULL and does not match. `?1` binds the
+/// crashed status.
+const UNCONFIRMED_SPAWNED_LAUNCH: &str = "s.backend_id IS NULL
+     AND EXISTS (
+         SELECT 1 FROM runs r
+          WHERE r.session_id = s.id
+            AND r.status = ?1
+            AND r.started_at IS NOT NULL
+     )";
+
+/// Whether `session_id` carries [`UNCONFIRMED_SPAWNED_LAUNCH`].
+pub(crate) async fn session_has_unconfirmed_spawned_launch(
+    db: &LocalDb,
+    session_id: &str,
+) -> Result<bool, DbError> {
+    let session_id = session_id.to_string();
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT 1 FROM sessions s WHERE s.id = ?2 AND {UNCONFIRMED_SPAWNED_LAUNCH} LIMIT 1"
+                    ),
+                    params![
+                        crate::models::RunStatus::Crashed.to_string(),
+                        session_id.as_str()
+                    ],
+                )
+                .await?;
+            Ok(rows.next().await?.is_some())
+        })
+    })
+    .await
+}
+
+/// An open session carrying [`UNCONFIRMED_SPAWNED_LAUNCH`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnconfirmedLaunchSession {
+    pub job_id: Option<String>,
+    pub session_id: String,
+    pub backend: String,
+    pub crashed_spawned_runs: i64,
+    /// Lineage generation (`rotate_session` sets parent + 1), not a launch count.
+    pub sequence: i64,
+}
+
+/// Every open session carrying [`UNCONFIRMED_SPAWNED_LAUNCH`].
+pub(crate) async fn list_unconfirmed_spawned_launch_sessions(
+    db: &LocalDb,
+) -> Result<Vec<UnconfirmedLaunchSession>, DbError> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT s.job_id, s.id, s.backend, s.sequence,
+                                (SELECT COUNT(*) FROM runs r
+                                  WHERE r.session_id = s.id
+                                    AND r.status = ?1
+                                    AND r.started_at IS NOT NULL)
+                           FROM sessions s
+                          WHERE s.status = 'open' AND {UNCONFIRMED_SPAWNED_LAUNCH}
+                          ORDER BY s.id"
+                    ),
+                    params![crate::models::RunStatus::Crashed.to_string()],
+                )
+                .await?;
+            let mut sessions = Vec::new();
+            while let Some(row) = rows.next().await? {
+                sessions.push(UnconfirmedLaunchSession {
+                    job_id: row.opt_text(0)?,
+                    session_id: row.text(1)?,
+                    backend: row.text(2)?,
+                    sequence: row.i64(3)?,
+                    crashed_spawned_runs: row.i64(4)?,
+                });
+            }
+            Ok(sessions)
+        })
+    })
+    .await
 }
 
 /// The rest of a provider change's durable state, committed by the same
@@ -296,6 +388,66 @@ mod tests {
                 .account_id
                 .as_deref(),
             Some("account-b")
+        );
+    }
+
+    /// The unconfirmed-launch mark is exactly: no provider handle, and a run
+    /// that crashed after the post-spawn `live` transition stamped `started_at`.
+    #[tokio::test]
+    async fn unconfirmed_spawned_launch_needs_a_crashed_run_that_spawned() {
+        let db = crate::storage::migrated_test_db("session-unconfirmed-launch.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+               VALUES ('ws', 'Workspace', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj', 'ws', 'Project', 'proj', '/tmp/proj', 1, 1);
+             INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+               VALUES ('job', 'proj', 'running', 'spawned', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, backend_id, status, sequence, created_at, updated_at)
+               VALUES ('spawned', 'job', 'claude', NULL, 'open', 24, 1, 1),
+                      ('never-spawned', 'job', 'claude', NULL, 'open', 1, 1, 1),
+                      ('still-live', 'job', 'claude', NULL, 'open', 1, 1, 1),
+                      ('confirmed', 'job', 'claude', 'native', 'open', 1, 1, 1),
+                      ('closed', 'job', 'claude', NULL, 'closed', 1, 1, 1);
+             INSERT INTO runs(id, job_id, session_id, status, started_at, created_at, updated_at)
+               VALUES ('r-spawned', 'job', 'spawned', 'crashed', 5, 1, 1),
+                      ('r-spawned-2', 'job', 'spawned', 'crashed', 6, 1, 1),
+                      ('r-prep', 'job', 'never-spawned', 'crashed', NULL, 1, 1),
+                      ('r-live', 'job', 'still-live', 'live', 5, 1, 1),
+                      ('r-confirmed', 'job', 'confirmed', 'crashed', 5, 1, 1),
+                      ('r-closed', 'job', 'closed', 'crashed', 5, 1, 1);",
+        )
+        .await
+        .expect("seed sessions across the predicate's edges");
+
+        for (session, expected) in [
+            ("spawned", true),
+            ("never-spawned", false),
+            ("still-live", false),
+            ("confirmed", false),
+            ("missing", false),
+        ] {
+            assert_eq!(
+                session_has_unconfirmed_spawned_launch(&db, session)
+                    .await
+                    .expect("read the mark"),
+                expected,
+                "{session}"
+            );
+        }
+
+        // The listing is the same predicate, over open sessions only.
+        assert_eq!(
+            list_unconfirmed_spawned_launch_sessions(&db)
+                .await
+                .expect("list marked sessions"),
+            vec![UnconfirmedLaunchSession {
+                job_id: Some("job".to_string()),
+                session_id: "spawned".to_string(),
+                backend: "claude".to_string(),
+                crashed_spawned_runs: 2,
+                sequence: 24,
+            }]
         );
     }
 

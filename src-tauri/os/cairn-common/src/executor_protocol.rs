@@ -371,6 +371,27 @@ pub struct DrainingCommandOwnership {
     pub ownership: CommandBatchOwnership,
 }
 
+/// The launch nonce (and stream id) under which a cell's drain records
+/// processes the executor found alive in the cell's tree from an epoch that has
+/// ended, rather than processes it launched.
+///
+/// Such an identity is evidence, not ownership. It came from scanning the
+/// tree's working directories, never from a launch the executor recorded, so
+/// nothing proves Cairn started it: it may be a daemon a build detached, or an
+/// operator's own shell. It is waited on — the cell stays fenced while it runs —
+/// and never signalled, by the executor's drain pass or by the runner retiring a
+/// colocated executor. Every other drain identity was recorded at launch and is
+/// reaped automatically.
+pub const PRIOR_EPOCH_SURVIVOR_NONCE: &str = "prior-epoch-survivor";
+
+impl CommandPhysicalProcessIdentity {
+    /// Whether this identity was recorded as tree-scan evidence of a prior
+    /// epoch rather than by a launch; see [`PRIOR_EPOCH_SURVIVOR_NONCE`].
+    pub fn is_prior_epoch_survivor_evidence(&self) -> bool {
+        self.launch_nonce == PRIOR_EPOCH_SURVIVOR_NONCE
+    }
+}
+
 /// Durable ownership of one transient command batch in a cell.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -4077,7 +4098,22 @@ pub struct LearnedResourceEstimate {
 /// runner reads absence from that account as loss. A 141 executor never sends
 /// it, and a 142 runner reconciling against such a snapshot would settle that
 /// pre-spawn work wrongly, which is why the number moves.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 142;
+///
+/// Version 143 (cairn/4980) changes the usable capacity of a machine with a
+/// build cell whose tree still holds processes from an ended epoch, and which
+/// of those processes may be signalled. No frame or field changes. Storage-sweep
+/// retirement, admission-time headroom reclaim, and release now fence such a
+/// cell in place (the `quarantined` lifecycle, a quarantine reason, and a drain
+/// record, the values the claim path has written since cairn/4601) and carry on
+/// with other cells. A 142 executor in the same state latches
+/// `StorageCleanupFailed` and refuses every admission, so the runner would see
+/// a whole machine refuse structurally where a 143 one admits, the kind of
+/// disagreement about usable capacity v86 and v87 were minted for. And
+/// survivors found only by scanning the tree, recorded under
+/// [`PRIOR_EPOCH_SURVIVOR_NONCE`], are no longer signalled by the executor's
+/// drain pass (a 142 executor kills them on its next sweep) nor by the runner's
+/// colocated retirement, which skips them in any version's cell state.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 143;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //

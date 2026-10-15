@@ -125,6 +125,8 @@ pub(crate) async fn preview_thread_branch_for_write(
 /// Allocate a numbered branch owned by the calling thread session. The database
 /// allocation is one transaction; the bookmark is then materialized at the
 /// already-resolved base commit without creating a workspace.
+///
+/// The caller must hold the per-store lock for the whole call.
 pub(crate) async fn mint_thread_branch_for_write(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
@@ -178,6 +180,11 @@ pub(crate) async fn mint_thread_branch_for_write(
     let repository_path = current.repository_path.clone();
     let create_ref = git_ref.clone();
     let base = current.commit_id.clone();
+    // The caller holds the per-store lock: the only call site is a file-bearing
+    // write batch inside its "logical write transaction" guard. That is what
+    // keeps another writer's rollback from erasing this create (see
+    // `prepare_store_coordinate`). The lock is not reentrant, so this must not
+    // take it again.
     let bookmark_result = match tokio::task::spawn_blocking(move || {
         let jj = crate::jj::environment(&jj_binary_path, &config_dir);
         crate::jj::create_bookmark_at(&jj, &repository_path, &create_ref, &base)
@@ -313,6 +320,7 @@ pub(crate) async fn resolve_current_for_read(
         .await
         .map_err(|error| error.to_string())?
         .unwrap_or((None, None));
+    let own_branch = coordinates.0.clone();
     let rev = resolve_job_rev(coordinates.0, coordinates.1, &project.default_branch);
     let project_path = project
         .project_path
@@ -335,7 +343,18 @@ pub(crate) async fn resolve_current_for_read(
         &project.default_branch,
     )
     .await
-    .map_err(|error| map_coordinate_error(error, &rev).to_string())?;
+    .map_err(|error| {
+        let error = map_own_coordinate_error(error, &rev, own_branch.as_deref());
+        if matches!(error, BranchRefResolutionError::OwnBranchLost { .. }) {
+            log::error!(
+                "run {} (job {}) lost its own branch `{rev}`: it no longer resolves in {}",
+                run.run_id,
+                run.job_id,
+                repository_path.display()
+            );
+        }
+        error.to_string()
+    })?;
     let default_commit_id =
         resolve_default_for_read(orch, &repository_path, &project.default_branch, &commit_id).await;
     Ok(BranchResolution {
@@ -346,6 +365,29 @@ pub(crate) async fn resolve_current_for_read(
         commit_id,
         default_commit_id,
     })
+}
+
+/// Map a failure to resolve the run's OWN coordinate.
+///
+/// When that coordinate is the branch this job minted and it is simply absent,
+/// nothing the session asks for can be served: every file read, file write, and
+/// command resolves the same missing name. The generic "could not resolve" text
+/// reads like a typo the agent should fix, so it retries. This case gets its own
+/// refusal saying the branch is gone, that the agent did not cause it, and what
+/// to do instead.
+fn map_own_coordinate_error(
+    error: cairn_vcs::CoordinateResolutionError,
+    requested: &str,
+    own_branch: Option<&str>,
+) -> BranchRefResolutionError {
+    if matches!(error, cairn_vcs::CoordinateResolutionError::Absent { .. })
+        && own_branch == Some(requested)
+    {
+        return BranchRefResolutionError::OwnBranchLost {
+            branch: requested.to_string(),
+        };
+    }
+    map_coordinate_error(error, requested)
 }
 
 /// The coordinate a job's own reads and writes address: the branch it minted,
@@ -487,6 +529,11 @@ pub(crate) enum BranchRefResolutionError {
         requested: String,
         versions: Vec<String>,
     },
+    /// The branch the calling job minted for itself no longer exists, so no
+    /// file read, file write, or command on it can be served.
+    OwnBranchLost {
+        branch: String,
+    },
 }
 
 impl std::fmt::Display for BranchRefResolutionError {
@@ -519,6 +566,18 @@ impl std::fmt::Display for BranchRefResolutionError {
                  branch itself needs a maintainer before work on it can continue.",
                 versions.len(),
                 versions.join(" and ")
+            ),
+            // Written for a model that would otherwise retry: it names the
+            // terminal fact, says the session did not cause it, rules out
+            // retrying, and names what still works and what to do next.
+            Self::OwnBranchLost { branch } => write!(
+                f,
+                "This session's own branch '{branch}' no longer exists, so no file read, file \
+                 write, or command on it can be served. Nothing this session did removed it, and \
+                 retrying will not bring it back. Reading files by absolute path and reading or \
+                 writing cairn:// resources still work. Stop here: put anything worth keeping \
+                 where the next attempt will find it, such as a comment on the issue, then end \
+                 your turn. A new execution of the issue starts on a fresh branch."
             ),
         }
     }
@@ -868,7 +927,63 @@ fn job_context_from_row(row: &cairn_db::turso::Row) -> crate::storage::DbResult<
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_job_rev, BranchRefResolutionError};
+    use super::{map_own_coordinate_error, resolve_job_rev, BranchRefResolutionError};
+
+    fn absent(coordinate: &str) -> cairn_vcs::CoordinateResolutionError {
+        cairn_vcs::CoordinateResolutionError::Absent {
+            coordinate: coordinate.to_string(),
+            diagnostic: format!("Revision `{coordinate}` doesn't exist"),
+        }
+    }
+
+    /// The job's own minted branch going missing is a different fact from a
+    /// mistyped ref: the first means nothing in this session can proceed.
+    #[test]
+    fn an_absent_own_branch_is_a_lost_branch_not_an_unresolvable_ref() {
+        let branch = "agent/cairn-4897-builder-0";
+        assert_eq!(
+            map_own_coordinate_error(absent(branch), branch, Some(branch)),
+            BranchRefResolutionError::OwnBranchLost {
+                branch: branch.to_string()
+            }
+        );
+    }
+
+    /// A branchless job resolving its base, or a base that is absent, keeps the
+    /// generic refusal: the job never owned that name.
+    #[test]
+    fn an_absent_base_stays_an_unresolvable_ref() {
+        let base = "agent/cairn-1-coordinator-0";
+        assert!(matches!(
+            map_own_coordinate_error(absent(base), base, None),
+            BranchRefResolutionError::Unresolvable { .. }
+        ));
+        assert!(matches!(
+            map_own_coordinate_error(absent(base), base, Some("agent/cairn-1-builder-0")),
+            BranchRefResolutionError::Unresolvable { .. }
+        ));
+    }
+
+    #[test]
+    fn the_lost_branch_refusal_says_stop_and_names_what_still_works() {
+        let text = BranchRefResolutionError::OwnBranchLost {
+            branch: "agent/cairn-4897-builder-0".into(),
+        }
+        .to_string();
+        assert!(text.contains("agent/cairn-4897-builder-0"), "{text}");
+        assert!(text.contains("no longer exists"), "{text}");
+        assert!(text.contains("retrying will not"), "{text}");
+        assert!(text.contains("Stop here"), "{text}");
+        assert!(text.contains("absolute path"), "{text}");
+        assert!(!text.contains("Could not resolve"), "{text}");
+        crate::system_prompt::assert_no_substrate_vocabulary("lost branch refusal", &text);
+        for jargon in ["bookmark", "revset", "jj", "store", "rollback"] {
+            assert!(
+                !text.to_lowercase().contains(jargon),
+                "the refusal names the machinery ({jargon:?}) instead of the agent's options: {text}"
+            );
+        }
+    }
 
     #[test]
     fn job_rev_prefers_its_own_branch() {

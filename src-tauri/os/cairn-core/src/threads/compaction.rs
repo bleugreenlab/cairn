@@ -34,6 +34,10 @@ pub enum CompactionTrigger {
     Capacity,
     /// An operator forced a digest resume.
     Manual,
+    /// The session's first provider launch created a conversation under its
+    /// id but never confirmed it, so the provider refuses that id again and
+    /// the thread continues on a fresh session.
+    UnconfirmedStart,
 }
 
 impl CompactionTrigger {
@@ -42,6 +46,7 @@ impl CompactionTrigger {
             CompactionTrigger::Expiry => "expiry",
             CompactionTrigger::Capacity => "capacity",
             CompactionTrigger::Manual => "manual",
+            CompactionTrigger::UnconfirmedStart => "unconfirmed_start",
         }
     }
 }

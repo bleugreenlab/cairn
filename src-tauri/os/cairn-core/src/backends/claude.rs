@@ -21,7 +21,7 @@ use super::run_state::{
 };
 
 use crate::credentials::RoutedProvider;
-use crate::models::{ContextTokenState, RunStatus};
+use crate::models::{ContextTokenState, RunStatus, TurnEndReason};
 use crate::orchestrator::session::{
     assemble_prompt_segments, flatten_prompt_segments, get_claude_path, insert_error_event,
     persist_system_prompt_event, select_routed_serving_identity, system_prompt_placement,
@@ -235,12 +235,21 @@ mod tests {
     }
 }
 
+/// Whether a stored `runs.status` names a run that still owns its process.
+/// Parsed through [`RunStatus`] so legacy spellings map to their canonical
+/// state and no status literal is compared here.
+fn stored_run_is_active(run_status: Option<&str>) -> bool {
+    run_status
+        .and_then(|status| status.parse::<RunStatus>().ok())
+        .is_some_and(|status| status.is_active())
+}
+
 fn should_finalize_task_run_on_terminal_tool_eof(
     terminal_tool_called: bool,
     run_status: Option<&str>,
     is_task_spawned: bool,
 ) -> bool {
-    terminal_tool_called && run_status == Some("running") && is_task_spawned
+    terminal_tool_called && stored_run_is_active(run_status) && is_task_spawned
 }
 
 /// How a Claude process's stdout-EOF should finalize its run.
@@ -282,7 +291,7 @@ fn classify_eof(
     ) {
         return EofVerdict::Exited;
     }
-    // No terminal Result and the run is still "running": the process died
+    // No terminal Result and the run is still active: the process died
     // mid-turn. Finalize Crashed, which *interrupts* the running turn rather than
     // completing it — leaving the job resumable (derives Pending), not
     // completed-and-advanced and not cascade-failed. A blocking rate-limit exit
@@ -290,7 +299,7 @@ fn classify_eof(
     // refines the diagnostic/error message in the reader thread, NOT the verdict.
     // (Finalizing Exited would apply TurnState::Complete and advance downstream
     // onto work the blocked account never finished.)
-    if run_status == Some("running") {
+    if stored_run_is_active(run_status) {
         return EofVerdict::Crashed;
     }
     EofVerdict::AlreadyTerminal
@@ -1082,6 +1091,11 @@ impl AgentBackend for ClaudeBackend {
         true
     }
 
+    /// A fresh start passes `--session-id <cairn session id>`.
+    fn fresh_start_claims_session_id(&self) -> bool {
+        true
+    }
+
     fn supports_warm_processes(&self) -> bool {
         true
     }
@@ -1510,6 +1524,18 @@ mod stderr_failure_tests {
     }
 
     #[test]
+    fn the_cli_session_id_collision_classifies_as_in_use() {
+        // Verbatim from the runner log that opened cairn/4978. Not
+        // SessionUnresolvable: the conversation exists, so no reseed is owed.
+        assert_eq!(
+            classify_stderr_failure(
+                "Error: Session ID 30fb0390-c508-4345-b87a-fd0f2f10f1b5 is already in use."
+            ),
+            Some(BackendFailure::SessionIdInUse)
+        );
+    }
+
+    #[test]
     fn ordinary_stderr_classifies_as_nothing() {
         assert_eq!(classify_stderr_failure(""), None);
         assert_eq!(
@@ -1527,83 +1553,124 @@ mod stderr_failure_tests {
 #[cfg(test)]
 mod terminal_tool_tests {
     use super::{classify_eof, should_finalize_task_run_on_terminal_tool_eof, EofVerdict};
+    use crate::models::RunStatus;
+
+    /// Every status a run row can carry today, spelled as the store writes it.
+    fn stored(status: RunStatus) -> String {
+        status.to_string()
+    }
+
+    const ACTIVE: [RunStatus; 2] = [RunStatus::Starting, RunStatus::Live];
+    const TERMINAL: [RunStatus; 2] = [RunStatus::Exited, RunStatus::Crashed];
 
     #[test]
-    fn terminal_tool_task_eof_is_treated_as_completed() {
-        assert!(should_finalize_task_run_on_terminal_tool_eof(
-            true,
-            Some("running"),
-            true
-        ));
+    fn terminal_tool_task_eof_is_treated_as_completed_while_active() {
+        for status in ACTIVE {
+            let status = stored(status);
+            assert!(should_finalize_task_run_on_terminal_tool_eof(
+                true,
+                Some(&status),
+                true
+            ));
+            assert!(!should_finalize_task_run_on_terminal_tool_eof(
+                false,
+                Some(&status),
+                true
+            ));
+            assert!(!should_finalize_task_run_on_terminal_tool_eof(
+                true,
+                Some(&status),
+                false
+            ));
+        }
+        for status in TERMINAL {
+            assert!(!should_finalize_task_run_on_terminal_tool_eof(
+                true,
+                Some(&stored(status)),
+                true
+            ));
+        }
         assert!(!should_finalize_task_run_on_terminal_tool_eof(
-            false,
-            Some("running"),
-            true
-        ));
-        assert!(!should_finalize_task_run_on_terminal_tool_eof(
-            true,
-            Some("exited"),
-            true
-        ));
-        assert!(!should_finalize_task_run_on_terminal_tool_eof(
-            true,
-            Some("running"),
-            false
+            true, None, true
         ));
     }
 
     #[test]
     fn classify_eof_warm_is_exited() {
         // Host-warmed (interrupt/eviction) closes stdout: completed, not a crash.
-        assert_eq!(
-            classify_eof(true, false, false, Some("running"), false, false),
-            EofVerdict::Exited
-        );
+        for status in ACTIVE {
+            assert_eq!(
+                classify_eof(true, false, false, Some(&stored(status)), false, false),
+                EofVerdict::Exited
+            );
+        }
     }
 
     #[test]
     fn classify_eof_terminal_result_then_eof_is_exited() {
         // A run that emitted a terminal Result and then closed stdout completed,
         // regardless of occupancy — belt-and-suspenders over the warm path.
-        assert_eq!(
-            classify_eof(false, true, false, Some("running"), false, false),
-            EofVerdict::Exited
-        );
+        for status in ACTIVE {
+            assert_eq!(
+                classify_eof(false, true, false, Some(&stored(status)), false, false),
+                EofVerdict::Exited
+            );
+        }
     }
 
     #[test]
     fn classify_eof_terminal_429_remains_interrupted_for_rollover() {
-        assert_eq!(
-            classify_eof(false, true, true, Some("running"), false, false),
-            EofVerdict::Crashed
-        );
+        for status in ACTIVE {
+            assert_eq!(
+                classify_eof(false, true, true, Some(&stored(status)), false, false),
+                EofVerdict::Crashed
+            );
+        }
     }
 
     #[test]
-    fn classify_eof_no_result_running_not_warm_is_crashed() {
-        // No terminal Result and still running → Crashed, which interrupts the
+    fn classify_eof_no_result_live_not_warm_is_crashed() {
+        // No terminal Result on a live run → Crashed, which interrupts the
         // running turn (leaving the job resumable). A blocking rate-limit exit
         // lands here too: the rate-limit signal refines the error message, not
         // the verdict — finalizing Exited would wrongly complete the turn and
         // advance downstream onto work the blocked account never finished.
         assert_eq!(
-            classify_eof(false, false, false, Some("running"), false, false),
+            classify_eof(false, false, false, Some("live"), false, false),
+            EofVerdict::Crashed
+        );
+    }
+
+    #[test]
+    fn classify_eof_no_result_starting_not_warm_is_crashed() {
+        // A process that dies before its first event (a refused start) settles
+        // on EOF too, rather than waiting for the reaper.
+        assert_eq!(
+            classify_eof(false, false, false, Some("starting"), false, false),
             EofVerdict::Crashed
         );
     }
 
     #[test]
     fn classify_eof_task_spawned_terminal_tool_is_exited() {
-        assert_eq!(
-            classify_eof(false, false, false, Some("running"), true, true),
-            EofVerdict::Exited
-        );
+        for status in ACTIVE {
+            assert_eq!(
+                classify_eof(false, false, false, Some(&stored(status)), true, true),
+                EofVerdict::Exited
+            );
+        }
     }
 
     #[test]
-    fn classify_eof_already_terminal_when_not_running() {
+    fn classify_eof_already_terminal_when_settled_or_unknown() {
+        for status in TERMINAL {
+            assert_eq!(
+                classify_eof(false, false, false, Some(&stored(status)), false, false),
+                EofVerdict::AlreadyTerminal
+            );
+        }
         assert_eq!(
-            classify_eof(false, false, false, Some("exited"), false, false),
+            classify_eof(false, false, false, None, false, false),
             EofVerdict::AlreadyTerminal
         );
     }
@@ -2154,8 +2221,19 @@ impl ClaudeHost for ClaudeReaderHost {
         crate::orchestrator::lifecycle::release_and_stop_process(&self.orch, &self.run_id);
     }
     fn startup_rejected(&self, message: &str) {
-        self.error(message);
-        crate::orchestrator::lifecycle::finalize_run(&self.orch, &self.run_id, RunStatus::Crashed);
+        if settle_active_run_as_crashed(
+            &self.orch,
+            &self.run_id,
+            BackendFailure::StartupRejected.exit_reason(),
+            message,
+        ) {
+            self.error(message);
+            crate::orchestrator::lifecycle::finalize_run(
+                &self.orch,
+                &self.run_id,
+                RunStatus::Crashed,
+            );
+        }
     }
     fn initialized(&self) {
         let orch = &self.orch;
@@ -2376,27 +2454,51 @@ impl ClaudeHost for ClaudeReaderHost {
                     // already-attempted session, an active head turn), so this
                     // text must not guarantee a recovery.
                     "The provider could not resolve this session's conversation handle, so the resume produced no output. Cairn's own transcript is intact."
+                } else if backend_failure == Some(BackendFailure::SessionIdInUse) {
+                    "Claude refused to start this session because an earlier, unconfirmed launch already created it under this id. Cairn's own transcript is intact."
                 } else {
                     "Process terminated unexpectedly without completing"
                 };
-                insert_error_event(orch, run_id, session_id.as_deref(), error_message);
 
                 // Record the typed diagnosis on the run before finalizing, so
                 // the lifecycle reaction reads a durable fact off `runs` rather
-                // than re-parsing provider text. Mirrors `fail_run`'s ordering.
-                if let Some(failure) = backend_failure {
-                    if let Err(e) = crate::orchestrator::lifecycle::set_exit_reason(
-                        orch,
-                        run_id,
-                        failure.exit_reason(),
-                    ) {
-                        log::warn!("Failed to record exit reason for run {}: {}", run_id, e);
-                    }
+                // than re-parsing provider text. The write is guarded on the
+                // run still being active: a run another path settled between
+                // the status read above and here keeps that path's cause, and
+                // is not finalized a second time.
+                let crash_reason = TurnEndReason::Crash.to_string();
+                let exit_reason = backend_failure
+                    .map(|failure| failure.exit_reason())
+                    .unwrap_or(crash_reason.as_str());
+                if settle_active_run_as_crashed(orch, run_id, exit_reason, error_message) {
+                    insert_error_event(orch, run_id, session_id.as_deref(), error_message);
+                    crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Crashed);
                 }
-
-                crate::orchestrator::lifecycle::finalize_run(orch, run_id, RunStatus::Crashed);
             }
             EofVerdict::AlreadyTerminal => {}
+        }
+    }
+}
+
+/// Claim a still-active run's crash cause. True when this caller owns the
+/// settle; a failed write is logged and treated as owning it, so a database
+/// hiccup never leaves a dead process's run live for the reaper.
+fn settle_active_run_as_crashed(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+    error_message: &str,
+) -> bool {
+    match crate::orchestrator::lifecycle::record_run_failure_if_active(
+        orch,
+        run_id,
+        exit_reason,
+        error_message,
+    ) {
+        Ok(owned) => owned,
+        Err(error) => {
+            log::warn!("Failed to record exit reason for run {run_id}: {error}");
+            true
         }
     }
 }

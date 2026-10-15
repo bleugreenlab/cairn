@@ -253,6 +253,9 @@ pub fn cell_workload(
             .flat_map(|batch| &batch.items)
             .flat_map(|item| &item.attempts)
             .flat_map(|attempt| &attempt.processes)
+            // Tree-scan evidence of a prior epoch names a process nothing
+            // proves Cairn launched, so it is never anyone's to kill.
+            .filter(|identity| !identity.is_prior_epoch_survivor_evidence())
         {
             // A session leader also leads its process group.
             let leads_group = identity
@@ -453,6 +456,41 @@ mod tests {
         let workload = recorded_workload(home.path());
         assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
         assert_eq!(workload.processes.len(), 4);
+    }
+
+    /// A survivor the executor found by scanning a cell's tree is recorded in
+    /// its drain as evidence. Retiring the executor must not turn that record
+    /// into a kill list: nothing proves Cairn started the process.
+    #[test]
+    fn prior_epoch_survivor_evidence_is_not_workload() {
+        let mut state = fixture("quarantined");
+        state["occupancy"]["draining"]["ownership"]["items"][0]["attempts"][0]["processes"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "pid": 700,
+                "processGroupId": 700,
+                "startToken": "700:1",
+                "launchNonce": crate::executor_protocol::PRIOR_EPOCH_SURVIVOR_NONCE,
+                "observedAtUnixMs": 5,
+                "parent": {"kind": "leader"},
+            }));
+        let (home, _) = home_with(&state);
+        let workload = recorded_workload(home.path());
+        assert!(workload.unreadable.is_empty(), "{:?}", workload.unreadable);
+        let pids: Vec<_> = workload
+            .processes
+            .iter()
+            .map(|process| process.pid)
+            .collect();
+        assert!(
+            pids.contains(&600),
+            "a drain identity recorded at launch is still workload: {pids:?}"
+        );
+        assert!(
+            !pids.contains(&700),
+            "tree-scan evidence must never be signalled: {pids:?}"
+        );
     }
 
     #[test]

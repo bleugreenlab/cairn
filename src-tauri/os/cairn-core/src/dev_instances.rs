@@ -533,11 +533,23 @@ pub async fn resolve_launch_coordinate(
     // after the last job provisioning is otherwise unresolvable here. Preparing
     // the store is what makes both an explicit selector and the checkout's own
     // head resolve against the refs that exist right now.
+    //
+    // The import writes local bookmarks, so it runs under the per-store lock: an
+    // import inside another writer's rollback window would be rewound by that
+    // rollback (see `docs/jj-migration.md`).
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = managed_store.clone();
     let repository = repository_path.clone();
-    tokio::task::spawn_blocking(move || crate::jj::ensure_project_store(&jj, &store, &repository))
+    let imported = {
+        let _store_guard = orch
+            .acquire_jj_store_lock(&managed_store, "project store import: dev instance launch")
+            .await;
+        tokio::task::spawn_blocking(move || {
+            crate::jj::ensure_project_store(&jj, &store, &repository)
+        })
         .await
+    };
+    imported
         .map_err(|error| error.to_string())
         .and_then(|prepared| prepared)
         .map_err(|diagnostic| DevInstanceLaunchFailure::InvalidProject {

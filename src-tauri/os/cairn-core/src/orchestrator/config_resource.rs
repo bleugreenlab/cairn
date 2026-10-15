@@ -1062,7 +1062,7 @@ impl Orchestrator {
     ///
     /// A pack install, update, restore, uninstall, or single-item removal moves
     /// content across every list a pack can contribute to — agents, skills,
-    /// recipes, workflows, responses, and the MCP registry — none of which are
+    /// recipes, workflows, responses, routes, and the MCP registry — none of which are
     /// database rows, so none of them produce a `db-change`. Without this one
     /// signal a settings screen keeps showing the pre-change workspace until the
     /// app restarts, which is exactly what CAIRN-3819 recorded happening live.
@@ -1070,7 +1070,13 @@ impl Orchestrator {
     /// Callers emit only after the filesystem, lock, and Git work has
     /// succeeded: an event for a workspace that did not move is a refetch that
     /// can only confuse.
+    ///
+    /// The routing worker's cached route sets are invalidated here too. A pack
+    /// that adds or drops a route changes which routes fire, and a cache left to
+    /// age out would keep running a removed route's sinks, or mark facts
+    /// unmatched that a restored route should have taken.
     pub fn emit_pack_registry_change(&self) {
+        crate::routes::invalidate_trigger_index(self);
         let _ = self
             .services
             .emitter

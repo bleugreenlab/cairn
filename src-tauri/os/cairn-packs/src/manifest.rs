@@ -64,6 +64,7 @@ pub enum PackItemKind {
     Mcp,
     Recipe,
     Response,
+    Route,
     Skill,
     Workflow,
 }
@@ -75,6 +76,7 @@ impl PackItemKind {
             PackItemKind::Mcp => "mcp",
             PackItemKind::Recipe => "recipe",
             PackItemKind::Response => "response",
+            PackItemKind::Route => "route",
             PackItemKind::Skill => "skill",
             PackItemKind::Workflow => "workflow",
         }
@@ -88,6 +90,7 @@ impl PackItemKind {
             "mcp" => Some(PackItemKind::Mcp),
             "recipe" => Some(PackItemKind::Recipe),
             "response" => Some(PackItemKind::Response),
+            "route" => Some(PackItemKind::Route),
             "skill" => Some(PackItemKind::Skill),
             "workflow" => Some(PackItemKind::Workflow),
             _ => None,
@@ -95,11 +98,12 @@ impl PackItemKind {
     }
 
     /// Every kind, for error text that enumerates the alternatives.
-    pub const ALL: [PackItemKind; 6] = [
+    pub const ALL: [PackItemKind; 7] = [
         PackItemKind::Agent,
         PackItemKind::Mcp,
         PackItemKind::Recipe,
         PackItemKind::Response,
+        PackItemKind::Route,
         PackItemKind::Skill,
         PackItemKind::Workflow,
     ];
@@ -258,7 +262,8 @@ pub fn load(dir: &Path) -> Result<PackManifest, String> {
 
     Err(format!(
         "{dir:?} is not a pack: expected {MANIFEST_FILE}, {CLAUDE_PLUGIN_MANIFEST}, a SKILL.md, \
-         or one of the conventional content directories (agents, recipes, responses, skills, workflows)"
+         or one of the conventional content directories (agents, recipes, responses, routes, skills, \
+         workflows)"
     ))
 }
 
@@ -484,7 +489,7 @@ pub fn discover_items(root: &Path) -> Vec<PackItem> {
                         items.push(PackItem::file(PackItemKind::Workflow, file_name, rel));
                     }
                 }
-                "agents" | "recipes" | "responses" => {
+                "agents" | "recipes" | "responses" | "routes" => {
                     if !path.is_file() {
                         continue;
                     }
@@ -492,6 +497,9 @@ pub fn discover_items(root: &Path) -> Vec<PackItem> {
                     let (kind, matches) = match dir_name {
                         "agents" => (PackItemKind::Agent, ext == "md"),
                         "responses" => (PackItemKind::Response, ext == "md"),
+                        // The route loader reads `.yaml` only, so a `.yml` route
+                        // would install and then never load.
+                        "routes" => (PackItemKind::Route, ext == "yaml"),
                         _ => (PackItemKind::Recipe, ext == "yaml" || ext == "yml"),
                     };
                     if !matches {
@@ -536,6 +544,8 @@ mod tests {
         write(&root.join("agents/analyst.md"), "# analyst\n");
         write(&root.join("recipes/run.yaml"), "name: run\n");
         write(&root.join("responses/tone.md"), "tone\n");
+        write(&root.join("routes/ping.yaml"), "name: ping\n");
+        write(&root.join("routes/ignored.yml"), "name: ignored\n");
         write(&root.join("workflows/sweep/workflow.yaml"), "name: sweep\n");
         write(
             &root.join(PACK_MCP_FILE),
@@ -570,6 +580,15 @@ mod tests {
             "tone",
             "responses/tone.md"
         )));
+        assert!(items.contains(&PackItem::file(
+            PackItemKind::Route,
+            "ping",
+            "routes/ping.yaml"
+        )));
+        assert!(
+            !items.iter().any(|item| item.id == "ignored"),
+            "a `.yml` route is not discovered, because the route loader would never read it"
+        );
         assert!(items.contains(&PackItem::file(
             PackItemKind::Workflow,
             "sweep",

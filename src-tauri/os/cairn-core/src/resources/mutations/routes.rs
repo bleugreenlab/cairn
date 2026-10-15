@@ -128,15 +128,29 @@ pub(super) async fn delete(
     dry: bool,
 ) -> Result<String, String> {
     reject(r, id, p)?;
-    let path = root(o, p).await?.join(format!("{id}.yaml"));
+    let project = match p {
+        Some(key) => Some(crate::mcp::handlers::skills_resources::project_path_by_key(o, key).await?),
+        None => None,
+    };
+    let path = project
+        .as_ref()
+        .map_or_else(|| o.config_dir.join("routes"), |project| project.join(".cairn/routes"))
+        .join(format!("{id}.yaml"));
     if !path.exists() {
         return Err(format!("Route not found: {id}"));
     }
     if dry {
         return Ok(format!("Would delete route '{id}'"));
     }
-    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    // Through the config module, so a workspace route an installed pack ships
+    // is recorded as removed instead of copied straight back by the next pack
+    // sync. The existence check pinned the scope, so its project-then-workspace
+    // order resolves to this same file.
+    crate::config::routes::delete_route(&o.config_dir, id, project.as_deref())?;
     crate::config::commit_config_paths(&[path], &format!("cairn: delete route {id}"));
     emit_change(o, "removed", id);
+    if project.is_none() {
+        o.emit_pack_registry_change();
+    }
     Ok(format!("Deleted route '{id}'"))
 }

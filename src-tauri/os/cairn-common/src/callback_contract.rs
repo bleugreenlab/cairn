@@ -39,7 +39,7 @@ use crate::executor_protocol::RunnerCallback;
 use crate::protocol::CallbackRequest;
 use crate::run_contract::RUN_GRACE_WINDOW_MS;
 use crate::uri::{parse_uri, CairnResource};
-use crate::write_contract::WRITE_STORE_LOCK_WAIT_MS;
+use crate::write_contract::{WRITE_CHECK_INLINE_WAIT_MS, WRITE_STORE_LOCK_WAIT_MS};
 
 /// How long the host waits inline for a permission answer, a question answer,
 /// or a spawned task before durably suspending the run (no auto-deny): long
@@ -101,9 +101,11 @@ pub const FENCE_CALLBACK_TIMEOUT: Duration =
 const RUN_HOST_BOUND: Duration = Duration::from_millis(RUN_GRACE_WINDOW_MS);
 
 /// The longest bounded host wait for every other verb: a file-target `write`
-/// queued on the project store lock. A `watch` long-poll (290 s) and a `read`
+/// queued on the project store lock, then waiting inline for the when:write
+/// checks of the commit it sealed. A `watch` long-poll (290 s) and a `read`
 /// both finish well inside it.
-const DEFAULT_HOST_BOUND: Duration = Duration::from_millis(WRITE_STORE_LOCK_WAIT_MS);
+const DEFAULT_HOST_BOUND: Duration =
+    Duration::from_millis(WRITE_STORE_LOCK_WAIT_MS + WRITE_CHECK_INLINE_WAIT_MS);
 
 const fn add(a: Duration, b: Duration) -> Duration {
     match a.checked_add(b) {
@@ -182,7 +184,8 @@ pub fn change_has_blocking_append(payload: &serde_json::Value) -> bool {
 
 /// The host's answer bound for a request. `run` always answers within its
 /// grace window; a blocking tasks/questions append awaits an unbounded external
-/// event; everything else answers within the store-lock wait.
+/// event; everything else answers within the store-lock wait plus the inline
+/// write-check wait.
 ///
 /// A `run` item's own `timeout` is deliberately absent: it decides when that
 /// item is killed, never when the host answers. Deriving the bound per item is
@@ -419,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_write_a_non_append_and_a_read_use_the_store_lock_bound() {
+    fn a_plain_write_a_non_append_and_a_read_use_the_write_bound() {
         let requests = [
             callback_request(
                 "write",
@@ -438,8 +441,26 @@ mod tests {
         for request in requests {
             assert_eq!(
                 host_answer_bound(&request),
-                HostAnswerBound::Bounded(Duration::from_millis(WRITE_STORE_LOCK_WAIT_MS))
+                HostAnswerBound::Bounded(Duration::from_millis(
+                    WRITE_STORE_LOCK_WAIT_MS + WRITE_CHECK_INLINE_WAIT_MS
+                ))
             );
         }
+    }
+
+    /// A committing write may wait on the store lock and then on its own
+    /// when:write checks. Both waits ride inside the host bound, so the socket
+    /// that carries the write always outlives the host's answer and the agent
+    /// receives the commit instead of a transport error.
+    #[test]
+    fn the_write_socket_outlives_the_lock_wait_plus_the_inline_check_wait() {
+        let write = callback_request(
+            "write",
+            serde_json::json!({ "changes": [{ "target": "file:a", "mode": "create" }] }),
+        );
+        let host_waits = Duration::from_millis(WRITE_STORE_LOCK_WAIT_MS)
+            + Duration::from_millis(WRITE_CHECK_INLINE_WAIT_MS);
+        assert!(relay_timeout(&write) > host_waits);
+        assert!(socket_timeout(&write) > relay_timeout(&write));
     }
 }

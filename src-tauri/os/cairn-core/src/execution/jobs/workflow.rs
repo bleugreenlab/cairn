@@ -145,7 +145,13 @@ pub(crate) fn prepare_workflow_run(
     let anchor_branch = anchor_branch.ok_or("Workflow execution anchor has no logical branch")?;
     let store = crate::jj::project_store_dir(&orch.config_dir, &project_path);
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
-    crate::jj::ensure_project_store(&jj, &store, &project_path)?;
+    super::lifecycle::import_project_store_locked(
+        orch,
+        &jj,
+        &store,
+        &project_path,
+        "workflow run preparation",
+    )?;
     let base_commit = match inherited_head {
         Some(head) => head,
         None => crate::jj::resolve_base_rev(&jj, &store, &anchor_branch, |revision| {

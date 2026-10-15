@@ -545,9 +545,10 @@ fn start_call_run_now(orch: &Orchestrator, prepared: &PreparedCallRun) -> Result
     // Mark the call's process ACTIVE (CAIRN-2526). A call establishes no DB turn
     // (it is node-less), so unlike an ordinary run it never reaches the
     // `set_current_turn_id -> begin_turn` that flips a normal run's occupancy off
-    // `Idle`. Left `Idle`, the Claude reader's `was_host_interrupted` check
-    // (which is exactly `occupancy == Idle`) treats every `tool_result` user
-    // event as a post-interrupt transport artifact and drops it — so a completed
+    // `Idle`. An `Idle` process reads as between turns, and when the Claude
+    // reader's `was_host_interrupted` check read `Idle` alone it treated every
+    // `tool_result` user event as a post-interrupt transport artifact and dropped
+    // it — so a completed
     // call's transcript kept its `tool_use` rows but stored zero results, and the
     // drill-in tool detail rendered forever "pending". The call IS actively
     // serving its prompt, so `Busy` is the honest occupancy; the handle exists by
@@ -1627,9 +1628,10 @@ mod restart_call_tests {
     }
 
     /// Regression for CAIRN-2526: a call must not be left at the default `Idle`
-    /// occupancy while it runs. The Claude reader's `was_host_interrupted` check
-    /// is exactly `occupancy == Idle`, so an `Idle` call has every `tool_result`
-    /// user event dropped as a post-interrupt transport artifact — which is why
+    /// occupancy while it runs. When the Claude reader's `was_host_interrupted`
+    /// check read `occupancy == Idle` alone, an `Idle` call had every
+    /// `tool_result` user event dropped as a post-interrupt transport artifact —
+    /// which is why
     /// completed calls stored their `tool_use` rows but zero results and the
     /// monitor drill-in tool detail rendered forever "pending". A call establishes
     /// no DB turn, so unlike an ordinary run it never reaches the

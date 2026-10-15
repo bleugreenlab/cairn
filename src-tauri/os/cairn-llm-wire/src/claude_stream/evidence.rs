@@ -79,6 +79,13 @@ pub fn stderr_reports_unknown_session(line: &str) -> bool {
     line.contains("No conversation found with session ID")
 }
 
+/// The Claude CLI's wording when `--session-id <id>` names a conversation the
+/// CLI already created: an earlier launch under the same id got far enough to
+/// create it, so a fresh start under that id is refused.
+pub fn stderr_reports_session_id_in_use(line: &str) -> bool {
+    line.contains("Session ID ") && line.contains(" is already in use")
+}
+
 /// The signals a reader needs at stdout EOF that follow purely from the events
 /// it saw.
 ///

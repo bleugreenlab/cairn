@@ -19,9 +19,9 @@ use cairn_models::types::catalog::{claude_context_window, ClaudeContextOptIn};
 use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use cairn_models::wire::claude_stream::{
     extract_tool_start, message_start_usage, parse_thinking_tokens_estimate,
-    result_is_rate_limited, stderr_reports_unknown_session, terminal_provider_depletion,
-    ClaudeEvent, ControlResponseInner, DeltaContent, ProviderDepletion, RateLimitInfo,
-    StreamEventInner, StreamEvidence, Usage,
+    result_is_rate_limited, stderr_reports_session_id_in_use, stderr_reports_unknown_session,
+    terminal_provider_depletion, ClaudeEvent, ControlResponseInner, DeltaContent,
+    ProviderDepletion, RateLimitInfo, StreamEventInner, StreamEvidence, Usage,
 };
 use cairn_platform::services::emitter::EventEmitter;
 use std::{
@@ -781,9 +781,16 @@ pub(crate) fn claude_rate_limit_snapshot(info: &RateLimitInfo) -> ProviderUsageS
 
 /// Map a stderr line to the typed backend failure it proves, if any. The CLI's
 /// wording is recognized by the wire crate; this names what it means for the
-/// session: a `--resume` handle the CLI could not find.
+/// session: a `--resume` handle the CLI could not find, or a fresh
+/// `--session-id` the CLI had already created a conversation under.
 pub fn classify_stderr_failure(line: &str) -> Option<BackendFailure> {
-    stderr_reports_unknown_session(line).then_some(BackendFailure::SessionUnresolvable)
+    if stderr_reports_unknown_session(line) {
+        Some(BackendFailure::SessionUnresolvable)
+    } else if stderr_reports_session_id_in_use(line) {
+        Some(BackendFailure::SessionIdInUse)
+    } else {
+        None
+    }
 }
 
 /// The stderr drain for a spawned agent process plus any failure it classified.

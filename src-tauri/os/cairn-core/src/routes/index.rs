@@ -175,8 +175,8 @@ impl TriggerIndex {
     }
 
     /// The route set for a fact's project (`None` for a project-less fact):
-    /// project routes shadow workspace routes, which shadow the bundled ones,
-    /// exactly as `config::routes::list_routes` decides.
+    /// project routes shadow workspace routes, exactly as
+    /// `config::routes::list_routes` decides.
     pub(crate) fn routes(
         &self,
         config_dir: &Path,

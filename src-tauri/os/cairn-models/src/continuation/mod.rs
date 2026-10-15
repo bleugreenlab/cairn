@@ -19,7 +19,7 @@
 //!
 //! CAN THIS CONVERSATION CARRY THE NEXT TURN? Never a function of the clock. A
 //! Cairn session is replaced only when the native provider conversation cannot
-//! carry the next turn. There are exactly four causes, and every one of them is a
+//! carry the next turn. There are exactly five causes, and every one of them is a
 //! positive observation rather than an inference:
 //!
 //!   1. the job's model moved to a provider that cannot serve the old resume
@@ -32,7 +32,12 @@
 //!      none yet;
 //!   3. the provider's own accounting says the model's window is running out
 //!      ([`window_pressure_reached`]);
-//!   4. an operator asked for a reset (Cairn's `resume_job_from_digest`).
+//!   4. an operator asked for a reset (Cairn's `resume_job_from_digest`);
+//!   5. the provider was launched under this session's id and never confirmed
+//!      it ([`ContinueAction::RotateUnconfirmedStart`]). A provider that keys a
+//!      fresh conversation by the caller's id (Claude's `--session-id`) creates
+//!      it at launch, so a launch rejected before confirmation leaves a
+//!      conversation the same id can never start again.
 //!
 //! Elapsed time is not on that list and must never rejoin it. A prompt cache
 //! expiring means the next request pays a cache write; it does not mean the
@@ -322,6 +327,10 @@ pub enum ContinueAction {
     /// started on — rotate to a fresh session on that backend (the old backend's
     /// resume handle is invalid on the new one). Carries the target backend key.
     RotateToBackend(String),
+    /// Replace a session whose provider was launched under its id but never
+    /// confirmed a handle. Retrying under the same id would be refused, so the
+    /// job continues on a successor carrying a fresh id.
+    RotateUnconfirmedStart,
     /// Retry a provisional session whose backend startup never confirmed a
     /// native resume handle. The session identity and transcript survive.
     RetryStart,
@@ -332,9 +341,12 @@ pub enum ContinueAction {
 }
 
 /// Decide how an open session continues on a user reply. A cross-backend model
-/// change is the only thing here that replaces a session outright, because it is
-/// the only thing that invalidates the resume handle. A session without a
-/// confirmed backend handle retries its original startup; a session that resumes
+/// change replaces a session outright, because it invalidates the resume handle.
+/// A session without a confirmed backend handle retries its original startup,
+/// unless `unconfirmed_spawned_launch` reports that the provider was already
+/// launched under this session's id — the host reads that only for providers
+/// that key a fresh conversation by Cairn's id — in which case the same id
+/// cannot start again and the session is replaced; a session that resumes
 /// natively (Codex with a stored thread id) resumes directly; everything else
 /// asks the window-pressure rebuild, which nearly always declines.
 ///
@@ -356,11 +368,15 @@ pub fn decide_continue_action(
     session_backend_id: Option<&str>,
     desired_backend: Option<&str>,
     prefix_cache: PrefixCacheState,
+    unconfirmed_spawned_launch: bool,
 ) -> ContinueAction {
     if let Some(want) = desired_backend.filter(|want| *want != session_backend) {
         return ContinueAction::RotateToBackend(want.to_string());
     }
     if session_backend_id.is_none() {
+        if unconfirmed_spawned_launch {
+            return ContinueAction::RotateUnconfirmedStart;
+        }
         return ContinueAction::RetryStart;
     }
     // A cold prefix is the one thing that makes a natively-resumable session
@@ -466,7 +482,8 @@ mod tests {
                 "claude",
                 Some("sess"),
                 Some("claude"),
-                PrefixCacheState::Cold
+                PrefixCacheState::Cold,
+                false
             ),
             ContinueAction::MaybeReseed
         );
@@ -549,7 +566,8 @@ mod tests {
                 "codex",
                 Some("thread-x"),
                 Some("codex"),
-                PrefixCacheState::Warm
+                PrefixCacheState::Warm,
+                false
             ),
             ContinueAction::Resume
         );
@@ -558,7 +576,8 @@ mod tests {
                 "codex",
                 Some("thread-x"),
                 Some("codex"),
-                PrefixCacheState::Unknown
+                PrefixCacheState::Unknown,
+                false
             ),
             ContinueAction::Resume,
             "an unmeasurable prefix must keep today's behaviour exactly"
@@ -568,7 +587,8 @@ mod tests {
                 "codex",
                 Some("thread-x"),
                 Some("codex"),
-                PrefixCacheState::Cold
+                PrefixCacheState::Cold,
+                false
             ),
             ContinueAction::MaybeReseed
         );
@@ -661,7 +681,8 @@ mod tests {
                 "codex",
                 Some("thread-existing"),
                 Some("codex"),
-                PrefixCacheState::Warm
+                PrefixCacheState::Warm,
+                false
             ),
             ContinueAction::Resume
         );
@@ -672,7 +693,8 @@ mod tests {
                 "codex",
                 Some("thread-existing"),
                 None,
-                PrefixCacheState::Warm
+                PrefixCacheState::Warm,
+                false
             ),
             ContinueAction::Resume
         );
@@ -688,7 +710,8 @@ mod tests {
                 "claude",
                 Some("sess-abc"),
                 Some("claude"),
-                PrefixCacheState::Warm
+                PrefixCacheState::Warm,
+                false
             ),
             ContinueAction::MaybeReseed
         );
@@ -697,12 +720,64 @@ mod tests {
         // identifier that does not exist. A cold prefix does not change that:
         // there is no conversation to price yet.
         assert_eq!(
-            decide_continue_action("claude", None, Some("claude"), PrefixCacheState::Warm),
+            decide_continue_action(
+                "claude",
+                None,
+                Some("claude"),
+                PrefixCacheState::Warm,
+                false
+            ),
             ContinueAction::RetryStart
         );
         assert_eq!(
-            decide_continue_action("codex", None, Some("codex"), PrefixCacheState::Cold),
+            decide_continue_action("codex", None, Some("codex"), PrefixCacheState::Cold, false),
             ContinueAction::RetryStart
+        );
+    }
+
+    #[test]
+    fn a_launched_but_unconfirmed_session_rotates_instead_of_retrying() {
+        // The provider was launched under this session's id and never
+        // confirmed it: a retry under the same id is refused, so the session is
+        // replaced. Neither a cold nor a warm prefix changes that.
+        for cache in [
+            PrefixCacheState::Warm,
+            PrefixCacheState::Cold,
+            PrefixCacheState::Unknown,
+        ] {
+            assert_eq!(
+                decide_continue_action("claude", None, Some("claude"), cache, true),
+                ContinueAction::RotateUnconfirmedStart
+            );
+        }
+        // Without that observation the same handle-less session keeps today's
+        // identity-preserving retry.
+        assert_eq!(
+            decide_continue_action(
+                "claude",
+                None,
+                Some("claude"),
+                PrefixCacheState::Warm,
+                false
+            ),
+            ContinueAction::RetryStart
+        );
+        // A provider change still outranks it: the successor is minted on the
+        // new backend either way, and that rotation carries the right reason.
+        assert_eq!(
+            decide_continue_action("claude", None, Some("codex"), PrefixCacheState::Warm, true),
+            ContinueAction::RotateToBackend("codex".to_string())
+        );
+        // A confirmed handle is never second-guessed by the reading.
+        assert_eq!(
+            decide_continue_action(
+                "claude",
+                Some("sess"),
+                Some("claude"),
+                PrefixCacheState::Warm,
+                true
+            ),
+            ContinueAction::MaybeReseed
         );
     }
 
@@ -715,7 +790,8 @@ mod tests {
                 "claude",
                 Some("sess"),
                 Some("codex"),
-                PrefixCacheState::Warm
+                PrefixCacheState::Warm,
+                false
             ),
             ContinueAction::RotateToBackend("codex".to_string())
         );
@@ -726,7 +802,8 @@ mod tests {
                 "claude",
                 Some("sess"),
                 Some("codex"),
-                PrefixCacheState::Cold
+                PrefixCacheState::Cold,
+                false
             ),
             ContinueAction::RotateToBackend("codex".to_string())
         );

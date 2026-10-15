@@ -19,3 +19,14 @@
 /// deliveries the write-replay guard exists to absorb (CAIRN-3264) — but a
 /// guard against a race is not a reason to keep the race.
 pub const WRITE_STORE_LOCK_WAIT_MS: u64 = 600_000;
+
+/// How long a committing `write` or `run` waits inline for the when:write
+/// checks of the commit it just sealed before answering with the checks marked
+/// pending.
+///
+/// The commit is the call's result; the checks are commentary on it. A wave
+/// that runs past this keeps running in the background and lands its verdicts
+/// at `cairn:~/checks`. Without this bound a hung or slow wave held the result
+/// open until the callback socket gave up, and the agent saw a transport
+/// failure for a write that had already committed.
+pub const WRITE_CHECK_INLINE_WAIT_MS: u64 = 120_000;

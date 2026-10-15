@@ -2056,12 +2056,13 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
             }
         }
 
-        // Synchronous when:write check runner: a write that sealed a source-touching
-        // commit fires the affected when:write checks against that sealed commit,
-        // streams their output live into this tool's transcript, runs them to
-        // completion, and returns a compact inline pass/fail line appended to the
-        // change report. Gated on an actual file change that produced a real commit
-        // sha — a cairn://-resource-only write has no file change and never triggers.
+        // when:write check runner: a write that sealed a source-touching commit
+        // fires the affected when:write checks against that sealed commit, streams
+        // their output live into this tool's transcript, and appends a compact
+        // pass/fail line to the change report — or a pending line once the bounded
+        // inline wait elapses, with the wave finishing in the background. Gated on
+        // an actual file change that produced a real commit sha — a
+        // cairn://-resource-only write has no file change and never triggers.
         let check_summary: Option<String> = if had_file_change
             && commit
                 .as_ref()

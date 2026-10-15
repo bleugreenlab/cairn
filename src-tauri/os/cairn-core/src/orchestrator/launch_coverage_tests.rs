@@ -1148,3 +1148,186 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
 
     recorder.release();
 }
+
+/// The Claude CLI as it behaved in cairn/4978, scripted by session id. The
+/// first launch under an id creates the conversation and then reports an
+/// `init` without Cairn's tools; every later fresh start under that id is
+/// refused on stderr; an id it has never seen launches cleanly.
+#[derive(Default)]
+struct ScriptedClaude {
+    created: Mutex<std::collections::HashSet<String>>,
+    /// The id each launch handed the CLI as `--session-id`, in order.
+    launched_ids: Mutex<Vec<String>>,
+}
+
+impl SessionProvider for ScriptedClaude {
+    fn open(
+        &self,
+        host: &dyn SessionHost,
+        spec: SessionSpec,
+    ) -> Result<LaunchedSession, SessionError> {
+        let id = spec.start.session_id().to_string();
+        self.launched_ids.lock().unwrap().push(id.clone());
+        let first_launch_of_id = self.created.lock().unwrap().insert(id.clone());
+        let refused = !first_launch_of_id;
+        let rejected_at_init = first_launch_of_id && id.ends_with("-rejected");
+        let (stdout, stderr): (Vec<u8>, Option<String>) = if refused {
+            (
+                Vec::new(),
+                Some(format!("Error: Session ID {id} is already in use.\n")),
+            )
+        } else if rejected_at_init {
+            (
+                format!(
+                    "{}\n",
+                    json!({"type": "system", "subtype": "init", "session_id": id, "tools": []})
+                )
+                .into_bytes(),
+                None,
+            )
+        } else {
+            let tools = cairn_session::agent_process::toolkits::CORE_VERBS;
+            let mut out = format!(
+                "{}\n",
+                json!({"type": "system", "subtype": "init", "session_id": id, "tools": tools})
+            )
+            .into_bytes();
+            out.extend(claude_one_shot_output(&spec));
+            (out, None)
+        };
+        Ok(LaunchedSession {
+            control: Box::new(RecordingControl {
+                recorder: Arc::new(Recorder::default()),
+                provider: "claude",
+            }),
+            events: SessionEvents::ClaudeStream {
+                stdout: Box::new(std::io::Cursor::new(stdout)),
+                stderr: stderr.map(|text| {
+                    Box::new(std::io::Cursor::new(text.into_bytes()))
+                        as Box<dyn std::io::BufRead + Send>
+                }),
+            },
+            process: Arc::new(Mutex::new(None)),
+            facts: facts(&spec, "claude", &id, host),
+        })
+    }
+}
+
+/// `(status, exit_reason, error_message)` once the run leaves `starting`/`live`.
+async fn settled_run(
+    orch: &Orchestrator,
+    run_id: &str,
+) -> (String, Option<String>, Option<String>) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let run = run_id.to_string();
+        let row = orch
+            .db
+            .local
+            .read(move |conn| {
+                let run = run.clone();
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT status, exit_reason, error_message FROM runs WHERE id = ?1",
+                            (run.as_str(),),
+                        )
+                        .await?;
+                    let row = rows.next().await?.expect("the run row");
+                    Ok((
+                        row.get::<String>(0)?,
+                        row.get::<Option<String>>(1)?,
+                        row.get::<Option<String>>(2)?,
+                    ))
+                })
+            })
+            .await
+            .unwrap();
+        if row.0 != "starting" && row.0 != "live" {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run {run_id} never settled after its process exited: {row:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn launch_claude(orch: &Orchestrator, run_id: &str, session_id: &str) {
+    seed_run(orch, run_id, session_id).await;
+    let (launch_orch, launch_config) = (orch.clone(), config(run_id, session_id, "sonnet", false));
+    tokio::task::spawn_blocking(move || {
+        backend_for_name(Some("claude")).start_session(launch_config, &launch_orch)
+    })
+    .await
+    .unwrap()
+    .unwrap_or_else(|error| panic!("{run_id} did not launch: {error}"));
+}
+
+/// cairn/4978, the provider half. A launch rejected at `init` records why on
+/// its run; a relaunch the CLI refuses because the id is taken settles on its
+/// own run, promptly and typed, rather than waiting for the reaper; and a
+/// fresh id launches and confirms its handle.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_claude_start_settles_on_its_own_run() {
+    let recorder = Arc::new(Recorder::default());
+    let (mut orch, _) = orchestrator(&recorder).await;
+    let claude = Arc::new(ScriptedClaude::default());
+    orch.models_runtime.claude = claude.clone();
+    orch.db
+        .local
+        .execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+               VALUES ('ws-4978', 'Workspace', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj-4978', 'ws-4978', 'Project', 'p4978', '/tmp/p4978', 1, 1);
+             INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+               VALUES ('job-4978', 'proj-4978', 'running', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES ('sess-a-rejected', 'job-4978', 'claude', 'open', 24, 1, 1),
+                      ('sess-b', 'job-4978', 'claude', 'open', 25, 1, 1);",
+        )
+        .await
+        .unwrap();
+
+    // The first launch: the CLI creates the conversation, then its `init`
+    // lacks Cairn's tools and the host rejects it.
+    launch_claude(&orch, "run-1", "sess-a-rejected").await;
+    let (status, exit_reason, error) = settled_run(&orch, "run-1").await;
+    assert_eq!(status, "crashed");
+    assert_eq!(exit_reason.as_deref(), Some("session_start_rejected"));
+    assert!(error.is_some_and(|error| !error.is_empty()));
+
+    // A retry under the same id: the CLI refuses on stderr and exits with no
+    // output. Before cairn/4978 this run stayed `live` until the reaper.
+    launch_claude(&orch, "run-2", "sess-a-rejected").await;
+    let (status, exit_reason, error) = settled_run(&orch, "run-2").await;
+    assert_eq!(status, "crashed");
+    assert_eq!(exit_reason.as_deref(), Some("session_id_in_use"));
+    assert!(
+        error
+            .as_deref()
+            .is_some_and(|error| error.contains("earlier, unconfirmed launch")),
+        "{error:?}"
+    );
+
+    // A fresh id launches and confirms its handle.
+    launch_claude(&orch, "run-3", "sess-b").await;
+    let (status, exit_reason, _) = settled_run(&orch, "run-3").await;
+    assert_eq!(status, "exited");
+    assert_eq!(exit_reason, None);
+    assert_eq!(
+        orch.db
+            .local
+            .query_opt_text("SELECT backend_id FROM sessions WHERE id = 'sess-b'", ())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sess-b")
+    );
+    assert_eq!(
+        *claude.launched_ids.lock().unwrap(),
+        ["sess-a-rejected", "sess-a-rejected", "sess-b"]
+    );
+}

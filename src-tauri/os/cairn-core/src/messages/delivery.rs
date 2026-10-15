@@ -800,9 +800,13 @@ pub fn flush_pending_directs_on_idle(orch: &Orchestrator, run_id: &str) -> Resul
     let short = &pending.job_id[..pending.job_id.len().min(8)];
     let handoff_started = std::time::Instant::now();
     match crate::execution::jobs::continue_job_impl(orch, &pending.job_id, None, None, None) {
-        Ok(_) => log::info!(
-            "flush-on-idle: resumed job {} ({} side-channel notice(s), {} queued user message(s); directs/pushes delivered by the resume)",
+        // `continue_job_impl` returns once the process is spawned, before the
+        // provider's first handshake, so `Ok` is a dispatch, not a confirmed
+        // launch. A start that fails afterwards settles on the run itself.
+        Ok(run) => log::info!(
+            "flush-on-idle: dispatched continuation for job {} (run {}; {} side-channel notice(s), {} queued user message(s)); launch outcome settles on the run",
             short,
+            &run.id[..run.id.len().min(8)],
             pending.notice_count,
             pending.queued_count
         ),

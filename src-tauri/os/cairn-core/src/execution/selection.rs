@@ -68,6 +68,12 @@ pub(crate) fn whole_suite_command(check: &CheckCommand) -> Result<String, String
     Ok(template.to_string())
 }
 
+fn contains_selector_placeholder(command: &str) -> bool {
+    [CHANGED_FILES_PLACEHOLDER, TARGETS_PLACEHOLDER]
+        .iter()
+        .any(|placeholder| command.contains(placeholder))
+}
+
 fn shell_command_is_well_formed(command: &str) -> bool {
     let mut in_single = false;
     let mut in_double = false;
@@ -117,11 +123,13 @@ pub struct CheckPlan {
     /// The check's name (its key in the `checks` map).
     pub(crate) name: String,
     /// Whether this check applies to the change set. A check that does not apply
-    /// is skipped by the runner; its `command`/`scope` are populated with the
-    /// full-run defaults but unused.
+    /// is skipped by the cadences; its `command` is the check's whole-suite
+    /// command and its `scope` is `Full`.
     pub(crate) applies: bool,
-    /// The concrete command to run, with any `{changedFiles}`/`{targets}`
-    /// placeholder already substituted.
+    /// The concrete command to run. Unless `config_error` is set, it never
+    /// contains a `{changedFiles}`/`{targets}` placeholder: a selective plan has
+    /// it substituted, any other selector plan carries the whole-suite command,
+    /// and a placeholder-free plan carries its command as declared.
     pub(crate) command: String,
     /// Whether `command` runs the whole check or a selected subset.
     pub(crate) scope: CheckScope,
@@ -216,17 +224,39 @@ fn plan_one(
     changed_files: &[GraphFileChange],
     repo_root: &Path,
 ) -> CheckPlan {
-    let full_plan = |scope: CheckScope, applies: bool| CheckPlan {
-        name: name.to_string(),
-        applies,
-        command: check.command.clone(),
-        scope,
-        resource_class: check.resource_class,
-        verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
-            check,
-        ),
-        verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
-        config_error: None,
+    // An un-narrowed plan never carries a raw selector template: a placeholder
+    // that reaches the shell unexpanded is a literal token the runner reads as a
+    // file belonging to nothing, so it runs zero tests. A selector check carries
+    // its whole-suite command instead, and one with no whole-suite form is
+    // unrunnable. A placeholder-free command already IS a full run and runs as
+    // declared; its `fullCommand` belongs to full-tree evaluations, which resolve
+    // it themselves (`resolve_full_tree_plans`).
+    let full_plan = |scope: CheckScope, applies: bool| {
+        let (command, config_error) = if !contains_selector_placeholder(&check.command) {
+            (check.command.clone(), None)
+        } else {
+            match whole_suite_command(check) {
+                Ok(command) => (command, None),
+                Err(error) => (
+                    check.command.clone(),
+                    Some(format!(
+                        "check {name:?} cannot resolve a whole-suite command: {error}"
+                    )),
+                ),
+            }
+        };
+        CheckPlan {
+            name: name.to_string(),
+            applies,
+            command,
+            scope,
+            resource_class: check.resource_class,
+            verdict_environment_names: crate::execution::check_identity::verdict_environment_names(
+                check,
+            ),
+            verdict_platforms: crate::execution::check_identity::verdict_platforms(check),
+            config_error,
+        }
     };
 
     // An invalid DECLARATION is unrunnable, not merely un-narrowed: there is no
@@ -422,9 +452,10 @@ pub(crate) fn build_glob_set(patterns: &[String]) -> Result<globset::GlobSet, St
 //    OPTION rather than a path is disambiguated, since quoting cannot help there
 //    (`'-x'` and `-x` reach `argv` identically).
 //
-// A declaration that violates (1) is a configuration bug rather than an attack,
-// and is handled the way every other uncertain selector resolution is: the
-// placeholder degrades to empty and the check runs its whole-suite command.
+// A declaration that violates (1) is a configuration bug rather than an attack.
+// It has no derivable whole-suite form, so the plan is refused with a
+// `config_error` and nothing runs (see `unexpandable_plan`), unless an explicit
+// `fullCommand` supplies the whole suite for a plan that does not expand.
 
 /// Whether `template` uses `placeholder` in the one position the expansion
 /// contract defines, and may therefore be expanded at all.
@@ -454,6 +485,12 @@ fn placeholder_is_expandable(template: &str, placeholder: &str) -> bool {
     }
     // A whitespace boundary, so the expansion cannot concatenate onto a literal.
     if !head.ends_with(char::is_whitespace) {
+        return false;
+    }
+    // No other selector in the head: expanding (or dropping) this one would
+    // leave that one behind as a literal token, and only one can be the
+    // trailing position the contract covers.
+    if contains_selector_placeholder(head) {
         return false;
     }
     head_is_single_simple_command(head)
@@ -723,6 +760,131 @@ mod tests {
         assert!(plan.applies);
         assert_eq!(plan.scope, CheckScope::Full);
         assert_eq!(plan.command, "bun run check");
+    }
+
+    // --- the planner never emits a raw placeholder --------------------------
+
+    #[test]
+    fn non_applicable_plan_carries_whole_suite_command() {
+        let mut declared = check("bun run test:rust {changedFiles}", Some(&["src-tauri/**"]));
+        declared.full_command = Some("bun run test:rust:full".to_string());
+        let plan = plan_for(declared, &[change("docs/x.md", "modified")]);
+        assert!(!plan.applies);
+        assert_eq!(plan.command, "bun run test:rust:full");
+        assert!(plan.config_error.is_none());
+
+        let derived = check("bun run test:rust {changedFiles}", Some(&["src-tauri/**"]));
+        let plan = plan_for(derived, &[]);
+        assert!(!plan.applies);
+        assert_eq!(plan.command, "bun run test:rust");
+        assert!(plan.config_error.is_none());
+    }
+
+    #[test]
+    fn declared_unresolvable_selector_runs_whole_suite_not_placeholder() {
+        // An invalid glob is a declared selector that cannot narrow, so the check
+        // applies to any change and runs its whole suite.
+        let c = check("bun run test:rust {changedFiles}", Some(&["src-tauri/["]));
+        let plan = plan_for(c, &[change("src-tauri/x.rs", "modified")]);
+        assert!(plan.applies);
+        assert_eq!(plan.scope, CheckScope::Full);
+        assert_eq!(plan.command, "bun run test:rust");
+        assert!(plan.config_error.is_none());
+    }
+
+    /// Two selectors in one command: whichever is trailing, removing or
+    /// expanding it would leave the other behind as a literal argument.
+    #[test]
+    fn mixed_placeholders_have_no_whole_suite_form_and_never_expand() {
+        for command in [
+            "tool {targets} {changedFiles}",
+            "tool {changedFiles} {targets}",
+        ] {
+            assert!(
+                whole_suite_command(&check(command, None)).is_err(),
+                "{command} has no derivable whole suite"
+            );
+            for changed in [Vec::new(), vec![change("src/a.ts", "modified")]] {
+                let plan = plan_for(check(command, Some(&["src/**"])), &changed);
+                assert!(
+                    plan.config_error.is_some(),
+                    "{command} changed={changed:?} planned {:?}",
+                    plan.command
+                );
+            }
+        }
+    }
+
+    /// An incremental cadence runs a placeholder-free command as declared, even
+    /// when the check also names a `fullCommand`: that entry point belongs to
+    /// full-tree evaluations.
+    #[test]
+    fn placeholder_free_check_runs_its_declared_command_not_full_command() {
+        let mut declared = check("tool quick", Some(&["src/**"]));
+        declared.full_command = Some("tool full".to_string());
+        for changed in [vec![change("src/a.ts", "modified")], Vec::new()] {
+            let plan = plan_for(declared.clone(), &changed);
+            assert_eq!(plan.command, "tool quick", "changed={changed:?}");
+            assert!(plan.config_error.is_none());
+        }
+    }
+
+    #[test]
+    fn unexpandable_placeholder_without_changes_is_config_error() {
+        let c = check("tool --files={changedFiles}", Some(&["src/**"]));
+        let plan = plan_for(c, &[]);
+        assert!(
+            plan.config_error.is_some(),
+            "a declaration with no whole-suite form is unrunnable: {plan:?}"
+        );
+    }
+
+    /// The planner's invariant: a plan without a config error never carries an
+    /// unexpanded selector placeholder, whichever branch produced it.
+    #[test]
+    fn a_plan_without_config_error_never_carries_a_placeholder() {
+        let commands: [(&str, Option<&str>); 13] = [
+            ("tool {targets} {changedFiles}", None),
+            ("tool {changedFiles} {targets}", None),
+            ("tool {targets} {changedFiles}", Some("tool --all")),
+            ("tool {changedFiles} {changedFiles}", None),
+            ("vitest related {changedFiles}", None),
+            ("vitest related {changedFiles}", Some("vitest run")),
+            ("bun run test:rust {targets}", None),
+            (
+                "bun run test:rust {targets}",
+                Some("bun run test:rust:full"),
+            ),
+            ("tool --files={changedFiles}", None),
+            ("tool --files={changedFiles}", Some("tool --all")),
+            ("tool {targets} --release", None),
+            ("cargo test", None),
+            ("cargo test", Some("cargo test --workspace")),
+        ];
+        let impacts: [Option<&[&str]>; 3] = [None, Some(&["src/**"]), Some(&["src/["])];
+        let change_sets = [
+            Vec::new(),
+            vec![change("src/a.ts", "modified")],
+            vec![change("docs/x.md", "modified")],
+        ];
+        for (command, full) in commands {
+            for impact in impacts {
+                for changed in &change_sets {
+                    let mut declared = check(command, impact);
+                    declared.full_command = full.map(str::to_string);
+                    let plan = plan_for(declared, changed);
+                    if plan.config_error.is_none() {
+                        assert!(
+                            !plan.command.contains(CHANGED_FILES_PLACEHOLDER)
+                                && !plan.command.contains(TARGETS_PLACEHOLDER),
+                            "{command:?} full={full:?} impact={impact:?} changed={changed:?} \
+                             planned {:?} with no config error",
+                            plan.command
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // --- {changedFiles} substitution ---------------------------------------

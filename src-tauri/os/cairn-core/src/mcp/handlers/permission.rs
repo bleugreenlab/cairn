@@ -4267,20 +4267,29 @@ pub(crate) mod tests {
         let orch =
             Orchestrator::builder(db, Arc::new(TestServicesBuilder::new().build()), root).build();
         seed_allow_all_permission(&orch).await;
-        crate::channels::ledger::claim_ask_resolution(
-            &orch.db.local,
-            "perm-request-1",
-            "Approve",
-            AppearanceTransport::ChannelReply,
-            Some("telegram"),
-            Some("telegram:8771562567"),
-            Some("8771562567"),
-            "permission",
-            "perm-request-1",
-            10,
-        )
-        .await
-        .unwrap();
+        // The Telegram win is written as raw rows in the shape the pre-0190
+        // schema defined (0182's tables plus 0184's provenance columns), not
+        // through today's `claim_ask_resolution`: the runtime claim path touches
+        // columns later migrations add, and this test witnesses what 0190 does
+        // to data that existed before it.
+        orch.db
+            .local
+            .execute_script(
+                "
+                INSERT INTO channel_ask_action (action_ref, kind)
+                 VALUES ('perm-request-1', 'permission');
+                INSERT INTO channel_ask_resolution (
+                    binding_ref, action_ref, kind, answer, winner_provider,
+                    winner_conversation, resolved_at, resolution_id, winner_surface, winner_actor
+                ) VALUES (
+                    'perm-request-1', 'perm-request-1', 'permission', 'Approve', 'telegram',
+                    'telegram:8771562567', 10, '6f1c1e0a-5b0e-4d2a-9c43-0d3f6b8a1e72',
+                    'channel_reply', '8771562567'
+                );
+                ",
+            )
+            .await
+            .unwrap();
         assert_eq!(
             MigrationRunner::new(vec![canonicalize])
                 .run(&orch.db.local)

@@ -577,6 +577,10 @@ pub(crate) struct PublishedSlotDelta {
     pub commit: String,
     pub patch: String,
     pub paths: Vec<String>,
+    /// The fix landed directly on the commit the batch ran against. False when
+    /// the branch advanced first and the delta was merged onto (or was already
+    /// carried by) a newer head: `commit` then holds code the batch never ran.
+    pub landed_on_tested_base: bool,
 }
 
 /// Publish an executor delta into a managed workspace and seal it through the
@@ -621,11 +625,12 @@ pub(crate) async fn publish_and_seal_slot_delta(
             log::warn!("system-fix delta upload was not finalized: {error}");
         }
     }
-    let (commit, patch) = match publication.outcome {
+    let (commit, patch, landed_on_tested_base) = match publication.outcome {
         SlotPublicationOutcome::Published {
             landed,
             export,
             patch,
+            integration,
             ..
         } => {
             // Fails closed: a fix whose commit never reached `refs/heads/*` is
@@ -637,11 +642,14 @@ pub(crate) async fn publish_and_seal_slot_delta(
                     landed.head
                 )
             })?;
-            (landed.head, patch)
+            (landed.head, patch, integration.is_none())
         }
         // The branch head already carries this fix. There is nothing to seal,
         // and an empty commit is not a better answer than saying so.
-        SlotPublicationOutcome::AlreadyLanded { head } => (head, String::new()),
+        SlotPublicationOutcome::AlreadyLanded { head } => {
+            let on_base = head == delta.base_commit;
+            (head, String::new(), on_base)
+        }
     };
     let paths = crate::jj::parse_git_diff(&patch)
         .into_iter()
@@ -651,6 +659,7 @@ pub(crate) async fn publish_and_seal_slot_delta(
         commit,
         patch,
         paths,
+        landed_on_tested_base,
     })
 }
 
@@ -1627,6 +1636,10 @@ mod slot_publication_tests {
             "nothing new was committed: the reported commit is the head that already carries it"
         );
         assert!(published.paths.is_empty());
+        assert!(
+            !published.landed_on_tested_base,
+            "the head carrying the fix is a sibling's commit, not the one the batch ran on"
+        );
         assert_eq!(
             fx.bookmark(),
             fx.head,
@@ -1636,6 +1649,43 @@ mod slot_publication_tests {
             orch.object_plane.staged_delta(&receipt).is_none(),
             "the upload was installed and fully handled, so its receipt must not be left staged"
         );
+    }
+
+    /// A write-check fix published while the branch stood still lands on the
+    /// commit the batch tested; one merged onto a head that advanced mid-batch
+    /// does not, and says so, because the published commit then carries code no
+    /// check in the batch ran against.
+    #[tokio::test]
+    #[serial_test::serial(jj)]
+    async fn a_fix_merged_onto_an_advanced_head_reports_it_left_the_tested_base() {
+        for (advance, expected) in [
+            (None, true),
+            (Some(&[("advanced.rs", "after\n")][..]), false),
+        ] {
+            let Some(fx) = straddle(advance, &[("mine.rs", "formatted\n")]).await else {
+                eprintln!("skipping a_fix_merged_onto_an_advanced_head: jj not resolvable");
+                return;
+            };
+            let orch = orchestrator().await;
+            let published = publish_and_seal_slot_delta(
+                &orch,
+                &fx.repository,
+                &fx.request,
+                &fx.delta,
+                "feature",
+                "fix: apply write-check changes",
+                None,
+            )
+            .await
+            .expect("a clean fix publishes");
+            assert_eq!(
+                published.landed_on_tested_base,
+                expected,
+                "advance={}",
+                advance.is_some()
+            );
+            assert_eq!(fx.blob(&published.commit, "mine.rs"), "formatted");
+        }
     }
 
     /// The one publication failure that leaves real work behind. Divergent edits
@@ -4551,11 +4601,12 @@ async fn settle_run_batch(
         }
         result.push_str(&barrier.message);
     }
-    // Synchronous when:write check runner: a sealed source-touching commit fires
-    // the affected when:write checks against that commit, streams their output
-    // live into this tool's transcript, runs them to completion, and appends a
-    // compact inline pass/fail line. Gated on an actually-landed commit
-    // (`committed` is true only with commit_msg + a successful seal).
+    // when:write check runner: a sealed source-touching commit fires the affected
+    // when:write checks against that commit, streams their output live into this
+    // tool's transcript, and appends a compact pass/fail line — or a pending line
+    // once the bounded inline wait elapses, with the wave finishing in the
+    // background. Gated on an actually-landed commit (`committed` is true only
+    // with commit_msg + a successful seal).
     if barrier.committed {
         // A commit just sealed → the branch advanced. Cancel any in-flight
         // when:review suite for this job so its heavy concurrent compiles stop

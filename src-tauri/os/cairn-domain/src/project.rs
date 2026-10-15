@@ -236,9 +236,10 @@ pub struct CheckCommand {
     /// The command to run. A `{changedFiles}` or `{targets}` placeholder makes
     /// it selective; a placeholder-less command runs as-is.
     pub command: String,
-    /// Deliberate whole-suite entry point used by full-tree cadences. When
-    /// omitted, Cairn may derive a full command only from a safely trailing
-    /// selector placeholder in `command`.
+    /// Deliberate whole-suite entry point used by full-tree evaluations
+    /// (main-health and manual runs), and by a selector check whose selection
+    /// cannot narrow. When omitted, Cairn may derive a full command only from a
+    /// safely trailing selector placeholder in `command`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

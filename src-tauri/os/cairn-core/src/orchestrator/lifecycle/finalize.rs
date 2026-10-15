@@ -738,6 +738,58 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
     finalize_run(orch, run_id, RunStatus::Crashed);
 }
 
+/// Record why a still-active run failed, only if it is still active.
+///
+/// Returns whether the run was `Starting`/`Live` and now carries the cause. A
+/// run another path already settled (a kill, the reaper, a user stop) keeps
+/// the cause that path wrote; the caller then must not finalize it again.
+pub(crate) fn record_run_failure_if_active(
+    orch: &Orchestrator,
+    run_id: &str,
+    exit_reason: &str,
+    error_message: &str,
+) -> Result<bool, String> {
+    let run_id = run_id.to_string();
+    let exit_reason = exit_reason.to_string();
+    let error_message = error_message.to_string();
+    run_db_blocking({
+        let dbs = orch.db.clone();
+        move || async move {
+            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            db.write(|conn| {
+                let run_id = run_id.clone();
+                let exit_reason = exit_reason.clone();
+                let error_message = error_message.clone();
+                Box::pin(async move {
+                    let changed = conn
+                        .execute(
+                            "UPDATE runs
+                             SET exit_reason = ?1,
+                                 error_message = ?2,
+                                 updated_at = ?3
+                             WHERE id = ?4
+                               AND status IN (?5, ?6)",
+                            (
+                                exit_reason.as_str(),
+                                error_message.as_str(),
+                                chrono::Utc::now().timestamp(),
+                                run_id.as_str(),
+                                RunStatus::Starting.to_string(),
+                                RunStatus::Live.to_string(),
+                            ),
+                        )
+                        .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())
+        }
+    })
+}
+
 /// Settle a turn that ended because its provider account is depleted.
 ///
 /// The turn is interrupted, never completed: the account produced no finished
@@ -1372,7 +1424,14 @@ mod session_reseed_fallback_tests {
     fn other_crash_reasons_never_fall_back() {
         // The pre-existing crashed-resume warning still covers these; they have
         // no automatic recovery.
-        for reason in [None, Some("capacity_retry"), Some("turn_failed")] {
+        for reason in [
+            None,
+            Some("capacity_retry"),
+            Some("turn_failed"),
+            Some("crash"),
+            Some("session_start_rejected"),
+            Some("session_id_in_use"),
+        ] {
             assert!(
                 !should_fall_back_to_digest_reseed(&RunStatus::Crashed, Some("resume"), reason),
                 "exit reason {reason:?} must not trigger the fallback"

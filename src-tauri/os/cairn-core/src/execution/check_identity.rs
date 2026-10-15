@@ -149,6 +149,13 @@ pub(crate) fn content_identity(
     }
     field(&mut hasher, &CHECK_RESULT_SCHEMA_VERSION.to_string());
     field(&mut hasher, &CHECK_PARSER_VERSION.to_string());
+    // A selector check whose selection cannot narrow runs its `fullCommand`, so
+    // that command is part of what the verdict attests to. Trailing and only
+    // when declared, so every check without one keeps its key byte for byte.
+    if let Some(full_command) = check.full_command.as_deref() {
+        field(&mut hasher, "full-command");
+        field(&mut hasher, full_command);
+    }
 
     CheckContentIdentity {
         fingerprint: digest(hasher),

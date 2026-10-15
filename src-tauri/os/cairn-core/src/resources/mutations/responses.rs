@@ -108,11 +108,25 @@ pub(super) async fn delete(
     p: Option<&str>,
 ) -> Result<String, String> {
     reject(r, id, p)?;
-    let path = root(o, r, p).await?.join(format!("{id}.md"));
+    let project = match p {
+        Some(key) => Some(crate::mcp::handlers::skills_resources::project_path_by_key(o, key).await?),
+        None => None,
+    };
+    let path = project
+        .as_ref()
+        .map_or_else(|| o.config_dir.join("responses"), |project| project.join(".cairn/responses"))
+        .join(format!("{id}.md"));
     if !path.exists() {
         return Err(format!("Response not found: {id}"));
     }
-    std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    // Through the config module, so a workspace response an installed pack
+    // ships is recorded as removed instead of copied straight back by the next
+    // pack sync. The existence check pinned the scope, so its
+    // project-then-workspace order resolves to this same file.
+    crate::config::responses::delete_response(&o.config_dir, id, project.as_deref())?;
     crate::config::commit_config_paths(&[path], &format!("cairn: delete response {id}"));
+    if project.is_none() {
+        o.emit_pack_registry_change();
+    }
     Ok(format!("Deleted response '{id}'"))
 }
