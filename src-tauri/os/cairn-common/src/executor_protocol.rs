@@ -4135,6 +4135,18 @@ pub struct LearnedResourceEstimate {
 /// the change touches. A refused lane is simply never submitted, which an
 /// executor of any version cannot distinguish from a lane that was not
 /// planned, so a runner talking to an older executor gets nothing wrong.
+///
+/// cairn/4815 changes the launch context the executor resolves a check's
+/// reported `toolchainFingerprint` in, without a bump. The executor now probes
+/// rustc and bun in the command's own working directory and launch environment,
+/// so under a repository `rust-toolchain` pin (or an item's `RUSTUP_TOOLCHAIN`)
+/// it reports the compiler the check actually ran under rather than the
+/// machine's default. The field, its type, and its `rustc=…;bun=…` shape
+/// are unchanged, and nothing the runner keys, matches, or reuses on reads it:
+/// the environment fingerprint still hashes the host identity. An older
+/// executor reports the host default, which is exactly what every runner has
+/// recorded until now, so a runner talking to it gets nothing wrong beyond the
+/// stale vintage this change exists to correct on newer executors.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 143;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
