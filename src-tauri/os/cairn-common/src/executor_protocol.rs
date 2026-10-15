@@ -4050,6 +4050,19 @@ pub struct LearnedResourceEstimate {
 /// same way. A runner talking to an older executor therefore gets nothing
 /// wrong, and two executors of different versions behave identically under it.
 ///
+/// cairn/4981 changes how long the runner waits for a claimed attempt's
+/// result, without a bump. The end-to-end watchdog, a fixed budget summed from
+/// declared item timeouts and executor phase budgets, is replaced by a wait
+/// that ends only when the claiming machine has given no account of the
+/// attempt for a bound: its link down or silent, or its snapshots no longer
+/// listing it in `grantedAttempts`, `executingRequests`, or `queuedRequests`.
+/// [`CellUnavailableReason::ClaimedAttemptSilent`] and
+/// [`ClaimedAttemptAccount`] are produced by the runner alone and read only by
+/// its own surfaces; a `CellOutcome` travels executor to runner only. The
+/// account is read from facts every 142 executor already sends, and the only
+/// frame the change sends is the existing `Cancel`, so a runner talking to
+/// any 142 executor gets nothing wrong.
+///
 /// Version 142 (cairn/4930) makes the runner settle work held across a link
 /// gap against the reattached executor's first snapshot in production, which
 /// until now only its tests did: the transport stored snapshots without that
@@ -6604,6 +6617,79 @@ pub enum CellUnavailableReason {
         alternative_executor_id: String,
         alternative_executor_name: String,
     },
+    /// The runner stopped waiting for an attempt it had granted, because the
+    /// machine holding it gave no account of it for `quiet_ms`: its link was
+    /// down or silent, or its snapshots stopped listing the attempt.
+    ///
+    /// Never a duration budget. A claimed attempt the machine keeps listing as
+    /// queued, held, or executing is waited on for as long as it takes, so
+    /// this ends only work the runner has evidence it is no longer hearing
+    /// about. Whether any of its commands ran is unknown.
+    ///
+    /// Emitted by the runner alone; no executor produces or reads it.
+    ClaimedAttemptSilent {
+        executor_name: String,
+        quiet_ms: u64,
+        /// The last account that counted as progress, or `None` when the
+        /// machine never listed the attempt after it was granted.
+        last_progress: Option<ClaimedAttemptAccount>,
+        /// What the runner read when it stopped waiting.
+        final_account: ClaimedAttemptAccount,
+    },
+}
+
+/// What the machine holding a claimed attempt says about it, read by the runner
+/// from that machine's link and latest snapshot.
+///
+/// The first three are progress: the machine is connected, reporting, and
+/// still accounts for the attempt. The rest are its absence, distinguished
+/// because they send a reader to different places.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ClaimedAttemptAccount {
+    /// Listed among the machine's queued requests.
+    Queued,
+    /// Granted and held with no command running: acquiring or preparing its
+    /// cell, materializing its checkout, or between two batch items.
+    Held,
+    /// A command of the attempt is running.
+    Executing,
+    /// The machine lists the attempt as completed, and its result never
+    /// reached the runner.
+    CompletedWithoutResult,
+    /// The machine's link is live and its snapshot does not mention the
+    /// attempt.
+    NotListed,
+    /// The machine's connection is attached but has reported nothing for
+    /// longer than [`EXECUTOR_PROGRESS_FRESHNESS_MS`].
+    LinkSilent,
+    /// No connection to the machine is attached at the generation holding
+    /// the claim.
+    LinkDown,
+}
+
+impl ClaimedAttemptAccount {
+    /// Whether this account is the machine still answering for the attempt.
+    pub fn is_progress(self) -> bool {
+        matches!(self, Self::Queued | Self::Held | Self::Executing)
+    }
+
+    /// The account as a clause: "the machine …".
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Queued => "listed it as queued",
+            Self::Held => {
+                "held it with no command running (preparing its cell or checkout, or between batch items)"
+            }
+            Self::Executing => "listed it as running a command",
+            Self::CompletedWithoutResult => {
+                "listed it as completed, but its result never reached the runner"
+            }
+            Self::NotListed => "was connected and no longer listed it",
+            Self::LinkSilent => "was connected but had stopped reporting",
+            Self::LinkDown => "was not connected",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -3064,6 +3064,11 @@ pub(crate) enum SubstrateFailureShape {
     EnvironmentRetired,
     /// The command ran, but Cairn could not obtain or record its result.
     Result,
+    /// The check was handed to a machine that then stopped accounting for it,
+    /// so whether any of it ran is not known. Distinct from `Result` and
+    /// `Dispatch` because neither "it ran" nor "it never started" can be
+    /// backed: the runner sees the machine's account only between polls.
+    OutcomeUnknown,
     /// Cairn's own storage for the check failed.
     Storage,
     /// Cairn cancelled the check before it produced a verdict.
@@ -3093,6 +3098,9 @@ impl SubstrateFailureShape {
                 "The working environment this check was given could not be made ready, so Cairn took it out of service."
             }
             Self::Result => "This check ran, but Cairn could not record its result.",
+            Self::OutcomeUnknown => {
+                "Cairn lost track of this check on the machine it was handed to, so whether it ran is unknown."
+            }
             Self::Storage => "Cairn's own storage for this check failed.",
             Self::Cancelled => "Cairn cancelled this check before it produced a verdict.",
         }
@@ -3244,6 +3252,10 @@ fn no_start_shape(
         // The pinned machine can never hold the work's measured memory: the
         // pin, not the fleet, is what left no machine to run it on.
         CellUnavailableReason::HomeCannotHold { .. } => SubstrateFailureShape::NoMachine,
+        // What the machine said last cannot settle whether the check ran: the
+        // runner reads its account between polls, an item can start and end
+        // between two reads, and a completion record covers refusals too.
+        CellUnavailableReason::ClaimedAttemptSilent { .. } => SubstrateFailureShape::OutcomeUnknown,
         CellUnavailableReason::Provisioning
         | CellUnavailableReason::Checkout
         | CellUnavailableReason::Preparation
@@ -3262,7 +3274,7 @@ fn no_start_shape(
 /// Which repair domain an infrastructure failure belongs to.
 ///
 /// Decided here, at the source, rather than read back off the stored
-/// `failure_kind`: [`substrate_failure_kind`] collapses ten substrate shapes
+/// `failure_kind`: [`substrate_failure_kind`] collapses eleven substrate shapes
 /// into `Infrastructure`, and the distinction this needs is exactly the one it
 /// throws away.
 ///
@@ -3293,6 +3305,7 @@ fn infra_repair_domain(
             | SubstrateFailureShape::Preparation
             | SubstrateFailureShape::EnvironmentRetired
             | SubstrateFailureShape::Result
+            | SubstrateFailureShape::OutcomeUnknown
             | SubstrateFailureShape::Storage
             | SubstrateFailureShape::Cancelled => InfraRepairDomain::Head,
         };
@@ -7381,14 +7394,32 @@ fn check_result_from_cell_outcome(
                     now.saturating_sub(started)
                 ));
             }
+            // The shape is what the evidence says the wait was on, read the way
+            // every other deadline is: a working machine is capacity, a
+            // stalled or draining one is not, and calling the second
+            // "capacity unavailable" sends the reader to placement.
+            let shape = deadline_shape(host_pressure.as_ref(), Some(&substrate));
             if let Some(pressure) = host_pressure {
                 facts.push(format!("hostPressure={pressure:?}"));
             }
             Err(CheckExecutionFailure::substrate(
-                SubstrateFailureShape::Capacity,
+                shape,
                 format!("build-slot deadline ({}) — {diagnostic}", facts.join(", ")),
             ))
         }
+        // The diagnostic already names the machine, the silence, and what the
+        // machine said last; a `Debug` rendering of the reason would only
+        // repeat it less readably.
+        CellOutcome::Unavailable {
+            reason:
+                reason @ cairn_common::executor_protocol::CellUnavailableReason::ClaimedAttemptSilent {
+                    ..
+                },
+            diagnostic,
+        } => Err(CheckExecutionFailure::substrate(
+            no_start_shape(&reason),
+            diagnostic,
+        )),
         CellOutcome::Unavailable { reason, diagnostic } => Err(CheckExecutionFailure::substrate(
             no_start_shape(&reason),
             format!("{reason:?}: {diagnostic}"),
@@ -7896,12 +7927,13 @@ mod tests {
             (Shape::Preparation, Domain::Head),
             (Shape::EnvironmentRetired, Domain::Head),
             (Shape::Result, Domain::Head),
+            (Shape::OutcomeUnknown, Domain::Head),
             (Shape::Storage, Domain::Head),
             (Shape::Cancelled, Domain::Head),
         ];
         assert_eq!(
             table.len(),
-            10,
+            11,
             "a new substrate shape must be classified in this table, not defaulted"
         );
         for (shape, expected) in table {
@@ -11008,7 +11040,8 @@ cairn-common = { path = "../cairn-common" }
             | CellUnavailableReason::NoMatchingExecutor
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_)
-            | CellUnavailableReason::HomeCannotHold { .. } => {}
+            | CellUnavailableReason::HomeCannotHold { .. }
+            | CellUnavailableReason::ClaimedAttemptSilent { .. } => {}
         }
         let cases = [
             (
@@ -11634,7 +11667,7 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 10] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 11] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
@@ -11643,6 +11676,7 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::Preparation,
         SubstrateFailureShape::EnvironmentRetired,
         SubstrateFailureShape::Result,
+        SubstrateFailureShape::OutcomeUnknown,
         SubstrateFailureShape::Storage,
         SubstrateFailureShape::Cancelled,
     ];
@@ -11666,6 +11700,7 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::Preparation
                 | SubstrateFailureShape::EnvironmentRetired
                 | SubstrateFailureShape::Result
+                | SubstrateFailureShape::OutcomeUnknown
                 | SubstrateFailureShape::Storage
                 | SubstrateFailureShape::Cancelled => {}
             }
@@ -15456,6 +15491,55 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
         assert!(excerpt.contains("failed to fill whole buffer"));
         assert!(excerpt.contains("FINAL-MARKER"));
         assert!(excerpt.chars().count() <= OUTPUT_TAIL_CHARS);
+    }
+
+    /// A claimed attempt's silence never becomes a claim about whether the
+    /// check ran, whatever the machine said last. Each case is a route the
+    /// runner's between-poll account cannot see through: an attempt that ran
+    /// and was then held between items before vanishing, one whose execution
+    /// fell entirely between two reads, a completion record for a refusal that
+    /// spawned nothing, and a machine that went away mid-run.
+    #[test]
+    fn a_claimed_attempts_silence_keeps_whether_the_check_ran_unknown() {
+        use cairn_common::executor_protocol::{
+            CellUnavailableReason, ClaimedAttemptAccount as Account,
+        };
+        let cases = [
+            (Some(Account::Held), Account::NotListed),
+            (None, Account::NotListed),
+            (Some(Account::Queued), Account::CompletedWithoutResult),
+            (None, Account::CompletedWithoutResult),
+            (Some(Account::Executing), Account::NotListed),
+            (Some(Account::Executing), Account::LinkDown),
+            (Some(Account::Held), Account::LinkSilent),
+        ];
+        for (last_progress, final_account) in cases {
+            let outcome = CellOutcome::Unavailable {
+                reason: CellUnavailableReason::ClaimedAttemptSilent {
+                    executor_name: "bgsrv-ub".into(),
+                    quiet_ms: 600_000,
+                    last_progress,
+                    final_account,
+                },
+                diagnostic: "bgsrv-ub gave no account of request r attempt a for 10m00s".into(),
+            };
+            let CheckExecutionFailure::Substrate(failure) =
+                check_result_from_cell_outcome(outcome, None).unwrap_err()
+            else {
+                panic!("silence is a substrate failure");
+            };
+            assert_eq!(
+                failure.shape(),
+                SubstrateFailureShape::OutcomeUnknown,
+                "{last_progress:?} -> {final_account:?}"
+            );
+            let agent = failure.agent_message();
+            assert!(agent.contains("whether it ran is unknown"), "{agent}");
+            assert!(agent.contains("bgsrv-ub gave no account"), "{agent}");
+            for claim in ["could not start", "This check ran", "capacity"] {
+                assert!(!agent.contains(claim), "{claim} in {agent}");
+            }
+        }
     }
 
     #[test]

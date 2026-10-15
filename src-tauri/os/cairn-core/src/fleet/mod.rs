@@ -46,9 +46,11 @@ use cairn_common::executor_protocol::{
     UpdateReport, WarmthUnknownReason, CPU_ADMISSION_BLIND_AFTER_MS,
     EXECUTOR_HEARTBEAT_INTERVAL_MS, EXECUTOR_LINK_STALL_REMEDIATION_MS,
     EXECUTOR_PROGRESS_FRESHNESS_MS, EXECUTOR_TELEMETRY_STALL_REMEDIATION_MS, LOCAL_EXECUTOR_NAME,
-    MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS, RESIDENCY_ACQUIRE_ATTEMPT_ID,
+    RESIDENCY_ACQUIRE_ATTEMPT_ID,
 };
-use cairn_common::executor_protocol::{executor_names_match, normalize_executor_name};
+use cairn_common::executor_protocol::{
+    executor_names_match, normalize_executor_name, ClaimedAttemptAccount,
+};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -450,9 +452,6 @@ pub(crate) fn default_wait_horizon_unix_ms(config: &FleetConfig) -> u64 {
 }
 
 type RequestIdentity = (String, String);
-
-const MIN_REQUEST_WATCHDOG_SLACK: Duration = Duration::from_millis(100);
-const MAX_REQUEST_WATCHDOG_SLACK: Duration = Duration::from_secs(5);
 
 /// What a reattached connection still owes an accounting for: the generation
 /// that owes it, and the executions carried across the gap into it.
@@ -891,6 +890,9 @@ pub struct Fleet {
     /// because management is fleet state: the same projection that answers what
     /// machines exist has to answer what is currently becoming one.
     management: Arc<management::ExecutorManagementState>,
+    /// How long a claimed attempt may go without its machine accounting for
+    /// it; see [`CLAIMED_ATTEMPT_SILENCE_BOUND_MS`].
+    claimed_attempt_silence: ClaimedAttemptSilenceBound,
 }
 
 /// Grace after a residency response's link stops reporting progress.
@@ -4114,8 +4116,8 @@ impl Fleet {
     /// The only way a snapshot enters the fleet from outside this crate, because
     /// a snapshot is more than state to store. The first one from a reattached
     /// generation is the machine's own account of what survived the gap, and
-    /// held work it omits is settled here rather than left to the end-to-end
-    /// watchdog. When the transport stored snapshots without this, an executor
+    /// held work it omits is settled here rather than left to the claimed-attempt
+    /// silence bound. When the transport stored snapshots without this, an executor
     /// that died and came back without a command kept its submitter waiting for
     /// hours on a result no process would send.
     pub fn apply_executor_snapshot(
@@ -8381,10 +8383,8 @@ impl Fleet {
         // A live checkout is never prepared, so it is held to nothing the
         // setup needs; what its checkout declares about building still holds.
         if runs_project_setup(&request.repository) {
-            request.project_requirements = Box::new(project_placement_requirements(
-                setup_commands,
-                Path::new(project_path),
-            ));
+            *request.project_requirements =
+                project_placement_requirements(setup_commands, Path::new(project_path));
             self.known_project_requirements.lock().unwrap().insert(
                 request.project_id.clone(),
                 (*request.project_requirements).clone(),
@@ -8394,11 +8394,11 @@ impl Fleet {
                 &request.project_requirements.setup_identity,
             );
         } else {
-            request.project_requirements = Box::new(ProjectPlacementRequirements {
+            *request.project_requirements = ProjectPlacementRequirements {
                 prerequisite_scripts: project_placement_requirements(&[], Path::new(project_path))
                     .prerequisite_scripts,
                 ..ProjectPlacementRequirements::default()
-            });
+            };
         }
     }
 
@@ -8466,10 +8466,10 @@ impl Fleet {
         // Offer, and let the machine answer from its own live facts. A decline
         // is routing information rather than a failure: the entry comes back
         // around this loop to the next candidate, having never been parked.
-        // Whether the placement a machine claimed went above that machine's
-        // memory ceiling, which the caller is owed whatever the outcome.
-        let mut claimed_above_ceiling = None;
-        let (selected, request, batch, profile_context) = loop {
+        // The loop also yields whether the placement a machine claimed went
+        // above that machine's memory ceiling, which the caller is owed
+        // whatever the outcome.
+        let (selected, request, batch, profile_context, claimed_above_ceiling) = loop {
             let Placement {
                 selected,
                 reservation,
@@ -8528,8 +8528,13 @@ impl Fleet {
                 .await;
             match answer {
                 OfferAnswer::Claimed => {
-                    claimed_above_ceiling = above_ceiling;
-                    break (selected, attempt_request, attempt_batch, profile_context);
+                    break (
+                        selected,
+                        attempt_request,
+                        attempt_batch,
+                        profile_context,
+                        above_ceiling,
+                    );
                 }
                 OfferAnswer::Requeued => continue,
                 OfferAnswer::Expired => {
@@ -8562,12 +8567,6 @@ impl Fleet {
         // the runner context and the purpose registry's record that this item
         // has actually been dispatched. An offer conferred neither, which is
         // what let it be declined for free.
-        let watchdog = execution_watchdog_budget(
-            &request,
-            batch.as_ref(),
-            &executor_config,
-            selected.colocated,
-        );
         if let Err(diagnostic) = self.bind_runner_context(
             batch.as_ref(),
             &request,
@@ -8656,33 +8655,26 @@ impl Fleet {
             )
             .into();
         }
-        let (outcome, watchdog_expired) = match tokio::time::timeout(watchdog.total(), rx).await {
-            Ok(Ok(outcome)) => (outcome, false),
-            Ok(Err(_)) => (
+        let (outcome, silent) = match self
+            .await_claimed_result(&key, granted_at_unix_ms, rx)
+            .await
+        {
+            ClaimedWait::Answered(outcome) => (*outcome, false),
+            ClaimedWait::ChannelClosed => (
                 executor_unavailable("executor result channel closed".into()),
                 false,
             ),
-            Err(_) => {
-                let substrate =
-                    self.executor_deadline_evidence(&selected.executor_id, selected.generation);
-                (
-                    CellOutcome::Unavailable {
-                        reason: CellUnavailableReason::Deadline {
-                            host_pressure: None,
-                            substrate: Some(substrate.clone()),
-                        },
-                        diagnostic: format!(
-                            "executor did not return request {} attempt {} within the end-to-end watchdog budget of {}; waiting on {:?} since {} with last progress {}; the in-flight attempt was cancelled",
-                            key.0,
-                            key.1,
-                            compact_duration(watchdog.total().as_millis() as u64),
-                            substrate.state,
-                            crate::clock::age_millis(substrate.since_unix_ms as i64),
-                            crate::clock::age_millis(substrate.last_progress_unix_ms as i64),
-                        ),
-                    },
-                    true,
-                )
+            ClaimedWait::Silent(silence) => {
+                let executor_name = self.executor_name_for_text(&selected.executor_id);
+                log::warn!(
+                    "no account of request {} attempt {} from {executor_name} for {}ms ({:?}, last progress {:?}); cancelling it",
+                    key.0,
+                    key.1,
+                    silence.quiet_ms,
+                    silence.final_account,
+                    silence.last_progress,
+                );
+                (silence.outcome(&key, executor_name), true)
             }
         };
         if !selected.colocated {
@@ -8720,9 +8712,10 @@ impl Fleet {
                         connection_drops_since_claim(&entry.chain)
                     })
                     .flatten(),
-                expired_budget: watchdog_expired.then_some(watchdog),
             });
-        if watchdog_expired {
+        // Left armed, the guard takes the entry out of the queue and sends the
+        // machine `Cancel`, in case it is still running work nobody waits for.
+        if silent {
             return ExecutedRequest {
                 outcome,
                 grant_without_result,
@@ -8775,6 +8768,91 @@ impl Fleet {
             outcome,
             grant_without_result,
             above_ceiling: claimed_above_ceiling,
+        }
+    }
+
+    /// What the machine holding `key`'s claim says about it now.
+    ///
+    /// `None` once the entry has left the queue: its outcome is on its way to
+    /// the waiter, and that says nothing about the machine. A claim that went
+    /// back to the queue after its grant has no machine answering for it, which
+    /// reads the same as a link that is down.
+    fn claimed_attempt_account(
+        &self,
+        key: &RequestIdentity,
+        now_unix_ms: u64,
+    ) -> Option<ClaimedAttemptAccount> {
+        let binding = self
+            .queue
+            .with_entry_by_identity(key, |entry| match &entry.state {
+                queue::EntryState::Claimed {
+                    executor_id,
+                    generation,
+                    ..
+                } => Some((executor_id.clone(), *generation)),
+                _ => None,
+            })?;
+        let Some((executor_id, generation)) = binding else {
+            return Some(ClaimedAttemptAccount::LinkDown);
+        };
+        let connections = self.lock_connections();
+        let Some(entry) = connections
+            .get(&executor_id)
+            .filter(|entry| entry.generation == generation)
+        else {
+            return Some(ClaimedAttemptAccount::LinkDown);
+        };
+        Some(account_of_claimed_attempt(
+            &entry.snapshot,
+            entry.last_progress_unix_ms,
+            key,
+            now_unix_ms,
+        ))
+    }
+
+    /// Wait for a granted attempt's result for as long as its machine accounts
+    /// for it.
+    ///
+    /// Progress is the machine's own account: connected, reporting, and listing
+    /// the attempt as queued, held, or executing. That covers every phase a
+    /// granted attempt passes through on the machine, including the ones with
+    /// no process (cell acquisition, checkout materialization, the gap between
+    /// batch items), because the executor holds a grant from the moment it
+    /// handles it until its result is queued. A command that prints nothing for
+    /// an hour is still progress: whether it is hung is the item's own timeout
+    /// or an explicit cancel to decide, never this wait.
+    async fn await_claimed_result(
+        &self,
+        key: &RequestIdentity,
+        granted_at_unix_ms: u64,
+        mut rx: oneshot::Receiver<CellOutcome>,
+    ) -> ClaimedWait {
+        let mut watch = ClaimedAttemptWatch::granted_at(granted_at_unix_ms);
+        loop {
+            let bound_ms = self.claimed_attempt_silence.get();
+            let now = unix_time_ms();
+            let silence = self
+                .claimed_attempt_account(key, now)
+                .and_then(|account| watch.observe(account, now, bound_ms));
+            if let Some(silence) = silence {
+                // A result that landed between the read and the verdict wins.
+                return match rx.try_recv() {
+                    Ok(outcome) => ClaimedWait::Answered(Box::new(outcome)),
+                    Err(oneshot::error::TryRecvError::Closed) => ClaimedWait::ChannelClosed,
+                    Err(oneshot::error::TryRecvError::Empty) => ClaimedWait::Silent(silence),
+                };
+            }
+            let poll = Duration::from_millis((bound_ms / 8).clamp(10, CLAIMED_ATTEMPT_POLL_MS));
+            tokio::select! {
+                biased;
+                result = &mut rx => {
+                    return match result {
+                        Ok(outcome) => ClaimedWait::Answered(Box::new(outcome)),
+                        Err(_) => ClaimedWait::ChannelClosed,
+                    };
+                }
+                _ = tokio::time::sleep(poll) => {}
+            }
         }
     }
 
@@ -13271,40 +13349,187 @@ fn outcome_matches(outcome: &CellOutcome, request_id: &str, attempt_id: &str) ->
     }
 }
 
-/// How long the runner waits for a claimed request's result, kept as the parts
-/// it is made of.
+/// How long a claimed attempt may go without its machine accounting for it
+/// before the runner stops waiting for its result.
 ///
-/// The parts matter because their sum is not what the requester declared. When
-/// this wait is what gives up, the reader of the failure has only their own
-/// item timeouts to compare it against, and the difference has to be accounted
-/// for in the text that tells them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WatchdogBudget {
-    /// Provisioning/checkout and preparation: one executor phase budget each.
-    pub(crate) infrastructure: Duration,
-    /// Managed object fetch and delta upload. Zero for colocated execution.
-    pub(crate) object_transfer: Duration,
-    /// The work's own declared timeouts: summed for a sequential batch, the
-    /// longest one for a parallel batch.
-    pub(crate) execution: Duration,
-    pub(crate) slack: Duration,
+/// Not a budget on the work. A claimed attempt is waited on for as long as the
+/// machine holding it is connected, reporting, and still lists it as queued,
+/// held, or executing, however long that takes; only the absence of that
+/// account is timed. Elapsed time since dispatch never ends a request: check
+/// items carry the unbounded-process sentinel precisely so that it cannot, and
+/// a wait summed from item timeouts and phase budgets reduced every check lane
+/// to a fixed infrastructure allowance (cairn/4981).
+///
+/// Four times the link-stall remediation bound, so the mechanisms that know
+/// more land first: a silent colocated link is recycled and its attempts
+/// resolved, and a reattached machine's first snapshot settles what it lost.
+/// This catches only what neither covers, such as a remote machine that never
+/// returns, or a result frame lost with a dying socket while the completion is
+/// still in the machine's history (cairn/4934).
+pub(crate) const CLAIMED_ATTEMPT_SILENCE_BOUND_MS: u64 = 4 * EXECUTOR_LINK_STALL_REMEDIATION_MS;
+
+/// The longest the claimed-attempt wait sleeps between reads of the machine's
+/// account. A result wakes it at once; this paces only the silence check.
+const CLAIMED_ATTEMPT_POLL_MS: u64 = 5_000;
+
+/// [`CLAIMED_ATTEMPT_SILENCE_BOUND_MS`] held as fleet state, so a test can
+/// exercise the silence verdict without waiting minutes for it.
+#[derive(Clone, Debug)]
+struct ClaimedAttemptSilenceBound(Arc<AtomicU64>);
+
+impl Default for ClaimedAttemptSilenceBound {
+    fn default() -> Self {
+        Self(Arc::new(AtomicU64::new(CLAIMED_ATTEMPT_SILENCE_BOUND_MS)))
+    }
 }
 
-impl WatchdogBudget {
-    pub(crate) fn total(&self) -> Duration {
-        self.infrastructure
-            .saturating_add(self.object_transfer)
-            .saturating_add(self.execution)
-            .saturating_add(self.slack)
+impl ClaimedAttemptSilenceBound {
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// How a wait on a claimed attempt's result ended.
+enum ClaimedWait {
+    Answered(Box<CellOutcome>),
+    ChannelClosed,
+    Silent(ClaimedAttemptSilence),
+}
+
+/// The runner's running read of one claimed attempt: when its machine last
+/// accounted for it, and how.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClaimedAttemptWatch {
+    last_progress_unix_ms: u64,
+    last_progress: Option<ClaimedAttemptAccount>,
+}
+
+/// A claimed attempt whose machine stopped accounting for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClaimedAttemptSilence {
+    quiet_ms: u64,
+    last_progress: Option<ClaimedAttemptAccount>,
+    final_account: ClaimedAttemptAccount,
+}
+
+impl ClaimedAttemptWatch {
+    /// The quiet clock starts at the grant: a machine that never lists what it
+    /// was granted is as silent about it as one that stopped.
+    fn granted_at(granted_at_unix_ms: u64) -> Self {
+        Self {
+            last_progress_unix_ms: granted_at_unix_ms,
+            last_progress: None,
+        }
+    }
+
+    /// Fold in one reading of the machine's account, answering the silence
+    /// once the account has been absent for `bound_ms`.
+    fn observe(
+        &mut self,
+        account: ClaimedAttemptAccount,
+        now_unix_ms: u64,
+        bound_ms: u64,
+    ) -> Option<ClaimedAttemptSilence> {
+        if account.is_progress() {
+            self.last_progress_unix_ms = self.last_progress_unix_ms.max(now_unix_ms);
+            self.last_progress = Some(account);
+            return None;
+        }
+        let quiet_ms = now_unix_ms.saturating_sub(self.last_progress_unix_ms);
+        (quiet_ms >= bound_ms).then_some(ClaimedAttemptSilence {
+            quiet_ms,
+            last_progress: self.last_progress,
+            final_account: account,
+        })
+    }
+}
+
+impl ClaimedAttemptSilence {
+    /// The outcome that ends the wait, saying why in the attempt's own terms:
+    /// which machine, how long it was quiet, what it said last and what it says
+    /// now. No substrate reading is taken at this instant, because the link's
+    /// state at the moment of giving up is not what the wait was on.
+    fn outcome(&self, key: &RequestIdentity, executor_name: String) -> CellOutcome {
+        let last = match self.last_progress {
+            Some(account) => format!(
+                "the last time it accounted for the attempt, it {}",
+                account.describe()
+            ),
+            None => "it never listed the attempt after the grant".to_string(),
+        };
+        let diagnostic = format!(
+            "{executor_name} gave no account of request {} attempt {} for {}: when the runner stopped waiting, the machine {}, and {last}. The runner waits on a claimed attempt for as long as its machine accounts for it, so this ended on that silence rather than on elapsed time; the attempt was cancelled and whether its commands ran is unknown",
+            key.0,
+            key.1,
+            compact_duration(self.quiet_ms),
+            self.final_account.describe(),
+        );
+        CellOutcome::Unavailable {
+            reason: CellUnavailableReason::ClaimedAttemptSilent {
+                executor_name,
+                quiet_ms: self.quiet_ms,
+                last_progress: self.last_progress,
+                final_account: self.final_account,
+            },
+            diagnostic,
+        }
+    }
+}
+
+/// What one connection's latest posted state says about a claimed attempt.
+///
+/// `executingRequests` is checked first because it is the strongest statement,
+/// then the executor's own queue, then `grantedAttempts`, which covers the
+/// phases with no process: acquiring a cell, materializing a checkout, and the
+/// gap between batch items. `recentCompletions` is not progress: the executor
+/// writes a result ahead of any snapshot that drops the attempt from its
+/// grants, so a completion the runner still has no result for is a result that
+/// was lost.
+fn account_of_claimed_attempt(
+    snapshot: &FleetSnapshot,
+    link_last_progress_unix_ms: u64,
+    key: &RequestIdentity,
+    now_unix_ms: u64,
+) -> ClaimedAttemptAccount {
+    if now_unix_ms.saturating_sub(link_last_progress_unix_ms) > EXECUTOR_PROGRESS_FRESHNESS_MS {
+        return ClaimedAttemptAccount::LinkSilent;
+    }
+    let names = |request_id: &str, attempt_id: &str| request_id == key.0 && attempt_id == key.1;
+    if snapshot
+        .executing_requests
+        .iter()
+        .any(|request| names(&request.request_id, &request.attempt_id))
+    {
+        ClaimedAttemptAccount::Executing
+    } else if snapshot
+        .queued_requests
+        .iter()
+        .any(|request| names(&request.request_id, &request.attempt_id))
+    {
+        ClaimedAttemptAccount::Queued
+    } else if snapshot
+        .granted_attempts
+        .iter()
+        .any(|attempt| names(&attempt.request_id, &attempt.attempt_id))
+    {
+        ClaimedAttemptAccount::Held
+    } else if snapshot
+        .recent_completions
+        .iter()
+        .any(|completion| names(&completion.request_id, &completion.attempt_id))
+    {
+        ClaimedAttemptAccount::CompletedWithoutResult
+    } else {
+        ClaimedAttemptAccount::NotListed
     }
 }
 
 /// A request this runner granted to an executor that produced no result for it.
 ///
-/// After a grant, an outcome without a result (a watchdog that expired, a
-/// result channel that closed, a machine declared gone with the claim on it, or
-/// a refusal the executor sent) cannot say nothing ran. This is what can be
-/// said in its place.
+/// After a grant, an outcome without a result (a machine that stopped
+/// accounting for the attempt, a result channel that closed, a machine declared
+/// gone with the claim on it, or a refusal the executor sent) cannot say
+/// nothing ran. This is what can be said in its place.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GrantWithoutResult {
     pub(crate) executor_name: String,
@@ -13313,9 +13538,6 @@ pub(crate) struct GrantWithoutResult {
     /// `None` when the request had already left the queue, which is the only
     /// place that history lives.
     pub(crate) connection_drops: Option<usize>,
-    /// What the runner was prepared to wait, when running out of it is what
-    /// ended the wait.
-    pub(crate) expired_budget: Option<WatchdogBudget>,
 }
 
 /// A request's outcome, and whether the runner rather than the executor
@@ -13378,57 +13600,6 @@ fn connection_drops_since_claim(
             .filter(|event| matches!(event, BindingEvent::GenerationEnded { .. }))
             .count(),
     )
-}
-
-/// How long to wait for a result from a machine that has already claimed the
-/// work.
-///
-/// Deliberately without an acquisition term. The old end-to-end budget carried
-/// one because a submitted request could sit in a queue on the executor for an
-/// unknown time before anything started, so the runner's patience had to cover
-/// a wait it could not see. Nothing parks any more: the queue owns the wait, the
-/// horizon bounds it, and a machine that has claimed an entry is running it. So
-/// this bounds only what happens after the claim.
-fn execution_watchdog_budget(
-    request: &CellRequest,
-    batch: Option<&ProcessBatch>,
-    executor_config: &ExecutorConfig,
-    colocated: bool,
-) -> WatchdogBudget {
-    let phase_budget = Duration::from_secs(executor_config.default_timeout_seconds);
-    // Provisioning/checkout and preparation are distinct executor phases.
-    let infrastructure = phase_budget.saturating_mul(2);
-    // Managed fetch and post-command delta upload each use the executor's bounded
-    // whole-request HTTP deadline. Colocated execution performs neither transfer.
-    let object_transfer = if colocated {
-        Duration::ZERO
-    } else {
-        Duration::from_secs(MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS * 2)
-    };
-    let execution = match batch {
-        None => Duration::from_millis(request.timeout_ms),
-        Some(batch) if batch.sequential => {
-            batch.items.iter().fold(Duration::ZERO, |total, item| {
-                total.saturating_add(Duration::from_millis(item.timeout_ms))
-            })
-        }
-        Some(batch) => batch
-            .items
-            .iter()
-            .map(|item| Duration::from_millis(item.timeout_ms))
-            .max()
-            .unwrap_or(Duration::ZERO),
-    };
-    let end_to_end_budget = infrastructure
-        .saturating_add(object_transfer)
-        .saturating_add(execution);
-    let proportional_slack = end_to_end_budget / 10;
-    WatchdogBudget {
-        infrastructure,
-        object_transfer,
-        execution,
-        slack: proportional_slack.clamp(MIN_REQUEST_WATCHDOG_SLACK, MAX_REQUEST_WATCHDOG_SLACK),
-    }
 }
 
 fn executor_unavailable(diagnostic: String) -> CellOutcome {
@@ -16684,148 +16855,6 @@ mod tests {
             "configured and learned duration bounds both lose kill authority"
         );
         assert!(batch.timeout_bases.is_empty());
-    }
-
-    #[test]
-    fn watchdog_covers_preparation_and_full_process_batch_budget() {
-        let mut request = targeted_request(std::env::consts::OS);
-        request.wait_horizon_unix_ms = unix_time_ms();
-        request.timeout_ms = 500;
-        let config = ExecutorConfig {
-            project_id: request.project_id.clone(),
-            project_key: "cairn".into(),
-            default_timeout_seconds: 2,
-            setup_commands: Vec::new(),
-            populate: Default::default(),
-            population_source_root: None,
-        };
-        let batch = ProcessBatch {
-            files: Vec::new(),
-            runtime_packages: Vec::new(),
-            sequential: true,
-            stop_on_error: false,
-            sandbox_mode: ProcessSandboxMode::Unconfined,
-            timeout_bases: Vec::new(),
-            items: vec![
-                ProcessBatchItem {
-                    header: "one".into(),
-                    stream_id: "one".into(),
-                    execution: ProcessBatchExecution::Direct,
-                    program: "true".into(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                    stdin: None,
-                    timeout_ms: 600,
-                    command_resource_identity: None,
-                    verdict_environment_names: Vec::new(),
-                },
-                ProcessBatchItem {
-                    header: "two".into(),
-                    stream_id: "two".into(),
-                    execution: ProcessBatchExecution::Direct,
-                    program: "true".into(),
-                    args: Vec::new(),
-                    env: Vec::new(),
-                    stdin: None,
-                    timeout_ms: 700,
-                    command_resource_identity: None,
-                    verdict_environment_names: Vec::new(),
-                },
-            ],
-            runner_context_id: None,
-            execution_residency: None,
-            containment: None,
-        };
-
-        let budget = execution_watchdog_budget(&request, Some(&batch), &config, true).total();
-        assert!(budget >= Duration::from_millis(5_300));
-        assert!(budget > Duration::from_millis(request.timeout_ms));
-    }
-
-    #[test]
-    fn remote_watchdog_reserves_both_managed_object_transfer_deadlines() {
-        let mut request = targeted_request(std::env::consts::OS);
-        request.wait_horizon_unix_ms = unix_time_ms();
-        request.timeout_ms = 60_000;
-        let config = ExecutorConfig {
-            project_id: request.project_id.clone(),
-            project_key: "cairn".into(),
-            default_timeout_seconds: 60,
-            setup_commands: Vec::new(),
-            populate: Default::default(),
-            population_source_root: None,
-        };
-
-        let colocated = execution_watchdog_budget(&request, None, &config, true).total();
-        let remote = execution_watchdog_budget(&request, None, &config, false).total();
-        assert_eq!(
-            remote - colocated,
-            Duration::from_secs(MANAGED_OBJECT_REQUEST_TIMEOUT_SECONDS * 2),
-            "remote execution must reserve one whole-request deadline for fetch and one for upload"
-        );
-    }
-
-    /// An item that omits `timeout` now carries the six-hour ceiling as its
-    /// budget, so the end-to-end watchdog has to sit above that. If it does not,
-    /// it simply becomes the new premature killer — the same shape of defect as
-    /// the HTTP socket that used to die first and discard a running suite's
-    /// output.
-    #[test]
-    fn watchdog_sits_above_a_ceiling_length_item_budget() {
-        let ceiling =
-            Duration::from_millis(u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS));
-        let mut request = targeted_request(std::env::consts::OS);
-        request.wait_horizon_unix_ms = unix_time_ms();
-        request.timeout_ms = u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS);
-        let config = ExecutorConfig {
-            project_id: request.project_id.clone(),
-            project_key: "cairn".into(),
-            default_timeout_seconds: 1_800,
-            setup_commands: Vec::new(),
-            populate: Default::default(),
-            population_source_root: None,
-        };
-        let item = |header: &str| ProcessBatchItem {
-            header: header.into(),
-            stream_id: header.into(),
-            execution: ProcessBatchExecution::Direct,
-            program: "true".into(),
-            args: Vec::new(),
-            env: Vec::new(),
-            stdin: None,
-            timeout_ms: u64::from(cairn_common::run_contract::RUN_BATCH_CEILING_MS),
-            command_resource_identity: None,
-            verdict_environment_names: Vec::new(),
-        };
-        let batch = |sequential: bool| ProcessBatch {
-            files: Vec::new(),
-            runtime_packages: Vec::new(),
-            sequential,
-            stop_on_error: false,
-            sandbox_mode: ProcessSandboxMode::Unconfined,
-            timeout_bases: Vec::new(),
-            items: vec![item("one"), item("two")],
-            runner_context_id: None,
-            execution_residency: None,
-            containment: None,
-        };
-
-        // Parallel items overlap, so one ceiling-length item is the budget — and
-        // the watchdog must still outlive it.
-        let parallel =
-            execution_watchdog_budget(&request, Some(&batch(false)), &config, true).total();
-        assert!(
-            parallel > ceiling,
-            "watchdog {parallel:?} must outlive a ceiling-length item"
-        );
-        // Sequential items add up, so the watchdog grows with them rather than
-        // capping at one item's budget.
-        let sequential =
-            execution_watchdog_budget(&request, Some(&batch(true)), &config, true).total();
-        assert!(
-            sequential > parallel,
-            "a sequential batch must get more watchdog than a parallel one: {sequential:?} vs {parallel:?}"
-        );
     }
 
     #[tokio::test]
@@ -21834,9 +21863,13 @@ mod tests {
         );
     }
 
+    /// The silence bound the granted-attempt tests run under, short enough that
+    /// a verdict arrives in well under a second.
+    const TEST_CLAIMED_SILENCE_MS: u64 = 300;
+
     /// A batch the colocated machine has claimed and been granted, with the
-    /// runner waiting on its result. The watchdog is the item's own one-second
-    /// timeout plus the minimum slack, so an expiry arrives in about a second.
+    /// runner waiting on its result. The machine has posted no snapshot since
+    /// the grant, so until a test posts one it has not accounted for the work.
     async fn granted_and_held(
         orch: &Arc<Orchestrator>,
     ) -> (
@@ -21846,6 +21879,10 @@ mod tests {
     ) {
         let (sender, mut machine) = mpsc::unbounded_channel();
         let generation = orch.fleet.attach_executor(sender);
+        orch.fleet.claimed_attempt_silence.0.store(
+            TEST_CLAIMED_SILENCE_MS,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let mut request = provenance_request();
         request.repository = RepositoryLocator::ScratchOnly {
@@ -21864,12 +21901,11 @@ mod tests {
             execution_residency: None,
             containment: None,
         };
-        let mut prepared = orch
+        let prepared = orch
             .fleet
             .prepare_execution(orch, &mut request)
             .await
             .expect("a scratch request prepares");
-        prepared.executor_config.default_timeout_seconds = 0;
 
         let submitting = {
             let orch = orch.clone();
@@ -21904,14 +21940,94 @@ mod tests {
     async fn settled(submitting: tokio::task::JoinHandle<ExecutedRequest>) -> ExecutedRequest {
         tokio::time::timeout(Duration::from_secs(30), submitting)
             .await
-            .expect("the watchdog bounds the wait")
+            .expect("the silence bound ends the wait")
             .unwrap()
     }
 
+    fn silent_accounts(
+        outcome: &CellOutcome,
+    ) -> Option<(Option<ClaimedAttemptAccount>, ClaimedAttemptAccount)> {
+        match outcome {
+            CellOutcome::Unavailable {
+                reason:
+                    CellUnavailableReason::ClaimedAttemptSilent {
+                        last_progress,
+                        final_account,
+                        ..
+                    },
+                ..
+            } => Some((*last_progress, *final_account)),
+            _ => None,
+        }
+    }
+
+    fn granted_snapshot(request: &CellRequest, executing: bool) -> FleetSnapshot {
+        let mut snapshot = FleetSnapshot {
+            granted_attempts: vec![cairn_common::executor_protocol::GrantedAttempt {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+            }],
+            ..FleetSnapshot::default()
+        };
+        if executing {
+            let mut running = executing_fixture(&request.request_id);
+            running.attempt_id = request.attempt_id.clone();
+            snapshot.executing_requests = vec![running];
+        }
+        snapshot
+    }
+
+    fn executing_fixture(request_id: &str) -> ExecutingCellRequest {
+        ExecutingCellRequest {
+            executor_id: COLOCATED_EXECUTOR_ID.into(),
+            cell_id: "cell".into(),
+            request_id: request_id.into(),
+            attempt_id: "attempt".into(),
+            owner: None,
+            command_class: Default::default(),
+            command: "bun run test:rust".into(),
+            started_at_unix_ms: unix_time_ms(),
+            process_ids: vec![4242],
+            priority: Some(CellPriority::ReviewCheck),
+            subscriber_count: 1,
+            resource_reservation: Default::default(),
+            command_resource_identity: None,
+            learned_estimate: None,
+        }
+    }
+
+    fn completion_fixture(
+        request_id: &str,
+        attempt_id: &str,
+    ) -> cairn_common::executor_protocol::CellCompletion {
+        cairn_common::executor_protocol::CellCompletion {
+            executor_id: COLOCATED_EXECUTOR_ID.into(),
+            request_id: request_id.into(),
+            attempt_id: attempt_id.into(),
+            owner: None,
+            command_class: Default::default(),
+            command: "bun run test:rust".into(),
+            priority: CellPriority::ReviewCheck,
+            queued_at_unix_ms: 0,
+            started_at_unix_ms: Some(0),
+            finished_at_unix_ms: 0,
+            duration_ms: 0,
+            verdict: cairn_common::executor_protocol::CellCompletionVerdict::Succeeded,
+            failure_output_tail: None,
+            transcript_event_uri: None,
+            resource_reservation: None,
+            learned_estimate: None,
+            actuals: None,
+            cached: false,
+            subscriber_count: 1,
+            served_at_unix_ms: 0,
+        }
+    }
+
     /// The cairn/4912 shape: a machine is granted a batch and is never heard
-    /// from about it again. The outcome the runner composes when its watchdog
-    /// expires has to arrive with the account of the grant, not as a bare
-    /// refusal a caller would read as "nothing ran".
+    /// from about it again. The outcome the runner composes when the machine's
+    /// silence ends the wait has to arrive with the account of the grant, not
+    /// as a bare refusal a caller would read as "nothing ran".
     #[tokio::test]
     async fn a_grant_the_machine_never_answers_is_reported_as_unanswered() {
         let temp = tempfile::tempdir().unwrap();
@@ -21919,16 +22035,18 @@ mod tests {
         let (_generation, submitting, _machine) = granted_and_held(&orch).await;
         let executed = settled(submitting).await;
 
-        assert!(
-            matches!(
-                executed.outcome,
-                CellOutcome::Unavailable {
-                    reason: CellUnavailableReason::Deadline { .. },
-                    ..
-                }
-            ),
-            "{:?}",
+        assert_eq!(
+            silent_accounts(&executed.outcome),
+            Some((None, ClaimedAttemptAccount::NotListed)),
+            "a connected machine that never listed the grant: {:?}",
             executed.outcome
+        );
+        let CellOutcome::Unavailable { diagnostic, .. } = &executed.outcome else {
+            unreachable!()
+        };
+        assert!(
+            diagnostic.contains("never listed the attempt after the grant"),
+            "{diagnostic}"
         );
         let grant = executed
             .grant_without_result
@@ -21938,11 +22056,225 @@ mod tests {
             orch.fleet.executor_name_for_text(COLOCATED_EXECUTOR_ID)
         );
         assert_eq!(grant.connection_drops, Some(0));
-        assert_eq!(
-            grant.expired_budget.map(|budget| budget.execution),
-            Some(Duration::from_millis(1_000)),
-            "the expired budget carries the batch's own declared timeout as its own part"
+    }
+
+    /// The cairn/4981 specimen inverted: a claimed attempt its machine keeps
+    /// accounting for is waited on through many multiples of the silence
+    /// bound, across the held phase and the executing one, and ends with the
+    /// machine's own answer. No elapsed time since the grant ends it.
+    #[tokio::test]
+    async fn a_claimed_attempt_its_machine_keeps_accounting_for_is_never_ended_by_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let (generation, submitting, _machine) = granted_and_held(&orch).await;
+        let request = provenance_request();
+        let pause = Duration::from_millis(TEST_CLAIMED_SILENCE_MS * 3);
+
+        assert!(orch.fleet.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            granted_snapshot(&request, false),
+            ExecutorSubstrateReport::default(),
+        ));
+        tokio::time::sleep(pause).await;
+        assert!(
+            !submitting.is_finished(),
+            "a held attempt (preparing its cell, between items) is progress"
         );
+        orch.fleet.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            granted_snapshot(&request, true),
+            ExecutorSubstrateReport::default(),
+        );
+        tokio::time::sleep(pause).await;
+        assert!(
+            !submitting.is_finished(),
+            "an executing attempt is progress, however long it runs"
+        );
+
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Result {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                outcome: CellOutcome::Cancelled {
+                    request_id: request.request_id,
+                    attempt_id: request.attempt_id,
+                },
+            },
+        );
+        let executed = settled(submitting).await;
+        assert!(
+            matches!(executed.outcome, CellOutcome::Cancelled { .. }),
+            "the machine's own answer ends the wait: {:?}",
+            executed.outcome
+        );
+        assert!(executed.grant_without_result.is_none());
+    }
+
+    /// The cairn/4934 shape: the machine ran the attempt and lists it as
+    /// completed, but the result frame was lost with a dying socket. A
+    /// completion the runner has no result for is not progress, so the wait
+    /// ends on the silence bound, naming what the machine said.
+    #[tokio::test]
+    async fn a_completion_whose_result_never_arrived_ends_on_silence() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let (generation, submitting, _machine) = granted_and_held(&orch).await;
+        let request = provenance_request();
+
+        orch.fleet.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            granted_snapshot(&request, true),
+            ExecutorSubstrateReport::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(TEST_CLAIMED_SILENCE_MS / 2)).await;
+        orch.fleet.set_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            FleetSnapshot {
+                recent_completions: vec![completion_fixture(
+                    &request.request_id,
+                    &request.attempt_id,
+                )],
+                ..FleetSnapshot::default()
+            },
+            ExecutorSubstrateReport::default(),
+        );
+        let executed = settled(submitting).await;
+        assert_eq!(
+            silent_accounts(&executed.outcome),
+            Some((
+                Some(ClaimedAttemptAccount::Executing),
+                ClaimedAttemptAccount::CompletedWithoutResult
+            )),
+            "{:?}",
+            executed.outcome
+        );
+        assert!(executed.grant_without_result.is_some());
+    }
+
+    /// What a machine's posted state says about one attempt, strongest first,
+    /// and a link quiet past freshness says nothing whatever it last posted.
+    #[test]
+    fn the_account_of_a_claimed_attempt_reads_the_machines_own_lists() {
+        let request = provenance_request();
+        let key = (request.request_id.clone(), request.attempt_id.clone());
+        let now = unix_time_ms();
+        let read = |snapshot: &FleetSnapshot, last_progress| {
+            account_of_claimed_attempt(snapshot, last_progress, &key, now)
+        };
+        assert_eq!(
+            read(&granted_snapshot(&request, false), now),
+            ClaimedAttemptAccount::Held
+        );
+        assert_eq!(
+            read(&granted_snapshot(&request, true), now),
+            ClaimedAttemptAccount::Executing
+        );
+        assert_eq!(
+            read(&FleetSnapshot::default(), now),
+            ClaimedAttemptAccount::NotListed
+        );
+        let other = FleetSnapshot {
+            executing_requests: vec![executing_fixture("someone-else")],
+            ..FleetSnapshot::default()
+        };
+        assert_eq!(read(&other, now), ClaimedAttemptAccount::NotListed);
+        assert_eq!(
+            read(
+                &granted_snapshot(&request, true),
+                now - EXECUTOR_PROGRESS_FRESHNESS_MS - 1
+            ),
+            ClaimedAttemptAccount::LinkSilent,
+            "a listing on a link that stopped reporting is not progress"
+        );
+    }
+
+    /// Progress resets the quiet clock whenever it is read; only an absence
+    /// that lasts the whole bound ends the wait, and it is measured from the
+    /// grant when the machine never listed the attempt at all.
+    #[test]
+    fn only_an_absence_lasting_the_bound_ends_a_claimed_wait() {
+        const BOUND: u64 = 600_000;
+        let granted = 1_000_000;
+        let mut watch = ClaimedAttemptWatch::granted_at(granted);
+        assert_eq!(
+            watch.observe(ClaimedAttemptAccount::NotListed, granted + BOUND - 1, BOUND),
+            None
+        );
+        // Hours of execution, read every few seconds, never end it.
+        for hour in 1..=6 {
+            let at = granted + hour * 3_600_000;
+            assert_eq!(
+                watch.observe(ClaimedAttemptAccount::Executing, at, BOUND),
+                None
+            );
+        }
+        let last = granted + 6 * 3_600_000;
+        assert_eq!(
+            watch.observe(ClaimedAttemptAccount::LinkDown, last + BOUND - 1, BOUND),
+            None,
+            "a link gap shorter than the bound is waited out"
+        );
+        assert_eq!(
+            watch.observe(ClaimedAttemptAccount::LinkDown, last + BOUND, BOUND),
+            Some(ClaimedAttemptSilence {
+                quiet_ms: BOUND,
+                last_progress: Some(ClaimedAttemptAccount::Executing),
+                final_account: ClaimedAttemptAccount::LinkDown,
+            })
+        );
+
+        let mut never = ClaimedAttemptWatch::granted_at(granted);
+        assert_eq!(
+            never.observe(ClaimedAttemptAccount::NotListed, granted + BOUND, BOUND),
+            Some(ClaimedAttemptSilence {
+                quiet_ms: BOUND,
+                last_progress: None,
+                final_account: ClaimedAttemptAccount::NotListed,
+            })
+        );
+    }
+
+    /// The row says why in the attempt's own terms, and never reaches for a
+    /// substrate label or a capacity reading taken at the instant of giving
+    /// up, which is what made a live link read as `ConnectedStalled`.
+    #[test]
+    fn a_claimed_attempts_silence_is_described_in_its_own_terms() {
+        let key = ("request".to_string(), "attempt".to_string());
+        let outcome = ClaimedAttemptSilence {
+            quiet_ms: 600_000,
+            last_progress: Some(ClaimedAttemptAccount::Executing),
+            final_account: ClaimedAttemptAccount::LinkDown,
+        }
+        .outcome(&key, "bgsrv-ub".into());
+        let CellOutcome::Unavailable { reason, diagnostic } = outcome else {
+            panic!("silence is an unavailable outcome");
+        };
+        assert!(matches!(
+            reason,
+            CellUnavailableReason::ClaimedAttemptSilent {
+                quiet_ms: 600_000,
+                ..
+            }
+        ));
+        for fact in [
+            "bgsrv-ub",
+            "request attempt",
+            "10m00s",
+            "was not connected",
+            "listed it as running a command",
+            "rather than on elapsed time",
+        ] {
+            assert!(diagnostic.contains(fact), "missing {fact}: {diagnostic}");
+        }
+        for absent in ["ConnectedStalled", "capacity", "budget", "watchdog"] {
+            assert!(!diagnostic.contains(absent), "{absent} in {diagnostic}");
+        }
     }
 
     /// A link that drops under a held claim and never comes back is one drop,
@@ -21959,6 +22291,12 @@ mod tests {
             .disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, generation));
         let executed = settled(submitting).await;
 
+        assert_eq!(
+            silent_accounts(&executed.outcome).map(|(_, now)| now),
+            Some(ClaimedAttemptAccount::LinkDown),
+            "{:?}",
+            executed.outcome
+        );
         let grant = executed
             .grant_without_result
             .unwrap_or_else(|| panic!("no grant account: {:?}", executed.outcome));
@@ -22000,10 +22338,10 @@ mod tests {
             "{:?}",
             executed.outcome
         );
-        let grant = executed
-            .grant_without_result
-            .expect("a refusal after a grant does not prove nothing ran");
-        assert_eq!(grant.expired_budget, None, "no budget ran out");
+        assert!(
+            executed.grant_without_result.is_some(),
+            "a refusal after a grant does not prove nothing ran"
+        );
     }
 
     /// Everything the claim took is back: its identity binds again, and the
@@ -26406,7 +26744,7 @@ mod tests {
         assert_eq!(verdict(&for_q), None);
         let mut live = for_p.clone();
         live.repository = live_checkout();
-        live.project_requirements = Default::default();
+        *live.project_requirements = Default::default();
         // A remote cannot take a live checkout at all; what matters is that
         // the refusal is never the preparation one.
         assert!(!verdict(&live).is_some_and(|reason| is_preparation_rejection(&reason)));
@@ -26448,7 +26786,7 @@ mod tests {
         // Preparation stamps no setup requirement on a live checkout.
         let mut live = managed.clone();
         live.repository = live_checkout();
-        live.project_requirements = Default::default();
+        *live.project_requirements = Default::default();
         assert!(!matches!(
             candidate_rejection(&bare, PlacementScope::of(&live), NOW),
             Some(

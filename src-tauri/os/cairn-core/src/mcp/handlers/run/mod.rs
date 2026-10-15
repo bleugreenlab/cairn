@@ -178,8 +178,8 @@ pub(crate) struct BatchWithoutResult {
 
 impl BatchWithoutResult {
     /// Everything after the opening: where the batch went and when, what
-    /// happened to that machine's connection since, which budget ran out and
-    /// what it was made of, and what to check before running it again.
+    /// happened to that machine's connection since, what ended the wait, and
+    /// what to check before running it again.
     ///
     /// The clock and the present are parameters so the text can be pinned in a
     /// test; production passes the host clock and the current instant.
@@ -202,19 +202,11 @@ impl BatchWithoutResult {
                 " That machine's connection dropped {count} times while the batch was there."
             )),
         }
-        match &grant.expired_budget {
-            Some(budget) => {
-                text.push(' ');
-                text.push_str(&describe_expired_budget(budget));
-            }
-            None => {
-                let detail = self.detail.trim();
-                text.push_str(" What ended the wait: ");
-                text.push_str(detail);
-                if !detail.ends_with(['.', '!', '?']) {
-                    text.push('.');
-                }
-            }
+        let detail = self.detail.trim();
+        text.push_str(" What ended the wait: ");
+        text.push_str(detail);
+        if !detail.ends_with(['.', '!', '?']) {
+            text.push('.');
         }
         text.push_str(
             " Its commands may have run, partly run, or still be running there, so check the working tree before re-running it.",
@@ -226,41 +218,6 @@ impl BatchWithoutResult {
         }
         text
     }
-}
-
-/// The wait that ran out, against the timeouts the agent itself declared.
-///
-/// The two always differ: the runner also waits for the machine to be prepared,
-/// for the checkout to travel, and a little slack. An agent that declared two
-/// hours and waited three cannot reconcile that unless the difference is named.
-fn describe_expired_budget(budget: &crate::fleet::WatchdogBudget) -> String {
-    let span = |duration: std::time::Duration| {
-        crate::clock::format_elapsed(duration.as_secs().try_into().unwrap_or(i64::MAX))
-    };
-    let total = budget.total();
-    let overhead = total.saturating_sub(budget.execution);
-    if overhead.is_zero() {
-        return format!(
-            "Cairn stopped waiting when its allowance of {}, its commands' declared timeouts, ran out.",
-            span(total)
-        );
-    }
-    let mut parts = vec!["preparing the machine"];
-    if !budget.object_transfer.is_zero() {
-        parts.push("transferring the checkout");
-    }
-    parts.push("slack");
-    let parts = match parts.as_slice() {
-        [first, last] => format!("{first} and {last}"),
-        [first, middle, last] => format!("{first}, {middle}, and {last}"),
-        _ => parts.join(", "),
-    };
-    format!(
-        "Cairn stopped waiting when the batch's end-to-end allowance of {} ran out: {} for its commands' declared timeouts plus {} for {parts}.",
-        span(total),
-        span(budget.execution),
-        span(overhead),
-    )
 }
 
 /// The failure for a batch that produced no result: a plain refusal when no
@@ -363,14 +320,11 @@ mod failure_contract_tests {
             RunFailure::Unaccounted("its batch did not run to completion (panic).".to_string()),
             RunFailure::DispatchedWithoutResult(BatchWithoutResult {
                 grant: specimen_grant(Some(2)),
-                detail: "executor did not return request r attempt a.".to_string(),
+                detail: SPECIMEN_SILENCE.to_string(),
                 commits: true,
             }),
             RunFailure::DispatchedWithoutResult(BatchWithoutResult {
-                grant: crate::fleet::GrantWithoutResult {
-                    expired_budget: None,
-                    ..specimen_grant(None)
-                },
+                grant: specimen_grant(None),
                 detail: "cache checkpoint callback: runner refused.".to_string(),
                 commits: false,
             }),
@@ -434,34 +388,31 @@ mod failure_contract_tests {
     /// 2025-07-12 21:40 PDT.
     const SPECIMEN_GRANTED_AT: u64 = 1_752_381_600_000;
 
-    /// The cairn/4912 specimen's shape: two one-hour sequential items granted
-    /// to a remote machine, waited on for an hour of preparation, twenty
-    /// minutes of object transfer, and five seconds of slack besides.
+    /// The cairn/4912 specimen's shape: a batch granted to a remote machine
+    /// that then stopped accounting for it.
     fn specimen_grant(connection_drops: Option<usize>) -> crate::fleet::GrantWithoutResult {
         crate::fleet::GrantWithoutResult {
             executor_name: "bgsrv-ub".to_string(),
             granted_at_unix_ms: SPECIMEN_GRANTED_AT,
             connection_drops,
-            expired_budget: Some(crate::fleet::WatchdogBudget {
-                infrastructure: std::time::Duration::from_secs(3_600),
-                object_transfer: std::time::Duration::from_secs(1_200),
-                execution: std::time::Duration::from_secs(7_200),
-                slack: std::time::Duration::from_secs(5),
-            }),
         }
     }
 
+    /// The shape of the diagnostic the runner composes when a claimed
+    /// attempt's machine stops accounting for it.
+    const SPECIMEN_SILENCE: &str = "bgsrv-ub gave no account of request r attempt a for 10m00s: when the runner stopped waiting, the machine was not connected, and the last time it accounted for the attempt, it listed it as running a command.";
+
     /// A batch a machine was granted and never answered for names where it
-    /// went, when, what became of that machine's connection, and the budget
-    /// that ran out against the timeouts the agent declared, and it never says
-    /// nothing ran.
+    /// went, when, what became of that machine's connection, and the silence
+    /// that ended the wait in the machine's own terms, and it never says
+    /// nothing ran or that a budget ran out.
     #[test]
     fn a_granted_batch_that_never_answered_says_where_it_went_and_not_that_nothing_ran() {
         let clock = crate::clock::HostClock::fixed("America/Los_Angeles");
         let now = SPECIMEN_GRANTED_AT + (3 * 3_600 + 20 * 60) * 1_000;
         let text = BatchWithoutResult {
             grant: specimen_grant(Some(2)),
-            detail: "executor did not return request r attempt a.".to_string(),
+            detail: SPECIMEN_SILENCE.to_string(),
             commits: true,
         }
         .describe(&clock, now);
@@ -470,20 +421,11 @@ mod failure_contract_tests {
         assert!(text.contains("3h 20m ago (2025-07-12 21:40 PDT)"), "{text}");
         assert!(text.contains("dropped 2 times"), "{text}");
         assert!(
-            !text.contains("executor did not return"),
-            "the named budget replaces the raw watchdog diagnostic: {text}"
+            text.contains(&format!("What ended the wait: {SPECIMEN_SILENCE}")),
+            "the machine's silence is what ended the wait: {text}"
         );
-        assert!(text.contains("allowance of 3h 20m"), "{text}");
-        assert!(
-            text.contains("2h for its commands' declared timeouts"),
-            "the declared timeouts stand beside the budget that exceeded them: {text}"
-        );
-        assert!(
-            text.contains(
-                "plus 1h 20m for preparing the machine, transferring the checkout, and slack"
-            ),
-            "{text}"
-        );
+        assert!(!text.contains("allowance"), "{text}");
+        assert!(!text.contains("budget"), "{text}");
         assert!(text.contains("check the working tree"), "{text}");
         assert!(text.contains("`commit_msg` was never applied"), "{text}");
         assert!(!text.contains("No commands ran"), "{text}");
@@ -518,16 +460,13 @@ mod failure_contract_tests {
     }
 
     /// A machine that answered with a refusal after its grant gets its own
-    /// words in the text, since no budget ran out to explain the wait, and the
-    /// refusal is still not taken as proof that nothing ran.
+    /// words in the text, and the refusal is still not taken as proof that
+    /// nothing ran.
     #[test]
     fn a_refusal_from_the_granted_machine_is_quoted_not_believed() {
         let clock = crate::clock::HostClock::fixed("America/Los_Angeles");
         let text = BatchWithoutResult {
-            grant: crate::fleet::GrantWithoutResult {
-                expired_budget: None,
-                ..specimen_grant(None)
-            },
+            grant: specimen_grant(None),
             detail: "cache checkpoint callback: runner refused".to_string(),
             commits: false,
         }

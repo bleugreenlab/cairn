@@ -238,6 +238,10 @@ pub(crate) fn classify_unavailable(
         // about the machine's size rather than its load: waiting on it waits
         // for nothing. Another machine can, and the caller is told which.
         CellUnavailableReason::HomeCannotHold { .. } => PlacementVerdict::Structural,
+        // Work a machine was granted and then stopped accounting for. Some of
+        // it may have run, so presenting it again could run it twice; the
+        // caller is told the outcome is unknown instead.
+        CellUnavailableReason::ClaimedAttemptSilent { .. } => PlacementVerdict::Structural,
     }
 }
 
@@ -361,7 +365,8 @@ mod tests {
             | CellUnavailableReason::NoMatchingExecutor
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_)
-            | CellUnavailableReason::HomeCannotHold { .. } => {}
+            | CellUnavailableReason::HomeCannotHold { .. }
+            | CellUnavailableReason::ClaimedAttemptSilent { .. } => {}
         }
         let waits = [
             deadline(Some(ExecutorSubstrateState::CapacityBusy)),
@@ -399,6 +404,14 @@ mod tests {
                 },
                 alternative_executor_id: "exec-big".into(),
                 alternative_executor_name: "bglab-mac".into(),
+            },
+            CellUnavailableReason::ClaimedAttemptSilent {
+                executor_name: "bgsrv-ub".into(),
+                quiet_ms: 600_000,
+                last_progress: Some(
+                    cairn_common::executor_protocol::ClaimedAttemptAccount::Executing,
+                ),
+                final_account: cairn_common::executor_protocol::ClaimedAttemptAccount::LinkDown,
             },
         ];
         for reason in waits {
