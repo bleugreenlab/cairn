@@ -234,6 +234,14 @@ macro_rules! shared_tail_post_feed_watch_as_fact_clause {
     };
 }
 
+/// cairn/4955: a question an operator Compact withdrew carries when and why.
+/// `prompts` is shared schema, so both lineages gain the columns additively.
+macro_rules! shared_tail_prompt_withdrawal {
+    () => {
+        migration!("0254_prompt_withdrawal")
+    };
+}
+
 macro_rules! shared_tail_merge_attempt_journal {
     () => {
         migration!("0220_merge_attempt_journal")
@@ -1304,6 +1312,7 @@ macro_rules! team_lineage {
             shared_tail_post_feed_watch_as_fact_clause!(),
             shared_tail_permission_resume_error!(),
             shared_tail_terminal_exit_reason!(),
+            shared_tail_prompt_withdrawal!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1561,6 +1570,7 @@ macro_rules! private_lineage {
             private_thread_compaction_unconfirmed_start_trigger!(),
             shared_tail_terminal_exit_reason!(),
             private_ref_store_maintenance!(),
+            shared_tail_prompt_withdrawal!(),
         ]
     };
 }
@@ -3219,6 +3229,7 @@ mod tests {
                 "thread_compaction_unconfirmed_start_trigger",
                 "terminal_exit_reason",
                 "ref_store_maintenance",
+                "prompt_withdrawal",
             ]
         );
         assert_eq!(
@@ -6346,6 +6357,8 @@ mod tests {
                 "permission_resume_error",
                 // cairn/4977: a terminal's process-lost reason, in both.
                 "terminal_exit_reason",
+                // cairn/4955: questions can be withdrawn in both.
+                "prompt_withdrawal",
             ]
         );
         assert_eq!(

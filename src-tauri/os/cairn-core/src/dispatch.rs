@@ -915,10 +915,10 @@ pub(crate) fn build_dup_stub(
     stub
 }
 
-/// Collect queued direct messages and child side-channel notices (one reminder
-/// body per item) for a tool result. Atomically claims and stamps each item so
-/// the Claude hook path can't double-deliver. Each pushed entry is the inner
-/// reminder text; the CLI wraps it in the `<system-reminder>` envelope.
+/// Deliver what waits for this agent into a tool result: the user's `steer`
+/// follow-ups, child side-channel notices, and live attention pushes, one
+/// reminder body per item. Each pushed entry is the inner reminder text; the
+/// CLI wraps it in the `<system-reminder>` envelope.
 async fn augment_with_queued_dms(
     orch: &crate::orchestrator::Orchestrator,
     request: &crate::mcp::types::McpCallbackRequest,
@@ -927,52 +927,122 @@ async fn augment_with_queued_dms(
     let Some(run_id) = request.run_id.as_deref() else {
         return;
     };
-
-    let job_id = crate::messages::side_channel::job_id_for_run(&orch.db.local, run_id).await;
-
-    let side_channel_notices = match job_id.as_deref() {
-        Some(job_id) => {
-            match crate::messages::side_channel::claim_pending_side_channel_for_job_async(
-                &orch.db.local,
-                job_id,
-            )
-            .await
-            {
-                Ok(notices) => notices,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to claim pending side-channel notices for job {}: {}",
-                        &job_id[..job_id.len().min(8)],
-                        e
-                    );
-                    Vec::new()
-                }
-            }
-        }
-        None => Vec::new(),
+    let Some(job_id) = crate::messages::side_channel::job_id_for_run(&orch.db.local, run_id).await
+    else {
+        return;
     };
+    if !tool_boundary_has_pending(orch, &job_id).await {
+        return;
+    }
+    reminders.extend(deliver_at_tool_boundary(orch, run_id, &job_id));
+}
+
+/// Whether anything waits for `job_id` at a tool boundary. Usually nothing
+/// does, and finding that out costs three reads and no lock. A read that fails
+/// answers yes, so the delivery itself runs and reports the failure.
+async fn tool_boundary_has_pending(orch: &crate::orchestrator::Orchestrator, job_id: &str) -> bool {
+    let db = &orch.db.local;
+    let steers = crate::messages::queued::peek_tool_boundary_pending_async(db, job_id).await;
+    let notices =
+        crate::messages::side_channel::peek_pending_side_channel_for_job_async(db, job_id).await;
+    let pushes = crate::orchestrator::attention_push::pending_deliverable_live(
+        db,
+        job_id,
+        crate::orchestrator::attention_push::Boundary::Event,
+    )
+    .await;
+    !matches!(steers, Ok(false))
+        || !notices.is_ok_and(|notices| notices.is_empty())
+        || !pushes.is_ok_and(|pushes| pushes.is_empty())
+}
+
+/// Deliver at a tool boundary of `run_id`, fenced against the job's launch.
+///
+/// Claiming stamps an item delivered, so it must reach a live turn of this run
+/// or not be claimed at all. Two things hold for the whole claim-and-record:
+///
+/// - The job's launch lock. A launch claims every pending item for the turn it
+///   starts, and an operator Compact holds the lock from its first teardown
+///   step through its successor's launch. When either holds it, nothing is
+///   claimed here and the items stay pending for that launch.
+/// - A running turn on `run_id`. A Compact settles every turn of the session it
+///   tears down, so a tool call that outlives the Compact (its boundary
+///   arriving after the lock is released) finds no running turn and claims
+///   nothing.
+///
+/// Neither fence drops anything: a deferred item is delivered at a later
+/// boundary or turn end. The lock is a std mutex, so the guarded work runs to
+/// completion on a database runtime rather than across an `.await`.
+pub fn deliver_at_tool_boundary(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+    job_id: &str,
+) -> Vec<String> {
+    let lock = orch.job_launch_lock(job_id);
+    let _launch = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Vec::new(),
+    };
+    crate::storage::run_db_blocking(|| async move {
+        if !run_has_running_turn(orch, run_id).await? {
+            return Ok(Vec::new());
+        }
+        Ok(drain_tool_boundary(orch, run_id, job_id).await)
+    })
+    .unwrap_or_else(|error| {
+        log::warn!("Tool-boundary delivery for run {run_id} was skipped: {error}");
+        Vec::new()
+    })
+}
+
+async fn run_has_running_turn(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+) -> Result<bool, String> {
+    use crate::storage::RowExt;
+    let db = crate::execution::routing::owning_db_for_run(&orch.db, run_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    db.query_one(
+        "SELECT EXISTS(SELECT 1 FROM turns WHERE run_id = ?1 AND state = 'running')",
+        cairn_db::turso::params![run_id.to_string()],
+        |row| row.i64(0),
+    )
+    .await
+    .map(|running| running != 0)
+    .map_err(|error| error.to_string())
+}
+
+/// Claim, record, and render everything pending at this boundary. Atomically
+/// claims and stamps each item so the Claude hook path can't double-deliver.
+async fn drain_tool_boundary(
+    orch: &crate::orchestrator::Orchestrator,
+    run_id: &str,
+    job_id: &str,
+) -> Vec<String> {
+    let short_job = &job_id[..job_id.len().min(8)];
+    let side_channel_notices =
+        crate::messages::side_channel::claim_pending_side_channel_for_job_async(
+            &orch.db.local,
+            job_id,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            log::warn!("Failed to claim pending side-channel notices for job {short_job}: {e}");
+            Vec::new()
+        });
 
     // CAIRN-1309: the user's `steer` follow-ups are delivered at the tool
     // boundary, mid-turn. `queue` rows are intentionally left pending for the
     // turn-end/resume sweep in `continue_job_impl`.
-    let queued_steer = match job_id.as_deref() {
-        Some(job_id) => {
-            match crate::messages::queued::claim_tool_boundary_for_job_async(&orch.db.local, job_id)
-                .await
-            {
-                Ok(msgs) => msgs,
-                Err(e) => {
-                    log::warn!(
-                        "Failed to claim steer queued messages for job {}: {}",
-                        &job_id[..job_id.len().min(8)],
-                        e
-                    );
-                    Vec::new()
-                }
-            }
-        }
-        None => Vec::new(),
-    };
+    let queued_steer =
+        crate::messages::queued::claim_tool_boundary_for_job_async(&orch.db.local, job_id)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("Failed to claim steer queued messages for job {short_job}: {e}");
+                Vec::new()
+            });
 
     // Drain every live push for this busy agent at the event boundary, regardless
     // of wake level. The running job is the recipient. Wake level governs whether
@@ -980,26 +1050,20 @@ async fn augment_with_queued_dms(
     // pushes never *woke* this agent (it is already running), but they ride along
     // at the next tool-call return just like rousing pushes. Lazy-resolved so a
     // push whose referent already resolved is skipped.
-    let pushes = match job_id.as_deref() {
-        Some(job_id) => crate::orchestrator::attention_push::pending_deliverable_live(
-            &orch.db.local,
-            job_id,
-            crate::orchestrator::attention_push::Boundary::Event,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            log::warn!(
-                "Failed to drain attention pushes for job {}: {}",
-                &job_id[..job_id.len().min(8)],
-                e
-            );
-            Vec::new()
-        }),
-        None => Vec::new(),
-    };
+    let pushes = crate::orchestrator::attention_push::pending_deliverable_live(
+        &orch.db.local,
+        job_id,
+        crate::orchestrator::attention_push::Boundary::Event,
+    )
+    .await
+    .unwrap_or_else(|e| {
+        log::warn!("Failed to drain attention pushes for job {short_job}: {e}");
+        Vec::new()
+    });
 
+    let mut reminders = Vec::new();
     if side_channel_notices.is_empty() && queued_steer.is_empty() && pushes.is_empty() {
-        return;
+        return reminders;
     }
 
     // Record the same `system:message` transcript events the Claude hook
@@ -1072,6 +1136,7 @@ async fn augment_with_queued_dms(
             reminders.push(part);
         }
     }
+    reminders
 }
 
 #[cfg(test)]

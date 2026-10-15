@@ -223,6 +223,58 @@ pub(crate) fn insert_session_boundary_sync(
     .map(|_| ())
 }
 
+/// Record what an operator Compact tore down, on the session it tore down.
+///
+/// `content` is the readable summary the transcript shows; `raw` carries the
+/// same counts as data.
+pub(crate) fn insert_operator_compact_event_sync(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: Option<&str>,
+    turn_id: Option<&str>,
+    content: String,
+    raw: serde_json::Value,
+) -> Result<(), String> {
+    let db = crate::storage::run_db_blocking({
+        let dbs = orch.db.clone();
+        let run_id = run_id.to_string();
+        move || async move {
+            crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })?;
+    let event = TranscriptEvent {
+        event_type: "system:operator_compact".to_string(),
+        session_id: session_id.map(str::to_string),
+        parent_tool_use_id: None,
+        content: Some(content),
+        thinking: None,
+        tool_name: None,
+        tool_input: None,
+        tool_uses: None,
+        tool_use_id: None,
+        tool_result: None,
+        is_error: false,
+        thinking_ms: None,
+        queued_message_id: None,
+        raw: Some(raw),
+    };
+    let data = event.observed().to_event_json();
+    insert_system_event_sync(
+        &db,
+        &orch.services.emitter,
+        &ids::mint_child(run_id),
+        run_id,
+        session_id,
+        "system:operator_compact",
+        &data,
+        chrono::Utc::now().timestamp() as i32,
+        turn_id,
+    )
+    .map(|_| ())
+}
+
 /// Write a session boundary on an existing connection, so it can join the
 /// transaction that performs the transition it marks.
 ///

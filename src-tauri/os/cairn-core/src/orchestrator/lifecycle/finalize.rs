@@ -813,9 +813,27 @@ pub(crate) fn interrupt_run_for_provider_depletion(orch: &Orchestrator, run_id: 
 }
 
 pub fn finalize_run(orch: &Orchestrator, run_id: &str, status: RunStatus) {
-    if let Err(error) = finalize_run_inner(orch, run_id, status, true) {
+    if let Err(error) = finalize_run_inner(orch, run_id, status, FinalizeEffects::Ordinary) {
         log::error!("Failed to finalize run {run_id}: {error}");
     }
+}
+
+/// Which of finalization's side effects a terminal run gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalizeEffects {
+    /// Everything, including the failed-agent alarm for a crash.
+    Ordinary,
+    /// Everything except the failed-agent alarm: an automatic successor is
+    /// already planned for the crashed turn.
+    Recovery,
+    /// Terminalize the run and release what it held, and nothing else. An
+    /// operator Compact owns this job's continuation: it settled the turns
+    /// itself, re-derives the job itself, and launches the successor session
+    /// itself. The ordinary effects would each fight it — a turn-end check wave
+    /// for a session being discarded, a delegated-parent wake, and an idle flush
+    /// that resumes the job, which from this thread would re-enter the job
+    /// launch lock the Compact is holding.
+    OperatorCompact,
 }
 
 /// Finalize a crashed turn that already has an automatic successor planned.
@@ -827,7 +845,17 @@ pub(crate) fn finalize_run_for_recovery(
     run_id: &str,
     status: RunStatus,
 ) -> Result<(), String> {
-    finalize_run_inner(orch, run_id, status, false)
+    finalize_run_inner(orch, run_id, status, FinalizeEffects::Recovery)
+}
+
+/// Finalize a run an operator Compact killed. See
+/// [`FinalizeEffects::OperatorCompact`].
+pub(crate) fn finalize_run_for_operator_compact(
+    orch: &Orchestrator,
+    run_id: &str,
+    status: RunStatus,
+) -> Result<(), String> {
+    finalize_run_inner(orch, run_id, status, FinalizeEffects::OperatorCompact)
 }
 
 /// Restore the failure signal when successor launch fails after recovery-aware
@@ -849,8 +877,9 @@ fn finalize_run_inner(
     orch: &Orchestrator,
     run_id: &str,
     status: RunStatus,
-    emit_terminal_failure_attention: bool,
+    effects: FinalizeEffects,
 ) -> Result<(), String> {
+    let emit_terminal_failure_attention = effects == FinalizeEffects::Ordinary;
     let mut first_error = None;
     // A finalized run's agent must not keep acting through the HTTP MCP
     // endpoint. First, so every terminal path below (the already-finalized
@@ -893,6 +922,12 @@ fn finalize_run_inner(
                 turn_state.as_str(),
                 "complete" | "failed" | "cancelled" | "interrupted" | "yielded"
             ) {
+                Ok(())
+            } else if effects == FinalizeEffects::OperatorCompact {
+                // The Compact settled every live turn before killing. One that
+                // started in between was cut off, not completed; the Compact's
+                // re-sweep after the kill settles it and counts it, so this
+                // must not read it as a clean exit.
                 Ok(())
             } else if status == RunStatus::Exited {
                 // Clean exit: a Running turn completed; a turn that never reached
@@ -986,6 +1021,15 @@ fn finalize_run_inner(
     // queued call. No-op for uncapped/non-call runs; idempotent. Tied to the
     // finalize choke so a crashed/killed call cannot leak its slot.
     crate::execution::jobs::on_call_run_finalized(orch, run_id);
+
+    if effects == FinalizeEffects::OperatorCompact {
+        let _ = orch
+            .services
+            .emitter
+            .emit("run-completed", serde_json::json!(run_id));
+        let _ = orch.run_completions.send(run_id.to_string());
+        return first_error.map_or(Ok(()), Err);
+    }
 
     let job_id = job_id_for_run(orch, run_id);
 

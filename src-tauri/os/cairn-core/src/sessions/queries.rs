@@ -40,6 +40,10 @@ pub(crate) enum RotationReason {
     /// leaves it alone and this reason is never the one written; it names the
     /// call site rather than an outcome.
     RecoveryReplacement,
+    /// The operator compacted a session that had live work: its processes were
+    /// killed, its asks withdrawn and waits abandoned, and the job continues on
+    /// a fresh session seeded from the digest.
+    OperatorCompact,
     /// The provider was launched under this session's id and created its
     /// conversation there, but the launch never confirmed the handle. The
     /// provider refuses that id on a second fresh start, so the job continues
@@ -57,6 +61,7 @@ impl RotationReason {
             RotationReason::Compaction => "rotated_compaction",
             RotationReason::CacheExpiry => "rotated_cache_expiry",
             RotationReason::RecoveryReplacement => "rotated_after_recovery",
+            RotationReason::OperatorCompact => "operator_compact",
             RotationReason::UnconfirmedStart => "rotated_unconfirmed_start",
         }
     }
@@ -149,8 +154,8 @@ pub(crate) async fn list_unconfirmed_spawned_launch_sessions(
     .await
 }
 
-/// The rest of a provider change's durable state, committed by the same
-/// transaction as the rotation itself.
+/// The rest of a rotation's durable state, committed by the same transaction as
+/// the rotation itself.
 ///
 /// A model edit that crosses providers is one transition, not three writes that
 /// usually happen together. When `jobs.model` could commit ahead of the
@@ -159,15 +164,53 @@ pub(crate) async fn list_unconfirmed_spawned_launch_sessions(
 /// stale-backend state the rotation exists to prevent — and a snapshot edit
 /// could strand an arbitrary prefix of its jobs there with no coherent retry,
 /// since repeating the edit would see already-mutated model state.
-#[derive(Clone)]
-pub(crate) struct ProviderChangeCommit {
+///
+/// The boundary is the same kind of fact for every transition that carries
+/// one: the marker explaining the seam lands with the session close it
+/// describes, or not at all.
+#[derive(Clone, Default)]
+pub(crate) struct RotationCommit {
     /// The job's new model, applied with the swap that makes it runnable.
     pub model: Option<String>,
-    /// The run whose transcript carries the boundary for this replacement.
-    /// `None` for a job that has never run, which has no transcript to mark.
-    pub run_id: Option<String>,
+    /// The transcript marker for this replacement. `None` for a job that has
+    /// never run, which has no transcript to mark.
+    pub boundary: Option<BoundaryCommit>,
+}
+
+/// A `system:session_boundary` event written on the predecessor session.
+#[derive(Clone)]
+pub(crate) struct BoundaryCommit {
+    /// The run whose transcript carries the boundary.
+    pub run_id: String,
     /// The turn the boundary belongs to, when the run has one.
     pub turn_id: Option<String>,
+    /// The boundary payload (`kind` and its detail), as the transcript reads it.
+    pub payload: serde_json::Value,
+}
+
+impl RotationCommit {
+    /// An explicit model edit crossing providers: the new model, and a
+    /// `provider_change` boundary on `run_id` when the job has run.
+    pub(crate) fn provider_change(
+        from_backend: &str,
+        to_backend: &str,
+        model: Option<&str>,
+        run_id: Option<String>,
+    ) -> Self {
+        Self {
+            model: model.map(str::to_string),
+            boundary: run_id.map(|run_id| BoundaryCommit {
+                run_id,
+                turn_id: None,
+                payload: serde_json::json!({
+                    "kind": "provider_change",
+                    "fromBackend": from_backend,
+                    "toBackend": to_backend,
+                    "model": model,
+                }),
+            }),
+        }
+    }
 }
 
 /// Rotate while explicitly recording the backend that will serve the successor.
@@ -179,7 +222,7 @@ pub(crate) async fn rotate_job_session_with_backend(
     job_id: &str,
     backend: &str,
     reason: RotationReason,
-    commit: Option<ProviderChangeCommit>,
+    commit: Option<RotationCommit>,
     emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
     if matches!(
@@ -232,7 +275,7 @@ async fn rotate_session(
     job_id: &str,
     target_backend: Option<String>,
     reason: RotationReason,
-    commit: Option<ProviderChangeCommit>,
+    commit: Option<RotationCommit>,
     emitter: &dyn EventEmitter,
 ) -> Result<Session, String> {
     let source = source.clone();
@@ -307,10 +350,9 @@ async fn rotate_session(
                 )
                 .await?;
 
-                // The rest of a provider change rides in this transaction, so
-                // the model the job will launch, the session it will launch
-                // under, and the marker explaining the seam either all land or
-                // none do.
+                // The rest of the transition rides in this transaction, so the
+                // model the job will launch, the session it will launch under,
+                // and the marker explaining the seam either all land or none do.
                 if let Some(commit) = commit.as_ref() {
                     if let Some(model) = commit.model.as_deref() {
                         conn.execute(
@@ -319,18 +361,13 @@ async fn rotate_session(
                         )
                         .await?;
                     }
-                    if let Some(run_id) = commit.run_id.as_deref() {
+                    if let Some(boundary) = commit.boundary.as_ref() {
                         crate::messages::transcript::insert_session_boundary_conn(
                             conn,
-                            run_id,
+                            &boundary.run_id,
                             Some(source.id.as_str()),
-                            commit.turn_id.as_deref(),
-                            serde_json::json!({
-                                "kind": "provider_change",
-                                "fromBackend": source.backend,
-                                "toBackend": backend,
-                                "model": commit.model,
-                            }),
+                            boundary.turn_id.as_deref(),
+                            boundary.payload.clone(),
                         )
                         .await?;
                     }
@@ -494,12 +531,120 @@ mod tests {
             .unwrap_or_default()
     }
 
-    fn provider_change_to_codex() -> Option<ProviderChangeCommit> {
-        Some(ProviderChangeCommit {
-            model: Some("gpt-5-codex".to_string()),
-            run_id: Some("run-pc".to_string()),
-            turn_id: None,
+    fn provider_change_to_codex() -> Option<RotationCommit> {
+        Some(RotationCommit::provider_change(
+            "claude",
+            "codex",
+            Some("gpt-5-codex"),
+            Some("run-pc".to_string()),
+        ))
+    }
+
+    fn operator_compact_boundary(run_id: &str) -> Option<RotationCommit> {
+        Some(RotationCommit {
+            model: None,
+            boundary: Some(BoundaryCommit {
+                run_id: run_id.to_string(),
+                turn_id: None,
+                payload: serde_json::json!({
+                    "kind": "digest_reseed",
+                    "fromBackend": "claude",
+                    "toBackend": "claude",
+                    "model": null,
+                    "seedBytes": 42,
+                    "initiatedBy": "operator",
+                }),
+            }),
         })
+    }
+
+    /// An operator Compact closes its session and marks the seam in one write:
+    /// the predecessor closes `operator_compact`, and the one boundary it
+    /// carries is the digest reseed the operator asked for.
+    #[tokio::test]
+    async fn an_operator_compact_closes_the_session_with_its_boundary() {
+        let db = seed_provider_change("operator-compact-rotation.db").await;
+        db.execute_script(
+            "INSERT INTO runs(id, job_id, status, created_at, updated_at)
+              VALUES ('run-pc', 'job-pc', 'exited', 1, 1);",
+        )
+        .await
+        .expect("the job has a run whose transcript carries the boundary");
+        let source = get(&db, "sess-pc-1").await.expect("source session");
+
+        let successor = rotate_job_session_with_backend(
+            &db,
+            &source,
+            "job-pc",
+            "claude",
+            RotationReason::OperatorCompact,
+            operator_compact_boundary("run-pc"),
+            &CapturingEmitter::new(),
+        )
+        .await
+        .expect("the compaction rotates");
+
+        assert_eq!(
+            current_session(&db).await.as_deref(),
+            Some(successor.id.as_str())
+        );
+        assert_eq!(
+            db.query_text(
+                "SELECT status || '/' || terminal_reason FROM sessions WHERE id = 'sess-pc-1'",
+                ()
+            )
+            .await
+            .expect("read the predecessor")
+            .as_deref(),
+            Some("closed/operator_compact")
+        );
+        let payload = db
+            .query_text(
+                "SELECT data FROM events WHERE event_type = 'system:session_boundary' AND session_id = 'sess-pc-1'",
+                (),
+            )
+            .await
+            .expect("read the boundary")
+            .expect("exactly one boundary on the predecessor");
+        let payload: serde_json::Value = serde_json::from_str(&payload).expect("boundary json");
+        let raw = payload.get("raw").unwrap_or(&payload);
+        assert_eq!(raw["kind"], "digest_reseed", "{payload}");
+        assert_eq!(raw["initiatedBy"], "operator", "{payload}");
+        assert_eq!(
+            job_model(&db).await.as_deref(),
+            Some("claude-opus-4"),
+            "a compaction changes no model"
+        );
+    }
+
+    /// The compaction's boundary is part of the close: if it cannot be written,
+    /// the session stays open and the job stays on it.
+    #[tokio::test]
+    async fn an_operator_compact_whose_boundary_fails_leaves_the_session_open() {
+        let db = seed_provider_change("operator-compact-unwritable-boundary.db").await;
+        let source = get(&db, "sess-pc-1").await.expect("source session");
+
+        rotate_job_session_with_backend(
+            &db,
+            &source,
+            "job-pc",
+            "claude",
+            RotationReason::OperatorCompact,
+            operator_compact_boundary("run-missing"),
+            &CapturingEmitter::new(),
+        )
+        .await
+        .expect_err("a compaction whose boundary cannot be written must fail");
+
+        assert_eq!(current_session(&db).await.as_deref(), Some("sess-pc-1"));
+        assert_eq!(
+            db.query_text("SELECT status FROM sessions WHERE id = 'sess-pc-1'", ())
+                .await
+                .expect("read the predecessor")
+                .as_deref(),
+            Some("open")
+        );
+        assert_eq!(count(&db, "SELECT COUNT(*) FROM sessions").await, 1);
     }
 
     /// The model and the boundary are written BY the rotation, not around it.

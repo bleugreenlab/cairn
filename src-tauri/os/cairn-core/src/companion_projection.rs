@@ -198,7 +198,7 @@ async fn read_graph(
         while let Some(r)=rows.next().await? { let id=r.text(0)?; executions.insert(id.clone(), CompanionExecution{id,issue_id:r.text(1)?,sequence:r.i64(2)? as i32,status:r.text(3)?,started_at:r.i64(4)?}); }
         let mut nodes = BTreeMap::new();
         let sql=format!("{ACTIVE_GRAPH_CTES} SELECT j.id,j.execution_id,j.name,j.status,
-          CASE WHEN EXISTS(SELECT 1 FROM prompts p WHERE p.turn_id=j.current_turn_id AND p.response IS NULL)
+          CASE WHEN EXISTS(SELECT 1 FROM prompts p WHERE p.turn_id=j.current_turn_id AND p.response IS NULL AND p.withdrawn_at IS NULL)
                  OR EXISTS(SELECT 1 FROM permission_requests pr LEFT JOIN runs r ON r.id=pr.run_id WHERE COALESCE(pr.job_id,r.job_id)=j.id AND pr.status='pending') THEN 'awaitinginput'
                WHEN t.state IN ('running','starting') THEN 'running' ELSE 'idle' END
           FROM selected_jobs j LEFT JOIN turns t ON t.id=COALESCE(j.current_turn_id,(SELECT id FROM turns WHERE job_id=j.id ORDER BY created_at DESC,sequence DESC LIMIT 1))");

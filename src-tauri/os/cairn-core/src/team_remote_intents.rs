@@ -416,6 +416,9 @@ async fn dispatch(orch: &Orchestrator, db: &LocalDb, intent: &Intent) -> Result<
                 ),
             )
             .await?;
+            if let Some(notice) = outcome.withdrawn {
+                return Ok(json!({"outcome": "withdrawn", "message": notice}));
+            }
             Ok(json!({"outcome": if outcome.duplicate {"duplicate"} else {"created"}}))
         }
         ("issue_comment", CairnResource::Issue { project, number }) => {

@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::permission::{
     emit_successor_turn_events, ensure_and_start_successor_turn, issue_id_for_run,
-    recompute_issue_status_for_issue, yield_turn_for_host,
+    recompute_issue_status_for_issue, yield_turn_for_host, WithdrawalCause,
 };
 use super::{emit_attention, AttentionEvent};
 
@@ -580,6 +580,83 @@ async fn ask_questions_owned(
 pub struct PromptAnswerOutcome {
     pub duplicate: bool,
     pub response: String,
+    /// The question had been withdrawn when this answer reached it: what the
+    /// answer surface shows instead of an acknowledgement. Nothing was
+    /// recorded, replayed, or resumed.
+    pub withdrawn: Option<String>,
+}
+
+impl PromptAnswerOutcome {
+    fn withdrawn(cause: Option<WithdrawalCause>) -> Self {
+        Self {
+            duplicate: false,
+            response: String::new(),
+            withdrawn: Some(withdrawn_question_notice(cause)),
+        }
+    }
+}
+
+/// What every answer surface says to an answer that arrived after its question
+/// was withdrawn. Mirrors the permission wording.
+pub fn withdrawn_question_notice(cause: Option<WithdrawalCause>) -> String {
+    let cause = cause
+        .map(WithdrawalCause::sentence)
+        .unwrap_or("its recorded cause could not be read");
+    format!(
+        "This question was withdrawn before it was answered: {cause}. Your answer was not \
+         recorded, nothing was replayed, and no turn was started."
+    )
+}
+
+/// Withdraw a pending question: it stops being pending everywhere, and a later
+/// answer is refused with `cause` rather than recorded. Reports whether this
+/// call withdrew it (an answered or already-withdrawn row is left alone).
+pub(crate) async fn withdraw_prompt_conn(
+    conn: &cairn_db::turso::Connection,
+    prompt_id: &str,
+    cause: WithdrawalCause,
+    now: i64,
+) -> DbResult<bool> {
+    let cause = serde_json::to_value(cause)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .ok_or_else(|| DbError::internal("withdrawal cause did not serialize to a string"))?;
+    let changed = conn
+        .execute(
+            "UPDATE prompts SET withdrawn_at = ?2, withdrawn_cause = ?3
+              WHERE id = ?1 AND response IS NULL AND withdrawn_at IS NULL",
+            params![prompt_id, now, cause],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
+/// The withdrawal recorded on a question: `None` when it is not withdrawn,
+/// `Some(None)` when it is but the cause cannot be read.
+async fn prompt_withdrawal_conn(
+    conn: &cairn_db::turso::Connection,
+    prompt_id: &str,
+) -> DbResult<Option<Option<WithdrawalCause>>> {
+    let mut rows = conn
+        .query(
+            "SELECT withdrawn_cause FROM prompts WHERE id = ?1 AND withdrawn_at IS NOT NULL",
+            params![prompt_id],
+        )
+        .await?;
+    let Some(row) = rows.next().await? else {
+        return Ok(None);
+    };
+    let cause = row
+        .opt_text(0)?
+        .and_then(|cause| serde_json::from_value(serde_json::Value::String(cause)).ok());
+    Ok(Some(cause))
+}
+
+/// What recording an answer did.
+enum PromptRecord {
+    Recorded(PromptResume),
+    /// The question was withdrawn first; nothing was written.
+    Withdrawn(Option<WithdrawalCause>),
 }
 
 #[derive(Debug, Clone)]
@@ -891,6 +968,18 @@ async fn answer_prompt_id_impl(
         let gate_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
             .await
             .map_err(|error| error.to_string())?;
+        // Ahead of the claim: a withdrawn question has no winner to record, and
+        // claiming one would leave the ledger naming an answer nothing took.
+        let withdrawn = gate_db
+            .read(|conn| {
+                let prompt_id = prompt_id.to_string();
+                Box::pin(async move { prompt_withdrawal_conn(conn, &prompt_id).await })
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(cause) = withdrawn {
+            return Ok(PromptAnswerOutcome::withdrawn(cause));
+        }
         canonical_prompt_answers(prompt_id, &response)?;
         let claim = crate::channels::ledger::claim_ask_resolution(
             &gate_db,
@@ -925,6 +1014,7 @@ async fn answer_prompt_id_impl(
             return Ok(PromptAnswerOutcome {
                 duplicate: true,
                 response: winning_response,
+                withdrawn: None,
             });
         };
         let result = Box::pin(answer_prompt_id_impl(
@@ -936,6 +1026,7 @@ async fn answer_prompt_id_impl(
         ))
         .await;
         return match result {
+            Ok(outcome) if outcome.withdrawn.is_some() => Ok(outcome),
             Ok(mut outcome) => {
                 crate::channels::ledger::finalize_ask_resolution(
                     &gate_db,
@@ -973,14 +1064,17 @@ async fn answer_prompt_id_impl(
     let owning_db = crate::execution::routing::owning_db_for_prompt(&orch.db, prompt_id)
         .await
         .map_err(|e| e.to_string())?;
-    let resume = owning_db
+    let record = owning_db
         .write(|conn| {
             let prompt_id = prompt_id_owned.clone();
             let response = response_for_db.clone();
             let provenance = provenance.clone();
             Box::pin(
                 async move {
-                    let result = record_prompt_response_conn(conn, &prompt_id, &response, now).await?;
+                    let result = match record_prompt_response_conn(conn, &prompt_id, &response, now).await? {
+                        PromptRecord::Recorded(result) => result,
+                        withdrawn @ PromptRecord::Withdrawn(_) => return Ok(withdrawn),
+                    };
                     if !result.duplicate {
                         let surface = provenance.surface_name();
                         conn.execute(
@@ -988,12 +1082,16 @@ async fn answer_prompt_id_impl(
                             params![prompt_id, provenance.id, surface, provenance.provider, provenance.conversation, provenance.actor],
                         ).await?;
                     }
-                    Ok(result)
+                    Ok(PromptRecord::Recorded(result))
                 },
             )
         })
         .await
         .map_err(|e| e.to_string())?;
+    let resume = match record {
+        PromptRecord::Recorded(resume) => resume,
+        PromptRecord::Withdrawn(cause) => return Ok(PromptAnswerOutcome::withdrawn(cause)),
+    };
 
     if !resume.duplicate {
         let _ = orch
@@ -1055,6 +1153,7 @@ async fn answer_prompt_id_impl(
         return Ok(PromptAnswerOutcome {
             duplicate: resume.duplicate,
             response,
+            withdrawn: None,
         });
     }
 
@@ -1115,6 +1214,7 @@ async fn answer_prompt_id_impl(
     Ok(PromptAnswerOutcome {
         duplicate: resume.duplicate,
         response,
+        withdrawn: None,
     })
 }
 
@@ -1196,7 +1296,12 @@ async fn record_prompt_response_conn(
     prompt_id: &str,
     response: &str,
     answered_at: i64,
-) -> DbResult<PromptResume> {
+) -> DbResult<PromptRecord> {
+    // First, before an MCP continuation can claim the answer: a withdrawn
+    // question takes no answer from any path.
+    if let Some(cause) = prompt_withdrawal_conn(conn, prompt_id).await? {
+        return Ok(PromptRecord::Withdrawn(cause));
+    }
     let mcp_claim = super::mcp_continuation::record_and_claim_answer_conn(
         conn,
         prompt_id,
@@ -1248,7 +1353,7 @@ async fn record_prompt_response_conn(
             "
             UPDATE prompts
             SET response = ?1, answered_at = ?2
-            WHERE id = ?3 AND response IS NULL
+            WHERE id = ?3 AND response IS NULL AND withdrawn_at IS NULL
             ",
             params![response, answered_at, prompt_id],
         )
@@ -1274,7 +1379,7 @@ async fn record_prompt_response_conn(
         crate::transitions::outcome::recompute_issue_status_conn(conn, issue_id).await?;
     }
 
-    Ok(PromptResume {
+    Ok(PromptRecord::Recorded(PromptResume {
         run_id,
         mcp_wait_id,
         session_id,
@@ -1284,7 +1389,7 @@ async fn record_prompt_response_conn(
         issue_id,
         tool_use_id,
         duplicate,
-    })
+    }))
 }
 
 async fn ensure_prompt_successor_turn_conn(

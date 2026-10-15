@@ -150,7 +150,9 @@ pub(super) async fn dispatch(
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?;
-                if outcome.duplicate {
+                if let Some(notice) = outcome.withdrawn {
+                    notice
+                } else if outcome.duplicate {
                     format!("Question {} was already answered", segment)
                 } else {
                     format!("Answered question {}", segment)

@@ -1153,6 +1153,7 @@ async fn load_pending_prompt(db: &LocalDb, run_id: String) -> Result<Option<Prom
              FROM prompts
              WHERE run_id = ?1
                AND response IS NULL
+               AND withdrawn_at IS NULL
              ORDER BY created_at DESC
              LIMIT 1"
         ),
@@ -1188,6 +1189,7 @@ async fn load_pending_prompt_for_job(
              FROM prompts
              WHERE turn_id = ?1
                AND response IS NULL
+               AND withdrawn_at IS NULL
              ORDER BY created_at DESC
              LIMIT 1"
         ),

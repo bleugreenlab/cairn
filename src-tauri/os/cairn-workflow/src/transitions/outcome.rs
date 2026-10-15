@@ -162,7 +162,7 @@ pub async fn recompute_thread_attention_conn(
 ) -> DbResult<()> {
     let attention = if count(
         conn,
-        "SELECT COUNT(*) FROM prompts p JOIN runs r ON p.run_id = r.id JOIN jobs j ON r.job_id = j.id WHERE j.thread_id = ?1 AND p.response IS NULL",
+        "SELECT COUNT(*) FROM prompts p JOIN runs r ON p.run_id = r.id JOIN jobs j ON r.job_id = j.id WHERE j.thread_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL",
         thread_id,
     )
     .await? > 0
@@ -365,7 +365,7 @@ async fn issue_progress_attention(
         SELECT COUNT(*)
         FROM prompts p
         JOIN runs r ON p.run_id = r.id
-        WHERE r.issue_id = ?1 AND p.response IS NULL
+        WHERE r.issue_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL
         ",
     )
     .await?

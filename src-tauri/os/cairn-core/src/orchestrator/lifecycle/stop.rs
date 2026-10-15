@@ -297,42 +297,66 @@ pub fn stop_active_turn_for_run(orch: &Orchestrator, run_id: &str, cancel_owned_
         return;
     };
 
-    let Some(state) = turn_state(orch, &turn_id) else {
-        log::warn!("Run {} current turn {} was not found", run_id, turn_id);
-        return;
-    };
+    if let Err(error) = settle_live_turn(orch, Some(run_id), &turn_id, TurnSettlement::UserStop) {
+        log::warn!("Failed to stop turn {turn_id} for run {run_id}: {error}");
+    }
+}
+
+/// Who is ending a live turn, which decides what it ends as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnSettlement {
+    /// A warm Stop: a running turn is interrupted (resumable), anything else
+    /// cancelled, both `user_stop`. Best effort, as Stop always was.
+    UserStop,
+    /// A cold operator Compact: every live turn is cancelled `operator_compact`,
+    /// and any failure is returned rather than logged past.
+    OperatorCompact,
+}
+
+/// End one live turn: answer its still-pending run and write tool calls with
+/// synthetic results, then terminalize it as `settlement` dictates. Reports
+/// whether the turn was live (and is now settled).
+pub(crate) fn settle_live_turn(
+    orch: &Orchestrator,
+    run_id: Option<&str>,
+    turn_id: &str,
+    settlement: TurnSettlement,
+) -> Result<bool, String> {
+    let state = turn_state(orch, turn_id).ok_or_else(|| format!("turn {turn_id} was not found"))?;
 
     if state == "running" {
-        if let Err(error) = settle_pending_tool_results(orch, run_id, &turn_id) {
-            log::warn!(
-                "Failed to fail pending run tool results for run {} turn {}: {}",
-                run_id,
-                turn_id,
-                error
-            );
+        if let Some(run_id) = run_id {
+            if let Err(error) = settle_pending_tool_results(orch, run_id, turn_id) {
+                let error = format!(
+                    "failed to settle pending run tool results for run {run_id} turn {turn_id}: {error}"
+                );
+                match settlement {
+                    TurnSettlement::UserStop => log::warn!("{error}"),
+                    TurnSettlement::OperatorCompact => return Err(error),
+                }
+            }
         }
     }
 
-    let result = match state.as_str() {
-        "running" => interrupt_turn(orch, &turn_id, Some(TurnEndReason::UserStop)),
-        "pending" | "yielded" => apply_turn_outcome(
+    match (state.as_str(), settlement) {
+        ("running", TurnSettlement::UserStop) => {
+            interrupt_turn(orch, turn_id, Some(TurnEndReason::UserStop))?
+        }
+        ("pending" | "yielded", TurnSettlement::UserStop) => apply_turn_outcome(
             orch,
-            &turn_id,
+            turn_id,
             TurnState::Cancelled,
             Some(TurnEndReason::UserStop),
-        ),
-        _ => Ok(()),
-    };
-
-    if let Err(error) = result {
-        log::warn!(
-            "Failed to stop turn {} for run {} from state {}: {}",
+        )?,
+        ("running" | "pending" | "yielded", TurnSettlement::OperatorCompact) => apply_turn_outcome(
+            orch,
             turn_id,
-            run_id,
-            state,
-            error
-        );
+            TurnState::Cancelled,
+            Some(TurnEndReason::OperatorCompact),
+        )?,
+        _ => return Ok(false),
     }
+    Ok(true)
 }
 
 fn running_terminals_for_job(orch: &Orchestrator, job_id: &str) -> Vec<(String, String)> {
@@ -620,7 +644,7 @@ fn child_run_ids_for_run(orch: &Orchestrator, run_id: &str) -> Vec<String> {
     .unwrap_or_default()
 }
 
-async fn find_descendant_job_ids(
+pub(crate) async fn find_descendant_job_ids(
     conn: &cairn_db::turso::Connection,
     job_id: &str,
 ) -> DbResult<Vec<String>> {
@@ -941,6 +965,7 @@ fn cancel_open_input_and_live_turns_for_job(
                     "UPDATE prompts
                      SET response = ?1, answered_at = ?2
                      WHERE response IS NULL
+                       AND withdrawn_at IS NULL
                        AND turn_id IN (SELECT id FROM turns WHERE job_id = ?3)",
                     (STOP_CANCELLED_PROMPT_RESPONSE, now, job_id.as_str()),
                 )
@@ -1141,6 +1166,10 @@ pub fn kill_session(orch: &Orchestrator, run_id: &str) -> Result<(), String> {
 /// but terminal failure attention must not fire between the two turns.
 pub(crate) const PROVIDER_SILENCE_RECOVERY_EXIT_REASON: &str = "provider_silence_recovery";
 pub(crate) const WATCHDOG_ARM_FAILED_EXIT_REASON: &str = "watchdog_arm_failed";
+/// Exit reason for a run an operator Compact killed. Finalized as `Exited`
+/// through [`super::finalize_run_for_operator_compact`], which leaves the job's
+/// continuation to the Compact.
+pub(crate) const OPERATOR_COMPACT_EXIT_REASON: &str = "operator_compact";
 
 /// Kill a session with a specific exit reason.
 pub fn kill_session_with_reason(
@@ -1223,6 +1252,8 @@ pub fn kill_session_with_reason(
 
     if exit_reason == PROVIDER_SILENCE_RECOVERY_EXIT_REASON {
         super::finalize_run_for_recovery(orch, run_id, final_status)?;
+    } else if exit_reason == OPERATOR_COMPACT_EXIT_REASON {
+        super::finalize_run_for_operator_compact(orch, run_id, final_status)?;
     } else {
         finalize_run(orch, run_id, final_status);
     }

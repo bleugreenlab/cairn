@@ -253,7 +253,7 @@ pub(crate) async fn record_and_claim_answer_conn(
     }
     let changed = conn
         .execute(
-            "UPDATE prompts SET response=?2,answered_at=?3,mcp_consumed_at=?3 WHERE id=?1 AND response IS NULL AND mcp_consumed_at IS NULL",
+            "UPDATE prompts SET response=?2,answered_at=?3,mcp_consumed_at=?3 WHERE id=?1 AND response IS NULL AND withdrawn_at IS NULL AND mcp_consumed_at IS NULL",
             params![prompt_id, response, now_ms],
         )
         .await?;
@@ -776,7 +776,7 @@ mod tests {
     async fn db() -> LocalDb {
         let db = LocalDb::open(":memory:").await.unwrap();
         db.exclusive(|conn| Box::pin(async move {
-            conn.execute_batch("CREATE TABLE agent_waits(id TEXT PRIMARY KEY,state TEXT NOT NULL,condition_json TEXT NOT NULL,deadline_ms INTEGER,created_at INTEGER DEFAULT 0); CREATE TABLE prompts(id TEXT PRIMARY KEY,response TEXT,answered_at INTEGER,mcp_wait_id TEXT REFERENCES agent_waits(id),mcp_consumed_at INTEGER);").await?;
+            conn.execute_batch("CREATE TABLE agent_waits(id TEXT PRIMARY KEY,state TEXT NOT NULL,condition_json TEXT NOT NULL,deadline_ms INTEGER,created_at INTEGER DEFAULT 0); CREATE TABLE prompts(id TEXT PRIMARY KEY,response TEXT,answered_at INTEGER,mcp_wait_id TEXT REFERENCES agent_waits(id),mcp_consumed_at INTEGER,withdrawn_at INTEGER);").await?;
             Ok(())
         })).await.unwrap();
         db
@@ -885,10 +885,10 @@ mod tests {
                     params![json],
                 )
                 .await?;
-                conn.execute("INSERT INTO prompts VALUES('owned',NULL,NULL,'w',NULL)", ())
+                conn.execute("INSERT INTO prompts(id,mcp_wait_id) VALUES('owned','w')", ())
                     .await?;
                 conn.execute(
-                    "INSERT INTO prompts VALUES('ordinary',NULL,NULL,NULL,NULL)",
+                    "INSERT INTO prompts(id) VALUES('ordinary')",
                     (),
                 )
                 .await?;

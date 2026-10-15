@@ -409,7 +409,7 @@ pub async fn record_prompt_response(
                          SET response = ?1, answered_at = ?2, resolution_id = ?4,
                              resolution_surface = ?5, resolution_provider = ?6,
                              resolution_conversation = ?7, resolution_actor = ?8
-                         WHERE id = ?3 AND response IS NULL",
+                         WHERE id = ?3 AND response IS NULL AND withdrawn_at IS NULL",
                         params![
                             response.as_str(),
                             answered_at,

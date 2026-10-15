@@ -35,9 +35,9 @@ pub(crate) use child_stall::{render_stall_push_body, sweep_stalled_children};
 pub(crate) use common::set_exit_reason;
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
 pub(crate) use finalize::{
-    finalize_run_for_recovery, interrupt_run_for_provider_depletion, memory_review_turn_ended,
-    record_run_failure_if_active, release_and_stop_process, report_recovery_launch_failure,
-    transition_to_warm_safety_pause,
+    finalize_run_for_operator_compact, finalize_run_for_recovery,
+    interrupt_run_for_provider_depletion, memory_review_turn_ended, record_run_failure_if_active,
+    release_and_stop_process, report_recovery_launch_failure, transition_to_warm_safety_pause,
 };
 pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,
@@ -48,6 +48,10 @@ pub(crate) use review_push::{
 };
 #[cfg(test)]
 pub(crate) use stop::USER_STOP_TOOL_RESULT;
+pub(crate) use stop::{
+    find_descendant_job_ids, settle_live_turn, TurnSettlement, OPERATOR_COMPACT_EXIT_REASON,
+    PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON,
+};
 pub use stop::{
     kill_session, kill_session_with_reason, live_run_id_for_job, stop_active_turn_for_run,
     stop_agents_for_host_shutdown, stop_call, stop_job, stop_session, stop_workflow,
@@ -55,7 +59,6 @@ pub use stop::{
     suspend_run_for_durable_wait_after_handoff_then, HostShutdownStops, ParkSlots,
     RUNNER_SHUTDOWN_EXIT_REASON, SUSPEND_HANDOFF_GRACE,
 };
-pub(crate) use stop::{PROVIDER_SILENCE_RECOVERY_EXIT_REASON, WATCHDOG_ARM_FAILED_EXIT_REASON};
 pub(crate) use watchdog_recovery::notify_watchdog_successor_started;
 pub(crate) use watchdog_recovery::sweep_stranded_watchdog_jobs;
 pub(crate) use watchdog_recovery::{

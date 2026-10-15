@@ -123,6 +123,7 @@ pub enum TurnEndCancelReason {
     IssueResolved = 0,
     BranchAdvanced = 1,
     UserRequested = 2,
+    OperatorCompact = 3,
 }
 
 impl TurnEndCancelReason {
@@ -131,6 +132,7 @@ impl TurnEndCancelReason {
             Self::IssueResolved => "its issue resolved",
             Self::BranchAdvanced => "its branch advanced",
             Self::UserRequested => "a user requested cancellation",
+            Self::OperatorCompact => "the operator compacted its session",
         }
     }
 
@@ -142,6 +144,7 @@ impl TurnEndCancelReason {
             Self::IssueResolved => 0,
             Self::BranchAdvanced => 1,
             Self::UserRequested => 2,
+            Self::OperatorCompact => 3,
         }
     }
 
@@ -150,6 +153,7 @@ impl TurnEndCancelReason {
             0 => Some(Self::IssueResolved),
             1 => Some(Self::BranchAdvanced),
             2 => Some(Self::UserRequested),
+            3 => Some(Self::OperatorCompact),
             NOT_CANCELLED => None,
             _ => None,
         }
@@ -2277,13 +2281,21 @@ impl Orchestrator {
     /// and idempotent: a no-op when no suite is in flight for the job. Fired when
     /// the job's issue reaches a terminal state, its branch advances beyond the
     /// checked tree, or a user explicitly cancels the suite.
-    pub fn cancel_turn_end_checks(&self, job_id: &str, reason: TurnEndCancelReason) {
-        if let Ok(map) = self.turn_end_checks_in_flight.lock() {
-            if let Some(cancel) = map.get(job_id) {
-                cancel.cancel(reason);
-            }
-        }
+    /// Signal the job's in-flight turn-end check wave, reporting whether there
+    /// was one to signal.
+    pub fn cancel_turn_end_checks(&self, job_id: &str, reason: TurnEndCancelReason) -> bool {
+        let signalled = match self.turn_end_checks_in_flight.lock() {
+            Ok(map) => match map.get(job_id) {
+                Some(cancel) => {
+                    cancel.cancel(reason);
+                    true
+                }
+                None => false,
+            },
+            Err(_) => false,
+        };
         self.invalidate_node_check_status(job_id, "cancellation");
+        signalled
     }
 
     /// Advance the complete correctness generation for a job's settled check

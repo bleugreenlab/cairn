@@ -1356,6 +1356,81 @@ pub(crate) async fn expire_previous_incarnations(
     .map_err(|error| format!("closing a previous runner's queue entries failed: {error}"))
 }
 
+/// Test seams on the fleet that drive this queue's own transitions. Kept here,
+/// off the executor wire path, because they change nothing a peer receives.
+#[cfg(any(test, feature = "test-utils"))]
+impl super::Fleet {
+    /// Put one command batch for `job_id` in the queue exactly as a real
+    /// dispatch leaves it: offered to the colocated executor attached at
+    /// `generation`, then claimed by it. For tests outside this crate that
+    /// need a running batch a job-level cancel must reach.
+    pub fn claim_job_command_for_test(
+        &self,
+        request_id: &str,
+        job_id: &str,
+        generation: u64,
+    ) -> tokio::sync::oneshot::Receiver<super::CellOutcome> {
+        let now = super::unix_time_ms();
+        let request = super::CellRequest {
+            request_id: request_id.into(),
+            attempt_id: format!("{request_id}-attempt"),
+            project_id: "p".into(),
+            repository: super::RepositoryLocator::ColocatedPath {
+                project_id: "p".into(),
+                repository_id: "p".into(),
+                absolute_path: "/repo".into(),
+            },
+            base_commit: "base".into(),
+            command: "cargo test --workspace".into(),
+            command_class: super::CellCommandClass::CargoTest,
+            placement_work_class: super::PlacementWorkClass::AgentSessions,
+            owner: None,
+            cwd: String::new(),
+            env: Vec::new(),
+            priority: super::CellPriority::ReviewCheck,
+            wait_horizon_unix_ms: now + 60_000,
+            waiting_since_unix_ms: 0,
+            timeout_ms: 60_000,
+            mutation_policy: super::MutationPolicy::PureVerdict,
+            requesting_job_id: Some(job_id.into()),
+            affinity_key: None,
+            executor: None,
+            pinned_executor_id: None,
+            placement_mobility: Default::default(),
+            verdict_platforms: Vec::new(),
+            avoided_executor_ids: Vec::new(),
+            project_requirements: Default::default(),
+            command_resource_identity: None,
+            resource_reservation: Default::default(),
+            learned_estimate: None,
+        };
+        let (entry_id, receiver) = self
+            .queue
+            .enqueue(
+                NewEntry {
+                    request,
+                    admission_kind: super::CellAdmissionKind::Command,
+                    interactive: false,
+                },
+                now,
+            )
+            .expect("a fresh request identity enqueues");
+        assert!(self.queue.offer(
+            &entry_id,
+            super::COLOCATED_EXECUTOR_ID,
+            super::COLOCATED_EXECUTOR_ID,
+            generation,
+            now
+        ));
+        assert_eq!(
+            self.queue
+                .claim(&entry_id, super::COLOCATED_EXECUTOR_ID, generation, now),
+            ClaimVerdict::Granted
+        );
+        receiver
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

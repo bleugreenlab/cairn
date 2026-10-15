@@ -15,7 +15,7 @@
 
 use crate::models::SessionStatus;
 use crate::orchestrator::Orchestrator;
-use crate::sessions::queries::ProviderChangeCommit;
+use crate::sessions::queries::RotationCommit;
 use crate::storage::LocalDb;
 
 /// Apply the provider-change lifecycle for `job_id` when its open session is on
@@ -79,11 +79,12 @@ pub async fn apply_for_job(
         job_id,
         to_backend,
         crate::sessions::queries::RotationReason::ProviderChange,
-        Some(ProviderChangeCommit {
-            model: model.map(str::to_string),
-            run_id: active_run_id.clone().or_else(|| latest_run_id.clone()),
-            turn_id: None,
-        }),
+        Some(RotationCommit::provider_change(
+            &session.backend,
+            to_backend,
+            model,
+            active_run_id.clone().or_else(|| latest_run_id.clone()),
+        )),
         orch.services.emitter.as_ref(),
     )
     .await?;

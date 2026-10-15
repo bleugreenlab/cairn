@@ -129,6 +129,7 @@ pub(crate) fn goal_pause_notice(cause: &crate::backends::stdin::GoalPauseCause) 
         GoalPauseCause::Complete => "[Goal state: complete. This delivery does not restart the goal.]".to_string(),
         GoalPauseCause::Paused(GoalPause::OperatorHold) => "[Goal state: paused by an operator Stop. Autonomous continuation stays off until the operator resumes; this delivery does not lift it.]".to_string(),
         GoalPauseCause::Paused(GoalPause::SafetyBrake) => "[Goal state: paused by the repeat safety brake. It lifts on an explicit rearm.]".to_string(),
+        GoalPauseCause::Paused(GoalPause::OperatorCompact) => "[Goal state: paused because the operator is compacting this session. This process is being replaced; nothing lifts this pause.]".to_string(),
         GoalPauseCause::Paused(GoalPause::Owned(owner)) => format!(
             "[Goal state: paused pending {} {}. It lifts automatically when that condition resolves; this delivery does not lift it.]",
             owner.kind(), owner.id(),
@@ -147,6 +148,10 @@ struct SessionBoundary {
     /// part of choosing it. `None` on the ordinary warm continuation, which
     /// keeps that payload byte-identical to what it has always been.
     cache: Option<CacheDecision>,
+    /// Who asked for this boundary, when it was not the system's own decision.
+    /// Absent everywhere but an operator Compact, so every other payload stays
+    /// byte-identical.
+    initiated_by: Option<&'static str>,
     /// Why a replacement happened, when its kind alone does not say. `None`
     /// keeps every other boundary's payload byte-identical.
     reason: Option<&'static str>,
@@ -165,6 +170,7 @@ impl SessionBoundary {
             model: model.map(str::to_string),
             seed_bytes: Some(seed_bytes),
             cache: None,
+            initiated_by: None,
             reason: None,
         }
     }
@@ -177,8 +183,16 @@ impl SessionBoundary {
             model: None,
             seed_bytes: Some(seed_bytes),
             cache: None,
+            initiated_by: None,
             reason: None,
         }
+    }
+
+    /// Mark a boundary the operator asked for, as distinct from one a
+    /// continuation decided on.
+    fn initiated_by_operator(mut self) -> Self {
+        self.initiated_by = Some("operator");
+        self
     }
 
     fn native_resume(model: Option<&str>, backend: Option<&str>) -> Self {
@@ -189,6 +203,7 @@ impl SessionBoundary {
             model: model.map(str::to_string),
             seed_bytes: None,
             cache: None,
+            initiated_by: None,
             reason: None,
         }
     }
@@ -201,6 +216,7 @@ impl SessionBoundary {
             model: model.map(str::to_string),
             seed_bytes: None,
             cache: None,
+            initiated_by: None,
             reason: None,
         }
     }
@@ -227,6 +243,9 @@ impl SessionBoundary {
             "model": self.model,
             "seedBytes": self.seed_bytes,
         });
+        if let (Some(initiated_by), Some(object)) = (self.initiated_by, raw.as_object_mut()) {
+            object.insert("initiatedBy".to_string(), initiated_by.into());
+        }
         if let (Some(reason), Some(object)) = (self.reason, raw.as_object_mut()) {
             object.insert("reason".to_string(), reason.into());
         }
@@ -1630,10 +1649,58 @@ pub fn prepare_job(orch: &Orchestrator, job_id: &str) -> Result<PreparedJob, Str
 /// converted into queued messages.
 const FORCED_DIGEST_RESUME_TRIGGER: &str = "Continue from the conversation digest above.";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum ContinuationIntent {
     Normal,
     ForceDigestReseed,
+    /// An operator's cold Compact. Everything live in the old session has
+    /// already been torn down under the launch lock this continuation runs
+    /// under; the forced reseed rotates with reason `operator_compact` and
+    /// writes its boundary inside the rotation's own transaction.
+    OperatorCompact(Option<OperatorBoundary>),
+}
+
+/// Where an operator Compact's `digest_reseed` boundary is written: the old
+/// session's last run, at the turn the Compact cancelled.
+#[derive(Debug, Clone)]
+pub(crate) struct OperatorBoundary {
+    pub(crate) run_id: String,
+    pub(crate) turn_id: Option<String>,
+}
+
+/// Rotate the job onto a fresh session seeded from its digest and launch it,
+/// for an operator Compact that has already torn the old session down.
+///
+/// The caller holds this job's launch lock and passes the guard in, so no
+/// racing resume can reach the old session between the teardown and this
+/// launch. Queued messages and attention pushes are claimed by this launch
+/// like any other, so whatever the operator sent while the session was stuck
+/// lands in the new session's first turn.
+pub(crate) fn continue_job_launch_locked_for_operator_compact<'a>(
+    orch: &Orchestrator,
+    job_id: &str,
+    identity_override: Option<crate::identity::UserIdentity>,
+    boundary: Option<OperatorBoundary>,
+    launch_guard: std::sync::MutexGuard<'a, ()>,
+) -> Result<Run, String> {
+    continue_job_launch_locked(
+        orch,
+        job_id,
+        Some(FORCED_DIGEST_RESUME_TRIGGER),
+        identity_override,
+        Some(ResumeContext {
+            suppress_user_event: true,
+            suppress_self_suspend_note: true,
+            supersede_pending_retry: true,
+            ..Default::default()
+        }),
+        ContinuationIntent::OperatorCompact(boundary),
+        ResumeTrace {
+            id: &ids::mint_child(job_id),
+            started: std::time::Instant::now(),
+        },
+        Some(launch_guard),
+    )
 }
 
 pub fn resume_job_from_digest(
@@ -1696,6 +1763,11 @@ const SEED_CHARS_PER_TOKEN: usize = 4;
 pub struct DigestPreview {
     /// Estimated tokens in that seed content, at [`SEED_CHARS_PER_TOKEN`].
     pub estimated_tokens: i64,
+    /// What a Compact pressed now would tear down first. All zero means the
+    /// idle reseed; anything else is the cold path, and the confirmation names
+    /// exactly these counts because they come from the same read the action
+    /// makes.
+    pub live_work: crate::execution::operator_compact::LiveWorkCounts,
 }
 
 impl DigestPreview {
@@ -1705,6 +1777,7 @@ impl DigestPreview {
     pub(crate) fn of(seed_content: &str) -> Self {
         Self {
             estimated_tokens: seed_content.chars().count().div_ceil(SEED_CHARS_PER_TOKEN) as i64,
+            live_work: Default::default(),
         }
     }
 }
@@ -1740,9 +1813,11 @@ pub fn preview_job_digest(orch: &Orchestrator, job_id: &str) -> Result<DigestPre
     let session = run_db(load_session_optional(owning_db.clone(), session_id))?
         .ok_or_else(|| "This job's current session could not be loaded.".to_string())?;
 
-    Ok(DigestPreview::of(
-        compose_forced_reseed(orch, &owning_db, &job, &session)?.framed(),
-    ))
+    let mut preview =
+        DigestPreview::of(compose_forced_reseed(orch, &owning_db, &job, &session)?.framed());
+    preview.live_work =
+        crate::execution::operator_compact::live_work_for_job(orch, job_id)?.counts();
+    Ok(preview)
 }
 
 pub fn continue_job_or_enqueue(
@@ -2542,6 +2617,13 @@ fn continue_job_launch_locked(
     // arm below and threaded into prompt assembly + seed-event storage.
     let mut reseed_outcome: Option<ReseedOutcome> = None;
     let mut resumes_provider_change = false;
+    // Set when the rotation itself committed this continuation's boundary.
+    let mut boundary_in_rotation = false;
+    let (forced_reseed, operator_compact) = match &continuation_intent {
+        ContinuationIntent::Normal => (false, None),
+        ContinuationIntent::ForceDigestReseed => (true, None),
+        ContinuationIntent::OperatorCompact(boundary) => (true, Some(boundary.clone())),
+    };
     let step_started = std::time::Instant::now();
     let mut session_boundary: Option<SessionBoundary> = None;
     // A cold prefix that was priced and kept: recorded on whichever boundary the
@@ -2553,30 +2635,38 @@ fn continue_job_launch_locked(
     ))? {
         Some(session) => match session.status {
             SessionStatus::Open => {
-                if continuation_intent == ContinuationIntent::ForceDigestReseed {
+                if forced_reseed {
                     // The one operator-authorized replacement. Digest construction
                     // and rotation must both succeed; on failure the old session
                     // remains usable and nothing was discarded.
+                    let (reason, rotation_boundary) = match operator_compact.as_ref() {
+                        Some(boundary) => (RotationReason::OperatorCompact, boundary.as_ref()),
+                        None => (RotationReason::Reseed, None),
+                    };
                     let outcome = force_session_reseed(
                         orch,
                         &owning_db,
                         &job,
                         &session,
                         desired_backend.as_deref(),
-                        RotationReason::Reseed,
+                        reason,
+                        rotation_boundary,
                     )?;
                     let session_start = crate::backends::SessionStart::New {
                         session_id: outcome.new_session_id.clone(),
                     };
                     let run_start_mode = run_start_mode(&session_start).to_string();
                     let new_id = outcome.new_session_id.clone();
+                    if operator_compact.is_some() {
+                        // Committed with the session close, or not at all.
+                        boundary_in_rotation = true;
+                    } else {
+                        session_boundary = Some(SessionBoundary::digest_reseed(
+                            session.backend.clone(),
+                            outcome.seed_content.len(),
+                        ));
+                    }
                     reseed_outcome = Some(outcome);
-                    session_boundary = Some(SessionBoundary::digest_reseed(
-                        session.backend.clone(),
-                        reseed_outcome
-                            .as_ref()
-                            .map_or(0, |value| value.seed_content.len()),
-                    ));
                     (new_id, session_start, run_start_mode)
                 } else {
                     // Cache economics are asked only of a cold process restart.
@@ -2632,6 +2722,7 @@ fn continue_job_launch_locked(
                                 &session,
                                 Some(&want),
                                 RotationReason::BackendChange,
+                                None,
                             )?;
                             let session_start = crate::backends::SessionStart::New {
                                 session_id: outcome.new_session_id.clone(),
@@ -2698,8 +2789,15 @@ fn continue_job_launch_locked(
                                 if let Ok(parent) = run_db(async move {
                                     crate::sessions::queries::get(db.as_ref(), &parent_id).await
                                 }) {
-                                    if parent.terminal_reason.as_deref() == Some("provider_change")
-                                    {
+                                    // A provider change seeds its successor here, at its
+                                    // first launch. An operator Compact seeds its own
+                                    // launch, and lands here only if that launch failed
+                                    // after the rotation committed; recomposing is what
+                                    // keeps the successor from starting with no context.
+                                    if matches!(
+                                        parent.terminal_reason.as_deref(),
+                                        Some("provider_change" | "operator_compact")
+                                    ) {
                                         let seed_content =
                                             compose_forced_reseed(orch, &owning_db, &job, &parent)?
                                                 .framed()
@@ -2990,7 +3088,11 @@ fn continue_job_launch_locked(
         );
         (new_run_id, false)
     };
-    if session_boundary.is_none() && !is_process_reuse && !resumes_provider_change {
+    if session_boundary.is_none()
+        && !is_process_reuse
+        && !resumes_provider_change
+        && !boundary_in_rotation
+    {
         session_boundary = Some(
             match &session_start {
                 crate::backends::SessionStart::Resume { .. }
@@ -3972,6 +4074,7 @@ fn attempt_session_reseed(
                 session,
                 target_backend,
                 RotationReason::Reseed,
+                None,
             ) else {
                 return ReseedDecision::NativeResume(None);
             };
@@ -4031,8 +4134,11 @@ fn attempt_session_reseed(
         job,
         session,
         framed,
-        RotationReason::CacheExpiry,
-        target_backend,
+        Rotation {
+            reason: RotationReason::CacheExpiry,
+            target_backend,
+            boundary: None,
+        },
     ) {
         Ok(outcome) => {
             log::info!(
@@ -4193,18 +4299,16 @@ fn force_session_reseed(
     session: &Session,
     target_backend: Option<&str>,
     reason: RotationReason,
+    boundary: Option<&OperatorBoundary>,
 ) -> Result<ReseedOutcome, String> {
+    let rotation = Rotation {
+        reason,
+        target_backend,
+        boundary,
+    };
     // Construct the complete seed before any process or session mutation.
     let composed = compose_forced_reseed(orch, owning_db, job, session)?;
-    apply_composed_reseed(
-        orch,
-        owning_db,
-        job,
-        session,
-        composed,
-        target_backend,
-        reason,
-    )
+    apply_composed_reseed(orch, owning_db, job, session, composed, rotation)
 }
 
 /// Apply an already-composed forced reseed: compact a thread, or rotate an
@@ -4215,12 +4319,11 @@ fn apply_composed_reseed(
     job: &DbJob,
     session: &Session,
     composed: ComposedReseed,
-    target_backend: Option<&str>,
-    reason: RotationReason,
+    rotation: Rotation<'_>,
 ) -> Result<ReseedOutcome, String> {
     // A thread's compaction generation records why it was rebuilt. Every
     // forced reseed but an unconfirmed start is recorded as the operator's.
-    let trigger = match reason {
+    let trigger = match rotation.reason {
         RotationReason::UnconfirmedStart => CompactionTrigger::UnconfirmedStart,
         _ => CompactionTrigger::Manual,
     };
@@ -4236,18 +4339,11 @@ fn apply_composed_reseed(
                 trigger,
                 occupancy: None,
             },
-            target_backend,
-            reason,
+            rotation,
         ),
-        ComposedReseed::Digest { framed } => rotate_with_seed(
-            orch,
-            owning_db,
-            job,
-            session,
-            framed,
-            reason,
-            target_backend,
-        ),
+        ComposedReseed::Digest { framed } => {
+            rotate_with_seed(orch, owning_db, job, session, framed, rotation)
+        }
     }
 }
 
@@ -4256,17 +4352,19 @@ fn apply_composed_reseed(
 /// The one mutating half of every reseed, thread or not. Rotation is the last
 /// and only persisted step, so any failure before it leaves session state
 /// exactly as a native resume would have.
+///
+/// An operator Compact's `boundary` is written by the rotation transaction
+/// itself, measured from the seed it is about to deliver.
 fn rotate_with_seed(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
     job: &DbJob,
     session: &Session,
     seed_content: String,
-    reason: RotationReason,
-    target_backend: Option<&str>,
+    rotation: Rotation<'_>,
 ) -> Result<ReseedOutcome, String> {
     let new_session_id =
-        rotate_job_onto_successor(orch, owning_db, job, session, reason, target_backend)?;
+        rotate_job_onto_successor(orch, owning_db, job, session, rotation, seed_content.len())?;
     Ok(ReseedOutcome {
         new_session_id,
         seed_content,
@@ -4293,7 +4391,11 @@ fn rotate_unconfirmed_start(
     session: &Session,
     target_backend: Option<&str>,
 ) -> Result<UnconfirmedStartRotation, String> {
-    let reason = RotationReason::UnconfirmedStart;
+    let rotation = Rotation {
+        reason: RotationReason::UnconfirmedStart,
+        target_backend,
+        boundary: None,
+    };
     match compose_forced_reseed(orch, owning_db, job, session) {
         Ok(composed) => {
             let outcome = apply_composed_reseed(
@@ -4302,8 +4404,7 @@ fn rotate_unconfirmed_start(
                 job,
                 session,
                 composed,
-                target_backend,
-                reason,
+                rotation,
             )?;
             Ok(UnconfirmedStartRotation {
                 new_session_id: outcome.new_session_id,
@@ -4316,8 +4417,8 @@ fn rotate_unconfirmed_start(
                 owning_db,
                 job,
                 session,
-                reason,
-                target_backend,
+                rotation,
+                0,
             )?,
             seed: None,
         }),
@@ -4356,14 +4457,33 @@ fn session_has_unconfirmed_spawned_launch(owning_db: &Arc<LocalDb>, session: &Se
 
 /// Stop the session's live process, if any, and rotate the job onto a fresh
 /// successor session. Returns the successor's id.
+///
+/// Every rotation cause enters here, carried by one [`Rotation`]. An operator
+/// Compact's boundary is written by the rotation transaction itself, as a
+/// `digest_reseed` of `seed_bytes`, the seed the successor is about to receive.
 fn rotate_job_onto_successor(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
     job: &DbJob,
     session: &Session,
-    reason: RotationReason,
-    target_backend: Option<&str>,
+    rotation: Rotation<'_>,
+    seed_bytes: usize,
 ) -> Result<String, String> {
+    let Rotation {
+        reason,
+        target_backend,
+        boundary,
+    } = rotation;
+    let commit = boundary.map(|anchor| crate::sessions::queries::RotationCommit {
+        model: None,
+        boundary: Some(crate::sessions::queries::BoundaryCommit {
+            run_id: anchor.run_id.clone(),
+            turn_id: anchor.turn_id.clone(),
+            payload: SessionBoundary::digest_reseed(session.backend.clone(), seed_bytes)
+                .initiated_by_operator()
+                .raw(),
+        }),
+    });
     if let Some(old_run) = orch.process_state.find_process_by_session(&session.id) {
         // Rotation ends the old physical process even though the logical job
         // continues. Release its provider-runtime claim before dropping the
@@ -4389,7 +4509,7 @@ fn rotate_job_onto_successor(
                 &job_id,
                 &target_backend,
                 reason,
-                None,
+                commit,
                 emitter.as_ref(),
             )
             .await
@@ -4398,6 +4518,16 @@ fn rotate_job_onto_successor(
     })?;
 
     Ok(new_session.id)
+}
+
+/// How a reseed rotates its session: why, onto which backend, and, for an
+/// operator Compact, the boundary the rotation transaction itself writes.
+#[derive(Clone, Copy)]
+struct Rotation<'a> {
+    reason: RotationReason,
+    /// `None` keeps the source session's backend.
+    target_backend: Option<&'a str>,
+    boundary: Option<&'a OperatorBoundary>,
 }
 
 /// Whether this job's session compacts as a thread. One resolution point, in
@@ -4572,8 +4702,11 @@ fn attempt_thread_compaction(
         job,
         session,
         decided,
-        target_backend,
-        rotation_reason,
+        Rotation {
+            reason: rotation_reason,
+            target_backend,
+            boundary: None,
+        },
     ) {
         Ok(outcome) => ReseedDecision::Rebuilt(outcome, cache_decision),
         Err(error) => {
@@ -4613,8 +4746,7 @@ fn apply_thread_compaction(
     job: &DbJob,
     session: &Session,
     decided: DecidedCompaction,
-    target_backend: Option<&str>,
-    rotation_reason: RotationReason,
+    rotation: Rotation<'_>,
 ) -> Result<ReseedOutcome, String> {
     let DecidedCompaction {
         seed,
@@ -4653,15 +4785,7 @@ fn apply_thread_compaction(
         orch.enqueue_thread_era_summary(&job.id, (first_minted_seq + offset as i64) as i32);
     }
 
-    let outcome = rotate_with_seed(
-        orch,
-        owning_db,
-        job,
-        session,
-        framed,
-        rotation_reason,
-        target_backend,
-    )?;
+    let outcome = rotate_with_seed(orch, owning_db, job, session, framed, rotation)?;
 
     // Occupancy rides in the log line because it is what the warm decision turns
     // on; the byte counts describe what the rebuild did, never why it happened.
@@ -5729,6 +5853,7 @@ mod tests {
             &source,
             Some("claude"),
             crate::sessions::queries::RotationReason::Reseed,
+            None,
         )
         .expect("the manual digest action composes history and rotates the session");
         let cursor = db

@@ -304,14 +304,60 @@ pub(crate) async fn run_session(db: &LocalDb, id: &str) -> Result<Option<String>
 /// already made apart from a wait still to be driven.
 const ABANDONED_OUTCOME: &str = "abandoned";
 
+/// Why a suspension was abandoned.
+///
+/// Both causes store the same `outcome`, so everything that recognizes an
+/// abandonment — the resolver's stand-down, startup reconciliation, the
+/// continuation claim — keeps recognizing it. The cause is the discriminator a
+/// reader uses to say *who* abandoned it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbandonCause {
+    /// A newer turn of the same job suspended, proving this one's turn gone.
+    Superseded,
+    /// The operator compacted the job's session, killing the turn that parked.
+    OperatorCompact,
+}
+
+impl AbandonCause {
+    const ALL: [AbandonCause; 2] = [AbandonCause::Superseded, AbandonCause::OperatorCompact];
+
+    /// The cause a stored resolution names. A resolution written before causes
+    /// existed carries none, and every such row was a supersession.
+    fn of(resolution: Option<&str>) -> Self {
+        let cause = resolution
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|value| {
+                value
+                    .get("cause")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        match cause.as_deref() {
+            Some("operator_compact") => Self::OperatorCompact,
+            _ => Self::Superseded,
+        }
+    }
+}
+
 /// What an abandoned suspension's own call is told. A wait row can outlive the
 /// turn that created it, and that turn's tool use would otherwise dangle in the
 /// transcript with no result at all.
-fn abandoned_result() -> String {
-    serde_json::json!({
-        "outcome":ABANDONED_OUTCOME,
-        "error":"This call's turn was replaced before its wait finished, so the wait was abandoned. Reissue it if the work still matters."
-    })
+///
+/// The supersession payload carries no `cause` field: it is byte-identical to
+/// what rows written before causes existed hold, which keeps the exact-payload
+/// comparison in [`claim_continuation`] true for them.
+fn abandoned_result(cause: AbandonCause) -> String {
+    match cause {
+        AbandonCause::Superseded => serde_json::json!({
+            "outcome":ABANDONED_OUTCOME,
+            "error":"This call's turn was replaced before its wait finished, so the wait was abandoned. Reissue it if the work still matters."
+        }),
+        AbandonCause::OperatorCompact => serde_json::json!({
+            "outcome":ABANDONED_OUTCOME,
+            "cause":"operator_compact",
+            "error":"The operator compacted this session before this wait finished, so the wait was abandoned and the session restarted from its digest. Reissue it if the work still matters."
+        }),
+    }
     .to_string()
 }
 
@@ -559,9 +605,29 @@ async fn supersede_abandoned(orch: &Orchestrator, db: &LocalDb, r: &Record) -> R
             r.job_id,
             r.turn_id
         );
-        abandon(orch, db, &wait).await?;
+        abandon(orch, db, &wait, AbandonCause::Superseded).await?;
     }
     Ok(())
+}
+
+/// Abandon every active suspension of `job_id` because the operator compacted
+/// its session, reporting how many this call abandoned.
+///
+/// A row whose own resolver already claimed its successor is not abandoned
+/// here (see [`abandon`]); that successor turn is settled by the compaction
+/// itself, so its later adoption fails rather than reaching the new session.
+pub(crate) async fn abandon_job_waits_for_operator_compact(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<usize, String> {
+    let mut abandoned = 0;
+    for wait in active_waits_for_job(db, job_id).await? {
+        if abandon(orch, db, &wait, AbandonCause::OperatorCompact).await? {
+            abandoned += 1;
+        }
+    }
+    Ok(abandoned)
 }
 
 /// Abandon one suspension: record the decision, answer its call, close the row.
@@ -578,8 +644,13 @@ async fn supersede_abandoned(orch: &Orchestrator, db: &LocalDb, r: &Record) -> R
 /// Closing the row comes LAST, because a row still in the re-driven set is a row
 /// reconciliation can finish. Closing first would hide an unanswered call inside
 /// a terminal state where nothing would ever look for it again.
-async fn abandon(orch: &Orchestrator, db: &LocalDb, call: &SuspendedCall) -> Result<(), String> {
-    if !mark_abandoned(db, &call.id).await? {
+async fn abandon(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    call: &SuspendedCall,
+    cause: AbandonCause,
+) -> Result<bool, String> {
+    if !mark_abandoned(db, &call.id, cause).await? {
         // Its own resolver owns the resume, so this must not answer or cancel it.
         // But a row whose resolver already did everything a resolution does --
         // claimed its successor, delivered its result -- is finished in fact and
@@ -587,9 +658,11 @@ async fn abandon(orch: &Orchestrator, db: &LocalDb, call: &SuspendedCall) -> Res
         // waiting single-use for the rest of the job's life. Complete it instead.
         // A resolver genuinely mid-flight is left alone; this suspension is then
         // refused rather than raced, and the retry succeeds.
-        return complete_resolution_in_fact(db, &call.id).await;
+        complete_resolution_in_fact(db, &call.id).await?;
+        return Ok(false);
     }
-    finish_abandonment(orch, db, call).await
+    finish_abandonment(orch, db, call, cause).await?;
+    Ok(true)
 }
 
 /// Everything after the decision is recorded, and therefore also what startup
@@ -599,9 +672,10 @@ async fn finish_abandonment(
     orch: &Orchestrator,
     db: &LocalDb,
     call: &SuspendedCall,
+    cause: AbandonCause,
 ) -> Result<(), String> {
-    deliver_abandonment(orch, db, call).await;
-    cancel_abandoned(db, &call.id).await
+    deliver_abandonment(orch, db, call, cause).await;
+    cancel_abandoned(db, &call.id, cause).await
 }
 
 /// Write the terminal state a resolution earned but never recorded.
@@ -644,10 +718,10 @@ async fn complete_resolution_in_fact(db: &LocalDb, id: &str) -> Result<(), Strin
 /// [`finish_abandonment`] instead of a resume. Refusing a row whose continuation
 /// is already owned is the other half of [`claim_continuation`]'s exclusion:
 /// between abandoning this suspension and resuming it, exactly one write wins.
-async fn mark_abandoned(db: &LocalDb, id: &str) -> Result<bool, String> {
+async fn mark_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<bool, String> {
     let id = id.to_string();
     db.write(|c| {
-        let (id, result) = (id.clone(), abandoned_result());
+        let (id, result) = (id.clone(), abandoned_result(cause));
         Box::pin(async move {
             let marked = c
                 .execute(
@@ -665,7 +739,12 @@ async fn mark_abandoned(db: &LocalDb, id: &str) -> Result<bool, String> {
 /// Answer an abandoned call, at most once, by winning the same claim the row's
 /// own resolver would take. Best effort past the claim: the abandoned turn may
 /// already be gone, in which case there is nothing to answer.
-async fn deliver_abandonment(orch: &Orchestrator, db: &LocalDb, call: &SuspendedCall) {
+async fn deliver_abandonment(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    call: &SuspendedCall,
+    cause: AbandonCause,
+) {
     match claim_result_delivery(db, &call.id).await {
         Ok(true) => {}
         Ok(false) => return,
@@ -682,7 +761,7 @@ async fn deliver_abandonment(orch: &Orchestrator, db: &LocalDb, call: &Suspended
         &call.run_id,
         &call.session_id,
         &call.tool_use_id,
-        &abandoned_result(),
+        &abandoned_result(cause),
         true,
         chrono::Utc::now().timestamp() as i32,
         Some(&call.turn_id),
@@ -768,11 +847,11 @@ async fn active_waits_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<Suspende
 /// Take an abandoned row out of the pending set with a typed outcome, so the
 /// job can suspend again. Delivering that outcome is a separate step behind the
 /// shared delivery claim, so cancelling never races another writer's answer.
-async fn cancel_abandoned(db: &LocalDb, id: &str) -> Result<(), String> {
+async fn cancel_abandoned(db: &LocalDb, id: &str, cause: AbandonCause) -> Result<(), String> {
     let id = id.to_string();
     let now = chrono::Utc::now().timestamp_millis();
     db.write(|c| {
-        let (id, result) = (id.clone(), abandoned_result());
+        let (id, result) = (id.clone(), abandoned_result(cause));
         Box::pin(async move {
             c.execute(
                 "UPDATE agent_waits SET state='cancelled',resolution_json=COALESCE(resolution_json,?2),resolved_at=COALESCE(resolved_at,?3) WHERE id=?1 AND state IN ('pending','resolving')",
@@ -1281,16 +1360,19 @@ async fn load_resolution(
 ///
 /// The abandonment test is an exact payload comparison rather than SQL-side JSON
 /// extraction, because `resolution_json` also carries settled `run` batch output,
-/// which is not JSON at all.
+/// which is not JSON at all. It therefore names every abandonment payload
+/// ([`AbandonCause::ALL`]); one it missed would let a resolver resume a turn
+/// that was deliberately abandoned.
 async fn claim_continuation(db: &LocalDb, id: &str, successor: &str) -> Result<bool, String> {
     let (id, successor) = (id.to_string(), successor.to_string());
     db.write(|c| {
-        let (id, successor, abandoned) = (id.clone(), successor.clone(), abandoned_result());
+        let (id, successor) = (id.clone(), successor.clone());
+        let [superseded, compacted] = AbandonCause::ALL.map(abandoned_result);
         Box::pin(async move {
             let owned = c
                 .execute(
-                    "UPDATE agent_waits SET successor_turn_id=?2 WHERE id=?1 AND state='resolving' AND (successor_turn_id IS NULL OR successor_turn_id=?2) AND (resolution_json IS NULL OR resolution_json<>?3)",
-                    params![id, successor, abandoned],
+                    "UPDATE agent_waits SET successor_turn_id=?2 WHERE id=?1 AND state='resolving' AND (successor_turn_id IS NULL OR successor_turn_id=?2) AND (resolution_json IS NULL OR resolution_json NOT IN (?3,?4))",
+                    params![id, successor, superseded, compacted],
                 )
                 .await?;
             Ok(owned > 0)
@@ -1532,7 +1614,10 @@ pub(crate) async fn reconcile(orch: &Orchestrator) {
                 // would create a successor and resume a run the job has already
                 // moved past -- resurrecting the suspension that was discarded.
                 if is_abandonment(stored_result.as_deref()) {
-                    if let Err(error) = finish_abandonment(&owned_orch, &owned_db, &call).await {
+                    let cause = AbandonCause::of(stored_result.as_deref());
+                    if let Err(error) =
+                        finish_abandonment(&owned_orch, &owned_db, &call, cause).await
+                    {
                         log::warn!("startup could not finish an abandoned suspension: {error}");
                     }
                     return;
@@ -4785,7 +4870,9 @@ mod tests {
         resolver_in_flight(&orch).await;
 
         assert!(
-            mark_abandoned(&orch.db.local, "wait-1").await.unwrap(),
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::Superseded)
+                .await
+                .unwrap(),
             "abandonment wins an unowned row"
         );
         assert!(
@@ -4796,8 +4883,59 @@ mod tests {
         );
         assert_eq!(
             wait_row(&orch, "wait-1").await.1.as_deref(),
-            Some(abandoned_result().as_str())
+            Some(abandoned_result(AbandonCause::Superseded).as_str())
         );
+    }
+
+    /// An operator Compact's abandonment carries its cause in the payload, so
+    /// the continuation claim's exact-payload fence must know that payload too:
+    /// a resolver already in flight loses the resume and mints nothing.
+    #[tokio::test]
+    async fn an_operator_compact_abandonment_also_wins_the_continuation() {
+        let (orch, record, _) = durable_env().await;
+        insert(&orch.db.local, &record).await.unwrap();
+        resolver_in_flight(&orch).await;
+        // The fixture's own claimable turns; resolving must add none.
+        let before = wait_resolved_turns(&orch).await;
+
+        assert!(
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::OperatorCompact)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !claim_continuation(&orch.db.local, "wait-1", "successor-turn")
+                .await
+                .unwrap(),
+            "a resolver must not resume a turn the operator compacted away"
+        );
+        resolve(&orch, &orch.db.local, &record, ELAPSED, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_resolved_turns(&orch).await,
+            before,
+            "no successor is minted for a compacted wait"
+        );
+    }
+
+    /// The supersession payload is byte-identical to what rows written before
+    /// causes existed hold, and each stored payload reads back as its cause.
+    #[test]
+    fn abandonment_causes_round_trip_through_their_payloads() {
+        assert_eq!(
+            abandoned_result(AbandonCause::Superseded),
+            serde_json::json!({
+                "outcome": "abandoned",
+                "error": "This call's turn was replaced before its wait finished, so the wait was abandoned. Reissue it if the work still matters."
+            })
+            .to_string()
+        );
+        for cause in AbandonCause::ALL {
+            let payload = abandoned_result(cause);
+            assert!(is_abandonment(Some(&payload)));
+            assert_eq!(AbandonCause::of(Some(&payload)), cause);
+        }
     }
 
     #[tokio::test]
@@ -4813,7 +4951,9 @@ mod tests {
             "the resolver wins an unabandoned row"
         );
         assert!(
-            !mark_abandoned(&orch.db.local, "wait-1").await.unwrap(),
+            !mark_abandoned(&orch.db.local, "wait-1", AbandonCause::Superseded)
+                .await
+                .unwrap(),
             "abandonment must lose once the resume is owned"
         );
         // The resolver's own resolution is untouched, so it resumes as planned.
@@ -4869,7 +5009,11 @@ mod tests {
             .await
             .unwrap();
         // A reconstructed turn abandons that suspension inside the window.
-        assert!(mark_abandoned(&orch.db.local, "wait-1").await.unwrap());
+        assert!(
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::Superseded)
+                .await
+                .unwrap()
+        );
 
         // The resolver now proceeds with the result it read before the change.
         resolve(&orch, &orch.db.local, &record, ELAPSED, true)
@@ -4921,8 +5065,12 @@ mod tests {
         let call = SuspendedCall::of(&record);
         // The pre-crash host recorded the decision and answered the call, then
         // died before closing the row.
-        assert!(mark_abandoned(&orch.db.local, "wait-1").await.unwrap());
-        deliver_abandonment(&orch, &orch.db.local, &call).await;
+        assert!(
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::Superseded)
+                .await
+                .unwrap()
+        );
+        deliver_abandonment(&orch, &orch.db.local, &call, AbandonCause::Superseded).await;
         assert_eq!(tool_results(&orch).await.len(), 1);
 
         reconcile(&orch).await;
@@ -4958,7 +5106,11 @@ mod tests {
         let (orch, record, _) = durable_env().await;
         insert(&orch.db.local, &record).await.unwrap();
         register_warm(&orch);
-        assert!(mark_abandoned(&orch.db.local, "wait-1").await.unwrap());
+        assert!(
+            mark_abandoned(&orch.db.local, "wait-1", AbandonCause::Superseded)
+                .await
+                .unwrap()
+        );
 
         reconcile(&orch).await;
         for _ in 0..200 {

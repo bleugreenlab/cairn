@@ -2452,7 +2452,7 @@ impl ChannelRouter {
                     winner.resolution_provenance()?,
                 )
                 .await
-                .map(|_| None)
+                .map(|outcome| outcome.withdrawn)
             } else {
                 let answer = answers
                     .first()
@@ -3901,6 +3901,7 @@ const QUESTION_GATES_SQL: &str = "SELECT p.id, p.questions, COALESCE(p.job_id, r
                 LEFT JOIN projects proj ON proj.id = i.project_id
                 LEFT JOIN executions e ON e.id = j.execution_id
                WHERE p.response IS NULL
+                 AND p.withdrawn_at IS NULL
                  AND COALESCE(i.status, 'open') NOT IN ('merged', 'closed', 'failed')
                ORDER BY p.created_at DESC";
 

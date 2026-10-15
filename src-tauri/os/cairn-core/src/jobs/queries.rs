@@ -666,6 +666,7 @@ pub async fn node_status_indicators(
                             SELECT 1 FROM prompts p
                              WHERE p.turn_id = j.current_turn_id
                                AND p.response IS NULL
+                               AND p.withdrawn_at IS NULL
                         ) AS has_pending_prompt,
                         EXISTS (
                             SELECT 1 FROM permission_requests pr
@@ -869,6 +870,7 @@ pub(crate) const THREAD_STATUS_ROWS_SQL: &str = "SELECT
             SELECT 1 FROM prompts p
              WHERE p.turn_id = j.current_turn_id
                AND p.response IS NULL
+               AND p.withdrawn_at IS NULL
         ) AS has_pending_prompt,
         EXISTS (
             SELECT 1 FROM permission_requests pr
@@ -1307,6 +1309,7 @@ const ISSUE_STATUS_JOB_ROWS_SQL: &str = "SELECT
         SELECT 1 FROM prompts p
          WHERE p.turn_id = j.current_turn_id
            AND p.response IS NULL
+           AND p.withdrawn_at IS NULL
     ) AS has_pending_prompt,
     EXISTS (
         SELECT 1 FROM permission_requests pr

@@ -371,6 +371,22 @@ pub(crate) fn claim_all_for_job(db: &LocalDb, job_id: &str) -> Result<Vec<Queued
     run_db_blocking(move || async move { claim_all_for_job_async(db, &job_id).await })
 }
 
+/// Whether any row a tool boundary would claim is pending for `job_id`,
+/// without claiming it.
+pub(crate) async fn peek_tool_boundary_pending_async(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<bool, String> {
+    db.query_all(
+        ClaimFilter::ToolBoundary.select_sql(),
+        params![job_id.to_string()],
+        message_from_row,
+    )
+    .await
+    .map(|pending| !pending.is_empty())
+    .map_err(|error| format!("Failed to inspect queued messages: {error}"))
+}
+
 pub(crate) async fn claim_all_for_job_async(
     db: &LocalDb,
     job_id: &str,
@@ -382,23 +398,26 @@ pub(crate) async fn claim_all_for_job_async(
 /// preparation fails before their canonical transcript events are stored.
 pub(crate) fn restore_claimed(db: &LocalDb, ids: &[String]) -> Result<(), String> {
     let ids = ids.to_vec();
-    run_db_blocking(move || async move {
-        db.write(|conn| {
-            let ids = ids.clone();
-            Box::pin(async move {
-                for id in ids {
-                    conn.execute(
-                        "UPDATE queued_messages SET delivered_at = NULL WHERE id = ?1",
-                        params![id.as_str()],
-                    )
-                    .await?;
-                }
-                Ok(())
-            })
+    run_db_blocking(move || async move { restore_claimed_async(db, &ids).await })
+}
+
+async fn restore_claimed_async(db: &LocalDb, ids: &[String]) -> Result<(), String> {
+    let ids = ids.to_vec();
+    db.write(|conn| {
+        let ids = ids.clone();
+        Box::pin(async move {
+            for id in ids {
+                conn.execute(
+                    "UPDATE queued_messages SET delivered_at = NULL WHERE id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+            }
+            Ok(())
         })
-        .await
-        .map_err(|error| format!("Failed to restore claimed queued messages: {error}"))
     })
+    .await
+    .map_err(|error| format!("Failed to restore claimed queued messages: {error}"))
 }
 
 #[derive(Clone, Copy)]

@@ -52,7 +52,7 @@ pub(crate) enum PermissionWait {
     /// The handoff that would have carried the answer closed before the inline
     /// budget, so the request was withdrawn: nothing was parked, and a later
     /// answer replays nothing.
-    Withdrawn(HandoffClosed),
+    Withdrawn(WithdrawalCause),
 }
 
 /// What the runner observed that closed a fence wait's handoff: the executor
@@ -78,6 +78,43 @@ pub enum HandoffClosed {
 impl HandoffClosed {
     /// The cause as the operator and the agent read it.
     pub fn sentence(self) -> &'static str {
+        WithdrawalCause::from(self).sentence()
+    }
+}
+
+/// Why a pending ask (a permission request or a question) was withdrawn rather
+/// than answered.
+///
+/// One vocabulary for every withdrawal, stored verbatim in the withdrawn row.
+/// The handoff causes are what a runner observed about an executor batch; the
+/// operator cause is an operator's cold Compact, which killed the session the
+/// ask belonged to. [`HandoffClosed`] stays the type of the handoff watch
+/// channel because that channel can never carry an operator cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WithdrawalCause {
+    BatchCancelled,
+    ExecutorLinkDropped,
+    BatchSettled,
+    ContextDropped,
+    /// The operator compacted the session that raised the ask.
+    OperatorCompact,
+}
+
+impl From<HandoffClosed> for WithdrawalCause {
+    fn from(cause: HandoffClosed) -> Self {
+        match cause {
+            HandoffClosed::BatchCancelled => Self::BatchCancelled,
+            HandoffClosed::ExecutorLinkDropped => Self::ExecutorLinkDropped,
+            HandoffClosed::BatchSettled => Self::BatchSettled,
+            HandoffClosed::ContextDropped => Self::ContextDropped,
+        }
+    }
+}
+
+impl WithdrawalCause {
+    /// The cause as the operator and the agent read it.
+    pub fn sentence(self) -> &'static str {
         match self {
             Self::BatchCancelled => "the batch that raised it was cancelled",
             Self::ExecutorLinkDropped => "the executor link dropped",
@@ -86,17 +123,52 @@ impl HandoffClosed {
                  stopped waiting before the inline budget"
             }
             Self::ContextDropped => "its batch context was dropped (cause not recorded)",
+            Self::OperatorCompact => {
+                "the operator compacted the session that raised it, which stopped that session"
+            }
         }
     }
 }
 
 /// The stored `response` of a withdrawn request.
-fn withdrawn_response_json(cause: HandoffClosed) -> String {
+fn withdrawn_response_json(cause: WithdrawalCause) -> String {
     serde_json::json!({ "withdrawn": { "cause": cause } }).to_string()
 }
 
+#[cfg(test)]
+mod withdrawal_cause_tests {
+    use super::*;
+
+    /// Rows withdrawn under the handoff vocabulary still read back, and every
+    /// cause round-trips through the stored response.
+    #[test]
+    fn withdrawal_causes_round_trip_including_stored_handoff_values() {
+        for (stored, cause) in [
+            ("batch_cancelled", WithdrawalCause::BatchCancelled),
+            (
+                "executor_link_dropped",
+                WithdrawalCause::ExecutorLinkDropped,
+            ),
+            ("batch_settled", WithdrawalCause::BatchSettled),
+            ("context_dropped", WithdrawalCause::ContextDropped),
+            ("operator_compact", WithdrawalCause::OperatorCompact),
+        ] {
+            let row = format!(r#"{{"withdrawn":{{"cause":"{stored}"}}}}"#);
+            assert_eq!(withdrawn_cause(Some(&row)), Some(cause));
+            assert_eq!(
+                withdrawn_cause(Some(&withdrawn_response_json(cause))),
+                Some(cause)
+            );
+        }
+        assert_eq!(
+            WithdrawalCause::from(HandoffClosed::BatchSettled).sentence(),
+            HandoffClosed::BatchSettled.sentence()
+        );
+    }
+}
+
 /// The cause stored on a withdrawn request, or `None` if it cannot be read.
-pub fn withdrawn_cause(response: Option<&str>) -> Option<HandoffClosed> {
+pub fn withdrawn_cause(response: Option<&str>) -> Option<WithdrawalCause> {
     let value = serde_json::from_str::<serde_json::Value>(response?).ok()?;
     serde_json::from_value(value.get("withdrawn")?.get("cause")?.clone()).ok()
 }
@@ -129,9 +201,9 @@ pub(crate) mod test_hooks {
 }
 
 /// What every answer surface says to an answer that arrived after withdrawal.
-pub fn withdrawn_notice(cause: Option<HandoffClosed>) -> String {
+pub fn withdrawn_notice(cause: Option<WithdrawalCause>) -> String {
     let cause = cause
-        .map(HandoffClosed::sentence)
+        .map(WithdrawalCause::sentence)
         .unwrap_or("its recorded cause could not be read");
     format!(
         "This permission was withdrawn before it was answered: {cause}. Your answer was not \
@@ -603,11 +675,12 @@ async fn withdraw_inline_wait(
         request_id,
         tool_use_id,
         predecessor_turn_id,
-        cause,
+        cause.into(),
+        HandBackPolicy::Resume,
     )
     .await
     {
-        Ok(Withdrawal::Withdrawn { .. }) => PermissionWait::Withdrawn(cause),
+        Ok(Withdrawal::Withdrawn { .. }) => PermissionWait::Withdrawn(cause.into()),
         // An answer landed in the same instant. Its own resume carries it, as
         // for any answer that arrives after its inline waiter has gone.
         Ok(Withdrawal::NotPending) => PermissionWait::Unavailable(format!(
@@ -653,6 +726,21 @@ pub(crate) enum HandBack {
         job_id: Option<String>,
         successor: PermissionSuccessor,
     },
+    /// The caller settles the turn itself ([`HandBackPolicy::None`]); nothing
+    /// was handed back.
+    Settled,
+}
+
+/// Whether withdrawing a request may hand its turn back to the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandBackPolicy {
+    /// Un-yield the turn in place when its provider turn is still open. A
+    /// handoff closure takes this: the agent is still there to continue.
+    Resume,
+    /// Never hand back. An operator Compact withdraws every ask of a session
+    /// it is about to kill, and settles the turn itself; un-yielding it would
+    /// restart work in the session being torn down.
+    None,
 }
 
 /// Withdraw a pending permission whose handoff closed, in one transaction:
@@ -669,12 +757,13 @@ pub(crate) async fn withdraw_permission_request(
     request_id: &str,
     tool_use_id: &str,
     predecessor_turn_id: Option<&str>,
-    cause: HandoffClosed,
+    cause: WithdrawalCause,
+    policy: HandBackPolicy,
 ) -> DbResult<Withdrawal> {
     use crate::agent_process::process::RunOccupancy;
 
-    let provider_turn_open =
-        predecessor_turn_id.is_some_and(|turn| match orch.process_state.get_occupancy(run_id) {
+    let provider_turn_open = policy == HandBackPolicy::Resume
+        && predecessor_turn_id.is_some_and(|turn| match orch.process_state.get_occupancy(run_id) {
             Some(RunOccupancy::AwaitingHost { turn_id }) => turn_id == turn,
             Some(RunOccupancy::ServingTurn(turn_id)) => turn_id == turn,
             _ => false,
@@ -735,6 +824,7 @@ pub(crate) async fn withdraw_permission_request(
 
                 let hand_back = match predecessor.as_deref() {
                     None => HandBack::NoTurn,
+                    Some(_) if policy == HandBackPolicy::None => HandBack::Settled,
                     Some(turn_id) => {
                         if turn_held_by_another_wait(conn, turn_id, &request_id).await? {
                             HandBack::HeldByAnotherWait
@@ -823,7 +913,7 @@ pub(crate) async fn withdraw_permission_request(
                 "withdrawn permission {request_id} left turn {turn_id} yielded: its provider \
                  turn has ended and there is no pending successor to continue in ({successor:?})"
             ),
-            HandBack::NoTurn | HandBack::HeldByAnotherWait => {}
+            HandBack::NoTurn | HandBack::HeldByAnotherWait | HandBack::Settled => {}
         }
     }
     Ok(withdrawal)
@@ -847,7 +937,8 @@ async fn turn_held_by_another_wait(
         .query(
             "SELECT EXISTS(SELECT 1 FROM permission_requests \
                            WHERE turn_id = ?1 AND status = 'pending' AND id <> ?2) \
-                 OR EXISTS(SELECT 1 FROM prompts WHERE turn_id = ?1 AND answered_at IS NULL) \
+                 OR EXISTS(SELECT 1 FROM prompts WHERE turn_id = ?1 AND answered_at IS NULL AND withdrawn_at IS NULL \
+                                    AND withdrawn_at IS NULL) \
                  OR EXISTS(SELECT 1 FROM agent_waits \
                            WHERE predecessor_turn_id = ?1 AND state IN ('pending', 'resolving'))",
             params![turn_id, request_id],

@@ -38,7 +38,7 @@ pub async fn derive_agent_state(
              (SELECT COUNT(*) FROM todos WHERE job_id=j.id),
              (SELECT COUNT(*) FROM todos WHERE job_id=j.id AND status='completed'),
              (SELECT active_form FROM todos WHERE job_id=j.id AND status='in_progress' ORDER BY position LIMIT 1),
-             (EXISTS(SELECT 1 FROM prompts WHERE job_id=j.id AND response IS NULL)
+             (EXISTS(SELECT 1 FROM prompts WHERE job_id=j.id AND response IS NULL AND withdrawn_at IS NULL)
               OR EXISTS(SELECT 1 FROM permission_requests pr JOIN runs r ON r.id=pr.run_id WHERE r.job_id=j.id AND pr.status='pending'))
              FROM jobs j WHERE j.id=?1 AND j.parent_job_id IS NULL AND j.status <> 'pending' AND j.uri_segment IS NOT NULL",
              params![job_id.as_str()]).await?.next().await? else { return Ok(None); };

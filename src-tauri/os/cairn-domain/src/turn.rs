@@ -142,6 +142,9 @@ pub enum TurnEndReason {
     /// A permission answer minted this turn to continue the job in, and the
     /// job refused to continue; nothing ever served it.
     PermissionResumeRefused,
+    /// The operator compacted the session while the turn was live: its process
+    /// was killed and the job continued on a fresh session from the digest.
+    OperatorCompact,
 }
 
 impl std::fmt::Display for TurnEndReason {
@@ -155,6 +158,7 @@ impl std::fmt::Display for TurnEndReason {
             TurnEndReason::LaunchRefused => write!(f, "launch_refused"),
             TurnEndReason::Superseded => write!(f, "superseded"),
             TurnEndReason::PermissionResumeRefused => write!(f, "permission_resume_refused"),
+            TurnEndReason::OperatorCompact => write!(f, "operator_compact"),
         }
     }
 }
@@ -172,6 +176,7 @@ impl std::str::FromStr for TurnEndReason {
             "launch_refused" => Ok(TurnEndReason::LaunchRefused),
             "superseded" => Ok(TurnEndReason::Superseded),
             "permission_resume_refused" => Ok(TurnEndReason::PermissionResumeRefused),
+            "operator_compact" => Ok(TurnEndReason::OperatorCompact),
             _ => Err(format!("Unknown turn end reason: {}", s)),
         }
     }

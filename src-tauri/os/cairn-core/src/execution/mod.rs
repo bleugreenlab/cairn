@@ -35,6 +35,7 @@ pub mod dispatch;
 pub mod inputs;
 pub mod jobs;
 pub mod model_routing;
+pub mod operator_compact;
 pub mod ownership;
 pub mod provider_change;
 pub mod queries;

@@ -1693,6 +1693,7 @@ async fn load_children(
              JOIN issues child ON child.id = r.issue_id
              WHERE child.parent_thread_id = (SELECT thread_id FROM jobs WHERE id = ?1)
                AND p.answered_at IS NULL
+               AND p.withdrawn_at IS NULL
              GROUP BY r.issue_id",
             params![job_id],
         )

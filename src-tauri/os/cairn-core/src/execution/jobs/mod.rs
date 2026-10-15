@@ -73,7 +73,8 @@ pub(crate) use inputs::{
     resolve_ctx_self_schemas_with_snapshot, resolve_instruction_prompt_conn,
 };
 pub(crate) use lifecycle::{
-    continue_automatic_retry, continue_job_launch_locked_for_watchdog, WatchdogContinuation,
+    continue_automatic_retry, continue_job_launch_locked_for_operator_compact,
+    continue_job_launch_locked_for_watchdog, OperatorBoundary, WatchdogContinuation,
 };
 // The branch-mode coordinate decision. Production reaches it only through
 // `prepare_job`; the delegation edge's regression imports it to run the mode it

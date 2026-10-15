@@ -148,6 +148,10 @@ use cairn_models::turn::SuspendKind;
 pub enum GoalPause {
     OperatorHold,
     SafetyBrake,
+    /// The operator is tearing this process down to compact its session. No
+    /// release path lifts it: the claim dies with the process, and the
+    /// successor session starts on a fresh provider thread.
+    OperatorCompact,
     Owned(GoalPauseOwner),
     /// The authoritative jobs row says this job is not runnable right now.
     JobState(JobPauseState),
@@ -171,7 +175,7 @@ impl JobPauseState {
 impl GoalPause {
     pub fn may_supersede(&self, current: Option<&GoalPause>) -> bool {
         match self {
-            Self::OperatorHold | Self::SafetyBrake => true,
+            Self::OperatorHold | Self::SafetyBrake | Self::OperatorCompact => true,
             // A newly established wait supersedes an older wait so stale results
             // cannot release the goal while the new condition remains pending.
             Self::Owned(_) => matches!(current, None | Some(Self::JobState(_) | Self::Owned(_))),
@@ -2353,6 +2357,7 @@ mod goal_pause_claim_tests {
             None,
             Some(GoalPause::OperatorHold),
             Some(GoalPause::SafetyBrake),
+            Some(GoalPause::OperatorCompact),
             Some(GoalPause::Owned(GoalPauseOwner::DurableWait {
                 wait_id: "wait-a".into(),
             })),
@@ -2394,7 +2399,9 @@ mod goal_pause_claim_tests {
         for current in causes() {
             for proposed in causes().into_iter().flatten() {
                 let allowed = match proposed {
-                    GoalPause::OperatorHold | GoalPause::SafetyBrake => true,
+                    GoalPause::OperatorHold
+                    | GoalPause::SafetyBrake
+                    | GoalPause::OperatorCompact => true,
                     GoalPause::Owned(_) => matches!(
                         current,
                         None | Some(GoalPause::JobState(_) | GoalPause::Owned(_))

@@ -339,7 +339,7 @@ async fn pending_question_uri(
                          JOIN jobs j ON r.job_id = j.id
                          JOIN executions e ON j.execution_id = e.id
                          LEFT JOIN jobs parent ON j.parent_job_id = parent.id
-                         WHERE r.issue_id = ?1 AND p.response IS NULL
+                         WHERE r.issue_id = ?1 AND p.response IS NULL AND p.withdrawn_at IS NULL
                          ORDER BY p.created_at DESC LIMIT 1",
         cairn_common::uri::build_node_question_uri,
     )

@@ -35,6 +35,7 @@ mod issue_outcome;
 mod issue_status_resolution;
 mod issues;
 mod job_continue_recovery;
+mod operator_compact;
 // Linux-only: it pins the feature choice behind the Linux Secret Service
 // backend, and no other platform's keychain has a runtime to nest inside.
 #[cfg(target_os = "linux")]
