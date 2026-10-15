@@ -12,8 +12,8 @@ tracing = "0.1"
 cairn-common = { path = "../cairn-common" }
 cairn-config = { path = "../cairn-config" }
 cairn-db = { path = "../cairn-db" }
-cairn-llm-types = { path = "../cairn-llm-types" }
-cairn-models = { path = "../cairn-models" }
+cairn-models-types = { path = "../cairn-models-types" }
+cairn-domain = { path = "../cairn-domain" }
 cairn-platform = { path = "../cairn-platform" }
 chrono = "0.4"
 log = "0.4"

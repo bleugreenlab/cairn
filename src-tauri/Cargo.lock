@@ -887,7 +887,7 @@ dependencies = [
  "async-trait",
  "cairn-common",
  "cairn-db",
- "cairn-models",
+ "cairn-domain",
  "cairn-platform",
  "chrono",
  "futures-util",
@@ -1008,8 +1008,8 @@ name = "cairn-config"
 version = "0.12.34"
 dependencies = [
  "cairn-common",
- "cairn-llm-types",
- "cairn-models",
+ "cairn-domain",
+ "cairn-models-types",
  "cairn-packs",
  "cairn-platform",
  "cairn-sandbox",
@@ -1041,7 +1041,7 @@ dependencies = [
  "cairn-config",
  "cairn-core",
  "cairn-db",
- "cairn-llm",
+ "cairn-models",
  "cairn-packs",
  "cairn-platform",
  "cairn-sandbox",
@@ -1105,8 +1105,8 @@ name = "cairn-credentials"
 version = "0.12.34"
 dependencies = [
  "base64 0.22.1",
- "cairn-llm-types",
- "cairn-models",
+ "cairn-domain",
+ "cairn-models-types",
  "chacha20poly1305",
  "chrono",
  "hostname",
@@ -1132,7 +1132,7 @@ dependencies = [
  "async-trait",
  "cairn-codec",
  "cairn-common",
- "cairn-models",
+ "cairn-domain",
  "chrono",
  "futures-util",
  "log",
@@ -1151,33 +1151,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "cairn-llm"
+name = "cairn-domain"
 version = "0.12.34"
 dependencies = [
- "base64 0.22.1",
- "cairn-credentials",
- "cairn-llm-types",
- "cairn-llm-wire",
- "cairn-models",
- "cairn-platform",
+ "cairn-cell",
+ "cairn-common",
  "chrono",
- "crossbeam-channel",
- "log",
- "reqwest 0.12.28",
+ "regex",
  "serde",
  "serde_json",
- "tempfile",
- "toml",
+ "serde_yaml",
  "uuid",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "cairn-llm-types"
-version = "0.12.34"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -1214,14 +1198,30 @@ dependencies = [
 name = "cairn-models"
 version = "0.12.34"
 dependencies = [
- "cairn-cell",
- "cairn-common",
+ "base64 0.22.1",
+ "cairn-credentials",
+ "cairn-domain",
+ "cairn-llm-wire",
+ "cairn-models-types",
+ "cairn-platform",
  "chrono",
- "regex",
+ "crossbeam-channel",
+ "log",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
- "serde_yaml",
+ "tempfile",
+ "toml",
  "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "cairn-models-types"
+version = "0.12.34"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1284,7 +1284,7 @@ dependencies = [
  "cairn-analytics",
  "cairn-common",
  "cairn-db",
- "cairn-llm",
+ "cairn-domain",
  "cairn-models",
  "cairn-platform",
  "cairn-tokenize",
@@ -1357,8 +1357,8 @@ dependencies = [
  "cairn-common",
  "cairn-config",
  "cairn-db",
- "cairn-llm-types",
- "cairn-models",
+ "cairn-domain",
+ "cairn-models-types",
  "cairn-platform",
  "chrono",
  "evalexpr",

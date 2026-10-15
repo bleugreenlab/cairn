@@ -1,4 +1,4 @@
-use cairn_llm::wire::claude_stream::{
+use cairn_models::wire::claude_stream::{
     extract_assistant_content, extract_user_content, parse_event, ClaudeEvent, Usage,
 };
 use serde::{Deserialize, Serialize};
@@ -56,7 +56,7 @@ impl TokenCounts {
     }
 }
 
-pub use cairn_llm::wire::ToolUseInfo;
+pub use cairn_models::wire::ToolUseInfo;
 
 /// Simplified event for frontend consumption
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,7 +393,7 @@ impl TranscriptEvent {
     }
 }
 
-impl From<TranscriptEvent> for cairn_llm::wire::ReplayEvent {
+impl From<TranscriptEvent> for cairn_models::wire::ReplayEvent {
     fn from(event: TranscriptEvent) -> Self {
         Self {
             content: event.content,
@@ -408,7 +408,7 @@ impl From<TranscriptEvent> for cairn_llm::wire::ReplayEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_llm::wire::claude_stream::{InputDefect, RejectedToolInput};
+    use cairn_models::wire::claude_stream::{InputDefect, RejectedToolInput};
 
     #[test]
     fn parse_metrics_count_attempts_failures_and_duration() {

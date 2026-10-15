@@ -937,7 +937,7 @@ async fn seed_live_session(orch: &Orchestrator, job_id: &str, run_id: &str) {
     .await;
     let mut handle =
         crate::agent_process::process::RunHandle::test_handle(Some("sess-stop"), Some(job_id));
-    handle.facts = Some(cairn_llm::interface::session::SessionFacts {
+    handle.facts = Some(cairn_models::interface::session::SessionFacts {
         provider: "claude".to_string(),
         backend_session_id: Some("sess-stop".to_string()),
         account_id: Some("acc-1".to_string()),
@@ -950,8 +950,8 @@ async fn seed_live_session(orch: &Orchestrator, job_id: &str, run_id: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_live_node_is_a_session_seen_through_the_llm_facet() {
-    use cairn_llm::interface::{Llm, SessionState};
+async fn a_live_node_is_a_session_seen_through_the_models_facet() {
+    use cairn_models::interface::{Models, SessionState};
     let orch = seeded_orch().await;
     let (number, job_id, run_id) = seed_running_node(&orch).await;
     seed_live_session(&orch, &job_id, &run_id).await;
@@ -1010,7 +1010,7 @@ async fn stopping_a_session_is_stopping_its_node() {
     let (node_summary, node_run, node_job, node_attached) =
         stopped(|number| format!("cairn://p/cairn/{number}/1/builder")).await;
     let (session_summary, session_run, session_job, session_attached) =
-        stopped(|_| "cairn://llm/sessions/sess-stop".to_string()).await;
+        stopped(|_| "cairn://models/sessions/sess-stop".to_string()).await;
 
     assert!(node_summary.contains("Stopped"), "{node_summary}");
     assert!(
@@ -1029,18 +1029,18 @@ async fn stopping_a_session_is_stopping_its_node() {
 async fn stopping_an_unknown_session_points_at_the_live_list() {
     let orch = seeded_orch().await;
     let item = change_item(
-        "cairn://llm/sessions/nope",
+        "cairn://models/sessions/nope",
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "stop"})),
     );
     let error = apply(&orch, &item).await.unwrap_err();
     assert!(
-        error.error.contains("cairn://llm/sessions"),
+        error.error.contains("cairn://models/sessions"),
         "{}",
         error.error
     );
     let wrong = change_item(
-        "cairn://llm/sessions/nope",
+        "cairn://models/sessions/nope",
         ChangeMode::Patch,
         Some(serde_json::json!({"action": "merge"})),
     );
@@ -2608,9 +2608,9 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectResponses => "cairn://p/cairn/responses",
         K::ProjectResponse => "cairn://p/cairn/responses/summarize",
         K::Grant => "cairn://grants/grant-1",
-        K::LlmSession => "cairn://llm/sessions/session-1",
-        K::LlmAccounts => "cairn://llm/accounts",
-        K::LlmAccount => "cairn://llm/accounts/acc_1",
+        K::ModelsSession => "cairn://models/sessions/session-1",
+        K::ModelsAccounts => "cairn://models/accounts",
+        K::ModelsAccount => "cairn://models/accounts/acc_1",
         K::ProjectAttachment => "cairn://p/cairn/4647/attachments/1",
         // Pre-existing gaps, filled here because they sit between this test and
         // the arm above: the parity check panics on the first unsampled kind and

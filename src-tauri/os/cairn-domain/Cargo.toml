@@ -1,0 +1,16 @@
+[package]
+name = "cairn-domain"
+version.workspace = true
+edition = "2021"
+description = "Cairn domain values, serialization, and pure transformations"
+license = "BUSL-1.1"
+
+[dependencies]
+cairn-common = { path = "../cairn-common" }
+cairn-cell = { path = "../cairn-cell" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+regex = "1"
+uuid = { version = "1.0", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }

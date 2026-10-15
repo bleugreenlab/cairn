@@ -1,0 +1,1699 @@
+//! Recipe types - workflow definitions.
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::decision::{DecisionNode, DecisionQuestion, Thresholds};
+
+/// Recipe trigger - when a recipe can be started
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipeTrigger {
+    #[default]
+    #[serde(alias = "issue")]
+    Manual,
+    Schedule,
+    JobEnded,
+    SkillCalled,
+}
+
+impl std::fmt::Display for RecipeTrigger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecipeTrigger::Manual => write!(f, "manual"),
+            RecipeTrigger::Schedule => write!(f, "schedule"),
+            RecipeTrigger::JobEnded => write!(f, "job_ended"),
+            RecipeTrigger::SkillCalled => write!(f, "skill_called"),
+        }
+    }
+}
+
+impl std::str::FromStr for RecipeTrigger {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "manual" | "issue" => Ok(RecipeTrigger::Manual),
+            "schedule" => Ok(RecipeTrigger::Schedule),
+            "job_ended" => Ok(RecipeTrigger::JobEnded),
+            "skill_called" => Ok(RecipeTrigger::SkillCalled),
+            _ => Err(format!("Unknown recipe trigger: {}", s)),
+        }
+    }
+}
+
+/// Trigger scope - where the recipe executes
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TriggerScope {
+    #[default]
+    Issue,
+    Project,
+}
+
+impl std::fmt::Display for TriggerScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriggerScope::Issue => write!(f, "issue"),
+            TriggerScope::Project => write!(f, "project"),
+        }
+    }
+}
+
+impl std::str::FromStr for TriggerScope {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "issue" => Ok(TriggerScope::Issue),
+            "project" => Ok(TriggerScope::Project),
+            _ => Err(format!("Unknown trigger scope: {}", s)),
+        }
+    }
+}
+
+/// Agent filter mode — allow or exclude listed agents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentFilterMode {
+    Allow,
+    Exclude,
+}
+
+/// Structured agent filter with allow/exclude semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFilter {
+    pub mode: AgentFilterMode,
+    pub ids: Vec<String>,
+}
+
+/// Custom deserializer for node_filter that accepts both the old String format
+/// and the new AgentFilter struct for backward compatibility.
+fn deserialize_node_filter<'de, D>(deserializer: D) -> Result<Option<AgentFilter>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum NodeFilterValue {
+        Struct(AgentFilter),
+        String(String),
+    }
+
+    let opt: Option<NodeFilterValue> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(NodeFilterValue::Struct(filter)) => Ok(Some(filter)),
+        Some(NodeFilterValue::String(s)) => {
+            if s.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(AgentFilter {
+                    mode: AgentFilterMode::Allow,
+                    ids: vec![s],
+                }))
+            }
+        }
+    }
+}
+
+/// Serialize AgentFilter — skip if None.
+fn serialize_node_filter<S>(value: &Option<AgentFilter>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(filter) => filter.serialize(serializer),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Event filter for event-driven triggers (JobEnded, SkillCalled)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventFilter {
+    /// For JobEnded: filter by job status (e.g., ["complete", "failed"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_status: Option<Vec<String>>,
+    /// For SkillCalled: filter by skill IDs (e.g., ["code-review"])
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_ids: Option<Vec<String>>,
+    /// Filter by agent config ID (allow/exclude list)
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "deserialize_node_filter",
+        serialize_with = "serialize_node_filter"
+    )]
+    pub node_filter: Option<AgentFilter>,
+
+    // --- Accumulation ---
+    /// Fire after every N matching events (default/absent/1 = immediate)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub every: Option<i32>,
+    /// Group events by this field in the event payload (required when every > 1)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<String>,
+    /// Scope override for accumulation: "global", "project", "issue"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accumulation_scope: Option<AccumulationScope>,
+    /// Only count events within this window (seconds). Older events are pruned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_window_secs: Option<i64>,
+}
+
+/// Accumulation scope — how events are grouped for counting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AccumulationScope {
+    Global,
+    #[default]
+    Project,
+    Issue,
+}
+
+/// Where an execution's work lands. One property of the execution, resolved at
+/// launch into the per-node branch topology (`BranchMode` on agent nodes, and
+/// whether the terminal `pr` node survives) by
+/// `execution::branch_target::apply_branch_target`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchTarget {
+    /// Agent nodes mint their own branch; the terminal `pr` node ships it.
+    #[default]
+    New,
+    /// The execution works on its resolved base branch: agent nodes take
+    /// `BranchMode::None` and terminal `pr` nodes are pruned from the snapshot.
+    Base,
+}
+
+impl std::fmt::Display for BranchTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BranchTarget::New => write!(f, "new"),
+            BranchTarget::Base => write!(f, "base"),
+        }
+    }
+}
+
+impl std::str::FromStr for BranchTarget {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "new" => Ok(BranchTarget::New),
+            "base" => Ok(BranchTarget::Base),
+            _ => Err(format!("Unknown branch target: {}", s)),
+        }
+    }
+}
+
+/// What a successor execution does with committed work that earlier executions
+/// on the same issue left on their branches.
+///
+/// An execution is not the only attempt an issue gets. When the first one dies
+/// for a reason that has nothing to do with its work — a provider fault, a
+/// wedged runner, a broken `prepare_job` — its commits stay reachable on the
+/// branch it minted, and the successor used to start at the issue's base branch
+/// as though they did not exist. This is the property that says otherwise, and
+/// like [`BranchTarget`] it is resolved once at launch and read off the snapshot
+/// everywhere downstream.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Continuity {
+    /// Carry the latest valid committed logical head forward when exactly one
+    /// exists, and refuse to guess when several unrelated heads make "latest"
+    /// undefined. The default, and what every snapshot written before this
+    /// existed deserializes as.
+    #[default]
+    Auto,
+    /// Start at the base branch and adopt nothing: the intentional start-over,
+    /// where prior work is superseded rather than continued.
+    ///
+    /// The supersession is durable, not momentary. A later execution that does
+    /// not think about continuity at all must not reinstate what this one
+    /// explicitly set aside, so `execution::continuity` treats this decision as
+    /// a boundary in the issue's series rather than a property of one launch.
+    Clean,
+    /// Adopt this exact prior coordinate — a node URI, a branch name, or a
+    /// commit id, spelled as the refusal that asked for a decision spelled it.
+    /// Only a coordinate the enumeration actually found is accepted, so this
+    /// widens the choice without letting a successor start anywhere at all.
+    ///
+    /// Like `Clean`, naming a coordinate is an explicit decision, so it draws
+    /// the same durable boundary: heads from executions earlier than this one
+    /// are not silently reconsidered by a later retry.
+    From(String),
+}
+
+impl std::fmt::Display for Continuity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Continuity::Auto => write!(f, "auto"),
+            Continuity::Clean => write!(f, "clean"),
+            Continuity::From(coordinate) => write!(f, "from {coordinate}"),
+        }
+    }
+}
+
+impl std::str::FromStr for Continuity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "" => Err("continuity must not be empty (auto|clean|<coordinate>)".to_string()),
+            "auto" => Ok(Continuity::Auto),
+            "clean" => Ok(Continuity::Clean),
+            coordinate => Ok(Continuity::From(coordinate.to_string())),
+        }
+    }
+}
+
+/// The branch targets a recipe supports when none are declared: only `new`.
+/// Offering `base` prunes the terminal `pr` node, which turns a shipping recipe
+/// into one whose builder never completes, so it must be opted into per recipe.
+pub fn default_branch_targets() -> Vec<BranchTarget> {
+    vec![BranchTarget::New]
+}
+
+/// Recipe - a workflow definition
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recipe {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub trigger: RecipeTrigger,
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    /// System recipes are backend/machinery workflows hidden from the
+    /// issue-create picker; they stay listed and runnable in Settings.
+    #[serde(default)]
+    pub is_system: bool,
+    pub version: i32,
+    pub parent_recipe_id: Option<String>,
+    pub child_recipe_id: Option<String>,
+    pub nodes: Vec<RecipeNode>,
+    pub edges: Vec<RecipeEdge>,
+    /// Branch targets this recipe's graph is meaningful under. Defaults to
+    /// `[new]`; a recipe declares `base` only when pruning its terminal `pr`
+    /// node still leaves a coherent workflow.
+    #[serde(default = "default_branch_targets")]
+    pub branch_targets: Vec<BranchTarget>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+impl Recipe {
+    /// Get the trigger scope from the trigger node's config.
+    /// Defaults to Issue if no trigger node or no scope specified.
+    pub fn scope(&self) -> TriggerScope {
+        self.nodes
+            .iter()
+            .find(|n| n.node_type == RecipeNodeType::Trigger)
+            .and_then(|n| n.trigger_config.as_ref())
+            .and_then(|tc| tc.scope.clone())
+            .unwrap_or(TriggerScope::Issue)
+    }
+}
+
+/// Input for creating a recipe
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateRecipe {
+    pub name: String,
+    pub description: Option<String>,
+    pub trigger: Option<RecipeTrigger>,
+    pub workspace_id: Option<String>,
+    pub project_id: Option<String>,
+    /// Marks the recipe as a system workflow (hidden from the issue-create picker).
+    pub is_system: Option<bool>,
+    pub nodes: Option<Vec<RecipeNode>>,
+    pub edges: Option<Vec<RecipeEdge>>,
+}
+
+/// Input for updating a recipe
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateRecipe {
+    pub name: Option<String>,
+    pub description: Option<Option<String>>,
+    pub trigger: Option<RecipeTrigger>,
+    #[allow(dead_code)]
+    pub workspace_id: Option<Option<String>>,
+    #[allow(dead_code)]
+    pub project_id: Option<Option<String>>,
+    /// When present, sets whether the recipe is a system workflow.
+    pub is_system: Option<bool>,
+    pub nodes: Option<Vec<RecipeNode>>,
+    pub edges: Option<Vec<RecipeEdge>>,
+}
+
+// ============================================================================
+// Recipe Node types (DAG-based structure)
+// ============================================================================
+
+/// Recipe node type enum
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipeNodeType {
+    Trigger,
+    Agent,
+    Action,
+    Pr,
+    Checkpoint,
+    Artifact,
+    /// Routes on an expression over upstream artifact data.
+    Condition,
+    /// Routes on a typed decision (`cairn_domain::decision`): one `choice`
+    /// question whose options are the node's ports, answered by `decide`.
+    Decision,
+    Context,
+    /// Author-facing text block whose content is injected into the running
+    /// node's system prompt (after the role prompt). Distinct from `Context`,
+    /// whose content flows to the initial user message / work packet. Reuses
+    /// `context_config` for its `{ content }` payload.
+    Instruction,
+}
+
+impl std::fmt::Display for RecipeNodeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecipeNodeType::Trigger => write!(f, "trigger"),
+            RecipeNodeType::Agent => write!(f, "agent"),
+            RecipeNodeType::Action => write!(f, "action"),
+            RecipeNodeType::Pr => write!(f, "pr"),
+            RecipeNodeType::Checkpoint => write!(f, "checkpoint"),
+            RecipeNodeType::Artifact => write!(f, "artifact"),
+            RecipeNodeType::Condition => write!(f, "condition"),
+            RecipeNodeType::Decision => write!(f, "decision"),
+            RecipeNodeType::Context => write!(f, "context"),
+            RecipeNodeType::Instruction => write!(f, "instruction"),
+        }
+    }
+}
+
+impl std::str::FromStr for RecipeNodeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "trigger" => Ok(RecipeNodeType::Trigger),
+            "agent" => Ok(RecipeNodeType::Agent),
+            "action" => Ok(RecipeNodeType::Action),
+            "pr" => Ok(RecipeNodeType::Pr),
+            "checkpoint" => Ok(RecipeNodeType::Checkpoint),
+            "artifact" => Ok(RecipeNodeType::Artifact),
+            "condition" => Ok(RecipeNodeType::Condition),
+            "decision" => Ok(RecipeNodeType::Decision),
+            "context" => Ok(RecipeNodeType::Context),
+            "instruction" => Ok(RecipeNodeType::Instruction),
+            _ => Err(format!("Unknown recipe node type: {}", s)),
+        }
+    }
+}
+
+/// Recipe edge type enum
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum RecipeEdgeType {
+    Control,
+    Context,
+}
+
+impl std::fmt::Display for RecipeEdgeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecipeEdgeType::Control => write!(f, "control"),
+            RecipeEdgeType::Context => write!(f, "context"),
+        }
+    }
+}
+
+impl std::str::FromStr for RecipeEdgeType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "control" => Ok(RecipeEdgeType::Control),
+            "context" => Ok(RecipeEdgeType::Context),
+            _ => Err(format!("Unknown recipe edge type: {}", s)),
+        }
+    }
+}
+
+/// Context port handles. Every agent node exposes three context ports:
+/// `context-in` (N inputs the run starts with), `context-out` (the terminal
+/// artifact the run produces — writing it ends the turn and moves the DAG, and
+/// may fan out to direct agent consumers), and `context-self` (N living
+/// working-doc artifacts the node owns and patches across its whole life, which
+/// never end the turn or satisfy the output contract). All three ride the
+/// `context` edge type; the source handle distinguishes terminal/fanout output
+/// edges from self-owned living-doc edges.
+pub const CONTEXT_IN_HANDLE: &str = "context-in";
+pub const CONTEXT_OUT_HANDLE: &str = "context-out";
+pub const CONTEXT_SELF_HANDLE: &str = "context-self";
+
+/// Node position in the DAG editor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodePosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+/// Type-specific configuration stored as JSON
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeConfig {
+    // Trigger config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trigger_type: Option<RecipeTrigger>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<TriggerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schedule_config: Option<ScheduleConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_filter: Option<EventFilter>,
+
+    // Agent config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_config_id: Option<String>,
+    /// Nested output schema for agent nodes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_schema: Option<SchemaConfig>,
+    /// Git/worktree configuration for agent nodes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    git_config: Option<AgentGitConfig>,
+
+    // Action config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_config_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_params: Option<serde_json::Value>,
+    /// Nested input schema for action nodes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_schema: Option<SchemaConfig>,
+    /// Nested output schema for action nodes (uses output_schema field above)
+
+    // Standalone checkpoint node config (command gate). A `checkpoint`-type node
+    // runs this command: exit 0 passes (continue), non-zero blocks (resumable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<String>,
+
+    // Artifact-node config (the typed schema node on a context edge)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema: Option<serde_json::Value>,
+    /// Confirm policy for an ArtifactNode used as a producer's terminal target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirm_policy: Option<ConfirmPolicy>,
+
+    // Condition config. `conditionType` and `question` are read only to
+    // migrate a stored `ai` condition into a decision node.
+    #[serde(default, skip_serializing)]
+    condition_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expression: Option<String>,
+    #[serde(default, skip_serializing)]
+    question: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ports: Option<Vec<String>>,
+
+    // Decision config (`model` also carried a legacy `ai` condition's model)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    questions: Option<Vec<DecisionQuestion>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thresholds: Option<Thresholds>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_error: Option<ConditionErrorBehavior>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_port: Option<String>,
+
+    // Context config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+}
+
+/// Recipe node - a single node in the workflow DAG
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeNode {
+    pub id: String,
+    pub node_type: RecipeNodeType,
+    pub name: String,
+    pub position: NodePosition,
+    /// For slot nodes (checkpoint, artifact): references the parent node they attach to
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_config: Option<TriggerConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_config: Option<AgentNodeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_config: Option<ActionNodeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_config: Option<CheckpointNodeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_config: Option<ArtifactNodeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_config: Option<ConditionNodeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_config: Option<DecisionNode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_config: Option<ContextNodeConfig>,
+}
+
+/// Schedule period - predefined intervals
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SchedulePeriod {
+    Month,
+    Week,
+    Weekday,
+    Day,
+    Hour,
+}
+
+/// Schedule interval - custom duration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleInterval {
+    pub days: u32,
+    pub hours: u32,
+    pub minutes: u32,
+}
+
+/// Schedule every - period or custom interval
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", untagged)]
+pub enum ScheduleEvery {
+    Period(SchedulePeriod),
+    Interval(ScheduleInterval),
+}
+
+/// Schedule at - specific time within a period
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleAt {
+    /// Day: 1-31 for month, 0-6 for week (Sunday=0). Ignored for weekday schedules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub day: Option<u32>,
+    pub hour: u32,
+    pub minute: u32,
+}
+
+/// Schedule configuration for scheduled recipes
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleConfig {
+    pub every: ScheduleEvery,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<ScheduleAt>,
+    pub allow_catchup: bool,
+    pub catchup_window_hours: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerConfig {
+    pub trigger_type: RecipeTrigger,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<TriggerScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_config: Option<ScheduleConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_filter: Option<EventFilter>,
+}
+
+/// Durable branch-coordinate policy for agent nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BranchMode {
+    /// Mint an isolated child branch from the resolved base coordinate.
+    #[default]
+    Isolate,
+    /// Inherit the upstream agent's branch and logical head.
+    Inherit,
+    /// Stay on the resolved base coordinate without minting a branch.
+    None,
+}
+
+impl std::fmt::Display for BranchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BranchMode::Isolate => write!(f, "isolate"),
+            BranchMode::Inherit => write!(f, "inherit"),
+            BranchMode::None => write!(f, "none"),
+        }
+    }
+}
+
+impl std::str::FromStr for BranchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "isolate" => Ok(BranchMode::Isolate),
+            "inherit" => Ok(BranchMode::Inherit),
+            "none" => Ok(BranchMode::None),
+            _ => Err(format!("Unknown branch mode: {}", s)),
+        }
+    }
+}
+
+/// Git configuration for agent nodes
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentGitConfig {
+    /// Branch policy: "isolate" (default), "inherit", or "none".
+    #[serde(default, skip_serializing_if = "is_default_branch_mode")]
+    pub branch_mode: BranchMode,
+    /// Whether inheritance must land on the parent branch's live head, refusing
+    /// to start when the store cannot resolve it.
+    ///
+    /// Plain `inherit` degrades instead: if the bookmark is gone it falls back to
+    /// the parent's recorded base and then to the base branch, so the node starts
+    /// *somewhere* rather than not at all. That is the right trade for a node
+    /// whose value survives a degraded coordinate.
+    ///
+    /// A delegated task is the opposite case. It exists to work on its parent's
+    /// in-flight state, so a task seeded anywhere else produces confidently wrong
+    /// work — green tests over code the parent already replaced (CAIRN-3309).
+    /// Refusing is strictly better: the delegating agent gets an error it can act
+    /// on instead of a child that quietly does the wrong thing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_parent_head: bool,
+}
+
+/// Helper to skip serializing default branch_mode
+fn is_default_branch_mode(mode: &BranchMode) -> bool {
+    *mode == BranchMode::Isolate
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentNodeConfig {
+    pub agent_config_id: Option<String>,
+    /// Output schema attached to agent (docks to right)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<SchemaConfig>,
+    /// Git/worktree configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_config: Option<AgentGitConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActionNodeConfig {
+    /// Reference to action_configs table (new style)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action_config_id: Option<String>,
+    /// Legacy action string (e.g., "create_pr") - used for migration
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub action_params: serde_json::Value,
+    /// Input schema attached above action
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<SchemaConfig>,
+    /// Output schema attached below action
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<SchemaConfig>,
+}
+
+/// How a produced artifact's confirm gate resolves.
+///
+/// `Auto` flips `artifact.confirmed` true on the first write (the projection
+/// derives Complete immediately); `User` leaves it false until a human confirms
+/// in the UI (the projection derives Blocked while the latest artifact is
+/// unconfirmed). A node with no declared schema defaults to `Auto`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfirmPolicy {
+    #[default]
+    Auto,
+    User,
+}
+
+/// Schema configuration for agent output or action input/output
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaConfig {
+    /// The artifact's canonical name and `cairn:~/<name>` URI segment. One
+    /// identifier — no separate display label, no preset reference.
+    pub name: String,
+    /// The full, self-contained JSON Schema for the artifact payload. Presets are
+    /// baked in at authoring time (an editor convenience), never referenced at
+    /// runtime. `None` means the field shape is inherited from a downstream
+    /// context-edge target (e.g. a builder whose PR shape comes from `create_pr`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// Whether the produced artifact auto-confirms or waits for a human. The
+    /// producing node's gate decision, independent of any inherited field shape.
+    #[serde(default)]
+    pub confirm_policy: ConfirmPolicy,
+    /// Custom tool name (defaults to "return")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Tool description shown to the agent
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Standalone checkpoint node config — a single pass-through command gate.
+///
+/// The command runs in the execution worktree: exit 0 passes (continue), a
+/// non-zero exit blocks the checkpoint job (a resumable halt). There is no
+/// human-approval checkpoint variant; a producing node's `confirm_policy` on its
+/// output schema is the sole human-approval gate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointNodeConfig {
+    /// Command to run (exit 0 = pass/continue, non-zero = fail/block).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Optional prompt/message to show the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// A typed artifact node — the first-class schema node on a context edge.
+///
+/// A producer's `context-out` edge targets it, which defines that producer's
+/// terminal output contract (name + schema + confirm gate); consumers read it via
+/// `context-in`. An ArtifactNode targeted by a node's `context-self` edge is a
+/// living working doc the node owns. An ArtifactNode carrying inline literal
+/// `content` with no upstream writer is the collapsed Context node — a static
+/// input document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactNodeConfig {
+    /// Canonical artifact name and `cairn:~/<name>` URI segment. `artifactType`
+    /// is the legacy key, still accepted when deserializing old snapshots.
+    #[serde(alias = "artifactType")]
+    pub name: String,
+    /// Full JSON Schema for the artifact payload. `None` for a pure
+    /// literal-content node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
+    /// How this artifact's confirm gate resolves when it is a producer's terminal
+    /// (`context-out`) target. `context-self` living docs are always auto-confirm.
+    #[serde(default)]
+    pub confirm_policy: ConfirmPolicy,
+    /// Inline literal content (collapsed Context node): a static input document
+    /// with no upstream writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+}
+
+/// Whether a stored `condition` node is a legacy AI condition: a question
+/// and ports answered by a model. Those are decision nodes now, and every
+/// read path converts them with [`DecisionNode::port_choice`].
+pub fn is_legacy_ai_condition(condition_type: Option<&str>) -> bool {
+    condition_type.is_some_and(|kind| kind.trim().eq_ignore_ascii_case("ai"))
+}
+
+/// Error behavior for condition evaluation failures
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ConditionErrorBehavior {
+    #[default]
+    UseDefault, // Activate default_port on error
+    Block, // Block execution, require manual intervention
+}
+
+impl std::fmt::Display for ConditionErrorBehavior {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConditionErrorBehavior::UseDefault => write!(f, "useDefault"),
+            ConditionErrorBehavior::Block => write!(f, "block"),
+        }
+    }
+}
+
+impl std::str::FromStr for ConditionErrorBehavior {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "usedefault" | "use_default" => Ok(ConditionErrorBehavior::UseDefault),
+            "block" => Ok(ConditionErrorBehavior::Block),
+            _ => Err(format!("Unknown condition error behavior: {}", s)),
+        }
+    }
+}
+
+/// Condition node configuration: an expression over upstream artifact data.
+/// A question answered by a model is a [`RecipeNodeType::Decision`] node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConditionNodeConfig {
+    /// An expression like "plan.risk_score > 7"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+    /// Output port names: ["yes", "no"] or ["low", "medium", "high"]
+    pub ports: Vec<String>,
+    /// Error handling behavior
+    #[serde(default)]
+    pub on_error: ConditionErrorBehavior,
+    /// Default port to use on error (when on_error = UseDefault)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_port: Option<String>,
+}
+
+/// Context node configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextNodeConfig {
+    /// The markdown/text content
+    pub content: String,
+}
+
+/// Recipe edge - a connection between nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeEdge {
+    pub id: String,
+    pub edge_type: RecipeEdgeType,
+    pub source_node_id: String,
+    pub source_handle: String,
+    pub target_node_id: String,
+    pub target_handle: String,
+}
+
+/// Info about a recipe version (for version history display)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeVersionInfo {
+    pub id: String,
+    pub version: i32,
+    pub created_at: i64,
+    pub is_current: bool,
+}
+
+/// The port a stored edge handle names on a node that routes by `ports`, when
+/// the handle is the recipe editor's legacy spelling of it.
+///
+/// The editor once stored a condition's output handles as `port-<name>`, while
+/// the engine routes the edge whose handle equals the port. A handle is read as
+/// its port only when it is not itself one of the ports and stripping `port-`
+/// names one, so an option genuinely called `port-yes` keeps its handle.
+pub fn legacy_port_handle<'a>(handle: &'a str, ports: &[String]) -> Option<&'a str> {
+    if ports.iter().any(|port| port == handle) {
+        return None;
+    }
+    let port = handle.strip_prefix("port-")?;
+    ports
+        .iter()
+        .any(|candidate| candidate == port)
+        .then_some(port)
+}
+
+/// Rewrite every edge leaving a condition or decision node by a legacy
+/// `port-<name>` handle ([`legacy_port_handle`]) to leave by the port itself.
+pub fn normalize_legacy_port_handles(nodes: &[RecipeNode], edges: &mut [RecipeEdge]) {
+    for edge in edges {
+        let Some(node) = nodes.iter().find(|node| node.id == edge.source_node_id) else {
+            continue;
+        };
+        if let Some(port) = legacy_port_handle(&edge.source_handle, &node.routing_ports()) {
+            edge.source_handle = port.to_string();
+        }
+    }
+}
+
+impl RecipeNode {
+    /// The ports a condition or decision node routes by; empty for any other
+    /// node. An edge leaves by one of these as its source handle.
+    pub fn routing_ports(&self) -> Vec<String> {
+        match self.node_type {
+            RecipeNodeType::Condition => self
+                .condition_config
+                .as_ref()
+                .map(|config| config.ports.clone())
+                .unwrap_or_default(),
+            RecipeNodeType::Decision => self
+                .decision_config
+                .as_ref()
+                .map(DecisionNode::ports)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Project decoded configuration into the fields belonging to this node kind.
+    /// Storage adapters supply identity and layout after parsing their row.
+    pub fn from_config(
+        id: String,
+        node_type: RecipeNodeType,
+        name: String,
+        position: NodePosition,
+        parent_id: Option<String>,
+        config: Option<NodeConfig>,
+    ) -> Self {
+        // A stored `ai` condition is read as the decision node it always was.
+        let legacy_ai = node_type == RecipeNodeType::Condition
+            && config
+                .as_ref()
+                .is_some_and(|cfg| is_legacy_ai_condition(cfg.condition_type.as_deref()));
+        let node_type = if legacy_ai {
+            RecipeNodeType::Decision
+        } else {
+            node_type
+        };
+        // Extract type-specific configs
+        let (
+            trigger_config,
+            agent_config,
+            action_config,
+            checkpoint_config,
+            artifact_config,
+            condition_config,
+            decision_config,
+            context_config,
+        ) = if let Some(cfg) = config {
+            // Build agent config with nested checkpoint/schema/git_config
+            let agent_config = if cfg.agent_config_id.is_some()
+                || cfg.output_schema.is_some()
+                || cfg.git_config.is_some()
+            {
+                // Only create agent config if we have agent-related data
+                if node_type == RecipeNodeType::Agent {
+                    Some(AgentNodeConfig {
+                        agent_config_id: cfg.agent_config_id,
+                        output_schema: cfg.output_schema.clone(),
+                        git_config: cfg.git_config,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            // Build action config with nested schemas/checkpoint
+            let action_config = if cfg.action.is_some()
+                || cfg.action_config_id.is_some()
+                || (node_type == RecipeNodeType::Pr && cfg.input_schema.is_some())
+            {
+                Some(ActionNodeConfig {
+                    action_config_id: cfg.action_config_id,
+                    action: cfg.action.unwrap_or_default(),
+                    action_params: cfg
+                        .action_params
+                        .unwrap_or(serde_json::Value::Object(Default::default())),
+                    input_schema: cfg.input_schema,
+                    output_schema: if node_type == RecipeNodeType::Action {
+                        cfg.output_schema
+                    } else {
+                        None
+                    },
+                })
+            } else {
+                None
+            };
+
+            let decision_config = if node_type == RecipeNodeType::Decision {
+                Some(if legacy_ai {
+                    DecisionNode::port_choice(
+                        cfg.question.as_deref().unwrap_or_default(),
+                        cfg.ports.as_deref().unwrap_or_default(),
+                        cfg.model.clone(),
+                    )
+                } else {
+                    DecisionNode {
+                        questions: cfg.questions.clone().unwrap_or_default(),
+                        model: cfg.model.clone(),
+                        thresholds: cfg.thresholds.unwrap_or_default(),
+                    }
+                })
+            } else {
+                None
+            };
+
+            let condition_config = if node_type == RecipeNodeType::Condition
+                && (cfg.condition_type.is_some() || cfg.ports.is_some())
+            {
+                Some(ConditionNodeConfig {
+                    expression: cfg.expression,
+                    ports: cfg.ports.unwrap_or_default(),
+                    on_error: cfg.on_error.unwrap_or_default(),
+                    default_port: cfg.default_port,
+                })
+            } else {
+                None
+            };
+
+            (
+                cfg.trigger_type.map(|t| TriggerConfig {
+                    trigger_type: t,
+                    scope: cfg.scope,
+                    schedule_config: cfg.schedule_config,
+                    event_filter: cfg.event_filter,
+                }),
+                agent_config,
+                action_config,
+                // Standalone checkpoint node config (command gate). Keyed on the
+                // node type now that the command is the only checkpoint shape.
+                if node_type == RecipeNodeType::Checkpoint {
+                    Some(CheckpointNodeConfig {
+                        command: cfg.command,
+                        prompt: cfg.prompt,
+                    })
+                } else {
+                    None
+                },
+                // ArtifactNode config (the typed schema node on a context edge).
+                if node_type == RecipeNodeType::Artifact {
+                    Some(ArtifactNodeConfig {
+                        name: cfg.artifact_type.clone().unwrap_or_default(),
+                        schema: cfg.schema.clone(),
+                        confirm_policy: cfg.confirm_policy.unwrap_or_default(),
+                        content: cfg.content.clone(),
+                    })
+                } else {
+                    None
+                },
+                condition_config,
+                decision_config,
+                // Context/Instruction node config: both carry a `{ content }`
+                // text block. Context content flows to the initial user message;
+                // Instruction content is injected into the system prompt.
+                if matches!(
+                    node_type,
+                    RecipeNodeType::Context | RecipeNodeType::Instruction
+                ) {
+                    cfg.content
+                        .clone()
+                        .map(|content| ContextNodeConfig { content })
+                } else {
+                    None
+                },
+            )
+        } else {
+            (None, None, None, None, None, None, None, None)
+        };
+
+        Self {
+            id,
+            node_type,
+            name,
+            position,
+            parent_id,
+            trigger_config,
+            agent_config,
+            action_config,
+            checkpoint_config,
+            artifact_config,
+            condition_config,
+            decision_config,
+            context_config,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_config_respects_node_kind_when_fields_for_other_kinds_are_present() {
+        for kind in [RecipeNodeType::Instruction, RecipeNodeType::Artifact] {
+            let config = serde_json::from_value(serde_json::json!({
+                "agentConfigId": "agent",
+                "content": "Authored content",
+                "artifactType": "memo",
+                "schema": {"type": "object"}
+            }))
+            .unwrap();
+            let node = RecipeNode::from_config(
+                "node".into(),
+                kind.clone(),
+                "Name".into(),
+                NodePosition { x: 1.0, y: 2.0 },
+                Some("parent".into()),
+                Some(config),
+            );
+            assert!(node.agent_config.is_none());
+            assert_eq!(node.parent_id.as_deref(), Some("parent"));
+            match kind {
+                RecipeNodeType::Instruction => {
+                    assert_eq!(node.context_config.unwrap().content, "Authored content");
+                    assert!(node.artifact_config.is_none());
+                }
+                RecipeNodeType::Artifact => {
+                    assert_eq!(node.artifact_config.unwrap().name, "memo");
+                    assert!(node.context_config.is_none());
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    fn assert_parse_cases<T>(cases: &[(&str, T)])
+    where
+        T: std::str::FromStr + PartialEq + std::fmt::Debug + Clone,
+        T::Err: std::fmt::Debug,
+    {
+        for (input, expected) in cases {
+            assert_eq!(input.parse::<T>().unwrap(), expected.clone());
+        }
+    }
+
+    // =========================================================================
+    // RecipeTrigger tests
+    // =========================================================================
+
+    #[test]
+    fn recipe_trigger_display() {
+        assert_eq!(RecipeTrigger::Manual.to_string(), "manual");
+        assert_eq!(RecipeTrigger::Schedule.to_string(), "schedule");
+        assert_eq!(RecipeTrigger::JobEnded.to_string(), "job_ended");
+        assert_eq!(RecipeTrigger::SkillCalled.to_string(), "skill_called");
+    }
+
+    #[test]
+    fn recipe_enums_parse_canonical_values() {
+        assert_parse_cases(&[
+            ("manual", RecipeTrigger::Manual),
+            ("schedule", RecipeTrigger::Schedule),
+            ("job_ended", RecipeTrigger::JobEnded),
+            ("skill_called", RecipeTrigger::SkillCalled),
+        ]);
+        assert_parse_cases(&[
+            ("issue", TriggerScope::Issue),
+            ("project", TriggerScope::Project),
+        ]);
+        assert_parse_cases(&[
+            ("trigger", RecipeNodeType::Trigger),
+            ("agent", RecipeNodeType::Agent),
+            ("action", RecipeNodeType::Action),
+            ("checkpoint", RecipeNodeType::Checkpoint),
+            ("artifact", RecipeNodeType::Artifact),
+            ("condition", RecipeNodeType::Condition),
+            ("decision", RecipeNodeType::Decision),
+            ("context", RecipeNodeType::Context),
+            ("instruction", RecipeNodeType::Instruction),
+        ]);
+        assert_parse_cases(&[
+            ("control", RecipeEdgeType::Control),
+            ("context", RecipeEdgeType::Context),
+        ]);
+        assert_parse_cases(&[
+            ("isolate", BranchMode::Isolate),
+            ("inherit", BranchMode::Inherit),
+            ("none", BranchMode::None),
+        ]);
+        assert_parse_cases(&[
+            ("usedefault", ConditionErrorBehavior::UseDefault),
+            ("block", ConditionErrorBehavior::Block),
+        ]);
+    }
+
+    #[test]
+    fn recipe_enums_parse_case_insensitively() {
+        assert_parse_cases(&[
+            ("MANUAL", RecipeTrigger::Manual),
+            ("Schedule", RecipeTrigger::Schedule),
+        ]);
+        assert_parse_cases(&[
+            ("TRIGGER", RecipeNodeType::Trigger),
+            ("Agent", RecipeNodeType::Agent),
+        ]);
+        assert_parse_cases(&[
+            ("CONTROL", RecipeEdgeType::Control),
+            ("Context", RecipeEdgeType::Context),
+        ]);
+        assert_parse_cases(&[
+            ("ISOLATE", BranchMode::Isolate),
+            ("Inherit", BranchMode::Inherit),
+            ("NONE", BranchMode::None),
+        ]);
+        assert_parse_cases(&[
+            ("USEDEFAULT", ConditionErrorBehavior::UseDefault),
+            ("Block", ConditionErrorBehavior::Block),
+        ]);
+    }
+
+    #[test]
+    fn recipe_trigger_from_str_legacy_issue_maps_to_manual() {
+        assert_eq!(
+            "issue".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Manual
+        );
+        assert_eq!(
+            "ISSUE".parse::<RecipeTrigger>().unwrap(),
+            RecipeTrigger::Manual
+        );
+    }
+
+    #[test]
+    fn recipe_trigger_from_str_invalid() {
+        let result = "invalid".parse::<RecipeTrigger>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown recipe trigger"));
+    }
+
+    #[test]
+    fn recipe_trigger_default() {
+        assert_eq!(RecipeTrigger::default(), RecipeTrigger::Manual);
+    }
+
+    #[test]
+    fn recipe_trigger_serde_alias_issue() {
+        // Deserializing "issue" from JSON/YAML should produce Manual
+        let trigger: RecipeTrigger = serde_json::from_str("\"issue\"").unwrap();
+        assert_eq!(trigger, RecipeTrigger::Manual);
+    }
+
+    #[test]
+    fn schedule_period_serde_includes_weekday() {
+        let config: ScheduleConfig = serde_json::from_value(serde_json::json!({
+            "every": "weekday",
+            "at": { "hour": 9, "minute": 30 },
+            "allowCatchup": false,
+            "catchupWindowHours": 24
+        }))
+        .unwrap();
+
+        assert_eq!(config.every, ScheduleEvery::Period(SchedulePeriod::Weekday));
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({
+                "every": "weekday",
+                "at": { "hour": 9, "minute": 30 },
+                "allowCatchup": false,
+                "catchupWindowHours": 24
+            })
+        );
+    }
+
+    // =========================================================================
+    // TriggerScope tests
+    // =========================================================================
+
+    #[test]
+    fn trigger_scope_display() {
+        assert_eq!(TriggerScope::Issue.to_string(), "issue");
+        assert_eq!(TriggerScope::Project.to_string(), "project");
+    }
+
+    #[test]
+    fn trigger_scope_from_str_invalid() {
+        let result = "invalid".parse::<TriggerScope>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown trigger scope"));
+    }
+
+    #[test]
+    fn trigger_scope_default() {
+        assert_eq!(TriggerScope::default(), TriggerScope::Issue);
+    }
+
+    // =========================================================================
+    // Recipe::scope() tests
+    // =========================================================================
+
+    #[test]
+    fn recipe_scope_returns_trigger_node_scope() {
+        let recipe = Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "t1".into(),
+                name: "Trigger".into(),
+                node_type: RecipeNodeType::Trigger,
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: Some(TriggerConfig {
+                    trigger_type: RecipeTrigger::Manual,
+                    scope: Some(TriggerScope::Project),
+                    schedule_config: None,
+                    event_filter: None,
+                }),
+                agent_config: None,
+                action_config: None,
+                artifact_config: None,
+                checkpoint_config: None,
+                condition_config: None,
+                decision_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(recipe.scope(), TriggerScope::Project);
+    }
+
+    #[test]
+    fn recipe_scope_defaults_to_issue_when_no_trigger_node() {
+        let recipe = Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(recipe.scope(), TriggerScope::Issue);
+    }
+
+    #[test]
+    fn recipe_scope_defaults_to_issue_when_trigger_has_no_scope() {
+        let recipe = Recipe {
+            branch_targets: crate::default_branch_targets(),
+            id: "r1".into(),
+            name: "Test".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            workspace_id: None,
+            project_id: None,
+            is_system: false,
+            version: 1,
+            parent_recipe_id: None,
+            child_recipe_id: None,
+            nodes: vec![RecipeNode {
+                id: "t1".into(),
+                name: "Trigger".into(),
+                node_type: RecipeNodeType::Trigger,
+                position: NodePosition { x: 0.0, y: 0.0 },
+                parent_id: None,
+                trigger_config: Some(TriggerConfig {
+                    trigger_type: RecipeTrigger::Manual,
+                    scope: None,
+                    schedule_config: None,
+                    event_filter: None,
+                }),
+                agent_config: None,
+                action_config: None,
+                artifact_config: None,
+                checkpoint_config: None,
+                condition_config: None,
+                decision_config: None,
+                context_config: None,
+            }],
+            edges: vec![],
+            created_at: 0,
+            updated_at: 0,
+        };
+        assert_eq!(recipe.scope(), TriggerScope::Issue);
+    }
+
+    // =========================================================================
+    // EventFilter tests
+    // =========================================================================
+
+    #[test]
+    fn event_filter_serde_roundtrip() {
+        let filter = EventFilter {
+            job_status: Some(vec!["complete".into(), "failed".into()]),
+            skill_ids: None,
+            node_filter: Some(AgentFilter {
+                mode: AgentFilterMode::Allow,
+                ids: vec!["Builder".into()],
+            }),
+            every: None,
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        let parsed: EventFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.job_status,
+            Some(vec!["complete".into(), "failed".into()])
+        );
+        assert!(parsed.skill_ids.is_none());
+        assert_eq!(
+            parsed.node_filter,
+            Some(AgentFilter {
+                mode: AgentFilterMode::Allow,
+                ids: vec!["Builder".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn event_filter_deserialize_old_string_format() {
+        // Old format: nodeFilter was a plain string
+        let json = r#"{"jobStatus":["complete"],"nodeFilter":"Builder"}"#;
+        let parsed: EventFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.node_filter,
+            Some(AgentFilter {
+                mode: AgentFilterMode::Allow,
+                ids: vec!["Builder".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn event_filter_deserialize_old_empty_string() {
+        let json = r#"{"nodeFilter":""}"#;
+        let parsed: EventFilter = serde_json::from_str(json).unwrap();
+        assert!(parsed.node_filter.is_none());
+    }
+
+    #[test]
+    fn event_filter_deserialize_new_struct_format() {
+        let json = r#"{"nodeFilter":{"mode":"exclude","ids":["build","review"]}}"#;
+        let parsed: EventFilter = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed.node_filter,
+            Some(AgentFilter {
+                mode: AgentFilterMode::Exclude,
+                ids: vec!["build".into(), "review".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn event_filter_omits_none_fields() {
+        let filter = EventFilter {
+            job_status: None,
+            skill_ids: Some(vec!["code-review".into()]),
+            node_filter: None,
+            every: None,
+            group_by: None,
+            accumulation_scope: None,
+            time_window_secs: None,
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        assert!(!json.contains("jobStatus"));
+        assert!(json.contains("skillIds"));
+        assert!(!json.contains("nodeFilter"));
+    }
+
+    // =========================================================================
+    // RecipeNodeType tests
+    // =========================================================================
+
+    #[test]
+    fn recipe_node_type_display() {
+        assert_eq!(RecipeNodeType::Trigger.to_string(), "trigger");
+        assert_eq!(RecipeNodeType::Agent.to_string(), "agent");
+        assert_eq!(RecipeNodeType::Action.to_string(), "action");
+        assert_eq!(RecipeNodeType::Checkpoint.to_string(), "checkpoint");
+        assert_eq!(RecipeNodeType::Artifact.to_string(), "artifact");
+        assert_eq!(RecipeNodeType::Condition.to_string(), "condition");
+        assert_eq!(RecipeNodeType::Context.to_string(), "context");
+        assert_eq!(RecipeNodeType::Instruction.to_string(), "instruction");
+    }
+
+    #[test]
+    fn recipe_node_type_from_str_invalid() {
+        let result = "invalid".parse::<RecipeNodeType>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown recipe node type"));
+    }
+
+    #[test]
+    fn recipe_node_type_executor_is_unknown() {
+        let result = "executor".parse::<RecipeNodeType>();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Unknown recipe node type: executor");
+    }
+
+    // =========================================================================
+    // RecipeEdgeType tests
+    // =========================================================================
+
+    #[test]
+    fn recipe_edge_type_display() {
+        assert_eq!(RecipeEdgeType::Control.to_string(), "control");
+        assert_eq!(RecipeEdgeType::Context.to_string(), "context");
+    }
+
+    #[test]
+    fn recipe_edge_type_from_str_invalid() {
+        let result = "invalid".parse::<RecipeEdgeType>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown recipe edge type"));
+    }
+
+    // =========================================================================
+    // Decision nodes and the legacy AI condition they replace
+    // =========================================================================
+
+    fn decoded(node_type: RecipeNodeType, config: serde_json::Value) -> RecipeNode {
+        RecipeNode::from_config(
+            "n".into(),
+            node_type,
+            "Touches the DB?".into(),
+            NodePosition { x: 0.0, y: 0.0 },
+            None,
+            Some(serde_json::from_value(config).unwrap()),
+        )
+    }
+
+    #[test]
+    fn a_stored_ai_condition_reads_as_a_port_choice_decision() {
+        let node = decoded(
+            RecipeNodeType::Condition,
+            serde_json::json!({
+                "conditionType": "ai",
+                "question": "Does it touch the database?",
+                "model": "sm",
+                "ports": ["yes", "no"],
+                "onError": "useDefault",
+                "defaultPort": "no"
+            }),
+        );
+        assert_eq!(node.node_type, RecipeNodeType::Decision);
+        assert!(node.condition_config.is_none());
+        let decision = node.decision_config.unwrap();
+        assert_eq!(
+            decision,
+            DecisionNode::port_choice(
+                "Does it touch the database?",
+                &["yes".to_string(), "no".to_string()],
+                Some("sm".into())
+            )
+        );
+        assert_eq!(decision.ports(), vec!["yes", "no"]);
+    }
+
+    #[test]
+    fn a_programmatic_condition_stays_a_condition() {
+        let node = decoded(
+            RecipeNodeType::Condition,
+            serde_json::json!({
+                "conditionType": "programmatic",
+                "expression": "plan.risk > 7",
+                "ports": ["high", "low"]
+            }),
+        );
+        assert_eq!(node.node_type, RecipeNodeType::Condition);
+        assert!(node.decision_config.is_none());
+        let condition = node.condition_config.unwrap();
+        assert_eq!(condition.expression.as_deref(), Some("plan.risk > 7"));
+        // Nothing about the retired AI shape is written back.
+        let written = serde_json::to_value(&condition).unwrap();
+        assert!(written.get("conditionType").is_none(), "{written}");
+    }
+
+    #[test]
+    fn a_decision_node_round_trips_its_questions_and_thresholds() {
+        let node = decoded(
+            RecipeNodeType::Decision,
+            serde_json::json!({
+                "questions": [{"name": "route", "instructions": "Ship?", "type": "choice",
+                               "options": [{"value": "ship"}, {"value": "hold"}]}],
+                "model": "custom:acc/sm",
+                "thresholds": {"native": 0.7}
+            }),
+        );
+        let decision = node.decision_config.clone().unwrap();
+        assert_eq!(decision.ports(), vec!["ship", "hold"]);
+        assert_eq!(decision.thresholds.native, Some(0.7));
+        assert_eq!(decision.model.as_deref(), Some("custom:acc/sm"));
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["nodeType"], "decision");
+        assert_eq!(json["decisionConfig"]["questions"][0]["type"], "choice");
+    }
+
+    // =========================================================================
+    // BranchMode tests
+    // =========================================================================
+
+    #[test]
+    fn branch_mode_display() {
+        assert_eq!(BranchMode::Isolate.to_string(), "isolate");
+        assert_eq!(BranchMode::Inherit.to_string(), "inherit");
+        assert_eq!(BranchMode::None.to_string(), "none");
+    }
+
+    #[test]
+    fn branch_mode_from_str_invalid() {
+        let result = "invalid".parse::<BranchMode>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown branch mode"));
+    }
+
+    #[test]
+    fn branch_mode_default() {
+        assert_eq!(BranchMode::default(), BranchMode::Isolate);
+    }
+
+    // =========================================================================
+    // ConditionErrorBehavior tests
+    // =========================================================================
+
+    #[test]
+    fn condition_error_behavior_display() {
+        assert_eq!(ConditionErrorBehavior::UseDefault.to_string(), "useDefault");
+        assert_eq!(ConditionErrorBehavior::Block.to_string(), "block");
+    }
+
+    #[test]
+    fn condition_error_behavior_from_str_alternate_format() {
+        // "use_default" is an alternate format
+        assert_eq!(
+            "use_default".parse::<ConditionErrorBehavior>().unwrap(),
+            ConditionErrorBehavior::UseDefault
+        );
+    }
+
+    #[test]
+    fn condition_error_behavior_from_str_invalid() {
+        let result = "invalid".parse::<ConditionErrorBehavior>();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Unknown condition error behavior"));
+    }
+
+    #[test]
+    fn condition_error_behavior_default() {
+        assert_eq!(
+            ConditionErrorBehavior::default(),
+            ConditionErrorBehavior::UseDefault
+        );
+    }
+}

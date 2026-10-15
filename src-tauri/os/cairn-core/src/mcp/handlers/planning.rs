@@ -461,7 +461,7 @@ async fn ask_questions_owned(
     // `should_resume` true at answer time.
     if owns_turn_loop {
         orch.process_state
-            .request_suspend(&run_id, cairn_llm::turn::SuspendKind::Prompt);
+            .request_suspend(&run_id, cairn_models::turn::SuspendKind::Prompt);
         return PROMPT_SUSPENDED_OWNED_LOOP_MARKER.to_string();
     }
 

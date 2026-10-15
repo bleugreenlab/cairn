@@ -24,7 +24,7 @@ use cairn_core::internal::runs::reap::{
 };
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
-use cairn_llm::session::claude::ClaudeControl;
+use cairn_models::session::claude::ClaudeControl;
 
 /// A job with an open session and no runs yet. Runs and turns are added per test
 /// so each one states the exact shape it is about.

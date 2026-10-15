@@ -23,7 +23,7 @@ use crate::backends::{
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::types::catalog::{
+use cairn_models::types::catalog::{
     DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
 };
 
@@ -67,7 +67,7 @@ impl AgentBackend for OpenRouterBackend {
         orch: &Orchestrator,
     ) -> Result<CompletionOutcome, CompletionError> {
         use crate::backends::openai_compat::http::Endpoint;
-        use cairn_llm::interface::complete::{CompletionCall, CompletionReply, CompletionWire};
+        use cairn_models::interface::complete::{CompletionCall, CompletionReply, CompletionWire};
         use serde_json::json;
         use std::time::Instant;
 
@@ -113,7 +113,7 @@ impl AgentBackend for OpenRouterBackend {
         };
         let started = Instant::now();
         let response = orch
-            .llm_runtime()
+            .models_runtime()
             .complete
             .complete(CompletionCall::whole(
                 CompletionWire::Chat(&endpoint),

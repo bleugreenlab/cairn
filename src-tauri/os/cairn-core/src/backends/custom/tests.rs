@@ -15,7 +15,7 @@ use crate::backends::openai_compat::wire::{ChatContent, ChatStreamChunk, Streami
 use crate::credentials::{
     ApiProvider, CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAccount, ProviderAuth,
 };
-use cairn_llm::types::catalog;
+use cairn_models::types::catalog;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -65,7 +65,7 @@ fn replay(fixture: &str) -> (StreamingAggregate, bool) {
 /// `max_output_tokens`.
 fn generation_body(sampling: CustomSampling, max_output_tokens: i64) -> serde_json::Value {
     use crate::backends::http_loop::{Connection, WireAdapter};
-    use cairn_llm::turn::ProtocolFamily;
+    use cairn_models::turn::ProtocolFamily;
     let mut provider = config("vLLM", "http://127.0.0.1:1/v1", CustomModelPolicy::Discover);
     provider.sampling = sampling;
     provider.max_output_tokens = max_output_tokens;
@@ -77,8 +77,8 @@ fn generation_body(sampling: CustomSampling, max_output_tokens: i64) -> serde_js
         &[crate::backends::openai_compat::wire::ChatMessage::user(
             "hi".to_string(),
         )],
-        &cairn_llm::wire::GenerationConfig {
-            tools: cairn_llm::wire::cairn_tool_definitions(),
+        &cairn_models::wire::GenerationConfig {
+            tools: cairn_models::wire::cairn_tool_definitions(),
             ..Default::default()
         },
     )
@@ -383,7 +383,7 @@ fn a_custom_provider_receives_a_preset_schema_required_first() {
     .unwrap();
     adapter
         .complete(
-            &cairn_llm::complete::HttpComplete,
+            &cairn_models::complete::HttpComplete,
             CompletionRequest {
                 system: None,
                 messages: vec![CompletionMessage {
@@ -451,7 +451,7 @@ fn discovery_reads_the_openai_model_list_and_its_served_context_length() {
     assert_eq!(models[0].context_window, Some(131072));
     assert_eq!(
         models[0].wire_protocol,
-        Some(cairn_llm::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions)
+        Some(cairn_models::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions)
     );
 }
 

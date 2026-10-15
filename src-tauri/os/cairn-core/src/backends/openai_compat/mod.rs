@@ -1,9 +1,9 @@
-//! Application adapter for the OpenAI Chat Completions protocol in `cairn-llm`.
+//! Application adapter for the OpenAI Chat Completions protocol in `cairn-models`.
 //! Core supplies credentials, model selection, history loading, and persistence.
 
 pub(crate) mod conversation;
 pub(crate) mod http;
-pub(crate) use cairn_llm::wire::openai_compat::wire;
+pub(crate) use cairn_models::wire::openai_compat::wire;
 
 use crate::backends::{CompletionError, CompletionRequest, CompletionRole};
 use serde_json::{json, Value};

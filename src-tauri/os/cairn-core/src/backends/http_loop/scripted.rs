@@ -23,14 +23,16 @@ use super::{run_http_turn, Connection, WireAdapter};
 use crate::agent_process::process::{AgentProcessState, RunHandle};
 use crate::backends::{AgentPermissions, SessionConfig, SessionStart};
 use crate::models::Fence;
-use crate::orchestrator::llm::LlmRuntime;
+use crate::orchestrator::models::ModelRuntime;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
-use cairn_llm::interface::complete::{Complete, CompletionCall, CompletionError, CompletionReply};
-use cairn_llm::turn::TurnExit;
-use cairn_llm::wire::anthropic_messages::wire::MessagesResponse;
-use cairn_llm::wire::openai_compat::wire::ChatResponse;
-use cairn_llm::wire::openai_responses::wire::{ResponseEnvelope, ResponsesResponse};
+use cairn_models::interface::complete::{
+    Complete, CompletionCall, CompletionError, CompletionReply,
+};
+use cairn_models::turn::TurnExit;
+use cairn_models::wire::anthropic_messages::wire::MessagesResponse;
+use cairn_models::wire::openai_compat::wire::ChatResponse;
+use cairn_models::wire::openai_responses::wire::{ResponseEnvelope, ResponsesResponse};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -97,13 +99,13 @@ pub(in crate::backends) async fn orchestrator(
     let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
     let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
     let services = Arc::new(TestServicesBuilder::new().build());
-    let mut runtime = LlmRuntime::local(
+    let mut runtime = ModelRuntime::local(
         services.process.clone(),
         Arc::new(AgentProcessState::default()),
     );
     runtime.complete = complete;
     let orch = OrchestratorBuilder::new(db_state, services, config_dir)
-        .llm_runtime(runtime)
+        .models_runtime(runtime)
         .build();
     (orch, db_dir)
 }

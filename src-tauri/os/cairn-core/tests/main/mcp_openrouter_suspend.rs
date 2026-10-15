@@ -16,7 +16,7 @@ use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::storage::{LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_llm::turn::SuspendKind;
+use cairn_models::turn::SuspendKind;
 use serde_json::json;
 
 async fn seed(db: &LocalDb) {

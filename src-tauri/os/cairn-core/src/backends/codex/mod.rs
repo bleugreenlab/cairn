@@ -15,7 +15,7 @@ pub(crate) use events::{
     emit_codex_run_turn_completed, store_usage_result_event, terminal_tool_called_for_run,
 };
 
-pub use cairn_llm::codex::tokens::{codex_account_identity, CodexAccountIdentity};
+pub use cairn_models::codex::tokens::{codex_account_identity, CodexAccountIdentity};
 
 pub(super) const CODEX_BACKEND_NAME: &str = "Codex";
 
@@ -29,7 +29,7 @@ type ScriptedStdinFixture = (
     std::sync::Arc<std::sync::Mutex<Option<String>>>,
 );
 
-use cairn_llm::wire::codex_app_server::goal;
+use cairn_models::wire::codex_app_server::goal;
 
 use crate::agent_process::process::{GoalPause, GoalPauseClaim, PauseIntent};
 use crate::execution::jobs::{GoalReactivation, GoalReconciliation, JobRunnable};
@@ -64,7 +64,7 @@ pub(crate) fn reactivate_app_server_goal(
 ) -> Result<GoalReactivationResult, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Ok(GoalReactivationResult::Active);
     };
@@ -115,11 +115,14 @@ pub(crate) fn scripted_owned_goal_stdin_for_test(
 ) -> ScriptedStdinFixture {
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(replies, requests.clone()),
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
+            replies,
+            requests.clone(),
+        ),
     );
     let current_turn_id =
         std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string())));
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -155,7 +158,7 @@ pub(crate) fn scripted_durable_wait_stdin_for_test(
     };
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
             vec![
                 Ok(goal("active")),
                 Ok(goal("paused")),
@@ -173,7 +176,7 @@ pub(crate) fn scripted_durable_wait_stdin_for_test(
     );
     let current_turn_id =
         std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string())));
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -206,7 +209,7 @@ pub(crate) fn scripted_durable_wait_rollback_stdin_for_test(
     };
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
             vec![
                 Ok(goal("active")),
                 Ok(goal("paused")),
@@ -218,7 +221,7 @@ pub(crate) fn scripted_durable_wait_rollback_stdin_for_test(
     );
     let current_turn_id =
         std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string())));
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -251,7 +254,7 @@ pub(crate) fn scripted_delegated_wait_stdin_for_test(
     };
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
             vec![
                 Ok(goal("active")),
                 Ok(goal("paused")),
@@ -269,7 +272,7 @@ pub(crate) fn scripted_delegated_wait_stdin_for_test(
     );
     let current_turn_id =
         std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string())));
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -289,7 +292,7 @@ pub(crate) fn pause_goal_and_interrupt_provider_turn(
 ) -> Result<bool, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Ok(false);
     };
@@ -319,7 +322,7 @@ pub(crate) fn scripted_user_stop_stdin_for_test(
     };
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
             vec![
                 Ok(goal("active")),
                 Ok(goal("paused")),
@@ -335,7 +338,7 @@ pub(crate) fn scripted_user_stop_stdin_for_test(
     );
     let current_turn_id =
         std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string())));
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -360,7 +363,7 @@ pub(crate) fn pause_goal_and_interrupt_app_server_turn(
 ) -> Result<bool, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Ok(false);
     };
@@ -375,7 +378,7 @@ pub(crate) fn set_app_server_goal_objective(
 ) -> Result<bool, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Ok(false);
     };
@@ -402,7 +405,7 @@ pub(crate) fn scripted_active_stdin_for_test(
 ) -> ScriptedStdinFixture {
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
             vec![
                 Ok(serde_json::json!({
                     "result": {
@@ -453,7 +456,7 @@ pub(crate) fn scripted_active_stdin_for_test(
     );
     let current_turn_id =
         std::sync::Arc::new(std::sync::Mutex::new(Some(provider_turn_id.to_string())));
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -472,12 +475,12 @@ pub(crate) fn failing_interrupt_stdin_for_test(
 ) -> Box<dyn crate::agent_process::process::SessionControl> {
     let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+        cairn_models::codex::app_server::AppServerClient::for_test_scripted(
             vec![Err("fixture interrupt transport failure".to_string())],
             requests,
         ),
     );
-    Box::new(cairn_llm::session::codex::CodexControl::new(
+    Box::new(cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         "/tmp/project".to_string(),
@@ -529,7 +532,7 @@ done
     std::fs::set_permissions(&executable, permissions).expect("chmod app-server fixture");
 
     let client = std::sync::Arc::new(
-        cairn_llm::codex::app_server::AppServerClient::spawn(
+        cairn_models::codex::app_server::AppServerClient::spawn(
             &crate::services::RealProcessSpawner,
             executable.to_str().expect("fixture path is utf-8"),
             &[],
@@ -545,9 +548,9 @@ done
     std::thread::spawn(move || {
         for message in notifications {
             if matches!(
-                cairn_llm::wire::codex_app_server::Notification::parse(&message),
-                cairn_llm::wire::codex_app_server::Notification::TurnAborted { .. }
-                    | cairn_llm::wire::codex_app_server::Notification::TurnCompleted { .. }
+                cairn_models::wire::codex_app_server::Notification::parse(&message),
+                cairn_models::wire::codex_app_server::Notification::TurnAborted { .. }
+                    | cairn_models::wire::codex_app_server::Notification::TurnCompleted { .. }
             ) {
                 let terminal_turn_id = runtime::provider_turn_id(&message, &observed_turn);
                 runtime::clear_cached_provider_turn_if_current(
@@ -557,7 +560,7 @@ done
             }
         }
     });
-    let stdin = cairn_llm::session::codex::CodexControl::new(
+    let stdin = cairn_models::session::codex::CodexControl::new(
         client,
         thread_id.to_string(),
         fixture.path().to_string_lossy().into_owned(),
@@ -572,10 +575,10 @@ done
 pub(crate) fn interrupt_exact_app_server_turn(
     stdin: &mut dyn crate::agent_process::process::SessionControl,
     provider_turn_id: &str,
-) -> Result<cairn_llm::session::codex::ExactTurnInterrupt, String> {
+) -> Result<cairn_models::session::codex::ExactTurnInterrupt, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Err("Codex app-server stdin unavailable".to_string());
     };
@@ -601,7 +604,7 @@ pub(crate) fn reconcile_app_server_goal(
     }
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Ok(());
     };
@@ -631,7 +634,7 @@ pub(crate) struct DurableGoalPause {
 }
 
 fn pause_goal(
-    app_stdin: &cairn_llm::session::codex::CodexControl,
+    app_stdin: &cairn_models::session::codex::CodexControl,
     claim: &mut GoalPauseClaim,
     intent: PauseIntent,
 ) -> Result<(), String> {
@@ -653,7 +656,7 @@ pub(crate) fn pause_app_server_goal_for_durable_wait(
 ) -> Result<Option<DurableGoalPause>, String> {
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Ok(None);
     };
@@ -702,7 +705,7 @@ pub(crate) fn restore_app_server_goal_after_failed_durable_wait(
     }
     let Some(app_stdin) = stdin
         .as_any_mut()
-        .downcast_mut::<cairn_llm::session::codex::CodexControl>()
+        .downcast_mut::<cairn_models::session::codex::CodexControl>()
     else {
         return Err("Codex app-server stdin unavailable during durable-wait rollback".to_string());
     };
@@ -726,7 +729,7 @@ pub(crate) fn restore_app_server_goal_after_failed_durable_wait(
 
 /// Failed writes and bookkeeping must not overwrite completion observed meanwhile.
 fn restore_nonterminal_goal_status(
-    app_stdin: &cairn_llm::session::codex::CodexControl,
+    app_stdin: &cairn_models::session::codex::CodexControl,
     status: goal::GoalStatus,
 ) -> Result<(), String> {
     if app_stdin
@@ -739,7 +742,7 @@ fn restore_nonterminal_goal_status(
 }
 
 fn set_goal_status(
-    app_stdin: &cairn_llm::session::codex::CodexControl,
+    app_stdin: &cairn_models::session::codex::CodexControl,
     status: goal::GoalStatus,
 ) -> Result<(), String> {
     match app_stdin.set_goal(None, Some(status), None) {
@@ -764,7 +767,7 @@ fn send_app_server_user_message(
     control: &mut dyn crate::agent_process::process::SessionControl,
     content: &str,
 ) -> Result<(), String> {
-    control.send(&cairn_llm::interface::session::SessionInput {
+    control.send(&cairn_models::interface::session::SessionInput {
         content: &crate::agent_process::stdin::MessageContent::text(content),
         session_id: "session-1",
         parent_tool_use_id: None,
@@ -791,7 +794,7 @@ mod goal_objective_tests {
         for status in ["paused", "blocked"] {
             let requests = Arc::new(Mutex::new(Vec::new()));
             let client = Arc::new(
-                cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+                cairn_models::codex::app_server::AppServerClient::for_test_scripted(
                     vec![
                         Ok(serde_json::json!({"result": {"goal": goal("old", status)}})),
                         Ok(serde_json::json!({"result": {"goal": goal("new", status)}})),
@@ -799,7 +802,7 @@ mod goal_objective_tests {
                     Arc::clone(&requests),
                 ),
             );
-            let mut stdin = cairn_llm::session::codex::CodexControl::new(
+            let mut stdin = cairn_models::session::codex::CodexControl::new(
                 client,
                 "thread-1".to_string(),
                 "/tmp/project".to_string(),
@@ -831,12 +834,12 @@ mod goal_status_tests {
     ) {
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let client = std::sync::Arc::new(
-            cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+            cairn_models::codex::app_server::AppServerClient::for_test_scripted(
                 responses.into_iter().map(Ok).collect(),
                 requests.clone(),
             ),
         );
-        let stdin = cairn_llm::session::codex::CodexControl::new(
+        let stdin = cairn_models::session::codex::CodexControl::new(
             client,
             "thread-1".to_string(),
             "/tmp/project".to_string(),
@@ -1051,7 +1054,7 @@ mod goal_status_tests {
         };
         let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let client = std::sync::Arc::new(
-            cairn_llm::codex::app_server::AppServerClient::for_test_scripted(
+            cairn_models::codex::app_server::AppServerClient::for_test_scripted(
                 vec![
                     Ok(goal("active")),
                     Ok(goal("paused")),
@@ -1064,7 +1067,7 @@ mod goal_status_tests {
             ),
         );
         let mut stdin: Box<dyn crate::agent_process::process::SessionControl> =
-            Box::new(cairn_llm::session::codex::CodexControl::new(
+            Box::new(cairn_models::session::codex::CodexControl::new(
                 client,
                 "thread-1".to_string(),
                 "/tmp/project".to_string(),
@@ -1129,17 +1132,19 @@ mod goal_status_tests {
 /// the credential store durably holds.
 pub(super) fn refresh_codex_tokens_for_session(
     orch: &crate::orchestrator::Orchestrator,
-    state_arc: &std::sync::Arc<std::sync::Mutex<cairn_llm::codex::tokens::CodexAuthState>>,
-) -> Result<cairn_llm::codex::tokens::CodexOAuthTokens, cairn_llm::codex::tokens::CodexRefreshFailure>
-{
-    cairn_llm::codex::tokens::refresh_session_tokens(orch, state_arc, |request| {
+    state_arc: &std::sync::Arc<std::sync::Mutex<cairn_models::codex::tokens::CodexAuthState>>,
+) -> Result<
+    cairn_models::codex::tokens::CodexOAuthTokens,
+    cairn_models::codex::tokens::CodexRefreshFailure,
+> {
+    cairn_models::codex::tokens::refresh_session_tokens(orch, state_arc, |request| {
         orch.subscriptions().refresh_codex(orch, request)
     })
 }
 
 /// Cairn's own `CODEX_HOME`, `~/.cairn/codex`, shared by every Codex process
 /// Cairn spawns so the user's `~/.codex` is never read (see
-/// `cairn_llm::session::codex::home`).
+/// `cairn_models::session::codex::home`).
 pub(crate) fn cairn_codex_home() -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
     home.join(".cairn").join("codex")

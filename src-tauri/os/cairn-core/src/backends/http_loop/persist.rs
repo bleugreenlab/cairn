@@ -270,7 +270,7 @@ fn single_tool_summary(tool_uses: &[ToolUseInfo]) -> (Option<String>, Option<Val
 /// be recorded on this event or they are dropped from the usage breakdown even
 /// though the generation's cost is still counted on the cumulative result event.
 #[cfg(test)]
-pub(super) use cairn_llm::turn::tool_call_usage;
+pub(super) use cairn_models::turn::tool_call_usage;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn store_assistant_tool_call(
@@ -497,7 +497,7 @@ impl<'a> TranscriptSink<'a> {
     }
 }
 
-impl cairn_llm::wire::stream::StreamSink for TranscriptSink<'_> {
+impl cairn_models::wire::stream::StreamSink for TranscriptSink<'_> {
     fn append(&mut self, text: &str) -> Result<(), String> {
         let orch = self.orch;
         let run_id = self.run_id;
@@ -508,7 +508,10 @@ impl cairn_llm::wire::stream::StreamSink for TranscriptSink<'_> {
         let run_id = self.run_id;
         self.open()?.append_thinking(orch, run_id, text)
     }
-    fn finalize(&mut self, summary: cairn_llm::wire::stream::StreamSummary) -> Result<(), String> {
+    fn finalize(
+        &mut self,
+        summary: cairn_models::wire::stream::StreamSummary,
+    ) -> Result<(), String> {
         let Some(state) = self.state.take() else {
             return Ok(());
         };

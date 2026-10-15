@@ -1,6 +1,6 @@
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::DiscoveredModel;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::error::Error;

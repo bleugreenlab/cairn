@@ -1,7 +1,7 @@
 //! Application host for in-process HTTP agent turns.
 //!
 //! Each adapter resolves its provider's credentials and endpoint into a
-//! `cairn_llm::turn` protocol family and replays Cairn's stored transcript into
+//! `cairn_models::turn` protocol family and replays Cairn's stored transcript into
 //! that family's native conversation. The facet's `FamilyTurn` owns the rest of
 //! the request side: the loop, fitting, request bodies, replies, and native
 //! appends. Core contributes `CairnEffects`, which streams into the live
@@ -18,7 +18,7 @@ pub(in crate::backends) mod scripted;
 #[cfg(test)]
 mod tests;
 
-pub(in crate::backends) use cairn_llm::wire::{repair, TurnToolCall, TurnUsage};
+pub(in crate::backends) use cairn_models::wire::{repair, TurnToolCall, TurnUsage};
 pub(in crate::backends) use persist::TranscriptSink;
 pub(in crate::backends) use tools::render_tool_result;
 
@@ -43,17 +43,17 @@ use crate::orchestrator::session::{
 };
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
-use cairn_llm::interface::complete::CompletionError;
-use cairn_llm::interface::session::SessionInput;
-use cairn_llm::turn::{FamilyTurn, ProtocolFamily, TurnExit};
-use cairn_llm::wire::MessageContent;
+use cairn_models::interface::complete::CompletionError;
+use cairn_models::interface::session::SessionInput;
+use cairn_models::turn::{FamilyTurn, ProtocolFamily, TurnExit};
+use cairn_models::wire::MessageContent;
 use serde_json::Value;
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 #[cfg(test)]
-use cairn_llm::turn::MAX_TOOL_ITERATIONS;
+use cairn_models::turn::MAX_TOOL_ITERATIONS;
 
 pub(super) trait HttpUsageExt {
     fn token_counts(&self) -> TokenCounts;
@@ -277,12 +277,12 @@ where
         );
         handle.backend = Some(backend_key.clone());
         handle.model = config.model.as_ref().map(|model| model.to_string());
-        handle.facts = Some(cairn_llm::interface::session::SessionFacts {
+        handle.facts = Some(cairn_models::interface::session::SessionFacts {
             provider: backend_key.clone(),
             // An HTTP session's conversation is Cairn's own transcript.
             backend_session_id: Some(session_id.clone()),
             account_id: adapter.account_id(),
-            host: cairn_llm::interface::LOCAL_HOST.to_string(),
+            host: cairn_models::interface::LOCAL_HOST.to_string(),
             model: handle.model.clone(),
         });
         // An HTTP-loop backend owns its turn/tool loop in-process and has no warm
@@ -348,7 +348,7 @@ fn run_http_turn<A: WireAdapter>(
     let context_window = adapter.context_window(orch, &model);
     let family = adapter.family(&connection)?;
     let generation_config = (&config).into();
-    let complete = orch.llm_runtime().complete.clone();
+    let complete = orch.models_runtime().complete.clone();
     let mut turn = FamilyTurn {
         family,
         model: model.clone(),

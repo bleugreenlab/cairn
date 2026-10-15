@@ -23,7 +23,7 @@ the dependency versions Cairn ships.
 | `cairn-session` | Agent session runtime and provider process protocols |
 | `cairn-attention` | Durable agent attention, wake subscriptions, and delivery policy |
 | `cairn-db` | Database records, domain conversions, and Turso + Tantivy storage |
-| `cairn-models` | Domain values, serialization, and pure transformations |
+| `cairn-domain` | Domain values, serialization, and pure transformations |
 | `cairn-config` | Configuration files, defaults, validation, and preset resolution |
 | `cairn-packs` | Pack schemas, ownership, and filesystem installation |
 | `cairn-channels` | Channel message contracts and Telegram/Discord transport adapters |
@@ -32,17 +32,17 @@ the dependency versions Cairn ships.
 | `cairn-cmd` | The `cairn` command-line helper agents and scripts use |
 | `cairn-common` | Shared types: the `cairn://` URI parser, the resource contract, authentication, and protocol types |
 
-**The LLM facet**, hostable outside Cairn
+**The models facet**, hostable outside Cairn
 
 | Crate | Purpose |
 |---|---|
-| `cairn-llm` | HTTP protocols, provider vocabulary, accounts and routing, and usage as data |
+| `cairn-models` | HTTP protocols, provider vocabulary, accounts and routing, and usage as data |
 | `cairn-llm-wire` | Model wires: HTTP protocol families with generation assembly and replay, and the Claude and Codex CLI streams |
-| `cairn-llm-types` | Facet vocabulary: provider ids, the provider catalog, usage windows and snapshots, pooled capacity |
+| `cairn-models-types` | Facet vocabulary: provider ids, the provider catalog, usage windows and snapshots, pooled capacity |
 | `cairn-credentials` | Provider accounts, credential storage, leases, and selection |
 
 Subscription mechanics (CLI sign-in, account-home placement, token refresh) are
-not published; `cairn-llm` defines the `Subscriptions` seam a host implements.
+not published; `cairn-models` defines the `Subscriptions` seam a host implements.
 
 **Utilities**
 
@@ -64,7 +64,7 @@ Depend on a crate by git, pinned to a commit or a release tag:
 
 ```toml
 [dependencies]
-cairn-llm = { git = "https://github.com/bleugreenlab/cairn", rev = "<commit>" }
+cairn-models = { git = "https://github.com/bleugreenlab/cairn", rev = "<commit>" }
 ```
 
 Cargo finds the crate by name anywhere in the repository. Copying

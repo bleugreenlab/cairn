@@ -16,7 +16,7 @@ use super::transcript::{
     load_job_events_ordered, load_turn_events, parse_raw_transcript_format, transcript_from_rows,
     DigestCoordinate, DigestMeta, RawTranscriptFormat,
 };
-use cairn_llm::continuation::DigestOptions;
+use cairn_models::continuation::DigestOptions;
 
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::query::QueryParam;
@@ -1877,8 +1877,8 @@ pub(crate) async fn render_reseed_digest(db: &LocalDb, job: &crate::db_records::
 ///
 /// The seed and the baseline are one neutral measure: both read the same
 /// ordered events through [`transcript_from_rows`], the seed rendered by
-/// `cairn_llm::continuation::render_digest` and the baseline measured by
-/// `cairn_llm::continuation::verbatim_bytes`, so the two sides of the
+/// `cairn_models::continuation::render_digest` and the baseline measured by
+/// `cairn_models::continuation::verbatim_bytes`, so the two sides of the
 /// comparison describe the same history in the same terms.
 ///
 /// `None` when the job has no transcript to measure, which leaves the caller on
@@ -1895,7 +1895,7 @@ pub(crate) async fn reseed_verbatim_baseline_bytes(db: &LocalDb, job_id: &str) -
     if event_rows.is_empty() {
         return None;
     }
-    Some(cairn_llm::continuation::verbatim_bytes(
+    Some(cairn_models::continuation::verbatim_bytes(
         &transcript_from_rows(&event_rows, "", &HashMap::new()),
     ))
 }

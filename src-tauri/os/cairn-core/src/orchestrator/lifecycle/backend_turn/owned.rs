@@ -5,7 +5,7 @@ use crate::models::RunStatus;
 use crate::orchestrator::lifecycle::{fail_run, finalize_run, set_exit_reason};
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::turn::SuspendKind;
+use cairn_models::turn::SuspendKind;
 
 pub(crate) fn apply_owned_turn_outcome(
     orch: &Orchestrator,

@@ -1,6 +1,6 @@
 //! Latest persisted context-token observation.
 use super::{DbResult, LocalDb, RowExt};
-use cairn_models::ContextTokenEventSnapshot;
+use cairn_domain::ContextTokenEventSnapshot;
 use serde_json::Value;
 use std::sync::Arc;
 use turso::params;
@@ -105,7 +105,7 @@ mod tests {
         "#).await.unwrap();
 
         // Exercise the existing public query path and the new model identity.
-        let event: cairn_models::ContextTokenEventSnapshot =
+        let event: cairn_domain::ContextTokenEventSnapshot =
             crate::models::get_latest_context_token_event(db.clone(), "ctx-session")
                 .await
                 .unwrap()

@@ -66,9 +66,9 @@ use crate::backends::{
 };
 use crate::credentials::{ActualTargetKind, ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::DiscoveredModel;
 
-pub(crate) use cairn_llm::types::catalog::ACTUAL_BACKEND_KEY;
+pub(crate) use cairn_models::types::catalog::ACTUAL_BACKEND_KEY;
 pub(crate) const ACTUAL_BACKEND_NAME: &str = "Actual";
 
 /// The endpoint a local Actual instance serves on.
@@ -276,7 +276,7 @@ impl AgentBackend for ActualBackend {
         let adapter =
             adapter::ActualAdapter::new(orch, &request.model, request.project_id.as_deref())
                 .map_err(|_| CompletionError::BackendUnavailable)?;
-        adapter.complete(orch.llm_runtime().complete.as_ref(), request)
+        adapter.complete(orch.models_runtime().complete.as_ref(), request)
     }
 
     fn completion_shape(&self) -> CompletionShape {

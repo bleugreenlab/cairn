@@ -345,13 +345,13 @@ impl CairnResource {
             | Self::ExecutorAction { .. }
             | Self::Grants
             | Self::Grant { .. }
-            | Self::Llm
-            | Self::LlmCatalog
-            | Self::LlmAccounts
-            | Self::LlmAccount { .. }
-            | Self::LlmUsage
-            | Self::LlmSessions
-            | Self::LlmSession { .. }
+            | Self::Models
+            | Self::ModelsCatalog
+            | Self::ModelsAccounts
+            | Self::ModelsAccount { .. }
+            | Self::ModelsUsage
+            | Self::ModelsSessions
+            | Self::ModelsSession { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -517,13 +517,13 @@ impl CairnResource {
             | Self::ExecutorAction { .. }
             | Self::Grants
             | Self::Grant { .. }
-            | Self::Llm
-            | Self::LlmCatalog
-            | Self::LlmAccounts
-            | Self::LlmAccount { .. }
-            | Self::LlmUsage
-            | Self::LlmSessions
-            | Self::LlmSession { .. }
+            | Self::Models
+            | Self::ModelsCatalog
+            | Self::ModelsAccounts
+            | Self::ModelsAccount { .. }
+            | Self::ModelsUsage
+            | Self::ModelsSessions
+            | Self::ModelsSession { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch
@@ -665,13 +665,13 @@ impl CairnResource {
             | Self::ExecutorAction { .. }
             | Self::Grants
             | Self::Grant { .. }
-            | Self::Llm
-            | Self::LlmCatalog
-            | Self::LlmAccounts
-            | Self::LlmAccount { .. }
-            | Self::LlmUsage
-            | Self::LlmSessions
-            | Self::LlmSession { .. }
+            | Self::Models
+            | Self::ModelsCatalog
+            | Self::ModelsAccounts
+            | Self::ModelsAccount { .. }
+            | Self::ModelsUsage
+            | Self::ModelsSessions
+            | Self::ModelsSession { .. }
             | Self::Bug
             | Self::Help
             | Self::WebSearch

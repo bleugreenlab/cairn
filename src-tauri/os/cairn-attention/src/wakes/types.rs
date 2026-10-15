@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::storage::{DbResult, RowExt};
-use cairn_models::DeliveryUrgency;
+use cairn_domain::DeliveryUrgency;
 
 pub const SOURCE_KIND_ISSUE: &str = "issue";
 pub const SOURCE_KIND_PEER: &str = "peer";

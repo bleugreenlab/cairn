@@ -324,10 +324,10 @@ mod tests {
         );
         account.id = id.to_string();
         account.health = Some(ProviderAccountHealth {
-            windows: vec![cairn_llm::types::usage::ProviderUsageWindow {
+            windows: vec![cairn_models::types::usage::ProviderUsageWindow {
                 id: "five-hour".to_string(),
                 label: "5h".to_string(),
-                scope: cairn_llm::types::usage::ProviderUsageScope::Session,
+                scope: cairn_models::types::usage::ProviderUsageScope::Session,
                 scope_target: None,
                 used_percent: 100.0 - remaining,
                 remaining_percent: remaining,
@@ -349,10 +349,10 @@ mod tests {
         terminal_429.health.as_mut().unwrap().windows[0].resets_at = Some(500);
         let mut usable_for_opus = healthy_claude_account("opus-profile", 24.0, 100);
         usable_for_opus.health.as_mut().unwrap().windows.push(
-            cairn_llm::types::usage::ProviderUsageWindow {
+            cairn_models::types::usage::ProviderUsageWindow {
                 id: "weekly_scoped-fable".to_string(),
                 label: "Current week (Fable)".to_string(),
-                scope: cairn_llm::types::usage::ProviderUsageScope::Weekly,
+                scope: cairn_models::types::usage::ProviderUsageScope::Weekly,
                 scope_target: Some("Fable".to_string()),
                 used_percent: 100.0,
                 remaining_percent: 0.0,
@@ -424,10 +424,10 @@ mod tests {
         let mut account = test_account(ApiProvider::OpenAI, oauth_auth(&format!("{id}-auth-json")));
         account.id = id.to_string();
         account.health = remaining.map(|remaining| ProviderAccountHealth {
-            windows: vec![cairn_llm::types::usage::ProviderUsageWindow {
+            windows: vec![cairn_models::types::usage::ProviderUsageWindow {
                 id: "primary".to_string(),
                 label: "5-hour window".to_string(),
-                scope: cairn_llm::types::usage::ProviderUsageScope::Session,
+                scope: cairn_models::types::usage::ProviderUsageScope::Session,
                 scope_target: None,
                 used_percent: 100.0 - remaining,
                 remaining_percent: remaining,

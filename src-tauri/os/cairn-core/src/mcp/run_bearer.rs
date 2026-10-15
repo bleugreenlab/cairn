@@ -38,7 +38,7 @@ use base64::Engine as _;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
-use cairn_llm::session::mcp::{McpServer, McpTransport, MCP_TOKEN_ENV};
+use cairn_models::session::mcp::{McpServer, McpTransport, MCP_TOKEN_ENV};
 
 use crate::orchestrator::Orchestrator;
 use crate::security::broker::CredentialSource;

@@ -7,7 +7,7 @@ mod handle;
 pub mod lease;
 pub mod store;
 
-pub use cairn_llm_types::ApiProvider;
+pub use cairn_models_types::ApiProvider;
 pub use handle::CredentialStoreHandle;
 
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ pub struct RoutedAccountDiagnostic {
     pub project_id: Option<String>,
     pub compatible_backends: Vec<String>,
     pub blocked_until: Option<i64>,
-    pub live_windows: Vec<cairn_llm_types::usage::ProviderUsageWindow>,
+    pub live_windows: Vec<cairn_models_types::usage::ProviderUsageWindow>,
     pub rejection: Option<String>,
 }
 
@@ -207,7 +207,7 @@ pub enum ProviderAuth {
     /// derived from the account id; its OAuth tokens live here, not there.
     ///
     /// `oauth` is the CLI's `claudeAiOauth` object, held verbatim as JSON plus
-    /// Cairn's own rotation fields (see `cairn_llm::claude::tokens`). `None`
+    /// Cairn's own rotation fields (see `cairn_models::claude::tokens`). `None`
     /// means the account has not been harvested from its home yet, or has been
     /// signed out. The CLI itself only ever receives the access token, so the
     /// refresh token is spent by Cairn alone.
@@ -642,7 +642,7 @@ pub struct AccountDepletion {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderAccountHealth {
     #[serde(default)]
-    pub windows: Vec<cairn_llm_types::usage::ProviderUsageWindow>,
+    pub windows: Vec<cairn_models_types::usage::ProviderUsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_until: Option<i64>,
     /// Credit exhaustion cannot be inferred to have healed with time. Only an
@@ -726,7 +726,7 @@ impl ProviderAccount {
     pub fn compatible_backends(&self) -> Vec<String> {
         let keys: Vec<&str> = match (&self.api_provider, &self.auth) {
             (ApiProvider::Custom, ProviderAuth::CustomEndpoint { .. }) => {
-                return vec![cairn_llm_types::catalog::custom_key(&self.id)]
+                return vec![cairn_models_types::catalog::custom_key(&self.id)]
             }
             // API keys work with both CLI and Native
             (ApiProvider::Anthropic, ProviderAuth::ApiKey { .. }) => vec!["claude", "native"],
@@ -762,7 +762,7 @@ impl ProviderAccount {
     }
 }
 
-use cairn_models::GitIdentity;
+use cairn_domain::GitIdentity;
 
 /// An Anthropic login that the profiles-only model no longer accepts, kept
 /// until the user has been told why it disappeared.
@@ -1835,10 +1835,10 @@ mod tests {
         );
         account.id = id.to_string();
         account.health = Some(ProviderAccountHealth {
-            windows: vec![cairn_llm_types::usage::ProviderUsageWindow {
+            windows: vec![cairn_models_types::usage::ProviderUsageWindow {
                 id: "five-hour".to_string(),
                 label: "5h".to_string(),
-                scope: cairn_llm_types::usage::ProviderUsageScope::Session,
+                scope: cairn_models_types::usage::ProviderUsageScope::Session,
                 scope_target: None,
                 used_percent: 100.0 - remaining,
                 remaining_percent: remaining,
@@ -1923,10 +1923,10 @@ mod tests {
 
         let mut model_scoped = healthy_claude_account("fable-spent", 24.0, 100);
         model_scoped.health.as_mut().unwrap().windows.push(
-            cairn_llm_types::usage::ProviderUsageWindow {
+            cairn_models_types::usage::ProviderUsageWindow {
                 id: "weekly_scoped-fable".to_string(),
                 label: "Current week (Fable)".to_string(),
-                scope: cairn_llm_types::usage::ProviderUsageScope::Weekly,
+                scope: cairn_models_types::usage::ProviderUsageScope::Weekly,
                 scope_target: Some("Fable".to_string()),
                 used_percent: 100.0,
                 remaining_percent: 0.0,
@@ -2082,7 +2082,7 @@ mod tests {
             account.health.as_mut().unwrap().windows[0].resets_at = Some(10_000);
             let mut weekly_all = account.health.as_ref().unwrap().windows[0].clone();
             weekly_all.id = "weekly_all".to_string();
-            weekly_all.scope = cairn_llm_types::usage::ProviderUsageScope::Weekly;
+            weekly_all.scope = cairn_models_types::usage::ProviderUsageScope::Weekly;
             weekly_all.remaining_percent = weekly;
             let mut fable = weekly_all.clone();
             fable.id = "weekly_scoped-fable".to_string();
@@ -2399,10 +2399,10 @@ mod tests {
         let mut account = test_account(ApiProvider::OpenAI, oauth_auth(&format!("{id}-auth-json")));
         account.id = id.to_string();
         account.health = remaining.map(|remaining| ProviderAccountHealth {
-            windows: vec![cairn_llm_types::usage::ProviderUsageWindow {
+            windows: vec![cairn_models_types::usage::ProviderUsageWindow {
                 id: "primary".to_string(),
                 label: "5-hour window".to_string(),
-                scope: cairn_llm_types::usage::ProviderUsageScope::Session,
+                scope: cairn_models_types::usage::ProviderUsageScope::Session,
                 scope_target: None,
                 used_percent: 100.0 - remaining,
                 remaining_percent: remaining,

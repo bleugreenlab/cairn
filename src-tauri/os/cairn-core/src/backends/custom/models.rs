@@ -13,7 +13,7 @@
 
 use super::CustomProviderConfig;
 use crate::credentials::{CustomModelPolicy, CustomProtocol};
-use cairn_llm::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::DiscoveredModel;
 use serde::Deserialize;
 use std::error::Error;
 use std::time::Duration;
@@ -137,11 +137,13 @@ fn model(
         architecture_modality: None,
         wire_protocol: Some(match config.protocol {
             CustomProtocol::OpenAiChatCompletions => {
-                cairn_llm::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions
+                cairn_models::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions
             }
             // No turn family serves it; the catalog's decision method says what
             // it does serve.
-            CustomProtocol::Decisions => cairn_llm::types::catalog::DiscoveredWireProtocol::Unknown,
+            CustomProtocol::Decisions => {
+                cairn_models::types::catalog::DiscoveredWireProtocol::Unknown
+            }
         }),
     }
 }

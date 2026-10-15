@@ -11,7 +11,7 @@ use crate::backends::openai_compat::http::{ChatDialect, ChatReasoning, Endpoint}
 use crate::backends::openai_compat::wire::ChatMessage;
 use crate::backends::SessionConfig;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::turn::ChatFamily;
+use cairn_models::turn::ChatFamily;
 use serde_json::{Map, Value};
 
 /// The OpenRouter wire adapter. Holds the provider-routing object resolved once

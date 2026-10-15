@@ -28,7 +28,7 @@ pub mod executor_registry; // Synced visibility; live placement remains in fleet
 pub(crate) mod generation_cache;
 pub mod identity;
 pub mod lifecycle;
-pub mod llm;
+pub mod models;
 pub mod object_plane;
 pub mod parent_wake;
 pub mod provider_pool;
@@ -65,14 +65,14 @@ use crate::mcp::McpAuthState;
 use crate::models::{get_latest_context_token_event, ContextTokenState, TriggerEvent};
 use crate::notify::Notifier;
 use crate::services::{ChildProcess, PtyState, Services};
-use cairn_llm::types::catalog::ProviderModelCatalog;
-use cairn_llm::types::usage::ProviderUsageSnapshot;
+use cairn_models::types::catalog::ProviderModelCatalog;
+use cairn_models::types::usage::ProviderUsageSnapshot;
 
 pub use crate::account::AnonDeviceManager;
 pub use account_manager::AccountManager;
 pub use attention::{AttentionEvent, AttentionFact, AttentionFactKey};
 
-type ProviderUsageSnapshots = Arc<cairn_llm::usage::book::UsageBook>;
+type ProviderUsageSnapshots = Arc<cairn_models::usage::book::UsageBook>;
 pub(crate) type ProviderUsageCaptures = Arc<Mutex<HashSet<(String, String)>>>;
 
 pub struct OrchestratorBuilder {
@@ -93,8 +93,8 @@ pub struct OrchestratorBuilder {
     session_allowed_tools: Arc<Mutex<HashSet<String>>>,
     session_allowed_crossings: Arc<Mutex<HashSet<String>>>,
     credential_store: Option<CredentialStore>,
-    subscriptions: Arc<dyn cairn_llm::subscription::Subscriptions>,
-    llm_runtime: Option<llm::LlmRuntime>,
+    subscriptions: Arc<dyn cairn_models::subscription::Subscriptions>,
+    models_runtime: Option<models::ModelRuntime>,
     mcp_binary_path: String,
     jj_binary_path: String,
     config_dir: PathBuf,
@@ -221,8 +221,8 @@ impl OrchestratorBuilder {
             session_allowed_tools,
             session_allowed_crossings,
             credential_store,
-            subscriptions: Arc::new(cairn_llm::subscription::Unsubscribed),
-            llm_runtime: None,
+            subscriptions: Arc::new(cairn_models::subscription::Unsubscribed),
+            models_runtime: None,
             mcp_binary_path: "cairn-cmd".to_string(),
             jj_binary_path: "jj".to_string(),
             config_dir,
@@ -237,7 +237,7 @@ impl OrchestratorBuilder {
             effect_tx: None,
             browser_command_tx: None,
             model_catalog: Arc::new(RwLock::new(HashMap::new())),
-            provider_usage_snapshots: Arc::new(cairn_llm::usage::book::UsageBook::new()),
+            provider_usage_snapshots: Arc::new(cairn_models::usage::book::UsageBook::new()),
             provider_usage_captures: Arc::new(Mutex::new(HashSet::new())),
             context_token_snapshots: Arc::new(RwLock::new(HashMap::new())),
             team_attention_sender: Arc::new(team_attention_push::HttpTeamAttentionSender::default()),
@@ -329,7 +329,7 @@ impl OrchestratorBuilder {
     /// nothing answers every subscription question with "no support".
     pub fn subscriptions(
         mut self,
-        subscriptions: Arc<dyn cairn_llm::subscription::Subscriptions>,
+        subscriptions: Arc<dyn cairn_models::subscription::Subscriptions>,
     ) -> Self {
         self.subscriptions = subscriptions;
         self
@@ -338,8 +338,8 @@ impl OrchestratorBuilder {
     /// The facet implementations launches go through. Defaults to the ones
     /// that reach providers, with sessions on this machine; tests install
     /// recorders here.
-    pub fn llm_runtime(mut self, runtime: llm::LlmRuntime) -> Self {
-        self.llm_runtime = Some(runtime);
+    pub fn models_runtime(mut self, runtime: models::ModelRuntime) -> Self {
+        self.models_runtime = Some(runtime);
         self
     }
 
@@ -445,8 +445,8 @@ impl OrchestratorBuilder {
         // Machines that could not prepare a project's cells stay excluded for
         // that project across a runner restart, until their evidence changes.
         fleet.attach_preparation_store(self.db.local.clone());
-        let llm_runtime = self.llm_runtime.unwrap_or_else(|| {
-            llm::LlmRuntime::local(self.services.process.clone(), self.process_state.clone())
+        let models_runtime = self.models_runtime.unwrap_or_else(|| {
+            models::ModelRuntime::local(self.services.process.clone(), self.process_state.clone())
         });
         let orchestrator = Orchestrator {
             db: self.db,
@@ -480,7 +480,7 @@ impl OrchestratorBuilder {
                 self.credential_store,
             ),
             subscriptions: self.subscriptions,
-            llm_runtime,
+            models_runtime,
             decision_observations: Arc::default(),
             mcp_binary_path: self.mcp_binary_path,
             jj_binary_path: self.jj_binary_path,
@@ -1144,11 +1144,11 @@ pub struct Orchestrator {
     credential_store: CredentialStoreHandle,
 
     /// Subscription mechanics, installed by the host. See
-    /// [`cairn_llm::subscription`].
-    subscriptions: Arc<dyn cairn_llm::subscription::Subscriptions>,
+    /// [`cairn_models::subscription`].
+    subscriptions: Arc<dyn cairn_models::subscription::Subscriptions>,
     /// The facet implementations every launch goes through. See
-    /// [`llm::LlmRuntime`].
-    llm_runtime: llm::LlmRuntime,
+    /// [`models::ModelRuntime`].
+    models_runtime: models::ModelRuntime,
     /// Which logprobs offers were seen to answer decisions, and which could
     /// not. See [`decide::DecisionObservations`].
     decision_observations: Arc<decide::DecisionObservations>,
@@ -3315,13 +3315,13 @@ impl Orchestrator {
             .and_then(|catalog| catalog.get(&backend.to_lowercase()))
             .map(|entry| entry.models.as_slice())
             .unwrap_or_default();
-        cairn_llm::types::catalog::context_window(backend, model, discovered)
+        cairn_models::types::catalog::context_window(backend, model, discovered)
     }
 
     fn refresh_provider_model_catalog_blocking(&self, backend_name: &str) -> ProviderModelCatalog {
         let backend = backend_for_name(Some(backend_name));
         let (mut models, error) = if let Some(account_id) =
-            cairn_llm::types::catalog::custom_account_id(backend_name)
+            cairn_models::types::catalog::custom_account_id(backend_name)
         {
             // Inventory is per provider, and a custom provider IS one account,
             // so discovery is scoped to that account rather than merged across
@@ -3407,7 +3407,7 @@ impl Orchestrator {
         backend: &str,
     ) -> Result<ProviderModelCatalog, String> {
         let backend = backend.to_ascii_lowercase();
-        if !cairn_llm::types::catalog::is_supported(&backend) {
+        if !cairn_models::types::catalog::is_supported(&backend) {
             return Err(format!("Unsupported backend: {backend}"));
         }
         if !self.provider_enabled(&backend) {
@@ -3447,7 +3447,7 @@ mod tests {
     use crate::services::testing::{CapturingEmitter, TestServicesBuilder};
     use crate::services::EventEmitter;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-    use cairn_llm::types::catalog::DiscoveredModel;
+    use cairn_models::types::catalog::DiscoveredModel;
 
     #[test]
     fn startup_silence_warms_until_deadline_then_becomes_evidence() {

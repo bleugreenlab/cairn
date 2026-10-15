@@ -106,7 +106,7 @@ pub fn workspace_mcp_write(
     Ok(AuthorityRequest::new(scope, mutation, summary).with_mcp_config(fingerprint))
 }
 
-/// Starting a subscription sign-in through `cairn://llm/accounts` → the same
+/// Starting a subscription sign-in through `cairn://models/accounts` → the same
 /// `WorkspaceSettings(accounts) + Write` place a `cairn://settings` `accounts`
 /// patch reaches.
 ///
@@ -117,7 +117,7 @@ pub fn workspace_mcp_write(
 /// `Update`.
 pub fn provider_sign_in(
     workspace_id: &str,
-    provider: cairn_llm::accounts::RoutedProvider,
+    provider: cairn_models::accounts::RoutedProvider,
     account_id: Option<&str>,
 ) -> AuthorityRequest {
     let scope = AuthorityScope::new(
@@ -128,8 +128,8 @@ pub fn provider_sign_in(
         AuthorityAction::Write,
     );
     let provider_name = match provider {
-        cairn_llm::accounts::RoutedProvider::Claude => "Claude",
-        cairn_llm::accounts::RoutedProvider::Codex => "Codex (ChatGPT)",
+        cairn_models::accounts::RoutedProvider::Claude => "Claude",
+        cairn_models::accounts::RoutedProvider::Codex => "Codex (ChatGPT)",
     };
     match account_id {
         None => AuthorityRequest::new(
@@ -212,7 +212,7 @@ mod tests {
     /// Two doors onto one credential store name one place.
     #[test]
     fn a_sign_in_reaches_the_settings_accounts_place() {
-        use cairn_llm::accounts::RoutedProvider;
+        use cairn_models::accounts::RoutedProvider;
         let settings = workspace_settings_write("default", "accounts").unwrap();
         let new = provider_sign_in("default", RoutedProvider::Claude, None);
         let again = provider_sign_in("default", RoutedProvider::Codex, Some("acc_1"));

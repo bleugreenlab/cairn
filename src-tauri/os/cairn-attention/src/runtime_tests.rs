@@ -2,7 +2,7 @@
 use crate::{push, runtime::*, storage::*, wakes::*};
 use async_trait::async_trait;
 use cairn_db::turso::{params, Connection};
-use cairn_models::{DeliveryUrgency, Message};
+use cairn_domain::{DeliveryUrgency, Message};
 use conditions::{ConditionOutcome, WakeCondition};
 use std::sync::{Arc, Mutex};
 

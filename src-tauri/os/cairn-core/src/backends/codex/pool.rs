@@ -1,8 +1,8 @@
 //! Credential refresh and workflow failure policy for the session-owned pool.
 use super::refresh_codex_tokens_for_session;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::codex::app_server::AppServerClient;
-use cairn_llm::codex::tokens::CodexAuthState;
+use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::codex::tokens::CodexAuthState;
 pub use cairn_session::backends::codex::pool::*;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};

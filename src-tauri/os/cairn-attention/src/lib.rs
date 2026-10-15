@@ -1,6 +1,6 @@
 //! Durable agent attention: facts, push queues, subscriptions and delivery policy.
 pub use cairn_db::storage;
-pub use cairn_models as models;
+pub use cairn_domain as models;
 pub mod delivery;
 pub mod direct;
 pub mod events;

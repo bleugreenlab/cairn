@@ -2424,7 +2424,7 @@ mod tests {
         let goal_status = Arc::new(Mutex::new("active".to_string()));
         let provider_goal = goal_status.clone();
         let client = Arc::new(
-            cairn_llm::codex::app_server::AppServerClient::for_test_responding(
+            cairn_models::codex::app_server::AppServerClient::for_test_responding(
                 move |request| match request["method"].as_str().unwrap() {
                     "thread/goal/get" => owned_goal_reply(&provider_goal.lock().unwrap()),
                     "thread/goal/set" => {
@@ -2442,7 +2442,7 @@ mod tests {
             ),
         );
         let stdin: Box<dyn crate::agent_process::process::SessionControl> =
-            Box::new(cairn_llm::session::codex::CodexControl::new(
+            Box::new(cairn_models::session::codex::CodexControl::new(
                 client,
                 "native-thread".into(),
                 "/tmp/project".into(),
@@ -3608,7 +3608,7 @@ mod tests {
         let mut processes = orch.process_state.processes.lock().unwrap();
         let child = Arc::new(std::sync::Mutex::new(None));
         let stdin = Arc::new(std::sync::Mutex::new(Some(
-            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
         )));
         let mut handle = crate::agent_process::process::RunHandle::new(
             child,

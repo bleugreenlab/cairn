@@ -1,9 +1,9 @@
-//! The orchestrator's side of the cairn-llm facet's `decide` verb.
+//! The orchestrator's side of the cairn-models facet's `decide` verb.
 //!
 //! The facet measures; this module decides where. It reports each provider's
 //! decision method into the catalog, resolves an authored model or tier to a
 //! decision offer through the facet's one selector
-//! ([`cairn_llm::interface::Catalog::decision_offer`]), confirms that offer
+//! ([`cairn_models::interface::Catalog::decision_offer`]), confirms that offer
 //! can measure the node's questions, and runs the facet's blocking `decide`
 //! off the async runtime.
 //!
@@ -26,9 +26,9 @@ use std::time::{Duration, Instant};
 
 use crate::models::decision::{Decision, DecisionNode, MeasuredBy};
 use crate::models::RecipeNode;
-use cairn_llm::interface::decide::{DecisionCall, DecisionOffer, DecisionRoute};
-use cairn_llm::interface::{Llm, LlmScope};
-use cairn_llm::types::catalog;
+use cairn_models::interface::decide::{DecisionCall, DecisionOffer, DecisionRoute};
+use cairn_models::interface::{ModelScope, Models};
+use cairn_models::types::catalog;
 
 use super::Orchestrator;
 use crate::backends::custom::CustomProviderConfig;
@@ -106,7 +106,7 @@ pub struct DecisionDiagnostic {
 
 /// Why `offer`'s method cannot ask `decision`'s questions, when it cannot.
 fn unmeasurable_by(offer: &DecisionOffer, decision: &DecisionNode) -> Option<String> {
-    let unmeasurable = cairn_llm::decide::unmeasurable(&decision.questions, offer.method);
+    let unmeasurable = cairn_models::decide::unmeasurable(&decision.questions, offer.method);
     (!unmeasurable.is_empty()).then(|| {
         format!(
             "{} on {} measures decisions by {}, which cannot ask this: {}",
@@ -144,7 +144,7 @@ impl Orchestrator {
         project_id: Option<&str>,
         decision: &DecisionNode,
     ) -> Result<DecisionOffer, String> {
-        let scope = LlmScope {
+        let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
         // Each pass either returns or records one more offer as unable, which
@@ -181,10 +181,10 @@ impl Orchestrator {
             return Ok(unable.is_none());
         }
         let route = self.decision_route(project_id, offer)?;
-        let complete = self.llm_runtime.complete.clone();
+        let complete = self.models_runtime.complete.clone();
         let model = offer.model.clone();
         let outcome = std::thread::spawn(move || {
-            cairn_llm::decide::probe(complete.as_ref(), &route, &model, PROBE_TIMEOUT)
+            cairn_models::decide::probe(complete.as_ref(), &route, &model, PROBE_TIMEOUT)
         })
         .join()
         .map_err(|_| "the decision capability probe panicked".to_string())?;
@@ -226,7 +226,7 @@ impl Orchestrator {
         nodes: &[RecipeNode],
         project_id: Option<&str>,
     ) -> Vec<DecisionDiagnostic> {
-        let scope = LlmScope {
+        let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
         let catalog = self.catalog(&scope);
@@ -333,8 +333,8 @@ impl Orchestrator {
     ) -> Result<Decision, String> {
         let offer = self.decision_offer(project_id, decision)?;
         let route = self.decision_route(project_id, &offer)?;
-        let result = cairn_llm::decide::decide(
-            self.llm_runtime.complete.as_ref(),
+        let result = cairn_models::decide::decide(
+            self.models_runtime.complete.as_ref(),
             DecisionCall {
                 route: &route,
                 model: &offer.model,
@@ -365,15 +365,15 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
-    use cairn_llm::interface::complete::{
+    use cairn_models::interface::complete::{
         Complete, CompletionCall, CompletionError, CompletionReply,
     };
-    use cairn_llm::interface::{Llm, LlmScope};
+    use cairn_models::interface::{ModelScope, Models};
     use serde_json::{json, Value};
 
     use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth};
     use crate::models::{CreateRecipe, Recipe, RecipeFile, UpdateRecipe};
-    use crate::orchestrator::llm::LlmRuntime;
+    use crate::orchestrator::models::ModelRuntime;
     use crate::orchestrator::Orchestrator;
 
     /// A chat server that answers from a script and counts what it was asked.
@@ -422,14 +422,14 @@ mod tests {
     /// A bare workspace whose one provider is a custom chat server serving
     /// `qwen3`, answering from `replies`.
     async fn workspace_with_chat_server(replies: Vec<Value>) -> (Orchestrator, Arc<Scripted>) {
-        let mut orch = crate::orchestrator::llm::tests::bare_orchestrator().await;
+        let mut orch = crate::orchestrator::models::tests::bare_orchestrator().await;
         let scripted = Arc::new(Scripted {
             replies: Mutex::new(replies.into()),
             ..Scripted::default()
         });
-        orch.llm_runtime = LlmRuntime {
+        orch.models_runtime = ModelRuntime {
             complete: scripted.clone(),
-            ..orch.llm_runtime.clone()
+            ..orch.models_runtime.clone()
         };
         let account = orch
             .add_custom_provider(
@@ -449,7 +449,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        orch.refresh_provider_model_catalog_blocking(&cairn_llm::types::catalog::custom_key(
+        orch.refresh_provider_model_catalog_blocking(&cairn_models::types::catalog::custom_key(
             &account.id,
         ));
         (orch, scripted)
@@ -532,7 +532,7 @@ edges:
         assert_eq!(server.calls(), 1);
 
         // And the catalog stops offering it for decisions.
-        let catalog = orch.catalog(&LlmScope::default()).unwrap();
+        let catalog = orch.catalog(&ModelScope::default()).unwrap();
         assert!(catalog.decision_offers().is_empty());
 
         // A read reports it as blocking, naming why, without asking again.

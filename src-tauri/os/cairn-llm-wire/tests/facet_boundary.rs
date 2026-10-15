@@ -1,7 +1,7 @@
-//! The public cairn-llm facet reaches neither the runtime nor the private crate.
+//! The public cairn-models facet reaches neither the runtime nor the private crate.
 //! The check lives with the facet; it runs here too so a manifest change to
 //! this crate re-runs it.
-#[path = "../../cairn-llm/tests/support/facet_graph.rs"]
+#[path = "../../cairn-models/tests/support/facet_graph.rs"]
 mod facet_graph;
 
 #[test]

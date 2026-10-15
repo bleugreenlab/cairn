@@ -416,10 +416,10 @@ pub fn recover_provider_watchdog(
         ) {
             Ok(outcome) => {
                 let reason = match outcome {
-                    cairn_llm::session::codex::ExactTurnInterrupt::AlreadyTerminal { .. } => {
-                        "post_tool_interrupt_already_terminal"
-                    }
-                    cairn_llm::session::codex::ExactTurnInterrupt::Acknowledged { .. } => {
+                    cairn_models::session::codex::ExactTurnInterrupt::AlreadyTerminal {
+                        ..
+                    } => "post_tool_interrupt_already_terminal",
+                    cairn_models::session::codex::ExactTurnInterrupt::Acknowledged { .. } => {
                         "post_tool_interrupt_acknowledged"
                     }
                 };

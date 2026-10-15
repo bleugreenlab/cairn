@@ -7,7 +7,7 @@ use crate::transcripts::stream_store::{
 use cairn_db::error::CairnError;
 use cairn_db::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::{params, Connection, Row};
-use cairn_models::{Event, Prompt, Run, RunStatus};
+use cairn_domain::{Event, Prompt, Run, RunStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::future::Future;

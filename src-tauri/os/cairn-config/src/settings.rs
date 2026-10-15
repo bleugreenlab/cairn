@@ -461,11 +461,11 @@ impl SettingsFile {
                     .map(|(backend, _)| backend.clone()),
             );
         }
-        evidence.retain(|backend| cairn_llm_types::catalog::is_supported(backend));
+        evidence.retain(|backend| cairn_models_types::catalog::is_supported(backend));
         if evidence.is_empty() {
-            evidence.push(cairn_llm_types::catalog::CLAUDE_FAMILY_BACKEND.to_string());
+            evidence.push(cairn_models_types::catalog::CLAUDE_FAMILY_BACKEND.to_string());
         }
-        cairn_llm_types::catalog::in_catalog_order(evidence)
+        cairn_models_types::catalog::in_catalog_order(evidence)
     }
 
     /// Convert to Settings DTO with defaults applied.
@@ -529,10 +529,10 @@ impl SettingsFile {
             tiers: presets.tiers,
             backends: presets.backends,
             enabled_providers: match &self.enabled_providers {
-                Some(enabled) => cairn_llm_types::catalog::in_catalog_order(enabled),
+                Some(enabled) => cairn_models_types::catalog::in_catalog_order(enabled),
                 // Un-migrated: every shipped provider, which is the surface this
                 // workspace already had. `migrate_enabled_providers` narrows it.
-                None => cairn_llm_types::catalog::supported_keys()
+                None => cairn_models_types::catalog::supported_keys()
                     .map(str::to_string)
                     .collect(),
             },
@@ -1147,7 +1147,7 @@ impl ProviderNames {
             .get(key)
             .cloned()
             .or_else(|| {
-                cairn_llm_types::catalog::descriptor(key)
+                cairn_models_types::catalog::descriptor(key)
                     .map(|entry| entry.display_name.to_string())
             })
             .unwrap_or_else(|| key.to_string())
@@ -1159,7 +1159,7 @@ fn validate_enabled_providers(
     enablement_changed: bool,
     provider_names: &ProviderNames,
 ) -> Result<(), String> {
-    use cairn_llm_types::catalog;
+    use cairn_models_types::catalog;
     if settings.enabled_providers.is_empty() {
         return Err(
             "A workspace needs at least one provider. Add a provider before removing this one."
@@ -1252,7 +1252,7 @@ fn apply_settings_update(current: &mut Settings, input: UpdateSettings) {
         current.backends = value;
     }
     if let Some(value) = input.enabled_providers {
-        current.enabled_providers = cairn_llm_types::catalog::in_catalog_order(value);
+        current.enabled_providers = cairn_models_types::catalog::in_catalog_order(value);
     }
     if let Some(value) = input.max_thinking_tokens {
         current.max_thinking_tokens = value;
@@ -3103,7 +3103,7 @@ mod enabled_provider_tests {
         // the full catalog is what makes this change invisible until the
         // migration has actually looked at the workspace's evidence.
         let file: SettingsFile = serde_yaml::from_str("tiers: [sm, md, lg]\n").unwrap();
-        let expected: Vec<String> = cairn_llm_types::catalog::supported_keys()
+        let expected: Vec<String> = cairn_models_types::catalog::supported_keys()
             .map(str::to_string)
             .collect();
         assert_eq!(file.to_settings().enabled_providers, expected);

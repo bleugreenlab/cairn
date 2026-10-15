@@ -1,14 +1,14 @@
-//! Application adapter for the OpenAI Responses protocol in `cairn-llm`.
+//! Application adapter for the OpenAI Responses protocol in `cairn-models`.
 //! Core supplies credentials, model selection, and history loading.
 
 pub(crate) mod conversation;
 pub(crate) mod http;
-pub(crate) use cairn_llm::wire::openai_responses::wire;
+pub(crate) use cairn_models::wire::openai_responses::wire;
 
 use crate::backends::http_loop::{Connection, WireAdapter};
 use crate::backends::SessionConfig;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::turn::ResponsesFamily;
+use cairn_models::turn::ResponsesFamily;
 use http::ResponsesEndpoint;
 use wire::ResponsesTurn;
 

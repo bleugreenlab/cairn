@@ -5,7 +5,7 @@
 //! has ended, token usage normalized from Codex's counters, readers for the
 //! items a turn produces, the goal payloads, and the `UserInput` a turn starts
 //! with. Spawning the server and correlating requests is transport
-//! (`cairn_llm::codex::app_server`); persisting what a turn did belongs to the
+//! (`cairn_models::codex::app_server`); persisting what a turn did belongs to the
 //! session runtime.
 
 pub mod goal;

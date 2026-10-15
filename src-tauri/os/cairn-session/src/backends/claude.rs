@@ -14,15 +14,15 @@ use crate::transcripts::stream_store::{
 };
 use cairn_common::ids;
 use cairn_db::storage::LocalDb;
-use cairn_llm::types::catalog::{claude_context_window, ClaudeContextOptIn};
-use cairn_llm::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
-use cairn_llm::wire::claude_stream::{
+use cairn_domain::ContextTokenState;
+use cairn_models::types::catalog::{claude_context_window, ClaudeContextOptIn};
+use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
+use cairn_models::wire::claude_stream::{
     extract_tool_start, message_start_usage, parse_thinking_tokens_estimate,
     result_is_rate_limited, stderr_reports_unknown_session, terminal_provider_depletion,
     ClaudeEvent, ControlResponseInner, DeltaContent, ProviderDepletion, RateLimitInfo,
     StreamEventInner, StreamEvidence, Usage,
 };
-use cairn_models::ContextTokenState;
 use cairn_platform::services::emitter::EventEmitter;
 use std::{
     collections::HashSet,
@@ -1465,7 +1465,7 @@ impl ClaudeRuntime {
                                     &run_id[..run_id.len().min(8)]
                                 );
                                 if let Some(generation) =
-                                    cairn_llm::session::claude::credential_push_generation(
+                                    cairn_models::session::claude::credential_push_generation(
                                         request_id,
                                     )
                                 {
@@ -2224,7 +2224,7 @@ impl ClaudeRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_llm::wire::claude_stream::{parse_event, ClaudeEvent, Usage};
+    use cairn_models::wire::claude_stream::{parse_event, ClaudeEvent, Usage};
     #[test]
     fn silent_resumed_turn_expires_at_the_bounded_window() {
         let timeout = Duration::from_secs(10);

@@ -4,7 +4,7 @@
 //! They form the completion boundary for the planned `cairn-session` crate.
 
 use super::stream::TokenCounts;
-use cairn_llm::turn::{SuspendKind, TurnExit};
+use cairn_models::turn::{SuspendKind, TurnExit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionTurnOutcome {

@@ -1666,42 +1666,42 @@ mod tests {
     }
 
     #[test]
-    fn affordance_for_llm_session_kind_offers_only_stop() {
-        let output = affordance_for_kind(ResourceKind::LlmSession);
-        assert!(output.starts_with("## LLM session\n"));
-        assert!(output.contains("- [stop a session](cairn://llm/sessions/{id}):"));
+    fn affordance_for_models_session_kind_offers_only_stop() {
+        let output = affordance_for_kind(ResourceKind::ModelsSession);
+        assert!(output.starts_with("## Model session\n"));
+        assert!(output.contains("- [stop a session](cairn://models/sessions/{id}):"));
         assert!(output.contains("payload:{action:\"stop\"}"));
         // Messaging is the home's door, named rather than duplicated.
         assert!(output.contains(
             "- [send this session a message: append to its home's messages (the home is shown on the session)](cairn://p/{project}/{number}/{exec}/{node}/messages):"
         ));
-        assert!(!output.contains("(cairn://llm/sessions/{id}): required `content"));
+        assert!(!output.contains("(cairn://models/sessions/{id}): required `content"));
     }
 
     #[test]
-    fn affordance_for_llm_sessions_names_the_task_door() {
-        let output = affordance_for_kind(ResourceKind::LlmSessions);
+    fn affordance_for_models_sessions_names_the_task_door() {
+        let output = affordance_for_kind(ResourceKind::ModelsSessions);
         assert!(output.contains(
             "- [start a session: delegate a task (choose its provider and model with backend/tier)](cairn://p/{project}/{number}/{exec}/{node}/tasks):"
         ));
         // The resource itself still creates nothing.
-        assert!(!output.contains("(cairn://llm/sessions)"));
+        assert!(!output.contains("(cairn://models/sessions)"));
     }
 
     #[test]
-    fn affordance_for_llm_read_kinds_is_read_only() {
+    fn affordance_for_models_read_kinds_is_read_only() {
         for kind in [
-            ResourceKind::Llm,
-            ResourceKind::LlmCatalog,
-            ResourceKind::LlmUsage,
+            ResourceKind::Models,
+            ResourceKind::ModelsCatalog,
+            ResourceKind::ModelsUsage,
         ] {
             let output = affordance_for_kind(kind);
             assert!(!output.contains("### actions"), "{kind:?}:\n{output}");
         }
         // The sessions list's one action is the task door, which lives elsewhere.
-        let sessions = affordance_for_kind(ResourceKind::LlmSessions);
+        let sessions = affordance_for_kind(ResourceKind::ModelsSessions);
         assert_eq!(sessions.matches("\n- [").count(), 1, "{sessions}");
-        let catalog = affordance_for_kind(ResourceKind::LlmCatalog);
+        let catalog = affordance_for_kind(ResourceKind::ModelsCatalog);
         assert!(catalog.contains("installed"), "{catalog}");
         assert!(catalog.contains("view"), "{catalog}");
     }
@@ -1710,12 +1710,12 @@ mod tests {
     /// account re-authenticates, finishes or cancels a pending sign-in, and
     /// re-measures. Both name the grant a sign-in needs and the human doors.
     #[test]
-    fn affordance_for_llm_accounts_offers_sign_in_and_refresh() {
-        let list = affordance_for_kind(ResourceKind::LlmAccounts);
+    fn affordance_for_models_accounts_offers_sign_in_and_refresh() {
+        let list = affordance_for_kind(ResourceKind::ModelsAccounts);
         assert!(list.contains("### actions"), "{list}");
         assert!(
             list.contains(
-                r#"target:"cairn://llm/accounts",mode:"append",payload:{provider:"claude"}"#
+                r#"target:"cairn://models/accounts",mode:"append",payload:{provider:"claude"}"#
             ),
             "{list}"
         );
@@ -1725,13 +1725,13 @@ mod tests {
         );
         assert!(list.contains("claude | codex"), "{list}");
 
-        let one = affordance_for_kind(ResourceKind::LlmAccount);
+        let one = affordance_for_kind(ResourceKind::ModelsAccount);
         assert!(one.contains(r#"payload:{action:"sign_in"}"#), "{one}");
         for action in ["sign_in", "submit_code", "cancel_sign_in", "refresh_usage"] {
             assert!(one.contains(action), "{action} missing:\n{one}");
         }
 
-        for kind in [ResourceKind::LlmAccounts, ResourceKind::LlmAccount] {
+        for kind in [ResourceKind::ModelsAccounts, ResourceKind::ModelsAccount] {
             let description = cairn_common::contract::contract_for(kind)
                 .expect("registered")
                 .description;

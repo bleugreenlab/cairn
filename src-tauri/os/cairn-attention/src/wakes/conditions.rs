@@ -8,7 +8,7 @@ use std::{
 use tokio::sync::mpsc;
 
 use crate::runtime::AttentionRuntime;
-use cairn_models::DeliveryUrgency;
+use cairn_domain::DeliveryUrgency;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -1,6 +1,6 @@
 //! Re-measuring a provider's usage on demand: the one path behind the
 //! Settings card's refresh button, the per-account usage refresh, and
-//! `cairn://llm/accounts` `refresh_usage`.
+//! `cairn://models/accounts` `refresh_usage`.
 //!
 //! A Claude or Codex account is probed under the same single-flight
 //! reservation a background capture takes, its result is kept only if the
@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use cairn_llm::types::usage::ProviderUsageSnapshot;
+use cairn_models::types::usage::ProviderUsageSnapshot;
 
 use super::identity::ProviderUsageCaptureReservation;
 use super::Orchestrator;
@@ -340,8 +340,8 @@ mod tests {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
-    use cairn_llm::subscription::testing::TempHomes;
-    use cairn_llm::types::usage::{ProviderUsageScope, ProviderUsageWindow};
+    use cairn_models::subscription::testing::TempHomes;
+    use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
     use std::path::Path;
     use std::sync::Arc;
 
@@ -452,14 +452,14 @@ mod tests {
         assert_eq!(refreshed[0].measurement, UsageMeasurement::Probed);
         assert_eq!(health_windows(&orch, &id).len(), 1);
 
-        let account = page(&orch, &format!("cairn://llm/accounts/{id}")).await;
+        let account = page(&orch, &format!("cairn://models/accounts/{id}")).await;
         assert!(account.contains("session: 42% left"), "{account}");
-        let usage = page(&orch, "cairn://llm/usage?provider=claude").await;
+        let usage = page(&orch, "cairn://models/usage?provider=claude").await;
         assert!(usage.contains("42%"), "{usage}");
 
         drop(orch);
         let restarted = orchestrator_at(&root, &homes).await;
-        let account = page(&restarted, &format!("cairn://llm/accounts/{id}")).await;
+        let account = page(&restarted, &format!("cairn://models/accounts/{id}")).await;
         assert!(account.contains("session: 42% left"), "{account}");
     }
 

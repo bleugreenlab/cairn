@@ -26,8 +26,8 @@ use std::thread;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde_json::Value;
 
-use cairn_llm::codex::app_server::AppServerClient;
-use cairn_llm::wire::codex_app_server::Notification;
+use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::wire::codex_app_server::Notification;
 /// Application actions for a pool's shared identity and disconnected runs.
 pub trait PoolHost: Send + Sync {
     fn refresh_tokens(&self, client: &AppServerClient, request_id: &Value);

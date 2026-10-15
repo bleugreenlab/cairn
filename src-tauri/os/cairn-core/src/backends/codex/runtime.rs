@@ -11,8 +11,8 @@ use crate::orchestrator::lifecycle::{apply_codex_turn_completion, CodexTurnConte
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
-use cairn_llm::codex::app_server::AppServerClient;
-use cairn_llm::codex::tokens::CodexAuthState;
+use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::codex::tokens::CodexAuthState;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -611,7 +611,7 @@ impl CodexHost for CodexReaderHost {
             }
         }
     }
-    fn account_usage(&self, snapshot: cairn_llm::types::usage::ProviderUsageSnapshot) {
+    fn account_usage(&self, snapshot: cairn_models::types::usage::ProviderUsageSnapshot) {
         let oauth_state = &self.oauth_state;
         let orch = &self.session.orch;
         // Attribute the update to the subscription that spent
@@ -794,7 +794,7 @@ mod tests {
             let mut handle = RunHandle::new(
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(Some(
-                    cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+                    cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
                 ))),
                 Some("s".into()),
                 Some("j".into()),
@@ -916,7 +916,7 @@ mod tests {
             requests.clone(),
         ));
         let provider_turn = Arc::new(Mutex::new(Some("p1".to_string())));
-        let stdin = cairn_llm::session::codex::CodexControl::new(
+        let stdin = cairn_models::session::codex::CodexControl::new(
             client.clone(),
             "native-thread".to_string(),
             "/tmp/p".to_string(),

@@ -16,8 +16,10 @@ use crate::backends::SessionConfig;
 use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
 use crate::credentials::CustomSampling;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::interface::complete::{Complete, CompletionCall, CompletionReply, CompletionWire};
-use cairn_llm::turn::ChatFamily;
+use cairn_models::interface::complete::{
+    Complete, CompletionCall, CompletionReply, CompletionWire,
+};
+use cairn_models::turn::ChatFamily;
 use serde_json::{json, Map, Value};
 use std::time::Instant;
 
@@ -114,7 +116,7 @@ impl WireAdapter for CustomAdapter {
     }
 
     fn account_id(&self) -> Option<String> {
-        cairn_llm::types::catalog::custom_account_id(&self.backend_key).map(str::to_string)
+        cairn_models::types::catalog::custom_account_id(&self.backend_key).map(str::to_string)
     }
 
     fn backend_name(&self) -> &str {

@@ -10,7 +10,7 @@ use crate::agent_process::stream::TranscriptEvent;
 use crate::backends::{self, SessionConfig, SessionStart};
 use crate::identity::CredentialStoreExt;
 use crate::models::Model;
-use cairn_llm::wire::claude_stream::ClaudeEvent;
+use cairn_models::wire::claude_stream::ClaudeEvent;
 use cairn_session::agent_process::stream::TranscriptJson;
 
 use crate::storage::{run_db_blocking, DbError, DbResult, LocalDb, RowExt};
@@ -910,7 +910,7 @@ fn render_schema_fields(schema_value: &serde_json::Value) -> String {
         return String::new();
     };
     let mut out = String::from("Fields:\n");
-    for key in cairn_llm::wire::schema_order::property_order(schema_value) {
+    for key in cairn_models::wire::schema_order::property_order(schema_value) {
         let val = &props[key];
         let ty = val.get("type").and_then(|t| t.as_str()).unwrap_or("any");
         let desc = val
@@ -1763,9 +1763,9 @@ pub(crate) fn system_prompt_placement(
     residence: &Path,
     run_id: &str,
     content: String,
-) -> cairn_llm::interface::session::PlacedFile {
+) -> cairn_models::interface::session::PlacedFile {
     let file_path = system_prompt_file_path(residence, run_id);
-    cairn_llm::interface::session::PlacedFile {
+    cairn_models::interface::session::PlacedFile {
         dir: file_path
             .parent()
             .unwrap_or(residence)
@@ -2723,7 +2723,7 @@ mod tests {
         }
         fn discover_models(
             &self,
-        ) -> Result<Vec<cairn_llm::types::catalog::DiscoveredModel>, String> {
+        ) -> Result<Vec<cairn_models::types::catalog::DiscoveredModel>, String> {
             Ok(Vec::new())
         }
         fn resolve_tools(
@@ -2777,9 +2777,9 @@ mod tests {
     /// never share a file and cleaning one up cannot strand the other.
     #[test]
     fn a_prompt_is_written_and_removed_per_run_within_one_residence() {
-        use cairn_llm::interface::session::SessionHost;
+        use cairn_models::interface::session::SessionHost;
         let residence = tempdir().unwrap();
-        let host = cairn_llm::session::local::LocalSessionHost::new(
+        let host = cairn_models::session::local::LocalSessionHost::new(
             std::sync::Arc::new(crate::services::RealProcessSpawner),
             residence.path().join("codex"),
         );
@@ -3130,7 +3130,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            cairn_llm::wire::schema_order::property_order(&schema)
+            cairn_models::wire::schema_order::property_order(&schema)
         );
         assert_eq!(names, ["title", "content", "summary"]);
     }
@@ -3459,10 +3459,10 @@ mod tests {
             .unwrap();
         orch.record_account_health(
             &exhausted.id,
-            vec![cairn_llm::types::usage::ProviderUsageWindow {
+            vec![cairn_models::types::usage::ProviderUsageWindow {
                 id: "weekly".to_string(),
                 label: "Weekly".to_string(),
-                scope: cairn_llm::types::usage::ProviderUsageScope::Weekly,
+                scope: cairn_models::types::usage::ProviderUsageScope::Weekly,
                 scope_target: None,
                 used_percent: 100.0,
                 remaining_percent: 0.0,

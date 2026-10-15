@@ -1,9 +1,9 @@
 //! Core's effects for the facet's `FamilyTurn`: the live transcript stream,
 //! Cairn tool dispatch, and transcript persistence.
 use super::*;
-use cairn_llm::turn::{GenerationMeta, ToolDispatch, TurnEffects};
-use cairn_llm::wire::replay::SKIPPED_TOOL_RESULT;
-use cairn_llm::wire::stream::StreamSink;
+use cairn_models::turn::{GenerationMeta, ToolDispatch, TurnEffects};
+use cairn_models::wire::replay::SKIPPED_TOOL_RESULT;
+use cairn_models::wire::stream::StreamSink;
 
 pub(super) struct CairnEffects<'a, A: WireAdapter> {
     pub orch: &'a Orchestrator,

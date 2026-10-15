@@ -1,5 +1,5 @@
 use crate::agent_process::process::AgentProcessState;
-use cairn_llm::types::usage::ProviderUsageSnapshot;
+use cairn_models::types::usage::ProviderUsageSnapshot;
 
 /// Host admission of a provider-initiated turn, after the host reconciles its job.
 pub enum GoalTurnAdmission {
@@ -66,15 +66,15 @@ use crate::agent_process::stream::TokenCounts;
 use crate::agent_process::stream::{ToolUseInfo, TranscriptEvent};
 use crate::transcripts::stream_store::append_chunks;
 use cairn_db::storage::LocalDb;
-use cairn_llm::usage::codex_rate_limits::codex_rate_limit_snapshot_from_value;
-use cairn_llm::wire::claude_stream::Usage;
-use cairn_llm::wire::codex_app_server::{
+use cairn_domain::ContextTokenState;
+use cairn_models::usage::codex_rate_limits::codex_rate_limit_snapshot_from_value;
+use cairn_models::wire::claude_stream::Usage;
+use cairn_models::wire::codex_app_server::{
     context_usage, extract_command_execution, extract_mcp_result,
     extract_raw_response_message_text, is_selected_model_capacity_error, normalize_capacity_error,
     notification_turn_id, summarize_command_result, summarize_file_change_result,
     CodexTurnUsageAccumulator, Notification, ProviderTurnStatus,
 };
-use cairn_models::ContextTokenState;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};

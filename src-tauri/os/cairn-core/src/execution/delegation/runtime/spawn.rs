@@ -12,7 +12,7 @@ use crate::execution::jobs::{
 use crate::models::{AgentConfig, DelegatedStatus, Model};
 use crate::orchestrator::Orchestrator;
 use cairn_common::protocol::CallbackResponse;
-use cairn_llm::turn::SuspendKind;
+use cairn_models::turn::SuspendKind;
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 

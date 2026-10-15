@@ -70,9 +70,9 @@ pub async fn prepare_batch(
                 },
             ));
         }
-        // A sign-in through `cairn://llm/accounts` reaches the same place a
+        // A sign-in through `cairn://models/accounts` reaches the same place a
         // `cairn://settings` `accounts` patch does, so it is the same boundary.
-        if let Some(request) = crate::resources::mutations::llm_account_authority(orch, item) {
+        if let Some(request) = crate::resources::mutations::models_account_authority(orch, item) {
             prepared.push((
                 index,
                 match request {

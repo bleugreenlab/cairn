@@ -353,7 +353,7 @@ pub(super) fn register_warm_process(orch: &Orchestrator, run_id: &str, job_id: O
     let mut processes = orch.process_state.processes.lock().unwrap();
     let child = Arc::new(Mutex::new(None));
     let stdin = Arc::new(Mutex::new(Some(
-        cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+        cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
     )));
     let handle = RunHandle::new(
         child,

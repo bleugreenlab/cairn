@@ -11,7 +11,7 @@
 //! no conversation, no tools, and no stream: [`http::build_body`] and
 //! [`http::post_decisions`] are the whole family. The types here are the
 //! provider's JSON, not Cairn's answer type; the facet's `decide` maps them
-//! onto `cairn_models::decision`, which is where the refusal rule is kept.
+//! onto `cairn_domain::decision`, which is where the refusal rule is kept.
 
 pub mod http;
 pub mod wire;

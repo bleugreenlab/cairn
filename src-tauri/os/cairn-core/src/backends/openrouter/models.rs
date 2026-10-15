@@ -1,4 +1,4 @@
-use cairn_llm::types::catalog::{
+use cairn_models::types::catalog::{
     DiscoveredModel, DiscoveredModelPricing, DiscoveredReasoningEffort,
 };
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};

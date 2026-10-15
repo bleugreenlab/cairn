@@ -1364,7 +1364,7 @@ mod tests {
         let handle = RunHandle::new(
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(Some(
-                cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+                cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
             ))),
             Some("sess-process".to_string()),
             Some("job-1".to_string()),
@@ -1400,7 +1400,7 @@ mod tests {
         let mut handle = RunHandle::new(
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(Some(
-                cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+                cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
             ))),
             Some("sess-1".to_string()),
             Some("job-thread".to_string()),

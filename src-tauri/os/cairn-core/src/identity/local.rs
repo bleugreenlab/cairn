@@ -2,7 +2,7 @@
 
 use super::{CredentialStoreExt, GitIdentity, UserIdentity};
 use crate::credentials::*;
-use cairn_llm::accounts::store::*;
+use cairn_models::accounts::store::*;
 use std::path::Path;
 
 /// Seed author metadata for a new credential store from the host Git config.

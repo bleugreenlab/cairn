@@ -7,7 +7,7 @@
 use crate::agent_process::process::{
     AgentProcessState, GoalPauseClaim, PauseIntent, SessionControl,
 };
-use cairn_llm::interface::session::SessionInput;
+use cairn_models::interface::session::SessionInput;
 
 /// Lock a run's control and goal claim, then call `f` with them.
 fn with_session_control<T, F>(
@@ -100,7 +100,7 @@ pub(crate) fn interrupt_exact_codex_turn(
     process_state: &AgentProcessState,
     run_id: &str,
     provider_turn_id: &str,
-) -> Result<cairn_llm::session::codex::ExactTurnInterrupt, String> {
+) -> Result<cairn_models::session::codex::ExactTurnInterrupt, String> {
     with_session_control(process_state, run_id, |stdin, _claim| {
         super::codex::interrupt_exact_app_server_turn(stdin, provider_turn_id)
     })

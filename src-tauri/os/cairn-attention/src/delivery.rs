@@ -113,7 +113,7 @@ pub fn create_resolved_push(runtime: &AttentionRuntime, event: &AttentionEvent) 
             for recipient in recipients {
                 if let Err(e) = runtime
                     .host
-                    .nudge(&recipient, cairn_models::DeliveryUrgency::Steer)
+                    .nudge(&recipient, cairn_domain::DeliveryUrgency::Steer)
                 {
                     log::warn!(
                         "resolved push wake for {} failed: {}",
@@ -792,7 +792,7 @@ async fn resolved_issue_confirmation(
 async fn keyed_direct_message(
     runtime: &AttentionRuntime,
     push: &crate::push::Push,
-) -> Option<cairn_models::Message> {
+) -> Option<cairn_domain::Message> {
     let message_id =
         crate::push::latest_push_fingerprint(&runtime.private_db, &push.recipient, &push.key)
             .await

@@ -12,10 +12,10 @@ use crate::backends::SessionConfig;
 use crate::dispatch::DispatchOutput;
 use crate::orchestrator::Orchestrator;
 use crate::storage::LocalDb;
-use cairn_llm::interface::complete::{
+use cairn_models::interface::complete::{
     Complete, CompletionCall, CompletionError, CompletionReply, Delivery,
 };
-use cairn_llm::turn::ChatFamily;
+use cairn_models::turn::ChatFamily;
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -385,7 +385,7 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
 
     // Sequence S: the streamed reasoning event, finalized exactly as the live
     // SSE reader does (open stream, append thinking deltas, finalize).
-    use cairn_llm::wire::stream::{StreamSink, StreamSummary};
+    use cairn_models::wire::stream::{StreamSink, StreamSummary};
     let mut sink = TranscriptSink::new(
         &orch,
         orch.db.local.clone(),
@@ -472,9 +472,9 @@ async fn streamed_reasoning_then_tool_call_persists_both_events() {
     assert_eq!(raw["generationId"], "generation-1");
     assert_eq!(raw["model"], "model-1");
     assert_eq!(raw["usage"]["prompt_tokens"], 20);
-    let replay: cairn_llm::wire::ReplayEvent = reasoning.clone().into();
+    let replay: cairn_models::wire::ReplayEvent = reasoning.clone().into();
     assert_eq!(
-        cairn_llm::wire::replay::stored_reasoning_details(&replay).unwrap()[0]["data"],
+        cairn_models::wire::replay::stored_reasoning_details(&replay).unwrap()[0]["data"],
         "opaque-signature"
     );
     // The tool call must ALSO surface, carrying tool_uses for the read.
@@ -517,7 +517,7 @@ enum SeamMode {
     /// Arm the terminal-tool boundary during the POST → finalize after one round.
     TerminalTool,
     /// Request a suspend during the POST → finalize suspended after one round.
-    Suspend(cairn_llm::turn::SuspendKind),
+    Suspend(cairn_models::turn::SuspendKind),
     CancelBeforePost,
     CancelDuringPost,
     Failure,
@@ -744,7 +744,7 @@ async fn seam_loop_finalizes_on_terminal_tool() {
 #[tokio::test]
 async fn seam_loop_finalizes_on_suspend() {
     let (orch, calls, _dir) =
-        run_seam(SeamMode::Suspend(cairn_llm::turn::SuspendKind::Prompt)).await;
+        run_seam(SeamMode::Suspend(cairn_models::turn::SuspendKind::Prompt)).await;
     // The suspend is read back after the round's tool executes and ends the turn
     // before any success result — no second POST.
     assert_eq!(calls, 1);
@@ -792,7 +792,7 @@ async fn seam_loop_cancellation_discards_partial_generation() {
 
 #[tokio::test]
 async fn seam_loop_preserves_both_durable_wait_reasons() {
-    use cairn_llm::turn::SuspendKind;
+    use cairn_models::turn::SuspendKind;
     for (kind, reason) in [
         (SuspendKind::Prompt, "prompt_wait_suspended"),
         (SuspendKind::DelegatedTask, "delegated_wait_suspended"),

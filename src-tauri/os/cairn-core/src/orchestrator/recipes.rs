@@ -729,7 +729,7 @@ edges:
     async fn a_decision_recipe_is_refused_until_something_can_answer_it() {
         use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth};
 
-        let orch = crate::orchestrator::llm::tests::bare_orchestrator().await;
+        let orch = crate::orchestrator::models::tests::bare_orchestrator().await;
 
         let validation = orch
             .validate_recipe_file(LEGACY_AI_CONDITION, "yaml")
@@ -776,7 +776,7 @@ edges:
                 None,
             )
             .unwrap();
-        orch.refresh_provider_model_catalog_blocking(&cairn_llm::types::catalog::custom_key(
+        orch.refresh_provider_model_catalog_blocking(&cairn_models::types::catalog::custom_key(
             &jev.id,
         ));
 

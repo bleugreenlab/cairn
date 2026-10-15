@@ -18,8 +18,8 @@
 use super::{opencode_api_key, OPENCODE_BACKEND_KEY};
 use crate::orchestrator::Orchestrator;
 use cairn_analytics::{self as analytics, types::Scope, types::TimeRange};
-use cairn_llm::types::usage::{ProviderModelUsageRow, ProviderUsageSnapshot};
-use cairn_llm::usage::opencode::fetch_usage_windows;
+use cairn_models::types::usage::{ProviderModelUsageRow, ProviderUsageSnapshot};
+use cairn_models::usage::opencode::fetch_usage_windows;
 
 /// Snapshot source tag for the Go usage snapshot.
 const OPENCODE_USAGE_SOURCE: &str = "opencode_go_usage";

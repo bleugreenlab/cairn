@@ -108,15 +108,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         ["grants", id] => Some(CairnResource::Grant {
             id: (*id).to_string(),
         }),
-        ["llm"] => Some(CairnResource::Llm),
-        ["llm", "catalog"] => Some(CairnResource::LlmCatalog),
-        ["llm", "accounts"] => Some(CairnResource::LlmAccounts),
-        ["llm", "accounts", id] => Some(CairnResource::LlmAccount {
+        ["models"] => Some(CairnResource::Models),
+        ["models", "catalog"] => Some(CairnResource::ModelsCatalog),
+        ["models", "accounts"] => Some(CairnResource::ModelsAccounts),
+        ["models", "accounts", id] => Some(CairnResource::ModelsAccount {
             id: (*id).to_string(),
         }),
-        ["llm", "usage"] => Some(CairnResource::LlmUsage),
-        ["llm", "sessions"] => Some(CairnResource::LlmSessions),
-        ["llm", "sessions", id] => Some(CairnResource::LlmSession {
+        ["models", "usage"] => Some(CairnResource::ModelsUsage),
+        ["models", "sessions"] => Some(CairnResource::ModelsSessions),
+        ["models", "sessions", id] => Some(CairnResource::ModelsSession {
             id: (*id).to_string(),
         }),
         // Names are normalized on the way in so the address an agent reads out

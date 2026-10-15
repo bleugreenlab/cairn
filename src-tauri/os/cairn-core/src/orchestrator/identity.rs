@@ -94,7 +94,7 @@ impl Orchestrator {
         provider: RoutedProvider,
         account_id: &str,
         captured_generation: Option<String>,
-        snapshot: cairn_llm::types::usage::ProviderUsageSnapshot,
+        snapshot: cairn_models::types::usage::ProviderUsageSnapshot,
     ) -> Result<bool, String> {
         if provider == RoutedProvider::Claude {
             let current_generation = self
@@ -130,13 +130,13 @@ impl Orchestrator {
     }
 
     /// The subscription mechanics this runtime was built with.
-    pub fn subscriptions(&self) -> &dyn cairn_llm::subscription::Subscriptions {
+    pub fn subscriptions(&self) -> &dyn cairn_models::subscription::Subscriptions {
         self.subscriptions.as_ref()
     }
 
     /// The facet implementations every launch goes through.
-    pub fn llm_runtime(&self) -> &super::llm::LlmRuntime {
-        &self.llm_runtime
+    pub fn models_runtime(&self) -> &super::models::ModelRuntime {
+        &self.models_runtime
     }
 
     /// Get the full identity store.
@@ -378,12 +378,12 @@ impl Orchestrator {
         label: String,
         auth_json: String,
         project_id: Option<String>,
-        target: &cairn_llm::subscription::SignInTarget,
-    ) -> Result<AccountInfo, cairn_llm::subscription::SignInRecordError> {
+        target: &cairn_models::subscription::SignInTarget,
+    ) -> Result<AccountInfo, cairn_models::subscription::SignInRecordError> {
         let mut store = self.get_credential_store().unwrap_or_else(|| {
             crate::identity::local::credential_store_from_git_config(&self.config_dir)
         });
-        let info = cairn_llm::subscription::store_codex_sign_in(
+        let info = cairn_models::subscription::store_codex_sign_in(
             &mut store,
             label,
             auth_json,
@@ -432,7 +432,7 @@ impl Orchestrator {
     pub(crate) fn record_account_health(
         &self,
         id: &str,
-        windows: Vec<cairn_llm::types::usage::ProviderUsageWindow>,
+        windows: Vec<cairn_models::types::usage::ProviderUsageWindow>,
         blocked_until: Option<i64>,
     ) -> Result<String, String> {
         let mut guard = self
@@ -584,7 +584,7 @@ impl Orchestrator {
             Some(snapshot)
                 if snapshot.error_kind
                     == Some(
-                        cairn_llm::types::usage::ProviderUsageErrorKind::UsageProbeAuthentication,
+                        cairn_models::types::usage::ProviderUsageErrorKind::UsageProbeAuthentication,
                     ) =>
             {
                 true
@@ -603,7 +603,7 @@ impl Orchestrator {
     fn apply_captured_account_usage(
         &self,
         account_id: &str,
-        snapshot: cairn_llm::types::usage::ProviderUsageSnapshot,
+        snapshot: cairn_models::types::usage::ProviderUsageSnapshot,
     ) -> Result<(), String> {
         // Commit the provider-card snapshot and routing health while account
         // identity is held stable. Removal takes this same lock and then clears
@@ -874,8 +874,8 @@ impl Orchestrator {
     }
 }
 
-/// The host services the cairn-llm facet's subscription mechanics run against.
-impl cairn_llm::subscription::LlmHost for Orchestrator {
+/// The host services the cairn-models facet's subscription mechanics run against.
+impl cairn_models::subscription::ModelHost for Orchestrator {
     fn store(&self) -> &CredentialStoreHandle {
         &self.credential_store
     }
@@ -890,7 +890,7 @@ impl cairn_llm::subscription::LlmHost for Orchestrator {
 
     fn codex_path(&self) -> Result<String, String> {
         let path = crate::env::find_binary("codex")?;
-        cairn_llm::session::codex::version::check_codex_version(&path)?;
+        cairn_models::session::codex::version::check_codex_version(&path)?;
         Ok(path)
     }
 
@@ -940,8 +940,8 @@ impl cairn_llm::subscription::LlmHost for Orchestrator {
         &self,
         auth_json: String,
         project_id: Option<String>,
-        target: &cairn_llm::subscription::SignInTarget,
-    ) -> Result<AccountInfo, cairn_llm::subscription::SignInRecordError> {
+        target: &cairn_models::subscription::SignInTarget,
+    ) -> Result<AccountInfo, cairn_models::subscription::SignInRecordError> {
         let account = self.upsert_codex_oauth_account(
             "Codex OAuth".to_string(),
             auth_json,
@@ -956,7 +956,7 @@ impl cairn_llm::subscription::LlmHost for Orchestrator {
         &self,
         sign_in_ref: &str,
         provider: RoutedProvider,
-        outcome: cairn_llm::subscription::SignInOutcome,
+        outcome: cairn_models::subscription::SignInOutcome,
     ) {
         self.record_sign_in_settled(sign_in_ref, provider, outcome);
     }
@@ -971,8 +971,8 @@ mod tests {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, SearchIndex};
-    use cairn_llm::subscription::testing::TempHomes;
-    use cairn_llm::subscription::{LlmHost, Unsubscribed};
+    use cairn_models::subscription::testing::TempHomes;
+    use cairn_models::subscription::{ModelHost, Unsubscribed};
     use std::sync::Arc;
 
     async fn test_orchestrator() -> Orchestrator {
@@ -999,65 +999,65 @@ mod tests {
         }
     }
 
-    impl cairn_llm::subscription::Subscriptions for Generations {
-        fn claude_home(&self, host: &dyn LlmHost, id: &str) -> Option<std::path::PathBuf> {
+    impl cairn_models::subscription::Subscriptions for Generations {
+        fn claude_home(&self, host: &dyn ModelHost, id: &str) -> Option<std::path::PathBuf> {
             Unsubscribed.claude_home(host, id)
         }
         fn prepare_claude_home(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             id: &str,
         ) -> Result<std::path::PathBuf, String> {
             Unsubscribed.prepare_claude_home(host, id)
         }
-        fn claude_home_signed_in(&self, host: &dyn LlmHost, id: &str) -> bool {
+        fn claude_home_signed_in(&self, host: &dyn ModelHost, id: &str) -> bool {
             Unsubscribed.claude_home_signed_in(host, id)
         }
-        fn release_claude_home(&self, host: &dyn LlmHost, id: &str) -> Result<(), String> {
+        fn release_claude_home(&self, host: &dyn ModelHost, id: &str) -> Result<(), String> {
             Unsubscribed.release_claude_home(host, id)
         }
         fn claude_session_credential(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             id: &str,
-        ) -> Result<cairn_llm::subscription::ClaudeSessionCredential, String> {
+        ) -> Result<cairn_models::subscription::ClaudeSessionCredential, String> {
             Unsubscribed.claude_session_credential(host, id)
         }
-        fn renew_claude_credentials(&self, host: &dyn LlmHost) -> Vec<String> {
+        fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
             Unsubscribed.renew_claude_credentials(host)
         }
         fn claude_credential_rejected(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             id: &str,
             generation: u64,
-        ) -> Result<cairn_llm::subscription::ClaudeSessionCredential, String> {
+        ) -> Result<cairn_models::subscription::ClaudeSessionCredential, String> {
             Unsubscribed.claude_credential_rejected(host, id, generation)
         }
-        fn migrate_claude_homes(&self, host: &dyn LlmHost) -> Vec<String> {
+        fn migrate_claude_homes(&self, host: &dyn ModelHost) -> Vec<String> {
             Unsubscribed.migrate_claude_homes(host)
         }
         fn codex_session_login(
             &self,
-            host: &dyn LlmHost,
-            auth: &cairn_llm::codex::tokens::CodexAuthState,
-        ) -> Result<cairn_llm::interface::session::Secret<serde_json::Value>, String> {
+            host: &dyn ModelHost,
+            auth: &cairn_models::codex::tokens::CodexAuthState,
+        ) -> Result<cairn_models::interface::session::Secret<serde_json::Value>, String> {
             Unsubscribed.codex_session_login(host, auth)
         }
         fn probe_usage(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             provider: RoutedProvider,
             id: Option<&str>,
         ) -> (
-            cairn_llm::types::usage::ProviderUsageSnapshot,
+            cairn_models::types::usage::ProviderUsageSnapshot,
             Option<String>,
         ) {
             Unsubscribed.probe_usage(host, provider, id)
         }
         fn credential_generation(
             &self,
-            _host: &dyn LlmHost,
+            _host: &dyn ModelHost,
             _provider: RoutedProvider,
             _id: &str,
         ) -> Option<String> {
@@ -1065,59 +1065,65 @@ mod tests {
         }
         fn consume_usage_reset(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             provider: RoutedProvider,
             id: Option<&str>,
-        ) -> Result<cairn_llm::types::usage::ProviderUsageResetResult, String> {
+        ) -> Result<cairn_models::types::usage::ProviderUsageResetResult, String> {
             Unsubscribed.consume_usage_reset(host, provider, id)
         }
         fn refresh_codex(
             &self,
-            host: &dyn LlmHost,
-            request: cairn_llm::codex::tokens::CodexRefreshRequest,
+            host: &dyn ModelHost,
+            request: cairn_models::codex::tokens::CodexRefreshRequest,
         ) -> Result<
-            (String, cairn_llm::codex::tokens::CodexAccountRef),
-            cairn_llm::codex::tokens::CodexRefreshFailure,
+            (String, cairn_models::codex::tokens::CodexAccountRef),
+            cairn_models::codex::tokens::CodexRefreshFailure,
         > {
             Unsubscribed.refresh_codex(host, request)
         }
 
         fn start_sign_in(
             &self,
-            host: std::sync::Arc<dyn LlmHost>,
-            request: cairn_llm::subscription::SignInRequest,
-        ) -> cairn_llm::subscription::SignInFuture<
-            Result<cairn_llm::subscription::SignInStart, cairn_llm::subscription::SignInError>,
+            host: std::sync::Arc<dyn ModelHost>,
+            request: cairn_models::subscription::SignInRequest,
+        ) -> cairn_models::subscription::SignInFuture<
+            Result<
+                cairn_models::subscription::SignInStart,
+                cairn_models::subscription::SignInError,
+            >,
         > {
             Unsubscribed.start_sign_in(host, request)
         }
         fn sign_in_status(
             &self,
             sign_in_ref: &str,
-        ) -> Result<cairn_llm::subscription::SignInStatus, cairn_llm::subscription::SignInError>
+        ) -> Result<cairn_models::subscription::SignInStatus, cairn_models::subscription::SignInError>
         {
             Unsubscribed.sign_in_status(sign_in_ref)
         }
         fn submit_sign_in_code(
             &self,
-            host: std::sync::Arc<dyn LlmHost>,
+            host: std::sync::Arc<dyn ModelHost>,
             sign_in_ref: String,
             code: String,
-        ) -> cairn_llm::subscription::SignInFuture<
-            Result<cairn_llm::subscription::SubmitCodeResult, cairn_llm::subscription::SignInError>,
+        ) -> cairn_models::subscription::SignInFuture<
+            Result<
+                cairn_models::subscription::SubmitCodeResult,
+                cairn_models::subscription::SignInError,
+            >,
         > {
             Unsubscribed.submit_sign_in_code(host, sign_in_ref, code)
         }
-        fn cancel_sign_in(&self, host: &dyn LlmHost, sign_in_ref: &str) -> bool {
+        fn cancel_sign_in(&self, host: &dyn ModelHost, sign_in_ref: &str) -> bool {
             Unsubscribed.cancel_sign_in(host, sign_in_ref)
         }
-        fn pending_sign_ins(&self) -> Vec<cairn_llm::subscription::PendingSignIn> {
+        fn pending_sign_ins(&self) -> Vec<cairn_models::subscription::PendingSignIn> {
             Unsubscribed.pending_sign_ins()
         }
     }
 
     async fn test_orchestrator_with(
-        subscriptions: Arc<dyn cairn_llm::subscription::Subscriptions>,
+        subscriptions: Arc<dyn cairn_models::subscription::Subscriptions>,
     ) -> Orchestrator {
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
@@ -1154,7 +1160,7 @@ mod tests {
         let refusal = crate::backends::claude::claude_launch_credential(&orch, &identity)
             .expect_err("no subscription support, no managed launch");
         assert!(
-            refusal.contains(cairn_llm::subscription::NO_SUBSCRIPTION_SUPPORT),
+            refusal.contains(cairn_models::subscription::NO_SUBSCRIPTION_SUPPORT),
             "{refusal}"
         );
     }
@@ -1163,11 +1169,11 @@ mod tests {
         id: &str,
         target: Option<&str>,
         remaining_percent: f64,
-    ) -> cairn_llm::types::usage::ProviderUsageWindow {
-        cairn_llm::types::usage::ProviderUsageWindow {
+    ) -> cairn_models::types::usage::ProviderUsageWindow {
+        cairn_models::types::usage::ProviderUsageWindow {
             id: id.to_string(),
             label: id.to_string(),
-            scope: cairn_llm::types::usage::ProviderUsageScope::Weekly,
+            scope: cairn_models::types::usage::ProviderUsageScope::Weekly,
             scope_target: target.map(str::to_string),
             used_percent: 100.0 - remaining_percent,
             remaining_percent,
@@ -1324,7 +1330,7 @@ mod tests {
         let captured_generation =
             orch.subscriptions()
                 .credential_generation(&orch, RoutedProvider::Claude, &account.id);
-        let snapshot = cairn_llm::types::usage::ProviderUsageSnapshot {
+        let snapshot = cairn_models::types::usage::ProviderUsageSnapshot {
             backend: "claude".to_string(),
             source: "claude_usage_oauth".to_string(),
             captured_at: 1,
@@ -1368,14 +1374,14 @@ mod tests {
             orch.subscriptions()
                 .credential_generation(&orch, RoutedProvider::Claude, &account.id);
         generations.set("generation-b");
-        let stale = cairn_llm::types::usage::ProviderUsageSnapshot {
+        let stale = cairn_models::types::usage::ProviderUsageSnapshot {
             backend: "claude".to_string(),
             source: "claude_usage_oauth".to_string(),
             captured_at: 1,
-            windows: vec![cairn_llm::types::usage::ProviderUsageWindow {
+            windows: vec![cairn_models::types::usage::ProviderUsageWindow {
                 id: "session".to_string(),
                 label: "Current session".to_string(),
-                scope: cairn_llm::types::usage::ProviderUsageScope::Session,
+                scope: cairn_models::types::usage::ProviderUsageScope::Session,
                 scope_target: None,
                 used_percent: 100.0,
                 remaining_percent: 0.0,
@@ -1574,7 +1580,7 @@ fi
                 "Codex OAuth".to_string(),
                 codex_auth_json("acct-one", "one@example.com", "refresh-one"),
                 None,
-                &cairn_llm::subscription::SignInTarget::NewOrMatching,
+                &cairn_models::subscription::SignInTarget::NewOrMatching,
             )
             .expect("first account stored");
         let second = orch
@@ -1582,7 +1588,7 @@ fi
                 "Codex OAuth".to_string(),
                 codex_auth_json("acct-two", "two@example.com", "refresh-two"),
                 None,
-                &cairn_llm::subscription::SignInTarget::NewOrMatching,
+                &cairn_models::subscription::SignInTarget::NewOrMatching,
             )
             .expect("second account stored");
 
@@ -1614,7 +1620,7 @@ fi
             "Codex OAuth".to_string(),
             codex_auth_json("acct-other", "other@example.com", "refresh-other"),
             None,
-            &cairn_llm::subscription::SignInTarget::NewOrMatching,
+            &cairn_models::subscription::SignInTarget::NewOrMatching,
         )
         .expect("unrelated account stored");
         let first = orch
@@ -1622,7 +1628,7 @@ fi
                 "Codex OAuth".to_string(),
                 codex_auth_json("acct-one", "one@example.com", "refresh-one"),
                 None,
-                &cairn_llm::subscription::SignInTarget::NewOrMatching,
+                &cairn_models::subscription::SignInTarget::NewOrMatching,
             )
             .expect("account stored");
 
@@ -1632,7 +1638,7 @@ fi
                 "Codex OAuth".to_string(),
                 reconnected_json.clone(),
                 None,
-                &cairn_llm::subscription::SignInTarget::NewOrMatching,
+                &cairn_models::subscription::SignInTarget::NewOrMatching,
             )
             .expect("account reconnected");
 
@@ -1673,7 +1679,7 @@ fi
             "Codex OAuth".to_string(),
             serde_json::json!({ "auth_mode": "chatgpt", "tokens": {} }).to_string(),
             None,
-            &cairn_llm::subscription::SignInTarget::NewOrMatching,
+            &cairn_models::subscription::SignInTarget::NewOrMatching,
         );
 
         assert!(stored.is_err());
@@ -1707,10 +1713,10 @@ fi
             .expect("project override stored");
         orch.record_account_health(
             &refreshed.id,
-            vec![cairn_llm::types::usage::ProviderUsageWindow {
+            vec![cairn_models::types::usage::ProviderUsageWindow {
                 id: "session".to_string(),
                 label: "Current session".to_string(),
-                scope: cairn_llm::types::usage::ProviderUsageScope::Session,
+                scope: cairn_models::types::usage::ProviderUsageScope::Session,
                 scope_target: None,
                 used_percent: 100.0,
                 remaining_percent: 0.0,
@@ -1723,7 +1729,7 @@ fi
         .expect("old health recorded");
         orch.store_provider_account_usage_snapshot(
             Some(refreshed.id.clone()),
-            cairn_llm::types::usage::ProviderUsageSnapshot::error(
+            cairn_models::types::usage::ProviderUsageSnapshot::error(
                 "claude",
                 "claude_usage_oauth",
                 "old credential error",
@@ -1859,10 +1865,10 @@ fi
                 None,
             )
             .expect("profile added");
-        let windows = vec![cairn_llm::types::usage::ProviderUsageWindow {
+        let windows = vec![cairn_models::types::usage::ProviderUsageWindow {
             id: "weekly".to_string(),
             label: "Current week".to_string(),
-            scope: cairn_llm::types::usage::ProviderUsageScope::Weekly,
+            scope: cairn_models::types::usage::ProviderUsageScope::Weekly,
             scope_target: None,
             used_percent: 20.0,
             remaining_percent: 80.0,
@@ -1874,7 +1880,7 @@ fi
             .expect("good health stored");
         orch.apply_captured_account_usage(
             &account.id,
-            cairn_llm::types::usage::ProviderUsageSnapshot::error(
+            cairn_models::types::usage::ProviderUsageSnapshot::error(
                 "claude",
                 "claude_usage_oauth",
                 "usage probe could not authenticate",

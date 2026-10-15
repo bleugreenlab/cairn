@@ -1,187 +1,39 @@
-//! Domain models for the Cairn application.
+//! The cairn-models facet: how tokens are produced, routed, and accounted.
 //!
-//! This module contains all the domain types used across the application.
-//! Types are organized by domain area.
+//! This is the one crate outside consumers import from. Its members are
+//! re-exported whole:
+//!
+//! - [`wire`]: the three HTTP protocol families (`cairn-llm-wire`).
+//! - [`types`]: provider ids, the shipped catalog, usage windows and
+//!   snapshots, pooled capacity (`cairn-models-types`).
+//! - [`accounts`]: the credential store, account routing, and leases
+//!   (`cairn-credentials`).
+//!
+//! [`interface`] is what the facet answers: the [`interface::Models`] trait the
+//! `cairn://models/*` resources render, and the launch side every backend adapts
+//! to, [`interface::complete::Complete`] and [`interface::session`].
+//! [`complete`] and [`session`] are the implementations that reach providers.
+//! [`turn`] is the provider-neutral HTTP agent turn: the loop of generation
+//! and host-dispatched tool calls that every HTTP backend runs.
+//! [`continuation`] decides whether a session resumes natively or is rebuilt,
+//! and renders the digest a rebuilt session is seeded with.
+//!
+//! Subscription mechanics (CLI sign-in, account-home placement, token refresh,
+//! subscription usage probes) are not public; they live in the private
+//! `cairn-models-subscriptions` crate outside `os/`.
+pub use cairn_credentials as accounts;
+pub use cairn_llm_wire as wire;
+pub use cairn_models_types as types;
 
-mod action;
-mod agent;
-mod artifact;
-mod common;
-mod context_tokens;
-mod docs;
-mod execution;
-mod files;
-mod github;
-mod identity;
-mod issue;
-pub use identity::GitIdentity;
-mod job;
-mod label;
-mod launch_deltas;
-mod memory;
-mod message;
-mod permissions;
-mod post;
-mod pr;
-mod project;
-mod recipe;
-mod recipe_file;
-mod run;
-mod search;
-mod session;
-mod skill;
-mod snapshot;
-mod thread;
-mod toolkit;
-mod trigger_event;
-mod turn;
-pub mod webhook;
-mod workflow;
-mod workspace;
-
-// Common enums
-pub use common::{
-    MergeType, Model, ModelSelection, Preset, PresetOptionValue, RuntimeExtras,
-    ThinkingDisplayMode, ToolDetailLevel, TranscriptDensity, TranscriptTextSize,
-};
-
-// Workspace and settings
-pub use workspace::{
-    ChannelInboundCapabilities, ChannelsConfig, DiscordChannelConfig, ExternalReplyMode,
-    IMessageChannelConfig, MessageClassPolicy, OpenRouterRouting, OpenRouterSort, Settings,
-    TelegramChannelConfig, UpdateSettings,
-};
-
-// Project types
-pub use project::{
-    CheckCommand, CheckPolicy, CheckResourceClass, CheckScopeSelector, CheckWhen, CreateProject,
-    HumanBaseMergePolicy, HumanBaseMergePolicyError, HumanBaseMergePolicyReadState,
-    HumanBaseMergePolicyState, MoveProject, PopulateConfig, Project, ProjectRemoteStatus,
-    TerminalCommand, UpdateProject,
-};
-
-// Context token snapshot types
-pub use context_tokens::{ContextTokenEventSnapshot, ContextTokenState};
-
-// Issue types
-pub use issue::{
-    Comment, CommentSource, CreateComment, CreateIssue, Issue, IssueAttention, IssueProgress,
-    IssueStatus, SidebarActiveIssue, UpdateIssue,
-};
-pub use label::{CreateLabel, Label, UpdateLabel};
-pub use post::{CreatePost, CreatePostComment, Post, PostComment};
-
-// Thread types
-pub use thread::{CreateThread, Thread, ThreadStatus, UpdateThread};
-
-// Job types (replaces timeline_nodes)
-pub use job::{Job, JobStatus};
-
-// Execution types (recipe instances)
-pub use execution::{
-    ConditionEvaluation, ConditionOutcome, Execution, ExecutionDetail, ExecutionFilters,
-    ExecutionLifecycle, ExecutionListItem, ExecutionListResult, ExecutionStatus, Initiator,
-    TriggerType, TriggeredExecution,
-};
-
-// Run types
-pub use run::{
-    Event, PermissionRequest, PermissionStatus, Prompt, ReadSegmentTokens, ResolutionReceipt, Run,
-    RunStartMode, RunStatus, RunTodos, TodoItem,
-};
-
-// Session types (durable conversation identity)
-pub use session::{Session, SessionStatus};
-
-// Turn types
-pub use turn::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason};
-
-// Recipe types
-pub use recipe::{
-    default_branch_targets, is_legacy_ai_condition, legacy_port_handle,
-    normalize_legacy_port_handles, AccumulationScope, ActionNodeConfig, AgentFilter,
-    AgentFilterMode, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, BranchMode, BranchTarget,
-    CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig, ConfirmPolicy,
-    ContextNodeConfig, Continuity, CreateRecipe, EventFilter, NodeConfig, NodePosition, Recipe,
-    RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger, RecipeVersionInfo,
-    ScheduleAt, ScheduleConfig, ScheduleEvery, ScheduleInterval, SchedulePeriod, SchemaConfig,
-    TriggerConfig, TriggerScope, UpdateRecipe,
-};
-pub use recipe::{CONTEXT_IN_HANDLE, CONTEXT_OUT_HANDLE, CONTEXT_SELF_HANDLE};
-
-// Recipe file types (export/import)
-pub use recipe_file::{RecipeFile, RecipeFileValidation};
-
-// Artifact types
-pub use artifact::Artifact;
-
-// PR types
-pub use pr::{
-    Check, CheckFailureDetails, CheckState, ChecksStatus, MergeableState, PrCache, PrDataSummary,
-    PrState, ReviewDecision,
-};
-
-// Agent types
-pub use agent::{
-    AgentConfig, CreateAgentConfig, OutputSchema, OutputSchemaInfo, UpdateAgentConfig,
-};
-
-// Permission types
-pub use permissions::{Fence, LegacyOnEscape, LegacySandbox};
-
-// Toolkit and MCP types
-pub use toolkit::{ALL_NATIVE_TOOLS, ALWAYS_DISALLOWED_TOOLS};
-
-// Documentation types
-pub use docs::{DocContent, DocFile, DocReference};
-
-// Action config types
-pub use action::{
-    generate_input_schema, interpolate_template, parse_template, ActionConfig, ActionRun,
-    ActionRunStatus, CreateActionConfig, TemplateVariable, UpdateActionConfig,
-};
-
-// Skill config types
-pub use skill::{CreateSkillConfig, SkillConfig, UpdateSkillConfig};
-
-// Workflow config types (settings surface)
-pub use workflow::{SaveWorkflowConfig, WorkflowConfig, WorkflowConfigDetail};
-
-// Execution snapshot types
-pub use snapshot::{
-    merge_agent_patch, AgentSnapshot, DelegatedOutputContract, DelegatedOwnershipScope,
-    DelegatedSessionMode, DelegatedSessionStrategy, DelegatedStatus, DelegatedWorkPacket,
-    DelegationOrigin, ExecutionSnapshot, ModelRouting, ModelRoutingDecision, ModelRoutingSource,
-    RecipeSnapshot, SkillSnapshot, SnapshotOverrides, SnapshotPresets, TriggerContext,
-};
-
-// Launch-time snapshot deltas (the agent-side grammar for SnapshotOverrides)
-pub use launch_deltas::{LaunchCustomization, LaunchDeltas};
-
-// File browsing types
-pub use files::{detect_language, BranchInfo, FileContent};
-
-// Message types
-pub use message::{ChannelType, DeliveryUrgency, Message};
-
-// Embedding types
-
-// Memory types
-pub use memory::{
-    CreateMemory, Memory, MemoryScope, MemoryStatus, MemoryTriageDecision, UpdateMemory,
-};
-
-// Trigger event types
-pub use trigger_event::{JobEndedEvent, SkillCalledEvent, TriggerEvent};
-
-// Webhook types
-pub use webhook::WebhookEvent;
-
-// Search types
-pub use search::{SearchContentType, SearchFilters, SearchResult};
-
-// GitHub status types
-pub use github::{EventDeliveryStatus, GitHubAppAuthorizationStatus, GitHubStatus};
-
-pub mod decision;
-pub mod question;
+pub mod catalog;
+pub mod claude;
+pub mod codex;
+pub mod complete;
+pub mod continuation;
+pub mod decide;
+pub mod interface;
+pub mod session;
+pub mod sign_in;
+pub mod subscription;
+pub mod turn;
+pub mod usage;

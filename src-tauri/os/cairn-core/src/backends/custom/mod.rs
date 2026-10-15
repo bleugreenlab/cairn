@@ -36,11 +36,11 @@ use crate::credentials::{
 };
 use crate::models::decision::MeasuredBy;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::interface::decide::DecisionRoute;
-use cairn_llm::types::catalog;
-use cairn_llm::types::catalog::DiscoveredModel;
-use cairn_llm::wire::decisions::http::DecisionsEndpoint;
-use cairn_llm::wire::openai_compat::http::Endpoint;
+use cairn_models::interface::decide::DecisionRoute;
+use cairn_models::types::catalog;
+use cairn_models::types::catalog::DiscoveredModel;
+use cairn_models::wire::decisions::http::DecisionsEndpoint;
+use cairn_models::wire::openai_compat::http::Endpoint;
 
 /// One custom provider, resolved from the account that defines it.
 ///
@@ -285,7 +285,8 @@ impl AgentBackend for CustomBackend {
         let config = self
             .config(orch, request.project_id.as_deref())
             .map_err(|_| CompletionError::BackendUnavailable)?;
-        adapter::CustomAdapter::new(config).complete(orch.llm_runtime().complete.as_ref(), request)
+        adapter::CustomAdapter::new(config)
+            .complete(orch.models_runtime().complete.as_ref(), request)
     }
 
     fn completion_shape(&self) -> CompletionShape {

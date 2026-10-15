@@ -17,8 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{IssueAttention, IssueStatus};
 use crate::storage::{DbError, LocalDb, RowExt};
-use cairn_models::question::Question;
-use cairn_models::DeliveryUrgency;
+use cairn_domain::question::Question;
+use cairn_domain::DeliveryUrgency;
 
 /// Discrete actionable fact that drove this emit.
 ///

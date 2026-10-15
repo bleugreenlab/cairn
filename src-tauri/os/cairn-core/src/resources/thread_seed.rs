@@ -36,7 +36,7 @@ use super::transcript::{
     format_transcript_digest_with, group_turn_blocks, load_job_events_ordered, DigestMeta,
     EventRow, TurnBlock,
 };
-use cairn_llm::continuation::DigestOptions;
+use cairn_models::continuation::DigestOptions;
 
 /// How many turns survive verbatim. Compaction is worth doing hard or not at
 /// all — halving a prefix takes ~20 turns to pay back its cache write, cutting

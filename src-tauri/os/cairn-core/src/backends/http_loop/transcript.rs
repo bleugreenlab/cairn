@@ -26,7 +26,7 @@ pub(in crate::backends) enum ReplayRow {
     /// turn, and every row would otherwise pay for the largest variant.
     Event {
         event_type: String,
-        event: Box<cairn_llm::wire::ReplayEvent>,
+        event: Box<cairn_models::wire::ReplayEvent>,
     },
 }
 

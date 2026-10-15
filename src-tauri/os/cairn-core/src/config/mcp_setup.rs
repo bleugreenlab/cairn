@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use cairn_llm::session::mcp::McpServer;
+use cairn_models::session::mcp::McpServer;
 
 /// The stdio attachment for one run: the agent's CLI launches `cairn-cmd mcp`,
 /// which calls back to `/api/mcp` on this machine's loopback.

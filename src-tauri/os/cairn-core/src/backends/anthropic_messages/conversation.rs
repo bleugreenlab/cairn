@@ -2,7 +2,7 @@ use super::wire::MessagesMessage;
 use crate::backends::http_loop::transcript::{load_prior_rows, ReplayRow};
 use crate::backends::{SessionConfig, SessionStart};
 use crate::orchestrator::Orchestrator;
-pub(crate) use cairn_llm::wire::anthropic_messages::conversation::*;
+pub(crate) use cairn_models::wire::anthropic_messages::conversation::*;
 
 /// Why a wholly empty turn is refused instead of assembled.
 const EMPTY_USER_MESSAGE: &str = "Refusing to start a turn with an empty user message: an empty content block is rejected by the provider and would poison every later replay of this conversation.";

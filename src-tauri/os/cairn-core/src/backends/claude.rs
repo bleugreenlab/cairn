@@ -10,10 +10,10 @@ use crate::orchestrator::lifecycle::{
     apply_claude_artifact_handoff, apply_claude_turn_completion, was_host_interrupted,
     ClaudeTurnContext,
 };
-use cairn_llm::interface::session::{
+use cairn_models::interface::session::{
     ClaudeMode, ClaudeSpec, ProviderSpec, SecretEnv, SessionError, SessionEvents, SessionSpec,
 };
-use cairn_llm::wire::claude_stream::{ProviderDepletion, RateLimitInfo, StreamEvidence};
+use cairn_models::wire::claude_stream::{ProviderDepletion, RateLimitInfo, StreamEvidence};
 
 use super::run_state::{
     is_task_spawned_run, resolve_run_db, run_backend_db, run_job_id, run_status,
@@ -30,10 +30,10 @@ use crate::orchestrator::session::{
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_llm::types::catalog::{
+use cairn_models::types::catalog::{
     OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
 };
-use cairn_llm::types::usage::ProviderUsageSnapshot;
+use cairn_models::types::usage::ProviderUsageSnapshot;
 use std::collections::BTreeMap;
 use std::io::BufRead;
 use std::sync::{Arc, Mutex};
@@ -43,7 +43,7 @@ use super::{
     AgentBackend, BackendFailure, CompletionError, CompletionOutcome, CompletionRequest,
     ResolvedTools, SessionConfig,
 };
-use cairn_llm::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::DiscoveredModel;
 
 use cairn_session::backends::claude::*;
 pub use cairn_session::backends::claude::{
@@ -814,7 +814,7 @@ impl AgentBackend for ClaudeBackend {
         orch.collect_warm_if_needed();
         let spawn_started = std::time::Instant::now();
 
-        let runtime = orch.llm_runtime();
+        let runtime = orch.models_runtime();
         let launched = runtime
             .claude
             .open(runtime.host.as_ref(), spec)
@@ -937,7 +937,7 @@ impl AgentBackend for ClaudeBackend {
         orch: &Orchestrator,
         project_id: Option<&str>,
     ) -> Result<(), String> {
-        use cairn_llm::interface::session::Cli;
+        use cairn_models::interface::session::Cli;
         let selection = select_routed_serving_identity(
             orch,
             RoutedProvider::Claude,
@@ -945,7 +945,7 @@ impl AgentBackend for ClaudeBackend {
             None,
             SelectionMode::Probe,
         )?;
-        orch.llm_runtime()
+        orch.models_runtime()
             .host
             .resolve_cli(Cli::Claude)
             .map_err(String::from)?;
@@ -988,8 +988,8 @@ impl AgentBackend for ClaudeBackend {
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
             response_scratch_dir, runtime_extras, whole_prompt_tokens,
         };
-        use cairn_llm::interface::session::{ApprovalMode, PlacedFile, SessionStart};
-        use cairn_llm::session::one_shot::await_one_shot;
+        use cairn_models::interface::session::{ApprovalMode, PlacedFile, SessionStart};
+        use cairn_models::session::one_shot::await_one_shot;
 
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
@@ -1043,7 +1043,7 @@ impl AgentBackend for ClaudeBackend {
             }),
         };
         let started = std::time::Instant::now();
-        let runtime = orch.llm_runtime();
+        let runtime = orch.models_runtime();
         let launched = runtime
             .claude
             .open(runtime.host.as_ref(), spec)
@@ -1132,7 +1132,7 @@ pub(crate) fn discover_catalog_blocking(
     orch: &Orchestrator,
 ) -> (Vec<DiscoveredModel>, Option<String>) {
     match usable_claude_credential(orch) {
-        Ok(()) => (cairn_llm::types::catalog::claude_models(), None),
+        Ok(()) => (cairn_models::types::catalog::claude_models(), None),
         Err(error) => (Vec::new(), Some(error)),
     }
 }
@@ -1187,11 +1187,11 @@ mod launch_contract_tests {
     use crate::backends::SessionStart;
     use crate::credentials::ClaudeAuth;
     use crate::identity::UserIdentity;
-    use cairn_llm::interface::session::{
+    use cairn_models::interface::session::{
         ApprovalMode, ClaudeMode, ClaudeSpec, PlacedFile, ProviderSpec, SecretEnv, SessionSpec,
     };
-    use cairn_llm::session::claude::ClaudeCli;
-    use cairn_llm::session::mcp::{McpServer, McpServers};
+    use cairn_models::session::claude::ClaudeCli;
+    use cairn_models::session::mcp::{McpServer, McpServers};
     use std::collections::{BTreeMap, HashMap};
 
     fn identity(auth: ClaudeAuth) -> UserIdentity {
@@ -1626,7 +1626,7 @@ mod flush_pending_tests {
     use crate::storage::{LocalDb, MigrationRunner, RowExt, SearchIndex, TURSO_MIGRATIONS};
     use crate::transcripts::stream_store::open_stream;
     use cairn_db::turso::params;
-    use cairn_llm::wire::claude_stream::parse_event;
+    use cairn_models::wire::claude_stream::parse_event;
     use std::sync::Arc;
 
     async fn test_db() -> LocalDb {
@@ -2429,7 +2429,7 @@ fn flush_pending_assistant_before_suppress(
     session_id: Option<&str>,
     state: &mut Option<StreamingState>,
     pending: &mut Option<TranscriptEvent>,
-    usage: Option<&cairn_llm::wire::claude_stream::Usage>,
+    usage: Option<&cairn_models::wire::claude_stream::Usage>,
 ) {
     let runtime = claude_runtime(
         orch,

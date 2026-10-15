@@ -1090,7 +1090,7 @@ fn example_output_text(output: &Value, schema: Option<&Value>) -> Result<String,
         .map_err(|e| format!("Invalid output JSON Schema: {e}"))?
         .validate(instance)
         .map_err(|e| format!("output violates the output contract: {e}"))?;
-    cairn_llm::wire::schema_order::ordered_instance_json(instance, schema)
+    cairn_models::wire::schema_order::ordered_instance_json(instance, schema)
         .map_err(|e| format!("output has no key order the output contract enforces: {e}"))
 }
 

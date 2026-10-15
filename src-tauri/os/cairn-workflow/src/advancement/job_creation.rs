@@ -208,7 +208,7 @@ async fn insert_job_for_node_conn(
             .transpose()?
             .flatten()
             .as_deref()
-            .and_then(cairn_llm_types::catalog::backend_for_model)
+            .and_then(cairn_models_types::catalog::backend_for_model)
             .map(str::to_string)
     } else {
         None

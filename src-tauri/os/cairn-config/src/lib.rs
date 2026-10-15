@@ -1,7 +1,7 @@
 //! File-based configuration and deterministic selection for Cairn.
 //! Runtime consumers provide paths and authored values; credentials, database
 //! reconciliation, and running services stay outside this crate.
-pub use cairn_models as models;
+pub use cairn_domain as models;
 pub use cairn_packs as pack;
 pub use cairn_platform::env;
 pub mod files;

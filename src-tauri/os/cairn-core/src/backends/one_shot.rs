@@ -2,16 +2,16 @@
 //!
 //! Claude and Codex answer [`super::AgentBackend::complete`] with one tool-free
 //! round trip through the facet: a session opened with no MCP attachment,
-//! awaited with [`cairn_llm::session::one_shot::await_one_shot`]. This module
+//! awaited with [`cairn_models::session::one_shot::await_one_shot`]. This module
 //! holds the pieces around that call both backends need the same way: the
 //! working directory, the default instructions, the token rule, and the
 //! error mapping.
 
 use std::path::PathBuf;
 
-use cairn_llm::interface::session::SessionError;
-use cairn_llm::session::one_shot::OneShotError;
-use cairn_llm::wire::TurnUsage;
+use cairn_models::interface::session::SessionError;
+use cairn_models::session::one_shot::OneShotError;
+use cairn_models::wire::TurnUsage;
 
 use super::{CompletionError, CompletionRequest, CompletionTokens};
 

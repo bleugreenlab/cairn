@@ -9,7 +9,7 @@ use crate::backends::{
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::DiscoveredModel;
 
 pub(crate) const OLLAMA_BACKEND_KEY: &str = "ollama";
 pub(crate) const OLLAMA_BACKEND_NAME: &str = "Ollama";
@@ -145,7 +145,7 @@ impl AgentBackend for OllamaBackend {
         let adapter =
             adapter::OllamaAdapter::new(orch, &request.model, request.project_id.as_deref())
                 .map_err(|_| CompletionError::BackendUnavailable)?;
-        adapter.complete(orch.llm_runtime().complete.as_ref(), request)
+        adapter.complete(orch.models_runtime().complete.as_ref(), request)
     }
     fn completion_shape(&self) -> CompletionShape {
         CompletionShape::InProcess

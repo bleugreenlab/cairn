@@ -355,7 +355,7 @@ pub fn default_presets_config(max_thinking: Option<i32>) -> PresetsConfig {
     backends.insert("codex".to_string(), default_codex_presets());
     backends.insert("openrouter".to_string(), default_openrouter_presets());
     backends.insert(
-        cairn_llm_types::catalog::OPENCODE_BACKEND_KEY.to_string(),
+        cairn_models_types::catalog::OPENCODE_BACKEND_KEY.to_string(),
         default_opencode_presets(),
     );
 
@@ -665,7 +665,7 @@ pub fn resolve_selection_with_provenance(
         .or_else(|| preferred_backend.map(str::to_string));
     let backend = match explicit_backend {
         Some(backend) => backend,
-        None => cairn_llm_types::catalog::backend_for_model(tier)
+        None => cairn_models_types::catalog::backend_for_model(tier)
             .map(str::to_string)
             .ok_or_else(|| {
                 format!(

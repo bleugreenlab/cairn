@@ -23,7 +23,7 @@
 //! The orchestrator retains the last good catalog through one, which is the
 //! behavior that makes this safe to insist on.
 
-use cairn_llm::types::catalog::{
+use cairn_models::types::catalog::{
     DiscoveredModel, DiscoveredModelPricing, DiscoveredReasoningEffort, DiscoveredWireProtocol,
 };
 use serde::Deserialize;

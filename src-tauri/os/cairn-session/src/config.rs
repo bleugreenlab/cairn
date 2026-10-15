@@ -1,5 +1,5 @@
 //! Resolved session and backend capability values.
-use cairn_models::Fence;
+use cairn_domain::Fence;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;

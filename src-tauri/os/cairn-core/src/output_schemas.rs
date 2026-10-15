@@ -4,11 +4,11 @@ pub use cairn_workflow::output_schemas::*;
 mod tests {
     //! Preset schemas are authored as the order they reach a model. Parsing
     //! sorts `properties`, and the wire restores the schema-order contract
-    //! (`cairn_llm::wire::schema_order`), so a file written in any other order
+    //! (`cairn_models::wire::schema_order`), so a file written in any other order
     //! misstates what a constrained decoder, the prompt's field list, and the
     //! examples all see.
     use super::*;
-    use cairn_llm::wire::schema_order::property_order;
+    use cairn_models::wire::schema_order::property_order;
     use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde_json::Value;
 

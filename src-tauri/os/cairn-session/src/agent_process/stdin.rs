@@ -2,10 +2,10 @@
 //!
 //! The stream-json and app-server serializations of this content, and the
 //! stdin writers that carry it, are wire facts and live in
-//! `cairn_llm::wire::{claude_stream, codex_app_server}`.
+//! `cairn_models::wire::{claude_stream, codex_app_server}`.
 
-pub use cairn_llm::wire::MessageContent;
-pub use cairn_llm::wire::MessageImage;
+pub use cairn_models::wire::MessageContent;
+pub use cairn_models::wire::MessageImage;
 
 #[cfg(test)]
 pub trait StableImageResolver {
@@ -35,7 +35,7 @@ fn resolve_message_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_llm::wire::claude_stream::build_message_content;
+    use cairn_models::wire::claude_stream::build_message_content;
     use serde_json::Value;
 
     struct FixtureResolver;

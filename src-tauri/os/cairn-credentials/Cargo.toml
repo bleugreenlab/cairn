@@ -6,8 +6,8 @@ description = "Provider accounts, credential storage, leases, and selection"
 license = "BUSL-1.1"
 
 [dependencies]
-cairn-llm-types = { path = "../cairn-llm-types" }
-cairn-models = { path = "../cairn-models" }
+cairn-models-types = { path = "../cairn-models-types" }
+cairn-domain = { path = "../cairn-domain" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"

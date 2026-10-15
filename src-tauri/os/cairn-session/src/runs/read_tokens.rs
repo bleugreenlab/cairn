@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 /// Per-target token count for one section of a composed read result. The type
 /// lives in `models::run` (serialized onto `Event.read_segments`); this module
 /// owns the token-counting logic that produces it.
-pub use cairn_models::ReadSegmentTokens;
+pub use cairn_domain::ReadSegmentTokens;
 
 /// True when `name` denotes the unified `read` tool, matching the frontend's
 /// `normalizeToolName` (strip an `mcp__<server>__` prefix, case-insensitive).

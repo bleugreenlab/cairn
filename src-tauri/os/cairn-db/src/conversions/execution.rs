@@ -1,5 +1,5 @@
 //! Database record conversion into domain values.
-use cairn_models::*;
+use cairn_domain::*;
 
 /// Convert DbExecution to Execution
 impl TryFrom<crate::db_records::DbExecution> for Execution {

@@ -17,8 +17,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use cairn_llm::claude::tokens::{stored_claude_oauth, ClaudeOAuth, ClaudeSessionCredential};
-use cairn_llm::subscription::LlmHost;
+use cairn_models::claude::tokens::{stored_claude_oauth, ClaudeOAuth, ClaudeSessionCredential};
+use cairn_models::subscription::ModelHost;
 use cairn_session::agent_process::process::FedProcess;
 
 use super::Orchestrator;
@@ -34,7 +34,7 @@ fn now_ms() -> i64 {
 impl Orchestrator {
     /// The account's credential as it stands on disk.
     fn durable_claude_oauth(&self, account_id: &str) -> Option<ClaudeOAuth> {
-        let store = LlmHost::store(self).durable()?;
+        let store = ModelHost::store(self).durable()?;
         let account = store.accounts.iter().find(|a| a.id == account_id)?;
         stored_claude_oauth(account)?.ok()
     }
@@ -46,7 +46,7 @@ impl Orchestrator {
         if fed.is_empty() {
             return;
         }
-        let Some(store) = LlmHost::store(self).durable() else {
+        let Some(store) = ModelHost::store(self).durable() else {
             return;
         };
         for process in fed {
@@ -180,10 +180,10 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use cairn_llm::accounts::{ApiProvider, ProviderAuth};
-    use cairn_llm::interface::session::{SecretEnv, SessionControl, SessionFacts, SessionInput};
-    use cairn_llm::subscription::{Subscriptions, Unsubscribed};
-    use cairn_llm::wire::MessageContent;
+    use cairn_models::accounts::{ApiProvider, ProviderAuth};
+    use cairn_models::interface::session::{SecretEnv, SessionControl, SessionFacts, SessionInput};
+    use cairn_models::subscription::{Subscriptions, Unsubscribed};
+    use cairn_models::wire::MessageContent;
     use cairn_session::agent_process::process::{CredentialFeed, RunHandle};
 
     use crate::db::DbState;
@@ -220,7 +220,7 @@ mod tests {
             // Only the token travels into a live process.
             assert_eq!(
                 env.names().collect::<Vec<_>>(),
-                vec![cairn_llm::claude::tokens::OAUTH_TOKEN_ENV]
+                vec![cairn_models::claude::tokens::OAUTH_TOKEN_ENV]
             );
             let expected = format!("at-{generation}");
             let token = if env.contains_value(&expected) {
@@ -243,7 +243,7 @@ mod tests {
         due: Vec<String>,
     }
 
-    fn rotate(host: &dyn LlmHost, account_id: &str) -> ClaudeOAuth {
+    fn rotate(host: &dyn ModelHost, account_id: &str) -> ClaudeOAuth {
         let next = host
             .store()
             .update(|store| {
@@ -272,31 +272,31 @@ mod tests {
     }
 
     impl Subscriptions for Rotator {
-        fn claude_home(&self, host: &dyn LlmHost, id: &str) -> Option<std::path::PathBuf> {
+        fn claude_home(&self, host: &dyn ModelHost, id: &str) -> Option<std::path::PathBuf> {
             Unsubscribed.claude_home(host, id)
         }
         fn prepare_claude_home(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             id: &str,
         ) -> Result<std::path::PathBuf, String> {
             Unsubscribed.prepare_claude_home(host, id)
         }
-        fn claude_home_signed_in(&self, host: &dyn LlmHost, id: &str) -> bool {
+        fn claude_home_signed_in(&self, host: &dyn ModelHost, id: &str) -> bool {
             Unsubscribed.claude_home_signed_in(host, id)
         }
-        fn release_claude_home(&self, host: &dyn LlmHost, id: &str) -> Result<(), String> {
+        fn release_claude_home(&self, host: &dyn ModelHost, id: &str) -> Result<(), String> {
             Unsubscribed.release_claude_home(host, id)
         }
         /// A launch below the floor renews first.
         fn claude_session_credential(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             id: &str,
         ) -> Result<ClaudeSessionCredential, String> {
             Ok(ClaudeSessionCredential::for_push(&rotate(host, id)))
         }
-        fn renew_claude_credentials(&self, host: &dyn LlmHost) -> Vec<String> {
+        fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
             for id in &self.due {
                 rotate(host, id);
             }
@@ -304,7 +304,7 @@ mod tests {
         }
         fn claude_credential_rejected(
             &self,
-            host: &dyn LlmHost,
+            host: &dyn ModelHost,
             id: &str,
             generation: u64,
         ) -> Result<ClaudeSessionCredential, String> {
@@ -318,84 +318,90 @@ mod tests {
             };
             Ok(ClaudeSessionCredential::for_push(&current))
         }
-        fn migrate_claude_homes(&self, host: &dyn LlmHost) -> Vec<String> {
+        fn migrate_claude_homes(&self, host: &dyn ModelHost) -> Vec<String> {
             Unsubscribed.migrate_claude_homes(host)
         }
         fn codex_session_login(
             &self,
-            host: &dyn LlmHost,
-            auth: &cairn_llm::codex::tokens::CodexAuthState,
-        ) -> Result<cairn_llm::interface::session::Secret<serde_json::Value>, String> {
+            host: &dyn ModelHost,
+            auth: &cairn_models::codex::tokens::CodexAuthState,
+        ) -> Result<cairn_models::interface::session::Secret<serde_json::Value>, String> {
             Unsubscribed.codex_session_login(host, auth)
         }
         fn probe_usage(
             &self,
-            host: &dyn LlmHost,
-            provider: cairn_llm::accounts::RoutedProvider,
+            host: &dyn ModelHost,
+            provider: cairn_models::accounts::RoutedProvider,
             id: Option<&str>,
         ) -> (
-            cairn_llm::types::usage::ProviderUsageSnapshot,
+            cairn_models::types::usage::ProviderUsageSnapshot,
             Option<String>,
         ) {
             Unsubscribed.probe_usage(host, provider, id)
         }
         fn credential_generation(
             &self,
-            host: &dyn LlmHost,
-            provider: cairn_llm::accounts::RoutedProvider,
+            host: &dyn ModelHost,
+            provider: cairn_models::accounts::RoutedProvider,
             id: &str,
         ) -> Option<String> {
             Unsubscribed.credential_generation(host, provider, id)
         }
         fn consume_usage_reset(
             &self,
-            host: &dyn LlmHost,
-            provider: cairn_llm::accounts::RoutedProvider,
+            host: &dyn ModelHost,
+            provider: cairn_models::accounts::RoutedProvider,
             id: Option<&str>,
-        ) -> Result<cairn_llm::types::usage::ProviderUsageResetResult, String> {
+        ) -> Result<cairn_models::types::usage::ProviderUsageResetResult, String> {
             Unsubscribed.consume_usage_reset(host, provider, id)
         }
         fn refresh_codex(
             &self,
-            host: &dyn LlmHost,
-            request: cairn_llm::codex::tokens::CodexRefreshRequest,
+            host: &dyn ModelHost,
+            request: cairn_models::codex::tokens::CodexRefreshRequest,
         ) -> Result<
-            (String, cairn_llm::codex::tokens::CodexAccountRef),
-            cairn_llm::codex::tokens::CodexRefreshFailure,
+            (String, cairn_models::codex::tokens::CodexAccountRef),
+            cairn_models::codex::tokens::CodexRefreshFailure,
         > {
             Unsubscribed.refresh_codex(host, request)
         }
 
         fn start_sign_in(
             &self,
-            host: std::sync::Arc<dyn LlmHost>,
-            request: cairn_llm::subscription::SignInRequest,
-        ) -> cairn_llm::subscription::SignInFuture<
-            Result<cairn_llm::subscription::SignInStart, cairn_llm::subscription::SignInError>,
+            host: std::sync::Arc<dyn ModelHost>,
+            request: cairn_models::subscription::SignInRequest,
+        ) -> cairn_models::subscription::SignInFuture<
+            Result<
+                cairn_models::subscription::SignInStart,
+                cairn_models::subscription::SignInError,
+            >,
         > {
             Unsubscribed.start_sign_in(host, request)
         }
         fn sign_in_status(
             &self,
             sign_in_ref: &str,
-        ) -> Result<cairn_llm::subscription::SignInStatus, cairn_llm::subscription::SignInError>
+        ) -> Result<cairn_models::subscription::SignInStatus, cairn_models::subscription::SignInError>
         {
             Unsubscribed.sign_in_status(sign_in_ref)
         }
         fn submit_sign_in_code(
             &self,
-            host: std::sync::Arc<dyn LlmHost>,
+            host: std::sync::Arc<dyn ModelHost>,
             sign_in_ref: String,
             code: String,
-        ) -> cairn_llm::subscription::SignInFuture<
-            Result<cairn_llm::subscription::SubmitCodeResult, cairn_llm::subscription::SignInError>,
+        ) -> cairn_models::subscription::SignInFuture<
+            Result<
+                cairn_models::subscription::SubmitCodeResult,
+                cairn_models::subscription::SignInError,
+            >,
         > {
             Unsubscribed.submit_sign_in_code(host, sign_in_ref, code)
         }
-        fn cancel_sign_in(&self, host: &dyn LlmHost, sign_in_ref: &str) -> bool {
+        fn cancel_sign_in(&self, host: &dyn ModelHost, sign_in_ref: &str) -> bool {
             Unsubscribed.cancel_sign_in(host, sign_in_ref)
         }
-        fn pending_sign_ins(&self) -> Vec<cairn_llm::subscription::PendingSignIn> {
+        fn pending_sign_ins(&self) -> Vec<cairn_models::subscription::PendingSignIn> {
             Unsubscribed.pending_sign_ins()
         }
     }
@@ -440,7 +446,7 @@ mod tests {
                 .id
             })
             .collect();
-        LlmHost::store(&orch)
+        ModelHost::store(&orch)
             .update(|store| {
                 for (generated, id) in added.iter().zip([ACCOUNT, OTHER]) {
                     let account = store
@@ -559,7 +565,7 @@ mod tests {
         let (pushes, feed) = live(&orch, "run-behind", ACCOUNT);
         // Rotated elsewhere (another Cairn process) without a push reaching
         // this one: no publish happened here.
-        LlmHost::store(&orch)
+        ModelHost::store(&orch)
             .update(|store| {
                 let account = store.accounts.iter_mut().find(|a| a.id == ACCOUNT).unwrap();
                 let next = stored_claude_oauth(account).unwrap()?.rotated(
@@ -580,7 +586,7 @@ mod tests {
 
         assert_eq!(pushed(&pushes), vec![(2, "at-2".to_string())]);
         assert_eq!(feed.pushed(), 2);
-        let store = LlmHost::store(&orch).durable().unwrap();
+        let store = ModelHost::store(&orch).durable().unwrap();
         let account = store.accounts.iter().find(|a| a.id == ACCOUNT).unwrap();
         assert_eq!(
             stored_claude_oauth(account).unwrap().unwrap().generation(),

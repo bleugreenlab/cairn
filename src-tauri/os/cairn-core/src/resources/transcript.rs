@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use cairn_db::turso::params;
-use cairn_llm::continuation::{
+use cairn_models::continuation::{
     self, cleaned_tool_name, count_prefixed_diff_lines, figure_for_read_result,
     figure_for_run_result, first_nonempty_line, first_result_line, json_value_to_display,
     single_line_preview, summarize_scalar, summarize_tool_input, DigestOptions, DigestRow, Entry,
@@ -567,7 +567,7 @@ const WRITE_CONTENT_PREVIEW_LINES: usize = 20;
 // (advertised in the header and each turn heading); the verbose stream is at
 // `chat/raw`.
 //
-// The turn renderer itself is `cairn_llm::continuation::render_digest`. What is
+// The turn renderer itself is `cairn_models::continuation::render_digest`. What is
 // Cairn's lives here: the header line, the mapping from stored events onto the
 // facet's neutral transcript, and the row builders for Cairn's own tools.
 

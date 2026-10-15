@@ -3,7 +3,7 @@
 use crate::runtime::AttentionRuntime;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_models::DeliveryUrgency;
+use cairn_domain::DeliveryUrgency;
 use serde::{Deserialize, Serialize};
 
 const MIN_EVERY_MS: i64 = 5 * 60 * 1_000;

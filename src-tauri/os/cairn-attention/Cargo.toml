@@ -9,7 +9,7 @@ description = "Durable agent attention, wake subscriptions and delivery policy"
 async-trait = "0.1"
 cairn-common = { path = "../cairn-common" }
 cairn-db = { path = "../cairn-db" }
-cairn-models = { path = "../cairn-models" }
+cairn-domain = { path = "../cairn-domain" }
 cairn-platform = { path = "../cairn-platform" }
 chrono = "0.4"
 futures-util = "0.3"

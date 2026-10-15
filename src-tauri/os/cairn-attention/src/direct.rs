@@ -1,7 +1,7 @@
 use crate::storage::DbError;
 use cairn_db::lineage::home_uri_for_job_conn as node_uri_for_job_conn;
 use cairn_db::turso::params;
-use cairn_models::DeliveryUrgency;
+use cairn_domain::DeliveryUrgency;
 
 pub fn direct_wake_for_urgency(urgency: DeliveryUrgency) -> crate::push::Wake {
     use crate::push::Wake;

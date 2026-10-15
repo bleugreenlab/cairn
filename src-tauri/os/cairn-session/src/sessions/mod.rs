@@ -1,7 +1,7 @@
 //! Durable backend conversation identity and account binding.
 use cairn_db::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_models::{Session, SessionStatus};
+use cairn_domain::{Session, SessionStatus};
 
 pub async fn create_with_id(
     db: &LocalDb,

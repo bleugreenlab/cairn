@@ -10,7 +10,7 @@
 use crate::config::settings::ProviderNames;
 use crate::credentials::{AccountInfo, ApiProvider, CustomHeader, CustomSampling, ProviderAuth};
 use crate::models::{Settings, UpdateSettings};
-use cairn_llm::types::catalog::{self, CustomProvider, ProviderDescriptor};
+use cairn_models::types::catalog::{self, CustomProvider, ProviderDescriptor};
 
 use super::Orchestrator;
 
@@ -19,14 +19,14 @@ impl Orchestrator {
     /// order.
     pub fn custom_providers(&self, project_id: Option<&str>) -> Vec<CustomProvider> {
         self.get_credential_store()
-            .map(|store| cairn_llm::catalog::custom_providers_in(&store, project_id))
+            .map(|store| cairn_models::catalog::custom_providers_in(&store, project_id))
             .unwrap_or_default()
     }
 
     /// This workspace's provider inventory: everything Cairn ships, then the
     /// custom providers defined here.
     pub fn provider_catalog(&self) -> Vec<ProviderDescriptor> {
-        cairn_llm::catalog::workspace_catalog_for(self.get_credential_store().as_ref())
+        cairn_models::catalog::workspace_catalog_for(self.get_credential_store().as_ref())
     }
 
     /// Provider display names for settings refusals.

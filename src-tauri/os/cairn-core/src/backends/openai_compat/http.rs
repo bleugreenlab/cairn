@@ -1,2 +1,2 @@
-//! The openai_compat transport, as `cairn-llm` provides it.
-pub(crate) use cairn_llm::wire::openai_compat::http::*;
+//! The openai_compat transport, as `cairn-models` provides it.
+pub(crate) use cairn_models::wire::openai_compat::http::*;

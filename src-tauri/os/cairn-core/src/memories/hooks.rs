@@ -11,7 +11,7 @@
 /// `mcp_callback_port` is the port the MCP callback server listens on.
 pub(crate) fn hook_settings_file(
     mcp_callback_port: u16,
-) -> cairn_llm::interface::session::PlacedFile {
+) -> cairn_models::interface::session::PlacedFile {
     // The configured Cairn home, not a hardcoded `~/.cairn`: a dev instance keeps
     // its hook settings in its own home rather than writing into the production
     // one it is otherwise isolated from.
@@ -37,7 +37,7 @@ pub(crate) fn hook_settings_file(
         }
     });
 
-    cairn_llm::interface::session::PlacedFile {
+    cairn_models::interface::session::PlacedFile {
         dir: cairn_dir.to_string_lossy().into_owned(),
         name: "hook-settings.json".to_string(),
         contents: serde_json::to_string_pretty(&settings).expect("a JSON value always serializes"),

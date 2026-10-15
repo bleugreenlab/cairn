@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub use cairn_llm::interface::session::{SessionControl, SessionFacts};
+pub use cairn_models::interface::session::{SessionControl, SessionFacts};
 
 /// A live session's one writer, shared by everything that talks to it. Empty
 /// once the session can no longer be written to.
@@ -141,7 +141,7 @@ pub enum DedupOutcome {
 /// after the tool dispatch returns and finalizes the run into a resumable
 /// waiting state. This is a structured side-channel keyed by `run_id`, the same
 /// per-run loop-control shape as the cancellation flag.
-use cairn_llm::turn::SuspendKind;
+use cairn_models::turn::SuspendKind;
 
 /// A process-scoped claim on a native goal's paused state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,7 +370,7 @@ impl FedProcess {
     /// nothing.
     pub fn push(
         &self,
-        env: &cairn_llm::interface::session::SecretEnv,
+        env: &cairn_models::interface::session::SecretEnv,
         generation: u64,
     ) -> Result<bool, String> {
         let mut control = self.control.lock().map_err(|e| e.to_string())?;

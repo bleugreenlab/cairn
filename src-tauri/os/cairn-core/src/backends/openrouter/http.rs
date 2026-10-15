@@ -34,7 +34,7 @@ pub(super) fn build_provider_object(routing: &OpenRouterRouting) -> Value {
 /// Cairn's server-side validation of the stored artifact makes a schema
 /// violation a loud failure; it cannot see an optional field a constrained
 /// decoder foreclosed, which is what the shared wire's required-first property
-/// order (`cairn_llm::wire::schema_order`) exists to prevent. A model
+/// order (`cairn_models::wire::schema_order`) exists to prevent. A model
 /// with no schema-capable provider then fails the request loudly (an HTTP error
 /// naming the model), which is the intended behavior.
 pub(super) fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {

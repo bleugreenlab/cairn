@@ -1,5 +1,5 @@
 //! Database record conversion into domain values.
-use cairn_models::*;
+use cairn_domain::*;
 
 impl From<crate::db_records::DbTurn> for Turn {
     fn from(db: crate::db_records::DbTurn) -> Self {

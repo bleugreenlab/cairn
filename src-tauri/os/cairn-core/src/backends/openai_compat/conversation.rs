@@ -4,7 +4,7 @@ use crate::agent_process::stream::TranscriptEvent;
 use crate::backends::http_loop::transcript::{load_prior_rows, ReplayRow};
 use crate::backends::{SessionConfig, SessionStart};
 use crate::orchestrator::Orchestrator;
-pub(crate) use cairn_llm::wire::openai_compat::conversation::*;
+pub(crate) use cairn_models::wire::openai_compat::conversation::*;
 #[cfg(test)]
 use cairn_session::agent_process::stream::TranscriptJson;
 

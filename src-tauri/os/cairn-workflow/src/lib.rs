@@ -1,7 +1,7 @@
 //! Durable recipe advancement, workflow state, and replay persistence.
 
 pub use cairn_db::{db_records, storage};
-pub use cairn_models as models;
+pub use cairn_domain as models;
 
 pub mod advancement;
 pub mod branch_target;

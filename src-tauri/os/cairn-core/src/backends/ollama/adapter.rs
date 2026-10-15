@@ -6,8 +6,10 @@ use crate::backends::openai_compat::wire::{ChatContent, ChatMessage};
 use crate::backends::SessionConfig;
 use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::interface::complete::{Complete, CompletionCall, CompletionReply, CompletionWire};
-use cairn_llm::turn::ChatFamily;
+use cairn_models::interface::complete::{
+    Complete, CompletionCall, CompletionReply, CompletionWire,
+};
+use cairn_models::turn::ChatFamily;
 use serde_json::Map;
 use std::time::Instant;
 
@@ -250,7 +252,7 @@ mod tests {
         .to_string();
         let response = http_response("200 OK", &body);
         let outcome = adapter_for(response)
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap();
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.model, "qwen:resolved");
@@ -263,7 +265,7 @@ mod tests {
     fn completion_maps_http_and_invalid_response_errors() {
         let response = http_response("500 Internal Server Error", "model failed");
         let error = adapter_for(response)
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
         assert!(
             matches!(error, CompletionError::Upstream(message) if message.contains("HTTP 500"))
@@ -271,7 +273,7 @@ mod tests {
 
         let response = http_response("200 OK", r#"{"model":"qwen","choices":[]}"#);
         let error = adapter_for(response)
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
         assert_eq!(
             error,
@@ -303,7 +305,7 @@ mod tests {
         request.timeout = Duration::from_millis(20);
         assert_eq!(
             adapter
-                .complete(&cairn_llm::complete::HttpComplete, request)
+                .complete(&cairn_models::complete::HttpComplete, request)
                 .unwrap_err(),
             CompletionError::Timeout
         );

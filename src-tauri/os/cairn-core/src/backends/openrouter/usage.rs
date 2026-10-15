@@ -9,8 +9,8 @@
 use super::{openrouter_api_key, OPENROUTER_BACKEND_KEY};
 use crate::orchestrator::Orchestrator;
 use cairn_analytics::{self as analytics, types::Scope, types::TimeRange};
-use cairn_llm::types::usage::{ProviderModelUsageRow, ProviderUsageSnapshot};
-use cairn_llm::usage::openrouter::fetch_openrouter_credits;
+use cairn_models::types::usage::{ProviderModelUsageRow, ProviderUsageSnapshot};
+use cairn_models::usage::openrouter::fetch_openrouter_credits;
 
 /// Snapshot source tag for the OpenRouter per-model breakdown. The frontend
 /// treats this as a canonical usage source, so a loaded breakdown is not

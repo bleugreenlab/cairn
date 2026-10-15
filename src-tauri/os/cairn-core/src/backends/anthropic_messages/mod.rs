@@ -1,14 +1,14 @@
-//! Application adapter for the Anthropic Messages protocol in `cairn-llm`.
+//! Application adapter for the Anthropic Messages protocol in `cairn-models`.
 //! Core supplies credentials, model selection, and history loading.
 
 pub(crate) mod conversation;
 pub(crate) mod http;
-pub(crate) use cairn_llm::wire::anthropic_messages::wire;
+pub(crate) use cairn_models::wire::anthropic_messages::wire;
 
 use crate::backends::http_loop::{Connection, WireAdapter};
 use crate::backends::SessionConfig;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::turn::MessagesFamily;
+use cairn_models::turn::MessagesFamily;
 use http::MessagesEndpoint;
 use wire::MessagesMessage;
 

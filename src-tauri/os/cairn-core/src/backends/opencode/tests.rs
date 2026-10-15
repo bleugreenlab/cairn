@@ -5,7 +5,7 @@ use crate::backends::openai_compat::wire::ChatMessage;
 use crate::backends::{AgentBackend, SessionConfig, SessionStart};
 use crate::config::presets::default_presets_config;
 use crate::models::Model;
-use cairn_llm::types::catalog::{DiscoveredModel, DiscoveredWireProtocol};
+use cairn_models::types::catalog::{DiscoveredModel, DiscoveredWireProtocol};
 use serde_json::json;
 
 /// Shapes taken from the live endpoints on 2026-08-15. The subscription catalog
@@ -407,7 +407,7 @@ fn config_with(
 /// The body of one owned-loop chat generation.
 fn build_body(model: &str, messages: &[ChatMessage], config: &SessionConfig) -> serde_json::Value {
     use crate::backends::http_loop::{Connection, WireAdapter};
-    use cairn_llm::turn::ProtocolFamily;
+    use cairn_models::turn::ProtocolFamily;
     let family = super::adapter::OpenCodeAdapter
         .family(&Connection {
             api_key: Some("test-key".to_string()),

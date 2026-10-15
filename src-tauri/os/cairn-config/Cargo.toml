@@ -6,8 +6,8 @@ description = "Cairn configuration files, defaults, validation, and preset resol
 license = "BUSL-1.1"
 
 [dependencies]
-cairn-llm-types = { path = "../cairn-llm-types" }
-cairn-models = { path = "../cairn-models" }
+cairn-models-types = { path = "../cairn-models-types" }
+cairn-domain = { path = "../cairn-domain" }
 cairn-common = { path = "../cairn-common" }
 cairn-platform = { path = "../cairn-platform" }
 cairn-packs = { path = "../cairn-packs" }

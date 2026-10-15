@@ -9,8 +9,8 @@ description = "Agent session runtime and provider process protocols"
 cairn-analytics = { path = "../cairn-analytics" }
 cairn-common = { path = "../cairn-common" }
 cairn-db = { path = "../cairn-db" }
-cairn-llm = { path = "../cairn-llm" }
 cairn-models = { path = "../cairn-models" }
+cairn-domain = { path = "../cairn-domain" }
 cairn-platform = { path = "../cairn-platform" }
 cairn-tokenize = { path = "../cairn-tokenize" }
 chrono = "0.4"
@@ -31,10 +31,10 @@ uuid = { version = "1", features = ["v4"] }
 
 
 [dev-dependencies]
-cairn-llm = { path = "../cairn-llm", features = ["test-utils"] }
+cairn-models = { path = "../cairn-models", features = ["test-utils"] }
 cairn-db = { path = "../cairn-db", features = ["test-utils"] }
 cairn-platform = { path = "../cairn-platform", features = ["test-utils"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-test-utils = ["cairn-llm/test-utils", "cairn-platform/test-utils", "cairn-db/test-utils"]
+test-utils = ["cairn-models/test-utils", "cairn-platform/test-utils", "cairn-db/test-utils"]

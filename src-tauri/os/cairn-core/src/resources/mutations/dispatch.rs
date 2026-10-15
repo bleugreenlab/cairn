@@ -22,11 +22,11 @@ mod feed;
 mod grants;
 mod issues;
 mod labels;
-mod llm;
-mod llm_accounts;
 mod mcp;
 mod memories;
 mod messages;
+mod models;
+mod models_accounts;
 mod nodes;
 mod packs;
 mod posts;
@@ -48,7 +48,7 @@ mod wakes;
 #[cfg(test)]
 mod issue_mutation_tests;
 #[cfg(test)]
-mod llm_account_tests;
+mod models_account_tests;
 #[cfg(test)]
 mod resource_gate_tests;
 #[cfg(test)]
@@ -371,11 +371,11 @@ pub(crate) async fn dispatch_resource_change(
     {
         summary
     } else if let Some(summary) =
-        llm::dispatch(orch, request, index, item, dry_run, &resource).await?
+        models::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) =
-        llm_accounts::dispatch(orch, request, index, item, dry_run, &resource).await?
+        models_accounts::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) = packs::dispatch(

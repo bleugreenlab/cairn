@@ -1,7 +1,7 @@
 //! Preset resolution of the backend a session runs on. The shipped provider
-//! catalog itself lives in `cairn_llm_types::catalog`.
+//! catalog itself lives in `cairn_models_types::catalog`.
 
-use cairn_llm_types::catalog::resolved_backend_for_model;
+use cairn_models_types::catalog::resolved_backend_for_model;
 
 /// The backend a session will actually run on, given the agent's resolved
 /// selection and the model persisted on the job.

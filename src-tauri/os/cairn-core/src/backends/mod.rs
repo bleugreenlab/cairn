@@ -20,7 +20,7 @@
 
 pub mod actual;
 mod anthropic_messages;
-use cairn_llm::types::catalog;
+use cairn_models::types::catalog;
 pub mod claude;
 mod claude_transcript;
 pub mod codex;
@@ -59,28 +59,28 @@ pub fn replayed_anthropic_context_for_test(
 use crate::models::Fence;
 use crate::models::Model;
 use crate::orchestrator::Orchestrator;
-pub use cairn_llm::wire::CompletionError;
+pub use cairn_models::wire::CompletionError;
 
-impl From<&SessionConfig> for cairn_llm::wire::GenerationConfig {
+impl From<&SessionConfig> for cairn_models::wire::GenerationConfig {
     fn from(config: &SessionConfig) -> Self {
         Self {
             reasoning_effort: config.reasoning_effort.clone(),
             max_thinking_tokens: config.max_thinking_tokens,
             output_schema: config.output_schema.clone(),
-            tools: cairn_llm::wire::cairn_tool_definitions(),
+            tools: cairn_models::wire::cairn_tool_definitions(),
         }
     }
 }
 
-pub use cairn_llm::interface::session::SessionStart;
-use cairn_llm::session::mcp::{McpServer, McpServers};
+pub use cairn_models::interface::session::SessionStart;
+use cairn_models::session::mcp::{McpServer, McpServers};
 
 /// Cairn's one MCP server as the set a session or a Codex app-server is given:
 /// every agent Cairn launches is given `cairn` and nothing else.
 pub(crate) fn cairn_servers(server: &McpServer) -> McpServers {
     McpServers::new(vec![server.clone()]).expect("Cairn's own MCP server name is valid")
 }
-use cairn_llm::types::catalog::{DiscoveredModel, ProviderOptionDescriptor};
+use cairn_models::types::catalog::{DiscoveredModel, ProviderOptionDescriptor};
 pub use cairn_session::config::*;
 
 /// Configuration for starting a session (backend-agnostic).
@@ -173,8 +173,8 @@ impl SessionConfig {}
 /// The facet's reading of a fence: how much a session may do without asking.
 pub(crate) fn approval_mode(
     fence: crate::models::Fence,
-) -> cairn_llm::interface::session::ApprovalMode {
-    use cairn_llm::interface::session::ApprovalMode;
+) -> cairn_models::interface::session::ApprovalMode {
+    use cairn_models::interface::session::ApprovalMode;
     match fence {
         crate::models::Fence::Allow => ApprovalMode::Allow,
         crate::models::Fence::Ask => ApprovalMode::Ask,
@@ -319,7 +319,7 @@ pub(crate) fn backend_for_name(name: Option<&str>) -> Box<dyn AgentBackend> {
 /// string at all, which is why the surfaces that offer a model to run filter to
 /// what this resolution can honor (see `isRuntimeRepresentable`) rather than
 /// pretending the name carries the provider.
-pub(crate) use cairn_llm::types::catalog::{backend_for_model, CLAUDE_FAMILY_BACKEND};
+pub(crate) use cairn_models::types::catalog::{backend_for_model, CLAUDE_FAMILY_BACKEND};
 
 #[cfg(test)]
 mod backend_failure_tests {
@@ -977,13 +977,13 @@ pub(crate) mod tests {
 
 mod transcript_host;
 
-pub(crate) use cairn_llm::types::catalog::resolved_backend_for_model;
+pub(crate) use cairn_models::types::catalog::resolved_backend_for_model;
 
 pub(crate) use cairn_config::providers::effective_backend_name;
 
 #[cfg(test)]
 mod catalog_coverage_tests {
-    use cairn_llm::types::catalog::{CLAUDE_FAMILY_BACKEND, PROVIDER_CATALOG};
+    use cairn_models::types::catalog::{CLAUDE_FAMILY_BACKEND, PROVIDER_CATALOG};
 
     #[test]
     fn a_backend_exists_for_every_catalog_entry() {

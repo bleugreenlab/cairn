@@ -4,7 +4,7 @@ use crate::backends::AgentBackend;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_db::turso::params;
-use cairn_llm::codex::app_server::AppServerClient;
+use cairn_models::codex::app_server::AppServerClient;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;

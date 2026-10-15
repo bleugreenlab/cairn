@@ -11,7 +11,7 @@
 
 use crate::models::{ExecutionSnapshot, Fence, Model, ModelSelection};
 use cairn_config::presets::{resolve_selection_with_provenance, PresetsConfig};
-use cairn_llm_types::catalog as providers;
+use cairn_models_types::catalog as providers;
 
 /// Deserialize a stored snapshot JSON string, applying resolve-early migration.
 ///

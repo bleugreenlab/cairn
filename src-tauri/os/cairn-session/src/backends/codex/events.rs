@@ -5,7 +5,7 @@ use crate::agent_process::stream::{TokenCounts, TranscriptEvent};
 use crate::transcripts::stream_store::{append_chunks, open_stream, EmitDelta, EventInsert};
 use cairn_common::ids;
 use cairn_db::storage::LocalDb;
-use cairn_llm::wire::claude_stream::Usage;
+use cairn_models::wire::claude_stream::Usage;
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;

@@ -875,22 +875,22 @@ pub enum CairnResource {
     Grant {
         id: String,
     },
-    /// The cairn-llm facet's index: one line per `cairn://llm/*` resource.
-    Llm,
+    /// The cairn-models facet's index: one line per `cairn://models/*` resource.
+    Models,
     /// Providers, their discovered models, and how tiers bind to them.
-    LlmCatalog,
+    ModelsCatalog,
     /// Every provider account, with its live usage windows and no secret.
-    LlmAccounts,
+    ModelsAccounts,
     /// One provider account by id.
-    LlmAccount {
+    ModelsAccount {
         id: String,
     },
     /// Pooled capacity per installed provider (the provider card).
-    LlmUsage,
+    ModelsUsage,
     /// Every live model session on this host.
-    LlmSessions,
+    ModelsSessions,
     /// One live model session, by session id or run id.
-    LlmSession {
+    ModelsSession {
         id: String,
     },
     /// Global bug report sink.
@@ -1007,13 +1007,13 @@ impl CairnResource {
             Self::ExecutorAction { .. } => ResourceKind::ExecutorAction,
             Self::Grants => ResourceKind::Grants,
             Self::Grant { .. } => ResourceKind::Grant,
-            Self::Llm => ResourceKind::Llm,
-            Self::LlmCatalog => ResourceKind::LlmCatalog,
-            Self::LlmAccounts => ResourceKind::LlmAccounts,
-            Self::LlmAccount { .. } => ResourceKind::LlmAccount,
-            Self::LlmUsage => ResourceKind::LlmUsage,
-            Self::LlmSessions => ResourceKind::LlmSessions,
-            Self::LlmSession { .. } => ResourceKind::LlmSession,
+            Self::Models => ResourceKind::Models,
+            Self::ModelsCatalog => ResourceKind::ModelsCatalog,
+            Self::ModelsAccounts => ResourceKind::ModelsAccounts,
+            Self::ModelsAccount { .. } => ResourceKind::ModelsAccount,
+            Self::ModelsUsage => ResourceKind::ModelsUsage,
+            Self::ModelsSessions => ResourceKind::ModelsSessions,
+            Self::ModelsSession { .. } => ResourceKind::ModelsSession,
             Self::Bug => ResourceKind::Bug,
             Self::Help => ResourceKind::Help,
             Self::WebSearch => ResourceKind::WebSearch,

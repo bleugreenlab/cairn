@@ -1,7 +1,7 @@
 use cairn_db::turso::params;
 
 use crate::runtime::AttentionRuntime;
-use cairn_models::DeliveryUrgency;
+use cairn_domain::DeliveryUrgency;
 
 use super::matching::{matching_subscription, matching_subscriptions_for_source};
 use super::types::*;

@@ -1855,39 +1855,41 @@ async fn render_resource_body(
         CairnResource::Grant { id } => {
             crate::resources::grants::read_grant(&orch.db.local, &id).await
         }
-        // The cairn-llm facet. Each page renders the facet interface's answer,
+        // The cairn-models facet. Each page renders the facet interface's answer,
         // which the orchestrator composes from what Settings → Providers reads.
-        CairnResource::Llm => match reject_query_params("cairn://llm", &params) {
+        CairnResource::Models => match reject_query_params("cairn://models", &params) {
             Some(error) => error,
-            None => crate::resources::llm::render_index(),
+            None => crate::resources::models::render_index(),
         },
-        CairnResource::LlmCatalog => crate::resources::llm::render_catalog(orch, &params),
-        CairnResource::LlmAccounts => crate::resources::llm::render_accounts(
+        CairnResource::ModelsCatalog => crate::resources::models::render_catalog(orch, &params),
+        CairnResource::ModelsAccounts => crate::resources::models::render_accounts(
             orch,
             &params,
             &orch.subscriptions().pending_sign_ins(),
         ),
-        CairnResource::LlmAccount { id } => {
-            match reject_query_params("cairn://llm/accounts/{id}", &params) {
+        CairnResource::ModelsAccount { id } => {
+            match reject_query_params("cairn://models/accounts/{id}", &params) {
                 Some(error) => error,
                 None => {
-                    let sign_ins = crate::resources::llm::AccountSignIns {
+                    let sign_ins = crate::resources::models::AccountSignIns {
                         pending: orch.subscriptions().pending_sign_ins(),
                         history: orch.account_sign_in_history(&id).await,
                     };
-                    crate::resources::llm::render_account(orch, &id, &sign_ins)
+                    crate::resources::models::render_account(orch, &id, &sign_ins)
                 }
             }
         }
-        CairnResource::LlmUsage => crate::resources::llm::render_usage(orch, &params),
-        CairnResource::LlmSessions => match reject_query_params("cairn://llm/sessions", &params) {
-            Some(error) => error,
-            None => crate::resources::llm::render_sessions(orch),
-        },
-        CairnResource::LlmSession { id } => {
-            match reject_query_params("cairn://llm/sessions/{id}", &params) {
+        CairnResource::ModelsUsage => crate::resources::models::render_usage(orch, &params),
+        CairnResource::ModelsSessions => {
+            match reject_query_params("cairn://models/sessions", &params) {
                 Some(error) => error,
-                None => crate::resources::llm::render_session(orch, &id),
+                None => crate::resources::models::render_sessions(orch),
+            }
+        }
+        CairnResource::ModelsSession { id } => {
+            match reject_query_params("cairn://models/sessions/{id}", &params) {
+                Some(error) => error,
+                None => crate::resources::models::render_session(orch, &id),
             }
         }
         CairnResource::Executors => {

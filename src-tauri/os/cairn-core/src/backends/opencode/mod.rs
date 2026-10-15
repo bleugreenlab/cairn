@@ -37,7 +37,7 @@ use crate::backends::{
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::types::catalog::{
+use cairn_models::types::catalog::{
     DiscoveredModel, DiscoveredWireProtocol, OptionChoice, OptionKind, ProviderOptionDescriptor,
     ProviderOptionKey,
 };
@@ -45,7 +45,7 @@ use cairn_llm::types::catalog::{
 /// The subscription is what Cairn serves, so the backend is named for it. The
 /// credential is an OpenCode Zen account key, which is why the provider it
 /// belongs to is [`ApiProvider::OpenCode`] rather than a Go-specific one.
-pub(crate) use cairn_llm::types::catalog::OPENCODE_BACKEND_KEY;
+pub(crate) use cairn_models::types::catalog::OPENCODE_BACKEND_KEY;
 pub(crate) const OPENCODE_BACKEND_NAME: &str = "OpenCode Go";
 
 /// The model a Go session falls back to when configuration names none. Go has
@@ -182,7 +182,9 @@ fn apply_extras(
     ))
 }
 
-use cairn_llm::interface::complete::{Complete, CompletionCall, CompletionReply, CompletionWire};
+use cairn_models::interface::complete::{
+    Complete, CompletionCall, CompletionReply, CompletionWire,
+};
 
 fn completion_role(role: &CompletionRole) -> &'static str {
     match role {
@@ -447,7 +449,7 @@ impl AgentBackend for OpenCodeBackend {
         let protocol =
             model_protocol(orch, &request.model).map_err(CompletionError::InvalidRequest)?;
         let started = std::time::Instant::now();
-        let llm = orch.llm_runtime().complete.as_ref();
+        let llm = orch.models_runtime().complete.as_ref();
         match protocol {
             DiscoveredWireProtocol::OpenAiChatCompletions => {
                 complete_chat(llm, &api_key, request, started)

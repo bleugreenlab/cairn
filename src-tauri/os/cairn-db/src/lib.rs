@@ -1,6 +1,6 @@
 //! Durable storage and database-to-domain adaptation for Cairn.
 //!
-//! [`models`] re-exports the storage-free values from `cairn-models`.
+//! [`models`] re-exports the storage-free values from `cairn-domain`.
 //! [`db_records`] owns table-shaped rows, and `conversions` owns their
 //! `From`/`TryFrom` implementations into those values. [`storage`] owns Turso,
 //! migrations, the Tantivy index, content storage, and event reconstruction.

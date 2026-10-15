@@ -2,10 +2,10 @@
 //!
 //! Every door that signs a subscription account in — Settings → Providers and
 //! `cairn auth login` through the transport's invoke commands, and
-//! `cairn://llm/accounts` — starts it through
+//! `cairn://models/accounts` — starts it through
 //! [`Orchestrator::start_provider_sign_in`], which records who started it
 //! before anything starts. Its terminal outcome arrives through
-//! `LlmHost::sign_in_settled`, exactly once per sign-in. The two rows are
+//! `ModelHost::sign_in_settled`, exactly once per sign-in. The two rows are
 //! correlated by the sign-in's opaque reference, so a reader can say "the flow
 //! started by X reached outcome Y" without claiming X performed the provider's
 //! browser step.
@@ -17,8 +17,8 @@ use std::sync::Arc;
 
 use cairn_common::identity::{AppearanceSnapshot, PrincipalPosition, PrincipalRef};
 use cairn_db::turso::params;
-use cairn_llm::accounts::RoutedProvider;
-use cairn_llm::subscription::{
+use cairn_models::accounts::RoutedProvider;
+use cairn_models::subscription::{
     SignInError, SignInFailureKind, SignInOutcome, SignInRequest, SignInStart, SignInTarget,
 };
 

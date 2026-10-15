@@ -17,7 +17,7 @@ mod events;
 mod globals;
 mod issues;
 mod jobs;
-mod llm;
+mod models;
 mod nodes;
 mod posts;
 mod projects;
@@ -60,13 +60,13 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     globals::EXECUTOR_CONTRACT,
     globals::GRANTS_CONTRACT,
     globals::GRANT_CONTRACT,
-    llm::LLM_CONTRACT,
-    llm::LLM_CATALOG_CONTRACT,
-    llm::LLM_ACCOUNTS_CONTRACT,
-    llm::LLM_ACCOUNT_CONTRACT,
-    llm::LLM_USAGE_CONTRACT,
-    llm::LLM_SESSIONS_CONTRACT,
-    llm::LLM_SESSION_CONTRACT,
+    models::MODELS_CONTRACT,
+    models::MODELS_CATALOG_CONTRACT,
+    models::MODELS_ACCOUNTS_CONTRACT,
+    models::MODELS_ACCOUNT_CONTRACT,
+    models::MODELS_USAGE_CONTRACT,
+    models::MODELS_SESSIONS_CONTRACT,
+    models::MODELS_SESSION_CONTRACT,
     globals::EXECUTOR_ACTION_CONTRACT,
     globals::MCP_CONTRACT,
     globals::HELP_CONTRACT,

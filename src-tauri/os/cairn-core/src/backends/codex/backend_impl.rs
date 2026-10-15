@@ -12,12 +12,12 @@ use crate::orchestrator::session::{
     select_routed_serving_identity, SelectionMode,
 };
 use crate::orchestrator::Orchestrator;
-use cairn_llm::codex::tokens::{find_codex_oauth_account_id, CodexAuthState};
-use cairn_llm::interface::session::{
+use cairn_models::codex::tokens::{find_codex_oauth_account_id, CodexAuthState};
+use cairn_models::interface::session::{
     Cli, CodexModels, CodexServer, CodexSpec, NativeGoal, ProviderSpec, Secret, SecretEnv,
     ServerLaunch, SessionError, SessionEvents, SessionHost, SessionSpec, SessionStart,
 };
-use cairn_llm::session::codex::models::discover_codex_models;
+use cairn_models::session::codex::models::discover_codex_models;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -28,7 +28,7 @@ use super::super::{
     AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionShape,
     ResolvedTools, SessionConfig,
 };
-use cairn_llm::types::catalog::{
+use cairn_models::types::catalog::{
     DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
 };
 
@@ -200,7 +200,7 @@ impl AgentBackend for CodexBackend {
         // private DB would fail the message_streams→runs foreign key. Fail-closed.
         let run_db = resolve_run_db(CODEX_BACKEND_NAME, orch, &config.run_id)?;
 
-        let runtime = orch.llm_runtime();
+        let runtime = orch.models_runtime();
         let codex_path = resolve_codex_cli(
             orch,
             runtime.host.as_ref(),
@@ -452,9 +452,9 @@ impl AgentBackend for CodexBackend {
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
             response_scratch_dir, runtime_extras, whole_prompt_tokens,
         };
-        use cairn_llm::interface::session::ApprovalMode;
-        use cairn_llm::session::one_shot::await_one_shot;
-        use cairn_llm::wire::MessageContent;
+        use cairn_models::interface::session::ApprovalMode;
+        use cairn_models::session::one_shot::await_one_shot;
+        use cairn_models::wire::MessageContent;
 
         if request.messages.is_empty() {
             return Err(CompletionError::InvalidRequest(
@@ -499,7 +499,7 @@ impl AgentBackend for CodexBackend {
             }),
         };
         let started = std::time::Instant::now();
-        let runtime = orch.llm_runtime();
+        let runtime = orch.models_runtime();
         let mut launched = runtime
             .codex
             .open(runtime.host.as_ref(), spec)
@@ -654,7 +654,7 @@ fn codex_response_availability(
 /// server. It carries no home: every pooled tool call is attributed by its
 /// `_meta.threadId`. A pooled server serves many runs, so no one run's HTTP
 /// bearer could credential it; it always reaches Cairn over the stdio shim.
-fn pooled_mcp_attachment(orch: &Orchestrator) -> cairn_llm::session::mcp::McpServer {
+fn pooled_mcp_attachment(orch: &Orchestrator) -> cairn_models::session::mcp::McpServer {
     let cairn_home = cairn_common::paths::cairn_home();
     let log_level = crate::config::settings::load_log_level(&orch.config_dir);
     crate::config::mcp_setup::stdio_attachment(
@@ -674,7 +674,7 @@ fn acquire_pooled_server(
     orch: &Orchestrator,
     codex_auth: &CodexAuth,
 ) -> Result<(Arc<super::pool::PooledAppServer>, Option<String>), String> {
-    let runtime = orch.llm_runtime().clone();
+    let runtime = orch.models_runtime().clone();
     let (oauth_state, account_id) = codex_oauth_state(orch, codex_auth)?;
     let pool_key = pool_key_for_auth(codex_auth, oauth_state.as_ref());
     orch.collect_warm_if_needed();
@@ -746,7 +746,7 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
     let start_time = std::time::Instant::now();
     let session_id = Some(config.session_start.session_id().to_string());
     let run_db = resolve_run_db(CODEX_BACKEND_NAME, orch, &config.run_id)?;
-    let runtime = orch.llm_runtime().clone();
+    let runtime = orch.models_runtime().clone();
     // Checked here, against the run, so a missing CLI is reported on its
     // transcript the way it always has been.
     resolve_codex_cli(
@@ -904,9 +904,9 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_llm::codex::app_server::AppServerClient;
-    use cairn_llm::interface::session::SessionControl;
-    use cairn_llm::session::codex::CodexControl;
+    use cairn_models::codex::app_server::AppServerClient;
+    use cairn_models::interface::session::SessionControl;
+    use cairn_models::session::codex::CodexControl;
 
     #[test]
     fn codex_send_set_model_is_unsupported() {

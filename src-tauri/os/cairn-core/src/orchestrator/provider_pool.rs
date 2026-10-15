@@ -1,8 +1,8 @@
 //! One provider's pooled capacity. The join itself lives in
-//! `cairn_llm::usage::pool`; the orchestrator supplies its usage book and
+//! `cairn_models::usage::pool`; the orchestrator supplies its usage book and
 //! credential store.
 
-use cairn_llm::types::pool::ProviderPoolSnapshot;
+use cairn_models::types::pool::ProviderPoolSnapshot;
 
 use super::Orchestrator;
 
@@ -15,7 +15,7 @@ impl Orchestrator {
         backend: &str,
         project_id: Option<&str>,
     ) -> ProviderPoolSnapshot {
-        cairn_llm::usage::pool::provider_usage_pool(
+        cairn_models::usage::pool::provider_usage_pool(
             &self.provider_usage_snapshots,
             self.get_credential_store().as_ref(),
             backend,
@@ -33,9 +33,9 @@ mod tests {
     use crate::orchestrator::OrchestratorBuilder;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, SearchIndex};
-    use cairn_llm::types::pool::{ProviderPoolAccountState, ProviderPoolSegmentState};
-    use cairn_llm::types::usage::ProviderUsageSnapshot;
-    use cairn_llm::types::usage::{ProviderUsageScope, ProviderUsageWindow};
+    use cairn_models::types::pool::{ProviderPoolAccountState, ProviderPoolSegmentState};
+    use cairn_models::types::usage::ProviderUsageSnapshot;
+    use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
     use std::sync::Arc;
 
     async fn test_orchestrator() -> Orchestrator {

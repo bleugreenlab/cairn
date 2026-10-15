@@ -1,5 +1,5 @@
 //! Database record conversion into domain values.
-use cairn_models::*;
+use cairn_domain::*;
 
 /// Convert DbArtifact to Artifact
 impl TryFrom<crate::db_records::DbArtifact> for Artifact {

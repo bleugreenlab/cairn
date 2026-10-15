@@ -3,7 +3,7 @@ use super::*;
 use crate::sessions::queries::RotationReason;
 use crate::threads::compaction::CompactionTrigger;
 use crate::threads::ThreadCompaction;
-use cairn_llm::continuation::{
+use cairn_models::continuation::{
     decide_continue_action, prefix_cache_state, price_cold_rebuild, reseed_step,
     window_pressure_reached, CacheDecision, ColdRebuild, ContinueAction, PrefixCacheState,
     ReseedStep, ResumeBackend, COLD_RESEED_MIN_SAVINGS_RATIO,
@@ -3652,7 +3652,7 @@ fn assemble_resume_prompt(
 // ============================================================================
 //
 // The policy itself — which continuations may replace a conversation, and how a
-// cold prefix is priced — is `cairn_llm::continuation`, whose module doc states
+// cold prefix is priced — is `cairn_models::continuation`, whose module doc states
 // it. What lives here is Cairn's orchestration around it: composing seeds from
 // stored transcripts, rotating sessions, and recording the boundary.
 
@@ -4624,7 +4624,7 @@ mod tests {
     use crate::storage::migrated_test_db;
     use crate::storage::SearchIndex;
     use cairn_db::turso::params;
-    use cairn_llm::continuation::{
+    use cairn_models::continuation::{
         decide_continue_action, prefix_cache_state, window_pressure_reached, ContinueAction,
         PrefixCacheState, ResumeBackend, COLD_RESEED_MIN_SAVINGS_RATIO,
     };
@@ -5207,7 +5207,7 @@ mod tests {
             let mut handle = RunHandle::new(
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(Some(
-                    cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+                    cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
                 ))),
                 Some("s1".to_string()),
                 Some("j".to_string()),
@@ -5713,7 +5713,7 @@ mod tests {
             let mut handle = RunHandle::new(
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(Some(
-                    cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+                    cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
                 ))),
                 Some("s1".to_string()),
                 Some("j".to_string()),
@@ -6337,7 +6337,7 @@ mod tests {
         let mut processes = state.processes.lock().unwrap();
         let child = Arc::new(Mutex::new(None));
         let stdin = Arc::new(Mutex::new(Some(
-            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
         )));
         let mut handle = RunHandle::new(child, stdin, Some(format!("sess-{run_id}")), None);
         handle.transition_to_warm();

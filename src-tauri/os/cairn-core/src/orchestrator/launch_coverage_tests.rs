@@ -1,6 +1,6 @@
-//! Every provider launches through the cairn-llm facet.
+//! Every provider launches through the cairn-models facet.
 //!
-//! A recording [`LlmRuntime`] replaces the facet's implementations: a
+//! A recording [`ModelRuntime`] replaces the facet's implementations: a
 //! [`Complete`] that records and refuses, Claude and Codex providers that
 //! record and hand back inert sessions, and a host that spawns nothing. Each
 //! provider in the shipped catalog, plus a custom one, is then launched
@@ -12,26 +12,26 @@ use std::io::Read;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use cairn_llm::codex::app_server::AppServerClient;
-use cairn_llm::interface::complete::{
+use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::interface::complete::{
     Complete, CompletionCall, CompletionError, CompletionReply, Delivery,
 };
-use cairn_llm::interface::session::{
+use cairn_models::interface::session::{
     Cli, CodexModels, CodexServer, CodexSessionProvider, LaunchedSession, ProviderSpec,
     ServerLaunch, SessionControl, SessionError, SessionEvents, SessionFacts, SessionHost,
     SessionInput, SessionProvider, SessionSpec,
 };
-use cairn_llm::interface::Llm;
-use cairn_llm::types::catalog::{
+use cairn_models::interface::Models;
+use cairn_models::types::catalog::{
     claude_models, DiscoveredWireProtocol, ProviderModelCatalog, CUSTOM_KEY_PREFIX,
     PROVIDER_CATALOG,
 };
-use cairn_llm::wire::MessageContent;
+use cairn_models::wire::MessageContent;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde_json::{json, Value};
 
-use super::llm::tests::seeded_orchestrator;
-use super::llm::LlmRuntime;
+use super::models::tests::seeded_orchestrator;
+use super::models::ModelRuntime;
 use super::Orchestrator;
 use crate::agent_process::process::PauseIntent;
 use crate::backends::{
@@ -270,7 +270,7 @@ impl SessionProvider for RecordingClaude {
             };
             assert!(matches!(
                 claude.mode,
-                cairn_llm::interface::session::ClaudeMode::OneShot { .. }
+                cairn_models::interface::session::ClaudeMode::OneShot { .. }
             ));
             assert!(
                 claude.allowed_tools.is_empty(),
@@ -478,14 +478,14 @@ fn plan(key: &str) -> Plan {
         custom if custom.starts_with(CUSTOM_KEY_PREFIX) => http("qwen3.8-27b", custom),
         other => panic!(
             "provider {other} is in the shipped catalog but has no launch coverage: give it an \
-             adapter over the cairn-llm facet and a plan here"
+             adapter over the cairn-models facet and a plan here"
         ),
     }
 }
 
 async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
     let mut orch = seeded_orchestrator().await;
-    orch.llm_runtime = LlmRuntime {
+    orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
@@ -648,7 +648,7 @@ async fn stored_text(orch: &Orchestrator) -> String {
         .unwrap()
 }
 
-fn view(orch: &Orchestrator, run_id: &str) -> cairn_llm::interface::SessionView {
+fn view(orch: &Orchestrator, run_id: &str) -> cairn_models::interface::SessionView {
     orch.sessions()
         .into_iter()
         .find(|view| view.run_id == run_id)
@@ -831,11 +831,11 @@ async fn session_rows(orch: &Orchestrator) -> i64 {
 /// subscription support presents, and without a run, session, or event.
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_and_codex_serve_responses_through_the_facet() {
-    use cairn_llm::subscription::testing::TempHomes;
+    use cairn_models::subscription::testing::TempHomes;
 
     let recorder = Arc::new(Recorder::default());
-    let mut orch = super::llm::tests::bare_orchestrator().await;
-    orch.llm_runtime = LlmRuntime {
+    let mut orch = super::models::tests::bare_orchestrator().await;
+    orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
@@ -1030,11 +1030,11 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
 async fn decisions_launch_only_on_a_decision_capable_offer() {
     use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling};
     use crate::models::decision::{DecisionNode, MeasuredBy};
-    use cairn_llm::subscription::testing::TempHomes;
+    use cairn_models::subscription::testing::TempHomes;
 
     let recorder = Arc::new(Recorder::default());
-    let mut orch = super::llm::tests::bare_orchestrator().await;
-    orch.llm_runtime = LlmRuntime {
+    let mut orch = super::models::tests::bare_orchestrator().await;
+    orch.models_runtime = ModelRuntime {
         complete: Arc::new(RecordingComplete(recorder.clone())),
         claude: Arc::new(RecordingClaude(recorder.clone())),
         codex: Arc::new(RecordingCodex(recorder.clone())),
@@ -1094,7 +1094,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
             None,
         )
         .unwrap();
-    let jev_key = cairn_llm::types::catalog::custom_key(&jev.id);
+    let jev_key = cairn_models::types::catalog::custom_key(&jev.id);
     orch.refresh_provider_model_catalog_blocking(&jev_key);
 
     let offer = orch.decision_offer(None, &decision).unwrap();
@@ -1128,7 +1128,7 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
             None,
         )
         .unwrap();
-    let spark_key = cairn_llm::types::catalog::custom_key(&spark.id);
+    let spark_key = cairn_models::types::catalog::custom_key(&spark.id);
     orch.refresh_provider_model_catalog_blocking(&spark_key);
     let pinned = DecisionNode {
         model: Some("gemma4-26b".into()),

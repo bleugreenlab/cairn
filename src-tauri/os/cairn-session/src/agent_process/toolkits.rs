@@ -5,7 +5,7 @@
 //! `read`, `write`, `run` — so the only surviving job here is a small
 //! friendly→canonical alias map. Native provider tools are fully off: every
 //! native name is hard-disallowed at the backend layer (see
-//! [`cairn_models::ALL_NATIVE_TOOLS`]) and dropped from the allow-list here.
+//! [`cairn_domain::ALL_NATIVE_TOOLS`]) and dropped from the allow-list here.
 //! There is no longer any "pick a side when both native and Cairn exist"
 //! logic — Cairn always wins because native never runs.
 //!
@@ -22,7 +22,7 @@ use std::sync::{Mutex, OnceLock};
 /// gateway. Nothing legitimate is a bare name, so a bare name in a live
 /// session's declared surface is a host-harness built-in that escaped
 /// `--disallowedTools`. That invariant is the durable check; the roster in
-/// [`cairn_models::ALWAYS_DISALLOWED_TOOLS`] is only the list of escapees
+/// [`cairn_domain::ALWAYS_DISALLOWED_TOOLS`] is only the list of escapees
 /// already known by name.
 fn is_native_leak(tool: &str) -> bool {
     !tool.starts_with("mcp__")
@@ -98,7 +98,7 @@ const DEAD_CAIRN_TOOLS: &[&str] = &[
 /// for dead Cairn names. Aliased names (`Read`/`Write`/`Edit`/`Bash`) are
 /// resolved before this is consulted, so they never reach here.
 fn is_dropped(tool: &str) -> bool {
-    cairn_models::ALL_NATIVE_TOOLS.contains(&tool) || DEAD_CAIRN_TOOLS.contains(&tool)
+    cairn_domain::ALL_NATIVE_TOOLS.contains(&tool) || DEAD_CAIRN_TOOLS.contains(&tool)
 }
 
 /// Resolve an agent's configured tool names to the Cairn allow-list.

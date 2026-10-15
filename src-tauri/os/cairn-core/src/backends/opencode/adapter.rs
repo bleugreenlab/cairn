@@ -13,7 +13,7 @@ use crate::backends::openai_compat::wire::ChatMessage;
 use crate::backends::openai_responses::OpenAiResponsesAdapter;
 use crate::backends::SessionConfig;
 use crate::orchestrator::Orchestrator;
-use cairn_llm::turn::ChatFamily;
+use cairn_models::turn::ChatFamily;
 use serde_json::Map;
 
 /// Resolve Go's API key into a connection, or own the missing-key error.

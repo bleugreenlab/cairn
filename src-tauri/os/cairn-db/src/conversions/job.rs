@@ -1,5 +1,5 @@
 //! Database record conversion into domain values.
-use cairn_models::*;
+use cairn_domain::*;
 
 /// Convert DbJob to Job
 impl TryFrom<crate::db_records::DbJob> for Job {

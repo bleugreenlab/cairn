@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cairn_db::storage::LocalDb;
 use cairn_db::{storage::DbResult, turso::Connection};
-use cairn_models::DeliveryUrgency;
+use cairn_domain::DeliveryUrgency;
 use std::sync::Arc;
 
 /// Recipient capabilities that need application policy inside an attention read/write.
@@ -32,7 +32,7 @@ pub trait AttentionHost: RecipientHost {
     /// Attempt to run a recipient whose durable push has already committed.
     /// Failure leaves the push and its occurrence/edge cursor intact.
     fn nudge(&self, job_id: &str, urgency: DeliveryUrgency) -> Result<(), String>;
-    async fn message(&self, db: &LocalDb, message_id: &str) -> Option<cairn_models::Message>;
+    async fn message(&self, db: &LocalDb, message_id: &str) -> Option<cairn_domain::Message>;
     /// Resolve application-specific card content; `None` selects the engine's fallback.
     async fn render_content(&self, request: ContentRequest<'_>) -> Option<String>;
     async fn mark_thread_chapter(

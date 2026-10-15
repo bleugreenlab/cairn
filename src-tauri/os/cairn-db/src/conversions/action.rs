@@ -1,5 +1,5 @@
 //! Database record conversion into domain values.
-use cairn_models::*;
+use cairn_domain::*;
 
 /// Convert from database model to domain model
 impl TryFrom<crate::db_records::DbActionConfig> for ActionConfig {

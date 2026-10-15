@@ -14,7 +14,7 @@ cairn-attention = { path = "../cairn-attention" }
 cairn-workflow = { path = "../cairn-workflow" }
 cairn-session = { path = "../cairn-session" }
 cairn-config = { path = "../cairn-config" }
-cairn-llm = { path = "../cairn-llm" }
+cairn-models = { path = "../cairn-models" }
 cairn-channels = { path = "../cairn-channels" }
 cairn-platform = { path = "../cairn-platform" }
 cairn-packs = { path = "../cairn-packs" }
@@ -165,7 +165,7 @@ cairn-db = { path = "../cairn-db", features = ["test-utils"] }
 
 [features]
 internal-api = []
-test-utils = ["cairn-llm/test-utils", "cairn-attention/test-utils", "cairn-workflow/test-utils", "cairn-session/test-utils", "cairn-platform/test-utils", "dep:mockall", "internal-api", "cairn-db/test-utils"]
+test-utils = ["cairn-models/test-utils", "cairn-attention/test-utils", "cairn-workflow/test-utils", "cairn-session/test-utils", "cairn-platform/test-utils", "dep:mockall", "internal-api", "cairn-db/test-utils"]
 
 [[example]]
 name = "compute_vibe_axes"

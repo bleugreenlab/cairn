@@ -200,7 +200,7 @@ pub fn register_recording_process(
     let handle = cairn_core::internal::agent_process::process::RunHandle::new(
         Arc::new(std::sync::Mutex::new(None)),
         Arc::new(std::sync::Mutex::new(Some(
-            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(RecordingStdin(
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(RecordingStdin(
                 delivered.clone(),
             ))),
         ))),
@@ -231,7 +231,7 @@ pub fn register_broken_process(orch: &Orchestrator, run_id: &str, session_id: &s
     let handle = cairn_core::internal::agent_process::process::RunHandle::new(
         Arc::new(std::sync::Mutex::new(None)),
         Arc::new(std::sync::Mutex::new(Some(
-            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(BrokenStdin)),
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(BrokenStdin)),
         ))),
         Some(session_id.to_string()),
         Some("job-1".to_string()),

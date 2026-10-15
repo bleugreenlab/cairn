@@ -6,8 +6,10 @@ use crate::backends::openai_compat::{completion_body, conversation};
 use crate::backends::SessionConfig;
 use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
 use crate::orchestrator::Orchestrator;
-use cairn_llm::interface::complete::{Complete, CompletionCall, CompletionReply, CompletionWire};
-use cairn_llm::turn::ChatFamily;
+use cairn_models::interface::complete::{
+    Complete, CompletionCall, CompletionReply, CompletionWire,
+};
+use cairn_models::turn::ChatFamily;
 use serde_json::Map;
 use std::time::Instant;
 
@@ -293,7 +295,7 @@ mod tests {
         .to_string();
         let (adapter, requests) = adapter_for(http_response("200 OK", &body));
         adapter
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap();
         let sent = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(
@@ -317,7 +319,7 @@ mod tests {
         let (adapter, requests) =
             adapter_for_target(http_response("200 OK", &body), relay, Duration::ZERO);
         adapter
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap();
         let sent = requests.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(
@@ -334,7 +336,7 @@ mod tests {
             "no model is currently loaded",
         ));
         let error = adapter
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
         let CompletionError::Upstream(message) = error else {
             panic!("expected an upstream error, got {error:?}");
@@ -361,7 +363,7 @@ mod tests {
             Duration::ZERO,
         );
         let error = adapter
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap_err();
         let CompletionError::Upstream(message) = error else {
             panic!("expected an upstream error, got {error:?}");
@@ -428,7 +430,7 @@ mod tests {
         request.timeout = Duration::from_millis(20);
         assert_eq!(
             adapter
-                .complete(&cairn_llm::complete::HttpComplete, request)
+                .complete(&cairn_models::complete::HttpComplete, request)
                 .unwrap_err(),
             CompletionError::Timeout
         );
@@ -440,9 +442,9 @@ mod tests {
     /// `Generation`, with none of the orchestrator.
     fn generation_from_stream(
         chunks: Vec<serde_json::Value>,
-    ) -> cairn_llm::wire::Generation<ChatMessage> {
+    ) -> cairn_models::wire::Generation<ChatMessage> {
         use crate::backends::openai_compat::wire::{ChatStreamChunk, StreamingAggregate};
-        use cairn_llm::wire::openai_compat::generation::into_generation;
+        use cairn_models::wire::openai_compat::generation::into_generation;
 
         let mut aggregate = StreamingAggregate::default();
         for chunk in chunks {
@@ -453,7 +455,7 @@ mod tests {
         into_generation(
             aggregate.into_response(false),
             ACTUAL_BACKEND_NAME,
-            &cairn_llm::wire::cairn_tool_definitions(),
+            &cairn_models::wire::cairn_tool_definitions(),
         )
         .unwrap()
     }
@@ -590,7 +592,7 @@ mod tests {
         .to_string();
         let (adapter, _requests) = adapter_for(http_response("200 OK", &body));
         let outcome = adapter
-            .complete(&cairn_llm::complete::HttpComplete, request())
+            .complete(&cairn_models::complete::HttpComplete, request())
             .unwrap();
         assert_eq!(outcome.tokens.input, Some(11));
         assert_eq!(outcome.tokens.output, Some(5));

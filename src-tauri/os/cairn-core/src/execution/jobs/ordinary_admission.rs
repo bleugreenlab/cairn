@@ -1519,7 +1519,7 @@ mod tests {
     use crate::orchestrator::Orchestrator;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{RowExt, SearchIndex};
-    use cairn_llm::types::catalog::DiscoveredModel;
+    use cairn_models::types::catalog::DiscoveredModel;
     use std::io::Write;
     use std::sync::{Arc, Mutex};
 
@@ -2571,7 +2571,7 @@ mod tests {
         orch.db.local.execute("INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,created_at,updated_at) VALUES('warm','p','i','j','s','live',1,1)", ()).await.unwrap();
         let bytes = Arc::new(Mutex::new(Vec::new()));
         let stdin = Arc::new(Mutex::new(Some(
-            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(CapturingWriter(
+            cairn_models::session::claude::ClaudeControl::boxed(Box::new(CapturingWriter(
                 bytes.clone(),
             ))),
         )));
@@ -2636,7 +2636,7 @@ mod tests {
             let handle = crate::agent_process::process::RunHandle::new(
                 Arc::new(Mutex::new(None)),
                 Arc::new(Mutex::new(Some(
-                    cairn_llm::session::claude::ClaudeControl::boxed(Box::new(CapturingWriter(
+                    cairn_models::session::claude::ClaudeControl::boxed(Box::new(CapturingWriter(
                         bytes.clone(),
                     ))),
                 ))),
