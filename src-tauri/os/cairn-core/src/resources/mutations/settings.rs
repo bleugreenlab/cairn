@@ -46,6 +46,7 @@ pub(crate) const PREF_KEYS: &[&str] = &[
     "enabledProviders",
     "openrouterRouting",
     "routeCallsViaOpenRouter",
+    "privateDedicatedProcessCapacity",
     "channels",
 ];
 

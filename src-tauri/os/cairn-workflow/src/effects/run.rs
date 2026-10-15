@@ -348,11 +348,13 @@ pub(crate) async fn evaluate_condition(
     let verdict = match crate::conditions::load_condition_node(&db, execution_id, node_id).await {
         Err(error) => ConditionVerdict::Blocked {
             reason: format!("Failed to load condition node: {error}"),
+            decision: None,
         },
         Ok(node) => {
             match crate::conditions::gather_condition_context(&db, execution_id, node_id).await {
                 Err(error) => ConditionVerdict::Blocked {
                     reason: format!("Failed to gather condition context: {error}"),
+                    decision: None,
                 },
                 Ok(context) => {
                     crate::conditions::evaluate_condition_node(
@@ -371,7 +373,7 @@ pub(crate) async fn evaluate_condition(
         ConditionVerdict::Routed { port, .. } => {
             log::info!("Condition node '{node_name}' evaluated to port '{port}'");
         }
-        ConditionVerdict::Blocked { reason } => {
+        ConditionVerdict::Blocked { reason, .. } => {
             log::warn!("Condition node '{node_name}' blocked, routed nowhere: {reason}");
         }
     }

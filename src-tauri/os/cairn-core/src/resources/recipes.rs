@@ -132,7 +132,7 @@ pub(crate) async fn read_recipe(
     recipe_id: &str,
     explicit_project: Option<&str>,
 ) -> String {
-    let (_, project_path) = match resolve_scope(orch, request, explicit_project).await {
+    let (project_key, project_path) = match resolve_scope(orch, request, explicit_project).await {
         Ok(scope) => scope,
         Err(e) => return e,
     };
@@ -163,20 +163,51 @@ pub(crate) async fn read_recipe(
         Ok(source) => source,
         Err(e) => return format!("Error reading recipe source: {e}"),
     };
-    render_recipe_full_source(&recipe, &source)
+    let project_id = match project_key.as_deref() {
+        Some(key) => orch
+            .db
+            .local
+            .query_text(
+                "SELECT id FROM projects WHERE UPPER(key) = UPPER(?1) LIMIT 1",
+                (key.to_string(),),
+            )
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let diagnostics = orch.decision_diagnostics(&recipe.recipe.nodes, project_id.as_deref());
+    render_recipe_full_source(&recipe, &source, &diagnostics)
 }
 
-/// Render the recipe header plus its verbatim YAML source. Factored out so the
-/// pure rendering is unit-testable without a DB-backed `Orchestrator`. The
-/// source is shown exactly as it lives on disk so a targeted `patch`
-/// (`old_string`/`new_string`) can match against what the reader sees.
-fn render_recipe_full_source(recipe: &FileRecipe, source: &str) -> String {
+/// Render the recipe header, what its decision nodes need, and its verbatim
+/// YAML source. Factored out so the pure rendering is unit-testable without a
+/// DB-backed `Orchestrator`. The source is shown exactly as it lives on disk
+/// so a targeted `patch` (`old_string`/`new_string`) can match against what
+/// the reader sees.
+fn render_recipe_full_source(
+    recipe: &FileRecipe,
+    source: &str,
+    diagnostics: &[crate::orchestrator::DecisionDiagnostic],
+) -> String {
     let mut out = format!(
         "# Recipe `{}` — {}\n\n[{}]\n\n",
         recipe.recipe.id,
         recipe.recipe.name,
         scope_label(recipe),
     );
+    if !diagnostics.is_empty() {
+        out.push_str("## decisions\n\n");
+        for diagnostic in diagnostics {
+            let standing = if diagnostic.blocking {
+                "refused at save and launch"
+            } else {
+                "note"
+            };
+            out.push_str(&format!("- {standing}: {}\n", diagnostic.message));
+        }
+        out.push('\n');
+    }
     out.push_str("## source\n\n");
     out.push_str(source.trim_end());
     out.push('\n');
@@ -310,7 +341,23 @@ mod tests {
             .unwrap()
             .unwrap();
         let source = std::fs::read_to_string(&recipe.file_path).unwrap();
-        let rendered = render_recipe_full_source(&recipe, &source);
+        let rendered = render_recipe_full_source(&recipe, &source, &[]);
+        assert!(!rendered.contains("## decisions"));
+
+        let reported = render_recipe_full_source(
+            &recipe,
+            &source,
+            &[crate::orchestrator::DecisionDiagnostic {
+                node_id: "db".into(),
+                node_name: "Touches the DB?".into(),
+                blocking: true,
+                message: "Decision node 'Touches the DB?' can't be answered: none".into(),
+            }],
+        );
+        assert!(reported.contains(
+            "## decisions\n\n- refused at save and launch: Decision node 'Touches the DB?' can't be answered: none\n"
+        ));
+        assert!(reported.find("## decisions") < reported.find("## source"));
 
         // Header still names the recipe and scope.
         assert!(rendered.contains("# Recipe `build` — Build Flow"));

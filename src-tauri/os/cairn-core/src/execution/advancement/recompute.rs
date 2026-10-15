@@ -133,6 +133,7 @@ mod artifact_present_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         };
         // The review fixture models a builder inside a SHIPPING recipe (it
@@ -154,6 +155,7 @@ mod artifact_present_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         };
         serde_json::to_string(&ExecutionSnapshot {
@@ -205,6 +207,7 @@ mod artifact_present_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         };
         serde_json::to_string(&ExecutionSnapshot {
@@ -891,6 +894,7 @@ mod port_gate_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }
@@ -913,6 +917,7 @@ mod port_gate_tests {
                 content: None,
             }),
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }

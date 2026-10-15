@@ -35,8 +35,8 @@ pub(crate) use child_stall::{render_stall_push_body, sweep_stalled_children};
 pub(crate) use common::set_exit_reason;
 pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
 pub(crate) use finalize::{
-    finalize_run_for_recovery, memory_review_turn_ended, release_and_stop_process,
-    report_recovery_launch_failure, transition_to_warm_safety_pause,
+    finalize_run_for_recovery, interrupt_run_for_provider_depletion, memory_review_turn_ended,
+    release_and_stop_process, report_recovery_launch_failure, transition_to_warm_safety_pause,
 };
 pub use review_push::{
     create_review_push_for_pr_open, evaluate_review_readiness, rearm_one_bounded_failed_review,

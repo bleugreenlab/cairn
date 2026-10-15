@@ -22,6 +22,56 @@ pub fn result_is_rate_limited(data: &Value) -> bool {
     data.get("api_error_status").and_then(Value::as_u64) == Some(429)
 }
 
+/// Why a Claude account stopped serving a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDepletion {
+    /// A rolling usage window is exhausted and heals at its reset.
+    RollingWindow { resets_at: Option<i64> },
+    /// Usage credits are exhausted. Nothing Cairn can observe heals this, so
+    /// the account stays out of rotation until an operator retries it.
+    Credits,
+}
+
+impl ClaudeEvent {
+    /// Classify only the CLI's structured synthetic API-error message. The
+    /// credit-marker check happens after that structural gate, so the same
+    /// words quoted in ordinary assistant prose are inert.
+    pub fn provider_depletion(&self) -> Option<ProviderDepletion> {
+        let ClaudeEvent::Assistant {
+            message,
+            is_api_error_message: true,
+            api_error_status: Some(429),
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let text = message.text();
+        if text.contains("cc_cli_limit_message") || text.contains("/usage-credits") {
+            Some(ProviderDepletion::Credits)
+        } else {
+            Some(ProviderDepletion::RollingWindow { resets_at: None })
+        }
+    }
+}
+
+/// The depletion a failed terminal `result` ends its turn with. The CLI
+/// reports credit exhaustion as a structured assistant error followed by a
+/// generic error result, so a depletion classified earlier in the turn is
+/// authoritative; a bare HTTP 429 result is a rolling-window block.
+pub fn terminal_provider_depletion(
+    is_error: bool,
+    data: &Value,
+    pending: Option<ProviderDepletion>,
+) -> Option<ProviderDepletion> {
+    if !is_error {
+        return None;
+    }
+    pending.or_else(|| {
+        result_is_rate_limited(data).then_some(ProviderDepletion::RollingWindow { resets_at: None })
+    })
+}
+
 /// The Claude CLI's wording when `--resume <id>` finds no conversation for the
 /// process's working directory (the CLI keys its conversation store by cwd).
 /// Matched here, at the boundary that emits it; no other layer sees the string.

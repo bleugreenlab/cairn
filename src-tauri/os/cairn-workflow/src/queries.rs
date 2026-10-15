@@ -165,7 +165,7 @@ pub fn list_executions_for_issue(
 
 fn extract_recipe_name_from_snapshot(snapshot_json: Option<&str>) -> String {
     snapshot_json
-        .and_then(|s| serde_json::from_str::<ExecutionSnapshot>(s).ok())
+        .and_then(|s| crate::snapshot_migrate::load(s).ok())
         .map(|snap| snap.recipe.name)
         .unwrap_or_else(|| "Unknown Recipe".to_string())
 }

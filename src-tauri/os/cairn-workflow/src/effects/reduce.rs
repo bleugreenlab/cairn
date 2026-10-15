@@ -103,6 +103,7 @@ mod tests {
             verdict: ConditionVerdict::Routed {
                 port: "yes".into(),
                 error: None,
+                decision: None,
             },
         });
         assert_eq!(effects.len(), 1);
@@ -123,13 +124,14 @@ mod tests {
             node_id: "n1".into(),
             verdict: ConditionVerdict::Blocked {
                 reason: "response timed out".into(),
+                decision: None,
             },
         });
         assert_eq!(effects.len(), 1);
         assert!(matches!(
             &effects[0],
             WorkflowEffect::StoreConditionEvaluation {
-                verdict: ConditionVerdict::Blocked { reason },
+                verdict: ConditionVerdict::Blocked { reason, .. },
                 ..
             } if reason == "response timed out"
         ));

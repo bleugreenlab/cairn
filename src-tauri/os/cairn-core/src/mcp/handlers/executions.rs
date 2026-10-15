@@ -225,16 +225,19 @@ pub(crate) async fn reevaluate_execution_condition(
     let verdict =
         crate::execution::advancement::reevaluate_condition(orch, &execution_id, node_id).await?;
     Ok(match verdict {
-        ConditionVerdict::Routed { port, error: None } => {
+        ConditionVerdict::Routed {
+            port, error: None, ..
+        } => {
             format!("Condition '{name}' re-evaluated: routed to '{port}'")
         }
         ConditionVerdict::Routed {
             port,
             error: Some(error),
+            ..
         } => format!(
             "Condition '{name}' re-evaluated: routed to default port '{port}' (evaluation failed: {error})"
         ),
-        ConditionVerdict::Blocked { reason } => {
+        ConditionVerdict::Blocked { reason, .. } => {
             format!("Condition '{name}' re-evaluated and is still blocked: {reason}")
         }
     })
@@ -486,6 +489,7 @@ mod snapshot_edit_guard_tests {
                 backend: "claude".to_string(),
                 model: Model::new(Model::SONNET),
             }),
+            provider_account: None,
             disallowed_tools: None,
             skills: None,
             fence: Some(fence),

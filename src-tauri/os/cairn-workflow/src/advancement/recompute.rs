@@ -1895,6 +1895,7 @@ mod gate_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }
@@ -2057,6 +2058,7 @@ mod gate_tests {
             }),
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         };
         // A checkpoint node is a command gate regardless of confirm policy.

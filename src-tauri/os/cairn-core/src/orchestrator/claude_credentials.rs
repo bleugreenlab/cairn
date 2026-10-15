@@ -365,6 +365,39 @@ mod tests {
         > {
             Unsubscribed.refresh_codex(host, request)
         }
+
+        fn start_sign_in(
+            &self,
+            host: std::sync::Arc<dyn LlmHost>,
+            request: cairn_llm::subscription::SignInRequest,
+        ) -> cairn_llm::subscription::SignInFuture<
+            Result<cairn_llm::subscription::SignInStart, cairn_llm::subscription::SignInError>,
+        > {
+            Unsubscribed.start_sign_in(host, request)
+        }
+        fn sign_in_status(
+            &self,
+            sign_in_ref: &str,
+        ) -> Result<cairn_llm::subscription::SignInStatus, cairn_llm::subscription::SignInError>
+        {
+            Unsubscribed.sign_in_status(sign_in_ref)
+        }
+        fn submit_sign_in_code(
+            &self,
+            host: std::sync::Arc<dyn LlmHost>,
+            sign_in_ref: String,
+            code: String,
+        ) -> cairn_llm::subscription::SignInFuture<
+            Result<cairn_llm::subscription::SubmitCodeResult, cairn_llm::subscription::SignInError>,
+        > {
+            Unsubscribed.submit_sign_in_code(host, sign_in_ref, code)
+        }
+        fn cancel_sign_in(&self, host: &dyn LlmHost, sign_in_ref: &str) -> bool {
+            Unsubscribed.cancel_sign_in(host, sign_in_ref)
+        }
+        fn pending_sign_ins(&self) -> Vec<cairn_llm::subscription::PendingSignIn> {
+            Unsubscribed.pending_sign_ins()
+        }
     }
 
     async fn orchestrator(due: &[&str]) -> Orchestrator {

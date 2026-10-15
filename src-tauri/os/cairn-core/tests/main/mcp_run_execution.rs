@@ -164,6 +164,7 @@ fn agent_snapshot() -> AgentSnapshot {
         tier: None,
         backend_preference: None,
         selection: None,
+        provider_account: None,
         model: None,
         disallowed_tools: None,
         skills: None,

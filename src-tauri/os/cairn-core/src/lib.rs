@@ -121,7 +121,6 @@ mod workspace;
 #[cfg(feature = "internal-api")]
 pub mod internal;
 
-mod workflow_condition;
 mod workflow_host;
 
 mod attention_host;

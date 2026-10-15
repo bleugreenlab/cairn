@@ -3241,6 +3241,9 @@ fn no_start_shape(
         },
         CellUnavailableReason::ExecutorUnavailable => SubstrateFailureShape::MachineUnreachable,
         CellUnavailableReason::NoMatchingExecutor => SubstrateFailureShape::NoMachine,
+        // The pinned machine can never hold the work's measured memory: the
+        // pin, not the fleet, is what left no machine to run it on.
+        CellUnavailableReason::HomeCannotHold { .. } => SubstrateFailureShape::NoMachine,
         CellUnavailableReason::Provisioning
         | CellUnavailableReason::Checkout
         | CellUnavailableReason::Preparation
@@ -11004,7 +11007,8 @@ cairn-common = { path = "../cairn-common" }
             | CellUnavailableReason::ExecutorUnavailable
             | CellUnavailableReason::NoMatchingExecutor
             | CellUnavailableReason::AdmissionRejected { .. }
-            | CellUnavailableReason::ObjectInfrastructure(_) => {}
+            | CellUnavailableReason::ObjectInfrastructure(_)
+            | CellUnavailableReason::HomeCannotHold { .. } => {}
         }
         let cases = [
             (

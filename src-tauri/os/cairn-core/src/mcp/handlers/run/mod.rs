@@ -2922,6 +2922,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         None,
         None,
         None,
+        None,
     )
     .await;
     if settled.suspended {
@@ -3034,6 +3035,53 @@ struct HomeFacts {
     /// an agent addresses them (`terminal \`dev\``). Always empty for a guessed
     /// home: with no recorded environment there is no tree for a process to hold.
     resident_processes: Vec<String>,
+    /// Set when placement found this machine can never hold the batch's
+    /// measured memory while another machine can. Means exactly what a
+    /// selector the home fails means: the batch leaves, unless it would strand
+    /// a live process.
+    cannot_hold: Option<CannotHold>,
+}
+
+/// A home that can never hold one batch, as placement reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CannotHold {
+    ceiling: cairn_common::executor_protocol::MemoryCeiling,
+    /// The machine placement would choose with the pin lifted, which can.
+    alternative_executor_id: String,
+    alternative_executor_name: String,
+}
+
+impl CannotHold {
+    fn from_outcome(outcome: &CellOutcome) -> Option<Self> {
+        match outcome {
+            CellOutcome::Unavailable {
+                reason:
+                    cairn_common::executor_protocol::CellUnavailableReason::HomeCannotHold {
+                        ceiling,
+                        alternative_executor_id,
+                        alternative_executor_name,
+                        ..
+                    },
+                ..
+            } => Some(Self {
+                ceiling: *ceiling,
+                alternative_executor_id: alternative_executor_id.clone(),
+                alternative_executor_name: alternative_executor_name.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The note a batch that ran elsewhere for this reason carries.
+    fn ran_elsewhere_note(&self, home: &str) -> String {
+        use cairn_common::executor_protocol::describe_gib;
+        format!(
+            "Ran on **{}**: this batch's measured memory (~{}) exceeds what {home} can ever hold ({}). Your execution environment there is unchanged.",
+            self.alternative_executor_name,
+            describe_gib(self.ceiling.estimate_bytes),
+            describe_gib(self.ceiling.ceiling_bytes),
+        )
+    }
 }
 
 impl BatchResidence {
@@ -3059,24 +3107,41 @@ impl BatchResidence {
     /// protect still goes where it asked, but a committing batch beside a live
     /// process stays home: acquisition then establishes where the tree actually
     /// is, and the rule is applied again there rather than refusing on a guess.
+    ///
+    /// A home that placement found can never hold the batch's measured memory
+    /// is refused the batch by the same rule: the batch leaves unless leaving
+    /// would strand a live process, and then the refusal names the process.
     fn decide(
         selector: Option<&ExecutorSelector>,
         home: Option<&HomeFacts>,
         commit_present: bool,
     ) -> Result<Self, String> {
-        let Some(selector) = selector.filter(|value| !value.is_empty()) else {
-            return Ok(Self::Home);
-        };
+        let selector = selector.filter(|value| !value.is_empty());
         let Some(home) = home else {
-            return Ok(Self::Detached);
+            return Ok(match selector {
+                Some(_) => Self::Detached,
+                None => Self::Home,
+            });
         };
         let protects_a_live_process = commit_present && !home.resident_processes.is_empty();
-        match home.satisfies_selector {
-            Some(true) => Ok(Self::Home),
-            Some(false) if protects_a_live_process => Err(split_tree_refusal(selector, home)),
-            None if protects_a_live_process => Ok(Self::Home),
-            Some(false) | None => Ok(Self::Detached),
+        let selector_refused = selector.filter(|_| home.satisfies_selector == Some(false));
+        let uncertain = selector.is_some() && home.satisfies_selector.is_none();
+        if let Some(selector) = selector_refused {
+            return match protects_a_live_process {
+                true => Err(split_tree_refusal(selector, home)),
+                false => Ok(Self::Detached),
+            };
         }
+        if let Some(cannot_hold) = &home.cannot_hold {
+            return match protects_a_live_process {
+                true => Err(cannot_hold_refusal(cannot_hold, home)),
+                false => Ok(Self::Detached),
+            };
+        }
+        Ok(match uncertain && !protects_a_live_process {
+            true => Self::Detached,
+            false => Self::Home,
+        })
     }
 
     /// The decision before the environment is acquired, from the machine its
@@ -3110,8 +3175,9 @@ impl BatchResidence {
             predicted
                 .as_ref()
                 .map(|home| (home.executor_id.as_str(), home.recorded)),
-            selector,
+            Some(selector),
             commit_present,
+            None,
         )
         .await;
         Self::decide(Some(selector), home.as_ref(), commit_present)
@@ -3135,21 +3201,27 @@ impl BatchResidence {
 /// environment, given as `(executor id, recorded)`: whether a residency route
 /// names it, or it is only the machine guessed for an owner with no environment.
 /// Resident processes are looked up only when they can change the answer, a
-/// committing batch that machine may not satisfy, and only for a recorded home.
+/// committing batch that machine may refuse, and only for a recorded home.
+/// With no selector there is nothing for the home to fail.
 async fn home_facts(
     orch: &Orchestrator,
     db: Option<&crate::storage::LocalDb>,
     job_id: &str,
     home: Option<(&str, bool)>,
-    selector: &ExecutorSelector,
+    selector: Option<&ExecutorSelector>,
     commit_present: bool,
+    cannot_hold: Option<CannotHold>,
 ) -> Option<HomeFacts> {
     let (executor_id, recorded) = home?;
-    let satisfies_selector = orch
-        .fleet
-        .recorded_executor_satisfies_selector(executor_id, selector);
+    let satisfies_selector = match selector {
+        Some(selector) => orch
+            .fleet
+            .recorded_executor_satisfies_selector(executor_id, selector),
+        None => Some(true),
+    };
+    let may_refuse = satisfies_selector != Some(true) || cannot_hold.is_some();
     let resident_processes = match db {
-        Some(db) if recorded && commit_present && satisfies_selector != Some(true) => {
+        Some(db) if recorded && commit_present && may_refuse => {
             resident_processes(orch, db, job_id).await
         }
         _ => Vec::new(),
@@ -3158,6 +3230,7 @@ async fn home_facts(
         executor_name: orch.fleet.executor_name_for_text(executor_id),
         satisfies_selector,
         resident_processes,
+        cannot_hold,
     })
 }
 
@@ -3224,6 +3297,23 @@ fn split_tree_refusal(selector: &ExecutorSelector, home: &HomeFacts) -> String {
     format!(
         "this batch commits, and {processes} running in this job's working tree on {machine}. A commit made on {destination} would leave that live process on a stale tree. Drop `commit_msg` to run it on {destination} as a verdict-only batch, or drop `executor` to run and commit it on {machine}",
         machine = home.executor_name,
+    )
+}
+
+/// Why a committing batch its home can never hold cannot run elsewhere either:
+/// the live process it would strand, the numbers, and the two ways out.
+fn cannot_hold_refusal(cannot_hold: &CannotHold, home: &HomeFacts) -> String {
+    use cairn_common::executor_protocol::describe_gib;
+    let processes = match home.resident_processes.as_slice() {
+        [only] => format!("{only} is"),
+        many => format!("{} are", many.join(", ")),
+    };
+    format!(
+        "this batch commits, and {processes} running in this job's working tree on {machine}, which cannot hold this batch's measured ~{demand} (the most it will ever reserve is {ceiling}). A commit made on {alternative}, which can, would leave that live process on a stale tree. Stop the process, or drop `commit_msg` to run it on {alternative} as a verdict-only batch",
+        machine = home.executor_name,
+        demand = describe_gib(cannot_hold.ceiling.estimate_bytes),
+        ceiling = describe_gib(cannot_hold.ceiling.ceiling_bytes),
+        alternative = cannot_hold.alternative_executor_name,
     )
 }
 
@@ -3346,20 +3436,26 @@ impl BatchPlacement {
     }
 
     /// Where this attempt runs, now that the environment's machine is known.
+    ///
+    /// `cannot_hold` is what an earlier attempt learned from placement: the
+    /// home can never hold this batch while another machine can.
     async fn residence_for(
         &self,
         orch: &Orchestrator,
         home: Option<&HomeExecutor>,
+        cannot_hold: Option<&CannotHold>,
     ) -> Result<BatchResidence, String> {
-        let (Some(environment), Some(selector)) = (
-            self.environment.as_ref(),
-            self.template
-                .executor
-                .as_ref()
-                .filter(|selector| !selector.is_empty()),
-        ) else {
+        let selector = self
+            .template
+            .executor
+            .as_ref()
+            .filter(|selector| !selector.is_empty());
+        let Some(environment) = self.environment.as_ref() else {
             return Ok(self.residence);
         };
+        if selector.is_none() && cannot_hold.is_none() {
+            return Ok(self.residence);
+        }
         // The fence is the authority here: the home is where acquisition found it.
         let facts = home_facts(
             orch,
@@ -3368,9 +3464,10 @@ impl BatchPlacement {
             home.map(|home| (home.executor_id.as_str(), true)),
             selector,
             self.commit_present,
+            cannot_hold.cloned(),
         )
         .await;
-        BatchResidence::decide(Some(selector), facts.as_ref(), self.commit_present)
+        BatchResidence::decide(selector, facts.as_ref(), self.commit_present)
     }
 }
 
@@ -3396,9 +3493,10 @@ fn home_bound_pin(home: Option<&HomeExecutor>) -> Option<String> {
 /// What the placement task produced.
 enum PlacedBatch {
     /// The batch reached an executor, which answered, from the residence it
-    /// actually ran in. Boxed because a completed outcome carries the whole
-    /// batch result and dwarfs the refusals beside it.
-    Cell(Box<CellOutcome>, BatchResidence),
+    /// actually ran in, with any note about where placement put it. Boxed
+    /// because a completed outcome carries the whole batch result and dwarfs
+    /// the refusals beside it.
+    Cell(Box<CellOutcome>, BatchResidence, PlacementNotes),
     /// The batch's own request contradicts a live process it would strand.
     Refused(String),
     /// The job's execution home could not be acquired, for a reason no amount of
@@ -3406,6 +3504,61 @@ enum PlacedBatch {
     NoEnvironment(String),
     /// The machine stayed full for longer than the agent's own declared bound.
     NoRoom(String),
+}
+
+/// What placement has to say about where a batch went, kept apart by what
+/// each claim needs in order to be true.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PlacementNotes {
+    /// "Ran on X: ..." for a batch detached because its home cannot hold it.
+    /// True only of an outcome that executed there.
+    ran_elsewhere: Option<String>,
+    /// The batch was placed on a machine its measured memory exceeds. Set only
+    /// once a machine claimed it, so it is true of every outcome after that,
+    /// and it must survive a failure: that is the case that ends in an
+    /// out-of-memory kill, and the one an operator most needs explained.
+    above_ceiling: Option<String>,
+}
+
+impl PlacementNotes {
+    /// Everything, for an outcome that executed.
+    fn executed(&self) -> Option<String> {
+        [self.ran_elsewhere.clone(), self.above_ceiling.clone()]
+            .into_iter()
+            .flatten()
+            .reduce(|left, right| format!("{left}\n\n{right}"))
+    }
+
+    /// Only what a claim makes true, for an outcome that may not have run.
+    fn claimed(&self) -> Option<String> {
+        self.above_ceiling.clone()
+    }
+}
+
+/// A settled failure's text with whatever placement note its outcome can
+/// truthfully carry: "Ran on X" only after the batch executed, and the
+/// above-ceiling note after any claim. The failure itself, and whether it may
+/// say nothing ran, is [`failure_without_result`]'s to decide.
+fn settled_failure_text(
+    outcome: &CellOutcome,
+    grant_without_result: Option<crate::fleet::GrantWithoutResult>,
+    commits: bool,
+    ceiling: Option<String>,
+    notes: &PlacementNotes,
+) -> Option<String> {
+    let text = failure_without_result(outcome, grant_without_result, commits, ceiling)?.text();
+    let note = match outcome {
+        CellOutcome::FailedAfterExecution { .. } | CellOutcome::Completed { .. } => {
+            notes.executed()
+        }
+        CellOutcome::Unavailable { .. }
+        | CellOutcome::StorageFailure { .. }
+        | CellOutcome::Cancelled { .. } => notes.claimed(),
+    };
+    Some(match note {
+        Some(note) => format!("{text}\n\n{note}"),
+        None => text,
+    })
 }
 
 /// What the placement task produced, and whether any attempt along the way was
@@ -3575,6 +3728,10 @@ async fn place_and_run_attempts(
     // now, with the contradiction, rather than after a queue it was never going
     // to leave.
     let mut wait = CapacityWait::new(placement.capacity_wait_budget);
+    // Learned from a home attempt placement refused because the home can never
+    // hold this batch, and kept for every later attempt: a machine's size does
+    // not change between them.
+    let mut cannot_hold: Option<CannotHold> = None;
     loop {
         if cancelled.load(Ordering::SeqCst) {
             return PlacedBatch::Cell(
@@ -3583,6 +3740,7 @@ async fn place_and_run_attempts(
                     attempt_id: String::new(),
                 }),
                 placement.residence,
+                PlacementNotes::default(),
             );
         }
         let fence = match placement.environment.as_ref() {
@@ -3611,11 +3769,27 @@ async fn place_and_run_attempts(
             },
         };
         let home = resolve_home_executor(orch, fence.as_ref());
-        let residence = match placement.residence_for(orch, home.as_ref()).await {
+        let residence = match placement
+            .residence_for(orch, home.as_ref(), cannot_hold.as_ref())
+            .await
+        {
             Ok(residence) => residence,
             Err(refusal) => return PlacedBatch::Refused(refusal),
         };
-        let request = placement.attempt(home.as_ref(), fence.is_some(), residence);
+        let mut request = placement.attempt(home.as_ref(), fence.is_some(), residence);
+        // A batch detached because its home cannot hold it goes where placement
+        // said it can be held, by pin. A pin rather than spill mobility keeps a
+        // committing batch from ever being replayed on a third machine when the
+        // one running it disappears.
+        let detached_for_memory = cannot_hold
+            .as_ref()
+            .filter(|_| residence == BatchResidence::Detached);
+        if let Some(cannot_hold) = detached_for_memory {
+            request.pinned_executor_id = Some(cannot_hold.alternative_executor_id.clone());
+        }
+        let home_name = home
+            .as_ref()
+            .map(|home| orch.fleet.executor_name_for_text(&home.executor_id));
         let mut attempt = batch.clone();
         attempt.execution_residency = match residence {
             BatchResidence::Home => fence,
@@ -3625,11 +3799,24 @@ async fn place_and_run_attempts(
         if let Some(grant) = executed.grant_without_result {
             *grant_without_result = Some(grant);
         }
+        let above_ceiling = executed.above_ceiling;
         let outcome = executed.outcome;
+        if residence == BatchResidence::Home && cannot_hold.is_none() {
+            if let Some(learned) = CannotHold::from_outcome(&outcome) {
+                cannot_hold = Some(learned);
+                continue;
+            }
+        }
         if !crate::fleet::placement::classify_cell_outcome(&outcome, orch.fleet.link_restoration())
             .is_capacity()
         {
-            return PlacedBatch::Cell(Box::new(outcome), residence);
+            let notes = PlacementNotes {
+                ran_elsewhere: detached_for_memory.map(|cannot_hold| {
+                    cannot_hold.ran_elsewhere_note(home_name.as_deref().unwrap_or("its home"))
+                }),
+                above_ceiling: above_ceiling.map(|above| above.note()),
+            };
+            return PlacedBatch::Cell(Box::new(outcome), residence, notes);
         }
         let diagnostic = match &outcome {
             CellOutcome::Unavailable { diagnostic, .. } => diagnostic.clone(),
@@ -3938,7 +4125,7 @@ async fn settle_joined_batch(
         )
     };
     match placed {
-        PlacedBatch::Cell(outcome, residence) => {
+        PlacedBatch::Cell(outcome, residence, notes) => {
             settle_routed_run_batch(
                 orch,
                 settlement,
@@ -3946,6 +4133,7 @@ async fn settle_joined_batch(
                 *outcome,
                 grant_without_result.clone(),
                 ceiling,
+                notes,
             )
             .await
         }
@@ -3967,6 +4155,7 @@ async fn settle_routed_run_batch(
     outcome: CellOutcome,
     grant_without_result: Option<crate::fleet::GrantWithoutResult>,
     ceiling: Option<String>,
+    notes: PlacementNotes,
 ) -> SettledRunBatch {
     if let CellOutcome::Unavailable { reason, diagnostic } = &outcome {
         // Only a structural refusal reaches here: a capacity-shaped one is a
@@ -3979,13 +4168,14 @@ async fn settle_routed_run_batch(
             "a capacity-shaped placement failure was settled as a run failure: {diagnostic}"
         );
     }
-    if let Some(failure) = failure_without_result(
+    if let Some(text) = settled_failure_text(
         &outcome,
         grant_without_result,
         settlement.commit_msg.is_some(),
         ceiling,
+        &notes,
     ) {
-        return SettledRunBatch::failure(failure.text());
+        return SettledRunBatch::failure(text);
     }
     let CellOutcome::Completed {
         attempt_id,
@@ -4027,6 +4217,7 @@ async fn settle_routed_run_batch(
         routed_delta,
         routed_tracked_modifications,
         publication_request.as_ref(),
+        notes.executed(),
     )
     .await
 }
@@ -4046,24 +4237,37 @@ fn environment_rebuild_note(orch: &Orchestrator, s: &RunBatchSettlement) -> Opti
         job_id: context.job_id.clone(),
     };
     let eviction = orch.fleet.take_environment_eviction(&holder)?;
+    Some(environment_rebuild_text(&eviction))
+}
+
+fn environment_rebuild_text(eviction: &crate::fleet::EnvironmentEviction) -> String {
     let why = match &eviction.cause {
-        crate::fleet::EvictionCause::SessionLost => format!(
-            "The machine holding the previous one (**{}**) is no longer connected",
-            eviction.executor
+        crate::fleet::EvictionCause::Disconnected { absent_ms } => format!(
+            "disconnected {} ago and did not come back",
+            crate::fleet::describe_quiet_ms(*absent_ms)
         ),
-        crate::fleet::EvictionCause::CannotPrepareProject { project_id, detail } => format!(
-            "The machine holding the previous one (**{}**) cannot prepare cells for {project_id} ({detail})",
-            eviction.executor
+        crate::fleet::EvictionCause::Silent { silent_ms, .. } => format!(
+            "stopped answering for {} while still connected",
+            crate::fleet::describe_quiet_ms(*silent_ms)
         ),
+        crate::fleet::EvictionCause::CannotPrepareProject { project_id, detail } => {
+            format!("cannot prepare cells for {project_id} ({detail})")
+        }
     };
-    Some(format!(
-        "Note: this job's execution environment was rebuilt. {why}, so a fresh checkout of your branch was materialized. Committed work is intact; uncommitted files, installed packages, and terminals or REPLs from earlier batches did not survive."
-    ))
+    let processes = match eviction.lost_processes.as_slice() {
+        [] => "terminals or REPLs from earlier batches".to_string(),
+        processes => processes.join(", "),
+    };
+    format!(
+        "Note: this job's execution environment was rebuilt. The machine holding the previous one (**{}**) {why}, so a fresh checkout of your branch was materialized. Committed work is intact; uncommitted files, installed packages, and {processes} did not survive.",
+        eviction.executor
+    )
 }
 
 /// The batch tail: the verdict-only modification report, the commit barrier and
 /// logical-head publication, the synchronous when:write checks, and the composed
 /// output with its advisories.
+#[allow(clippy::too_many_arguments)]
 async fn settle_run_batch(
     orch: &Orchestrator,
     s: &RunBatchSettlement,
@@ -4074,6 +4278,7 @@ async fn settle_run_batch(
         cairn_common::executor_protocol::TrackedModificationEvidence,
     >,
     publication_request: Option<&CellRequest>,
+    placement_note: Option<String>,
 ) -> SettledRunBatch {
     // Suspension is backend control flow, not item output. This guard is the
     // common settlement boundary for host-local and routed batches and must run
@@ -4091,7 +4296,10 @@ async fn settle_run_batch(
         .await;
     }
     let mut result = compose_run_output(&outcomes);
-    let residence_note = residence.note(s.selector.as_ref());
+    let residence_note = [residence.note(s.selector.as_ref()), placement_note]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| format!("{left}\n\n{right}"));
 
     if s.discards_tracked_changes(residence) {
         let mut modified_paths = std::collections::BTreeSet::new();
@@ -4593,6 +4801,42 @@ mod tests {
         );
     }
 
+    /// The note says which way the machine was lost, because the two send an
+    /// agent looking in different places, and it names what was running there
+    /// rather than a generic "terminals or REPLs".
+    #[test]
+    fn the_rebuild_note_names_the_cause_and_the_processes_lost() {
+        let silent = crate::fleet::EnvironmentEviction {
+            executor: "bbs".into(),
+            cause: crate::fleet::EvictionCause::Silent {
+                silent_ms: 303_000,
+                generation: 1,
+            },
+            lost_processes: vec!["terminal `dev`".into()],
+        };
+        let note = environment_rebuild_text(&silent);
+        assert!(
+            note.contains("(**bbs**) stopped answering for 5m03s while still connected"),
+            "{note}"
+        );
+        assert!(
+            note.contains("and terminal `dev` did not survive"),
+            "{note}"
+        );
+
+        let gone = crate::fleet::EnvironmentEviction {
+            executor: "bbs".into(),
+            cause: crate::fleet::EvictionCause::Disconnected { absent_ms: 300_000 },
+            lost_processes: Vec::new(),
+        };
+        let note = environment_rebuild_text(&gone);
+        assert!(note.contains("disconnected 5m00s ago"), "{note}");
+        assert!(
+            note.contains("terminals or REPLs from earlier batches did not survive"),
+            "{note}"
+        );
+    }
+
     #[test]
     fn detached_residence_note_is_compact_and_home_is_silent() {
         let selector = named("bglab-ub");
@@ -4615,6 +4859,7 @@ mod tests {
             executor_name: "bglab-mac".into(),
             satisfies_selector: Some(false),
             resident_processes: resident_processes.iter().map(|p| p.to_string()).collect(),
+            cannot_hold: None,
         }
     }
 
@@ -4730,6 +4975,7 @@ mod tests {
             executor_name: "local".into(),
             satisfies_selector: Some(true),
             resident_processes: Vec::new(),
+            cannot_hold: None,
         };
         assert_eq!(
             BatchResidence::decide(Some(&selector), Some(&predicted), false),
@@ -4774,6 +5020,146 @@ mod tests {
         assert_eq!(
             BatchResidence::decide(Some(&named("local")), None, true),
             Ok(BatchResidence::Detached)
+        );
+    }
+
+    /// cairn/4931 specimen B: bgsrv-ub, which holds the environment, can never
+    /// hold this cargo test, and bglab-mac can. No selector is involved.
+    fn home_too_small(resident_processes: &[&str]) -> HomeFacts {
+        HomeFacts {
+            executor_name: "bgsrv-ub".into(),
+            satisfies_selector: Some(true),
+            resident_processes: resident_processes.iter().map(|p| p.to_string()).collect(),
+            cannot_hold: Some(CannotHold {
+                ceiling: cairn_common::executor_protocol::MemoryCeiling {
+                    estimate_bytes: 10_307_921_510,
+                    ceiling_bytes: 8_282_086_656,
+                },
+                alternative_executor_id: "exec-bglab-mac".into(),
+                alternative_executor_name: "bglab-mac".into(),
+            }),
+        }
+    }
+
+    /// A home that cannot hold the batch is a reason to leave exactly as a
+    /// selector it fails is: verdict batches and committing batches with
+    /// nothing live in the tree both run where placement says they fit.
+    #[test]
+    fn a_batch_its_home_cannot_hold_detaches_unless_it_would_strand_a_live_process() {
+        assert_eq!(
+            BatchResidence::decide(None, Some(&home_too_small(&["terminal `dev`"])), false),
+            Ok(BatchResidence::Detached)
+        );
+        assert_eq!(
+            BatchResidence::decide(None, Some(&home_too_small(&[])), true),
+            Ok(BatchResidence::Detached)
+        );
+    }
+
+    /// The one binding constraint is a live process sharing the tree, and the
+    /// refusal names it and the numbers, never an "execution home".
+    #[test]
+    fn a_committing_batch_its_home_cannot_hold_beside_a_live_process_is_refused_by_name() {
+        let refusal =
+            BatchResidence::decide(None, Some(&home_too_small(&["terminal `dev`"])), true)
+                .expect_err("a commit elsewhere would strand the terminal's tree");
+        assert!(refusal.contains("terminal `dev` is running"), "{refusal}");
+        assert!(refusal.contains("bgsrv-ub"), "{refusal}");
+        assert!(refusal.contains("9.6 GiB"), "{refusal}");
+        assert!(refusal.contains("7.7 GiB"), "{refusal}");
+        assert!(refusal.contains("bglab-mac"), "{refusal}");
+        assert!(refusal.contains("drop `commit_msg`"), "{refusal}");
+        assert!(!refusal.contains("execution home"), "{refusal}");
+    }
+
+    fn oversized_notes(detached: bool) -> PlacementNotes {
+        PlacementNotes {
+            ran_elsewhere: detached.then(|| "Ran on **bglab-mac**: this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged.".to_string()),
+            above_ceiling: Some("Note: no executor can hold this batch's measured ~9.6 GiB (largest ceiling 7.7 GiB on bgsrv-ub); it was placed on **bgsrv-ub** at the clamp.".into()),
+        }
+    }
+
+    /// Running above the ceiling is never silent, least of all when the batch
+    /// then dies: that is the out-of-memory path the note exists to explain.
+    #[test]
+    fn a_claimed_oversized_batch_that_fails_after_execution_still_says_it_was_oversized() {
+        let text = settled_failure_text(
+            &CellOutcome::FailedAfterExecution {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+                diagnostic: "executor process was killed".into(),
+            },
+            None,
+            false,
+            None,
+            &oversized_notes(false),
+        )
+        .unwrap();
+        assert!(text.contains("executor process was killed"), "{text}");
+        assert!(
+            text.contains("no executor can hold this batch's measured ~9.6 GiB"),
+            "{text}"
+        );
+    }
+
+    /// A cancelled batch was placed and claimed, so the ceiling note is still
+    /// true of it; whether it ran is not known, so "Ran on" is not said.
+    #[test]
+    fn a_cancelled_oversized_batch_keeps_the_ceiling_note_but_never_claims_it_ran() {
+        let text = settled_failure_text(
+            &CellOutcome::Cancelled {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+            },
+            None,
+            false,
+            None,
+            &oversized_notes(true),
+        )
+        .unwrap();
+        assert!(
+            text.contains("placed on **bgsrv-ub** at the clamp"),
+            "{text}"
+        );
+        assert!(!text.contains("Ran on"), "{text}");
+
+        let storage = settled_failure_text(
+            &CellOutcome::StorageFailure {
+                request_id: "r".into(),
+                attempt_id: "a".into(),
+                stage: cairn_common::executor_protocol::StorageFailureStage::ProvisioningCheckout,
+                kind: cairn_common::executor_protocol::StorageFailureKind::NoSpace,
+                diagnostic: "checkout failed".into(),
+                slot_retired: false,
+            },
+            None,
+            false,
+            None,
+            &oversized_notes(true),
+        )
+        .unwrap();
+        assert!(!storage.contains("Ran on"), "{storage}");
+        assert!(storage.contains("at the clamp"), "{storage}");
+    }
+
+    /// A completed batch settles through publication with both notes.
+    #[test]
+    fn a_completed_batch_carries_every_placement_note() {
+        let executed = oversized_notes(true).executed().unwrap();
+        assert!(executed.starts_with("Ran on **bglab-mac**"), "{executed}");
+        assert!(executed.contains("at the clamp"), "{executed}");
+        assert_eq!(PlacementNotes::default().executed(), None);
+    }
+
+    #[test]
+    fn a_batch_that_ran_elsewhere_for_memory_says_why_and_that_the_home_is_intact() {
+        let note = home_too_small(&[])
+            .cannot_hold
+            .unwrap()
+            .ran_elsewhere_note("bgsrv-ub");
+        assert_eq!(
+            note,
+            "Ran on **bglab-mac**: this batch's measured memory (~9.6 GiB) exceeds what bgsrv-ub can ever hold (7.7 GiB). Your execution environment there is unchanged."
         );
     }
 

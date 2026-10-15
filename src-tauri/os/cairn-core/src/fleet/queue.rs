@@ -40,7 +40,7 @@
 //! the only place that holds both, and it holds them in that order because the
 //! sweep must happen in the same critical section that removes the connection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
@@ -58,6 +58,16 @@ use super::RequestIdentity;
 /// and be enqueued again, and the journal has to tell those apart; the
 /// at-most-one-live-entry rule for a request identity is a separate index.
 pub(crate) type EntryId = String;
+
+/// A claim carried across a link gap onto the connection that came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeldClaim {
+    pub(crate) claimed_at_unix_ms: u64,
+    /// The generation the claim was bound to when the link went: the process
+    /// that was running it, and so the one that lost it if the new connection
+    /// does not account for it.
+    pub(crate) lost_generation: u64,
+}
 
 /// Where a live entry stands.
 ///
@@ -953,9 +963,13 @@ impl ExecutionQueue {
     /// What identifies an execution is what it is on the machine, not the link
     /// that carried the order, so a result computed during the gap arrives on
     /// the new generation and has to be accepted there.
-    pub(crate) fn rebind(&self, executor_id: &str, generation: u64) -> HashSet<RequestIdentity> {
+    pub(crate) fn rebind(
+        &self,
+        executor_id: &str,
+        generation: u64,
+    ) -> HashMap<RequestIdentity, HeldClaim> {
         let mut state = self.entries.lock().unwrap();
-        let mut carried = HashSet::new();
+        let mut carried = HashMap::new();
         for entry in state.entries.values_mut() {
             let EntryState::Claimed {
                 executor_id: bound,
@@ -973,7 +987,13 @@ impl ExecutionQueue {
                 generation,
                 at_unix_ms,
             };
-            carried.insert(entry.identity());
+            carried.insert(
+                entry.identity(),
+                HeldClaim {
+                    claimed_at_unix_ms: at_unix_ms,
+                    lost_generation: bound_generation,
+                },
+            );
         }
         carried
     }

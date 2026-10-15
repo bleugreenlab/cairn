@@ -845,6 +845,7 @@ pub fn resolve_agent_snapshot(
         tier: Some(authored.tier),
         backend_preference: authored.backend,
         selection: Some(resolved.selection),
+        provider_account: None,
         disallowed_tools: file_agent.disallowed_tools.clone(),
         skills: file_agent.skills.clone(),
         seed_budget_tokens: file_agent.seed_budget_tokens,

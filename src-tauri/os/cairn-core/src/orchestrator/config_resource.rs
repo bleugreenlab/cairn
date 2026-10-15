@@ -373,6 +373,17 @@ pub(crate) trait ConfigResource {
     ) -> Result<PathBuf, String>;
     fn delete_file(config_dir: &Path, id: &str, project_path: Option<&Path>) -> Result<(), String>;
 
+    /// Refuse a file the workspace could not run, before it is written.
+    /// Called by create and update with the scope the file is being saved
+    /// into. Accepts everything unless a resource says otherwise.
+    fn check_before_save(
+        _orch: &Orchestrator,
+        _file: &Self::File,
+        _project_id: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     fn file_is_project_scoped(file: &Self::File) -> bool;
     fn file_bundles(file: &Self::File) -> &[String];
     fn package_kind() -> crate::config::contextual_packages::ContextualPackageKind;
@@ -683,6 +694,7 @@ pub(crate) fn create_config<R: ConfigResource>(
     let id = R::create_id(&input);
     let now = now_timestamp();
     let file = R::build_create_file(input, id.clone(), is_project_scoped, now);
+    R::check_before_save(orch, &file, project_id.as_deref())?;
 
     let dest_path = R::save_file(&write_root, &file, project_path.as_deref())?;
     // Offer the resolved write root as the push target; commit_and_maybe_push
@@ -746,6 +758,7 @@ pub(crate) fn update_config<R: ConfigResource>(
         scope_changing,
         now,
     );
+    R::check_before_save(orch, &file, new_project_id.as_deref())?;
     let dest_path = R::save_file(&write_base, &file, new_project_path.as_deref())?;
 
     let mut commit_targets = R::stage_paths(&dest_path);

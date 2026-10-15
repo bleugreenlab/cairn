@@ -192,6 +192,8 @@ impl Llm for Orchestrator {
                 installed: true,
                 models: discovered.get(key).cloned(),
                 tiers: tier_bindings(key, &presets),
+                decision: self.decision_method(key, scope.project_id.as_deref()),
+                decision_unsupported: self.decision_observations.unsupported(key),
             })
             .collect();
         providers.extend(
@@ -203,6 +205,8 @@ impl Llm for Orchestrator {
                     installed: false,
                     models: None,
                     tiers: Vec::new(),
+                    decision: None,
+                    decision_unsupported: Default::default(),
                 }),
         );
         Ok(Catalog { providers })
@@ -338,6 +342,13 @@ pub(crate) mod tests {
     pub(crate) const CUSTOM_KEY_SECRET: &str = "sk-custom-secret-value";
 
     pub(crate) async fn bare_orchestrator() -> Orchestrator {
+        bare_orchestrator_with(Arc::new(cairn_llm::subscription::Unsubscribed)).await
+    }
+
+    /// [`bare_orchestrator`] with `subscriptions` installed.
+    pub(crate) async fn bare_orchestrator_with(
+        subscriptions: Arc<dyn cairn_llm::subscription::Subscriptions>,
+    ) -> Orchestrator {
         let root = tempfile::tempdir().unwrap().keep();
         let config_dir = root.join("config");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -349,7 +360,9 @@ pub(crate) mod tests {
         let search = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
         let db_state = Arc::new(DbState::new(Arc::new(db), search));
         let services = Arc::new(TestServicesBuilder::new().build());
-        OrchestratorBuilder::new(db_state, services, config_dir).build()
+        OrchestratorBuilder::new(db_state, services, config_dir)
+            .subscriptions(subscriptions)
+            .build()
     }
 
     fn window(id: &str, scope: ProviderUsageScope, remaining: f64) -> ProviderUsageWindow {
@@ -370,7 +383,14 @@ pub(crate) mod tests {
     /// API-key, OAuth and custom-endpoint accounts, one with measured windows.
     /// Every secret value it stores is one of the constants above.
     pub(crate) async fn seeded_orchestrator() -> Orchestrator {
-        let orch = bare_orchestrator().await;
+        seeded_orchestrator_with(Arc::new(cairn_llm::subscription::Unsubscribed)).await
+    }
+
+    /// [`seeded_orchestrator`] with `subscriptions` installed.
+    pub(crate) async fn seeded_orchestrator_with(
+        subscriptions: Arc<dyn cairn_llm::subscription::Subscriptions>,
+    ) -> Orchestrator {
+        let orch = bare_orchestrator_with(subscriptions).await;
         orch.update_settings(UpdateSettings {
             enabled_providers: Some(vec![
                 "claude".to_string(),

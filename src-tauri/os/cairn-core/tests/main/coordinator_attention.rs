@@ -174,6 +174,7 @@ async fn seed_coordinator_and_child(db: &LocalDb, root: &std::path::Path) {
                 checkpoint_config: None,
                 artifact_config: None,
                 condition_config: None,
+                decision_config: None,
                 context_config: None,
             }],
             edges: Vec::new(),
@@ -230,6 +231,7 @@ fn agent_node(id: &str) -> RecipeNode {
         checkpoint_config: None,
         artifact_config: None,
         condition_config: None,
+        decision_config: None,
         context_config: None,
     }
 }
@@ -252,6 +254,7 @@ fn artifact_node(id: &str, name: &str, policy: ConfirmPolicy) -> RecipeNode {
             content: None,
         }),
         condition_config: None,
+        decision_config: None,
         context_config: None,
     }
 }

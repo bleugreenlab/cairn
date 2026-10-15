@@ -1,7 +1,10 @@
 //! The cairn-llm facet's resources: `cairn://llm/*`.
 //!
-//! Read-only apart from the session stop. Every read renders what Settings →
-//! Providers shows for the workspace; nothing here reveals a credential value.
+//! Reads render what Settings → Providers shows for the workspace; nothing here
+//! reveals a credential value. The writes are a session's stop and the
+//! accounts' sign-in and usage-refresh actions. Starting a sign-in crosses the
+//! `workspace/default/settings/accounts:write` boundary, the place
+//! `cairn://settings` `accounts` writes reach.
 //!
 //! Sessions are started and messaged through the doors that already exist for
 //! them (a delegated task, a home's messages), which the sessions affordances
@@ -16,6 +19,36 @@ const LLM_SESSION_ACTION: KeySpec = KeySpec::new(
     "stop — interrupts the session's active turn and parks it warm (resumable, not a kill; cascades to child runs), exactly as stopping its node does",
 );
 
+const LLM_SIGN_IN_PROVIDER: KeySpec = KeySpec::new(
+    "provider",
+    KeyType::Str,
+    "claude | codex — the subscription to sign a new account in to",
+);
+
+const LLM_ACCOUNTS_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "refresh_usage — re-measure every account of one installed provider now (an account measured in the last minute answers from that measurement)",
+);
+
+const LLM_USAGE_PROVIDER: KeySpec = KeySpec::new(
+    "provider",
+    KeyType::Str,
+    "KEY — the installed provider to re-measure, e.g. claude, codex, openrouter",
+);
+
+const LLM_ACCOUNT_ACTION: KeySpec = KeySpec::new(
+    "action",
+    KeyType::Str,
+    "sign_in (re-authenticate a Claude or Codex subscription account; needs the workspace/default/settings/accounts:write grant) | submit_code (finish its pending Claude sign-in with the pasted code#state) | cancel_sign_in (end its pending sign-in) | refresh_usage (re-measure it now)",
+);
+
+const LLM_SIGN_IN_CODE: KeySpec = KeySpec::new(
+    "code",
+    KeyType::Str,
+    "with submit_code: the code#state string Claude's sign-in page shows on its manual path",
+);
+
 pub(crate) const LLM_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::Llm,
     uri_template: "cairn://llm",
@@ -24,7 +57,7 @@ pub(crate) const LLM_CONTRACT: ResourceContract = ResourceContract {
     read_projections: NO_PROJECTIONS,
     related: &[
         RelatedSpec { label: "providers, models, and tier bindings", kind: ResourceKind::LlmCatalog, actions: false },
-        RelatedSpec { label: "accounts and their usage windows", kind: ResourceKind::LlmAccounts, actions: false },
+        RelatedSpec { label: "accounts and their usage windows; sign in and re-measure", kind: ResourceKind::LlmAccounts, actions: false },
         RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::LlmUsage, actions: false },
         RelatedSpec { label: "live model sessions", kind: ResourceKind::LlmSessions, actions: false },
     ],
@@ -51,22 +84,43 @@ pub(crate) const LLM_ACCOUNTS_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::LlmAccounts,
     uri_template: "cairn://llm/accounts",
     name: "LLM accounts",
-    description: "Every provider account visible to the workspace, grouped by provider in priority order: label, the kind of credential it holds (a Cairn-managed Claude sign-in, a ChatGPT sign-in, an API key, a host, a custom endpoint) but never the credential itself, email and plan where the provider reports them, and its usage windows (remaining percent and reset time) with when they were measured and any block still in force. A window whose reset has passed since it was measured is shown as expired history, not as remaining capacity. Read-only: add or re-authenticate an account in Settings → Providers, or run `cairn auth login claude` in a shell for a managed Claude account.",
+    description: "Every provider account visible to the workspace, grouped by provider in priority order: label, the kind of credential it holds (a Cairn-managed Claude sign-in, a ChatGPT sign-in, an API key, a host, a custom endpoint) but never the credential itself, email and plan where the provider reports them, and its usage windows (remaining percent and reset time) with when they were measured and any block still in force. A window whose reset has passed since it was measured is shown as expired history, not as remaining capacity. A sign-in still in the user's hands shows under its provider. Append {provider: claude|codex} to start a sign-in for a new subscription account: a browser opens on this machine, the result names the page to open if it did not, and the account appears here when the user finishes. Starting a sign-in needs the `workspace/default/settings/accounts:write` grant, the same place `cairn://settings` `accounts` writes reach: an Ask run is prompted for it and a Deny run is refused. Patch {action:\"refresh_usage\", provider} to re-measure one provider's accounts now. People sign in through Settings → Providers or `cairn auth login claude`; all three doors run the same sign-in.",
     read_projections: &[ProjectionSpec { key: "provider", values: "KEY — one provider's accounts, e.g. claude, codex, ollama" }],
     related: &[RelatedSpec { label: "pooled capacity per provider", kind: ResourceKind::LlmUsage, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
+    mutations: &[
+        MutationSpec {
+            mode: ChangeMode::Append,
+            required: &[LLM_SIGN_IN_PROVIDER],
+            optional: &[],
+            label: "start a sign-in for a new subscription account (needs the workspace/default/settings/accounts:write grant)",
+            example: r#"write({changes:[{target:"cairn://llm/accounts",mode:"append",payload:{provider:"claude"}}]})"#,
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[LLM_ACCOUNTS_ACTION, LLM_USAGE_PROVIDER],
+            optional: &[],
+            label: "re-measure one provider's accounts now",
+            example: r#"write({changes:[{target:"cairn://llm/accounts",mode:"patch",payload:{action:"refresh_usage",provider:"claude"}}]})"#,
+        },
+    ],
 };
 
 pub(crate) const LLM_ACCOUNT_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::LlmAccount,
     uri_template: "cairn://llm/accounts/{id}",
     name: "LLM account",
-    description: "One provider account: its credential kind (never the credential), the providers it serves, email, plan, scope, priority, when it was last used, and every usage window it has reported. Read-only: sign-in and re-authentication happen in Settings → Providers, or with `cairn auth login claude --account <id>`.",
+    description: "One provider account: its credential kind (never the credential), the providers it serves, email, plan, scope, priority, when it was last used, and every usage window it has reported, a sign-in still pending on it, and its sign-in history (who started each sign-in and how it ended). Patch it with action sign_in to re-authenticate a Claude or Codex subscription account (needs the `workspace/default/settings/accounts:write` grant; an Ask run is prompted for it and a Deny run is refused; a browser opens on this machine), submit_code with the pasted code#state to finish a pending Claude sign-in on its manual path, cancel_sign_in to end a pending one, or refresh_usage to re-measure it now. An API key, host, or custom endpoint changes through `cairn://settings` `accounts`. People re-authenticate in Settings → Providers or with `cairn auth login claude --account <id>`; every door runs the same sign-in.",
     read_projections: NO_PROJECTIONS,
     related: NO_RELATED,
     cross_actions: NO_CROSS_ACTIONS,
-    mutations: NO_MUTATIONS,
+    mutations: &[MutationSpec {
+        mode: ChangeMode::Patch,
+        required: &[LLM_ACCOUNT_ACTION],
+        optional: &[LLM_SIGN_IN_CODE],
+        label: "re-authenticate, finish or cancel a pending sign-in, or re-measure usage",
+        example: r#"write({changes:[{target:"cairn://llm/accounts/ACCOUNT_ID",mode:"patch",payload:{action:"sign_in"}}]})"#,
+    }],
 };
 
 pub(crate) const LLM_USAGE_CONTRACT: ResourceContract = ResourceContract {

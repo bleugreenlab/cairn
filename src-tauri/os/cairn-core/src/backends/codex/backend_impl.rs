@@ -390,6 +390,7 @@ impl AgentBackend for CodexBackend {
             );
             active_process.backend = Some("codex".to_string());
             active_process.model = config.model.as_ref().map(|m| m.as_str().to_string());
+            active_process.account_id = config.account_id.clone();
             active_process.facts = Some(launched.facts);
             orch.process_state
                 .register_process(config.run_id.clone(), active_process)?;
@@ -862,6 +863,7 @@ fn start_pooled_call(config: SessionConfig, orch: &Orchestrator) -> Result<(), S
         );
         active_process.backend = Some("codex".to_string());
         active_process.model = config.model.as_ref().map(|m| m.as_str().to_string());
+        active_process.account_id = config.account_id.clone();
         active_process.facts = Some(launched.facts);
         orch.process_state
             .register_process(config.run_id.clone(), active_process)?;

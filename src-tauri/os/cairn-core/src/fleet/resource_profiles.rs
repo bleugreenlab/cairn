@@ -3,7 +3,7 @@ use crate::storage::LocalDb;
 use cairn_common::executor_protocol::{
     CellCommandClass, CellExecutionMeta, CommandResourceIdentity, ContentionEstimate,
     ContentionEvidence, ContentionFallback, DurationEstimate, DurationEvidence, DurationFallback,
-    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality,
+    ExecutionLoadContext, ExecutionWarmth, ExecutorCapabilities, MeasurementQuality, MemoryCeiling,
     ReservationFallback, ReservationRationale, DURATION_PROFILE_STALE_AFTER_MS,
     DURATION_SAMPLE_WINDOW, MIN_CONFIDENT_DURATION_SAMPLES, MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
@@ -21,6 +21,82 @@ const MEMORY_QUARANTINE_NUMERATOR: u64 = 9;
 const MEMORY_QUARANTINE_DENOMINATOR: u64 = 10;
 const MEMORY_RESERVATION_CAP_NUMERATOR: u64 = 3;
 const MEMORY_RESERVATION_CAP_DENOMINATOR: u64 = 4;
+
+/// The most one request may reserve on a machine with this memory budget.
+fn memory_reservation_cap(memory_budget_bytes: u64) -> u64 {
+    memory_budget_bytes.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
+        / MEMORY_RESERVATION_CAP_DENOMINATOR
+}
+
+/// Whether a peak is large enough against this budget that it describes the
+/// machine's saturation rather than one command.
+fn memory_peak_quarantined(peak_bytes: u64, memory_budget_bytes: Option<u64>) -> bool {
+    memory_budget_bytes.is_some_and(|budget| {
+        peak_bytes.saturating_mul(MEMORY_QUARANTINE_DENOMINATOR)
+            >= budget.saturating_mul(MEMORY_QUARANTINE_NUMERATOR)
+    })
+}
+
+/// Whether this machine can ever hold the work's measured memory demand.
+///
+/// Three answers, because two of them are evidence and one is not. A missing
+/// measurement, or a machine that states no budget, is `Unknown`, and it is
+/// never read as either of the others: treating an absent ceiling as proof a
+/// machine can hold the work is how a smaller, colder machine would be named
+/// the safe alternative to one measurably too small.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum MemoryFit {
+    #[default]
+    Unknown,
+    /// A measured demand fits under this machine's reservation cap.
+    Holds,
+    /// A measured demand this machine's cap will never reach: the clamp as a
+    /// fact.
+    Exceeds(MemoryCeiling),
+}
+
+impl MemoryFit {
+    pub(super) fn of(demand_bytes: Option<u64>, memory_budget_bytes: Option<u64>) -> Self {
+        let (Some(estimate_bytes), Some(budget)) = (demand_bytes, memory_budget_bytes) else {
+            return Self::Unknown;
+        };
+        let ceiling_bytes = memory_reservation_cap(budget);
+        match estimate_bytes > ceiling_bytes {
+            true => Self::Exceeds(MemoryCeiling {
+                estimate_bytes,
+                ceiling_bytes,
+            }),
+            false => Self::Holds,
+        }
+    }
+
+    pub(super) fn ceiling(self) -> Option<MemoryCeiling> {
+        match self {
+            Self::Exceeds(ceiling) => Some(ceiling),
+            Self::Holds | Self::Unknown => None,
+        }
+    }
+
+    /// The fit of a batch, which must hold its heaviest item: any item that
+    /// exceeds decides it (the one measured furthest past the cap), and an item
+    /// nothing is known about leaves the rest of the batch unknown.
+    pub(super) fn of_batch(items: impl IntoIterator<Item = Self>) -> Self {
+        items
+            .into_iter()
+            .reduce(|left, right| match (left, right) {
+                (Self::Exceeds(held), Self::Exceeds(next)) => {
+                    Self::Exceeds(match next.estimate_bytes > held.estimate_bytes {
+                        true => next,
+                        false => held,
+                    })
+                }
+                (Self::Exceeds(held), _) | (_, Self::Exceeds(held)) => Self::Exceeds(held),
+                (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+                (Self::Holds, Self::Holds) => Self::Holds,
+            })
+            .unwrap_or_default()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct ProfileContext {
@@ -183,6 +259,11 @@ pub(super) struct ResolvedResourceProfile {
     pub duration: DurationEstimate,
     /// Per-item durations when this profile represents a process batch.
     pub item_durations: Vec<DurationEstimate>,
+    /// Whether this machine can ever hold the measured memory demand. When it
+    /// cannot, `reservation` holds the clamp rather than the demand. Admission
+    /// is unchanged by it; placement reads it to prefer a machine that can
+    /// hold the work, and to say so when none can.
+    pub memory_fit: MemoryFit,
 }
 
 /// The conservative safety prior for a work class that has never been measured
@@ -221,11 +302,9 @@ pub(super) fn cold_start_prior(
     };
     // Memory always leaves the same host reserve as learned demand. A small
     // machine does not make the operating system and executor disappear.
-    let memory = capabilities.memory_budget_bytes.map_or(memory, |budget| {
-        let cap = budget.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
-            / MEMORY_RESERVATION_CAP_DENOMINATOR;
-        memory.min(cap)
-    });
+    let memory = capabilities
+        .memory_budget_bytes
+        .map_or(memory, |budget| memory.min(memory_reservation_cap(budget)));
     let disk = capabilities
         .disk_budget_bytes
         .map_or(disk, |budget| disk.min(budget));
@@ -279,27 +358,9 @@ fn fleet_prior(
     class_prior: &ResourceReservation,
     memory_budget_bytes: Option<u64>,
 ) -> Option<ResourceReservation> {
-    if evidence.peaks.is_empty() {
-        return None;
-    }
-    let borrowed_peak = upper_median(&evidence.peaks);
-    // The quarantine that guards a machine's own observations guards a borrowed
-    // one for the same reason and with more force: a peak that would consume
-    // this machine describes some other machine's saturation, or a machine this
-    // command has no business running on. Either way it is not this machine's
-    // prior, and letting it through would refuse the work here forever.
-    if memory_budget_bytes.is_some_and(|budget| {
-        borrowed_peak.saturating_mul(MEMORY_QUARANTINE_DENOMINATOR)
-            >= budget.saturating_mul(MEMORY_QUARANTINE_NUMERATOR)
-    }) {
-        return None;
-    }
-    let memory = with_headroom(borrowed_peak);
-    let memory = memory_budget_bytes.map_or(memory, |budget| {
-        let cap = budget.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
-            / MEMORY_RESERVATION_CAP_DENOMINATOR;
-        memory.min(cap)
-    });
+    let memory = fleet_memory_demand(evidence, memory_budget_bytes)?;
+    let memory =
+        memory_budget_bytes.map_or(memory, |budget| memory.min(memory_reservation_cap(budget)));
     // A prior is a floor. Borrowed evidence may raise the class prior and never
     // lower it, so a fleet that happens to have run this command on idle
     // machines cannot talk a host into admitting more than a cold start allows.
@@ -323,6 +384,32 @@ fn fleet_prior(
         // reader from mistaking another machine's history for this one's.
         source: ResourceReservationSource::Unmeasured,
     })
+}
+
+/// What the rest of the fleet measured this command needing, with headroom,
+/// judged against nothing: the demand as the machines that ran it saw it. For
+/// fit only; a reservation borrows through [`fleet_memory_demand`].
+fn fleet_portable_demand(evidence: &FleetEvidence) -> Option<u64> {
+    (!evidence.peaks.is_empty()).then(|| with_headroom(upper_median(&evidence.peaks)))
+}
+
+/// What the rest of the fleet measured this command needing, with headroom and
+/// before this machine's cap, or `None` when nothing was measured or the
+/// borrowed peak is quarantined here.
+fn fleet_memory_demand(evidence: &FleetEvidence, memory_budget_bytes: Option<u64>) -> Option<u64> {
+    if evidence.peaks.is_empty() {
+        return None;
+    }
+    let borrowed_peak = upper_median(&evidence.peaks);
+    // The quarantine that guards a machine's own observations guards a borrowed
+    // one for the same reason and with more force: a peak that would consume
+    // this machine describes some other machine's saturation, or a machine this
+    // command has no business running on. Either way it is not this machine's
+    // prior, and letting it through would refuse the work here forever.
+    if memory_peak_quarantined(borrowed_peak, memory_budget_bytes) {
+        return None;
+    }
+    Some(with_headroom(borrowed_peak))
 }
 
 /// The conservative duration a work class is assumed to take on a machine that
@@ -535,6 +622,7 @@ pub(super) async fn resolve_reservation(
             ),
             duration,
             item_durations: Vec::new(),
+            memory_fit: MemoryFit::Unknown,
         };
     };
     // A store that could not be read and a work class that has never run are
@@ -547,13 +635,22 @@ pub(super) async fn resolve_reservation(
     // speaks for itself and pays for no extra query.
     let cold_here =
         !matches!(&local, Ok(Some(profile)) if profile.sample_count >= MIN_CONFIDENT_SAMPLES);
-    let borrowed = match cold_here {
+    let fleet_evidence = match cold_here {
         false => None,
-        true => load_fleet_evidence(db, identity, context)
-            .await
-            .ok()
-            .and_then(|evidence| fleet_prior(&evidence, &prior, memory_budget_bytes)),
+        true => load_fleet_evidence(db, identity, context).await.ok(),
     };
+    let borrowed = fleet_evidence
+        .as_ref()
+        .and_then(|evidence| fleet_prior(evidence, &prior, memory_budget_bytes));
+    // Read beside the prior rather than from it, because the prior is already
+    // clamped, may have been discarded as no larger than the class prior, and is
+    // quarantined against this machine's budget: none of those says what the
+    // fleet measured. The quarantine is right for a reservation and wrong for a
+    // fit. A borrowed peak was measured on machines it did not saturate, so one
+    // that would nearly consume this machine is evidence this machine is too
+    // small, not that this machine was saturated.
+    let borrowed_demand = fleet_evidence.as_ref().and_then(fleet_portable_demand);
+    let fit_for = |demand: Option<u64>| MemoryFit::of(demand, memory_budget_bytes);
     // The prior is settled before anything explains itself, so every rationale
     // below reports the number this resolution actually stood on.
     let prior = borrowed.clone().unwrap_or(prior);
@@ -579,6 +676,7 @@ pub(super) async fn resolve_reservation(
                 ),
                 duration,
                 item_durations: Vec::new(),
+                memory_fit: fit_for(borrowed_demand),
             }
         }
         Err(_) => {
@@ -588,16 +686,14 @@ pub(super) async fn resolve_reservation(
                 rationale: rationale(Some(ReservationFallback::ProfileLookupFailed), None),
                 duration,
                 item_durations: Vec::new(),
+                memory_fit: fit_for(borrowed_demand),
             }
         }
     };
     let below_floor = profile.sample_count < MIN_CONFIDENT_SAMPLES;
-    let memory_quarantined = memory_budget_bytes.is_some_and(|budget| {
-        profile.upper_peak_rss_bytes.is_some_and(|peak| {
-            peak.saturating_mul(MEMORY_QUARANTINE_DENOMINATOR)
-                >= budget.saturating_mul(MEMORY_QUARANTINE_NUMERATOR)
-        })
-    });
+    let memory_quarantined = profile
+        .upper_peak_rss_bytes
+        .is_some_and(|peak| memory_peak_quarantined(peak, memory_budget_bytes));
     let reservation = reservation_for_profile(
         &profile,
         prior.clone(),
@@ -629,6 +725,13 @@ pub(super) async fn resolve_reservation(
         ),
         duration,
         item_durations: Vec::new(),
+        // Whichever measurement the reservation stood on: this machine's own,
+        // or, while that is still thin, the fleet's.
+        // A quarantined own peak measured this machine's saturation, so it says
+        // nothing about fit and leaves it unknown unless the fleet says more.
+        memory_fit: fit_for(
+            measured_memory_demand(&profile, memory_quarantined).max(borrowed_demand),
+        ),
     }
 }
 
@@ -772,16 +875,28 @@ pub(super) async fn observe_completed(
     .await;
 }
 
+/// The memory demand this machine's own profile measured, as a reservation
+/// charges it before the machine's cap: the raw high-water mark while evidence
+/// is thin, with headroom once it is confident, and nothing at all for a
+/// quarantined peak.
+fn measured_memory_demand(profile: &ResourceProfile, memory_quarantined: bool) -> Option<u64> {
+    if memory_quarantined {
+        return None;
+    }
+    let peak = profile.upper_peak_rss_bytes?;
+    Some(match profile.sample_count < MIN_CONFIDENT_SAMPLES {
+        true => peak,
+        false => with_headroom(peak),
+    })
+}
+
 fn reservation_for_profile(
     profile: &ResourceProfile,
     prior: ResourceReservation,
     memory_budget_bytes: Option<u64>,
     memory_quarantined: bool,
 ) -> ResourceReservation {
-    let learned_memory = (!memory_quarantined)
-        .then_some(profile.upper_peak_rss_bytes)
-        .flatten()
-        .map(with_headroom);
+    let measured_memory = measured_memory_demand(profile, memory_quarantined);
     let learned_disk = profile.upper_disk_delta_bytes.map(with_headroom);
     let (memory_bytes, disk_growth_bytes) = if profile.sample_count < MIN_CONFIDENT_SAMPLES {
         // Thin evidence cannot justify predictive headroom, but it is still a
@@ -789,13 +904,7 @@ fn reservation_for_profile(
         // the larger of the prior and the raw observation until enough samples
         // exist to apply the learned estimate with headroom.
         (
-            if memory_quarantined {
-                prior.memory_bytes
-            } else {
-                profile
-                    .upper_peak_rss_bytes
-                    .map_or(prior.memory_bytes, |value| prior.memory_bytes.max(value))
-            },
+            measured_memory.map_or(prior.memory_bytes, |value| prior.memory_bytes.max(value)),
             profile
                 .upper_disk_delta_bytes
                 .map_or(prior.disk_growth_bytes, |value| {
@@ -804,14 +913,14 @@ fn reservation_for_profile(
         )
     } else {
         (
-            learned_memory.unwrap_or(prior.memory_bytes),
+            measured_memory.unwrap_or(prior.memory_bytes),
             learned_disk.unwrap_or(prior.disk_growth_bytes),
         )
     };
+    // The cap is what keeps work measured on a big host from claiming a small
+    // one whole. It hides that it clamped, which `memory_fit` states.
     let memory_bytes = memory_budget_bytes.map_or(memory_bytes, |budget| {
-        let cap = budget.saturating_mul(MEMORY_RESERVATION_CAP_NUMERATOR)
-            / MEMORY_RESERVATION_CAP_DENOMINATOR;
-        memory_bytes.min(cap)
+        memory_bytes.min(memory_reservation_cap(budget))
     });
     ResourceReservation {
         memory_bytes,
@@ -828,6 +937,30 @@ fn reservation_for_profile(
             true => ResourceReservationSource::Learned,
             false => prior.source,
         },
+    }
+}
+
+/// Seed one context's memory profile, for placement tests outside this module.
+/// [`observe_completed`] stays the only production writer.
+#[cfg(test)]
+pub(super) async fn seed_memory_profile_for_test(
+    db: Arc<LocalDb>,
+    identity: &CommandResourceIdentity,
+    context: &ProfileContext,
+    peak_rss_bytes: u64,
+) {
+    for finished in 1..=MIN_CONFIDENT_SAMPLES {
+        update_profile(
+            db.clone(),
+            identity,
+            context,
+            finished,
+            Some(peak_rss_bytes),
+            Some(1024 * 1024),
+            Some(1_000),
+        )
+        .await
+        .unwrap();
     }
 }
 
@@ -1808,6 +1941,167 @@ mod tests {
             Some(ReservationFallback::MemoryObservationQuarantined)
         );
         assert_eq!(resolved.rationale.upper_peak_rss_bytes, Some(99 * GIB));
+    }
+
+    /// The budget of the ~12 GiB host in cairn/4931's specimen B. Three quarters
+    /// of it is exactly the 8,282,086,656 bytes that host reported as a cargo
+    /// test's "required" memory, which was the clamp and not the measurement.
+    const SPECIMEN_BUDGET: u64 = 11_042_782_208;
+    const SPECIMEN_CAP: u64 = 8_282_086_656;
+
+    async fn ceiling_for_local_peak(
+        name: &str,
+        samples: u64,
+        peak: u64,
+    ) -> ResolvedResourceProfile {
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let context = ProfileContext {
+            executor_class: "bgsrv-ub:bgsrv-ub".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            toolchain_fingerprint: "rust".into(),
+        };
+        for finished in 1..=samples {
+            update_profile(
+                db.clone(),
+                &identity,
+                &context,
+                finished,
+                Some(peak),
+                Some(GIB),
+                Some(1_000),
+            )
+            .await
+            .unwrap();
+        }
+        resolve_reservation(
+            db,
+            Some(&identity),
+            &context,
+            cold_start_prior(CellCommandClass::CargoTest, &capabilities()),
+            Some(SPECIMEN_BUDGET),
+            test_duration_context(),
+        )
+        .await
+    }
+
+    /// The clamp keeps the reservation admissible, and now also says it
+    /// clamped: a measured demand above the cap is a ceiling this machine will
+    /// never reach, which is what lets placement prefer one that can hold it.
+    #[tokio::test]
+    async fn a_measured_demand_above_the_cap_is_stated_and_the_reservation_stays_clamped() {
+        let peak = 8 * GIB;
+        let resolved = ceiling_for_local_peak(
+            "resource-profile-ceiling-measured.db",
+            MIN_CONFIDENT_SAMPLES,
+            peak,
+        )
+        .await;
+        assert_eq!(resolved.reservation.memory_bytes, SPECIMEN_CAP);
+        assert_eq!(
+            resolved.memory_fit,
+            MemoryFit::Exceeds(MemoryCeiling {
+                estimate_bytes: with_headroom(peak),
+                ceiling_bytes: SPECIMEN_CAP,
+            })
+        );
+    }
+
+    /// A peak near the whole budget measured the machine's saturation, not the
+    /// command. Calling it a ceiling would refuse this machine the work forever
+    /// (a solo user's laptop included), so it states nothing.
+    #[tokio::test]
+    async fn a_quarantined_peak_is_not_a_ceiling() {
+        let resolved = ceiling_for_local_peak(
+            "resource-profile-ceiling-quarantined.db",
+            MIN_CONFIDENT_SAMPLES,
+            SPECIMEN_BUDGET,
+        )
+        .await;
+        assert_eq!(
+            resolved.rationale.fallback,
+            Some(ReservationFallback::MemoryObservationQuarantined)
+        );
+        assert_eq!(resolved.memory_fit, MemoryFit::Unknown);
+    }
+
+    /// A prior is not a measurement, whatever it holds, and one that fits under
+    /// the cap by construction never says the machine is too small.
+    #[tokio::test]
+    async fn a_number_the_prior_set_is_not_a_ceiling() {
+        let unmeasured = ceiling_for_local_peak("resource-profile-ceiling-prior.db", 0, GIB).await;
+        assert_eq!(
+            unmeasured.rationale.fallback,
+            Some(ReservationFallback::NoProfileRecorded)
+        );
+        assert_eq!(unmeasured.memory_fit, MemoryFit::Unknown);
+
+        let thin_and_small =
+            ceiling_for_local_peak("resource-profile-ceiling-thin.db", 1, 512 * 1024 * 1024).await;
+        assert_eq!(
+            thin_and_small.reservation.memory_bytes,
+            cold_start_prior(CellCommandClass::CargoTest, &capabilities()).memory_bytes
+        );
+        assert_eq!(
+            thin_and_small.memory_fit,
+            MemoryFit::Holds,
+            "a measured peak under the cap is evidence the machine can hold it"
+        );
+    }
+
+    /// A machine with no history of its own is judged on what the fleet
+    /// measured, before this machine's cap discards the difference.
+    #[tokio::test]
+    async fn a_borrowed_demand_above_this_machines_cap_is_a_ceiling_here() {
+        let db = Arc::new(
+            crate::storage::migrated_test_db("resource-profile-ceiling-borrowed.db").await,
+        );
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let context = |executor_class: &str| ProfileContext {
+            executor_class: executor_class.into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            toolchain_fingerprint: "rust".into(),
+        };
+        for elsewhere in ["bbs:bbs", "fedora:fedora"] {
+            for finished in 1..=MIN_CONFIDENT_SAMPLES {
+                update_profile(
+                    db.clone(),
+                    &identity,
+                    &context(elsewhere),
+                    finished,
+                    Some(8 * GIB),
+                    Some(GIB),
+                    Some(1_000),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let resolved = resolve_reservation(
+            db,
+            Some(&identity),
+            &context("bgsrv-ub:bgsrv-ub"),
+            cold_start_prior(CellCommandClass::CargoTest, &capabilities()),
+            Some(SPECIMEN_BUDGET),
+            test_duration_context(),
+        )
+        .await;
+        assert_eq!(resolved.reservation.memory_bytes, SPECIMEN_CAP);
+        assert_eq!(
+            resolved.memory_fit,
+            MemoryFit::Exceeds(MemoryCeiling {
+                estimate_bytes: with_headroom(8 * GIB),
+                ceiling_bytes: SPECIMEN_CAP,
+            })
+        );
     }
 
     #[test]

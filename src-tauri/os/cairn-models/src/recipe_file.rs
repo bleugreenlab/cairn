@@ -7,12 +7,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use crate::decision::{DecisionNode, DecisionQuestion, Thresholds};
+
 use super::{
-    default_branch_targets, ActionNodeConfig, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig,
-    BranchMode, BranchTarget, CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig,
-    ConditionType, ConfirmPolicy, ContextNodeConfig, EventFilter, NodePosition, Recipe, RecipeEdge,
-    RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger, ScheduleConfig, SchemaConfig,
-    TriggerConfig, TriggerScope,
+    default_branch_targets, is_legacy_ai_condition, legacy_port_handle, ActionNodeConfig,
+    AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, BranchMode, BranchTarget,
+    CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig, ConfirmPolicy,
+    ContextNodeConfig, EventFilter, NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode,
+    RecipeNodeType, RecipeTrigger, ScheduleConfig, SchemaConfig, TriggerConfig, TriggerScope,
 };
 
 /// Generate a slug from a name (lowercase, hyphens, no special chars)
@@ -162,17 +164,24 @@ pub struct NodeFileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirm_policy: Option<ConfirmPolicy>,
 
-    // Condition config
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub condition_type: Option<ConditionType>,
+    // Condition config. `conditionType` and `question` are legacy, read only
+    // to migrate an `ai` condition into a decision node and never written.
+    #[serde(default, skip_serializing)]
+    pub condition_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expression: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     pub question: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<String>>,
+
+    // Decision config
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub questions: Option<Vec<DecisionQuestion>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ports: Option<Vec<String>>,
+    pub thresholds: Option<Thresholds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_error: Option<ConditionErrorBehavior>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -376,13 +385,20 @@ fn build_node_file_config(node: &RecipeNode) -> Option<NodeFileConfig> {
 
     // Condition config
     if let Some(cc) = &node.condition_config {
-        config.condition_type = Some(cc.condition_type.clone());
         config.expression = cc.expression.clone();
-        config.question = cc.question.clone();
-        config.model = cc.model.clone();
         config.ports = Some(cc.ports.clone());
         config.on_error = Some(cc.on_error.clone());
         config.default_port = cc.default_port.clone();
+        has_config = true;
+    }
+
+    // Decision config
+    if let Some(dc) = &node.decision_config {
+        config.questions = Some(dc.questions.clone());
+        config.model = dc.model.clone();
+        if !dc.thresholds.is_empty() {
+            config.thresholds = Some(dc.thresholds);
+        }
         has_config = true;
     }
 
@@ -682,6 +698,8 @@ impl RecipeFile {
             }
         }
 
+        errors.extend(self.decision_errors());
+
         // Declaring the `base` branch target means an execution may be launched
         // with every `pr` node pruned from the snapshot. Pruning a node that
         // still has downstream control would sever the DAG, so a recipe may only
@@ -716,8 +734,57 @@ impl RecipeFile {
 }
 
 impl RecipeFileNode {
+    /// The ports a condition or decision node routes by (a legacy `ai`
+    /// condition's are its decision's options); empty for any other node.
+    fn routing_ports(&self) -> Vec<String> {
+        if let Some(decision) = self.decision() {
+            return decision.ports();
+        }
+        if self.node_type == RecipeNodeType::Condition {
+            return self
+                .config
+                .as_ref()
+                .and_then(|config| config.ports.clone())
+                .unwrap_or_default();
+        }
+        Vec::new()
+    }
+
+    /// Whether this is a legacy `ai` condition, which reads as a decision.
+    fn is_legacy_ai(&self) -> bool {
+        self.node_type == RecipeNodeType::Condition
+            && self
+                .config
+                .as_ref()
+                .is_some_and(|config| is_legacy_ai_condition(config.condition_type.as_deref()))
+    }
+
+    /// The decision this node asks, for a decision node or a legacy `ai`
+    /// condition.
+    fn decision(&self) -> Option<DecisionNode> {
+        let config = self.config.clone().unwrap_or_default();
+        if self.is_legacy_ai() {
+            return Some(DecisionNode::port_choice(
+                config.question.as_deref().unwrap_or_default(),
+                config.ports.as_deref().unwrap_or_default(),
+                config.model,
+            ));
+        }
+        (self.node_type == RecipeNodeType::Decision).then(|| DecisionNode {
+            questions: config.questions.unwrap_or_default(),
+            model: config.model,
+            thresholds: config.thresholds.unwrap_or_default(),
+        })
+    }
+
     /// Convert to RecipeNode with new ID
     fn into_node(self, new_id: String, id_map: &HashMap<String, String>) -> RecipeNode {
+        let decision_config = self.decision();
+        let node_type = if decision_config.is_some() {
+            RecipeNodeType::Decision
+        } else {
+            self.node_type.clone()
+        };
         let config = self.config.unwrap_or_default();
 
         // Build type-specific configs
@@ -795,12 +862,11 @@ impl RecipeFileNode {
         };
 
         // Condition config
-        let condition_config = if config.condition_type.is_some() || config.ports.is_some() {
+        let condition_config = if node_type == RecipeNodeType::Condition
+            && (config.condition_type.is_some() || config.ports.is_some())
+        {
             Some(ConditionNodeConfig {
-                condition_type: config.condition_type.unwrap_or_default(),
                 expression: config.expression,
-                question: config.question,
-                model: config.model,
                 ports: config.ports.unwrap_or_default(),
                 on_error: config.on_error.unwrap_or_default(),
                 default_port: config.default_port,
@@ -832,7 +898,7 @@ impl RecipeFileNode {
 
         RecipeNode {
             id: new_id,
-            node_type: self.node_type,
+            node_type,
             name: self.name,
             position: parse_position(&self.position),
             parent_id,
@@ -842,6 +908,7 @@ impl RecipeFileNode {
             checkpoint_config,
             artifact_config,
             condition_config,
+            decision_config,
             context_config,
         }
     }
@@ -926,14 +993,79 @@ impl RecipeFile {
         serde_json::to_string_pretty(self).map_err(|e| format!("JSON serialization error: {}", e))
     }
 
+    /// Every structural problem with this recipe's decision nodes.
+    ///
+    /// A decision node routes on one choice question whose options are its
+    /// ports, so its definition must be askable and every control edge out
+    /// of it must leave by one of those options. Checked wherever a recipe is
+    /// validated or saved, because an unaskable decision would otherwise
+    /// block mid-run.
+    pub fn decision_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for node in &self.nodes {
+            let Some(decision) = node.decision() else {
+                continue;
+            };
+            for problem in decision.problems() {
+                errors.push(format!("Decision node '{}': {problem}", node.name));
+            }
+            if let Err(problem) = decision.port_question() {
+                errors.push(format!("Decision node '{}': {problem}", node.name));
+                continue;
+            }
+            let ports = decision.ports();
+            for edge in &self.edges {
+                let (source_node, source_handle) = parse_node_handle(&edge.from);
+                if source_node != node.id || edge.edge_type != RecipeEdgeType::Control {
+                    continue;
+                }
+                match source_handle {
+                    Some(handle) if ports.iter().any(|port| port == handle) => {}
+                    handle => errors.push(format!(
+                        "Decision node '{}' has an edge leaving by '{}', which is not one of its options ({})",
+                        node.name,
+                        handle.unwrap_or("no port"),
+                        ports.join(", ")
+                    )),
+                }
+            }
+        }
+        errors
+    }
+
+    /// Rewrite the recipe editor's legacy `port-<name>` handles on edges
+    /// leaving a condition or decision node to the port itself
+    /// ([`legacy_port_handle`]). Applied on every parse, so validation and
+    /// conversion only ever see the canonical handle.
+    fn normalize_legacy_port_handles(&mut self) {
+        for edge in &mut self.edges {
+            let (source, handle) = parse_node_handle(&edge.from);
+            let Some(handle) = handle else {
+                continue;
+            };
+            let Some(node) = self.nodes.iter().find(|node| node.id == source) else {
+                continue;
+            };
+            if let Some(port) = legacy_port_handle(handle, &node.routing_ports()) {
+                edge.from = format!("{source}@{port}");
+            }
+        }
+    }
+
     /// Parse from YAML format
     pub fn from_yaml(content: &str) -> Result<Self, String> {
-        serde_yaml::from_str(content).map_err(|e| format!("YAML parse error: {}", e))
+        let mut file: Self =
+            serde_yaml::from_str(content).map_err(|e| format!("YAML parse error: {}", e))?;
+        file.normalize_legacy_port_handles();
+        Ok(file)
     }
 
     /// Parse from JSON format
     pub fn from_json(content: &str) -> Result<Self, String> {
-        serde_json::from_str(content).map_err(|e| format!("JSON parse error: {}", e))
+        let mut file: Self =
+            serde_json::from_str(content).map_err(|e| format!("JSON parse error: {}", e))?;
+        file.normalize_legacy_port_handles();
+        Ok(file)
     }
 
     /// Parse from either format (auto-detect)
@@ -982,6 +1114,7 @@ mod tests {
                     checkpoint_config: None,
                     artifact_config: None,
                     condition_config: None,
+                    decision_config: None,
                     context_config: None,
                 },
                 RecipeNode {
@@ -1000,6 +1133,7 @@ mod tests {
                     checkpoint_config: None,
                     artifact_config: None,
                     condition_config: None,
+                    decision_config: None,
                     context_config: None,
                 },
             ],
@@ -1244,6 +1378,181 @@ edges: []
         assert_eq!(tc.scope, Some(TriggerScope::Issue)); // context migrated to scope
     }
 
+    const LEGACY_AI_CONDITION: &str = r#"cairnVersion: 1
+name: Legacy Condition
+trigger: manual
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: manual
+  - id: db
+    type: condition
+    name: Touches the DB?
+    position: 200@0
+    config:
+      conditionType: ai
+      question: Does the issue touch the database?
+      model: sm
+      ports: [yes, no]
+      onError: block
+edges:
+  - from: trigger-1@control-out
+    to: db@control-in
+    type: control
+"#;
+
+    /// The old recipe editor stored a condition's outgoing handles as
+    /// `port-<name>`; the engine routes by the port name itself.
+    const LEGACY_EDITOR_EDGES: &str = r#"cairnVersion: 1
+name: Legacy Editor Edges
+trigger: manual
+nodes:
+  - id: db
+    type: condition
+    name: Touches the DB?
+    position: 200@0
+    config:
+      conditionType: ai
+      question: Does the issue touch the database?
+      ports: [yes, no]
+  - id: risk
+    type: condition
+    name: Risk
+    position: 400@0
+    config:
+      conditionType: programmatic
+      expression: plan.risk
+      ports: [port-high, low]
+edges:
+  - from: db@port-yes
+    to: risk@control-in
+    type: control
+  - from: db@port-no
+    to: risk@control-in
+    type: control
+  - from: risk@port-high
+    to: db@control-in
+    type: control
+  - from: risk@port-low
+    to: db@control-in
+    type: control
+"#;
+
+    #[test]
+    fn legacy_port_handles_read_as_the_ports_they_name() {
+        let parsed = RecipeFile::from_yaml(LEGACY_EDITOR_EDGES).unwrap();
+        let from: Vec<&str> = parsed.edges.iter().map(|edge| edge.from.as_str()).collect();
+        // An option genuinely named `port-high` keeps its handle; the rest
+        // lose the editor's prefix.
+        assert_eq!(from, vec!["db@yes", "db@no", "risk@port-high", "risk@low"]);
+        assert!(
+            parsed.decision_errors().is_empty(),
+            "{:?}",
+            parsed.decision_errors()
+        );
+
+        let recipe = parsed.into_recipe(None, None);
+        let db = recipe
+            .nodes
+            .iter()
+            .find(|node| node.name == "Touches the DB?")
+            .unwrap();
+        let handles: Vec<&str> = recipe
+            .edges
+            .iter()
+            .filter(|edge| edge.source_node_id == db.id)
+            .map(|edge| edge.source_handle.as_str())
+            .collect();
+        assert_eq!(handles, vec!["yes", "no"]);
+
+        let json = RecipeFile::from_json(
+            &serde_json::to_string(&RecipeFile::from_yaml(LEGACY_EDITOR_EDGES).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json.edges[0].from, "db@yes");
+    }
+
+    #[test]
+    fn a_decision_edge_by_an_unknown_handle_is_still_refused() {
+        let yaml = LEGACY_EDITOR_EDGES.replace("db@port-no", "db@port-maybe");
+        let errors = RecipeFile::from_yaml(&yaml).unwrap().decision_errors();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("'port-maybe'"), "{errors:?}");
+    }
+
+    #[test]
+    fn a_legacy_ai_condition_imports_as_a_decision_node_and_exports_as_one() {
+        let parsed = RecipeFile::from_yaml(LEGACY_AI_CONDITION).unwrap();
+        assert!(parsed.validate().valid, "{:?}", parsed.validate().errors);
+        let recipe = parsed.into_recipe(None, None);
+        let node = recipe
+            .nodes
+            .iter()
+            .find(|node| node.name == "Touches the DB?")
+            .unwrap();
+        assert_eq!(node.node_type, RecipeNodeType::Decision);
+        assert!(node.condition_config.is_none());
+        let decision = node.decision_config.as_ref().unwrap();
+        assert_eq!(decision.ports(), vec!["yes", "no"]);
+        assert_eq!(decision.model.as_deref(), Some("sm"));
+        assert_eq!(
+            decision.questions[0].instructions,
+            "Does the issue touch the database?"
+        );
+
+        // Written back, it is a decision node; the ai shape is gone.
+        let yaml = RecipeFile::from(recipe).to_yaml().unwrap();
+        assert!(yaml.contains("type: decision"), "{yaml}");
+        assert!(!yaml.contains("conditionType"), "{yaml}");
+        assert!(!yaml.contains("question:"), "{yaml}");
+        let reread = RecipeFile::from_yaml(&yaml).unwrap();
+        assert!(reread.validate().valid, "{:?}", reread.validate().errors);
+        let again = reread.into_recipe(None, None);
+        let node = again
+            .nodes
+            .iter()
+            .find(|node| node.node_type == RecipeNodeType::Decision)
+            .unwrap();
+        assert_eq!(
+            node.decision_config.as_ref().unwrap().ports(),
+            vec!["yes", "no"]
+        );
+    }
+
+    #[test]
+    fn a_decision_node_may_only_be_left_by_one_of_its_options() {
+        let yaml = LEGACY_AI_CONDITION.replace(
+            "edges:\n",
+            "edges:\n  - from: db@maybe\n    to: trigger-1@control-in\n    type: control\n",
+        );
+        let validation = RecipeFile::from_yaml(&yaml).unwrap().validate();
+        assert!(!validation.valid);
+        assert!(
+            validation.errors.iter().any(|error| error
+                == "Decision node 'Touches the DB?' has an edge leaving by 'maybe', which is not one of its options (yes, no)"),
+            "{:?}",
+            validation.errors
+        );
+    }
+
+    #[test]
+    fn an_unaskable_decision_node_is_refused_at_validation() {
+        let yaml =
+            LEGACY_AI_CONDITION.replace("      question: Does the issue touch the database?\n", "");
+        let validation = RecipeFile::from_yaml(&yaml).unwrap().validate();
+        assert!(
+            validation.errors.contains(
+                &"Decision node 'Touches the DB?': question 'route' has no instructions"
+                    .to_string()
+            ),
+            "{:?}",
+            validation.errors
+        );
+    }
+
     #[test]
     fn test_legacy_context_does_not_overwrite_existing_scope() {
         // If trigger node already has a scope, the legacy context should not overwrite it
@@ -1360,6 +1669,7 @@ edges: []
                     checkpoint_config: None,
                     artifact_config: None,
                     condition_config: None,
+                    decision_config: None,
                     context_config: None,
                 },
                 RecipeNode {
@@ -1374,6 +1684,7 @@ edges: []
                     checkpoint_config: None,
                     artifact_config: None,
                     condition_config: None,
+                    decision_config: None,
                     context_config: Some(ContextNodeConfig {
                         content: "This is the context content.\n\nWith multiple lines.".to_string(),
                     }),
@@ -1446,6 +1757,7 @@ edges: []
                     checkpoint_config: None,
                     artifact_config: None,
                     condition_config: None,
+                    decision_config: None,
                     context_config: None,
                 },
                 RecipeNode {
@@ -1460,6 +1772,7 @@ edges: []
                     checkpoint_config: None,
                     artifact_config: None,
                     condition_config: None,
+                    decision_config: None,
                     context_config: Some(ContextNodeConfig {
                         content: "You drive one feature.\n\n**Finish** when whole.".to_string(),
                     }),

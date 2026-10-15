@@ -280,6 +280,14 @@ pub enum RemoteConnectionPhase {
     Disconnected,
     RemoteProcessExited,
     RetryScheduled,
+    /// A job's execution environment on this machine was given up and rebuilt
+    /// on another, because this machine stopped answering (silent while still
+    /// connected, or disconnected) for longer than the environment lease
+    /// grace. Not a link transition: the link may still be attached. It is on
+    /// this timeline because it is the consequence of one, and an operator
+    /// reading why a machine lost its work should find it beside the silence
+    /// that caused it. Runner-local like the rest of this enum.
+    EnvironmentEvicted,
 }
 
 impl RemoteConnectionPhase {
@@ -300,7 +308,8 @@ impl RemoteConnectionPhase {
             | Self::CredentialRecovered
             | Self::ProtocolReady
             | Self::ProtocolReadyTimedOut
-            | Self::RetryScheduled => false,
+            | Self::RetryScheduled
+            | Self::EnvironmentEvicted => false,
         }
     }
 }
@@ -4023,7 +4032,39 @@ pub struct LearnedResourceEstimate {
 /// batch context has closed rather than parking the turn. A newer executor
 /// against an older runner waits past that runner's 45 s answer, so it
 /// receives the same reply it always did.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 141;
+///
+/// cairn/4931 adds runner-side placement vocabulary without a bump.
+/// [`MemoryCeiling`] and [`PlacementSelection::memory_ceiling`],
+/// [`PlacementRejectionReason::ExceedsMemoryCeiling`],
+/// [`CellUnavailableReason::HomeCannotHold`], and
+/// [`RemoteConnectionPhase::EnvironmentEvicted`] are produced by the runner
+/// alone and read only by its own surfaces: no executor build constructs,
+/// decodes, or matches any of them, and nothing the runner sends an executor
+/// carries them (a `CellOutcome` travels executor to runner only). The
+/// behaviour behind them, which residency routes count as live, when a silent
+/// home is evicted, how placement ranks a machine whose memory ceiling the
+/// work exceeds, and when a pinned batch is refused for it, is decided
+/// entirely on the runner from facts executors already send (progress stamps,
+/// `memory_budget_bytes`, snapshots). The only message the change sends an
+/// executor is the existing residency `Release`, which any version answers the
+/// same way. A runner talking to an older executor therefore gets nothing
+/// wrong, and two executors of different versions behave identically under it.
+///
+/// Version 142 (cairn/4930) makes the runner settle work held across a link
+/// gap against the reattached executor's first snapshot in production, which
+/// until now only its tests did: the transport stored snapshots without that
+/// accounting, so an executor that died mid-command and came back left its
+/// submitter waiting out the end-to-end watchdog. Settling against
+/// `executingRequests` alone would resolve live work as lost whenever a link
+/// blipped while an attempt was acquiring its cell, materializing its checkout
+/// or between batch items, because only a spawned process appears there. So
+/// [`FleetSnapshot::granted_attempts`] now names every attempt the executor
+/// process holds a grant for, from the handled grant until its result is
+/// queued, and the executor writes queued results ahead of any snapshot. The
+/// runner reads absence from that account as loss. A 141 executor never sends
+/// it, and a 142 runner reconciling against such a snapshot would settle that
+/// pre-spawn work wrongly, which is why the number moves.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 142;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -6548,6 +6589,21 @@ pub enum CellUnavailableReason {
         reason: AdmissionRejectionReason,
     },
     ObjectInfrastructure(ObjectInfrastructureStage),
+    /// Pinned to its job's execution home, and that machine can never hold
+    /// this work's measured memory demand while another usable machine can.
+    /// Refused at once rather than queued, because the home would only run it
+    /// into its own memory limit. `alternative_executor_id` is where placement
+    /// would put it with the pin lifted, so the caller can run it there from
+    /// the branch head and leave the environment where it is.
+    ///
+    /// Emitted by the runner's placement alone; no executor produces or reads
+    /// it.
+    HomeCannotHold {
+        home: String,
+        ceiling: MemoryCeiling,
+        alternative_executor_id: String,
+        alternative_executor_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -7471,6 +7527,14 @@ pub struct FleetSnapshot {
     pub in_flight_residency_operations: HashMap<String, ExecutorSubstrateEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recent_completions: Vec<CellCompletion>,
+    /// Every attempt this executor process was granted and has not finished,
+    /// whatever phase it is in: acquiring a cell, materializing a checkout,
+    /// between batch items, or running a command. `executingRequests` names only
+    /// attempts with a live command process, so this is the account the runner
+    /// settles work held across a link gap against: an attempt absent from it
+    /// and from `recentCompletions` did not survive the process that ran it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub granted_attempts: Vec<GrantedAttempt>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resident_occupancy: Option<ResidentOccupancyEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7490,6 +7554,15 @@ pub struct FleetSnapshot {
 
 fn is_zero_u64(value: &u64) -> bool {
     *value == 0
+}
+
+/// One attempt an executor process holds a grant for. See
+/// [`FleetSnapshot::granted_attempts`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct GrantedAttempt {
+    pub request_id: String,
+    pub attempt_id: String,
 }
 
 /// One project's provisioning serialisation on a machine, and who holds it.
@@ -9946,6 +10019,12 @@ pub struct PlacementSelection {
     /// placement itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prediction: Option<PlacementPrediction>,
+    /// Present when this work's measured memory demand is larger than this
+    /// machine will ever reserve, and it was placed here anyway because no
+    /// usable machine could hold it. The reservation above is then the clamp,
+    /// not the demand, and this is what says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_ceiling: Option<MemoryCeiling>,
 }
 
 /// Why this machine, in words that distinguish a measured win from the absence
@@ -10583,6 +10662,44 @@ pub struct PlacementRejection {
     pub prediction: Option<PlacementPrediction>,
 }
 
+/// A measured memory demand larger than one machine will ever reserve.
+///
+/// Every machine caps a reservation at a fixed share of its memory budget, so
+/// that work measured on a bigger host cannot claim a small one whole and
+/// starve admission there forever. The cap keeps work flowing, and it also
+/// hides that it clamped: a reservation of exactly the cap reads as "fits".
+/// This is the clamp stated as a fact, so placement can prefer a machine that
+/// can hold the work and every surface can say when one could not.
+///
+/// Only a measurement sets it, never a class prior, and never a quarantined
+/// peak: a peak near the whole budget measured the machine's saturation rather
+/// than the command, and treating it as demand would refuse that machine the
+/// work forever.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryCeiling {
+    /// The measured demand, before the cap.
+    pub estimate_bytes: u64,
+    /// The most this machine will ever reserve for one request.
+    pub ceiling_bytes: u64,
+}
+
+impl MemoryCeiling {
+    /// The two numbers in the units a person reads them in.
+    pub fn describe(&self) -> String {
+        format!(
+            "its measured memory demand {} exceeds what this machine can ever hold ({})",
+            describe_gib(self.estimate_bytes),
+            describe_gib(self.ceiling_bytes)
+        )
+    }
+}
+
+/// Bytes as gibibytes with one decimal, for prose about memory demand.
+pub fn describe_gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+}
+
 /// Why a machine could not take this work. Every variant is actionable: it names
 /// the thing that would have to change for this machine to be usable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -10633,6 +10750,14 @@ pub enum PlacementRejectionReason {
     InsufficientVolume {
         required_bytes: u64,
         free_bytes: u64,
+    },
+    /// This work's measured memory demand is larger than this machine will
+    /// ever reserve, however idle it is. Distinct from
+    /// [`Self::InsufficientMemory`], which is about what is free now: no amount
+    /// of waiting makes this machine big enough. See [`MemoryCeiling`].
+    ExceedsMemoryCeiling {
+        estimate_bytes: u64,
+        ceiling_bytes: u64,
     },
     /// Usable, measured, and simply beaten by the machine that won.
     OutrankedBy { executor_name: String },
@@ -10751,6 +10876,14 @@ impl PlacementRejectionReason {
                 required_bytes,
                 free_bytes,
             } => format!("needs {required_bytes} bytes of volume, has {free_bytes}"),
+            Self::ExceedsMemoryCeiling {
+                estimate_bytes,
+                ceiling_bytes,
+            } => MemoryCeiling {
+                estimate_bytes: *estimate_bytes,
+                ceiling_bytes: *ceiling_bytes,
+            }
+            .describe(),
             Self::OutrankedBy { executor_name } => format!("outranked by {executor_name}"),
             Self::UntrustedVerdictPlatform { os, trusted } => format!(
                 "runs {os}, and this verdict counts only from {}",
@@ -12871,6 +13004,7 @@ mod tests {
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 cache_distance: None,
                 prediction: None,
+                memory_ceiling: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,
@@ -14240,6 +14374,10 @@ mod tests {
                     cached: false,
                     subscriber_count: 1,
                     served_at_unix_ms: 37,
+                }],
+                granted_attempts: vec![GrantedAttempt {
+                    request_id: "executing".into(),
+                    attempt_id: "attempt".into(),
                 }],
                 resident_occupancy: Some(ResidentOccupancyEvidence {
                     process_count: 4,

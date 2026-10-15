@@ -1693,8 +1693,6 @@ mod tests {
         for kind in [
             ResourceKind::Llm,
             ResourceKind::LlmCatalog,
-            ResourceKind::LlmAccounts,
-            ResourceKind::LlmAccount,
             ResourceKind::LlmUsage,
         ] {
             let output = affordance_for_kind(kind);
@@ -1706,12 +1704,51 @@ mod tests {
         let catalog = affordance_for_kind(ResourceKind::LlmCatalog);
         assert!(catalog.contains("installed"), "{catalog}");
         assert!(catalog.contains("view"), "{catalog}");
-        // Read-only accounts still say where sign-in happens today.
-        let accounts = cairn_common::contract::contract_for(ResourceKind::LlmAccounts)
-            .expect("registered")
-            .description;
-        assert!(accounts.contains("Settings → Providers"), "{accounts}");
-        assert!(accounts.contains("cairn auth login claude"), "{accounts}");
+    }
+
+    /// The accounts list starts a sign-in and re-measures a provider; one
+    /// account re-authenticates, finishes or cancels a pending sign-in, and
+    /// re-measures. Both name the grant a sign-in needs and the human doors.
+    #[test]
+    fn affordance_for_llm_accounts_offers_sign_in_and_refresh() {
+        let list = affordance_for_kind(ResourceKind::LlmAccounts);
+        assert!(list.contains("### actions"), "{list}");
+        assert!(
+            list.contains(
+                r#"target:"cairn://llm/accounts",mode:"append",payload:{provider:"claude"}"#
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains(r#"action:"refresh_usage",provider:"claude""#),
+            "{list}"
+        );
+        assert!(list.contains("claude | codex"), "{list}");
+
+        let one = affordance_for_kind(ResourceKind::LlmAccount);
+        assert!(one.contains(r#"payload:{action:"sign_in"}"#), "{one}");
+        for action in ["sign_in", "submit_code", "cancel_sign_in", "refresh_usage"] {
+            assert!(one.contains(action), "{action} missing:\n{one}");
+        }
+
+        for kind in [ResourceKind::LlmAccounts, ResourceKind::LlmAccount] {
+            let description = cairn_common::contract::contract_for(kind)
+                .expect("registered")
+                .description;
+            assert!(
+                description.contains("workspace/default/settings/accounts:write"),
+                "{description}"
+            );
+            assert!(
+                description.contains("Settings → Providers"),
+                "{description}"
+            );
+            assert!(
+                description.contains("cairn auth login claude"),
+                "{description}"
+            );
+            assert!(!description.contains("Read-only"), "{description}");
+        }
     }
 
     #[test]

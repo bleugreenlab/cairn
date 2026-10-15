@@ -3,7 +3,7 @@
 use crate::interface::complete::{
     Complete, CompletionCall, CompletionError, CompletionReply, CompletionWire, Delivery,
 };
-use crate::wire::{anthropic_messages, openai_compat, openai_responses};
+use crate::wire::{anthropic_messages, decisions, openai_compat, openai_responses};
 
 /// Sends each completion straight to its provider over the wire it names.
 #[derive(Debug, Clone, Copy, Default)]
@@ -43,6 +43,16 @@ impl Complete for HttpComplete {
             (CompletionWire::Responses(endpoint), Delivery::Whole { timeout }) => {
                 openai_responses::http::post_response(endpoint, body, timeout)
                     .map(CompletionReply::Responses)
+            }
+            (CompletionWire::Decisions(endpoint), Delivery::Whole { timeout }) => {
+                decisions::http::post_decisions(endpoint, body, timeout)
+                    .map(CompletionReply::Decisions)
+            }
+            (CompletionWire::Decisions(endpoint), Delivery::Stream { .. }) => {
+                Err(CompletionError::InvalidRequest(format!(
+                    "{} answers a decision as one whole reply; a decision is never streamed",
+                    endpoint.provider_name
+                )))
             }
         }
     }

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::decision::{DecisionNode, DecisionQuestion, Thresholds};
+
 /// Recipe trigger - when a recipe can be started
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -361,7 +363,11 @@ pub enum RecipeNodeType {
     Pr,
     Checkpoint,
     Artifact,
+    /// Routes on an expression over upstream artifact data.
     Condition,
+    /// Routes on a typed decision (`cairn_models::decision`): one `choice`
+    /// question whose options are the node's ports, answered by `decide`.
+    Decision,
     Context,
     /// Author-facing text block whose content is injected into the running
     /// node's system prompt (after the role prompt). Distinct from `Context`,
@@ -380,6 +386,7 @@ impl std::fmt::Display for RecipeNodeType {
             RecipeNodeType::Checkpoint => write!(f, "checkpoint"),
             RecipeNodeType::Artifact => write!(f, "artifact"),
             RecipeNodeType::Condition => write!(f, "condition"),
+            RecipeNodeType::Decision => write!(f, "decision"),
             RecipeNodeType::Context => write!(f, "context"),
             RecipeNodeType::Instruction => write!(f, "instruction"),
         }
@@ -398,6 +405,7 @@ impl std::str::FromStr for RecipeNodeType {
             "checkpoint" => Ok(RecipeNodeType::Checkpoint),
             "artifact" => Ok(RecipeNodeType::Artifact),
             "condition" => Ok(RecipeNodeType::Condition),
+            "decision" => Ok(RecipeNodeType::Decision),
             "context" => Ok(RecipeNodeType::Context),
             "instruction" => Ok(RecipeNodeType::Instruction),
             _ => Err(format!("Unknown recipe node type: {}", s)),
@@ -505,17 +513,24 @@ pub struct NodeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     confirm_policy: Option<ConfirmPolicy>,
 
-    // Condition config
-    #[serde(skip_serializing_if = "Option::is_none")]
-    condition_type: Option<ConditionType>,
+    // Condition config. `conditionType` and `question` are read only to
+    // migrate a stored `ai` condition into a decision node.
+    #[serde(default, skip_serializing)]
+    condition_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     expression: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing)]
     question: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ports: Option<Vec<String>>,
+
+    // Decision config (`model` also carried a legacy `ai` condition's model)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    questions: Option<Vec<DecisionQuestion>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ports: Option<Vec<String>>,
+    thresholds: Option<Thresholds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     on_error: Option<ConditionErrorBehavior>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -549,6 +564,8 @@ pub struct RecipeNode {
     pub artifact_config: Option<ArtifactNodeConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub condition_config: Option<ConditionNodeConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decision_config: Option<DecisionNode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_config: Option<ContextNodeConfig>,
 }
@@ -796,34 +813,11 @@ pub struct ArtifactNodeConfig {
     pub content: Option<String>,
 }
 
-/// Condition type - how the condition is evaluated
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ConditionType {
-    #[default]
-    Programmatic, // Expression evaluating artifact data
-    Ai, // Haiku one-shot question
-}
-
-impl std::fmt::Display for ConditionType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConditionType::Programmatic => write!(f, "programmatic"),
-            ConditionType::Ai => write!(f, "ai"),
-        }
-    }
-}
-
-impl std::str::FromStr for ConditionType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
-            "programmatic" => Ok(ConditionType::Programmatic),
-            "ai" => Ok(ConditionType::Ai),
-            _ => Err(format!("Unknown condition type: {}", s)),
-        }
-    }
+/// Whether a stored `condition` node is a legacy AI condition: a question
+/// and ports answered by a model. Those are decision nodes now, and every
+/// read path converts them with [`DecisionNode::port_choice`].
+pub fn is_legacy_ai_condition(condition_type: Option<&str>) -> bool {
+    condition_type.is_some_and(|kind| kind.trim().eq_ignore_ascii_case("ai"))
 }
 
 /// Error behavior for condition evaluation failures
@@ -856,21 +850,14 @@ impl std::str::FromStr for ConditionErrorBehavior {
     }
 }
 
-/// Condition node configuration
+/// Condition node configuration: an expression over upstream artifact data.
+/// A question answered by a model is a [`RecipeNodeType::Decision`] node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConditionNodeConfig {
-    pub condition_type: ConditionType,
-    /// For programmatic: expression like "plan.risk_score > 7"
+    /// An expression like "plan.risk_score > 7"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expression: Option<String>,
-    /// For AI: question like "Does this change affect database schema?"
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub question: Option<String>,
-    /// For AI: a tier reference (`sm`, `md`, `lg`, or `backend/tier`) or an
-    /// exact model; defaults to the `sm` tier
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     /// Output port names: ["yes", "no"] or ["low", "medium", "high"]
     pub ports: Vec<String>,
     /// Error handling behavior
@@ -911,7 +898,56 @@ pub struct RecipeVersionInfo {
     pub is_current: bool,
 }
 
+/// The port a stored edge handle names on a node that routes by `ports`, when
+/// the handle is the recipe editor's legacy spelling of it.
+///
+/// The editor once stored a condition's output handles as `port-<name>`, while
+/// the engine routes the edge whose handle equals the port. A handle is read as
+/// its port only when it is not itself one of the ports and stripping `port-`
+/// names one, so an option genuinely called `port-yes` keeps its handle.
+pub fn legacy_port_handle<'a>(handle: &'a str, ports: &[String]) -> Option<&'a str> {
+    if ports.iter().any(|port| port == handle) {
+        return None;
+    }
+    let port = handle.strip_prefix("port-")?;
+    ports
+        .iter()
+        .any(|candidate| candidate == port)
+        .then_some(port)
+}
+
+/// Rewrite every edge leaving a condition or decision node by a legacy
+/// `port-<name>` handle ([`legacy_port_handle`]) to leave by the port itself.
+pub fn normalize_legacy_port_handles(nodes: &[RecipeNode], edges: &mut [RecipeEdge]) {
+    for edge in edges {
+        let Some(node) = nodes.iter().find(|node| node.id == edge.source_node_id) else {
+            continue;
+        };
+        if let Some(port) = legacy_port_handle(&edge.source_handle, &node.routing_ports()) {
+            edge.source_handle = port.to_string();
+        }
+    }
+}
+
 impl RecipeNode {
+    /// The ports a condition or decision node routes by; empty for any other
+    /// node. An edge leaves by one of these as its source handle.
+    pub fn routing_ports(&self) -> Vec<String> {
+        match self.node_type {
+            RecipeNodeType::Condition => self
+                .condition_config
+                .as_ref()
+                .map(|config| config.ports.clone())
+                .unwrap_or_default(),
+            RecipeNodeType::Decision => self
+                .decision_config
+                .as_ref()
+                .map(DecisionNode::ports)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Project decoded configuration into the fields belonging to this node kind.
     /// Storage adapters supply identity and layout after parsing their row.
     pub fn from_config(
@@ -922,6 +958,16 @@ impl RecipeNode {
         parent_id: Option<String>,
         config: Option<NodeConfig>,
     ) -> Self {
+        // A stored `ai` condition is read as the decision node it always was.
+        let legacy_ai = node_type == RecipeNodeType::Condition
+            && config
+                .as_ref()
+                .is_some_and(|cfg| is_legacy_ai_condition(cfg.condition_type.as_deref()));
+        let node_type = if legacy_ai {
+            RecipeNodeType::Decision
+        } else {
+            node_type
+        };
         // Extract type-specific configs
         let (
             trigger_config,
@@ -930,6 +976,7 @@ impl RecipeNode {
             checkpoint_config,
             artifact_config,
             condition_config,
+            decision_config,
             context_config,
         ) = if let Some(cfg) = config {
             // Build agent config with nested checkpoint/schema/git_config
@@ -973,13 +1020,29 @@ impl RecipeNode {
                 None
             };
 
-            // Build condition config
-            let condition_config = if cfg.condition_type.is_some() || cfg.ports.is_some() {
+            let decision_config = if node_type == RecipeNodeType::Decision {
+                Some(if legacy_ai {
+                    DecisionNode::port_choice(
+                        cfg.question.as_deref().unwrap_or_default(),
+                        cfg.ports.as_deref().unwrap_or_default(),
+                        cfg.model.clone(),
+                    )
+                } else {
+                    DecisionNode {
+                        questions: cfg.questions.clone().unwrap_or_default(),
+                        model: cfg.model.clone(),
+                        thresholds: cfg.thresholds.unwrap_or_default(),
+                    }
+                })
+            } else {
+                None
+            };
+
+            let condition_config = if node_type == RecipeNodeType::Condition
+                && (cfg.condition_type.is_some() || cfg.ports.is_some())
+            {
                 Some(ConditionNodeConfig {
-                    condition_type: cfg.condition_type.unwrap_or_default(),
                     expression: cfg.expression,
-                    question: cfg.question,
-                    model: cfg.model,
                     ports: cfg.ports.unwrap_or_default(),
                     on_error: cfg.on_error.unwrap_or_default(),
                     default_port: cfg.default_port,
@@ -1019,6 +1082,7 @@ impl RecipeNode {
                     None
                 },
                 condition_config,
+                decision_config,
                 // Context/Instruction node config: both carry a `{ content }`
                 // text block. Context content flows to the initial user message;
                 // Instruction content is injected into the system prompt.
@@ -1034,7 +1098,7 @@ impl RecipeNode {
                 },
             )
         } else {
-            (None, None, None, None, None, None, None)
+            (None, None, None, None, None, None, None, None)
         };
 
         Self {
@@ -1049,6 +1113,7 @@ impl RecipeNode {
             checkpoint_config,
             artifact_config,
             condition_config,
+            decision_config,
             context_config,
         }
     }
@@ -1133,16 +1198,13 @@ mod tests {
             ("checkpoint", RecipeNodeType::Checkpoint),
             ("artifact", RecipeNodeType::Artifact),
             ("condition", RecipeNodeType::Condition),
+            ("decision", RecipeNodeType::Decision),
             ("context", RecipeNodeType::Context),
             ("instruction", RecipeNodeType::Instruction),
         ]);
         assert_parse_cases(&[
             ("control", RecipeEdgeType::Control),
             ("context", RecipeEdgeType::Context),
-        ]);
-        assert_parse_cases(&[
-            ("programmatic", ConditionType::Programmatic),
-            ("ai", ConditionType::Ai),
         ]);
         assert_parse_cases(&[
             ("isolate", BranchMode::Isolate),
@@ -1168,10 +1230,6 @@ mod tests {
         assert_parse_cases(&[
             ("CONTROL", RecipeEdgeType::Control),
             ("Context", RecipeEdgeType::Context),
-        ]);
-        assert_parse_cases(&[
-            ("PROGRAMMATIC", ConditionType::Programmatic),
-            ("AI", ConditionType::Ai),
         ]);
         assert_parse_cases(&[
             ("ISOLATE", BranchMode::Isolate),
@@ -1294,6 +1352,7 @@ mod tests {
                 artifact_config: None,
                 checkpoint_config: None,
                 condition_config: None,
+                decision_config: None,
                 context_config: None,
             }],
             edges: vec![],
@@ -1356,6 +1415,7 @@ mod tests {
                 artifact_config: None,
                 checkpoint_config: None,
                 condition_config: None,
+                decision_config: None,
                 context_config: None,
             }],
             edges: vec![],
@@ -1498,25 +1558,84 @@ mod tests {
     }
 
     // =========================================================================
-    // ConditionType tests
+    // Decision nodes and the legacy AI condition they replace
     // =========================================================================
 
-    #[test]
-    fn condition_type_display() {
-        assert_eq!(ConditionType::Programmatic.to_string(), "programmatic");
-        assert_eq!(ConditionType::Ai.to_string(), "ai");
+    fn decoded(node_type: RecipeNodeType, config: serde_json::Value) -> RecipeNode {
+        RecipeNode::from_config(
+            "n".into(),
+            node_type,
+            "Touches the DB?".into(),
+            NodePosition { x: 0.0, y: 0.0 },
+            None,
+            Some(serde_json::from_value(config).unwrap()),
+        )
     }
 
     #[test]
-    fn condition_type_from_str_invalid() {
-        let result = "invalid".parse::<ConditionType>();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Unknown condition type"));
+    fn a_stored_ai_condition_reads_as_a_port_choice_decision() {
+        let node = decoded(
+            RecipeNodeType::Condition,
+            serde_json::json!({
+                "conditionType": "ai",
+                "question": "Does it touch the database?",
+                "model": "sm",
+                "ports": ["yes", "no"],
+                "onError": "useDefault",
+                "defaultPort": "no"
+            }),
+        );
+        assert_eq!(node.node_type, RecipeNodeType::Decision);
+        assert!(node.condition_config.is_none());
+        let decision = node.decision_config.unwrap();
+        assert_eq!(
+            decision,
+            DecisionNode::port_choice(
+                "Does it touch the database?",
+                &["yes".to_string(), "no".to_string()],
+                Some("sm".into())
+            )
+        );
+        assert_eq!(decision.ports(), vec!["yes", "no"]);
     }
 
     #[test]
-    fn condition_type_default() {
-        assert_eq!(ConditionType::default(), ConditionType::Programmatic);
+    fn a_programmatic_condition_stays_a_condition() {
+        let node = decoded(
+            RecipeNodeType::Condition,
+            serde_json::json!({
+                "conditionType": "programmatic",
+                "expression": "plan.risk > 7",
+                "ports": ["high", "low"]
+            }),
+        );
+        assert_eq!(node.node_type, RecipeNodeType::Condition);
+        assert!(node.decision_config.is_none());
+        let condition = node.condition_config.unwrap();
+        assert_eq!(condition.expression.as_deref(), Some("plan.risk > 7"));
+        // Nothing about the retired AI shape is written back.
+        let written = serde_json::to_value(&condition).unwrap();
+        assert!(written.get("conditionType").is_none(), "{written}");
+    }
+
+    #[test]
+    fn a_decision_node_round_trips_its_questions_and_thresholds() {
+        let node = decoded(
+            RecipeNodeType::Decision,
+            serde_json::json!({
+                "questions": [{"name": "route", "instructions": "Ship?", "type": "choice",
+                               "options": [{"value": "ship"}, {"value": "hold"}]}],
+                "model": "custom:acc/sm",
+                "thresholds": {"native": 0.7}
+            }),
+        );
+        let decision = node.decision_config.clone().unwrap();
+        assert_eq!(decision.ports(), vec!["ship", "hold"]);
+        assert_eq!(decision.thresholds.native, Some(0.7));
+        assert_eq!(decision.model.as_deref(), Some("custom:acc/sm"));
+        let json = serde_json::to_value(&node).unwrap();
+        assert_eq!(json["nodeType"], "decision");
+        assert_eq!(json["decisionConfig"]["questions"][0]["type"], "choice");
     }
 
     // =========================================================================

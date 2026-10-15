@@ -456,7 +456,7 @@ const MAX_REQUEST_WATCHDOG_SLACK: Duration = Duration::from_secs(5);
 
 /// What a reattached connection still owes an accounting for: the generation
 /// that owes it, and the executions carried across the gap into it.
-type HeldExecutions = (u64, HashSet<RequestIdentity>);
+type HeldExecutions = (u64, HashMap<RequestIdentity, queue::HeldClaim>);
 
 struct PendingLifetimeResult {
     executor_id: String,
@@ -1190,17 +1190,123 @@ pub(crate) struct EnvironmentEviction {
     /// placement request would address it with.
     pub(crate) executor: String,
     pub(crate) cause: EvictionCause,
+    /// The live processes the old environment held, as its machine last
+    /// reported them and worded the way an agent addresses them
+    /// (``terminal `dev` ``). Empty when the machine is gone and took its
+    /// report with it, which the note then says generically.
+    pub(crate) lost_processes: Vec<String>,
 }
 
 /// Why an environment was given up and rebuilt elsewhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EvictionCause {
-    /// The executor session holding it ended and did not come back.
-    SessionLost,
+    /// The executor session holding it ended and did not come back within
+    /// the lease grace.
+    Disconnected { absent_ms: u64 },
+    /// The executor stayed in the connection table, so nothing ever ended its
+    /// session, but it stopped answering for longer than the lease grace. A
+    /// half-open remote socket looks exactly like this until the operating
+    /// system notices, which can be never.
+    Silent { silent_ms: u64, generation: u64 },
     /// The machine holding it cannot prepare cells for its project, so every
     /// batch pinned there would fail before running. `detail` is the
     /// placement rejection that says why.
     CannotPrepareProject { project_id: String, detail: String },
+}
+
+/// Whether the machine a residency route names is answering.
+///
+/// The one liveness rule for routing. Presence in the connection table is not
+/// it: a connection that stays attached while its machine says nothing is in
+/// the table and cannot serve a batch, and reading presence as liveness is
+/// what pinned a job to a silent machine indefinitely (cairn/4931).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteAnswer {
+    Live,
+    Unanswered(Unanswered),
+}
+
+/// A route whose machine is not answering, and since when.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Unanswered {
+    /// When the machine last answered: its last progress while it is still
+    /// attached, or the moment its link was first seen absent.
+    since_unix_ms: u64,
+    cause: UnansweredCause,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnansweredCause {
+    /// Not in the connection table, or in it with its sender closed.
+    Disconnected,
+    /// In the table on an open sender, with no progress past the liveness
+    /// bound.
+    Silent { generation: u64 },
+}
+
+/// How long a connection has gone without progress, when that is past the
+/// liveness bound, and `None` while it is fresh.
+///
+/// THE staleness rule. Placement's candidate filter, residency dispatch, and
+/// residency routing all judge a link by it, so none of them can decide a
+/// machine is answering that another has already given up on.
+fn link_silence_ms(entry: &ExecutorConnectionState, now_unix_ms: u64) -> Option<u64> {
+    let silence_ms = now_unix_ms.saturating_sub(entry.last_progress_unix_ms);
+    (silence_ms > EXECUTOR_PROGRESS_FRESHNESS_MS).then_some(silence_ms)
+}
+
+/// An owner in the words the executors page uses for it.
+fn describe_holder(holder: &ResidencyHolder) -> String {
+    match holder {
+        ResidencyHolder::Job { job_id } => format!("job {job_id}"),
+        other => other.storage_key(),
+    }
+}
+
+/// Milliseconds as minutes and seconds, for prose about how long a machine
+/// has been quiet.
+pub(crate) fn describe_quiet_ms(ms: u64) -> String {
+    let seconds = ms / 1_000;
+    match seconds / 60 {
+        0 => format!("{seconds}s"),
+        minutes => format!("{minutes}m{:02}s", seconds % 60),
+    }
+}
+
+/// The live resident processes one machine's last snapshot reports in an
+/// owner's environment, named the way an agent addresses them.
+fn live_resident_process_labels(
+    entry: &ExecutorConnectionState,
+    holder: &ResidencyHolder,
+) -> Vec<String> {
+    entry
+        .snapshot
+        .cells
+        .iter()
+        .filter(|cell| {
+            cell.residency
+                .as_ref()
+                .is_some_and(|residency| residency.holder == *holder)
+        })
+        .flat_map(|cell| cell.occupancy.processes.values())
+        .filter(|process| process.is_live())
+        .map(|process| resident_process_label(&process.kind))
+        .collect()
+}
+
+/// A resident process named the way an agent addresses it.
+fn resident_process_label(kind: &cairn_common::executor_protocol::ResidentProcessKind) -> String {
+    use cairn_common::executor_protocol::ResidentProcessKind;
+    match kind {
+        ResidentProcessKind::Terminal { slug } => format!("terminal `{slug}`"),
+        ResidentProcessKind::Repl { slug } => format!("REPL `{slug}`"),
+        ResidentProcessKind::Service { name, .. } if !name.is_empty() => {
+            format!("service `{name}`")
+        }
+        ResidentProcessKind::Service { .. } => "a service process".into(),
+        ResidentProcessKind::DevInstance { .. } => "a dev instance".into(),
+        ResidentProcessKind::WorkflowRuntime { workflow } => format!("workflow `{workflow}`"),
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1900,6 +2006,61 @@ struct Placement {
     selected: SelectedExecutor,
     reservation: Option<resource_profiles::ResolvedResourceProfile>,
     decision: PlacementDecision,
+    /// Set when this work was placed on a machine that can never hold its
+    /// measured memory, because no usable machine could.
+    above_ceiling: Option<AboveMemoryCeiling>,
+}
+
+/// Work placed on a machine its measured memory demand exceeds, at the clamp.
+///
+/// The scheduling rule is that a measurement prices placement and does not
+/// gate work, so when nothing usable can hold a batch it still runs. What it
+/// may not do is run there silently: that is the case that ends in the kernel's
+/// out-of-memory killer, and an operator or agent reading the result must be
+/// able to see the work was oversized for the fleet rather than conclude the
+/// machine is flaky.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AboveMemoryCeiling {
+    pub(crate) executor_name: String,
+    pub(crate) ceiling: cairn_common::executor_protocol::MemoryCeiling,
+    /// The largest ceiling among the machines placement evaluated, by name.
+    pub(crate) largest: Option<(String, u64)>,
+    /// Whether some evaluated machine is known to hold it but was not usable
+    /// (measured-blind, say), which makes "no executor can hold" untrue.
+    pub(crate) holdable_elsewhere: bool,
+    /// Whether some evaluated machine has no measured fit either way, which
+    /// makes "no executor can hold" a claim nothing supports.
+    pub(crate) unknown_elsewhere: bool,
+}
+
+impl AboveMemoryCeiling {
+    /// The sentence a run result carries.
+    pub(crate) fn note(&self) -> String {
+        use cairn_common::executor_protocol::describe_gib;
+        let demand = describe_gib(self.ceiling.estimate_bytes);
+        let ceiling = describe_gib(self.ceiling.ceiling_bytes);
+        if self.holdable_elsewhere {
+            return format!(
+                "Note: this batch's measured memory (~{demand}) exceeds what **{}** can ever hold ({ceiling}), and no machine that can hold it was usable, so it was placed there at the clamp.",
+                self.executor_name,
+            );
+        }
+        if self.unknown_elsewhere {
+            return format!(
+                "Note: this batch's measured memory (~{demand}) exceeds what **{}** can ever hold ({ceiling}), and no usable machine is known to hold it, so it was placed there at the clamp.",
+                self.executor_name,
+            );
+        }
+        let largest = self
+            .largest
+            .as_ref()
+            .map(|(name, bytes)| format!(" (largest ceiling {} on {name})", describe_gib(*bytes)))
+            .unwrap_or_default();
+        format!(
+            "Note: no executor can hold this batch's measured ~{demand}{largest}; it was placed on **{}** at the clamp.",
+            self.executor_name
+        )
+    }
 }
 
 /// What one placement pass concluded about a request that was not refused.
@@ -1932,6 +2093,7 @@ impl Selection {
 struct RefusedPlacement {
     decision: PlacementDecision,
     diagnostic: String,
+    reason: CellUnavailableReason,
 }
 
 fn refused_placement(
@@ -1953,7 +2115,133 @@ fn refused_placement(
             Vec::new(),
         ),
         diagnostic,
+        reason: CellUnavailableReason::NoMatchingExecutor,
     }
+}
+
+/// A pinned request whose home can never hold its measured memory, while the
+/// machine placement would choose with the pin lifted can.
+///
+/// Refused at once rather than queued on the home: the home is healthy for
+/// everything it can hold, but this work would only run it into its memory
+/// limit, and waiting there waits for a machine to grow. The refusal names the
+/// machine that can hold it, so the caller can run it there from the branch
+/// head and leave the environment where it is. When no other usable machine can
+/// hold it either, this answers `None` and the pin holds at the clamp.
+fn home_cannot_hold(
+    request: &CellRequest,
+    decided_at_unix_ms: u64,
+    policy: &ActivePlacementPolicy,
+    reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
+    survey: &CandidateSurvey<'_>,
+    unpinned_winner: Option<&PlacementCounterfactualWinner>,
+) -> Option<RefusedPlacement> {
+    let home_id = request.pinned_executor_id.as_deref()?;
+    let home = survey
+        .usable
+        .iter()
+        .find(|entry| entry.identity.executor_id == home_id)?;
+    let ceiling = reservations.get(home_id)?.memory_fit.ceiling()?;
+    let winner = unpinned_winner.filter(|winner| winner.executor_id != home_id)?;
+    // The machine named must be known to hold the work, by a measured demand
+    // under its own cap. A missing measurement is not that, and naming an
+    // unmeasured machine as the safe place would pin the batch somewhere
+    // possibly smaller than the home it left.
+    if reservations
+        .get(&winner.executor_id)
+        .is_none_or(|resolved| resolved.memory_fit != resource_profiles::MemoryFit::Holds)
+    {
+        return None;
+    }
+    let home_name = executor_public_name(home);
+    let diagnostic = format!(
+        "{home_name}, which holds this job's execution environment, cannot run this batch: {}; {} can",
+        ceiling.describe(),
+        winner.executor_name
+    );
+    let mut rejected = vec![PlacementRejection {
+        prediction: None,
+        executor_name: home_name.clone(),
+        executor_id: home_id.to_string(),
+        reason: PlacementRejectionReason::ExceedsMemoryCeiling {
+            estimate_bytes: ceiling.estimate_bytes,
+            ceiling_bytes: ceiling.ceiling_bytes,
+        },
+    }];
+    rejected.extend(survey.rejected.iter().cloned());
+    Some(RefusedPlacement {
+        decision: placement_decision(
+            request,
+            decided_at_unix_ms,
+            Some(policy_evidence(request, policy, false)),
+            Some(winner.clone()),
+            PlacementOutcome::Refused {
+                diagnostic: diagnostic.clone(),
+            },
+            rejected,
+        ),
+        diagnostic,
+        reason: CellUnavailableReason::HomeCannotHold {
+            home: home_name,
+            ceiling,
+            alternative_executor_id: winner.executor_id.clone(),
+            alternative_executor_name: winner.executor_name.clone(),
+        },
+    })
+}
+
+/// Work about to run above its machine's memory ceiling: say so on every
+/// machine that could not hold it either, and compose the note its result
+/// carries. A pinned decision lists the other machines as pin mismatches, which
+/// is true and beside the point: the useful fact is that none of them could
+/// have held it, which is why the pin held.
+fn above_memory_ceiling(
+    selection: &PlacementSelection,
+    rejected: &mut [PlacementRejection],
+    reservations: &HashMap<String, resource_profiles::ResolvedResourceProfile>,
+    connections: &HashMap<String, ExecutorConnectionState>,
+) -> Option<AboveMemoryCeiling> {
+    let ceiling = selection.memory_ceiling?;
+    for rejection in rejected.iter_mut() {
+        if let Some(other) = reservations
+            .get(&rejection.executor_id)
+            .and_then(|resolved| resolved.memory_fit.ceiling())
+        {
+            rejection.reason = PlacementRejectionReason::ExceedsMemoryCeiling {
+                estimate_bytes: other.estimate_bytes,
+                ceiling_bytes: other.ceiling_bytes,
+            };
+        }
+    }
+    let largest = reservations
+        .iter()
+        .filter_map(|(executor_id, resolved)| {
+            resolved
+                .memory_fit
+                .ceiling()
+                .map(|other| (executor_id, other.ceiling_bytes))
+        })
+        .max_by(|(left_id, left), (right_id, right)| {
+            left.cmp(right).then_with(|| right_id.cmp(left_id))
+        })
+        .map(|(executor_id, bytes)| {
+            let name = connections
+                .get(executor_id)
+                .map(executor_public_name)
+                .unwrap_or_else(|| executor_id.clone());
+            (name, bytes)
+        });
+    Some(AboveMemoryCeiling {
+        executor_name: selection.executor_name.clone(),
+        ceiling,
+        largest,
+        holdable_elsewhere: reservations
+            .values()
+            .any(|resolved| resolved.memory_fit == resource_profiles::MemoryFit::Holds),
+        unknown_elsewhere: reservations
+            .values()
+            .any(|resolved| resolved.memory_fit == resource_profiles::MemoryFit::Unknown),
+    })
 }
 
 fn placement_decision(
@@ -3780,15 +4068,7 @@ impl Fleet {
                 snapshot, health, ..
             }
             | ExecutorMessage::SnapshotUpdated { snapshot, health } => {
-                self.reconcile_held_executions(executor_id, generation, &snapshot);
-                // New posted state is the only thing that makes reconsidering a
-                // machine that declined meaningful, so it is the only thing that
-                // clears a decline. An ordering rather than a threshold: nothing
-                // here waits out a clock to try a machine again.
-                if self.queue.clear_declines_for(executor_id) {
-                    self.connection_ready.notify_waiters();
-                }
-                self.set_executor_snapshot(executor_id, generation, snapshot, health)
+                self.apply_executor_snapshot(executor_id, generation, snapshot, health)
             }
             ExecutorMessage::Heartbeat {
                 advertisement,
@@ -3829,7 +4109,38 @@ impl Fleet {
     /// Apply a snapshot from the current executor generation. `false` means the
     /// public cell snapshot did not change (or the generation is stale); health is
     /// still refreshed for a current connection.
-    pub fn set_executor_snapshot(
+    /// Ingest one snapshot a connected executor posted.
+    ///
+    /// The only way a snapshot enters the fleet from outside this crate, because
+    /// a snapshot is more than state to store. The first one from a reattached
+    /// generation is the machine's own account of what survived the gap, and
+    /// held work it omits is settled here rather than left to the end-to-end
+    /// watchdog. When the transport stored snapshots without this, an executor
+    /// that died and came back without a command kept its submitter waiting for
+    /// hours on a result no process would send.
+    pub fn apply_executor_snapshot(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        snapshot: FleetSnapshot,
+        health: ExecutorSubstrateReport,
+    ) -> bool {
+        self.reconcile_held_executions(executor_id, generation, &snapshot);
+        // New posted state is the only thing that makes reconsidering a
+        // machine that declined meaningful, so it is the only thing that
+        // clears a decline. An ordering rather than a threshold: nothing
+        // here waits out a clock to try a machine again.
+        if self.queue.clear_declines_for(executor_id) {
+            self.connection_ready.notify_waiters();
+        }
+        self.set_executor_snapshot(executor_id, generation, snapshot, health)
+    }
+
+    /// Store a snapshot as this connection's posted state, and nothing else.
+    ///
+    /// Crate-private so ingest cannot skip the accounting in
+    /// [`Fleet::apply_executor_snapshot`]; tests use it to stage state.
+    pub(crate) fn set_executor_snapshot(
         &self,
         executor_id: &str,
         generation: u64,
@@ -4063,10 +4374,7 @@ impl Fleet {
         self.lock_connections()
             .get(executor_id)
             .filter(|entry| entry.generation == generation)
-            .is_some_and(|entry| {
-                unix_time_ms().saturating_sub(entry.last_progress_unix_ms)
-                    <= EXECUTOR_PROGRESS_FRESHNESS_MS
-            })
+            .is_some_and(|entry| link_silence_ms(entry, unix_time_ms()).is_none())
     }
 
     fn request_substrate_hold(
@@ -6368,10 +6676,10 @@ impl Fleet {
             .filter(|route| route.holder == *holder)
             .map(|route| route.executor_id.clone())
             .collect::<Vec<_>>();
-        let connections = self.lock_connections();
+        let now = unix_time_ms();
         routed
             .into_iter()
-            .find(|executor_id| connections.contains_key(executor_id))
+            .find(|executor_id| self.route_answer(executor_id, now) == RouteAnswer::Live)
     }
 
     /// What to call an executor in text a person or an agent reads, whether or
@@ -6429,22 +6737,49 @@ impl Fleet {
             .map(|route| route.executor_id.clone())
             .collect::<Vec<_>>();
         let now = unix_time_ms();
-        let absent = {
-            let connections = self.lock_connections();
-            routed
-                .iter()
-                .filter(|executor_id| !connections.contains_key(*executor_id))
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let within_grace = absent.iter().any(|executor_id| {
-            now.saturating_sub(self.link_absent_since(executor_id, now))
-                < ENVIRONMENT_LEASE_GRACE_MS
+        let within_grace = routed.iter().any(|executor_id| {
+            matches!(
+                self.route_answer(executor_id, now),
+                RouteAnswer::Unanswered(unanswered)
+                    if now.saturating_sub(unanswered.since_unix_ms) < ENVIRONMENT_LEASE_GRACE_MS
+            )
         });
         if within_grace {
             return placement::LinkRestoration::Restoring;
         }
         self.link_restoration()
+    }
+
+    /// Whether the machine a route names is answering, by the one staleness
+    /// rule placement and dispatch use.
+    fn route_answer(&self, executor_id: &str, now_unix_ms: u64) -> RouteAnswer {
+        let present = self.lock_connections().get(executor_id).map(|entry| {
+            (
+                entry.sender.is_closed(),
+                entry.generation,
+                entry.last_progress_unix_ms,
+                link_silence_ms(entry, now_unix_ms).is_some(),
+            )
+        });
+        match present {
+            // Read after the table lock is released: the absence clock has a
+            // lock of its own, and attach takes the two separately.
+            None => RouteAnswer::Unanswered(Unanswered {
+                since_unix_ms: self.link_absent_since(executor_id, now_unix_ms),
+                cause: UnansweredCause::Disconnected,
+            }),
+            Some((true, _, last_progress_unix_ms, _)) => RouteAnswer::Unanswered(Unanswered {
+                since_unix_ms: last_progress_unix_ms,
+                cause: UnansweredCause::Disconnected,
+            }),
+            Some((false, generation, last_progress_unix_ms, true)) => {
+                RouteAnswer::Unanswered(Unanswered {
+                    since_unix_ms: last_progress_unix_ms,
+                    cause: UnansweredCause::Silent { generation },
+                })
+            }
+            Some((false, _, _, false)) => RouteAnswer::Live,
+        }
     }
 
     /// Whether the runner has positive evidence it is bringing one executor's
@@ -6531,10 +6866,23 @@ impl Fleet {
         if existing.is_empty() {
             return Ok(None);
         }
+        // A route counts as live by the same rule dispatch will judge it by. A
+        // connection still in the table that has stopped answering would pass a
+        // presence test here and then fail dispatch for staleness, refusing every
+        // batch while nothing ever evicted it (cairn/4931).
+        let now = unix_time_ms();
+        let mut unanswered = Vec::new();
+        let mut answering = Vec::new();
+        for route in &existing {
+            match self.route_answer(&route.executor_id, now) {
+                RouteAnswer::Live => answering.push(route.clone()),
+                RouteAnswer::Unanswered(quiet) => unanswered.push((route.clone(), quiet)),
+            }
+        }
         let mut live = {
             let connections = self.lock_connections();
-            existing
-                .iter()
+            answering
+                .into_iter()
                 .filter_map(|route| {
                     connections
                         .get(&route.executor_id)
@@ -6553,7 +6901,7 @@ impl Fleet {
             ));
         }
         let Some((route, selected)) = live.pop() else {
-            self.evict_lost_environment(&request.holder, &existing)?;
+            self.evict_lost_environment(&request.holder, &unanswered)?;
             return Ok(None);
         };
         if route.repository.identity() != request.repository.identity() {
@@ -6588,9 +6936,14 @@ impl Fleet {
         Ok(Some(selected))
     }
 
-    /// Answer for an environment whose every route names an executor this runner
-    /// has no live connection to, and leave the route authority in the state that
-    /// answer implies.
+    /// Answer for an environment whose every route names an executor that is not
+    /// answering, and leave the route authority in the state that answer implies.
+    ///
+    /// Disconnected and silent are one case measured from one instant: when the
+    /// machine last answered. A machine that stays attached while saying nothing
+    /// cannot serve a batch any better than one that left, and a half-open
+    /// remote socket can stay attached indefinitely, so presence earns no more
+    /// grace than absence does.
     ///
     /// Absence from the connection map is not death. A transport that dropped
     /// leaves the executor process running and its cells intact, so treating the
@@ -6608,9 +6961,9 @@ impl Fleet {
     fn evict_lost_environment(
         &self,
         holder: &ResidencyHolder,
-        lost: &[ResidencyRoute],
+        lost: &[(ResidencyRoute, Unanswered)],
     ) -> Result<(), ResidencyResult> {
-        if let Some(restoring) = lost.iter().find(|route| {
+        if let Some((restoring, _)) = lost.iter().find(|(route, _)| {
             self.executor_link_restoration(&route.executor_id)
                 == placement::LinkRestoration::Restoring
         }) {
@@ -6632,24 +6985,42 @@ impl Fleet {
             ));
         }
         let now = unix_time_ms();
-        if let Some((route, absent_ms)) = lost
+        // The most recently heard machine decides: while any of this owner's
+        // routes still has a machine that might answer, the environment is not
+        // yet gone.
+        let Some((deciding, quiet)) = lost
             .iter()
-            .map(|route| {
-                (
-                    route,
-                    now.saturating_sub(self.link_absent_since(&route.executor_id, now)),
-                )
-            })
-            // The most recently seen machine decides: while any of this owner's
-            // routes still has a machine that might answer, the environment is
-            // not yet gone.
-            .min_by_key(|(_, absent_ms)| *absent_ms)
-            .filter(|(_, absent_ms)| *absent_ms < ENVIRONMENT_LEASE_GRACE_MS)
-        {
+            .min_by_key(|(_, quiet)| now.saturating_sub(quiet.since_unix_ms))
+        else {
+            return Ok(());
+        };
+        let quiet_ms = now.saturating_sub(quiet.since_unix_ms);
+        let lost_processes = self.resident_processes_held_for(holder, lost);
+        if quiet_ms < ENVIRONMENT_LEASE_GRACE_MS {
+            let machine = self.executor_name_for_text(&deciding.executor_id);
+            // Rounded up: a deadline stated a second early is one the caller
+            // can watch pass with nothing happening.
+            let remaining =
+                describe_quiet_ms((ENVIRONMENT_LEASE_GRACE_MS - quiet_ms).div_ceil(1_000) * 1_000);
+            let state = match quiet.cause {
+                UnansweredCause::Disconnected => format!(
+                    "has not answered for {}; if it does not reconnect",
+                    describe_quiet_ms(quiet_ms)
+                ),
+                UnansweredCause::Silent { .. } => format!(
+                    "is connected but has not answered for {}; if it stays silent",
+                    describe_quiet_ms(quiet_ms)
+                ),
+            };
+            let cost = match lost_processes.as_slice() {
+                [] => String::new(),
+                processes => format!(
+                    ", and {} running there would not survive",
+                    processes.join(", ")
+                ),
+            };
             let diagnostic = format!(
-                "the machine holding this execution environment ({}) has not answered for {}s",
-                self.executor_name_for_text(&route.executor_id),
-                absent_ms / 1_000
+                "the machine holding this execution environment ({machine}) {state}, this job's environment is rebuilt elsewhere in {remaining}{cost}"
             );
             return Err(residency_core_failure(
                 ResidencyFailureKind::Admission,
@@ -6660,15 +7031,28 @@ impl Fleet {
                 }),
             ));
         }
+        let cause = match quiet.cause {
+            UnansweredCause::Disconnected => EvictionCause::Disconnected {
+                absent_ms: quiet_ms,
+            },
+            UnansweredCause::Silent { generation } => EvictionCause::Silent {
+                silent_ms: quiet_ms,
+                generation,
+            },
+        };
         // Named in a stable order, because this reaches an agent as prose and
         // the map these came from has no order of its own.
         let mut names = lost
             .iter()
-            .map(|route| self.executor_name_for_text(&route.executor_id))
+            .map(|(route, _)| self.executor_name_for_text(&route.executor_id))
             .collect::<Vec<_>>();
         names.sort();
         names.dedup();
         let executor = names.join(", ");
+        // A silent machine still holds the cell, and may start answering again
+        // before the rebuild has reported in. Telling it now to let go keeps it
+        // from re-recording this owner's environment beside the new one.
+        let fences = self.residency_fences_held_on_silent(holder, lost);
         if let Err(error) = self.update_residency_routes(|routes| {
             routes.retain(|_, route| route.holder != *holder);
         }) {
@@ -6678,16 +7062,51 @@ impl Fleet {
                 None,
             ));
         }
+        for (executor_id, generation, fence) in fences {
+            self.release_residency_on(&executor_id, generation, fence);
+        }
+        for (route, quiet) in lost {
+            let reason = match quiet.cause {
+                UnansweredCause::Disconnected => format!(
+                    "{}'s execution environment rebuilt elsewhere: disconnected {}",
+                    describe_holder(holder),
+                    describe_quiet_ms(now.saturating_sub(quiet.since_unix_ms))
+                ),
+                UnansweredCause::Silent { generation } => format!(
+                    "{}'s execution environment rebuilt elsewhere: silent {} on generation {generation}",
+                    describe_holder(holder),
+                    describe_quiet_ms(now.saturating_sub(quiet.since_unix_ms))
+                ),
+            };
+            self.record_remote_connection_transition(
+                &route.executor_id,
+                RemoteConnectionTransition {
+                    occurred_at_unix_ms: now,
+                    phase:
+                        cairn_common::executor_protocol::RemoteConnectionPhase::EnvironmentEvicted,
+                    generation: match quiet.cause {
+                        UnansweredCause::Silent { generation } => Some(generation),
+                        UnansweredCause::Disconnected => None,
+                    },
+                    reason: Some(reason),
+                    remote_process_exit_status: None,
+                    last_stderr: None,
+                    memory_at_generation_end: None,
+                },
+            );
+        }
         tracing::warn!(
             %holder,
             %executor,
-            "execution environment lost with its executor session; rebuilding it through placement"
+            ?cause,
+            "execution environment's machine stopped answering past the lease grace; rebuilding it through placement"
         );
         self.environment_evictions.lock().unwrap().insert(
             holder.storage_key(),
             EnvironmentEviction {
                 executor,
-                cause: EvictionCause::SessionLost,
+                cause,
+                lost_processes,
             },
         );
         Ok(())
@@ -6768,6 +7187,11 @@ impl Fleet {
                 None,
             ));
         }
+        let lost_processes = self
+            .lock_connections()
+            .get(&selected.executor_id)
+            .map(|entry| live_resident_process_labels(entry, holder))
+            .unwrap_or_default();
         let fence = self
             .connections
             .lock()
@@ -6804,9 +7228,66 @@ impl Fleet {
                     project_id: project_id.to_string(),
                     detail,
                 },
+                lost_processes,
             },
         );
         Ok(())
+    }
+
+    /// The live processes an owner's environment holds on machines that are
+    /// still attached but silent, as their last snapshots report them. A machine
+    /// that disconnected took its report with it, so it contributes nothing.
+    fn resident_processes_held_for(
+        &self,
+        holder: &ResidencyHolder,
+        lost: &[(ResidencyRoute, Unanswered)],
+    ) -> Vec<String> {
+        let connections = self.lock_connections();
+        let mut processes = lost
+            .iter()
+            .filter_map(|(route, _)| connections.get(&route.executor_id))
+            .flat_map(|entry| live_resident_process_labels(entry, holder))
+            .collect::<Vec<_>>();
+        processes.sort();
+        processes.dedup();
+        processes
+    }
+
+    /// The cells silent machines still hold for an owner, with the generation
+    /// to address each machine on.
+    fn residency_fences_held_on_silent(
+        &self,
+        holder: &ResidencyHolder,
+        lost: &[(ResidencyRoute, Unanswered)],
+    ) -> Vec<(String, u64, ResidencyFence)> {
+        let connections = self.lock_connections();
+        lost.iter()
+            .filter_map(|(route, quiet)| match quiet.cause {
+                UnansweredCause::Silent { generation } => connections
+                    .get(&route.executor_id)
+                    .filter(|entry| entry.generation == generation)
+                    .map(|entry| (route.executor_id.clone(), generation, entry)),
+                UnansweredCause::Disconnected => None,
+            })
+            .flat_map(|(executor_id, generation, entry)| {
+                entry.snapshot.cells.iter().filter_map(move |cell| {
+                    cell.residency
+                        .as_ref()
+                        .filter(|residency| residency.holder == *holder)
+                        .map(|residency| {
+                            (
+                                executor_id.clone(),
+                                generation,
+                                ResidencyFence {
+                                    holder: residency.holder.clone(),
+                                    incarnation_id: residency.incarnation_id.clone(),
+                                    cell_epoch: cell.cell_epoch,
+                                },
+                            )
+                        })
+                })
+            })
+            .collect()
     }
 
     /// Tell an executor to let go of a cell whose owner now lives (or is about
@@ -7985,11 +8466,15 @@ impl Fleet {
         // Offer, and let the machine answer from its own live facts. A decline
         // is routing information rather than a failure: the entry comes back
         // around this loop to the next candidate, having never been parked.
+        // Whether the placement a machine claimed went above that machine's
+        // memory ceiling, which the caller is owed whatever the outcome.
+        let mut claimed_above_ceiling = None;
         let (selected, request, batch, profile_context) = loop {
             let Placement {
                 selected,
                 reservation,
                 mut decision,
+                above_ceiling,
             } = match self
                 .select_executor(&request, Some(&plan), &placement_policy, Some(&entry_id))
                 .await
@@ -8043,7 +8528,8 @@ impl Fleet {
                 .await;
             match answer {
                 OfferAnswer::Claimed => {
-                    break (selected, attempt_request, attempt_batch, profile_context)
+                    claimed_above_ceiling = above_ceiling;
+                    break (selected, attempt_request, attempt_batch, profile_context);
                 }
                 OfferAnswer::Requeued => continue,
                 OfferAnswer::Expired => {
@@ -8240,6 +8726,7 @@ impl Fleet {
             return ExecutedRequest {
                 outcome,
                 grant_without_result,
+                above_ceiling: claimed_above_ceiling,
             };
         }
         if let CellOutcome::Completed {
@@ -8287,6 +8774,7 @@ impl Fleet {
         ExecutedRequest {
             outcome,
             grant_without_result,
+            above_ceiling: claimed_above_ceiling,
         }
     }
 
@@ -8673,7 +9161,7 @@ impl Fleet {
                     // a success, and it is recorded as one.
                     self.record_placement_decision(refused.decision);
                     return Err(CellOutcome::Unavailable {
-                        reason: CellUnavailableReason::NoMatchingExecutor,
+                        reason: refused.reason,
                         diagnostic: refused.diagnostic,
                     });
                 }
@@ -8878,6 +9366,16 @@ impl Fleet {
                 ));
             }
         };
+        if let Some(refused) = home_cannot_hold(
+            request,
+            now,
+            policy,
+            &reservations,
+            &survey,
+            unpinned_winner.as_ref(),
+        ) {
+            return Err(refused);
+        }
         // Ranking can still find nothing it may choose among the usable
         // machines (policy keeps work off one, telemetry blinds another). While
         // a capable machine's decline stands, that is not a refusal: the
@@ -8947,6 +9445,9 @@ impl Fleet {
             exploration.record_selection(selection.executor_id.as_str());
         }
         drop(exploration_by_work_class);
+        let mut rejected = draft.rejected;
+        let above_ceiling =
+            above_memory_ceiling(&selection, &mut rejected, &reservations, &connections);
         let reservation = reservations.remove(&selected.executor_id);
         let decision = placement_decision(
             request,
@@ -8954,12 +9455,13 @@ impl Fleet {
             Some(draft.policy),
             unpinned_winner,
             PlacementOutcome::Selected(Box::new(selection)),
-            draft.rejected,
+            rejected,
         );
         Ok(Selection::Placed(Box::new(Placement {
             selected,
             reservation,
             decision,
+            above_ceiling,
         })))
     }
 
@@ -9077,7 +9579,7 @@ impl Fleet {
         &self,
         executor_id: &str,
         generation: u64,
-    ) -> HashSet<RequestIdentity> {
+    ) -> HashMap<RequestIdentity, queue::HeldClaim> {
         let rebound = self.queue.rebind(executor_id, generation);
         for pending in self.pending_residency.lock().unwrap().values_mut() {
             if pending.executor_id == executor_id && pending.granted_entry_id.as_deref().is_some_and(|entry_id|
@@ -9114,9 +9616,15 @@ impl Fleet {
         let identify =
             |request_id: &String, attempt_id: &String| (request_id.clone(), attempt_id.clone());
         let accounted: HashSet<RequestIdentity> = snapshot
-            .executing_requests
+            .granted_attempts
             .iter()
-            .map(|request| identify(&request.request_id, &request.attempt_id))
+            .map(|attempt| identify(&attempt.request_id, &attempt.attempt_id))
+            .chain(
+                snapshot
+                    .executing_requests
+                    .iter()
+                    .map(|request| identify(&request.request_id, &request.attempt_id)),
+            )
             .chain(
                 snapshot
                     .queued_requests
@@ -9150,22 +9658,29 @@ impl Fleet {
                     }),
             )
             .collect();
-        for key in held.difference(&accounted) {
+        let now = unix_time_ms();
+        for (key, claim) in held.iter().filter(|(key, _)| !accounted.contains(*key)) {
             let settled = self.queue.settle(
                 key,
                 Some((executor_id, generation)),
                 queue::TerminalState::Completed,
                 executor_unavailable(format!(
-                    "the executor reattached without request {} attempt {}: it is no longer running or queued on that machine",
-                    key.0, key.1
+                    "the executor reattached at generation {generation} without request {} attempt {}, \
+                     which it claimed {}s earlier and was running at generation {}: it is no longer \
+                     running or queued on that machine, so no result is coming",
+                    key.0,
+                    key.1,
+                    now.saturating_sub(claim.claimed_at_unix_ms) / 1000,
+                    claim.lost_generation,
                 )),
-                unix_time_ms(),
+                now,
             );
             if settled {
                 log::warn!(
-                    "executor_id={executor_id} reattached without request {} attempt {}",
+                    "executor_id={executor_id} reattached at generation {generation} without request {} attempt {} (running at generation {})",
                     key.0,
-                    key.1
+                    key.1,
+                    claim.lost_generation,
                 );
             }
         }
@@ -9751,8 +10266,7 @@ fn selected_link_dispatch_error(
             selected.executor_id, selected.generation
         ));
     }
-    let silence_ms = now_unix_ms.saturating_sub(current.last_progress_unix_ms);
-    (silence_ms > EXECUTOR_PROGRESS_FRESHNESS_MS).then(|| {
+    link_silence_ms(current, now_unix_ms).map(|silence_ms| {
         format!(
             "selected executor {} connection generation {} became stale before residency dispatch: no progress for {}ms (liveness bound {}ms)",
             selected.executor_id,
@@ -9804,11 +10318,9 @@ fn candidate_rejection(
         Some(PlacementRejectionReason::AvoidedInfrastructure)
     } else if entry.sender.is_closed() {
         Some(PlacementRejectionReason::ConnectionClosed)
-    } else if now_unix_ms.saturating_sub(entry.last_progress_unix_ms)
-        > EXECUTOR_PROGRESS_FRESHNESS_MS
-    {
+    } else if let Some(silence_ms) = link_silence_ms(entry, now_unix_ms) {
         Some(PlacementRejectionReason::ConnectionStale {
-            silence_ms: now_unix_ms.saturating_sub(entry.last_progress_unix_ms),
+            silence_ms,
             stale_after_ms: EXECUTOR_PROGRESS_FRESHNESS_MS,
         })
     } else if scope
@@ -10198,6 +10710,9 @@ fn rank_survey(
             ObservationReuse::UntrustedRemoteEnvironment
         },
         prediction: Some(winner.prediction.clone()),
+        memory_ceiling: winner
+            .reservation
+            .and_then(|resolved| resolved.memory_fit.ceiling()),
         cache_distance: winner.cache_distance.map(|distance| {
             cairn_common::cache_distance::MeasuredDistance {
                 target_commit: request.base_commit.clone(),
@@ -10245,6 +10760,10 @@ struct ScoredCandidate<'a> {
     blindness: Option<PlacementRejectionReason>,
     /// Set when the machine is measured and the resolved demand does not fit.
     misfit: Option<PlacementRejectionReason>,
+    /// Set when the work's measured memory demand is larger than this machine
+    /// will ever reserve. A fact about the machine's size rather than its
+    /// readings, so it holds whether or not the machine is blind.
+    over_ceiling: Option<PlacementRejectionReason>,
     /// Whether executor admission can retain and fit this request right now.
     admission_accepts: bool,
     /// The machine's volume is at or below its pressure line. A price: a tight
@@ -10369,12 +10888,19 @@ impl<'a> ScoredCandidate<'a> {
                     .saturating_add(demand.disk_growth_bytes)
                     <= capacity
             });
+        let over_ceiling = reservation
+            .and_then(|resolved| resolved.memory_fit.ceiling())
+            .map(|ceiling| PlacementRejectionReason::ExceedsMemoryCeiling {
+                estimate_bytes: ceiling.estimate_bytes,
+                ceiling_bytes: ceiling.ceiling_bytes,
+            });
         Self {
             entry,
             sync_cost,
             reservation,
             blindness,
             misfit,
+            over_ceiling,
             admission_accepts,
             disk_tight: entry.health.disk.status == DiskHealthStatus::Tight,
             cpu_headroom_risk,
@@ -10391,6 +10917,7 @@ impl<'a> ScoredCandidate<'a> {
             reason: self
                 .blindness
                 .clone()
+                .or_else(|| self.over_ceiling.clone())
                 .or_else(|| self.misfit.clone())
                 .unwrap_or(PlacementRejectionReason::NotColocated),
         }
@@ -10402,6 +10929,7 @@ impl<'a> ScoredCandidate<'a> {
         let reason = self
             .blindness
             .clone()
+            .or_else(|| self.over_ceiling.clone())
             .or_else(|| self.misfit.clone())
             .unwrap_or_else(|| PlacementRejectionReason::OutrankedBy {
                 executor_name: winner_name.to_string(),
@@ -10419,8 +10947,13 @@ impl<'a> ScoredCandidate<'a> {
 
 /// Order the usable machines and name the winner.
 ///
-/// A measured machine always beats a measured-blind one, and a machine that fits
-/// the resolved demand always beats one that does not. Fit is a ranking key
+/// A measured machine always beats a measured-blind one, a machine that can ever
+/// hold the work's measured memory always beats one that cannot, and a machine
+/// that fits the resolved demand now always beats one that does not. The
+/// ceiling comes before fit on purpose: a big machine that is busy right now
+/// queues the work in its own admission until it has room, while a small one
+/// that is idle right now runs it into its memory limit. Neither is a filter,
+/// so a fleet where nothing can hold the work still places it, at the clamp. Fit is a ranking key
 /// rather than a hard filter on purpose: reserving capacity and queueing for it
 /// belong to the executor's admission, and placement refusing work the executor
 /// would have queued would be a second, quieter queue.
@@ -10463,6 +10996,7 @@ fn rank_candidates<'a, 'b>(
         a.blindness
             .is_some()
             .cmp(&b.blindness.is_some())
+            .then_with(|| a.over_ceiling.is_some().cmp(&b.over_ceiling.is_some()))
             .then_with(|| a.misfit.is_some().cmp(&b.misfit.is_some()))
             .then_with(|| b.admission_accepts.cmp(&a.admission_accepts))
             // A tight volume is reclaiming toward its pressure line, and new
@@ -10573,6 +11107,9 @@ fn rank_candidates<'a, 'b>(
     let bootstrap_eligible = |candidate: &&ScoredCandidate<'a>| {
         selectable(candidate)
             && candidate.misfit.is_none()
+            // Exploring a machine that can never hold the work earns an
+            // out-of-memory kill, not a duration sample.
+            && candidate.over_ceiling.is_none()
             && candidate.admission_accepts
             && candidate.prediction.queue.predicted_ms() == Some(0)
             && candidate.prediction.run.profile_key.is_some()
@@ -11598,6 +12135,9 @@ impl ReservationPlan {
                 rationale: resource_profiles::declared_rationale(&context, self.stated.clone()),
                 duration: self.predict_duration(&context, duration_context).await,
                 item_durations: Vec::new(),
+                // A stated reservation is the caller's own number, not a
+                // measurement this machine's cap could be hiding.
+                memory_fit: resource_profiles::MemoryFit::Unknown,
             };
         }
         // Whether the caller declared concurrency is decided here, before the
@@ -11728,6 +12268,9 @@ impl ReservationPlan {
         // No item has spoken yet, so there is no rationale to seed: an unconsulted
         // batch must not carry a stand-in explanation that could survive as one.
         let mut rationale: Option<ReservationRationale> = None;
+        // The batch must fit its heaviest item, so the item measured furthest
+        // past the cap is the one that says this machine cannot hold it.
+        let mut memory_fits = Vec::with_capacity(self.batch_identities.len());
         for identity in &self.batch_identities {
             let item = resource_profiles::resolve_reservation(
                 self.db.clone(),
@@ -11755,6 +12298,7 @@ impl ReservationPlan {
             if rationale.is_none() || item.reservation.memory_bytes >= reservation.memory_bytes {
                 rationale = Some(item.rationale.clone());
             }
+            memory_fits.push(item.memory_fit);
             learned_estimates.push(item.learned_estimate);
             item_durations.push(item.duration);
         }
@@ -11765,6 +12309,7 @@ impl ReservationPlan {
                 .unwrap_or_else(|| resource_profiles::declared_rationale(context, prior)),
             duration: self.predict_batch_duration(context, duration_context).await,
             item_durations,
+            memory_fit: resource_profiles::MemoryFit::of_batch(memory_fits),
         }
     }
 }
@@ -12778,6 +13323,9 @@ pub(crate) struct GrantWithoutResult {
 pub(crate) struct ExecutedRequest {
     pub(crate) outcome: CellOutcome,
     pub(crate) grant_without_result: Option<GrantWithoutResult>,
+    /// Set when a machine claimed this work above its memory ceiling, because
+    /// no usable machine could hold it.
+    pub(crate) above_ceiling: Option<AboveMemoryCeiling>,
 }
 
 /// An outcome reached before any grant was delivered.
@@ -12786,6 +13334,7 @@ impl From<CellOutcome> for ExecutedRequest {
         Self {
             outcome,
             grant_without_result: None,
+            above_ceiling: None,
         }
     }
 }
@@ -13596,22 +14145,60 @@ mod tests {
         let reattached = pool.attach_executor(sender);
 
         // A first snapshot without it means the process behind the link was
-        // replaced while the link was down.
-        pool.handle_executor_message(
+        // replaced while the link was down. Applied through the ingest the
+        // transport uses, since that is where this accounting was once skipped.
+        pool.apply_executor_snapshot(
             COLOCATED_EXECUTOR_ID,
             reattached,
-            ExecutorMessage::SnapshotUpdated {
-                snapshot: FleetSnapshot::default(),
-                health: ExecutorSubstrateReport::default(),
-            },
+            FleetSnapshot::default(),
+            ExecutorSubstrateReport::default(),
         );
-        assert!(matches!(
-            result_rx.await.unwrap(),
-            CellOutcome::Unavailable {
-                reason: CellUnavailableReason::ExecutorUnavailable,
-                ref diagnostic,
-            } if diagnostic.contains("no longer running or queued")
-        ));
+        let outcome = result_rx.await.unwrap();
+        assert!(
+            matches!(
+                &outcome,
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::ExecutorUnavailable,
+                    diagnostic,
+                } if diagnostic.contains("no longer running or queued")
+                    && diagnostic.contains(&format!("reattached at generation {reattached}"))
+                    && diagnostic.contains(&format!("running at generation {generation}"))
+            ),
+            "the settlement names the generation that lost the work: {outcome:?}"
+        );
+    }
+
+    /// Granted work that has not spawned a process yet (acquiring its cell,
+    /// materializing its checkout, between batch items) is listed only as a
+    /// granted attempt. That is account enough: a link blip in one of those
+    /// phases must not resolve live work as lost.
+    #[tokio::test]
+    async fn granted_work_without_a_process_yet_stays_held_across_a_reattach() {
+        let pool = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let generation = pool.attach_executor(sender);
+        let key = ("request".to_string(), "attempt".to_string());
+        let _result_rx = claim_entry(&pool, &key, COLOCATED_EXECUTOR_ID, generation, None);
+        assert!(pool.disconnect_advertised_executor(COLOCATED_EXECUTOR_ID, generation));
+
+        let (sender, _executor) = mpsc::unbounded_channel();
+        let reattached = pool.attach_executor(sender);
+        pool.apply_executor_snapshot(
+            COLOCATED_EXECUTOR_ID,
+            reattached,
+            FleetSnapshot {
+                granted_attempts: vec![cairn_common::executor_protocol::GrantedAttempt {
+                    request_id: key.0.clone(),
+                    attempt_id: key.1.clone(),
+                }],
+                ..FleetSnapshot::default()
+            },
+            ExecutorSubstrateReport::default(),
+        );
+        assert!(
+            pool.queue.holds(&key),
+            "a granted attempt the machine still holds stays held"
+        );
     }
 
     /// The supervisor is the only thing that knows a machine's process is gone,
@@ -16808,6 +17395,323 @@ mod tests {
         );
     }
 
+    /// cairn/4931 specimen B, as placement sees it: a ~12 GiB home whose
+    /// reservation cap is exactly the 8,282,086,656 bytes it once reported as a
+    /// cargo test's requirement, a measured demand above that cap, and a second
+    /// machine with room. `other_budget` sizes the second machine.
+    async fn ceiling_fleet(
+        db_name: &str,
+        other_budget: u64,
+        other_cpu: f64,
+        other_available: u64,
+    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+        ceiling_fleet_with(
+            db_name,
+            Some(other_budget),
+            true,
+            other_cpu,
+            other_available,
+        )
+        .await
+    }
+
+    /// [`ceiling_fleet`], where the second machine may state no budget and may
+    /// never have run the command itself (cold, so it borrows the fleet's).
+    async fn ceiling_fleet_with(
+        db_name: &str,
+        other_budget: Option<u64>,
+        other_measured: bool,
+        other_cpu: f64,
+        other_available: u64,
+    ) -> (Fleet, Arc<cairn_db::storage::LocalDb>, CellRequest) {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let db = Arc::new(crate::storage::migrated_test_db(db_name).await);
+        let identity = CommandResourceIdentity {
+            version: 1,
+            key: "test:rust".into(),
+        };
+        let pool = Fleet::default();
+        let now = unix_time_ms();
+        let mut connections = HashMap::new();
+        for (id, budget, measured, cpu, available) in [
+            ("bgsrv-ub", Some(11_042_782_208), true, 0.01, 10 * GIB),
+            (
+                "bglab-mac",
+                other_budget,
+                other_measured,
+                other_cpu,
+                other_available,
+            ),
+        ] {
+            let (id, mut entry) = fleet_entry_at(id, "linux", 0, &[], now);
+            entry.advertisement.capabilities.memory_budget_bytes = budget;
+            measured_at(&mut entry, cpu, available, 500 * GIB, now);
+            if !measured {
+                connections.insert(id, entry);
+                continue;
+            }
+            resource_profiles::seed_memory_profile_for_test(
+                db.clone(),
+                &identity,
+                &ReservationPlan::context_for(
+                    &entry.identity.device_id,
+                    &entry.identity.executor_id,
+                    &entry.advertisement.capabilities,
+                ),
+                8 * GIB,
+            )
+            .await;
+            connections.insert(id, entry);
+        }
+        *pool.lock_connections() = connections;
+        let mut request = spillable_request();
+        request.command_class = cairn_common::executor_protocol::CellCommandClass::CargoTest;
+        request.command_resource_identity = Some(identity);
+        (pool, db, request)
+    }
+
+    fn pinned_to(mut request: CellRequest, home: &str) -> CellRequest {
+        request.pinned_executor_id = Some(home.into());
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        request.repository = RepositoryLocator::ColocatedPath {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            absolute_path: "/repo".into(),
+        };
+        request
+    }
+
+    /// The home is healthy for everything it can hold, and this is not one of
+    /// those things. Queueing the batch there runs it into the home's memory
+    /// limit, so it is refused at once, naming the machine that can hold it.
+    #[tokio::test]
+    async fn a_pinned_batch_whose_home_can_never_hold_it_is_refused_at_once_when_another_machine_can(
+    ) {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) =
+            ceiling_fleet("ceiling-home-refused.db", 100 * GIB, 0.01, 60 * GIB).await;
+        let request = pinned_to(request, "bgsrv-ub");
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let started = std::time::Instant::now();
+        let refusal = pool
+            .select_executor(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                None,
+            )
+            .await
+            .expect_err("a home that can never hold the batch does not take it");
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "refused on the first pass, not at the horizon"
+        );
+        let CellOutcome::Unavailable {
+            reason:
+                CellUnavailableReason::HomeCannotHold {
+                    home,
+                    ceiling,
+                    alternative_executor_id,
+                    ..
+                },
+            diagnostic,
+        } = refusal
+        else {
+            panic!("expected HomeCannotHold, got {refusal:?}");
+        };
+        assert_eq!(home, "bgsrv-ub");
+        assert_eq!(alternative_executor_id, "bglab-mac");
+        assert_eq!(ceiling.ceiling_bytes, 8_282_086_656);
+        assert!(ceiling.estimate_bytes > ceiling.ceiling_bytes);
+        assert!(diagnostic.contains("can ever hold"), "{diagnostic}");
+
+        let decision = pool
+            .placements_naming("bgsrv-ub")
+            .into_iter()
+            .next()
+            .expect("the refusal is a recorded decision");
+        assert!(matches!(decision.outcome, PlacementOutcome::Refused { .. }));
+        assert!(decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bgsrv-ub"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+    }
+
+    /// When no machine can hold it the pin holds, at the clamp, and nothing
+    /// about that is silent: every machine that could not hold it says so in
+    /// the decision, and the selection carries the ceiling it went above.
+    #[tokio::test]
+    async fn when_no_machine_can_hold_it_the_pinned_batch_runs_home_at_the_clamp_and_says_so() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) =
+            ceiling_fleet("ceiling-nothing-holds.db", 10 * GIB, 0.01, 8 * GIB).await;
+        let request = pinned_to(request, "bgsrv-ub");
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .expect("the pin holds when nothing else can hold the work");
+        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
+        assert_eq!(
+            placement
+                .reservation
+                .as_ref()
+                .unwrap()
+                .reservation
+                .memory_bytes,
+            8_282_086_656,
+            "the reservation is the clamp"
+        );
+        let PlacementOutcome::Selected(selection) = &placement.decision.outcome else {
+            panic!("selected");
+        };
+        assert!(selection.memory_ceiling.is_some());
+        assert!(placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bglab-mac"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+        let above = placement.above_ceiling.expect("the result is told");
+        assert!(!above.holdable_elsewhere);
+        let note = above.note();
+        assert!(note.contains("no executor can hold"), "{note}");
+        assert!(note.contains("bgsrv-ub"), "{note}");
+    }
+
+    /// cairn/4931 review: a cold machine with a smaller budget than the home
+    /// borrows the fleet's measurement, and that measurement says it is too
+    /// small too. The borrowed peak is quarantined against its budget for a
+    /// reservation, but for fit it is evidence, so the smaller machine is never
+    /// named as the place that can hold the work, and the pin holds at the
+    /// clamp with every machine's ceiling on the record.
+    #[tokio::test]
+    async fn a_smaller_cold_machine_is_never_named_as_able_to_hold_what_its_home_cannot() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) = ceiling_fleet_with(
+            "ceiling-smaller-cold.db",
+            Some(6 * GIB),
+            false,
+            0.01,
+            5 * GIB,
+        )
+        .await;
+        let request = pinned_to(request, "bgsrv-ub");
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .expect("no HomeCannotHold naming the smaller machine")
+            .placed()
+            .expect("the pin holds");
+        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
+        assert!(placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bglab-mac"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+        let above = placement.above_ceiling.unwrap();
+        assert!(!above.holdable_elsewhere && !above.unknown_elsewhere);
+        assert!(above.note().contains("no executor can hold"));
+    }
+
+    /// A machine with no stated budget has no measured fit either way. It is not
+    /// named as able to hold the work, and the note does not claim that nothing
+    /// can.
+    #[tokio::test]
+    async fn a_machine_whose_fit_is_unknown_is_neither_the_safe_choice_nor_proof_none_exists() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) =
+            ceiling_fleet_with("ceiling-unknown.db", None, true, 0.01, 60 * GIB).await;
+        let request = pinned_to(request, "bgsrv-ub");
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .expect("an unknown fit is not a machine that can hold it")
+            .placed()
+            .unwrap();
+        assert_eq!(placement.selected.executor_id, "bgsrv-ub");
+        let above = placement.above_ceiling.unwrap();
+        assert!(above.unknown_elsewhere);
+        let note = above.note();
+        assert!(
+            note.contains("no usable machine is known to hold it"),
+            "{note}"
+        );
+        assert!(!note.contains("no executor can hold"), "{note}");
+    }
+
+    /// A big machine that is busy right now queues the work in its own
+    /// admission; a small idle one runs it into its memory limit. The ceiling
+    /// therefore outranks momentary fit and predicted speed alike.
+    #[tokio::test]
+    async fn unpinned_work_prefers_a_machine_that_can_ever_hold_it_over_a_more_idle_one_that_cannot(
+    ) {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let (pool, db, request) =
+            ceiling_fleet("ceiling-ranking.db", 100 * GIB, 0.60, 4 * GIB).await;
+        let mut request = request;
+        request.repository = RepositoryLocator::ManagedObjects {
+            project_id: "p".into(),
+            repository_id: "repo".into(),
+            object_format: GitObjectFormat::Sha1,
+        };
+        let plan = ReservationPlan::new(db, &request, None);
+
+        let placement = pool
+            .select_executor_once_with(
+                &request,
+                Some(&plan),
+                &ActivePlacementPolicy::default_profile(),
+                &HashMap::new(),
+                |_, _| SyncCost::Known(0),
+            )
+            .await
+            .unwrap()
+            .placed()
+            .unwrap();
+        assert_eq!(placement.selected.executor_id, "bglab-mac");
+        assert!(placement.above_ceiling.is_none());
+        assert!(placement.decision.rejected.iter().any(|rejection| {
+            rejection.executor_id == "bgsrv-ub"
+                && matches!(
+                    rejection.reason,
+                    PlacementRejectionReason::ExceedsMemoryCeiling { .. }
+                )
+        }));
+    }
+
     #[test]
     fn unpinned_shadow_can_choose_a_remote_machine_without_changing_dispatch() {
         let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
@@ -18332,6 +19236,7 @@ mod tests {
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
+            memory_fit: resource_profiles::MemoryFit::Unknown,
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -18386,6 +19291,7 @@ mod tests {
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
+            memory_fit: resource_profiles::MemoryFit::Unknown,
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -18514,6 +19420,7 @@ mod tests {
             },
             learned_estimate: None,
             rationale: unresolved_rationale(&ResourceReservation::default()),
+            memory_fit: resource_profiles::MemoryFit::Unknown,
         };
         let reservations = HashMap::from([
             (COLOCATED_EXECUTOR_ID.to_string(), demand.clone()),
@@ -20432,8 +21339,8 @@ mod tests {
     #[test]
     fn fleet_lifetime_retry_routes_to_original_executor() {
         let pool = Fleet::default();
-        let first = fleet_entry("first", "linux", 10, &[]);
-        let second = fleet_entry("second", "linux", 0, &[]);
+        let first = answering_fleet_entry("first", "linux", 10, &[]);
+        let second = answering_fleet_entry("second", "linux", 0, &[]);
         pool.lock_connections().extend([first, second]);
         let mut request = dev_instance_request("launcher");
         // The executor holds the same repository by identity, addressed as
@@ -20659,13 +21566,14 @@ mod tests {
             COLOCATED_EXECUTOR_ID
         );
         drop(routes);
-        assert_eq!(
+        assert!(matches!(
             orch.fleet.take_environment_eviction(&holder),
             Some(EnvironmentEviction {
-                executor: "departed".into(),
-                cause: EvictionCause::SessionLost,
-            })
-        );
+                executor,
+                cause: EvictionCause::Disconnected { .. },
+                ..
+            }) if executor == "departed"
+        ));
     }
 
     #[tokio::test]
@@ -21277,8 +22185,8 @@ mod tests {
     fn a_pending_route_binds_its_owner_only_while_that_executor_answers() {
         let pool = Fleet::default();
         pool.lock_connections().extend([
-            fleet_entry("first", "linux", 10, &[]),
-            fleet_entry("second", "linux", 0, &[]),
+            answering_fleet_entry("first", "linux", 10, &[]),
+            answering_fleet_entry("second", "linux", 0, &[]),
         ]);
         let mut request = dev_instance_request("lease");
         pool.reserve_pending_residency_route(ResidencyRoute {
@@ -21309,11 +22217,190 @@ mod tests {
 
     /// Put an executor's link outage far enough in the past that the runner has
     /// stopped reading it as a flap.
+    /// A connection that answered just now. Residency routing judges a route by
+    /// the staleness rule dispatch uses, so a home that a test means to be live
+    /// has to have spoken recently, not at the fixed test instant.
+    fn answering_fleet_entry(
+        id: &str,
+        os: &str,
+        load: usize,
+        warm: &[&str],
+    ) -> (String, ExecutorConnectionState) {
+        fleet_entry_at(id, os, load, warm, unix_time_ms())
+    }
+
     fn machine_left(pool: &Fleet, executor_id: &str) {
         pool.link_absence_since.lock().unwrap().insert(
             executor_id.into(),
             unix_time_ms().saturating_sub(ENVIRONMENT_LEASE_GRACE_MS + 1),
         );
+    }
+
+    /// cairn/4931 specimen A: bbs holds a job's environment with terminal `dev`
+    /// running in it, and its link stays in the connection table while the
+    /// machine says nothing. `quiet_ms` is how long ago it last answered.
+    fn pool_with_a_silent_home(
+        quiet_ms: u64,
+    ) -> (
+        Fleet,
+        ResidencyAcquireRequest,
+        mpsc::UnboundedReceiver<ExecutorMessage>,
+    ) {
+        let pool = Fleet::default();
+        pool.declare_enrolled_remote("bbs", "bbs", "linux", "x86_64");
+        let (sender, inbox) = mpsc::unbounded_channel();
+        let (id, mut entry) = fleet_entry("bbs", "linux", 0, &[]);
+        entry.sender = sender;
+        entry.last_progress_unix_ms = unix_time_ms().saturating_sub(quiet_ms);
+        let mut cell = materialization_read_cell("bbs-home", "silent");
+        cell.occupancy.processes.insert(
+            "terminal:dev".into(),
+            cairn_common::executor_protocol::ResidentProcess {
+                generation: 1,
+                kind: cairn_common::executor_protocol::ResidentProcessKind::Terminal {
+                    slug: "dev".into(),
+                },
+                spec: None,
+                status: cairn_common::executor_protocol::ResidentProcessStatus::Starting,
+                reservation: None,
+            },
+        );
+        entry.snapshot.cells = vec![cell];
+        pool.lock_connections().insert(id, entry);
+        pool.lock_connections()
+            .extend([answering_fleet_entry("second", "linux", 0, &[])]);
+        let request = fleet_residency_request(ResidencyHolder::Job {
+            job_id: "silent".into(),
+        });
+        pool.residency_routes.lock().unwrap().insert(
+            ("bbs".into(), request.holder.storage_key()),
+            ResidencyRoute {
+                holder: request.holder.clone(),
+                repository: request.repository.clone(),
+                executor_id: "bbs".into(),
+                pending: false,
+            },
+        );
+        (pool, request, inbox)
+    }
+
+    /// Presence in the connection table is not liveness. A machine that stays
+    /// attached and says nothing for the whole lease grace is gone for the
+    /// purposes of its environment, exactly like one that disconnected: the
+    /// environment is rebuilt, the cause and the process it cost are stated,
+    /// the executors page records it, and the silent machine is told to let go
+    /// of the cell in case it ever answers again.
+    #[test]
+    fn a_silent_home_still_in_the_connection_table_is_evicted_after_the_lease_grace() {
+        let (pool, mut request, mut inbox) =
+            pool_with_a_silent_home(ENVIRONMENT_LEASE_GRACE_MS + 1_000);
+
+        assert!(pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap()
+            .is_none());
+        assert!(pool.residency_routes.lock().unwrap().is_empty());
+        let eviction = pool
+            .take_environment_eviction(&request.holder)
+            .expect("the loss is reported");
+        assert_eq!(eviction.executor, "bbs");
+        assert!(matches!(
+            eviction.cause,
+            EvictionCause::Silent { generation: 1, silent_ms } if silent_ms > ENVIRONMENT_LEASE_GRACE_MS
+        ));
+        assert_eq!(eviction.lost_processes, vec!["terminal `dev`".to_string()]);
+
+        let timeline = pool.enrolled_remotes.lock().unwrap()["bbs"]
+            .connection_timeline
+            .clone();
+        let evicted = timeline
+            .iter()
+            .find(|transition| transition.phase == RemoteConnectionPhase::EnvironmentEvicted)
+            .expect("the executors page records the eviction");
+        assert_eq!(evicted.generation, Some(1));
+        let reason = evicted.reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with("job silent's execution environment rebuilt elsewhere: silent 5m"),
+            "{reason}"
+        );
+        assert!(reason.ends_with("on generation 1"), "{reason}");
+
+        assert!(matches!(
+            inbox.try_recv(),
+            Ok(ExecutorMessage::ResidencyRequest {
+                operation: ResidencyOperation::Release { .. },
+                ..
+            })
+        ));
+    }
+
+    /// Silence that has not yet outlasted the grace holds the environment, and
+    /// the caller waits rather than being refused. The diagnostic names the
+    /// silence, when the rebuild will happen, and what it would cost.
+    #[test]
+    fn a_silent_home_within_the_grace_is_held_and_says_when_it_will_be_rebuilt() {
+        let (pool, mut request, _inbox) =
+            pool_with_a_silent_home(EXECUTOR_PROGRESS_FRESHNESS_MS + 17_000);
+
+        let refusal = pool
+            .resolve_residency_acquire_route(&mut request)
+            .unwrap_err();
+        let ResidencyResult::Failed {
+            kind,
+            diagnostic,
+            cell_outcome,
+        } = &refusal
+        else {
+            panic!("a home inside its grace refuses with a classified failure");
+        };
+        assert_eq!(*kind, ResidencyFailureKind::Admission);
+        assert!(
+            diagnostic.contains("(bbs) is connected but has not answered for 1m32s"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("rebuilt elsewhere in 3m28s"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("terminal `dev` running there would not survive"),
+            "{diagnostic}"
+        );
+        assert!(placement::classify_residency_failure(
+            kind,
+            cell_outcome.as_deref(),
+            pool.residency_link_restoration(&request.holder)
+        )
+        .is_capacity());
+        assert_eq!(pool.residency_routes.lock().unwrap().len(), 1);
+        assert!(pool.take_environment_eviction(&request.holder).is_none());
+    }
+
+    /// Two routes for one owner, one machine answering and one silent, is not a
+    /// contradiction: the silent one cannot serve a batch, so the answering one
+    /// holds the environment and the silent route is forgotten.
+    #[test]
+    fn a_silent_route_beside_a_live_one_yields_to_the_live_one() {
+        let (pool, mut request, _inbox) =
+            pool_with_a_silent_home(EXECUTOR_PROGRESS_FRESHNESS_MS + 1_000);
+        pool.residency_routes.lock().unwrap().insert(
+            ("second".into(), request.holder.storage_key()),
+            ResidencyRoute {
+                holder: request.holder.clone(),
+                repository: request.repository.clone(),
+                executor_id: "second".into(),
+                pending: false,
+            },
+        );
+
+        let selected = pool
+            .resolve_residency_acquire_route(&mut request)
+            .expect("no conflicting declaration")
+            .expect("the answering machine holds the environment");
+        assert_eq!(selected.executor_id, "second");
+        let routes = pool.residency_routes.lock().unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes.values().next().unwrap().executor_id, "second");
     }
 
     /// The mistake the grace exists to prevent, and the reason absence alone
@@ -21441,13 +22528,14 @@ mod tests {
         assert!(pool.residency_routes.lock().unwrap().is_empty());
         // The loss is a fact the agent is owed, exactly once: its next batch runs
         // in a fresh checkout, and anything only the old environment held is gone.
-        assert_eq!(
+        assert!(matches!(
             pool.take_environment_eviction(&request.holder),
             Some(EnvironmentEviction {
-                executor: "first".into(),
-                cause: EvictionCause::SessionLost,
-            })
-        );
+                executor,
+                cause: EvictionCause::Disconnected { .. },
+                ..
+            }) if executor == "first"
+        ));
         assert!(pool.take_environment_eviction(&request.holder).is_none());
     }
 
@@ -21661,8 +22749,8 @@ mod tests {
     fn duplicate_fleet_lifetime_snapshots_fail_closed() {
         let pool = Fleet::default();
         pool.lock_connections().extend([
-            fleet_entry("first", "linux", 0, &[]),
-            fleet_entry("second", "linux", 0, &[]),
+            answering_fleet_entry("first", "linux", 0, &[]),
+            answering_fleet_entry("second", "linux", 0, &[]),
         ]);
         let mut request = dev_instance_request("lease");
         let mut routes = pool.residency_routes.lock().unwrap();
@@ -25435,7 +26523,7 @@ mod tests {
     fn a_home_that_cannot_prepare_its_project_is_rebuilt_elsewhere() {
         for predictive in [false, true] {
             let pool = Fleet::default();
-            let (id, mut entry) = fleet_entry("bgsrv-ub2", "linux", 0, &[]);
+            let (id, mut entry) = answering_fleet_entry("bgsrv-ub2", "linux", 0, &[]);
             advertising(&mut entry, if predictive { &[] } else { &["bun"] });
             pool.lock_connections().insert(id.clone(), entry);
             pool.known_project_requirements
@@ -25481,7 +26569,7 @@ mod tests {
     fn a_branch_owned_failure_a_live_checkout_or_an_unknown_setup_keeps_its_home() {
         for case in ["bad-branch", "live", "unknown-setup"] {
             let pool = Fleet::default();
-            let (id, mut entry) = fleet_entry("bglab-mac", "linux", 0, &[]);
+            let (id, mut entry) = answering_fleet_entry("bglab-mac", "linux", 0, &[]);
             advertising(
                 &mut entry,
                 if case == "bad-branch" { &["bun"] } else { &[] },

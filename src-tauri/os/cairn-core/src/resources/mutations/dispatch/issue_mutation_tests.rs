@@ -556,7 +556,11 @@ async fn issue_uri_append_still_creates_a_comment() {
     assert_eq!(listed[0].content, "a fresh comment");
 }
 
-fn change_item(target: &str, mode: ChangeMode, payload: Option<serde_json::Value>) -> ChangeItem {
+pub(super) fn change_item(
+    target: &str,
+    mode: ChangeMode,
+    payload: Option<serde_json::Value>,
+) -> ChangeItem {
     ChangeItem {
         target: target.to_string(),
         mode,
@@ -788,7 +792,7 @@ async fn run_status_for(orch: &Orchestrator, run_id: &str) -> Option<String> {
 /// Seed a `CAIRN` project + issue + execution (seq 1) + agent job
 /// (uri_segment `builder`) + a `live` run. Returns (issue number, job id,
 /// run id).
-async fn seed_running_node(orch: &Orchestrator) -> (i32, String, String) {
+pub(super) async fn seed_running_node(orch: &Orchestrator) -> (i32, String, String) {
     let (issue_id, number) = seed_issue(orch).await;
     // The project created by seed_issue keys on CAIRN; recover its id from
     // the issue so the execution/job/run FKs all resolve.
@@ -2605,6 +2609,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectResponse => "cairn://p/cairn/responses/summarize",
         K::Grant => "cairn://grants/grant-1",
         K::LlmSession => "cairn://llm/sessions/session-1",
+        K::LlmAccounts => "cairn://llm/accounts",
+        K::LlmAccount => "cairn://llm/accounts/acc_1",
         K::ProjectAttachment => "cairn://p/cairn/4647/attachments/1",
         // Pre-existing gaps, filled here because they sit between this test and
         // the arm above: the parity check panics on the first unsampled kind and

@@ -422,6 +422,7 @@ pub struct UpdateSettings {
     /// loop instead of the native backend. Default false.
     #[serde(rename = "routeCallsViaOpenRouter")]
     pub route_calls_via_openrouter: Option<bool>,
+    /// Set the private-session process ceiling; `0` clears it.
     pub private_dedicated_process_capacity: Option<u32>,
     /// Replace the workspace external delivery policy.
     pub channels: Option<ChannelsConfig>,

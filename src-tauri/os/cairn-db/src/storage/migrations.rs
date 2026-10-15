@@ -50,6 +50,15 @@ macro_rules! private_executor_preparation_refusals {
     };
 }
 
+/// cairn/4817: the provider sign-in lifecycle journal. Private like the
+/// authorization journal it sits beside: an install's credential history is
+/// its own.
+macro_rules! private_account_credential_events {
+    () => {
+        migration!("0249_account_credential_events")
+    };
+}
+
 /// Immutable ordinary-session launch inputs waiting in runner-local admission.
 macro_rules! private_prepared_ordinary_launches {
     () => {
@@ -108,6 +117,16 @@ macro_rules! shared_tail_issue_resolution_generation {
 macro_rules! shared_tail_condition_evaluation_outcome {
     () => {
         migration!("0239_condition_evaluation_outcome")
+    };
+}
+
+/// cairn/4936: an answered permission whose job could not be continued records
+/// why on the request row, so the refusal is visible where the answer is.
+/// `permission_requests` is project-scoped shared state carried by both
+/// lineages, so the column is written once and composed into both.
+macro_rules! shared_tail_permission_resume_error {
+    () => {
+        migration!("0250_permission_resume_error")
     };
 }
 
@@ -1257,6 +1276,7 @@ macro_rules! team_lineage {
             shared_tail_issue_resolution_generation!(),
             shared_tail_condition_evaluation_outcome!(),
             shared_tail_post_feed_watch_as_fact_clause!(),
+            shared_tail_permission_resume_error!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1509,6 +1529,8 @@ macro_rules! private_lineage {
             private_executor_preparation_refusals!(),
             private_fact_log_wakes!(),
             shared_tail_post_feed_watch_as_fact_clause!(),
+            private_account_credential_events!(),
+            shared_tail_permission_resume_error!(),
         ]
     };
 }
@@ -1772,6 +1794,12 @@ impl TableScope {
 /// its projection. `teams` is the team-only root and has no private counterpart,
 /// so it is intentionally absent here and special-cased in the test.
 pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
+    // Provider sign-in history, beside the authorization journal: who started a
+    // sign-in on this install and how it ended.
+    (
+        "account_credential_events",
+        TableScope::Private(PrivateReason::IdentityCredential),
+    ),
     // Execution offers belong to one runner incarnation, never a team replica.
     (
         "execution_queue",
@@ -3146,6 +3174,8 @@ mod tests {
                 "executor_preparation_refusals",
                 "fact_log_wakes",
                 "post_feed_watch_as_fact_clause",
+                "account_credential_events",
+                "permission_resume_error",
             ]
         );
         assert_eq!(
@@ -6268,6 +6298,9 @@ mod tests {
                 "condition_evaluation_outcome",
                 // cairn/4913: Posts watches become a fact clause in both.
                 "post_feed_watch_as_fact_clause",
+                // cairn/4936: `permission_requests` is shared project state, so
+                // the resume refusal reaches both lineages.
+                "permission_resume_error",
             ]
         );
         assert_eq!(

@@ -172,22 +172,55 @@ mod tests {
     }
 
     #[test]
-    fn try_from_db_recipe_node_condition() {
-        let config =
-            r#"{"conditionType": "ai", "question": "Is this ready?", "ports": ["yes", "no"]}"#;
+    fn try_from_db_recipe_node_programmatic_condition() {
+        let config = r#"{"conditionType": "programmatic", "expression": "plan.risk > 7", "ports": ["yes", "no"]}"#;
         let db = make_db_recipe_node("condition", Some(config));
 
         let node = RecipeNode::try_from(db).unwrap();
 
         assert_eq!(node.node_type, RecipeNodeType::Condition);
-        assert!(node.condition_config.is_some());
+        assert!(node.decision_config.is_none());
         let condition_config = node.condition_config.unwrap();
-        assert_eq!(condition_config.condition_type, ConditionType::Ai);
         assert_eq!(
-            condition_config.question,
-            Some("Is this ready?".to_string())
+            condition_config.expression.as_deref(),
+            Some("plan.risk > 7")
         );
         assert_eq!(condition_config.ports, vec!["yes", "no"]);
+    }
+
+    #[test]
+    fn try_from_db_recipe_node_legacy_ai_condition_is_a_decision() {
+        let config = r#"{"conditionType": "ai", "question": "Is this ready?", "model": "sm", "ports": ["yes", "no"]}"#;
+        let db = make_db_recipe_node("condition", Some(config));
+
+        let node = RecipeNode::try_from(db).unwrap();
+
+        assert_eq!(node.node_type, RecipeNodeType::Decision);
+        assert!(node.condition_config.is_none());
+        assert_eq!(
+            node.decision_config,
+            Some(decision::DecisionNode::port_choice(
+                "Is this ready?",
+                &["yes".to_string(), "no".to_string()],
+                Some("sm".to_string()),
+            ))
+        );
+    }
+
+    #[test]
+    fn try_from_db_recipe_node_decision() {
+        let definition = decision::DecisionNode::port_choice(
+            "Is this ready?",
+            &["yes".to_string(), "no".to_string()],
+            None,
+        );
+        let config = serde_json::to_string(&definition).unwrap();
+        let db = make_db_recipe_node("decision", Some(&config));
+
+        let node = RecipeNode::try_from(db).unwrap();
+
+        assert_eq!(node.node_type, RecipeNodeType::Decision);
+        assert_eq!(node.decision_config, Some(definition));
     }
 
     #[test]

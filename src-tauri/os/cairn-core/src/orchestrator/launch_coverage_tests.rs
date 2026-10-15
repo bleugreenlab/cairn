@@ -596,6 +596,7 @@ fn config(run_id: &str, session_id: &str, model: &str, ephemeral: bool) -> Sessi
         permissions: AgentPermissions::new(Fence::Allow),
         bidirectional: true,
         identity: Some(identity()),
+        account_id: None,
         output_schema: None,
         ambient: false,
         is_ephemeral_call: ephemeral,
@@ -1021,14 +1022,15 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
     recorder.release();
 }
 
-/// A workflow AI condition is the built-in response `builtin:workflow-condition`:
-/// with no account it refuses without launching anything, and with a Claude
-/// subscription it answers through the facet on that account. Both outcomes are
-/// journaled against the execution's project.
+/// A decision is answered only by a decision-capable offer. A subscription-only
+/// workspace refuses with the fixes and launches nothing (no CLI, no Response);
+/// a Decisions provider is asked over the Decisions wire, whole and unstreamed;
+/// and a custom chat server is offered as a logprobs route.
 #[tokio::test(flavor = "multi_thread")]
-async fn workflow_conditions_are_responses_on_a_routed_account() {
+async fn decisions_launch_only_on_a_decision_capable_offer() {
+    use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling};
+    use crate::models::decision::{DecisionNode, MeasuredBy};
     use cairn_llm::subscription::testing::TempHomes;
-    use cairn_workflow::runtime::AiConditionRequest;
 
     let recorder = Arc::new(Recorder::default());
     let mut orch = super::llm::tests::bare_orchestrator().await;
@@ -1045,73 +1047,6 @@ async fn workflow_conditions_are_responses_on_a_routed_account() {
         ..Default::default()
     })
     .unwrap();
-    let repo = tempfile::tempdir().unwrap();
-    orch.db
-        .local
-        .execute(
-            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
-             VALUES ('p1', 'default', 'P', 'P', ?1, 1, 1)",
-            (repo.path().to_string_lossy().to_string(),),
-        )
-        .await
-        .unwrap();
-    orch.db
-        .local
-        .execute(
-            "INSERT INTO executions (id, recipe_id, project_id, status, started_at, seq)
-             VALUES ('e1', 'r', 'p1', 'running', 1, 1)",
-            (),
-        )
-        .await
-        .unwrap();
-    let request = AiConditionRequest {
-        execution_id: "e1".into(),
-        node_id: "n1".into(),
-        node_name: "Touches the database?".into(),
-        question: "Does the issue mention a database?".into(),
-        ports: vec!["yes".into(), "no".into()],
-        context: "{}".into(),
-        model: None,
-    };
-    let journal = || async {
-        crate::storage::list_response_invocations(
-            &orch.db.local,
-            "project:p1",
-            crate::workflow_condition::RESPONSE_ID,
-            10,
-        )
-        .await
-        .unwrap()
-    };
-
-    let refused = crate::workflow_condition::complete_condition(&orch, request.clone())
-        .await
-        .unwrap_err();
-    assert!(
-        refused.starts_with("AI condition 'Touches the database?' can't run: no configured account can serve the 'sm' tier"),
-        "{refused}"
-    );
-    assert!(refused.contains("Settings → Providers"), "{refused}");
-    assert!(
-        recorder.calls.lock().unwrap().is_empty(),
-        "a refusal launches nothing"
-    );
-    let rows = journal().await;
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, "failed");
-    assert_eq!(rows[0].caller_kind, "workflow");
-    assert_eq!(rows[0].caller_run_id, None);
-    assert_eq!(rows[0].project_id.as_deref(), Some("p1"));
-    assert_eq!(
-        rows[0].backend.as_deref(),
-        Some("claude"),
-        "sm resolves to claude"
-    );
-    assert!(rows[0]
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("Settings → Providers")));
-
     let profile = orch
         .add_account(
             ApiProvider::Anthropic,
@@ -1121,85 +1056,93 @@ async fn workflow_conditions_are_responses_on_a_routed_account() {
         )
         .unwrap();
     homes.sign_in(&profile.id);
-    let answer = crate::workflow_condition::complete_condition(&orch, request.clone())
-        .await
-        .unwrap();
-    assert_eq!(answer, CLAUDE_ANSWER);
-    assert!(recorder.saw("claude:open") && recorder.saw("claude:tool_free"));
-    let rows = journal().await;
-    let served = rows
-        .iter()
-        .find(|row| row.status == "ok")
-        .expect("an ok row");
-    assert_eq!(served.backend.as_deref(), Some("claude"));
-    assert_eq!(served.account_id.as_deref(), Some(profile.id.as_str()));
-    assert_eq!(
-        served.caller_label.as_deref(),
-        Some("condition 'Touches the database?' in execution e1")
+    let decision = DecisionNode::port_choice(
+        "Does the issue mention a database?",
+        &["yes".to_string(), "no".to_string()],
+        None,
     );
-    assert!(served
-        .rendered_prompt
-        .contains("Answer with EXACTLY one word from this list: yes, no"));
 
-    // An exact pin the discovery catalog doesn't list (it lists only the
-    // Claude aliases) still runs: eligibility is the account, not the catalog.
-    let versioned = "claude-sonnet-4-5-20250929";
-    let pinned = crate::workflow_condition::complete_condition(
-        &orch,
-        AiConditionRequest {
-            model: Some(versioned.into()),
-            ..request.clone()
-        },
-    )
-    .await
-    .unwrap();
-    assert_eq!(pinned, CLAUDE_ANSWER);
-    assert!(journal()
-        .await
-        .iter()
-        .any(|row| row.status == "ok" && row.model.as_deref() == Some(versioned)));
+    let refused = orch.decide(None, &decision, "{}".into()).await.unwrap_err();
+    assert!(
+        refused.starts_with("No decision-capable model is configured"),
+        "{refused}"
+    );
+    assert!(
+        refused.contains("Decisions API key") && refused.contains("logprobs"),
+        "the refusal names both fixes: {refused}"
+    );
+    assert!(
+        recorder.calls.lock().unwrap().is_empty(),
+        "a signed-in subscription is not a decision offer; nothing launches"
+    );
 
-    // Removing Claude stops every Claude selection even though the signed-in
-    // account remains: the exact pin and the explicit `claude/sm` refuse, and
-    // the default tier moves to the one provider left (OpenRouter, with no
-    // key) and refuses there. None launches, and each is journaled.
-    orch.update_settings(crate::models::UpdateSettings {
-        enabled_providers: Some(vec!["openrouter".to_string()]),
-        tier_defaults: Some(
-            ["sm", "md", "lg"]
-                .into_iter()
-                .map(|tier| (tier.to_string(), "openrouter".to_string()))
-                .collect(),
-        ),
-        ..Default::default()
-    })
-    .unwrap();
-    let launches = recorder.calls.lock().unwrap().len();
-    for model in [Some(versioned), Some("claude/sm"), None] {
-        let before = journal().await.len();
-        let refused = crate::workflow_condition::complete_condition(
-            &orch,
-            AiConditionRequest {
-                model: model.map(str::to_string),
-                ..request.clone()
-            },
+    let jev = orch
+        .add_custom_provider(
+            "TypeSafe".into(),
+            ProviderAuth::custom_endpoint(
+                "https://ai-gateway.vercel.sh/v1",
+                CustomProtocol::Decisions,
+                Some("gateway-key"),
+                &[],
+                CustomModelPolicy::Explicit {
+                    ids: vec!["typesafe-ai/jev".into()],
+                },
+                CustomSampling::default(),
+                1,
+            )
+            .unwrap(),
+            None,
         )
-        .await
-        .unwrap_err();
-        assert!(
-            refused.contains("can't run") && refused.contains("Settings → Providers"),
-            "{model:?}: {refused}"
-        );
-        let rows = journal().await;
-        assert_eq!(rows.len(), before + 1, "{model:?} is journaled");
-        let row = rows.iter().max_by_key(|row| row.seq).unwrap();
-        assert_eq!(row.status, "failed", "{model:?}");
-        assert!(row.error.is_some(), "{model:?}");
-    }
+        .unwrap();
+    let jev_key = cairn_llm::types::catalog::custom_key(&jev.id);
+    orch.refresh_provider_model_catalog_blocking(&jev_key);
+
+    let offer = orch.decision_offer(None, &decision).unwrap();
     assert_eq!(
-        recorder.calls.lock().unwrap().len(),
-        launches,
-        "a disabled provider launches nothing"
+        (offer.provider.as_str(), offer.model.as_str(), offer.method),
+        (jev_key.as_str(), "typesafe-ai/jev", MeasuredBy::Native)
+    );
+    let failed = orch.decide(None, &decision, "{}".into()).await.unwrap_err();
+    assert!(failed.contains("recorded, not sent"), "{failed}");
+    assert_eq!(
+        *recorder.calls.lock().unwrap(),
+        [format!("complete:decisions:{jev_key}:whole")],
+        "one whole POST on the Decisions wire"
+    );
+
+    let spark = orch
+        .add_custom_provider(
+            "Spark".into(),
+            ProviderAuth::custom_endpoint(
+                "http://10.10.10.83:8000",
+                CustomProtocol::OpenAiChatCompletions,
+                None,
+                &[],
+                CustomModelPolicy::Explicit {
+                    ids: vec!["gemma4-26b".into()],
+                },
+                CustomSampling::default(),
+                4_096,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+    let spark_key = cairn_llm::types::catalog::custom_key(&spark.id);
+    orch.refresh_provider_model_catalog_blocking(&spark_key);
+    let pinned = DecisionNode {
+        model: Some("gemma4-26b".into()),
+        ..decision.clone()
+    };
+    let offer = orch.decision_offer(None, &pinned).unwrap();
+    assert_eq!(
+        (offer.provider.as_str(), offer.method),
+        (spark_key.as_str(), MeasuredBy::Logprobs)
+    );
+    assert_eq!(
+        orch.decision_offer(None, &decision).unwrap().method,
+        MeasuredBy::Native,
+        "unset prefers a native offer over a logprobs one"
     );
     assert_eq!(session_rows(&orch).await, 0);
 

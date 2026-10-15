@@ -18,8 +18,9 @@ use cairn_llm::types::catalog::{claude_context_window, ClaudeContextOptIn};
 use cairn_llm::types::usage::{ProviderUsageScope, ProviderUsageSnapshot, ProviderUsageWindow};
 use cairn_llm::wire::claude_stream::{
     extract_tool_start, message_start_usage, parse_thinking_tokens_estimate,
-    result_is_rate_limited, stderr_reports_unknown_session, ClaudeEvent, ControlResponseInner,
-    DeltaContent, RateLimitInfo, StreamEventInner, StreamEvidence, Usage,
+    result_is_rate_limited, stderr_reports_unknown_session, terminal_provider_depletion,
+    ClaudeEvent, ControlResponseInner, DeltaContent, ProviderDepletion, RateLimitInfo,
+    StreamEventInner, StreamEvidence, Usage,
 };
 use cairn_models::ContextTokenState;
 use cairn_platform::services::emitter::EventEmitter;
@@ -46,6 +47,19 @@ pub trait ClaudeHost: Send + Sync {
     fn initialized(&self);
     fn capture_output(&self, output: serde_json::Value);
     fn rate_limit(&self, snapshot: ProviderUsageSnapshot, info: Option<&RateLimitInfo>) -> bool;
+    /// The turn ended because its account is depleted. Called at most once per
+    /// turn and BEFORE that turn's completion is applied, so account health and
+    /// any replacement pin are durable before completion can dispatch queued
+    /// work. `block_recorded` is true when this turn's blocking
+    /// `rate_limit_event` already persisted the provider's own block, which a
+    /// reset-less terminal quarantine must not overwrite. Returns whether the
+    /// host persisted the account's health.
+    fn provider_depleted(
+        &self,
+        depletion: ProviderDepletion,
+        snapshot: ProviderUsageSnapshot,
+        block_recorded: bool,
+    ) -> bool;
     fn context_snapshot(&self, snapshot: ContextTokenState);
     fn complete(&self, outcome: ClaudeTurnOutcome, context: ClaudeTurnContext);
     fn artifact_handoff(&self);
@@ -67,6 +81,12 @@ pub trait ClaudeHost: Send + Sync {
 pub struct ClaudeEof {
     pub evidence: StreamEvidence,
     pub persisted_rate_limit_quarantine: bool,
+    /// The depletion classified during the last turn, if any.
+    pub pending_depletion: Option<ProviderDepletion>,
+    /// Whether [`ClaudeHost::provider_depleted`] already handled that turn.
+    pub depletion_handled: bool,
+    /// Whether the last turn's blocking `rate_limit_event` persisted a block.
+    pub turn_block_recorded: bool,
     pub terminal_tool_called: bool,
     pub backend_failure: Option<BackendFailure>,
 }
@@ -1213,6 +1233,12 @@ impl ClaudeRuntime {
         // persisted a quarantine is the host's answer, not stream evidence.
         let mut evidence = StreamEvidence::default();
         let mut persisted_rate_limit_quarantine = false;
+        // The CLI reports credit exhaustion as a structured assistant error and
+        // only then a generic error result, so the classification is carried to
+        // the turn's Result. A new user message starts a new turn.
+        let mut pending_depletion: Option<ProviderDepletion> = None;
+        let mut depletion_handled = false;
+        let mut turn_block_recorded = false;
 
         log::trace!("reader_thread: about to read lines");
         for line_result in stdout.lines() {
@@ -1264,6 +1290,14 @@ impl ClaudeRuntime {
                         first_event_logged = true;
                     }
                     evidence.observe(&event);
+                    if matches!(&event, ClaudeEvent::User { .. }) {
+                        pending_depletion = None;
+                        depletion_handled = false;
+                        turn_block_recorded = false;
+                    }
+                    if let Some(depletion) = event.provider_depletion() {
+                        pending_depletion = Some(depletion);
+                    }
                     if let Ok(mut watchdog) = progress_watchdog.lock() {
                         let now = Instant::now();
                         let current_turn = host.process_state.get_current_turn_id(run_id);
@@ -1465,6 +1499,7 @@ impl ClaudeRuntime {
                         let snapshot = claude_rate_limit_snapshot(rate_limit_info);
                         if host.host.rate_limit(snapshot, Some(rate_limit_info)) {
                             persisted_rate_limit_quarantine = true;
+                            turn_block_recorded = true;
                         }
                         continue;
                     }
@@ -2079,19 +2114,30 @@ impl ClaudeRuntime {
 
                     // Check for turn completion
                     if let ClaudeEvent::Result { is_error, data, .. } = &event {
-                        let terminal_rate_limit = *is_error && result_is_rate_limited(data);
+                        let depletion =
+                            terminal_provider_depletion(*is_error, data, pending_depletion);
+                        let terminal_rate_limit = depletion.is_some();
                         if terminal_rate_limit {
                             evidence.record_terminal_rate_limit();
-                            let snapshot = terminal_rate_limit_snapshot();
-                            if host.host.rate_limit(snapshot, None) {
-                                persisted_rate_limit_quarantine = true;
-                            }
                         }
                         // The terminal-tool boundary interrupt's ack is the next
                         // Result after we sent it. Consume the expectation on any
                         // Result so it can never leak into a later turn's outcome.
                         let ack_pending = terminal_interrupt_ack_pending;
                         terminal_interrupt_ack_pending = false;
+                        // Before completion: settling the turn can flush a queued
+                        // reply into a new launch, which must already see the
+                        // depleted account's health and the replacement pin.
+                        if let Some(depletion) = depletion.filter(|_| !depletion_handled) {
+                            if host.host.provider_depleted(
+                                depletion,
+                                terminal_rate_limit_snapshot(),
+                                turn_block_recorded,
+                            ) {
+                                persisted_rate_limit_quarantine = true;
+                            }
+                            depletion_handled = true;
+                        }
                         host.host.complete(
                             claude_result_outcome(*is_error, data),
                             ClaudeTurnContext {
@@ -2162,6 +2208,9 @@ impl ClaudeRuntime {
         host.host.eof(ClaudeEof {
             evidence,
             persisted_rate_limit_quarantine,
+            pending_depletion,
+            depletion_handled,
+            turn_block_recorded,
             terminal_tool_called: terminal_tool_flag.load(Ordering::Acquire),
             backend_failure: stderr_watch.and_then(StderrWatch::settle),
         });
@@ -2435,5 +2484,154 @@ mod startup_inventory_tests {
         assert!(!error.contains(['\n', '\r', '\t']));
         assert!(error.contains("tool\\nforged\\r\\tline"));
         assert!(error.contains("MCP failed:"));
+    }
+}
+
+#[cfg(test)]
+mod depletion_order_tests {
+    //! The reader must hand a turn's depletion to the host before it completes
+    //! that turn: completion can flush a queued reply into a new launch, which
+    //! has to see the depleted account's health and the replacement pin.
+    use super::*;
+    use crate::transcripts::stream_store::FinalizedStream;
+    use crate::transcripts::TranscriptHost;
+
+    #[derive(Default)]
+    struct RecordingHost {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingHost {
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl TranscriptHost for RecordingHost {
+        fn insert_event(&self, _event: EventInsert) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn finalize_stream(
+            &self,
+            _stream_id: &str,
+            _version: i32,
+            _event: Option<TranscriptEvent>,
+            _counts: TokenCounts,
+        ) -> Result<FinalizedStream, String> {
+            Err("no streaming in this script".to_string())
+        }
+        fn streams_changed(&self, _action: &str) {}
+        fn event_committed(&self, _id: &str, _kind: &str, _data: &str, _counts: TokenCounts) {}
+    }
+
+    impl ClaudeHost for RecordingHost {
+        fn transcripts(&self) -> &dyn TranscriptHost {
+            self
+        }
+        fn stop_process(&self) {}
+        fn credential_rejected(&self) {}
+        fn credential_acknowledged(&self, _generation: u64) {}
+        fn error(&self, _message: &str) {}
+        fn startup_rejected(&self, _message: &str) {}
+        fn initialized(&self) {}
+        fn capture_output(&self, _output: serde_json::Value) {}
+        fn rate_limit(
+            &self,
+            _snapshot: ProviderUsageSnapshot,
+            info: Option<&RateLimitInfo>,
+        ) -> bool {
+            let blocking = info.is_none_or(|info| info.is_blocking());
+            self.record(format!("rate_limit:{blocking}"));
+            blocking
+        }
+        fn provider_depleted(
+            &self,
+            depletion: ProviderDepletion,
+            _snapshot: ProviderUsageSnapshot,
+            block_recorded: bool,
+        ) -> bool {
+            self.record(format!("depleted:{depletion:?}:{block_recorded}"));
+            true
+        }
+        fn context_snapshot(&self, _snapshot: ContextTokenState) {}
+        fn complete(&self, _outcome: ClaudeTurnOutcome, context: ClaudeTurnContext) {
+            self.record(format!("complete:{}", context.rate_limited));
+        }
+        fn artifact_handoff(&self) {}
+        fn interrupt(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn recover_watchdog(
+            &self,
+            _identity: &crate::runs::watchdog_ledger::WatchdogIdentity,
+            _now: i64,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn eof(&self, report: ClaudeEof) {
+            self.record(format!("eof:handled={}", report.depletion_handled));
+        }
+    }
+
+    async fn run_script(lines: &[&str]) -> Vec<String> {
+        let db = Arc::new(cairn_db::storage::migrated_test_db("claude-depletion-order.db").await);
+        let host = Arc::new(RecordingHost::default());
+        let runtime = ClaudeRuntime {
+            process_state: Arc::new(AgentProcessState::default()),
+            emitter: Arc::new(cairn_platform::services::emitter::CapturingEmitter::default()),
+            boot_id: "boot".to_string(),
+            host: host.clone(),
+        };
+        let stdout = format!("{}\n", lines.join("\n"));
+        std::thread::spawn(move || {
+            ClaudeRuntime::reader_thread(
+                &runtime,
+                "run-depletion",
+                None,
+                false,
+                Box::new(std::io::Cursor::new(stdout.into_bytes())),
+                None,
+                db,
+            );
+        })
+        .join()
+        .expect("reader thread");
+        let calls = host.calls.lock().unwrap().clone();
+        calls
+    }
+
+    #[tokio::test]
+    async fn credit_depletion_is_reported_before_the_turn_completes() {
+        let calls = run_script(&[
+            r#"{"type":"assistant","uuid":"a1","session_id":"s1","is_api_error_message":true,"api_error_status":429,"error_details":"credits_required","message":{"role":"assistant","content":[{"type":"text","text":"Manage credits with /usage-credits"}]}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"s1","is_error":true,"result":"You're out of usage credits."}"#,
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            [
+                "depleted:Credits:false",
+                "complete:true",
+                "eof:handled=true"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turns_provider_block_is_passed_to_the_terminal_depletion() {
+        let calls = run_script(&[
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}"#,
+            r#"{"type":"result","subtype":"success","session_id":"s1","is_error":true,"api_error_status":429}"#,
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            [
+                "rate_limit:true",
+                "depleted:RollingWindow { resets_at: None }:true",
+                "complete:true",
+                "eof:handled=true",
+            ]
+        );
     }
 }

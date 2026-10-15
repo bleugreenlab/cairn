@@ -180,6 +180,36 @@ pub struct ChatResponse {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatChoice {
     pub message: ChatMessage,
+    /// Per-token log-probabilities, present only when the request asked for
+    /// them (`logprobs: true`) and the server serves them.
+    #[serde(default)]
+    pub logprobs: Option<ChoiceLogprobs>,
+}
+
+/// A choice's `logprobs` object.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ChoiceLogprobs {
+    /// One entry per generated token, in order. Servers send `null` when no
+    /// token was generated.
+    #[serde(default)]
+    pub content: Option<Vec<TokenLogprob>>,
+}
+
+/// One generated token's log-probability and its most likely alternatives.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenLogprob {
+    pub token: String,
+    pub logprob: f64,
+    /// The `top_logprobs` most likely tokens at this position, the generated
+    /// one among them.
+    #[serde(default)]
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopLogprob {
+    pub token: String,
+    pub logprob: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -516,6 +546,8 @@ impl StreamingAggregate {
                     reasoning_details,
                     reasoning,
                 },
+                // A streamed turn never asks for logprobs.
+                logprobs: None,
             }],
             usage: self.usage,
             streamed_text,

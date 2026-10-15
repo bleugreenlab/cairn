@@ -3,10 +3,7 @@ use super::append_payload;
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::models::{CreatePost, CreatePostComment};
 use crate::orchestrator::Orchestrator;
-use cairn_common::identity::{
-    Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
-    VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
-};
+use cairn_common::identity::{AppearanceSnapshot, PrincipalRef};
 use cairn_common::uri::CairnResource;
 
 fn content<'a>(
@@ -66,42 +63,16 @@ async fn identity(
     let agent = crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
         .await
         .map_err(|error| build_failure(index, item, error))?;
-    let live_run_id = agent.run_id.as_str();
     let job_id = agent.job_id.clone();
-    let node = agent.home;
-    let home = cairn_common::uri::parse_uri(&node)
+    let home = cairn_common::uri::parse_uri(&agent.home)
         .ok_or_else(|| build_failure(index, item, "Authenticated run has an invalid home URI"))?;
     let project = home
         .project_key()
         .ok_or_else(|| build_failure(index, item, "Authenticated run has no project-scoped home"))?
         .to_string();
-    let author = PrincipalRef::Agent {
-        node: node.clone(),
-        run_id: Some(live_run_id.to_string()),
-    };
-    let now = orch.services.clock.now();
-    let verification = VerificationRecord::new(
-        VerificationMethod::NodeSession,
-        VerificationStatus::Verified,
-        None,
-        None,
-        Some(live_run_id.to_string()),
-        None,
-        VerificationStrength::new("session-bound")
-            .map_err(|error| build_failure(index, item, error.to_string()))?,
-        now,
-    )
-    .map_err(|error| build_failure(index, item, error.to_string()))?;
-    let evidence = AppearanceEvidence::new(
-        AppearanceTransport::ResourcePatch,
-        Address::Resource { node },
-        verification,
-        now,
-        None,
-    )
-    .map_err(|error| build_failure(index, item, error.to_string()))?;
-    let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None)
-        .map_err(|error| build_failure(index, item, error.to_string()))?;
+    let (author, appearance) = agent
+        .appearance(orch.services.clock.now())
+        .map_err(|error| build_failure(index, item, error))?;
     Ok((author, appearance, project, job_id))
 }
 

@@ -1,4 +1,3 @@
-use crate::db_records::DbRecipeNode;
 use crate::models::{
     AgentGitConfig, AgentNodeConfig, BranchMode, DelegatedOutputContract, DelegatedStatus,
     DelegatedWorkPacket, ExecutionSnapshot, NodePosition, RecipeEdge, RecipeEdgeType, RecipeNode,
@@ -12,87 +11,9 @@ mod delegation;
 
 use delegation::*;
 
-use cairn_workflow::effects::dag::extract_condition_spec;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn make_node(config: Option<&str>) -> DbRecipeNode {
-        DbRecipeNode {
-            id: "cond-1".into(),
-            recipe_id: "r-1".into(),
-            node_type: "condition".into(),
-            name: "Test Condition".into(),
-            position_x: 0.0,
-            position_y: 0.0,
-            config: config.map(|s| s.to_string()),
-            created_at: 0,
-            updated_at: 0,
-            parent_id: None,
-        }
-    }
-
-    #[test]
-    fn extract_condition_spec_full_config() {
-        let node = make_node(Some(
-            r#"{
-            "conditionType": "llm",
-            "expression": "x > 0",
-            "question": "Is the value positive?",
-            "ports": ["yes", "no"],
-            "errorHandling": "fail_closed"
-        }"#,
-        ));
-        let spec = extract_condition_spec(&node);
-
-        assert_eq!(spec.condition_type, "llm");
-        assert_eq!(spec.expression.as_deref(), Some("x > 0"));
-        assert_eq!(spec.question.as_deref(), Some("Is the value positive?"));
-        assert_eq!(spec.ports, vec!["yes", "no"]);
-        assert_eq!(spec.error_handling, "fail_closed");
-    }
-
-    #[test]
-    fn extract_condition_spec_defaults_on_missing_fields() {
-        let node = make_node(Some("{}"));
-        let spec = extract_condition_spec(&node);
-
-        assert_eq!(spec.condition_type, "programmatic");
-        assert!(spec.expression.is_none());
-        assert!(spec.question.is_none());
-        assert!(spec.ports.is_empty());
-        assert_eq!(spec.error_handling, "use_default");
-    }
-
-    #[test]
-    fn extract_condition_spec_defaults_on_no_config() {
-        let node = make_node(None);
-        let spec = extract_condition_spec(&node);
-
-        assert_eq!(spec.condition_type, "programmatic");
-        assert!(spec.expression.is_none());
-        assert!(spec.question.is_none());
-        assert!(spec.ports.is_empty());
-        assert_eq!(spec.error_handling, "use_default");
-    }
-
-    #[test]
-    fn extract_condition_spec_invalid_json_uses_defaults() {
-        let node = make_node(Some("not valid json"));
-        let spec = extract_condition_spec(&node);
-
-        assert_eq!(spec.condition_type, "programmatic");
-        assert_eq!(spec.error_handling, "use_default");
-    }
-
-    #[test]
-    fn extract_condition_spec_ignores_non_string_ports() {
-        let node = make_node(Some(r#"{"ports": ["yes", 42, "no", null]}"#));
-        let spec = extract_condition_spec(&node);
-
-        assert_eq!(spec.ports, vec!["yes", "no"]);
-    }
 
     // ---- reparent_delegated_jobs disambiguation -------------------------------
 
@@ -390,6 +311,7 @@ mod tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         };
         let builder = RecipeNode {
@@ -408,6 +330,7 @@ mod tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         };
         let edge = RecipeEdge {

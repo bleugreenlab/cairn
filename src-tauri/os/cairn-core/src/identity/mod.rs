@@ -336,6 +336,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            depleted: None,
             captured_at,
         });
         account
@@ -435,6 +436,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            depleted: None,
             captured_at,
         });
         account

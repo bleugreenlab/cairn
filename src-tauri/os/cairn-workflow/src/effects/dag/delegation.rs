@@ -111,6 +111,7 @@ fn delegated_agent_node(agent_id: String, packet: &DelegatedWorkPacket) -> Recip
         checkpoint_config: None,
         artifact_config: None,
         condition_config: None,
+        decision_config: None,
         context_config: None,
     }
 }
@@ -178,6 +179,7 @@ pub fn expand_delegated_packets(
                 checkpoint_config: None,
                 artifact_config: None,
                 condition_config: None,
+                decision_config: None,
                 context_config: None,
             });
         }
@@ -214,6 +216,7 @@ pub fn expand_delegated_packets(
                 checkpoint_config: None,
                 artifact_config: None,
                 condition_config: None,
+                decision_config: None,
                 context_config: Some(ContextNodeConfig {
                     content: format!("{}{}{}", packet_view.problem_statement, acceptance, policy),
                 }),

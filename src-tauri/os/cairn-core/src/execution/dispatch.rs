@@ -9,9 +9,7 @@ use crate::execution::triggers::{
     is_event_triggered,
 };
 use crate::execution::Initiator;
-use crate::models::{
-    ExecutionSnapshot, JobEndedEvent, SkillCalledEvent, TriggerEvent, TriggerType,
-};
+use crate::models::{JobEndedEvent, SkillCalledEvent, TriggerEvent, TriggerType};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_common::ids;
@@ -469,7 +467,7 @@ async fn load_execution_dispatch_context_conn(
     let skip_event_triggered = row
         .opt_text(0)?
         .as_deref()
-        .and_then(|json| serde_json::from_str::<ExecutionSnapshot>(json).ok())
+        .and_then(|json| crate::config::snapshot_migrate::load(json).ok())
         .is_some_and(|snapshot| is_event_triggered(&snapshot));
     let exec_seq = row.opt_i64(1)?.map(|value| value as i32);
     let sub = row.opt_text(2)?;

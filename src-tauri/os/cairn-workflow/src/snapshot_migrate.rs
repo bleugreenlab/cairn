@@ -19,10 +19,75 @@ use cairn_llm_types::catalog as providers;
 /// `ExecutionSnapshot`: `serde_json::from_str` followed by [`migrate_on_read`],
 /// exactly the semantics the old `ExecutionSnapshot::from_json` carried.
 pub fn load(json: &str) -> Result<ExecutionSnapshot, String> {
-    let mut snapshot: ExecutionSnapshot =
+    let mut value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
+    migrate_ai_conditions(&mut value);
+    let mut snapshot: ExecutionSnapshot = serde_json::from_value(value)
+        .map_err(|e| format!("Failed to deserialize snapshot: {}", e))?;
     migrate_on_read(&mut snapshot);
+    // A frozen recipe drawn in the old editor leaves its conditions by
+    // `port-<name>` handles, which the engine would never route.
+    crate::models::normalize_legacy_port_handles(
+        &snapshot.recipe.nodes,
+        &mut snapshot.recipe.edges,
+    );
     Ok(snapshot)
+}
+
+/// Rewrite a frozen `ai` condition node into the decision node it always
+/// was: one `choice` question whose options are its ports.
+///
+/// Done on the JSON because the typed node no longer has the fields an `ai`
+/// condition carried; deserializing first would drop the question and leave a
+/// programmatic condition with no expression.
+fn migrate_ai_conditions(snapshot: &mut serde_json::Value) {
+    use crate::models::decision::DecisionNode;
+    use serde_json::Value;
+
+    let Some(nodes) = snapshot
+        .pointer_mut("/recipe/nodes")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for node in nodes {
+        if node.get("nodeType").and_then(Value::as_str) != Some("condition") {
+            continue;
+        }
+        let Some(config) = node.get("conditionConfig") else {
+            continue;
+        };
+        if !crate::models::is_legacy_ai_condition(
+            config.get("conditionType").and_then(Value::as_str),
+        ) {
+            continue;
+        }
+        let text = |key: &str| config.get(key).and_then(Value::as_str).map(str::to_string);
+        let ports: Vec<String> = config
+            .get("ports")
+            .and_then(Value::as_array)
+            .map(|ports| {
+                ports
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let decision = DecisionNode::port_choice(
+            text("question").as_deref().unwrap_or_default(),
+            &ports,
+            text("model"),
+        );
+        if let Some(object) = node.as_object_mut() {
+            object.remove("conditionConfig");
+            object.insert("nodeType".into(), Value::from("decision"));
+            object.insert(
+                "decisionConfig".into(),
+                serde_json::to_value(decision).unwrap_or(Value::Null),
+            );
+        }
+    }
 }
 
 /// Fold legacy per-agent flat `model`/`resolved_backend` (and frozen `presets`)
@@ -191,5 +256,44 @@ mod tests {
             .unwrap();
         assert_eq!(selection.backend, "codex");
         assert_eq!(selection.model.as_str(), "gpt-5.3-codex");
+    }
+
+    #[test]
+    fn a_frozen_ai_condition_routes_by_its_ports_after_migration() {
+        let json = r#"{
+            "recipe": {
+                "id": "r-1", "name": "R", "description": null, "trigger": "manual",
+                "nodes": [{
+                    "id": "db", "nodeType": "condition", "name": "Touches the DB?",
+                    "position": {"x": 0, "y": 0},
+                    "conditionConfig": {
+                        "conditionType": "ai", "question": "Does it touch the DB?",
+                        "ports": ["yes", "no"], "onError": "block"
+                    }
+                }],
+                "edges": [
+                    {"id": "e1", "edgeType": "control", "sourceNodeId": "db",
+                     "sourceHandle": "port-yes", "targetNodeId": "a", "targetHandle": "control-in"},
+                    {"id": "e2", "edgeType": "control", "sourceNodeId": "db",
+                     "sourceHandle": "no", "targetNodeId": "b", "targetHandle": "control-in"}
+                ]
+            },
+            "agents": {},
+            "skills": {},
+            "triggerContext": {"issueId": null, "projectId": "p-1", "triggerType": "manual"},
+            "createdAt": 1
+        }"#;
+
+        let snapshot = load(json).unwrap();
+        let node = &snapshot.recipe.nodes[0];
+        assert_eq!(node.node_type, crate::models::RecipeNodeType::Decision);
+        assert_eq!(node.routing_ports(), vec!["yes", "no"]);
+        let handles: Vec<&str> = snapshot
+            .recipe
+            .edges
+            .iter()
+            .map(|edge| edge.source_handle.as_str())
+            .collect();
+        assert_eq!(handles, vec!["yes", "no"]);
     }
 }

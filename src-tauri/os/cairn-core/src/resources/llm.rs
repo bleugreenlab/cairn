@@ -22,6 +22,9 @@ use serde_json::Value;
 use std::fmt::Write as _;
 
 use super::common::find_query_value;
+use crate::orchestrator::account_events::{CredentialEvent, CredentialEventKind};
+use cairn_common::identity::PrincipalRef;
+use cairn_llm::subscription::PendingSignIn;
 
 const INDEX: &[(&str, &str)] = &[
     (
@@ -422,7 +425,7 @@ fn window_line(window: &Value, captured_at: Option<i64>, now: i64) -> String {
     line
 }
 
-fn account_block(account: &Value, now: i64, out: &mut String) {
+fn account_block(account: &Value, now: i64, pending: &[PendingSignIn], out: &mut String) {
     let label = account["label"].as_str().unwrap_or("(unnamed)");
     let id = account["id"].as_str().unwrap_or_default();
     let _ = write!(out, "- **{label}** `{id}` — {}", credential_kind(account));
@@ -467,9 +470,24 @@ fn account_block(account: &Value, now: i64, out: &mut String) {
             let _ = writeln!(out, "  - {}", window_line(window, captured, now));
         }
     }
+    let id = account["id"].as_str();
+    if let Some(sign_in) = pending
+        .iter()
+        .find(|sign_in| sign_in.account_id.as_deref() == id)
+    {
+        let _ = writeln!(
+            out,
+            "  - sign-in in progress since {}",
+            when(sign_in.started_at)
+        );
+    }
 }
 
-pub(crate) fn render_accounts(llm: &dyn Llm, params: &[QueryParam]) -> String {
+pub(crate) fn render_accounts(
+    llm: &dyn Llm,
+    params: &[QueryParam],
+    pending: &[PendingSignIn],
+) -> String {
     const URI: &str = "cairn://llm/accounts";
     if let Some(error) = unsupported(URI, params, &["provider"]) {
         return error;
@@ -482,7 +500,7 @@ pub(crate) fn render_accounts(llm: &dyn Llm, params: &[QueryParam]) -> String {
     let only = find_query_value(params, "provider");
     let now = chrono::Utc::now().timestamp();
     let mut out = String::from(
-        "# LLM accounts\n\nGrouped by installed provider, in priority order. A credential is described, never shown. To add or re-authenticate an account use Settings → Providers, or `cairn auth login claude` for a managed Claude account.\n",
+        "# LLM accounts\n\nGrouped by installed provider, in priority order. A credential is described, never shown. Append {provider: claude|codex} here to start a subscription sign-in, or use Settings → Providers, or `cairn auth login claude` for a managed Claude account.\n",
     );
     let mut placed = vec![false; accounts.len()];
     let mut shown = 0;
@@ -502,7 +520,17 @@ pub(crate) fn render_accounts(llm: &dyn Llm, params: &[QueryParam]) -> String {
             let _ = writeln!(out, "No account. {}", provider.descriptor.setup_requirement);
         }
         for index in mine {
-            account_block(&accounts[index], now, &mut out);
+            account_block(&accounts[index], now, pending, &mut out);
+        }
+        // A new Codex account has no row until its sign-in completes.
+        for sign_in in pending.iter().filter(|sign_in| {
+            sign_in.account_id.is_none() && sign_in.provider.backend() == provider.descriptor.key
+        }) {
+            let _ = writeln!(
+                out,
+                "- Sign-in in progress since {}; the account appears here when it completes.",
+                when(sign_in.started_at)
+            );
         }
     }
     if let Some(key) = only {
@@ -520,13 +548,61 @@ pub(crate) fn render_accounts(llm: &dyn Llm, params: &[QueryParam]) -> String {
     if !others.is_empty() {
         out.push_str("\n## Serving no installed provider\n");
         for account in others {
-            account_block(account, now, &mut out);
+            account_block(account, now, pending, &mut out);
         }
     }
     out
 }
 
-pub(crate) fn render_account(llm: &dyn Llm, id: &str) -> String {
+/// Who started a sign-in, as a reader may see it. Never the appearance
+/// evidence behind it.
+fn initiator_line(initiator: Option<&PrincipalRef>) -> String {
+    match initiator {
+        Some(PrincipalRef::Agent { node, .. }) => node.clone(),
+        Some(PrincipalRef::Machine { .. }) => "operator via desktop".to_string(),
+        Some(PrincipalRef::Human { .. }) => "signed-in operator".to_string(),
+        Some(PrincipalRef::External { .. }) => "external principal".to_string(),
+        None => "unattributed".to_string(),
+    }
+}
+
+fn history_line(event: &CredentialEvent) -> String {
+    let at = when(event.occurred_at);
+    match event.kind {
+        CredentialEventKind::Started => format!(
+            "{at} — {} sign-in started by {}",
+            event.provider,
+            initiator_line(event.initiator.as_ref())
+        ),
+        CredentialEventKind::Completed => {
+            let mut line = format!("{at} — completed");
+            if let Some(email) = &event.email {
+                let _ = write!(line, " as {email}");
+            }
+            if let Some(plan) = &event.plan {
+                let _ = write!(line, " ({plan})");
+            }
+            line
+        }
+        CredentialEventKind::Failed => format!(
+            "{at} — failed: {}",
+            event
+                .failure_kind
+                .map(|kind| kind.as_str().replace('_', " "))
+                .unwrap_or_else(|| "other".to_string())
+        ),
+        CredentialEventKind::Cancelled => format!("{at} — cancelled"),
+    }
+}
+
+/// What an account's page shows about sign-in beyond the account itself.
+#[derive(Debug)]
+pub(crate) struct AccountSignIns {
+    pub pending: Vec<PendingSignIn>,
+    pub history: Result<Vec<CredentialEvent>, String>,
+}
+
+pub(crate) fn render_account(llm: &dyn Llm, id: &str, sign_ins: &AccountSignIns) -> String {
     let accounts = match sorted_accounts(llm, &LlmScope::workspace()) {
         Ok(accounts) => accounts,
         Err(error) => return format!("Could not read accounts: {error}"),
@@ -544,7 +620,7 @@ pub(crate) fn render_account(llm: &dyn Llm, id: &str) -> String {
         "# LLM account {}\n\n",
         account["label"].as_str().unwrap_or(id)
     );
-    account_block(account, now, &mut out);
+    account_block(account, now, &sign_ins.pending, &mut out);
     let serves: Vec<&str> = account["compatibleBackends"]
         .as_array()
         .into_iter()
@@ -554,7 +630,36 @@ pub(crate) fn render_account(llm: &dyn Llm, id: &str) -> String {
     if !serves.is_empty() {
         let _ = writeln!(out, "\nServes: {}", serves.join(", "));
     }
-    out.push_str("\nRead-only here: sign-in and re-authentication happen in Settings → Providers, or with `cairn auth login claude --account <id>` for a managed Claude account.\n");
+
+    out.push_str("\n## Sign-in\n");
+    if sign_ins
+        .pending
+        .iter()
+        .any(|sign_in| sign_in.account_id.as_deref() == Some(id))
+    {
+        out.push_str("A sign-in is in progress: finish it in the browser, patch {action:\"submit_code\", code} with the code#state Claude's manual path shows, or patch {action:\"cancel_sign_in\"} to end it.\n");
+    }
+    match &sign_ins.history {
+        Ok(history) if history.is_empty() => {
+            out.push_str("No sign-in recorded for this account.\n");
+        }
+        Ok(history) => {
+            for event in history {
+                let _ = writeln!(out, "- {}", history_line(event));
+            }
+        }
+        Err(error) => {
+            let _ = writeln!(out, "Sign-in history unavailable: {error}");
+        }
+    }
+    if matches!(
+        account["authType"].as_str(),
+        Some("claude_profile" | "oauth_token")
+    ) {
+        out.push_str("\nRe-authenticate with patch {action:\"sign_in\"} (needs the `workspace/default/settings/accounts:write` grant), in Settings → Providers, or with `cairn auth login claude --account <id>` for a managed Claude account.\n");
+    } else {
+        out.push_str("\nThis credential is not a subscription sign-in; change it through `cairn://settings` `accounts` or Settings → Providers.\n");
+    }
     out
 }
 

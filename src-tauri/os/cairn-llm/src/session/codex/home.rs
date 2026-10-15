@@ -153,6 +153,13 @@ unified_exec = false
 multi_agent = false
 collab = false
 multi_agent_v2 = false
+# Disable Codex's native image generation tool (image_gen.imagegen). It is on
+# by default; its result is an opaque tool result carrying base64 image data,
+# and the file lands in CODEX_HOME/generated_images outside any Cairn record.
+# Images come from the model-access facet's typed image verb instead. The
+# model catalog cannot re-enable it: Codex checks this flag before any model
+# capability (codex `core/src/tools/spec_plan.rs`, image_generation_available).
+image_generation = false
 "#,
         model_catalog_toml = model_catalog_toml,
     )
@@ -288,6 +295,28 @@ mod tests {
                 config
             );
         }
+    }
+
+    #[test]
+    fn test_codex_config_disables_native_image_generation() {
+        // Codex's native image_gen.imagegen tool is on by default and returns
+        // base64 image data into the transcript while saving the file outside
+        // any Cairn record. Images belong to the model-access facet's image
+        // verb, so the generated config must turn the native tool off.
+        let config = render_codex_config_toml("");
+        assert!(
+            config
+                .lines()
+                .any(|line| line.trim() == "image_generation = false"),
+            "config must set `image_generation = false` to disable native image generation, got:\n{}",
+            config
+        );
+        let parsed: toml::Table = toml::from_str(&config).expect("config is TOML");
+        assert_eq!(
+            parsed["features"]["image_generation"].as_bool(),
+            Some(false),
+            "image_generation must be a [features] key"
+        );
     }
 
     #[test]

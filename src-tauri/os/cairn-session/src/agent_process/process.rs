@@ -414,6 +414,9 @@ pub struct RunHandle {
     /// The effective model this process was started with. Used by warm reuse to
     /// detect when the job's requested model has diverged from the live process.
     pub model: Option<String>,
+    /// Concrete provider account whose credentials were frozen into this child
+    /// at launch. Warm reuse compares this with the durable session pin.
+    pub account_id: Option<String>,
     /// Set for a process that runs on a rotating subscription credential and
     /// can take a renewed one live; `None` for everything else.
     pub credential_feed: Option<Arc<CredentialFeed>>,
@@ -504,6 +507,7 @@ impl RunHandle {
             backend: None,
             goal_pause: Arc::new(Mutex::new(GoalPauseClaim::default())),
             model: None,
+            account_id: None,
             credential_feed: None,
             terminal_tool_called: Arc::new(AtomicBool::new(false)),
             consumed_uris: Arc::new(Mutex::new(HashSet::new())),
@@ -1395,6 +1399,12 @@ impl AgentProcessState {
     pub fn get_model(&self, run_id: &str) -> Option<String> {
         let processes = self.processes.lock().ok()?;
         processes.get(run_id).and_then(|p| p.model.clone())
+    }
+
+    /// The provider account a live process was launched with.
+    pub fn get_account_id(&self, run_id: &str) -> Option<String> {
+        let processes = self.processes.lock().ok()?;
+        processes.get(run_id).and_then(|p| p.account_id.clone())
     }
 
     /// Record the provider's session id once the provider confirms it.

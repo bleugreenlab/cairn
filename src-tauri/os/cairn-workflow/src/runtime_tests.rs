@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use cairn_db::turso::params;
 use cairn_platform::services::emitter::CapturingEmitter;
 use effects::types::{EffectResult, JobEvent, WorkflowEffect};
-use runtime::{AiConditionRequest, WorkflowHost, WorkflowOwner, WorkflowRuntime, Workload};
+use models::decision::{Decision, DecisionAnswer, DecisionNode, MeasuredBy, PORT_QUESTION_NAME};
+use runtime::{DecisionRequest, WorkflowHost, WorkflowOwner, WorkflowRuntime, Workload};
 use std::{
     collections::HashSet,
     path::Path,
@@ -17,13 +18,13 @@ struct Host {
     calls: Mutex<Vec<String>>,
     checkpoint_passes: Mutex<Vec<bool>>,
     head: Mutex<String>,
-    /// The host's answer to an AI condition; `None` means none is expected.
-    condition_answer: Mutex<Option<Result<String, String>>>,
-    condition_requests: Mutex<Vec<AiConditionRequest>>,
+    /// The host's answer to a decision node; `None` means none is expected.
+    condition_answer: Mutex<Option<Result<Decision, String>>>,
+    condition_requests: Mutex<Vec<DecisionRequest>>,
     /// The outcome each `condition_evaluated` call reported, in order.
     condition_outcomes: Mutex<Vec<models::ConditionOutcome>>,
-    /// SQL the host runs against the owning database while it answers an AI
-    /// condition: whatever lands while the model call is in flight.
+    /// SQL the host runs against the owning database while it answers a
+    /// decision: whatever lands while the model call is in flight.
     during_condition: Mutex<Option<String>>,
 }
 
@@ -44,7 +45,7 @@ impl WorkflowHost for Host {
     fn job_head(&self, _: &str) -> Result<String, String> {
         Ok(self.head.lock().unwrap().clone())
     }
-    async fn complete_condition(&self, request: AiConditionRequest) -> Result<String, String> {
+    async fn decide(&self, request: DecisionRequest) -> Result<Decision, String> {
         let answer = self
             .condition_answer
             .lock()
@@ -271,10 +272,61 @@ async fn action_condition_agent_cycle_and_duplicate_replay_on_team_schema() {
     );
 }
 
-/// Seed trigger -> AI condition, with the condition's `no` port feeding an agent.
-async fn seed_ai_condition(host: &Host, config: serde_json::Value) {
+/// A decision node with id `condition`.
+fn decision_node(definition: DecisionNode) -> serde_json::Value {
+    let mut decision = node("condition", "decision");
+    decision["decisionConfig"] = serde_json::to_value(definition).unwrap();
+    decision
+}
+
+fn ports() -> Vec<String> {
+    vec!["yes".to_string(), "no".to_string()]
+}
+
+fn yes_or_no() -> DecisionNode {
+    DecisionNode::port_choice("Q?", &ports(), None)
+}
+
+fn decided(answer: DecisionAnswer) -> Decision {
+    Decision {
+        provider: "decisions".into(),
+        model: "typesafe-ai/jev".into(),
+        answers: vec![answer],
+        input_tokens: Some(12),
+    }
+}
+
+/// A native answer picking `port` at probability 0.9.
+fn picked(port: &str) -> Decision {
+    decided(DecisionAnswer::Choice {
+        name: PORT_QUESTION_NAME.into(),
+        measured_by: MeasuredBy::Native,
+        pick: port.into(),
+        confidence: Some(0.9),
+        probabilities: vec![],
+    })
+}
+
+fn refused() -> Decision {
+    decided(DecisionAnswer::Refusal {
+        name: PORT_QUESTION_NAME.into(),
+        measured_by: MeasuredBy::Native,
+        reason: Some("not enough context".into()),
+    })
+}
+
+const REFUSED_REASON: &str = "the model refused to answer 'route': not enough context";
+
+/// A frozen pre-decision snapshot's condition node, as stored before the
+/// `decision` node kind existed.
+fn legacy_ai_condition(config: serde_json::Value) -> serde_json::Value {
     let mut condition = node("condition", "condition");
     condition["conditionConfig"] = config;
+    condition
+}
+
+/// Seed trigger -> `condition`, with the condition's `no` port feeding an agent.
+async fn seed_condition(host: &Host, condition: serde_json::Value) {
     seed(
         &host.owning,
         vec![
@@ -291,15 +343,30 @@ async fn seed_ai_condition(host: &Host, config: serde_json::Value) {
     host.owning.execute_script("INSERT INTO jobs(id,execution_id,recipe_node_id,issue_id,project_id,status,node_name,uri_segment,created_at,updated_at) VALUES('job','exec','agent','issue','p','pending','agent','agent',1,1)").await.unwrap();
 }
 
-#[tokio::test]
-async fn ai_condition_routes_on_the_hosts_answer() {
-    let (runtime, host, _dir) = fixture(true).await;
-    seed_ai_condition(
-        &host,
-        serde_json::json!({"conditionType":"ai", "question":"Does it touch the database?", "ports":["yes","no"], "onError":"block"}),
+/// The typed answer stored on every condition row, oldest first.
+async fn stored_decisions(db: &LocalDb) -> Vec<Option<Decision>> {
+    db.query_all(
+        "SELECT raw_result FROM condition_evaluations ORDER BY evaluated_at, rowid".to_string(),
+        (),
+        |row| {
+            use storage::RowExt;
+            row.opt_text(0)
+        },
     )
-    .await;
-    *host.condition_answer.lock().unwrap() = Some(Ok("No.".into()));
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|raw| raw.map(|raw| serde_json::from_str(&raw).unwrap()))
+    .collect()
+}
+
+#[tokio::test]
+async fn a_decision_node_routes_on_the_pick_and_records_the_answer() {
+    let (runtime, host, _dir) = fixture(true).await;
+    let definition =
+        DecisionNode::port_choice("Does it touch the database?", &ports(), Some("sm".into()));
+    seed_condition(&host, decision_node(definition.clone())).await;
+    *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
 
     effects::run::execute_effects(&runtime, vec![advance(None)])
         .await
@@ -308,53 +375,45 @@ async fn ai_condition_routes_on_the_hosts_answer() {
     let requests = host.condition_requests.lock().unwrap().clone();
     assert_eq!(
         requests,
-        [AiConditionRequest {
+        [DecisionRequest {
             execution_id: "exec".into(),
             node_id: "condition".into(),
             node_name: "condition".into(),
-            question: "Does it touch the database?".into(),
-            ports: vec!["yes".into(), "no".into()],
-            context: "{}".into(),
-            model: None,
+            decision: definition,
+            input: "{}".into(),
         }]
     );
     assert_eq!(
-        count(
-            &host.owning,
-            "SELECT COUNT(*) FROM condition_evaluations WHERE result_port = 'no' AND error_message IS NULL"
-        )
-        .await,
-        1
+        condition_rows(&host.owning).await,
+        [("routed".to_string(), "no".to_string(), None)]
+    );
+    assert_eq!(
+        stored_decisions(&host.owning).await,
+        [Some(picked("no"))],
+        "the evaluation row is the decision's record"
     );
     assert_eq!(*host.calls.lock().unwrap(), ["condition", "agent"]);
 }
 
 #[tokio::test]
-async fn ai_condition_refusal_takes_the_default_port_and_keeps_the_reason() {
+async fn a_frozen_ai_condition_is_asked_as_a_decision() {
     let (runtime, host, _dir) = fixture(true).await;
-    seed_ai_condition(
+    seed_condition(
         &host,
-        serde_json::json!({"conditionType":"ai", "question":"Q?", "model":"md", "ports":["yes","no"], "onError":"useDefault", "defaultPort":"no"}),
+        legacy_ai_condition(serde_json::json!({"conditionType":"ai", "question":"Does it touch the database?", "model":"md", "ports":["yes","no"], "onError":"block"})),
     )
     .await;
-    *host.condition_answer.lock().unwrap() = Some(Err("no configured account".into()));
+    *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
 
     effects::run::execute_effects(&runtime, vec![advance(None)])
         .await
         .unwrap();
 
     assert_eq!(
-        host.condition_requests.lock().unwrap()[0].model.as_deref(),
-        Some("md")
+        host.condition_requests.lock().unwrap()[0].decision,
+        DecisionNode::port_choice("Does it touch the database?", &ports(), Some("md".into()))
     );
-    assert_eq!(
-        count(
-            &host.owning,
-            "SELECT COUNT(*) FROM condition_evaluations WHERE outcome = 'routed' AND result_port = 'no' AND error_message LIKE '%no configured account%'"
-        )
-        .await,
-        1
-    );
+    assert_eq!(*host.calls.lock().unwrap(), ["condition", "agent"]);
 }
 
 /// The condition node's entry in the execution's node-status projection.
@@ -380,16 +439,19 @@ async fn condition_rows(db: &LocalDb) -> Vec<(String, String, Option<String>)> {
     .unwrap()
 }
 
-const BLOCK_ON_ERROR: &str =
-    r#"{"conditionType":"ai", "question":"Q?", "ports":["yes","no"], "onError":"block"}"#;
-
-/// Run a blocking AI condition whose host answers `answer`, and assert it left
-/// exactly one blocked row carrying `reason`, started nothing downstream, told
-/// the host it blocked, and stays parked on a replayed advance.
-async fn assert_condition_blocks(config: &str, answer: Result<String, String>, reason: &str) {
-    let (runtime, host, _dir) = fixture(true).await;
-    seed_ai_condition(&host, serde_json::from_str(config).unwrap()).await;
-    *host.condition_answer.lock().unwrap() = Some(answer);
+/// Run `condition` with the host answering `answer` (`None` for a node that
+/// must not ask), and assert it left exactly one blocked row carrying
+/// `reason`, started nothing downstream, told the host it blocked, and stays
+/// parked on a replayed advance.
+async fn assert_condition_blocks(
+    condition: serde_json::Value,
+    answer: Option<Result<Decision, String>>,
+    reason: &str,
+) -> (Arc<Host>, tempfile::TempDir) {
+    let (runtime, host, dir) = fixture(true).await;
+    seed_condition(&host, condition).await;
+    let asks = usize::from(answer.is_some());
+    *host.condition_answer.lock().unwrap() = answer;
 
     effects::run::execute_effects(&runtime, vec![advance(None)])
         .await
@@ -431,49 +493,82 @@ async fn assert_condition_blocks(config: &str, answer: Result<String, String>, r
         .unwrap();
     assert_eq!(
         host.condition_requests.lock().unwrap().len(),
-        1,
+        asks,
         "a blocked condition stays parked; advancing must not ask again"
     );
     assert_eq!(condition_rows(&host.owning).await.len(), 1);
+    (host, dir)
 }
 
 #[tokio::test]
-async fn blocked_ai_condition_refusal_writes_a_blocked_row() {
-    let refusal = "AI condition 'condition' can't run: no configured account can serve it. Connect an account in Settings → Providers.";
-    assert_condition_blocks(BLOCK_ON_ERROR, Err(refusal.into()), refusal).await;
+async fn a_refused_decision_routes_nowhere_and_records_the_refusal() {
+    let (host, _dir) = assert_condition_blocks(
+        decision_node(yes_or_no()),
+        Some(Ok(refused())),
+        REFUSED_REASON,
+    )
+    .await;
+    assert_eq!(stored_decisions(&host.owning).await, [Some(refused())]);
 }
 
+/// A legacy `useDefault` survives migration as configuration nobody reads: a
+/// decision has no default port, so a refusal never becomes one.
 #[tokio::test]
-async fn blocked_ai_condition_timeout_writes_a_blocked_row() {
+async fn a_refused_frozen_ai_condition_never_takes_its_default_port() {
     assert_condition_blocks(
-        BLOCK_ON_ERROR,
-        Err("response timed out".into()),
+        legacy_ai_condition(serde_json::json!({"conditionType":"ai", "question":"Q?", "ports":["yes","no"], "onError":"useDefault", "defaultPort":"no"})),
+        Some(Ok(refused())),
+        REFUSED_REASON,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_pick_below_its_methods_threshold_routes_nowhere() {
+    let mut definition = yes_or_no();
+    definition.thresholds.native = Some(0.95);
+    definition.thresholds.logprobs = Some(0.5);
+    let (host, _dir) = assert_condition_blocks(
+        decision_node(definition),
+        Some(Ok(picked("no"))),
+        "'route' picked 'no' with native confidence 0.90, below the native threshold 0.95",
+    )
+    .await;
+    assert_eq!(stored_decisions(&host.owning).await, [Some(picked("no"))]);
+}
+
+#[tokio::test]
+async fn a_decision_with_no_offer_writes_a_blocked_row() {
+    let refusal =
+        "Decision node 'condition' can't run: no configured provider can answer a decision.";
+    let (host, _dir) = assert_condition_blocks(
+        decision_node(yes_or_no()),
+        Some(Err(refusal.into())),
+        refusal,
+    )
+    .await;
+    assert_eq!(stored_decisions(&host.owning).await, [None]);
+}
+
+#[tokio::test]
+async fn a_decision_timeout_writes_a_blocked_row() {
+    assert_condition_blocks(
+        decision_node(yes_or_no()),
+        Some(Err("response timed out".into())),
         "response timed out",
     )
     .await;
 }
 
 #[tokio::test]
-async fn blocked_ai_condition_unmatched_answer_writes_a_blocked_row() {
-    let ports = vec!["yes".to_string(), "no".to_string()];
-    let reason = condition::match_ai_condition_answer("Maybe.", &ports).unwrap_err();
-    assert_condition_blocks(BLOCK_ON_ERROR, Ok("Maybe.".into()), &reason).await;
-}
-
-#[tokio::test]
-async fn blocked_ai_condition_ambiguous_answer_writes_a_blocked_row() {
-    let ports = vec!["yes".to_string(), "no".to_string()];
-    let reason = condition::match_ai_condition_answer("no, not yes", &ports).unwrap_err();
-    assert!(reason.contains("more than one port"), "{reason}");
-    assert_condition_blocks(BLOCK_ON_ERROR, Ok("no, not yes".into()), &reason).await;
-}
-
-#[tokio::test]
 async fn use_default_without_a_default_port_writes_a_blocked_row() {
+    let failure =
+        condition::evaluate_programmatic_condition("missing > 1", &serde_json::json!({}), &ports())
+            .unwrap_err();
     assert_condition_blocks(
-        r#"{"conditionType":"ai", "question":"Q?", "ports":["yes","no"], "onError":"useDefault"}"#,
-        Err("response timed out".into()),
-        "onError is useDefault but no defaultPort is configured; evaluation failed: response timed out",
+        legacy_ai_condition(serde_json::json!({"expression":"missing > 1", "ports":["yes","no"], "onError":"useDefault"})),
+        None,
+        &format!("onError is useDefault but no defaultPort is configured; evaluation failed: {failure}"),
     )
     .await;
 }
@@ -481,7 +576,7 @@ async fn use_default_without_a_default_port_writes_a_blocked_row() {
 #[tokio::test]
 async fn reevaluating_a_blocked_condition_routes_and_keeps_the_blocked_row() {
     let (runtime, host, _dir) = fixture(true).await;
-    seed_ai_condition(&host, serde_json::from_str(BLOCK_ON_ERROR).unwrap()).await;
+    seed_condition(&host, decision_node(yes_or_no())).await;
     *host.condition_answer.lock().unwrap() = Some(Err("no configured account".into()));
     effects::run::execute_effects(&runtime, vec![advance(None)])
         .await
@@ -492,7 +587,7 @@ async fn reevaluating_a_blocked_condition_routes_and_keeps_the_blocked_row() {
         Some("blocked")
     );
 
-    *host.condition_answer.lock().unwrap() = Some(Ok("no".into()));
+    *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
     let verdict = advancement::reevaluate_condition(&runtime, "exec", "condition")
         .await
         .unwrap();
@@ -501,7 +596,8 @@ async fn reevaluating_a_blocked_condition_routes_and_keeps_the_blocked_row() {
         verdict,
         conditions::ConditionVerdict::Routed {
             port: "no".into(),
-            error: None
+            error: None,
+            decision: Some(picked("no")),
         }
     );
     assert_eq!(
@@ -541,16 +637,16 @@ async fn reevaluating_a_blocked_condition_routes_and_keeps_the_blocked_row() {
     assert!(error.contains("already routed to 'no'"), "{error}");
 }
 
-/// Seed the AI condition and block it once on a refusal, leaving one blocked
+/// Seed the decision node and block it once on a failed call, leaving one blocked
 /// row and an answer of `no` ready for the next evaluation.
 async fn block_condition_once(runtime: &WorkflowRuntime, host: &Host) {
-    seed_ai_condition(host, serde_json::from_str(BLOCK_ON_ERROR).unwrap()).await;
+    seed_condition(host, decision_node(yes_or_no())).await;
     *host.condition_answer.lock().unwrap() = Some(Err("no configured account".into()));
     effects::run::execute_effects(runtime, vec![advance(None)])
         .await
         .unwrap();
     assert_eq!(condition_rows(&host.owning).await.len(), 1);
-    *host.condition_answer.lock().unwrap() = Some(Ok("no".into()));
+    *host.condition_answer.lock().unwrap() = Some(Ok(picked("no")));
 }
 
 #[tokio::test]
@@ -661,8 +757,7 @@ async fn a_route_recorded_during_reevaluation_wins_and_the_late_answer_is_discar
 #[tokio::test]
 async fn a_blocked_condition_with_no_pending_work_keeps_the_execution_running_until_fenced() {
     let (runtime, host, _dir) = fixture(true).await;
-    let mut condition = node("condition", "condition");
-    condition["conditionConfig"] = serde_json::from_str(BLOCK_ON_ERROR).unwrap();
+    let condition = decision_node(yes_or_no());
     seed(
         &host.owning,
         vec![
@@ -706,7 +801,7 @@ async fn a_blocked_condition_with_no_pending_work_keeps_the_execution_running_un
 #[tokio::test]
 async fn reevaluating_a_condition_that_never_ran_is_refused() {
     let (runtime, host, _dir) = fixture(true).await;
-    seed_ai_condition(&host, serde_json::from_str(BLOCK_ON_ERROR).unwrap()).await;
+    seed_condition(&host, decision_node(yes_or_no())).await;
 
     let error = advancement::reevaluate_condition(&runtime, "exec", "condition")
         .await

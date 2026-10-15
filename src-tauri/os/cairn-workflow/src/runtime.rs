@@ -35,22 +35,20 @@ pub enum Workload {
     },
 }
 
-/// An AI condition node asking the host to answer its question.
+/// A decision node asking the host to answer its questions.
 ///
-/// The host owns the prompt, the model selection and the model call; the
-/// engine only matches the returned answer to one of `ports`.
+/// The host owns offer selection and the `decide` call; the engine routes on
+/// the typed answers it returns.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AiConditionRequest {
+pub struct DecisionRequest {
     pub execution_id: String,
     pub node_id: String,
     pub node_name: String,
-    pub question: String,
-    pub ports: Vec<String>,
-    /// Upstream artifact context, serialized as pretty JSON.
-    pub context: String,
-    /// The node's authored model: a tier reference or an exact model. `None`
-    /// leaves the choice to the host.
-    pub model: Option<String>,
+    /// The node's questions, authored model, and thresholds.
+    pub decision: crate::models::decision::DecisionNode,
+    /// The text every question is asked about: the upstream artifact
+    /// context, serialized as pretty JSON.
+    pub input: String,
 }
 
 /// Application operations supplied to the workflow engine.
@@ -65,9 +63,13 @@ pub trait WorkflowHost: Send + Sync {
     fn claimed_launch_job_ids(&self) -> HashSet<String>;
     fn resolve_coordinate(&self, repository: &Path, branch: &str) -> Result<String, String>;
     fn job_head(&self, job_id: &str) -> Result<String, String>;
-    /// Answer an AI condition's question. The text returned is matched to a
-    /// port by the engine.
-    async fn complete_condition(&self, request: AiConditionRequest) -> Result<String, String>;
+    /// Answer a decision node's questions. A refused question is an answer,
+    /// not an error; an error means nothing answered (no decision-capable
+    /// offer, or the provider failed), and blocks the node with that text.
+    async fn decide(
+        &self,
+        request: DecisionRequest,
+    ) -> Result<crate::models::decision::Decision, String>;
     fn lifecycle_message(&self, job_id: &str, run_id: Option<&str>, event: JobEvent);
     fn projection_changed(&self, execution_id: &str, outcome: &RecomputeOutcome);
     /// A condition evaluation row was stored, routed or blocked, and the

@@ -33,6 +33,11 @@ pub fn recipe_node_to_db(node: &RecipeNode, recipe_id: &str) -> DbRecipeNode {
                 config_map.extend(map);
             }
         }
+        if let Some(ref decision_cfg) = node.decision_config {
+            if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(decision_cfg) {
+                config_map.extend(map);
+            }
+        }
         if let Some(ref context_cfg) = node.context_config {
             if let Ok(serde_json::Value::Object(map)) = serde_json::to_value(context_cfg) {
                 config_map.extend(map);

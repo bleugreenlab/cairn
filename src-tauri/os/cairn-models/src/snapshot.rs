@@ -147,6 +147,20 @@ pub struct RecipeSnapshot {
     pub edges: Vec<RecipeEdge>,
 }
 
+/// How a provider session chooses among compatible configured accounts.
+///
+/// Serialized as `"automatic"` or `{"account": "<stable account id>"}`. The
+/// policy is read when each provider session is created; it never changes the
+/// account of a process that is already running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderAccountPolicy {
+    /// Choose the available account with the most model-relevant headroom.
+    Automatic,
+    /// Use exactly this account, failing closed when it is unavailable.
+    Account(String),
+}
+
 /// Snapshot of an agent configuration at execution time
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +183,9 @@ pub struct AgentSnapshot {
     /// on read from the legacy flat `model`/`resolved_backend` for old snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<ModelSelection>,
+    /// Account policy for the next provider session; absent means automatic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_account: Option<ProviderAccountPolicy>,
     pub disallowed_tools: Option<Vec<String>>,
     /// Skill IDs attached to this agent (None = inherit all available skills)
     pub skills: Option<Vec<String>>,
@@ -525,6 +542,7 @@ mod tests {
                     tier: Some(Model::new(Model::SONNET)),
                     backend_preference: None,
                     selection: None,
+                    provider_account: None,
                     model: Some(Model::new(Model::SONNET)),
                     disallowed_tools: Some(vec!["Bash".to_string()]),
                     skills: Some(vec!["data-fetching".to_string()]),
@@ -711,6 +729,7 @@ mod tests {
             tier: None,
             backend_preference: None,
             selection: None,
+            provider_account: None,
             model: None,
             disallowed_tools: None,
             skills: None,
@@ -735,6 +754,25 @@ mod tests {
         assert_eq!(extras.service_tier.as_deref(), Some("priority"));
     }
 
+    /// The account policy uses the wire shape the snapshot editor writes.
+    #[test]
+    fn provider_account_policy_round_trips_the_editor_shape() {
+        assert_eq!(
+            serde_json::to_value(ProviderAccountPolicy::Automatic).unwrap(),
+            serde_json::json!("automatic")
+        );
+        assert_eq!(
+            serde_json::to_value(ProviderAccountPolicy::Account("acc_b".to_string())).unwrap(),
+            serde_json::json!({"account": "acc_b"})
+        );
+        let explicit: ProviderAccountPolicy =
+            serde_json::from_value(serde_json::json!({"account": "acc_b"})).unwrap();
+        assert_eq!(
+            explicit,
+            ProviderAccountPolicy::Account("acc_b".to_string())
+        );
+    }
+
     /// extras is omitted from JSON when None (skip_serializing_if).
     #[test]
     fn agent_snapshot_skips_null_extras() {
@@ -748,6 +786,7 @@ mod tests {
             tier: None,
             backend_preference: None,
             selection: None,
+            provider_account: None,
             model: None,
             disallowed_tools: None,
             skills: None,

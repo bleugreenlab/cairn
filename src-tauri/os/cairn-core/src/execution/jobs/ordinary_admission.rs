@@ -457,6 +457,8 @@ pub(super) fn enqueue_or_start(
                 &prepared.session_id,
                 Some(&prepared.project_id),
                 prepared.job_model.as_ref().map(Model::as_str),
+                crate::orchestrator::session::snapshot_account_override(orch, &prepared.run_id)?
+                    .as_deref(),
             )?;
         }
     }
@@ -592,7 +594,7 @@ pub(super) fn enqueue_or_start(
             },
         );
     } else {
-        promote_private_lane(orch, &capability.lane.0)?;
+        promote_private_lane(orch, &capability.lane.0);
     }
     Ok(false)
 }
@@ -601,13 +603,10 @@ fn dispatch_team_promotion(
     orch: &Orchestrator,
     request: crate::runtime_admission::EnqueueAdmissionRequest,
 ) {
+    let scheduler = orch;
     let orch = orch.clone();
     let request_id = request.id.clone();
-    let Ok(handle) = tokio::runtime::Handle::try_current() else {
-        log::warn!("team ordinary admission {request_id} is durable but cannot promote without a Tokio runtime");
-        return;
-    };
-    handle.spawn_blocking(move || {
+    scheduler.spawn_blocking_detached(move || {
         let mut delay = std::time::Duration::from_secs(1);
         loop {
             // The run lives in the team replica and this queue row in the local
@@ -747,17 +746,18 @@ fn enqueue_and_promote_team(
     Ok(false)
 }
 
-pub(crate) fn promote_private_lane(orch: &Orchestrator, lane: &str) -> Result<(), String> {
-    let orch = orch.clone();
+/// Schedule a promotion pass for `lane` in the background. Callers include
+/// process-teardown callbacks on plain OS threads, so scheduling never depends
+/// on the caller having a runtime, and a pass that fails is the sweep's to
+/// retry: nothing the caller holds would change that outcome.
+pub(crate) fn promote_private_lane(orch: &Orchestrator, lane: &str) {
+    let promoter = orch.clone();
     let lane = lane.to_string();
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| "ordinary admission promotion requires a Tokio runtime".to_string())?;
-    handle.spawn_blocking(move || {
-        if let Err(error) = promote_private_lane_blocking(&orch, &lane) {
+    orch.spawn_blocking_detached(move || {
+        if let Err(error) = promote_private_lane_blocking(&promoter, &lane) {
             log::warn!("ordinary admission lane {lane} stopped promoting: {error}");
         }
     });
-    Ok(())
 }
 
 /// Drain every queued launch the lane can admit right now. Each pass measures
@@ -2121,6 +2121,162 @@ mod tests {
             text(&orch, "SELECT CAST(COUNT(*) AS TEXT) FROM runtime_admission_requests WHERE launch_key='ordinary:cold'").await,
             "1"
         );
+    }
+
+    /// A measured host with ample headroom, so only the ceiling decides.
+    fn roomy_gc() -> Arc<crate::agent_process::gc::WarmProcessGC> {
+        Arc::new(crate::agent_process::gc::WarmProcessGC::with_probe(
+            6,
+            Arc::new(crate::agent_process::memory::StubMemoryProbe::new(Some(
+                crate::agent_process::memory::SystemMemory {
+                    total: 64 << 30,
+                    available: 32 << 30,
+                },
+            ))),
+        ))
+    }
+
+    /// Wait for `run` to register WITHOUT promoting: the trigger under test
+    /// must have scheduled the pass itself, as no sweep runs in these tests.
+    async fn wait_until_started(orch: &Orchestrator, run: &str) {
+        for _ in 0..500 {
+            if orch.process_state.has_process(run) == Some(true) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{run} was never promoted by its own trigger");
+    }
+
+    /// Process teardown callbacks release on plain OS threads (the provider
+    /// reader and exit watcher), which carry no Tokio runtime context. The unit
+    /// they free must still wake the queue head immediately.
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_off_the_runtime_promotes_the_queue_head_without_the_sweep() {
+        let (orch, _, snapshot) =
+            lifecycle_fixture_with_gc("ordinary-off-runtime-release.db", Some(roomy_gc())).await;
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = starts.clone();
+        let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+            &orch,
+            move || Box::new(CountingBackend(counted.clone())),
+        );
+        set_ceiling(&orch, 1);
+        hold_cold_active(&orch).await;
+        queue_launch(&orch, &snapshot, 2, "starting").await;
+
+        let releaser = orch.clone();
+        let released = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            crate::orchestrator::lifecycle::release_and_stop_process(&releaser, "cold")
+        })
+        .join()
+        .unwrap();
+        assert!(released);
+
+        wait_until_started(&orch, "r2").await;
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(request_state(&orch, "req").await.0, "released");
+    }
+
+    /// Once the admission row is durable the launch IS queued, so an enqueue
+    /// from a thread without a runtime (attention delivery's flush-on-idle
+    /// resume) must report it queued rather than failed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn enqueue_off_the_runtime_reports_a_durably_queued_launch_as_queued() {
+        let (orch, _, _) =
+            lifecycle_fixture_with_gc("ordinary-off-runtime-enqueue.db", Some(roomy_gc())).await;
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = starts.clone();
+        let _backend = crate::orchestrator::session::install_orchestrator_test_session_backend(
+            &orch,
+            move || Box::new(CountingBackend(counted.clone())),
+        );
+        set_ceiling(&orch, 1);
+        // The launch resolves to the real Claude capability, so its lane is
+        // `claude-cli`; a resident blocker there holds the one unit.
+        orch.db
+            .local
+            .execute_script(
+                "DELETE FROM runtime_admission_requests WHERE request_id='req';
+                 UPDATE turns SET run_id=NULL WHERE id='t';
+                 INSERT INTO runtime_admission_requests(
+                    request_id,workspace_key,resource_lane,launch_key,claim_json,priority,
+                    enqueue_seq,state,lease_owner,lease_generation,lease_expires_at,created_at,updated_at
+                 ) VALUES(
+                    'blocker','private-runtime','claude-cli','ordinary:blocker',
+                    '{\"residentProcessUnits\":1,\"logicalStreamUnits\":1}',0,
+                    1,'active','ordinary-session-promoter',1,9999999999,1,1
+                 );",
+            )
+            .await
+            .unwrap();
+
+        let enqueuer = orch.clone();
+        let (result, claim_dropped) = std::thread::spawn(move || {
+            assert!(tokio::runtime::Handle::try_current().is_err());
+            let mut prepared = super::PreparedJob {
+                job_id: "j".into(),
+                project_id: "p".into(),
+                run_id: "cold".into(),
+                session_id: "s".into(),
+                session_start: crate::backends::SessionStart::New {
+                    session_id: "s".into(),
+                },
+                prompt: "queued hello".into(),
+                job_model: None,
+                agent_config: None,
+                artifact_schema_info: None,
+                execution_id: Some("e".into()),
+                turn_id: "t".into(),
+                launch_event_id: "ev".into(),
+                start_reason: crate::models::TurnStartReason::FollowUp,
+                launch_claim: Some(enqueuer.claim_job_launch("j", "cold")),
+            };
+            let identity = crate::identity::UserIdentity {
+                user_id: "u".into(),
+                email: "u@example.com".into(),
+                name: "U".into(),
+                claude_auth: None,
+                codex_auth: None,
+                github_token: None,
+            };
+            let result = super::enqueue_or_start(&enqueuer, &mut prepared, Some(identity));
+            (result, prepared.launch_claim.is_none())
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            result,
+            Ok(false),
+            "a durably queued launch is not a failure"
+        );
+        assert!(claim_dropped, "the durable row is the claim once it exists");
+        assert_eq!(
+            request_state(&orch, "ordinary-admission:cold").await.0,
+            "queued"
+        );
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        assert!(crate::storage::finish_admission_by_launch_key(
+            &orch.db.local,
+            "private-runtime",
+            "ordinary:blocker",
+            "ordinary-session-promoter",
+            1,
+            "released",
+            None,
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap());
+        let promoter = orch.clone();
+        std::thread::spawn(move || super::promote_private_lane(&promoter, "claude-cli"))
+            .join()
+            .unwrap();
+
+        wait_until_started(&orch, "cold").await;
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     async fn lifecycle_fixture_with_gc(

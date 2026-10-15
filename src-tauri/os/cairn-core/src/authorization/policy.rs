@@ -46,7 +46,8 @@ const CAPABILITY_BEARING_SETTINGS: &[&str] = &[
 ];
 
 /// Sections that are cosmetic or account-local: they change how this install
-/// presents itself or how much housekeeping it does, and grant nothing.
+/// presents itself, how much housekeeping it does, or how much work it admits
+/// at once, and grant nothing.
 ///
 /// Listed explicitly rather than inferred, so that adding a settings key
 /// without thinking about its authority lands in
@@ -63,6 +64,10 @@ const LOCAL_PREFERENCE_SETTINGS: &[&str] = &[
     "mergeType",
     "orphanCleanupDays",
     "pendingMemoryThreshold",
+    // A ceiling on how many agent sessions this host keeps resident. Raising or
+    // clearing it changes how much of the operator's own machine Cairn uses;
+    // every admitted session still runs with exactly the authority it had.
+    "privateDedicatedProcessCapacity",
     "repoTargetSweepDays",
     "seedBudgetTokens",
     "seedEras",

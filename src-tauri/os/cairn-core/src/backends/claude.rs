@@ -13,7 +13,7 @@ use crate::orchestrator::lifecycle::{
 use cairn_llm::interface::session::{
     ClaudeMode, ClaudeSpec, ProviderSpec, SecretEnv, SessionError, SessionEvents, SessionSpec,
 };
-use cairn_llm::wire::claude_stream::{RateLimitInfo, StreamEvidence};
+use cairn_llm::wire::claude_stream::{ProviderDepletion, RateLimitInfo, StreamEvidence};
 
 use super::run_state::{
     is_task_spawned_run, resolve_run_db, run_backend_db, run_job_id, run_status,
@@ -305,35 +305,214 @@ struct RateLimitRetryTarget {
     model: Option<String>,
 }
 
+/// The session, turn, and account a run's provider outcome belongs to.
+///
+/// Bound to the run itself, never to the job head: by the time a depletion is
+/// handled the job may already point at a successor session or turn. The
+/// account is the one whose credentials were frozen into this run's process at
+/// launch, falling back to the run session's durable pin when the process is
+/// no longer registered.
 fn rate_limit_retry_target(
+    orch: &Orchestrator,
     db: &Arc<LocalDb>,
     run_id: &str,
+    session_id: Option<&str>,
 ) -> Result<Option<RateLimitRetryTarget>, String> {
     let db = db.clone();
-    let run_id = run_id.to_string();
-    run_backend_db(CLAUDE_BACKEND_NAME, async move {
+    let run = run_id.to_string();
+    let session = session_id.map(str::to_string);
+    let row = run_backend_db(CLAUDE_BACKEND_NAME, async move {
         db.read(|conn| Box::pin(async move {
             let mut rows = conn.query(
-                "SELECT j.current_session_id, j.current_turn_id, COALESCE(r.project_id, i.project_id), s.account_id, j.model
+                "SELECT s.id, j.current_turn_id, COALESCE(r.project_id, i.project_id), s.account_id, j.model
                    FROM runs r
                    JOIN jobs j ON j.id = r.job_id
                    LEFT JOIN issues i ON i.id = r.issue_id
-                   JOIN sessions s ON s.id = j.current_session_id
+                   JOIN sessions s ON s.id = COALESCE(?2, j.current_session_id)
                   WHERE r.id = ?1
                   LIMIT 1",
-                (run_id.as_str(),),
+                (run.as_str(), session.as_deref()),
             ).await?;
             let Some(row) = rows.next().await? else { return Ok(None); };
-            let Some(session_id) = row.opt_text(0)? else { return Ok(None); };
-            let Some(turn_id) = row.opt_text(1)? else { return Ok(None); };
-            let Some(account_id) = row.opt_text(3)? else { return Ok(None); };
-            Ok(Some(RateLimitRetryTarget {
-                session_id, turn_id,
-                project_id: row.opt_text(2)?, account_id,
-                model: row.opt_text(4)?,
-            }))
+            Ok(Some((
+                row.text(0)?,
+                row.opt_text(1)?,
+                row.opt_text(2)?,
+                row.opt_text(3)?,
+                row.opt_text(4)?,
+            )))
         })).await.map_err(|error| error.to_string())
-    })
+    })?;
+    let Some((session_id, head_turn_id, project_id, pinned_account_id, model)) = row else {
+        return Ok(None);
+    };
+    let Some(account_id) = orch
+        .process_state
+        .get_account_id(run_id)
+        .or(pinned_account_id)
+    else {
+        return Ok(None);
+    };
+    let Some(turn_id) = orch
+        .process_state
+        .get_current_turn_id(run_id)
+        .or(head_turn_id)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(RateLimitRetryTarget {
+        session_id,
+        turn_id,
+        project_id,
+        account_id,
+        model,
+    }))
+}
+
+fn account_label(accounts: &[crate::credentials::AccountInfo], account_id: &str) -> String {
+    accounts
+        .iter()
+        .find(|account| account.id == account_id)
+        .map(|account| account.label.clone())
+        .unwrap_or_else(|| account_id.to_string())
+}
+
+/// Apply a verified depletion of the turn's pinned account.
+///
+/// Health is persisted against the exact pinned account before any
+/// replacement is chosen. Under Automatic policy the session is repinned by
+/// compare-and-set to the healthiest eligible account; under an explicit
+/// policy that names the depleted account the pin stays and the session fails
+/// closed. The caller settles the turn afterwards (interrupted, with its
+/// process stopped), so the next explicit continuation cold-launches on
+/// whatever the pin now names. The interrupted turn is never replayed here.
+///
+/// `health_recorded` is true when this turn's blocking `rate_limit_event`
+/// already recorded the provider's own block, which a reset-less re-probe
+/// quarantine must not overwrite.
+fn handle_provider_depletion(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    run_id: &str,
+    session_id: Option<&str>,
+    depletion: ProviderDepletion,
+    health_recorded: bool,
+) -> bool {
+    let Ok(Some(target)) = rate_limit_retry_target(orch, run_db, run_id, session_id) else {
+        return false;
+    };
+    let persisted = match depletion {
+        ProviderDepletion::Credits => orch
+            .record_account_credit_depletion(&target.account_id, "credits_required".to_string())
+            .map(|_| ()),
+        ProviderDepletion::RollingWindow { .. } if health_recorded => Ok(()),
+        ProviderDepletion::RollingWindow { resets_at } => orch
+            .record_account_health(
+                &target.account_id,
+                Vec::new(),
+                resets_at.or_else(|| {
+                    Some(
+                        chrono::Utc::now().timestamp()
+                            + TERMINAL_429_REPROBE_AFTER.as_secs() as i64,
+                    )
+                }),
+            )
+            .map(|_| ()),
+    };
+    if let Err(error) = persisted {
+        log::warn!("Failed to persist Claude account depletion: {error}");
+        return false;
+    }
+
+    let accounts = orch.list_accounts(target.project_id.as_deref());
+    let old_label = account_label(&accounts, &target.account_id);
+    let snapshot_override = crate::orchestrator::session::snapshot_account_override(orch, run_id)
+        .ok()
+        .flatten();
+    let project_override = crate::orchestrator::session::routed_project_override(
+        orch,
+        RoutedProvider::Claude,
+        target.project_id.as_deref(),
+    );
+    let explicit_policy = snapshot_override.as_deref().or(project_override.as_deref());
+    let explicitly_pinned = explicit_policy == Some(target.account_id.as_str());
+    let replacement = (!explicitly_pinned)
+        .then(|| {
+            orch.select_routed_identity(
+                RoutedProvider::Claude,
+                target.project_id.as_deref(),
+                explicit_policy,
+                Some(&target.account_id),
+                target.model.as_deref(),
+            )
+        })
+        .flatten();
+    let (replacement_id, replacement_label) = if let Some((replacement_id, _)) = replacement {
+        let repinned = crate::storage::run_db_blocking({
+            let db = run_db.clone();
+            let session_id = target.session_id.clone();
+            let expected_id = target.account_id.clone();
+            let replacement_id = replacement_id.clone();
+            move || async move {
+                crate::sessions::queries::compare_and_set_account_id(
+                    &db,
+                    &session_id,
+                    &expected_id,
+                    &replacement_id,
+                )
+                .await
+            }
+        });
+        match repinned {
+            Ok(true) => {
+                let label = account_label(&accounts, &replacement_id);
+                (Some(replacement_id), Some(label))
+            }
+            // A concurrent repin won; report the durable winner.
+            Ok(false) => {
+                let winner = crate::storage::run_db_blocking({
+                    let db = run_db.clone();
+                    let session_id = target.session_id.clone();
+                    move || async move { crate::sessions::queries::get(&db, &session_id).await }
+                })
+                .ok()
+                .and_then(|session| session.account_id);
+                let winner_label = winner.as_deref().map(|id| account_label(&accounts, id));
+                (winner, winner_label)
+            }
+            Err(error) => {
+                log::warn!("Failed to atomically repin depleted Claude account: {error}");
+                return false;
+            }
+        }
+    } else {
+        (None, None)
+    };
+
+    let kind = match depletion {
+        ProviderDepletion::Credits => "credits",
+        ProviderDepletion::RollingWindow { .. } => "rolling_window",
+    };
+    let message = match replacement_label.as_ref() {
+        Some(new_label) => format!("{old_label} is unavailable. Switched this provider session to {new_label}; continue once to resume safely. The interrupted turn was not replayed."),
+        None if explicitly_pinned => format!("The Claude account chosen for this execution, {old_label}, is unavailable. Choose another account or Automatic, then continue once. The interrupted turn was not replayed."),
+        None => format!("{old_label} is unavailable and no eligible Claude account remains. The interrupted turn was not replayed."),
+    };
+    let _ = crate::messages::transcript::insert_system_message_sync(
+        orch,
+        run_id,
+        session_id,
+        Some(&target.turn_id),
+        &message,
+        serde_json::json!({"provider":"claude","kind":"provider_account_depleted","depletionKind":kind,"fromAccountId":target.account_id,"fromAccountLabel":old_label,"toAccountId":replacement_id,"toAccountLabel":replacement_label,"needsExplicitContinuation":true}),
+    );
+    if matches!(
+        orch.process_state.get_occupancy(run_id),
+        Some(crate::agent_process::process::RunOccupancy::Idle)
+    ) {
+        crate::orchestrator::lifecycle::release_and_stop_process(orch, run_id);
+    }
+    true
 }
 
 /// Look up `(job_id, execution_id)` for a run, for the crash diagnostic.
@@ -688,6 +867,7 @@ impl AgentBackend for ClaudeBackend {
                 process_job_id,
             );
             active_process.model = effective_model.clone();
+            active_process.account_id = config.account_id.clone();
             active_process.facts = Some(launched.facts);
             // Only a process with a live stdin can take a renewed credential;
             // a one-shot runs out its turn on the one it launched with.
@@ -1981,7 +2161,9 @@ impl ClaudeHost for ClaudeReaderHost {
         let orch = &self.orch;
         let run_db = self.run_db.clone();
         let run_id = self.run_id.as_str();
-        if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
+        if let Ok(Some(target)) =
+            rate_limit_retry_target(orch, &run_db, run_id, self.session_id.as_deref())
+        {
             orch.capture_claude_usage_after_launch(target.account_id);
         }
     }
@@ -2011,7 +2193,12 @@ impl ClaudeHost for ClaudeReaderHost {
         if info.is_some_and(|info| !info.is_blocking()) {
             return false;
         }
-        let Ok(Some(target)) = rate_limit_retry_target(&self.run_db, &self.run_id) else {
+        let Ok(Some(target)) = rate_limit_retry_target(
+            &self.orch,
+            &self.run_db,
+            &self.run_id,
+            self.session_id.as_deref(),
+        ) else {
             return false;
         };
         let provider_reset = info.and_then(|info| info.resets_at.or(info.overage_resets_at));
@@ -2033,6 +2220,22 @@ impl ClaudeHost for ClaudeReaderHost {
                 false
             }
         }
+    }
+    fn provider_depleted(
+        &self,
+        depletion: ProviderDepletion,
+        snapshot: ProviderUsageSnapshot,
+        block_recorded: bool,
+    ) -> bool {
+        self.orch.store_provider_usage_snapshot(snapshot);
+        handle_provider_depletion(
+            &self.orch,
+            &self.run_db,
+            &self.run_id,
+            self.session_id.as_deref(),
+            depletion,
+            block_recorded,
+        )
     }
     fn context_snapshot(&self, snapshot: ContextTokenState) {
         self.orch.store_context_token_snapshot(snapshot);
@@ -2080,7 +2283,10 @@ impl ClaudeHost for ClaudeReaderHost {
     fn eof(&self, report: ClaudeEof) {
         let ClaudeEof {
             evidence,
-            persisted_rate_limit_quarantine,
+            mut persisted_rate_limit_quarantine,
+            pending_depletion,
+            depletion_handled,
+            turn_block_recorded,
             terminal_tool_called,
             backend_failure,
         } = report;
@@ -2146,55 +2352,18 @@ impl ClaudeHost for ClaudeReaderHost {
                      saw_blocking_rate_limit={saw_blocking_rate_limit} run_status={run_status_val:?}"
                 );
 
-                if saw_blocking_rate_limit && persisted_rate_limit_quarantine {
-                    if let Ok(Some(target)) = rate_limit_retry_target(&run_db, run_id) {
-                        if let Some((replacement_id, _)) = orch.select_routed_identity(
-                            crate::credentials::RoutedProvider::Claude,
-                            target.project_id.as_deref(),
-                            None,
-                            Some(&target.account_id),
-                            target.model.as_deref(),
-                        ) {
-                            let old_label = orch
-                                .list_accounts(target.project_id.as_deref())
-                                .into_iter()
-                                .find(|account| account.id == target.account_id)
-                                .map(|account| account.label)
-                                .unwrap_or_else(|| target.account_id.clone());
-                            let new_label = orch
-                                .list_accounts(target.project_id.as_deref())
-                                .into_iter()
-                                .find(|account| account.id == replacement_id)
-                                .map(|account| account.label)
-                                .unwrap_or_else(|| replacement_id.clone());
-                            let repinned = crate::storage::run_db_blocking({
-                                let db = run_db.clone();
-                                let session_id = target.session_id.clone();
-                                let replacement_id = replacement_id.clone();
-                                move || async move {
-                                    crate::sessions::queries::set_account_id(
-                                        &db,
-                                        &session_id,
-                                        &replacement_id,
-                                    )
-                                    .await
-                                }
-                            });
-                            if repinned.is_ok() {
-                                let message = format!(
-                                    "Rate limit reached on {old_label}. Switched this session to {new_label}; continue once to resume safely."
-                                );
-                                let _ = crate::messages::transcript::insert_system_message_sync(
-                                    orch,
-                                    run_id,
-                                    session_id.as_deref(),
-                                    Some(&target.turn_id),
-                                    &message,
-                                    serde_json::json!({"provider":"claude","kind":"rate_limit_account_switch","fromAccountId":target.account_id,"toAccountId":replacement_id,"automaticResume":false}),
-                                );
-                            }
-                        }
-                    }
+                // A blocking exit whose turn never reached a terminal result
+                // has not been handled by `provider_depleted` yet.
+                if saw_blocking_rate_limit && !depletion_handled {
+                    persisted_rate_limit_quarantine = handle_provider_depletion(
+                        orch,
+                        &run_db,
+                        run_id,
+                        session_id.as_deref(),
+                        pending_depletion
+                            .unwrap_or(ProviderDepletion::RollingWindow { resets_at: None }),
+                        turn_block_recorded,
+                    ) || turn_block_recorded;
                 }
 
                 let error_message = if saw_blocking_rate_limit && persisted_rate_limit_quarantine {

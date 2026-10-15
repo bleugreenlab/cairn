@@ -234,6 +234,10 @@ pub(crate) fn classify_unavailable(
         // or toolchain nothing in the fleet provides. Time does not add one, and
         // no link coming back changes what an executor will advertise.
         CellUnavailableReason::NoMatchingExecutor => PlacementVerdict::Structural,
+        // The home can never hold this work's measured memory, which is a fact
+        // about the machine's size rather than its load: waiting on it waits
+        // for nothing. Another machine can, and the caller is told which.
+        CellUnavailableReason::HomeCannotHold { .. } => PlacementVerdict::Structural,
     }
 }
 
@@ -356,7 +360,8 @@ mod tests {
             | CellUnavailableReason::ExecutorUnavailable
             | CellUnavailableReason::NoMatchingExecutor
             | CellUnavailableReason::AdmissionRejected { .. }
-            | CellUnavailableReason::ObjectInfrastructure(_) => {}
+            | CellUnavailableReason::ObjectInfrastructure(_)
+            | CellUnavailableReason::HomeCannotHold { .. } => {}
         }
         let waits = [
             deadline(Some(ExecutorSubstrateState::CapacityBusy)),
@@ -386,6 +391,15 @@ mod tests {
             CellUnavailableReason::ObjectInfrastructure(
                 ObjectInfrastructureStage::FetchInterrupted,
             ),
+            CellUnavailableReason::HomeCannotHold {
+                home: "bgsrv-ub".into(),
+                ceiling: cairn_common::executor_protocol::MemoryCeiling {
+                    estimate_bytes: 10_352_608_320,
+                    ceiling_bytes: 8_282_086_656,
+                },
+                alternative_executor_id: "exec-big".into(),
+                alternative_executor_name: "bglab-mac".into(),
+            },
         ];
         for reason in waits {
             assert!(

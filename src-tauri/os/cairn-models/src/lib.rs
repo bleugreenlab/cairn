@@ -98,13 +98,14 @@ pub use turn::{Turn, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason}
 
 // Recipe types
 pub use recipe::{
-    default_branch_targets, AccumulationScope, ActionNodeConfig, AgentFilter, AgentFilterMode,
-    AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, BranchMode, BranchTarget,
-    CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig, ConditionType,
-    ConfirmPolicy, ContextNodeConfig, Continuity, CreateRecipe, EventFilter, NodeConfig,
-    NodePosition, Recipe, RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger,
-    RecipeVersionInfo, ScheduleAt, ScheduleConfig, ScheduleEvery, ScheduleInterval, SchedulePeriod,
-    SchemaConfig, TriggerConfig, TriggerScope, UpdateRecipe,
+    default_branch_targets, is_legacy_ai_condition, legacy_port_handle,
+    normalize_legacy_port_handles, AccumulationScope, ActionNodeConfig, AgentFilter,
+    AgentFilterMode, AgentGitConfig, AgentNodeConfig, ArtifactNodeConfig, BranchMode, BranchTarget,
+    CheckpointNodeConfig, ConditionErrorBehavior, ConditionNodeConfig, ConfirmPolicy,
+    ContextNodeConfig, Continuity, CreateRecipe, EventFilter, NodeConfig, NodePosition, Recipe,
+    RecipeEdge, RecipeEdgeType, RecipeNode, RecipeNodeType, RecipeTrigger, RecipeVersionInfo,
+    ScheduleAt, ScheduleConfig, ScheduleEvery, ScheduleInterval, SchedulePeriod, SchemaConfig,
+    TriggerConfig, TriggerScope, UpdateRecipe,
 };
 pub use recipe::{CONTEXT_IN_HANDLE, CONTEXT_OUT_HANDLE, CONTEXT_SELF_HANDLE};
 
@@ -182,4 +183,5 @@ pub use search::{SearchContentType, SearchFilters, SearchResult};
 // GitHub status types
 pub use github::{EventDeliveryStatus, GitHubAppAuthorizationStatus, GitHubStatus};
 
+pub mod decision;
 pub mod question;

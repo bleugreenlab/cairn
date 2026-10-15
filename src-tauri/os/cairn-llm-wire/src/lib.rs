@@ -12,6 +12,7 @@ use serde_json::Value;
 pub mod anthropic_messages;
 pub mod claude_stream;
 pub mod codex_app_server;
+pub mod decisions;
 pub mod openai_compat;
 pub mod openai_responses;
 pub mod repair;

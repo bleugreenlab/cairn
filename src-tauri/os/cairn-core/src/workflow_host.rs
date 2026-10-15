@@ -10,7 +10,7 @@ use cairn_workflow::{
     advancement::RecomputeOutcome,
     conditions::ExecutedCheckpoint,
     effects::types::{EffectResult, JobEvent, WorkflowEffect},
-    runtime::{AiConditionRequest, WorkflowHost, WorkflowOwner, WorkflowRuntime, Workload},
+    runtime::{DecisionRequest, WorkflowHost, WorkflowOwner, WorkflowRuntime, Workload},
 };
 use std::{collections::HashSet, path::Path, sync::Arc};
 
@@ -25,6 +25,23 @@ pub(crate) fn runtime(orch: &Orchestrator) -> WorkflowRuntime {
 }
 
 struct CoreWorkflowHost(Orchestrator);
+
+/// The project an execution belongs to, so its decision resolves offers in
+/// that project's scope (its private providers and tier overrides).
+async fn execution_project(
+    orch: &Orchestrator,
+    execution_id: &str,
+) -> Result<Option<String>, String> {
+    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    db.query_opt_text(
+        "SELECT project_id FROM executions WHERE id = ?1",
+        (execution_id.to_string(),),
+    )
+    .await
+    .map_err(|error| format!("failed to read execution {execution_id}: {error}"))
+}
 
 #[async_trait]
 impl WorkflowHost for CoreWorkflowHost {
@@ -75,8 +92,20 @@ impl WorkflowHost for CoreWorkflowHost {
     fn job_head(&self, job_id: &str) -> Result<String, String> {
         crate::execution::cache::get_job_logical_head_sha(&self.0, job_id)
     }
-    async fn complete_condition(&self, request: AiConditionRequest) -> Result<String, String> {
-        crate::workflow_condition::complete_condition(&self.0, request).await
+    async fn decide(
+        &self,
+        request: DecisionRequest,
+    ) -> Result<crate::models::decision::Decision, String> {
+        let project_id = execution_project(&self.0, &request.execution_id).await?;
+        self.0
+            .decide(project_id.as_deref(), &request.decision, request.input)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Decision node '{}' could not be answered: {error}",
+                    request.node_name
+                )
+            })
     }
     fn lifecycle_message(&self, job_id: &str, run_id: Option<&str>, event: JobEvent) {
         crate::messages::system::emit_job_event(&self.0, job_id, run_id, event);

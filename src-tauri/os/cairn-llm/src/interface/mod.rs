@@ -18,6 +18,7 @@
 //! catalog, its catalog-id view, the session view, and the requests refusal.
 
 pub mod complete;
+pub mod decide;
 pub mod session;
 
 use std::collections::BTreeMap;
@@ -26,6 +27,7 @@ use std::fmt;
 use cairn_credentials::AccountInfo;
 use cairn_llm_types::catalog::{DiscoveredModelPricing, ProviderDescriptor, ProviderModelCatalog};
 use cairn_llm_types::pool::ProviderPoolSnapshot;
+use cairn_models::decision::MeasuredBy;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -71,6 +73,22 @@ pub struct CatalogProvider {
     pub models: Option<ProviderModelCatalog>,
     /// The tiers bound on this provider, in the workspace's tier order.
     pub tiers: Vec<TierBinding>,
+    /// How this provider's offers answer a decision: natively over the
+    /// Decisions wire, from chat logprobs, or (`None`) not at all.
+    pub decision: Option<MeasuredBy>,
+    /// Models on this provider observed unable to answer a decision despite
+    /// its method (a chat server that returned no logprobs, or a model that
+    /// reasons before it answers), each with why. They offer no decision.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub decision_unsupported: BTreeMap<String, String>,
+}
+
+impl CatalogProvider {
+    /// How `model` on this provider answers a decision, or `None`.
+    pub fn decision_for(&self, model: &str) -> Option<MeasuredBy> {
+        self.decision
+            .filter(|_| !self.decision_unsupported.contains_key(model))
+    }
 }
 
 /// One tier as it resolves on one provider.
@@ -109,6 +127,10 @@ pub struct CatalogOffer {
     pub model: String,
     pub context_window: Option<i64>,
     pub pricing: Option<DiscoveredModelPricing>,
+    /// How this offer can answer a decision, or `None`. Whether a given
+    /// answer was measured natively is recorded on the answer itself, since
+    /// tier resolution picks the offer at run time.
+    pub decision: Option<MeasuredBy>,
 }
 
 impl Catalog {
@@ -187,6 +209,7 @@ impl Catalog {
                         model: model.model.clone(),
                         context_window: model.context_window,
                         pricing: model.pricing.clone(),
+                        decision: provider.decision_for(&model.model),
                     },
                     aliases,
                 );
@@ -206,12 +229,191 @@ impl Catalog {
                         model: binding.model.clone(),
                         context_window: None,
                         pricing: None,
+                        decision: provider.decision_for(&binding.model),
                     },
                     tier_refs(&[binding.model.as_str()]),
                 );
             }
         }
         out
+    }
+
+    /// Every offer that can answer a decision: native offers first, then
+    /// logprobs offers, each in the workspace's provider order.
+    pub fn decision_offers(&self) -> Vec<decide::DecisionOffer> {
+        let mut offers: Vec<decide::DecisionOffer> = self
+            .models()
+            .into_iter()
+            .flat_map(|model| model.offers)
+            .filter_map(|offer| {
+                Some(decide::DecisionOffer {
+                    method: offer.decision?,
+                    provider: offer.provider,
+                    model: offer.model,
+                })
+            })
+            .collect();
+        // Stable: provider order survives within each method.
+        offers.sort_by_key(|offer| offer.method != MeasuredBy::Native);
+        offers
+    }
+
+    /// The offer a decision asking for `requested` is served by.
+    ///
+    /// `requested` is what an author wrote. Unset takes the first
+    /// decision-capable offer ([`Self::decision_offers`]). A tier (`sm`, or
+    /// `provider/sm`) takes that tier's binding on a decision-capable
+    /// provider, the tier's default provider first. Anything else is an exact
+    /// model, matched by native id, catalog id, or alias. A selection that
+    /// lands only on providers that cannot decide is refused, never served by
+    /// something that can.
+    pub fn decision_offer(
+        &self,
+        requested: Option<&str>,
+    ) -> Result<decide::DecisionOffer, decide::NoDecisionOffer> {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        let refuse = |detail: Option<String>| decide::NoDecisionOffer {
+            requested: requested.map(str::to_string),
+            detail,
+        };
+        let Some(requested) = requested else {
+            return self.decision_offers().into_iter().next().ok_or_else(|| {
+                // Say why offers that would have decided did not.
+                let unable: Vec<String> = self
+                    .installed()
+                    .filter(|provider| provider.decision.is_some())
+                    .flat_map(|provider| {
+                        provider
+                            .decision_unsupported
+                            .iter()
+                            .map(move |(model, why)| {
+                                format!("{model} on {} {why}", provider.descriptor.key)
+                            })
+                    })
+                    .collect();
+                refuse((!unable.is_empty()).then(|| {
+                    format!(
+                        "every offer that could was seen unable ({})",
+                        unable.join("; ")
+                    )
+                }))
+            });
+        };
+
+        let (qualifier, tier) = match requested.split_once('/') {
+            Some((provider, tier))
+                if self
+                    .installed()
+                    .any(|candidate| candidate.descriptor.key.as_ref() == provider) =>
+            {
+                (Some(provider), tier)
+            }
+            _ => (None, requested),
+        };
+        let mut bindings: Vec<(&CatalogProvider, &TierBinding)> = self
+            .installed()
+            .filter(|provider| qualifier.is_none_or(|key| provider.descriptor.key.as_ref() == key))
+            .flat_map(|provider| {
+                provider
+                    .tiers
+                    .iter()
+                    .filter(|binding| binding.tier == tier)
+                    .map(move |binding| (provider, binding))
+            })
+            .collect();
+        if !bindings.is_empty() {
+            bindings.sort_by_key(|(provider, binding)| {
+                (
+                    provider.decision != Some(MeasuredBy::Native),
+                    !binding.is_tier_default,
+                )
+            });
+            return bindings
+                .iter()
+                .find_map(|(provider, binding)| {
+                    Some(decide::DecisionOffer {
+                        provider: provider.descriptor.key.to_string(),
+                        model: binding.model.clone(),
+                        method: provider.decision_for(&binding.model)?,
+                    })
+                })
+                .ok_or_else(|| {
+                    refuse(Some(format!(
+                        "the '{requested}' tier is bound only on {}, which cannot answer decisions{}",
+                        bindings
+                            .iter()
+                            .map(|(provider, _)| provider.descriptor.key.as_ref())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        self.observed_unable(bindings.iter().map(|(provider, binding)| {
+                            (provider.descriptor.key.as_ref(), binding.model.as_str())
+                        }))
+                    )))
+                });
+        }
+
+        let matching: Vec<CatalogOffer> = self
+            .models()
+            .into_iter()
+            .filter(|model| {
+                model.catalog_id == requested
+                    || model.aliases.iter().any(|alias| alias == requested)
+                    || model.offers.iter().any(|offer| offer.model == requested)
+            })
+            .flat_map(|model| model.offers)
+            .collect();
+        if matching.is_empty() {
+            return Err(refuse(Some(format!(
+                "no installed provider offers '{requested}'"
+            ))));
+        }
+        let mut capable: Vec<decide::DecisionOffer> = matching
+            .iter()
+            .filter_map(|offer| {
+                Some(decide::DecisionOffer {
+                    provider: offer.provider.clone(),
+                    model: offer.model.clone(),
+                    method: offer.decision?,
+                })
+            })
+            .collect();
+        capable.sort_by_key(|offer| offer.method != MeasuredBy::Native);
+        capable.into_iter().next().ok_or_else(|| {
+            let mut providers: Vec<&str> = matching
+                .iter()
+                .map(|offer| offer.provider.as_str())
+                .collect();
+            providers.dedup();
+            refuse(Some(format!(
+                "'{requested}' is offered only by {}, which cannot answer decisions{}",
+                providers.join(", "),
+                self.observed_unable(
+                    matching
+                        .iter()
+                        .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
+                )
+            )))
+        })
+    }
+
+    /// Why the named offers were observed unable to decide, as a clause to
+    /// append to a refusal; empty when none was.
+    fn observed_unable<'a>(&self, offers: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+        let reasons: Vec<String> = offers
+            .filter_map(|(key, model)| {
+                let provider = self
+                    .providers
+                    .iter()
+                    .find(|provider| provider.descriptor.key.as_ref() == key)?;
+                let why = provider.decision_unsupported.get(model)?;
+                Some(format!("{model} on {key} {why}"))
+            })
+            .collect();
+        if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", reasons.join("; "))
+        }
     }
 }
 
@@ -352,6 +554,213 @@ mod tests {
                 error: None,
             }),
             tiers,
+            decision: None,
+            decision_unsupported: BTreeMap::new(),
+        }
+    }
+
+    fn deciding(mut provider: CatalogProvider, method: MeasuredBy) -> CatalogProvider {
+        provider.decision = Some(method);
+        provider
+    }
+
+    fn custom(account: &str, models: &[&str], tiers: Vec<TierBinding>) -> CatalogProvider {
+        let key = cairn_llm_types::catalog::custom_key(account);
+        CatalogProvider {
+            descriptor: cairn_llm_types::catalog::custom_descriptor(
+                &cairn_llm_types::catalog::CustomProvider {
+                    account_id: account.to_string(),
+                    display_name: account.to_string(),
+                },
+            ),
+            installed: true,
+            models: Some(ProviderModelCatalog {
+                backend: key,
+                models: models.iter().map(|id| model(id, None)).collect(),
+                options: Vec::new(),
+                refreshed_at: Some(1),
+                error: None,
+            }),
+            tiers,
+            decision: None,
+            decision_unsupported: BTreeMap::new(),
+        }
+    }
+
+    fn subscription_only() -> Catalog {
+        Catalog {
+            providers: vec![provider(
+                "claude",
+                Some(claude_models()),
+                vec![binding("sm", "haiku"), binding("lg", "opus")],
+            )],
+        }
+    }
+
+    #[test]
+    fn offers_state_their_providers_decision_method() {
+        let catalog = Catalog {
+            providers: vec![
+                provider("claude", Some(claude_models()), vec![]),
+                deciding(
+                    custom("acc_sparks", &["gemma4-26b"], vec![]),
+                    MeasuredBy::Logprobs,
+                ),
+            ],
+        };
+        let models = catalog.models();
+        assert_eq!(find(&models, "claude/opus").offers[0].decision, None);
+        let gemma = find(&models, "custom:acc_sparks/gemma4-26b");
+        assert_eq!(gemma.offers[0].decision, Some(MeasuredBy::Logprobs));
+        let json = serde_json::to_value(&gemma.offers[0]).unwrap();
+        assert_eq!(json["decision"], "logprobs");
+    }
+
+    #[test]
+    fn an_unset_decision_model_takes_a_native_offer_before_a_logprobs_one() {
+        let catalog = Catalog {
+            providers: vec![
+                deciding(
+                    custom("acc_sparks", &["gemma4-26b"], vec![]),
+                    MeasuredBy::Logprobs,
+                ),
+                deciding(
+                    custom("acc_gateway", &["typesafe-ai/jev"], vec![]),
+                    MeasuredBy::Native,
+                ),
+            ],
+        };
+        assert_eq!(
+            catalog.decision_offer(None).unwrap(),
+            decide::DecisionOffer {
+                provider: "custom:acc_gateway".into(),
+                model: "typesafe-ai/jev".into(),
+                method: MeasuredBy::Native,
+            }
+        );
+        assert_eq!(
+            catalog.decision_offer(Some("  ")).unwrap().provider,
+            "custom:acc_gateway"
+        );
+    }
+
+    #[test]
+    fn a_subscription_only_workspace_refuses_naming_the_fixes() {
+        let refusal = subscription_only().decision_offer(None).unwrap_err();
+        let text = refusal.to_string();
+        assert!(
+            text.starts_with("No decision-capable model is configured."),
+            "{text}"
+        );
+        assert!(text.contains("Decisions API key"), "{text}");
+        assert!(text.contains("returns logprobs"), "{text}");
+        assert!(text.contains("Settings → Providers"), "{text}");
+    }
+
+    #[test]
+    fn a_tier_resolves_only_on_providers_that_can_decide() {
+        let mut catalog = subscription_only();
+        let refusal = catalog.decision_offer(Some("sm")).unwrap_err();
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("the 'sm' tier is bound only on claude, which cannot answer decisions")
+        );
+
+        catalog.providers.push(deciding(
+            custom("acc_sparks", &["qwen3-4b"], vec![binding("sm", "qwen3-4b")]),
+            MeasuredBy::Logprobs,
+        ));
+        assert_eq!(
+            catalog.decision_offer(Some("sm")).unwrap(),
+            decide::DecisionOffer {
+                provider: "custom:acc_sparks".into(),
+                model: "qwen3-4b".into(),
+                method: MeasuredBy::Logprobs,
+            }
+        );
+        // A qualified tier names its provider and nothing else.
+        assert!(catalog.decision_offer(Some("claude/sm")).is_err());
+        assert_eq!(
+            catalog
+                .decision_offer(Some("custom:acc_sparks/sm"))
+                .unwrap()
+                .model,
+            "qwen3-4b"
+        );
+    }
+
+    #[test]
+    fn an_exact_model_is_refused_when_only_non_deciding_providers_offer_it() {
+        let mut catalog = subscription_only();
+        let refusal = catalog.decision_offer(Some("opus")).unwrap_err();
+        assert_eq!(refusal.requested.as_deref(), Some("opus"));
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("'opus' is offered only by claude, which cannot answer decisions")
+        );
+        assert!(refusal
+            .to_string()
+            .starts_with("No decision-capable model serves 'opus': "));
+
+        let unknown = catalog.decision_offer(Some("nothing-like-it")).unwrap_err();
+        assert_eq!(
+            unknown.detail.as_deref(),
+            Some("no installed provider offers 'nothing-like-it'")
+        );
+
+        catalog.providers.push(deciding(
+            custom("acc_gateway", &["typesafe-ai/jev"], vec![]),
+            MeasuredBy::Native,
+        ));
+        assert_eq!(
+            catalog
+                .decision_offer(Some("typesafe-ai/jev"))
+                .unwrap()
+                .method,
+            MeasuredBy::Native
+        );
+    }
+
+    #[test]
+    fn a_model_observed_unable_to_decide_is_not_offered_and_the_refusal_says_why() {
+        let mut sparks = deciding(
+            custom(
+                "acc_sparks",
+                &["qwen3", "gemma4"],
+                vec![binding("sm", "qwen3")],
+            ),
+            MeasuredBy::Logprobs,
+        );
+        sparks
+            .decision_unsupported
+            .insert("qwen3".into(), "returned no logprobs".into());
+        let catalog = Catalog {
+            providers: vec![sparks],
+        };
+        // The other model on the same provider still decides.
+        let offers = catalog.decision_offers();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].model, "gemma4");
+        assert_eq!(catalog.decision_offer(None).unwrap().model, "gemma4");
+
+        let mut only_qwen = catalog.clone();
+        only_qwen.providers[0].decision_unsupported.insert(
+            "gemma4".into(),
+            "began 'The' instead of an answer label".into(),
+        );
+        let refusal = only_qwen.decision_offer(None).unwrap_err();
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("every offer that could was seen unable (gemma4 on custom:acc_sparks began 'The' instead of an answer label; qwen3 on custom:acc_sparks returned no logprobs)")
+        );
+
+        for requested in ["qwen3", "sm"] {
+            let refusal = catalog.decision_offer(Some(requested)).unwrap_err();
+            let detail = refusal.detail.unwrap();
+            assert!(
+                detail.ends_with("(qwen3 on custom:acc_sparks returned no logprobs)"),
+                "{detail}"
+            );
         }
     }
 

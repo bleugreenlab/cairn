@@ -130,7 +130,7 @@ pub(crate) enum SelectionMode {
     Serve,
 }
 
-fn routed_project_override(
+pub(crate) fn routed_project_override(
     orch: &Orchestrator,
     provider: crate::credentials::RoutedProvider,
     project_id: Option<&str>,
@@ -230,6 +230,7 @@ pub(crate) fn resolve_routed_session_identity(
     session_id: &str,
     project_id: Option<&str>,
     requested_model: Option<&str>,
+    snapshot_account_id: Option<&str>,
 ) -> Result<Option<crate::identity::UserIdentity>, String> {
     let session = crate::storage::run_db_blocking({
         let db = orch.db.local.clone();
@@ -237,43 +238,138 @@ pub(crate) fn resolve_routed_session_identity(
         move || async move { crate::sessions::queries::get(&db, &session_id).await }
     })?;
     let project_override = routed_project_override(orch, provider, project_id);
-    // A session keeps its account while that account can still serve, unless
-    // the project names one.
-    if project_override.is_none() {
-        if let Some(identity) = session.account_id.as_deref().and_then(|account_id| {
-            orch.resolve_available_routed_account(provider, project_id, account_id, requested_model)
-        }) {
-            return Ok(Some(identity));
-        }
+    // An existing session authenticates as its pin while that account can still
+    // serve: its conversation and prompt cache live there. Account policy — the
+    // snapshot's, then the project's — chooses only for sessions with no usable
+    // pin: new and successor sessions, or one whose account became unavailable.
+    // Editing either policy therefore never moves a healthy session, and a warm
+    // process and a cold resume of the same session always agree, because warm
+    // reuse likewise compares only the stored pin.
+    if let Some(identity) = session.account_id.as_deref().and_then(|account_id| {
+        orch.resolve_available_routed_account(provider, project_id, account_id, requested_model)
+    }) {
+        return Ok(Some(identity));
     }
+    // The execution snapshot's explicit account is the most specific policy,
+    // then the project's.
+    let explicit_account = snapshot_account_id.or(project_override.as_deref());
     let Some(selection) = route(
         orch,
         provider,
         project_id,
-        project_override.as_deref(),
+        explicit_account,
         requested_model,
         SelectionMode::Serve,
     )?
     else {
         return Ok(None);
     };
-    if let Some(account_id) = selection
+    let Some(account_id) = selection
         .account_id
-        .as_deref()
+        .clone()
         .filter(|_| selection.subscription)
-    {
-        if session.account_id.as_deref() != Some(account_id) {
-            crate::storage::run_db_blocking({
-                let db = orch.db.local.clone();
-                let session_id = session_id.to_string();
-                let account_id = account_id.to_string();
-                move || async move {
-                    crate::sessions::queries::set_account_id(&db, &session_id, &account_id).await
+    else {
+        return Ok(Some(selection.identity));
+    };
+    persist_routed_account_and_resolve_identity(
+        orch,
+        provider,
+        session_id,
+        project_id,
+        requested_model,
+        session.account_id,
+        account_id,
+        selection.identity,
+    )
+}
+
+/// Pin the selected account before launch, then authenticate as whatever the
+/// durable pin names: a concurrent cold launch or repin that won the
+/// compare-and-set is the account this process must run on.
+#[allow(clippy::too_many_arguments)]
+fn persist_routed_account_and_resolve_identity(
+    orch: &Orchestrator,
+    provider: crate::credentials::RoutedProvider,
+    session_id: &str,
+    project_id: Option<&str>,
+    requested_model: Option<&str>,
+    observed_account_id: Option<String>,
+    account_id: String,
+    identity: crate::identity::UserIdentity,
+) -> Result<Option<crate::identity::UserIdentity>, String> {
+    if observed_account_id.as_deref() != Some(account_id.as_str()) {
+        crate::storage::run_db_blocking({
+            let db = orch.db.local.clone();
+            let session_id = session_id.to_string();
+            let account_id = account_id.clone();
+            let observed_account_id = observed_account_id.clone();
+            move || async move {
+                if let Some(observed) = observed_account_id {
+                    crate::sessions::queries::compare_and_set_account_id(
+                        &db,
+                        &session_id,
+                        &observed,
+                        &account_id,
+                    )
+                    .await
+                    .map(|_| ())
+                } else {
+                    crate::sessions::queries::set_account_id_if_unset(&db, &session_id, &account_id)
+                        .await
+                        .map(|_| ())
                 }
-            })?;
-        }
+            }
+        })?;
     }
-    Ok(Some(selection.identity))
+    let pinned = crate::storage::run_db_blocking({
+        let db = orch.db.local.clone();
+        let session_id = session_id.to_string();
+        move || async move { crate::sessions::queries::get(&db, &session_id).await }
+    })?;
+    if pinned.account_id.as_deref() == Some(account_id.as_str()) {
+        Ok(Some(identity))
+    } else if let Some(winner) = pinned.account_id.as_deref() {
+        orch.resolve_available_routed_account(provider, project_id, winner, requested_model)
+            .map(Some)
+            .ok_or_else(|| {
+                format!("The concurrently selected provider account {winner} is unavailable")
+            })
+    } else {
+        Err("Provider account selection did not persist before launch".to_string())
+    }
+}
+
+/// The explicit provider account an execution snapshot selects for a run's
+/// agent, or `None` for Automatic.
+pub(crate) fn snapshot_account_override(
+    orch: &Orchestrator,
+    run_id: &str,
+) -> Result<Option<String>, String> {
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id).await?;
+        let row = db
+            .query_opt(
+                "SELECT e.snapshot, j.agent_config_id FROM runs r JOIN jobs j ON j.id = r.job_id LEFT JOIN executions e ON e.id = j.execution_id WHERE r.id = ?1",
+                (run_id,),
+                |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let Some((Some(snapshot), Some(agent_id))) = row else {
+            return Ok(None);
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&snapshot).map_err(|e| e.to_string())?;
+        Ok(value
+            .get("agents")
+            .and_then(|agents| agents.get(&agent_id))
+            .and_then(|agent| agent.get("providerAccount"))
+            .and_then(|policy| policy.get("account"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string))
+    })
 }
 
 /// Resolve the non-subscription outcome after routed account selection fails.
@@ -2436,9 +2532,9 @@ pub fn start_agent_session(
 
     // Resolve identity: an explicit server identity always wins. A session on a
     // subscription provider (Claude, Codex) otherwise retains its durable
-    // account pin while it is available; project overrides win selection
-    // outright, and an unavailable pin is replaced by the account with the most
-    // remaining usage.
+    // account pin while it is available. An execution snapshot override is the
+    // most specific policy, then a project override; otherwise an unavailable
+    // pin is replaced by the account with the most remaining usage.
     let routed_provider =
         crate::credentials::RoutedProvider::for_backend(&backend.name().to_ascii_lowercase());
     let requested_model = effective_model.as_ref().map(|model| model.as_str());
@@ -2456,6 +2552,7 @@ pub fn start_agent_session(
             &session_id,
             session_project_id.as_deref(),
             requested_model,
+            snapshot_account_override(orch, run_id)?.as_deref(),
         )?
     } else {
         let project_overrides = session_project_id.as_ref().and_then(|pid| {
@@ -2464,6 +2561,55 @@ pub fn start_agent_session(
         });
         orch.resolve_identity_for_project(session_project_id.as_deref(), project_overrides.as_ref())
     };
+    let resolved_account_id = if routed_provider.is_some() {
+        let session_id = session_start.session_id().to_string();
+        crate::storage::run_db_blocking({
+            let db = orch.db.local.clone();
+            move || async move { crate::sessions::queries::get(&db, &session_id).await }
+        })?
+        .account_id
+    } else {
+        None
+    };
+    if let (Some(provider), Some(account_id)) = (routed_provider, resolved_account_id.as_deref()) {
+        let snapshot_override = snapshot_account_override(orch, run_id)?;
+        let project_override =
+            routed_project_override(orch, provider, session_project_id.as_deref());
+        let effective_override = snapshot_override.as_deref().or(project_override.as_deref());
+        let label = orch
+            .list_accounts(session_project_id.as_deref())
+            .into_iter()
+            .find(|account| account.id == account_id)
+            .map(|account| account.label)
+            .unwrap_or_else(|| account_id.to_string());
+        let diagnostics = orch
+            .get_credential_store()
+            .map(|store| {
+                store.routed_account_diagnostics(
+                    provider,
+                    session_project_id.as_deref(),
+                    effective_override,
+                    None,
+                    requested_model,
+                    chrono::Utc::now().timestamp(),
+                )
+            })
+            .unwrap_or_default();
+        let policy = effective_override.map_or("automatic", |_| "account");
+        let message = if effective_override.is_some() {
+            format!("Provider account selected: {label} (explicit policy).")
+        } else {
+            format!("Provider account selected: {label} (automatic balancing).")
+        };
+        let _ = crate::messages::transcript::insert_system_message_sync(
+            orch,
+            run_id,
+            Some(&session_id_for_timing),
+            orch.process_state.get_current_turn_id(run_id).as_deref(),
+            &message,
+            serde_json::json!({"kind":"system:account_selection","policy":policy,"selectedAccountId":account_id,"selectedAccountLabel":label,"model":requested_model,"headroomFamily":requested_model,"candidates":diagnostics}),
+        );
+    }
 
     // Resolve the native output-constraint schema for a schema-constrained call.
     // Only calls opt in (`constrain_output_natively`); the same contract that
@@ -2538,6 +2684,7 @@ pub fn start_agent_session(
         permissions,
         bidirectional: true,
         identity: resolved_identity,
+        account_id: resolved_account_id,
         output_schema: native_output_schema,
         ambient,
         // Only the calls path passes `constrain_output_natively = true`, so this
@@ -3040,6 +3187,247 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn execution_snapshot_account_overrides_conflicting_project_account() {
+        let db = Arc::new(migrated_db().await);
+        seed_session(&db).await;
+        let orch = test_orchestrator(db.clone());
+        let project_account = orch
+            .add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                "Project default".to_string(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap();
+        let snapshot_account = orch
+            .add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                "Execution choice".to_string(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap();
+        orch.set_project_overrides(
+            "p",
+            Some(crate::credentials::AccountOverrides {
+                anthropic_account_id: Some(project_account.id.clone()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+
+        let identity = resolve_routed_session_identity(
+            &orch,
+            crate::credentials::RoutedProvider::Claude,
+            "sess",
+            Some("p"),
+            Some("opus"),
+            Some(&snapshot_account.id),
+        )
+        .unwrap()
+        .expect("snapshot-selected managed identity");
+
+        assert_eq!(
+            crate::sessions::queries::get(&db, "sess")
+                .await
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some(snapshot_account.id.as_str())
+        );
+        assert!(matches!(
+            identity.claude_auth.as_ref(),
+            Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) if account_id == &snapshot_account.id
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_policy_edit_moves_only_sessions_without_a_usable_pin() {
+        let db = Arc::new(migrated_db().await);
+        seed_session(&db).await;
+        db.execute_script(
+            "INSERT INTO sessions(id, job_id, backend, status, sequence, created_at, updated_at)
+               VALUES('successor', 'j', 'claude', 'open', 2, 1, 1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db.clone());
+        let [current, chosen] = ["Current", "Chosen for next session"].map(|label| {
+            orch.add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                label.to_string(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap()
+            .id
+        });
+        db.execute(
+            "UPDATE sessions SET account_id = ?1 WHERE id = 'sess'",
+            (current.as_str(),),
+        )
+        .await
+        .unwrap();
+        let resolve = |session: &'static str| {
+            resolve_routed_session_identity(
+                &orch,
+                crate::credentials::RoutedProvider::Claude,
+                session,
+                Some("p"),
+                Some("opus"),
+                Some(&chosen),
+            )
+            .unwrap()
+            .expect("managed identity")
+        };
+        let pin = |session: &'static str| {
+            let db = db.clone();
+            async move {
+                crate::sessions::queries::get(&db, session)
+                    .await
+                    .unwrap()
+                    .account_id
+            }
+        };
+
+        // A cold resume of the healthy session keeps its account, exactly as
+        // warm reuse does.
+        let resumed = resolve("sess");
+        assert!(matches!(
+            resumed.claude_auth.as_ref(),
+            Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) if account_id == &current
+        ));
+        assert_eq!(pin("sess").await.as_deref(), Some(current.as_str()));
+
+        // The successor session takes the edited policy.
+        resolve("successor");
+        assert_eq!(pin("successor").await.as_deref(), Some(chosen.as_str()));
+
+        // Once the pinned account cannot serve, the existing session follows
+        // the policy too.
+        orch.record_account_credit_depletion(&current, "credits_required".to_string())
+            .unwrap();
+        resolve("sess");
+        assert_eq!(pin("sess").await.as_deref(), Some(chosen.as_str()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_conflicting_project_override_does_not_move_a_healthy_snapshot_chosen_pin() {
+        let db = Arc::new(migrated_db().await);
+        seed_session(&db).await;
+        let orch = test_orchestrator(db.clone());
+        let [project_default, snapshot_choice, next_choice] =
+            ["Project default", "Snapshot choice", "Next session choice"].map(|label| {
+                orch.add_account(
+                    crate::credentials::ApiProvider::Anthropic,
+                    label.to_string(),
+                    crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                    None,
+                )
+                .unwrap()
+                .id
+            });
+        orch.set_project_overrides(
+            "p",
+            Some(crate::credentials::AccountOverrides {
+                anthropic_account_id: Some(project_default.clone()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        // The snapshot outranked the project when this session was created.
+        db.execute(
+            "UPDATE sessions SET account_id = ?1 WHERE id = 'sess'",
+            (snapshot_choice.as_str(),),
+        )
+        .await
+        .unwrap();
+
+        // The snapshot is edited for the successor; the project is unchanged.
+        let resumed = resolve_routed_session_identity(
+            &orch,
+            crate::credentials::RoutedProvider::Claude,
+            "sess",
+            Some("p"),
+            Some("opus"),
+            Some(&next_choice),
+        )
+        .unwrap()
+        .expect("managed identity");
+
+        assert!(matches!(
+            resumed.claude_auth.as_ref(),
+            Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) if account_id == &snapshot_choice
+        ));
+        assert_eq!(
+            crate::sessions::queries::get(&db, "sess")
+                .await
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some(snapshot_choice.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_replacement_wins_over_a_stale_explicit_repin_for_authentication() {
+        let db = Arc::new(migrated_db().await);
+        seed_session(&db).await;
+        let orch = test_orchestrator(db.clone());
+        let [observed, explicit, concurrent_winner] =
+            ["Observed", "Explicit repin", "Concurrent winner"].map(|label| {
+                orch.add_account(
+                    crate::credentials::ApiProvider::Anthropic,
+                    label.to_string(),
+                    crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                    None,
+                )
+                .unwrap()
+                .id
+            });
+        db.execute(
+            "UPDATE sessions SET account_id = ?1 WHERE id = 'sess'",
+            (concurrent_winner.as_str(),),
+        )
+        .await
+        .unwrap();
+        let speculative_identity = orch
+            .resolve_available_routed_account(
+                crate::credentials::RoutedProvider::Claude,
+                Some("p"),
+                &explicit,
+                Some("opus"),
+            )
+            .unwrap();
+
+        let process_identity = persist_routed_account_and_resolve_identity(
+            &orch,
+            crate::credentials::RoutedProvider::Claude,
+            "sess",
+            Some("p"),
+            Some("opus"),
+            Some(observed),
+            explicit,
+            speculative_identity,
+        )
+        .unwrap()
+        .expect("durable winner identity");
+
+        assert_eq!(
+            crate::sessions::queries::get(&db, "sess")
+                .await
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some(concurrent_winner.as_str())
+        );
+        assert!(matches!(
+            process_identity.claude_auth.as_ref(),
+            Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) if account_id == &concurrent_winner
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn removal_restart_and_session_start_pin_the_healthy_claude_profile() {
         let db = Arc::new(migrated_db().await);
         seed_session(&db).await;
@@ -3181,6 +3569,7 @@ mod tests {
             health: Some(crate::credentials::ProviderAccountHealth {
                 windows: Vec::new(),
                 blocked_until: Some(chrono::Utc::now().timestamp() + 300),
+                depleted: None,
                 captured_at: chrono::Utc::now().timestamp(),
             }),
         });

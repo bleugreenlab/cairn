@@ -978,6 +978,69 @@ async fn fail_run_on_top_level_job_stays_resumable() {
     );
 }
 
+/// A turn whose provider account ran out produced no finished work. It must
+/// never take the warm path, which completes the turn and lets recompute derive
+/// the job Complete and advance downstream nodes. It is interrupted with its own
+/// reason, and the process holding the spent credentials is stopped so the next
+/// continuation cold-launches on whatever account the session pin names.
+#[tokio::test]
+async fn provider_depleted_claude_turn_is_interrupted_not_completed() {
+    let db = test_db().await;
+    seed_top_level_run(&db, "run-spent", "job-spent", "turn-spent", "none").await;
+    let orch = test_orchestrator(db);
+    register_warm_process(&orch, "run-spent", Some("job-spent"));
+    orch.process_state.begin_turn("run-spent", "turn-spent");
+
+    super::apply_claude_turn_completion(
+        &orch,
+        &orch.db.local,
+        &orch.services.emitter,
+        "run-spent",
+        Some("sess-attn"),
+        crate::agent_process::completion::ClaudeTurnOutcome::Failed {
+            message: "You're out of usage credits.".to_string(),
+        },
+        super::ClaudeTurnContext {
+            terminal_tool_completed: false,
+            terminal_interrupt_ack_pending: false,
+            rate_limited: true,
+        },
+    );
+
+    assert_eq!(turn_state(&orch, "turn-spent").await, "interrupted");
+    assert_eq!(
+        scalar_text(
+            &orch,
+            "SELECT end_reason FROM turns WHERE id = ?1",
+            "turn-spent"
+        )
+        .await
+        .as_deref(),
+        Some("provider_depleted"),
+    );
+    assert_eq!(
+        scalar_text(&orch, "SELECT status FROM runs WHERE id = ?1", "run-spent")
+            .await
+            .as_deref(),
+        Some("crashed"),
+    );
+    assert_ne!(
+        scalar_text(&orch, "SELECT status FROM jobs WHERE id = ?1", "job-spent")
+            .await
+            .as_deref(),
+        Some("complete"),
+    );
+    assert!(
+        orch.process_state
+            .processes
+            .lock()
+            .unwrap()
+            .get("run-spent")
+            .is_none(),
+        "the process holding the depleted account's credentials must not stay reusable"
+    );
+}
+
 /// Seed a parent durably suspended on a delegated wait (anchor turn + pending
 /// `dependency_unblock` successor) and a NODE-LESS delegated child — a workflow
 /// (or ephemeral call) whose pre-materialized packet gives it no recipe node, so
@@ -1871,45 +1934,33 @@ mod claude_and_owned_completion {
     }
 
     #[tokio::test]
-    async fn claude_rate_limit_and_host_interrupt_keep_live_warm_process() {
-        for rate_limited in [false, true] {
-            let db = test_db().await;
-            seed_top_level_run(&db, "r", "j", "t", "none").await;
-            let (orch, emitter) = test_orchestrator_with_emitter(db, None);
-            register_warm_process(&orch, "r", Some("j"));
-            orch.process_state.set_current_turn_id("r", Some("t"));
-            if rate_limited {
-                orch.process_state.begin_turn("r", "t");
-            } else {
-                // The host has already parked occupancy before its interrupt ack.
-                orch.process_state.transition_to_warm("r");
-            }
-            claude(
-                &orch,
-                "r",
-                error(),
-                ClaudeTurnContext {
-                    rate_limited,
-                    ..normal_context()
-                },
-            );
-            assert_eq!(
-                scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "r")
-                    .await
-                    .as_deref(),
-                Some("live")
-            );
-            assert!(orch
-                .process_state
-                .processes
-                .lock()
-                .unwrap()
-                .get("r")
-                .unwrap()
-                .is_warm());
-            assert_eq!(emitter.events_named("run-turn-completed").len(), 1);
-            assert_eq!(diagnostic_count(&orch).await, 0);
-        }
+    /// A provider-depleted Result is settled as an interrupted turn instead; see
+    /// `provider_depleted_claude_turn_is_interrupted_not_completed`.
+    async fn claude_host_interrupt_ack_keeps_live_warm_process() {
+        let db = test_db().await;
+        seed_top_level_run(&db, "r", "j", "t", "none").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db, None);
+        register_warm_process(&orch, "r", Some("j"));
+        orch.process_state.set_current_turn_id("r", Some("t"));
+        // The host has already parked occupancy before its interrupt ack.
+        orch.process_state.transition_to_warm("r");
+        claude(&orch, "r", error(), normal_context());
+        assert_eq!(
+            scalar_text(&orch, "SELECT status FROM runs WHERE id=?1", "r")
+                .await
+                .as_deref(),
+            Some("live")
+        );
+        assert!(orch
+            .process_state
+            .processes
+            .lock()
+            .unwrap()
+            .get("r")
+            .unwrap()
+            .is_warm());
+        assert_eq!(emitter.events_named("run-turn-completed").len(), 1);
+        assert_eq!(diagnostic_count(&orch).await, 0);
     }
 
     #[tokio::test]

@@ -98,26 +98,14 @@ pub enum WorkflowEffect {
         ctx: EffectContext,
     },
 
-    /// Evaluate a condition node (may involve LLM call).
+    /// Evaluate a condition or decision node. The node's definition is read
+    /// from the execution snapshot when the effect runs.
     EvaluateCondition {
         execution_id: String,
         node_id: String,
         node_name: String,
-        /// Lightweight condition spec extracted from the recipe node config.
-        condition: ConditionSpec,
         ctx: EffectContext,
     },
-}
-
-/// Lightweight condition spec extracted from DbRecipeNode config.
-/// Avoids putting heavy DB structs in the effect.
-#[derive(Debug, Clone)]
-pub struct ConditionSpec {
-    pub condition_type: String,
-    pub expression: Option<String>,
-    pub question: Option<String>,
-    pub ports: Vec<String>,
-    pub error_handling: String,
 }
 
 /// Results from effect execution that feed back into the workflow reducer.

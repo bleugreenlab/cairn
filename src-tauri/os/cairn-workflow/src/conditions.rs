@@ -6,8 +6,9 @@
 use cairn_common::ids;
 
 use crate::db_records::{DbRecipeEdge, DbRecipeNode};
+use crate::models::decision::{Decision, DecisionNode};
 use crate::models::ConditionOutcome;
-use crate::runtime::{AiConditionRequest, WorkflowHost};
+use crate::runtime::{DecisionRequest, WorkflowHost};
 use crate::storage::{DbError, LocalDb, RowExt};
 use cairn_platform::services::emitter::EventEmitter;
 
@@ -114,14 +115,25 @@ pub async fn gather_condition_context(
     Ok(serde_json::Value::Object(context))
 }
 
-/// What evaluating a condition decided.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What evaluating a condition or decision node decided.
+///
+/// `decision` is the typed answer a decision node routed on (or refused,
+/// abstained, or fell below its threshold with). It is stored on the
+/// evaluation row, which is the decision's audit record.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConditionVerdict {
-    /// Routed to `port`. `error` is set when evaluation failed and `useDefault`
-    /// took the configured default port instead.
-    Routed { port: String, error: Option<String> },
+    /// Routed to `port`. `error` is set when a condition's evaluation failed
+    /// and `useDefault` took the configured default port instead.
+    Routed {
+        port: String,
+        error: Option<String>,
+        decision: Option<Decision>,
+    },
     /// Routed nowhere; `reason` is shown verbatim wherever the row renders.
-    Blocked { reason: String },
+    Blocked {
+        reason: String,
+        decision: Option<Decision>,
+    },
 }
 
 impl ConditionVerdict {
@@ -133,59 +145,45 @@ impl ConditionVerdict {
     }
 }
 
-/// Evaluate a condition node to a verdict.
+fn blocked(reason: impl Into<String>) -> ConditionVerdict {
+    ConditionVerdict::Blocked {
+        reason: reason.into(),
+        decision: None,
+    }
+}
+
+/// Evaluate a condition or decision node to a verdict.
 ///
-/// AI conditions are answered by the host; the answer is matched to a port
-/// here. Every failure that does not end on a port is a `Blocked` verdict, so
-/// the caller always has something to record.
+/// Every failure that does not end on a port is a `Blocked` verdict, so the
+/// caller always has something to record.
 pub async fn evaluate_condition_node(
     host: &dyn WorkflowHost,
     execution_id: &str,
     node: &DbRecipeNode,
     context: &serde_json::Value,
 ) -> ConditionVerdict {
+    if node.node_type == "decision" {
+        return evaluate_decision_node(host, execution_id, node, context).await;
+    }
     let Some(config) = node
         .config
         .as_ref()
         .and_then(|c| serde_json::from_str::<crate::models::ConditionNodeConfig>(c).ok())
     else {
-        return ConditionVerdict::Blocked {
-            reason: "Condition node has no valid config".to_string(),
-        };
+        return blocked("Condition node has no valid config");
     };
-
-    let result = match config.condition_type {
-        crate::models::ConditionType::Programmatic => {
-            let Some(expression) = config.expression.as_ref() else {
-                return ConditionVerdict::Blocked {
-                    reason: "Programmatic condition requires expression".to_string(),
-                };
-            };
-            crate::condition::evaluate_programmatic_condition(expression, context, &config.ports)
-        }
-        crate::models::ConditionType::Ai => {
-            let Some(question) = config.question.as_ref() else {
-                return ConditionVerdict::Blocked {
-                    reason: "AI condition requires question".to_string(),
-                };
-            };
-            let request = AiConditionRequest {
-                execution_id: execution_id.to_string(),
-                node_id: node.id.clone(),
-                node_name: node.name.clone(),
-                question: question.clone(),
-                ports: config.ports.clone(),
-                context: crate::condition::serialize_context_for_ai(context),
-                model: config.model.clone(),
-            };
-            host.complete_condition(request).await.and_then(|answer| {
-                crate::condition::match_ai_condition_answer(&answer, &config.ports)
-            })
-        }
+    let Some(expression) = config.expression.as_ref() else {
+        return blocked("A condition requires an expression");
     };
+    let result =
+        crate::condition::evaluate_programmatic_condition(expression, context, &config.ports);
 
     match result {
-        Ok(port) => ConditionVerdict::Routed { port, error: None },
+        Ok(port) => ConditionVerdict::Routed {
+            port,
+            error: None,
+            decision: None,
+        },
         Err(e) => match config.on_error {
             crate::models::ConditionErrorBehavior::UseDefault => match config.default_port {
                 Some(default_port) => {
@@ -198,15 +196,70 @@ pub async fn evaluate_condition_node(
                     ConditionVerdict::Routed {
                         port: default_port,
                         error: Some(e),
+                        decision: None,
                     }
                 }
-                None => ConditionVerdict::Blocked {
-                    reason: format!(
-                        "onError is useDefault but no defaultPort is configured; evaluation failed: {e}"
-                    ),
-                },
+                None => blocked(format!(
+                    "onError is useDefault but no defaultPort is configured; evaluation failed: {e}"
+                )),
             },
-            crate::models::ConditionErrorBehavior::Block => ConditionVerdict::Blocked { reason: e },
+            crate::models::ConditionErrorBehavior::Block => blocked(e),
+        },
+    }
+}
+
+/// Evaluate a decision node: ask its one routing question through the host,
+/// and route on the pick.
+///
+/// The recipe failure contract: a refusal, a pick below the node's threshold
+/// for its measuring method, or a failed call routes nowhere and blocks. A
+/// decision node has no default port, because an abstention routed to one
+/// would be a guess presented as an answer.
+async fn evaluate_decision_node(
+    host: &dyn WorkflowHost,
+    execution_id: &str,
+    node: &DbRecipeNode,
+    context: &serde_json::Value,
+) -> ConditionVerdict {
+    let Some(definition) = node
+        .config
+        .as_ref()
+        .and_then(|config| serde_json::from_str::<DecisionNode>(config).ok())
+    else {
+        return blocked("Decision node has no valid config");
+    };
+    let question = match definition.port_question() {
+        Ok((question, _)) => question.name.clone(),
+        Err(problem) => return blocked(problem),
+    };
+    let request = DecisionRequest {
+        execution_id: execution_id.to_string(),
+        node_id: node.id.clone(),
+        node_name: node.name.clone(),
+        decision: definition.clone(),
+        input: crate::condition::serialize_context_for_ai(context),
+    };
+    let decision = match host.decide(request).await {
+        Ok(decision) => decision,
+        Err(error) => return blocked(error),
+    };
+    let admitted = match decision.answer(&question) {
+        None => Err(format!("the decision returned no answer to '{question}'")),
+        Some(answer) => definition
+            .thresholds
+            .admit(answer)
+            .map(str::to_string)
+            .map_err(|abstention| abstention.to_string()),
+    };
+    match admitted {
+        Ok(port) => ConditionVerdict::Routed {
+            port,
+            error: None,
+            decision: Some(decision),
+        },
+        Err(reason) => ConditionVerdict::Blocked {
+            reason,
+            decision: Some(decision),
         },
     }
 }
@@ -237,10 +290,22 @@ pub async fn store_condition_evaluation(
     let execution_id = execution_id.to_string();
     let node_id = node_id.to_string();
     let outcome = verdict.outcome().as_str();
-    let (result_port, error_message) = match verdict {
-        ConditionVerdict::Routed { port, error } => (port.clone(), error.clone()),
-        ConditionVerdict::Blocked { reason } => (String::new(), Some(reason.clone())),
+    let (result_port, error_message, decision) = match verdict {
+        ConditionVerdict::Routed {
+            port,
+            error,
+            decision,
+        } => (port.clone(), error.clone(), decision),
+        ConditionVerdict::Blocked { reason, decision } => {
+            (String::new(), Some(reason.clone()), decision)
+        }
     };
+    // A decision node's typed answer is the row's raw result.
+    let raw_result = decision
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| format!("Failed to record the decision: {error}"))?;
 
     let stored = db
         .write(|conn| {
@@ -249,6 +314,7 @@ pub async fn store_condition_evaluation(
             let node_id = node_id.clone();
             let result_port = result_port.clone();
             let error_message = error_message.clone();
+            let raw_result = raw_result.clone();
             Box::pin(async move {
                 let inserted = conn
                     .execute(
@@ -257,7 +323,7 @@ pub async fn store_condition_evaluation(
                             id, execution_id, recipe_node_id, outcome, result_port,
                             raw_result, error_message, evaluated_at
                          )
-                         SELECT ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7
+                         SELECT ?1, ?2, ?3, ?4, ?5, ?8, ?6, ?7
                          FROM executions e
                          WHERE e.id = ?2
                            AND NOT EXISTS (
@@ -276,6 +342,7 @@ pub async fn store_condition_evaluation(
                             result_port.as_str(),
                             error_message.as_deref(),
                             now,
+                            raw_result.as_deref(),
                         ),
                     )
                     .await?;
@@ -358,7 +425,7 @@ async fn load_execution_snapshot(
         .map_err(|e| format!("Failed to load execution: {e}"))?
         .ok_or_else(|| "Execution has no snapshot".to_string())?;
 
-    serde_json::from_str(&snapshot_json)
+    crate::snapshot_migrate::load(&snapshot_json)
         .map_err(|e| format!("Failed to parse execution snapshot: {e}"))
 }
 

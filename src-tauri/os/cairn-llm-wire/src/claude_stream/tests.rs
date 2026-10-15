@@ -763,3 +763,42 @@ fn an_api_retry_frame_exposes_its_status() {
     let (init, _) = parse_event(r#"{"type":"system","subtype":"init","session_id":"s"}"#).unwrap();
     assert_eq!(init.api_retry_status(), None);
 }
+
+const CREDIT_DEPLETION_ASSISTANT: &str = r#"{"type":"assistant","uuid":"a1","session_id":"s1","is_api_error_message":true,"api_error_status":429,"error_details":"credits_required","message":{"role":"assistant","content":[{"type":"text","text":"Manage credits with /usage-credits or https://claude.ai/settings/usage?from=cc_cli_limit_message"}]}}"#;
+
+#[test]
+fn structured_assistant_errors_classify_credit_depletion() {
+    let (event, _) = parse_event(CREDIT_DEPLETION_ASSISTANT).unwrap();
+    assert_eq!(event.provider_depletion(), Some(ProviderDepletion::Credits));
+}
+
+#[test]
+fn structured_429_without_credit_marker_is_a_rolling_window() {
+    let (event, _) = parse_event(r#"{"type":"assistant","uuid":"a1","session_id":"s1","is_api_error_message":true,"api_error_status":429,"message":{"role":"assistant","content":"limit reached"}}"#).unwrap();
+    assert_eq!(
+        event.provider_depletion(),
+        Some(ProviderDepletion::RollingWindow { resets_at: None })
+    );
+}
+
+#[test]
+fn ordinary_assistant_quoting_credit_marker_is_inert() {
+    let (event, _) = parse_event(r#"{"type":"assistant","uuid":"a1","session_id":"s1","message":{"role":"assistant","content":"quoted cc_cli_limit_message and /usage-credits"}}"#).unwrap();
+    assert_eq!(event.provider_depletion(), None);
+}
+
+#[test]
+fn assistant_credit_depletion_followed_by_generic_error_result_is_terminal() {
+    let (assistant, _) = parse_event(CREDIT_DEPLETION_ASSISTANT).unwrap();
+    let pending = assistant.provider_depletion();
+    let (result, _) = parse_event(r#"{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":1,"duration_api_ms":1,"num_turns":1,"result":"An error occurred","session_id":"s1","total_cost_usd":0}"#).unwrap();
+    let ClaudeEvent::Result { is_error, data, .. } = result else {
+        panic!("fixture must end with a Result");
+    };
+
+    assert_eq!(
+        terminal_provider_depletion(is_error, &data, pending),
+        Some(ProviderDepletion::Credits)
+    );
+    assert_eq!(terminal_provider_depletion(false, &data, pending), None);
+}

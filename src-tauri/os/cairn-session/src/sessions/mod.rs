@@ -203,6 +203,44 @@ pub async fn set_account_id(
     Ok(())
 }
 
+/// Move an existing pin only if it still has the value the resolver observed.
+/// A false result means another cold launch won and its durable choice must be
+/// re-read and used for authentication.
+pub async fn compare_and_set_account_id(
+    db: &LocalDb,
+    session_id: &str,
+    expected_account_id: &str,
+    account_id: &str,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE sessions SET account_id = ?1, updated_at = ?2 WHERE id = ?3 AND account_id = ?4",
+        params![
+            account_id,
+            chrono::Utc::now().timestamp(),
+            session_id,
+            expected_account_id
+        ],
+    )
+    .await
+    .map(|changed| changed > 0)
+    .map_err(|e| format!("Failed to atomically repin session account: {e}"))
+}
+
+/// Claim an unpinned session account without overwriting a concurrent winner.
+pub async fn set_account_id_if_unset(
+    db: &LocalDb,
+    session_id: &str,
+    account_id: &str,
+) -> Result<bool, String> {
+    db.execute(
+        "UPDATE sessions SET account_id = ?1, updated_at = ?2 WHERE id = ?3 AND account_id IS NULL",
+        params![account_id, chrono::Utc::now().timestamp(), session_id],
+    )
+    .await
+    .map(|changed| changed > 0)
+    .map_err(|e| format!("Failed to atomically pin session account: {e}"))
+}
+
 /// Count sessions assigned to each account after its latest health snapshot.
 /// The per-account cutoff is applied by the caller because snapshots differ.
 pub async fn account_assignments(db: &LocalDb) -> Result<Vec<(String, i64)>, String> {

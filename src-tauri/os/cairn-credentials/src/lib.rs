@@ -317,22 +317,37 @@ fn default_custom_max_output_tokens() -> i64 {
 
 /// The wire protocol a custom endpoint speaks.
 ///
-/// One variant, deliberately. Cairn serves the OpenAI Chat Completions family
-/// and nothing else here, and the field exists so that stays a *statement* the
-/// operator made rather than an assumption Cairn drew. An endpoint routing the
-/// Messages or Responses paths as well is evidence those routes exist, not that
-/// their semantics have been verified, so a second variant is earned by a
-/// verified adapter and by fixtures, not by an address that answers.
+/// The field exists so the protocol stays a *statement* the operator made
+/// rather than an assumption Cairn drew. An endpoint routing other paths as
+/// well is evidence those routes exist, not that their semantics have been
+/// verified, so a variant is earned by a verified adapter and by fixtures, not
+/// by an address that answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CustomProtocol {
+    /// OpenAI Chat Completions: agent turns and responses, and decisions
+    /// measured from logprobs when the server returns them.
     #[serde(rename = "openai-chat")]
     OpenAiChatCompletions,
+    /// The Decisions wire (`POST {base}/decisions`): OpenAI's Decisions API,
+    /// the Vercel AI Gateway, or TypeSafe. It answers decisions and nothing
+    /// else, so it never serves an agent turn or a response.
+    #[serde(rename = "openai-decisions")]
+    Decisions,
 }
 
 impl CustomProtocol {
     pub fn as_str(self) -> &'static str {
         match self {
             CustomProtocol::OpenAiChatCompletions => "openai-chat",
+            CustomProtocol::Decisions => "openai-decisions",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "openai-chat" => Some(Self::OpenAiChatCompletions),
+            "openai-decisions" => Some(Self::Decisions),
+            _ => None,
         }
     }
 }
@@ -465,6 +480,15 @@ impl ProviderAuth {
     ) -> Result<Self, String> {
         if max_output_tokens <= 0 {
             return Err("maximum output tokens must be greater than zero".to_string());
+        }
+        if protocol == CustomProtocol::Decisions && matches!(models, CustomModelPolicy::Discover) {
+            // A Decisions deployment's `/models` lists every model it routes,
+            // nearly all of which are chat models that cannot answer a
+            // decision. Offering them would be a list of refusals.
+            return Err(
+                "list the decision model ids for a Decisions provider (for example typesafe-ai/jev); its model listing names chat models that cannot answer decisions"
+                    .to_string(),
+            );
         }
         let raw = base_url.trim();
         let parsed = url::Url::parse(raw)
@@ -603,6 +627,16 @@ impl ProviderAuth {
     }
 }
 
+/// Provider-reported credit exhaustion for one account.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDepletion {
+    /// Unix timestamp when the provider reported the depletion.
+    pub since: i64,
+    /// Non-secret provider detail suitable for operator-facing diagnostics.
+    pub detail: String,
+}
+
 /// Persisted availability and subscription usage for one provider account.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -611,13 +645,17 @@ pub struct ProviderAccountHealth {
     pub windows: Vec<cairn_llm_types::usage::ProviderUsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_until: Option<i64>,
+    /// Credit exhaustion cannot be inferred to have healed with time. Only an
+    /// explicit operator retry clears this marker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depleted: Option<AccountDepletion>,
     pub captured_at: i64,
 }
 
 impl ProviderAccountHealth {
     /// Whether the provider has told Cairn this account cannot run yet.
     fn is_blocked(&self, now: i64) -> bool {
-        self.blocked_until.is_some_and(|until| until > now)
+        self.depleted.is_some() || self.blocked_until.is_some_and(|until| until > now)
     }
 
     /// The tightest remaining headroom this snapshot still speaks for at `now`,
@@ -832,6 +870,20 @@ pub struct CredentialStore {
     pub config_dir: std::path::PathBuf,
 }
 
+/// Whether `account` is a configured row in `project_id`'s scope holding a
+/// login `same_login` recognizes.
+fn holds_oauth_login(
+    account: &ProviderAccount,
+    api_provider: ApiProvider,
+    project_id: Option<&str>,
+    same_login: &dyn Fn(&str) -> bool,
+) -> bool {
+    account.api_provider == api_provider
+        && account.source == AccountSource::Configured
+        && account.project_id.as_deref() == project_id
+        && matches!(&account.auth, ProviderAuth::OAuthToken { value } if same_login(value))
+}
+
 impl CredentialStore {
     /// Explain routing eligibility without exposing any credential material.
     pub fn routed_account_diagnostics(
@@ -864,6 +916,15 @@ impl CredentialStore {
                 } else if !account.serves_backend(backend) {
                     Some(format!(
                         "account is not compatible with backend '{backend}'"
+                    ))
+                } else if let Some(depletion) = account
+                    .health
+                    .as_ref()
+                    .and_then(|health| health.depleted.as_ref())
+                {
+                    Some(format!(
+                        "usage credits are exhausted since {}; Cairn cannot detect a top-up automatically ({}). Retry this account after adding credits",
+                        depletion.since, depletion.detail
                     ))
                 } else if account
                     .health
@@ -961,6 +1022,20 @@ impl CredentialStore {
         info
     }
 
+    /// The configured account in `project_id`'s scope that already holds a
+    /// login `same_login` recognizes as the same provider account: the row
+    /// [`Self::upsert_oauth_account`] would replace.
+    pub fn held_oauth_account(
+        &self,
+        api_provider: ApiProvider,
+        project_id: Option<&str>,
+        same_login: impl Fn(&str) -> bool,
+    ) -> Option<&ProviderAccount> {
+        self.accounts
+            .iter()
+            .find(|account| holds_oauth_login(account, api_provider, project_id, &same_login))
+    }
+
     /// Store a completed OAuth login, replacing in place the configured
     /// account that already holds a login for the same provider account.
     ///
@@ -983,10 +1058,7 @@ impl CredentialStore {
     ) -> AccountInfo {
         let label = login.email.clone().unwrap_or(label);
         let existing = self.accounts.iter_mut().find(|account| {
-            account.api_provider == api_provider
-                && account.source == AccountSource::Configured
-                && account.project_id == project_id
-                && matches!(&account.auth, ProviderAuth::OAuthToken { value } if same_login(value))
+            holds_oauth_login(account, api_provider, project_id.as_deref(), &same_login)
         });
         if let Some(account) = existing {
             account.label = label;
@@ -1631,6 +1703,7 @@ mod account_operation_tests {
         store.accounts[0].health = Some(ProviderAccountHealth {
             windows: Vec::new(),
             blocked_until: Some(99),
+            depleted: None,
             captured_at: 1,
         });
         let updated = store
@@ -1774,6 +1847,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            depleted: None,
             captured_at,
         });
         account
@@ -2232,6 +2306,52 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn credit_depletion_stays_unavailable_without_a_time_expiry() {
+        let mut store = test_store();
+        let mut depleted = healthy_claude_account("depleted", 90.0, 100);
+        depleted.health.as_mut().unwrap().depleted = Some(AccountDepletion {
+            since: 150,
+            detail: "credits_required".to_string(),
+        });
+        store.accounts = vec![depleted];
+
+        assert!(store
+            .select_routed_account(
+                RoutedProvider::Claude,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                i64::MAX,
+            )
+            .is_none());
+        let diagnostics = store.routed_account_diagnostics(
+            RoutedProvider::Claude,
+            None,
+            Some("depleted"),
+            None,
+            None,
+            i64::MAX,
+        );
+        let reason = diagnostics[0].rejection.as_deref().unwrap();
+        assert!(reason.contains("credits are exhausted"));
+        assert!(reason.contains("cannot detect a top-up"));
+    }
+
+    #[test]
+    fn legacy_health_without_depletion_deserializes_as_available() {
+        let health: ProviderAccountHealth = serde_json::from_value(serde_json::json!({
+            "windows": [],
+            "capturedAt": 100
+        }))
+        .unwrap();
+
+        assert_eq!(health.depleted, None);
+        assert!(!health.is_blocked(i64::MAX));
+    }
+
     /// A subscription account measured empty is out of rotation only while
     /// that window stands. Once its reset time passes the number is history,
     /// not exhaustion — otherwise nothing would ever route to the account
@@ -2291,6 +2411,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            depleted: None,
             captured_at,
         });
         account

@@ -34,9 +34,13 @@ use crate::backends::{
 use crate::credentials::{
     ApiProvider, CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth,
 };
+use crate::models::decision::MeasuredBy;
 use crate::orchestrator::Orchestrator;
+use cairn_llm::interface::decide::DecisionRoute;
 use cairn_llm::types::catalog;
 use cairn_llm::types::catalog::DiscoveredModel;
+use cairn_llm::wire::decisions::http::DecisionsEndpoint;
+use cairn_llm::wire::openai_compat::http::Endpoint;
 
 /// One custom provider, resolved from the account that defines it.
 ///
@@ -129,6 +133,53 @@ impl CustomProviderConfig {
     pub(crate) fn models_url(&self) -> String {
         format!("{}/models", self.base_url)
     }
+
+    pub(crate) fn decisions_url(&self) -> String {
+        format!("{}/decisions", self.base_url)
+    }
+
+    /// Refuse what a Decisions provider cannot do: it answers decisions, and
+    /// has no agent turn or text completion to offer.
+    pub(crate) fn require_turns(&self) -> Result<(), String> {
+        match self.protocol {
+            CustomProtocol::OpenAiChatCompletions => Ok(()),
+            CustomProtocol::Decisions => Err(format!(
+                "{} speaks the Decisions protocol, which answers decisions only; it cannot run an agent or a response. Choose a chat provider for this.",
+                self.display_name
+            )),
+        }
+    }
+
+    /// How this provider answers a decision. A chat server is offered as a
+    /// logprobs route; whether it actually returns logprobs is learned from
+    /// its first reply, and one that does not is refused, never guessed at.
+    pub(crate) fn decision_method(&self) -> MeasuredBy {
+        match self.protocol {
+            CustomProtocol::OpenAiChatCompletions => MeasuredBy::Logprobs,
+            CustomProtocol::Decisions => MeasuredBy::Native,
+        }
+    }
+
+    /// The deployment that measures this provider's decisions.
+    pub(crate) fn decision_route(&self) -> DecisionRoute {
+        let provider_name = self.display_name.clone();
+        let backend_key = self.backend_key();
+        let headers = self.headers.clone();
+        match self.protocol {
+            CustomProtocol::OpenAiChatCompletions => DecisionRoute::Logprobs(Endpoint {
+                provider_name,
+                backend_key,
+                chat_url: self.chat_url(),
+                headers,
+            }),
+            CustomProtocol::Decisions => DecisionRoute::Native(DecisionsEndpoint {
+                provider_name,
+                backend_key,
+                url: self.decisions_url(),
+                headers,
+            }),
+        }
+    }
 }
 
 /// The backend for one custom provider.
@@ -185,7 +236,7 @@ impl AgentBackend for CustomBackend {
         orch: &Orchestrator,
         project_id: Option<&str>,
     ) -> Result<(), String> {
-        self.config(orch, project_id).map(|_| ())
+        self.config(orch, project_id)?.require_turns()
     }
 
     fn response_model_availability(
@@ -256,6 +307,7 @@ impl AgentBackend for CustomBackend {
 
     fn start_session(&self, config: SessionConfig, orch: &Orchestrator) -> Result<(), String> {
         let provider = self.config(orch, Some(&config.project_id))?;
+        provider.require_turns()?;
         crate::backends::http_loop::start_session(
             config,
             orch,

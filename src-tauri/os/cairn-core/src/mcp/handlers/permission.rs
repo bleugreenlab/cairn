@@ -12,7 +12,9 @@ use crate::agent_process::process::GoalPauseOwner;
 use crate::backends::{stdin, AgentPermissions};
 use crate::execution::jobs::GoalReactivation;
 use crate::mcp::types::McpCallbackRequest;
-use crate::models::{ExecutionSnapshot, Fence, TurnStartReason, TurnState, TurnYieldReason};
+use crate::models::{
+    ExecutionSnapshot, Fence, TurnEndReason, TurnStartReason, TurnState, TurnYieldReason,
+};
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 use cairn_common::authorization::AuthorityLifetimeKind;
@@ -515,16 +517,11 @@ pub(crate) async fn await_permission_decision(
             .await
         }
         Woke::Answer(Ok(response)) => {
-            // Create successor turn for the permission response.
+            // `record_permission_response` minted this answer's successor
+            // (pending) before it broadcast; the inline waiter is the one owner
+            // that starts it, because this process continues the provider turn.
             if let Some(ref pred_turn_id) = current_turn_id {
-                match ensure_and_start_successor_turn(
-                    &orch.db.local,
-                    run_id,
-                    pred_turn_id,
-                    TurnStartReason::PermissionResponse,
-                )
-                .await
-                {
+                match start_permission_successor(&orch.db.local, run_id, pred_turn_id).await {
                     Ok(Some(successor)) => {
                         emit_successor_turn_events(&orch.db.local, &*services.emitter, &successor)
                             .await;
@@ -532,7 +529,7 @@ pub(crate) async fn await_permission_decision(
                             .set_current_turn_id(run_id, Some(&successor.turn_id));
                     }
                     Ok(None) => {}
-                    Err(e) => log::warn!("Failed to ensure successor turn: {}", e),
+                    Err(e) => log::warn!("Failed to start permission successor turn: {}", e),
                 }
             }
             PermissionWait::Decided(response)
@@ -627,7 +624,7 @@ async fn withdraw_inline_wait(
 }
 
 /// What [`withdraw_permission_request`] did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Withdrawal {
     /// The request was no longer pending; nothing changed.
     NotPending,
@@ -639,7 +636,7 @@ pub(crate) enum Withdrawal {
 }
 
 /// Who continues the yielded turn once its permission is withdrawn.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum HandBack {
     /// The request carried no turn.
     NoTurn,
@@ -648,10 +645,14 @@ pub(crate) enum HandBack {
     HeldByAnotherWait,
     /// The provider turn was still open, so it was un-yielded in place.
     Unyielded,
-    /// The provider turn has ended and nothing else owns it. Continuing it
-    /// needs the single successor owner cairn/4936 introduces; until then it
-    /// is left yielded and logged, and nothing is minted here.
-    ProviderTurnEnded,
+    /// The provider turn has ended and nothing else owns it. The withdrawal
+    /// decided its successor in the same transaction, through the single
+    /// minter [`ensure_permission_successor_conn`]; a pending one is continued
+    /// into with the withdrawal notice once the transaction commits.
+    ProviderTurnEnded {
+        job_id: Option<String>,
+        successor: PermissionSuccessor,
+    },
 }
 
 /// Withdraw a pending permission whose handoff closed, in one transaction:
@@ -748,7 +749,11 @@ pub(crate) async fn withdraw_permission_request(
                             .await?;
                             HandBack::Unyielded
                         } else {
-                            HandBack::ProviderTurnEnded
+                            HandBack::ProviderTurnEnded {
+                                job_id: job_id.clone(),
+                                successor: ensure_permission_successor_conn(conn, &run_id, turn_id)
+                                    .await?,
+                            }
                         }
                     }
                 };
@@ -780,14 +785,55 @@ pub(crate) async fn withdraw_permission_request(
                     crate::notify::turn_db_change_for_id(&orch.db.local, turn_id, "update").await;
                 let _ = emitter.emit("db-change", change);
             }
-            HandBack::ProviderTurnEnded => log::warn!(
+            HandBack::ProviderTurnEnded {
+                job_id: Some(job_id),
+                successor:
+                    PermissionSuccessor::Successor {
+                        turn_id: successor_turn_id,
+                        state: TurnState::Pending,
+                        ..
+                    },
+            } => {
+                if let PermissionSuccessor::Successor { inserted: true, .. } =
+                    hand_back_successor(hand_back)
+                {
+                    let change = crate::notify::turn_db_change_for_id(
+                        &orch.db.local,
+                        successor_turn_id,
+                        "insert",
+                    )
+                    .await;
+                    let _ = emitter.emit("db-change", change);
+                }
+                let outcome = continue_into_permission_successor(
+                    orch,
+                    &orch.db.local,
+                    request_id,
+                    job_id,
+                    successor_turn_id,
+                    &withdrawn_notice(Some(cause)),
+                )
+                .await;
+                log::info!(
+                    "withdrawn permission {request_id}: continued turn {turn_id} into \
+                     {successor_turn_id}: {outcome:?}"
+                );
+            }
+            HandBack::ProviderTurnEnded { successor, .. } => log::warn!(
                 "withdrawn permission {request_id} left turn {turn_id} yielded: its provider \
-                 turn has ended and continuing it needs the single successor owner (cairn/4936)"
+                 turn has ended and there is no pending successor to continue in ({successor:?})"
             ),
             HandBack::NoTurn | HandBack::HeldByAnotherWait => {}
         }
     }
     Ok(withdrawal)
+}
+
+fn hand_back_successor(hand_back: &HandBack) -> &PermissionSuccessor {
+    match hand_back {
+        HandBack::ProviderTurnEnded { successor, .. } => successor,
+        _ => &PermissionSuccessor::Unowned,
+    }
 }
 
 /// Whether some wait other than `request_id` still holds `turn_id` yielded: a
@@ -1574,7 +1620,10 @@ pub struct PermissionResponseResume {
     pub session_id: Option<String>,
     pub issue_id: Option<String>,
     pub predecessor_turn_id: Option<String>,
-    pub successor_turn_id: Option<String>,
+    /// What the answer did to the run's turn lineage, decided in the same
+    /// transaction that recorded it. `None` for a duplicate answer or a request
+    /// with no recoverable predecessor turn.
+    pub successor: Option<PermissionSuccessor>,
     pub job_id: Option<String>,
     pub duplicate: bool,
     /// The request had been withdrawn when this answer reached it: what the
@@ -1582,6 +1631,75 @@ pub struct PermissionResponseResume {
     /// recorded the answer, so a withdrawal that lands after the resolver's
     /// first look is still caught before any effect.
     pub withdrawn_notice: Option<String>,
+}
+
+impl PermissionResponseResume {
+    /// The turn the run continues in after this answer, when the answer owns
+    /// one: the `permission_response` successor, whether this answer minted it
+    /// or a sibling permission of the same predecessor did.
+    pub fn successor_turn_id(&self) -> Option<&str> {
+        match self.successor.as_ref() {
+            Some(PermissionSuccessor::Successor { turn_id, .. }) => Some(turn_id),
+            _ => None,
+        }
+    }
+}
+
+/// What answering a permission did to its run's turn lineage. Decided by
+/// [`ensure_permission_successor_conn`], the single place a `permission_response`
+/// turn is minted. Minting never starts the turn: exactly one caller starts it
+/// afterwards -- the inline waiter on the fast path, or
+/// [`continue_into_permission_successor`] on the slow path.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PermissionSuccessor {
+    /// The predecessor turn is still open (`running` or `pending`). A live
+    /// provider poll owns it -- Codex never yields its turn while it waits -- and
+    /// the broadcast wakes it, so nothing is minted and nothing is resumed.
+    ProviderTurnOpen,
+    /// The run has no owning job or session, or its predecessor turn is gone, so
+    /// there is no lineage to continue.
+    Unowned,
+    /// The job is already serving a turn that is not this predecessor's
+    /// continuation. The result is delivered through the job's queue.
+    JobBusy { active_turn_id: String },
+    /// The predecessor already continued in a turn something else minted (an
+    /// operator steer, another continuation). It is not this answer's to start;
+    /// the result is delivered through the job's queue.
+    ForeignSuccessor { turn_id: String },
+    /// The predecessor's `permission_response` successor: minted by this answer
+    /// (`inserted`) or by an earlier answer to a sibling permission raised by the
+    /// same turn. `state` is as read inside the answering transaction.
+    Successor {
+        turn_id: String,
+        inserted: bool,
+        state: TurnState,
+    },
+}
+
+impl PermissionSuccessor {
+    /// Whether a durably suspended run is resumed after this answer: driven into
+    /// its own successor, or handed the result through the queue.
+    fn resumes_job(&self) -> bool {
+        matches!(
+            self,
+            PermissionSuccessor::Successor { .. }
+                | PermissionSuccessor::JobBusy { .. }
+                | PermissionSuccessor::ForeignSuccessor { .. }
+        )
+    }
+}
+
+/// How the slow path delivered an answered permission's result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PermissionContinuation {
+    /// The job continued into the successor turn; the process was driven.
+    Driven,
+    /// Another launch had already served or finished the successor, so the
+    /// result was queued for the job's next boundary.
+    Queued,
+    /// Nothing could continue the job. The successor (if unserved) was settled
+    /// and the refusal recorded on the permission row.
+    Refused { reason: String },
 }
 
 /// Persist an "allow all" decision for the agent that owns a permission request.
@@ -2229,8 +2347,12 @@ async fn resolve_permission_request_impl(
         "db-change",
         serde_json::json!({"table": "permission_requests", "action": "update"}),
     );
-    if let Some(turn_id) = resume.successor_turn_id.as_deref() {
-        let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, "update").await;
+    if let Some(PermissionSuccessor::Successor {
+        turn_id, inserted, ..
+    }) = resume.successor.as_ref()
+    {
+        let action = if *inserted { "insert" } else { "update" };
+        let change = crate::notify::turn_db_change_for_id(&owning_db, turn_id, action).await;
         let _ = orch.services.emitter.emit("db-change", change);
     }
 
@@ -2266,17 +2388,19 @@ async fn resolve_permission_request_impl(
         }
     } else if !resume.duplicate
         && !inline_waiter_was_present
-        && resume.successor_turn_id.is_none()
+        && resume.successor != Some(PermissionSuccessor::ProviderTurnOpen)
         && !crossing
             .as_ref()
             .is_some_and(CrossingDetail::is_terminal_origin)
     {
         // Park-forever signature (CAIRN-2123): the run durably suspended (no
-        // inline waiter), this is the first answer (not a duplicate), and yet no
-        // successor turn was created — so the run has no turn to resume into. The
-        // resume-time predecessor fallback should have recovered one; if this
-        // fires, a permission was answered but its run stays parked. Logged at
-        // warn so a recurrence is diagnosable from logs, not just a live DB peek.
+        // inline waiter), this is the first answer (not a duplicate), and yet
+        // the answer has no turn to continue in -- the predecessor is missing
+        // or the run has no job/session. The resume-time predecessor fallback
+        // should have recovered one; if this fires, a permission was answered
+        // but its run stays parked. Logged at warn so a recurrence is
+        // diagnosable from logs, not just a live DB peek. An open provider turn
+        // is not this: its live poll receives the broadcast.
         log::warn!(
             "permission {request_id}: durably suspended but no successor turn was created \
              (predecessor turn missing); run {} may stay parked. job_id={:?}",
@@ -2455,7 +2579,10 @@ fn should_resume_permission_response(
 ) -> bool {
     !crossing.is_some_and(CrossingDetail::is_terminal_origin)
         && !resume.duplicate
-        && resume.successor_turn_id.is_some()
+        && resume
+            .successor
+            .as_ref()
+            .is_some_and(PermissionSuccessor::resumes_job)
         && !inline_waiter_was_present
 }
 
@@ -2509,6 +2636,7 @@ async fn resume_suspended_permission(
         if let Some(error) = mint_failure {
             return finish_resume(
                 orch,
+                owning_db,
                 record,
                 resume,
                 session_id,
@@ -2521,7 +2649,8 @@ async fn resume_suspended_permission(
                     true,
                 ),
                 resolution,
-            );
+            )
+            .await;
         }
         let (content, is_error) = match decision {
             PermissionDecision::Deny => (
@@ -2545,13 +2674,15 @@ async fn resume_suspended_permission(
         };
         return finish_resume(
             orch,
+            owning_db,
             record,
             resume,
             session_id,
             job_id,
             (content, is_error),
             resolution,
-        );
+        )
+        .await;
     }
 
     let (content, is_error) = match crossing {
@@ -2595,6 +2726,7 @@ async fn resume_suspended_permission(
 
     finish_resume(
         orch,
+        owning_db,
         record,
         resume,
         session_id,
@@ -2602,13 +2734,21 @@ async fn resume_suspended_permission(
         (content, is_error),
         resolution,
     )
+    .await
 }
 
 /// Attach the synthetic tool result to the call the agent is waiting on and
 /// continue the job. Shared by the fence, authority, and legacy-prompt resume
 /// paths so all three land the result identically.
-fn finish_resume(
+///
+/// The job continues INTO the successor the answer minted, by explicit id; it
+/// never allocates a turn of its own. When the job is busy with something else
+/// the result goes through its queue instead, where nothing is minted and so
+/// nothing can strand.
+#[allow(clippy::too_many_arguments)]
+async fn finish_resume(
     orch: &Orchestrator,
+    owning_db: &LocalDb,
     record: &PermissionRequestRecord,
     resume: &PermissionResponseResume,
     session_id: &str,
@@ -2630,24 +2770,264 @@ fn finish_resume(
         Some(resolution),
     )?;
 
-    let prompt_resume = crate::execution::jobs::ResumeContext {
+    match resume.successor.as_ref() {
+        Some(PermissionSuccessor::Successor { turn_id, .. }) => {
+            // The driver settles and records its own refusal; nothing further
+            // for the caller to report.
+            continue_into_permission_successor(
+                orch, owning_db, &record.id, job_id, turn_id, &content,
+            )
+            .await;
+            Ok(())
+        }
+        Some(
+            PermissionSuccessor::JobBusy { .. } | PermissionSuccessor::ForeignSuccessor { .. },
+        ) => {
+            if let Err(error) = crate::execution::jobs::continue_job_or_enqueue(
+                orch,
+                job_id,
+                Some(&content),
+                None,
+                Some(&record.id),
+            ) {
+                let reason = format!("the job was busy and queueing the result failed: {error}");
+                record_resume_error(orch, owning_db, &record.id, &reason).await;
+                return Err(reason);
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "no turn to continue after permission (successor: {other:?})"
+        )),
+    }
+}
+
+/// Continue a job into the `permission_response` successor an answer minted,
+/// and make sure that turn never outlives a refusal.
+///
+/// `continue_job_impl` adopts the turn through `preclaimed_successor_turn_id`
+/// (validated as this job's, this session's, and still pending), takes a native
+/// resume, and starts it on the resumed run.
+///
+/// Whether a successor went undelivered is never inferred from process
+/// occupancy: a process reads as serving no turn while it is `Busy`, and
+/// between its `end_turn()` and finalize writing the turn `complete`, so that
+/// predicate would cancel a turn a sibling answer's launch delivered. Only two
+/// facts mark a successor as undriven, and both are decided under the job's
+/// launch lock, the lock every warm launch holds from `start_turn` through
+/// prompt delivery:
+///
+/// - a launch that started it and then failed to deliver settles it itself,
+///   before releasing the lock (`ResumeContext::unwind_preclaimed_start_as`).
+///   So under the lock, a `running` successor always means a launch delivered it.
+/// - one still `pending` under the lock, with no admitted cold launch owning
+///   the job, was never started, and is settled here.
+///
+/// Either way it ends `cancelled` with
+/// [`TurnEndReason::PermissionResumeRefused`] and the refusal is written to
+/// `permission_requests.resume_error`. Otherwise another launch owns the
+/// successor (served, finished, or admitted), and the result is queued for its
+/// next boundary.
+///
+/// The settle is diagnostic: the answer is already committed, so a failure here
+/// is logged and never fails the answer.
+pub(crate) async fn continue_into_permission_successor(
+    orch: &Orchestrator,
+    owning_db: &LocalDb,
+    request_id: &str,
+    job_id: &str,
+    successor_turn_id: &str,
+    content: &str,
+) -> PermissionContinuation {
+    let context = crate::execution::jobs::ResumeContext {
         suppress_user_event: true,
         goal_reactivation: Some(GoalReactivation::OwnedConditionResolved(
             GoalPauseOwner::UserInput {
-                request_id: record.id.clone(),
+                request_id: request_id.to_string(),
             },
         )),
+        preclaimed_successor_turn_id: Some(successor_turn_id.to_string()),
+        unwind_preclaimed_start_as: Some(TurnEndReason::PermissionResumeRefused),
         ..Default::default()
     };
-    crate::execution::jobs::continue_job_impl(
+    let end_reason = TurnEndReason::PermissionResumeRefused.to_string();
+    // Only a still-pending successor is this caller's to start. One a sibling
+    // answer already drove is classified below without entering the launch
+    // funnel, whose own pending check sits after run selection.
+    let mut launched = false;
+    let refusal = match load_successor_turn(owning_db, successor_turn_id).await {
+        Ok(Some((TurnState::Pending, _))) => {
+            launched = true;
+            match crate::execution::jobs::continue_job_impl(
+                orch,
+                job_id,
+                Some(content),
+                None,
+                Some(context),
+            ) {
+                Ok(_) => return PermissionContinuation::Driven,
+                Err(reason) => reason,
+            }
+        }
+        Ok(Some((state, _))) => format!("successor turn {successor_turn_id} is already {state}"),
+        Ok(None) => format!("successor turn {successor_turn_id} not found"),
+        Err(error) => format!("could not read successor turn {successor_turn_id}: {error}"),
+    };
+
+    let settled = match settle_undriven_successor_locked(
+        orch,
+        owning_db,
+        job_id,
+        successor_turn_id,
+        &end_reason,
+    ) {
+        Ok(settled) => settled,
+        Err(error) => {
+            log::warn!(
+                "permission {request_id}: could not classify successor {successor_turn_id} \
+                 after a refused resume ({refusal}): {error}; queueing the result"
+            );
+            false
+        }
+    };
+    if settled {
+        let change =
+            crate::notify::turn_db_change_for_id(owning_db, successor_turn_id, "update").await;
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    // This call's own launch started the successor and unwound it on failure.
+    let unwound = !settled
+        && launched
+        && matches!(
+            load_successor_turn(owning_db, successor_turn_id).await,
+            Ok(Some((TurnState::Cancelled, Some(reason)))) if reason == end_reason
+        );
+    if settled || unwound {
+        record_resume_error(orch, owning_db, request_id, &refusal).await;
+        log::warn!(
+            "permission {request_id}: answered, but the job could not continue into \
+             successor {successor_turn_id} ({refusal}); settled it as {end_reason}"
+        );
+        return PermissionContinuation::Refused { reason: refusal };
+    }
+
+    match crate::execution::jobs::continue_job_or_enqueue(
         orch,
         job_id,
-        Some(&content),
+        Some(content),
         None,
-        Some(prompt_resume),
+        Some(request_id),
+    ) {
+        Ok(_) => {
+            log::info!(
+                "permission {request_id}: successor {successor_turn_id} is owned by another \
+                 launch ({refusal}); queued the result for its next boundary"
+            );
+            PermissionContinuation::Queued
+        }
+        Err(error) => {
+            let reason = format!("{refusal}; queueing the result also failed: {error}");
+            record_resume_error(orch, owning_db, request_id, &reason).await;
+            log::warn!(
+                "permission {request_id}: answered, but the result was not delivered: {reason}"
+            );
+            PermissionContinuation::Refused { reason }
+        }
+    }
+}
+
+/// A successor turn's state and end reason, if it exists.
+async fn load_successor_turn(
+    db: &LocalDb,
+    turn_id: &str,
+) -> DbResult<Option<(TurnState, Option<String>)>> {
+    db.query_opt(
+        "SELECT state, end_reason FROM turns WHERE id = ?1",
+        params![turn_id],
+        |row| {
+            let state = row.text(0)?.parse::<TurnState>().map_err(DbError::Row)?;
+            Ok((state, row.opt_text(1)?))
+        },
     )
-    .map_err(|e| format!("Failed to resume after permission: {}", e))?;
-    Ok(())
+    .await
+}
+
+/// Under the job's launch lock, settle the successor `cancelled` if it is still
+/// pending and nothing owns it, and report whether it did. Owners, either of
+/// which leaves it alone: an admitted cold start (in-memory launch claim), or a
+/// cold continuation queued in durable admission (a `starting` run for the job).
+///
+/// A `running` successor is never settled here. Every permission launch that
+/// starts one and fails unwinds it before releasing this lock, so `running`
+/// means delivered, even when the serving process has already ended the turn
+/// or reads as `Busy`. The compare-and-set on `pending` is belt and braces; the
+/// lock is what keeps a launch out of its start window while this decides.
+fn settle_undriven_successor_locked(
+    orch: &Orchestrator,
+    owning_db: &LocalDb,
+    job_id: &str,
+    turn_id: &str,
+    end_reason: &str,
+) -> Result<bool, String> {
+    let launch_lock = orch.job_launch_lock(job_id);
+    let _launch_guard = launch_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if orch.claimed_launch_run(job_id).is_some() {
+        return Ok(false);
+    }
+    crate::storage::run_db_blocking(|| async {
+        let Some((TurnState::Pending, _)) = load_successor_turn(owning_db, turn_id)
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let starting_runs = owning_db
+            .query_one(
+                "SELECT COUNT(*) FROM runs WHERE job_id = ?1 AND status = 'starting'",
+                params![job_id],
+                |row| row.i64(0),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if starting_runs > 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let settled = owning_db
+            .execute(
+                "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, \
+                 updated_at = ?2 WHERE id = ?3 AND state = 'pending'",
+                params![end_reason, now, turn_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(settled > 0)
+    })
+}
+
+/// Record on the permission row why its answer did not resume the job, so the
+/// refusal is visible where the answer is rather than only in the host log.
+async fn record_resume_error(
+    orch: &Orchestrator,
+    owning_db: &LocalDb,
+    request_id: &str,
+    reason: &str,
+) {
+    if let Err(error) = owning_db
+        .execute(
+            "UPDATE permission_requests SET resume_error = ?2 WHERE id = ?1",
+            params![request_id, reason],
+        )
+        .await
+    {
+        log::warn!("permission {request_id}: could not record resume refusal: {error}");
+    }
+    let _ = orch.services.emitter.emit(
+        "db-change",
+        serde_json::json!({"table": "permission_requests", "action": "update"}),
+    );
 }
 
 /// Mint the grant an allowed authority request earns.
@@ -2742,8 +3122,8 @@ async fn mint_authority_grant(
         lifetime: answer.grant_lifetime(),
         request_id: Some(record.id.clone()),
         turn_id: resume
-            .successor_turn_id
-            .clone()
+            .successor_turn_id()
+            .map(str::to_string)
             .or_else(|| resume.predecessor_turn_id.clone()),
         session_id: resume.session_id.clone(),
         expires_at: answer.expires_at,
@@ -2903,7 +3283,7 @@ async fn record_permission_response_with(
     let request_id = request_id.to_string();
     let status = status.to_string();
     let response_json = response_json.to_string();
-    let mut resume = db
+    let resume = db
         .write(|conn| {
             let request_id = request_id.clone();
             let status = status.clone();
@@ -3001,12 +3381,21 @@ async fn record_permission_response_with(
                     }
                 }
 
+                // The answer and its successor commit together: a reader never
+                // sees an answered request whose continuation is undecided.
+                let successor = match (duplicate, predecessor_turn_id.as_deref()) {
+                    (false, Some(predecessor)) => {
+                        Some(ensure_permission_successor_conn(conn, &run_id, predecessor).await?)
+                    }
+                    _ => None,
+                };
+
                 Ok(PermissionResponseResume {
                     run_id,
                     session_id,
                     issue_id,
                     predecessor_turn_id,
-                    successor_turn_id: None,
+                    successor,
                     job_id,
                     duplicate,
                     withdrawn_notice,
@@ -3014,21 +3403,6 @@ async fn record_permission_response_with(
             })
         })
         .await?;
-
-    if !resume.duplicate {
-        if let Some(predecessor_turn_id) = resume.predecessor_turn_id.as_deref() {
-            if let Some(successor) = ensure_and_start_successor_turn(
-                db,
-                &resume.run_id,
-                predecessor_turn_id,
-                TurnStartReason::PermissionResponse,
-            )
-            .await?
-            {
-                resume.successor_turn_id = Some(successor.turn_id);
-            }
-        }
-    }
 
     Ok(resume)
 }
@@ -3333,6 +3707,150 @@ pub async fn ensure_wait_resolved_successor(
             )
             .await?;
             Ok(Some(WaitSuccessor::Ready(update)))
+        })
+    })
+    .await
+}
+
+/// The single minter of `permission_response` successor turns.
+///
+/// - An existing successor of the predecessor is returned whatever its state: a
+///   `permission_response` one as [`PermissionSuccessor::Successor`] (a sibling
+///   permission of the same turn already minted it), any other as
+///   [`PermissionSuccessor::ForeignSuccessor`].
+/// - A predecessor that is not terminal (`yielded` counts as terminal) is an open
+///   provider turn: [`PermissionSuccessor::ProviderTurnOpen`].
+/// - A job serving some other turn is [`PermissionSuccessor::JobBusy`].
+/// - Otherwise a `pending` successor is inserted and becomes the job's current
+///   turn.
+///
+/// It never starts the turn, and never fails for a busy job or an open
+/// predecessor, so it can run inside the transaction that records the answer.
+pub(crate) async fn ensure_permission_successor_conn(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+    predecessor_turn_id: &str,
+) -> DbResult<PermissionSuccessor> {
+    let Some((job_id, session_id)) = run_turn_context(conn, run_id).await? else {
+        return Ok(PermissionSuccessor::Unowned);
+    };
+
+    let existing = {
+        let mut rows = conn
+            .query(
+                "SELECT id, start_reason, state FROM turns WHERE predecessor_id = ?1 \
+                 ORDER BY sequence ASC LIMIT 1",
+                params![predecessor_turn_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Some((row.text(0)?, row.text(1)?, row.text(2)?)),
+            None => None,
+        }
+    };
+    if let Some((turn_id, start_reason, state)) = existing {
+        if start_reason != TurnStartReason::PermissionResponse.to_string() {
+            return Ok(PermissionSuccessor::ForeignSuccessor { turn_id });
+        }
+        let state: TurnState = state.parse().map_err(DbError::Row)?;
+        return Ok(PermissionSuccessor::Successor {
+            turn_id,
+            inserted: false,
+            state,
+        });
+    }
+
+    let (predecessor_state, predecessor_start_reason) = {
+        let mut rows = conn
+            .query(
+                "SELECT state, start_reason FROM turns WHERE id = ?1 LIMIT 1",
+                params![predecessor_turn_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => (
+                row.text(0)?.parse::<TurnState>().map_err(DbError::Row)?,
+                row.text(1)?,
+            ),
+            None => return Ok(PermissionSuccessor::Unowned),
+        }
+    };
+    // A permission raised while a slow-path resume re-dispatched its verb finds
+    // the job's current turn to be that answer's still-pending successor, which
+    // stood down for this request. It is the turn this answer continues in.
+    if predecessor_state == TurnState::Pending
+        && predecessor_start_reason == TurnStartReason::PermissionResponse.to_string()
+    {
+        return Ok(PermissionSuccessor::Successor {
+            turn_id: predecessor_turn_id.to_string(),
+            inserted: false,
+            state: TurnState::Pending,
+        });
+    }
+    if !predecessor_state.is_terminal() {
+        return Ok(PermissionSuccessor::ProviderTurnOpen);
+    }
+
+    let active_turn_id = {
+        let mut rows = conn
+            .query(
+                "SELECT id FROM turns WHERE job_id = ?1 AND state IN ('pending', 'running') \
+                 ORDER BY sequence DESC LIMIT 1",
+                params![job_id.as_str()],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Some(row.text(0)?),
+            None => None,
+        }
+    };
+    if let Some(active_turn_id) = active_turn_id {
+        return Ok(PermissionSuccessor::JobBusy { active_turn_id });
+    }
+
+    let minted = ensure_successor_turn(
+        conn,
+        &session_id,
+        &job_id,
+        predecessor_turn_id,
+        TurnStartReason::PermissionResponse,
+    )
+    .await?;
+    Ok(PermissionSuccessor::Successor {
+        turn_id: minted.turn_id,
+        inserted: minted.inserted,
+        state: TurnState::Pending,
+    })
+}
+
+/// The inline fast path's start: adopt the answer's pending successor and start
+/// it on this run. In practice it never mints -- the answer did, before it
+/// broadcast -- but it goes through the same helper so the two paths cannot
+/// disagree about which turn is the successor.
+async fn start_permission_successor(
+    db: &LocalDb,
+    run_id: &str,
+    predecessor_turn_id: &str,
+) -> DbResult<Option<SuccessorTurnUpdate>> {
+    let run_id = run_id.to_string();
+    let predecessor_turn_id = predecessor_turn_id.to_string();
+    db.write(|conn| {
+        let run_id = run_id.clone();
+        let predecessor_turn_id = predecessor_turn_id.clone();
+        Box::pin(async move {
+            match ensure_permission_successor_conn(conn, &run_id, &predecessor_turn_id).await? {
+                PermissionSuccessor::Successor {
+                    turn_id, inserted, ..
+                } => {
+                    let started = start_turn_for_run(conn, &turn_id, &run_id).await?;
+                    Ok(Some(SuccessorTurnUpdate {
+                        turn_id,
+                        inserted,
+                        started,
+                    }))
+                }
+                _ => Ok(None),
+            }
         })
     })
     .await
@@ -4412,6 +4930,194 @@ pub(crate) mod tests {
         assert_eq!(parsed.request.tool, "read");
     }
 
+    /// A job with one session and run, and a predecessor turn in `state`.
+    async fn seed_successor_lineage(orch: &Orchestrator, predecessor_state: &str) {
+        orch.db
+            .local
+            .execute_script(format!(
+                "
+                INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('ws','Workspace',1,1);
+                INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                 VALUES ('project-1','ws','Project','prj','/tmp/project',1,1);
+                INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at)
+                 VALUES ('issue-1','project-1',1,'Issue','active',1,1);
+                INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                 VALUES ('execution-1','recipe-1','issue-1','project-1','running',1,1);
+                INSERT INTO jobs(id, execution_id, issue_id, project_id, status, node_name, uri_segment, created_at, updated_at)
+                 VALUES ('job-1','execution-1','issue-1','project-1','running','Agent','agent',1,1);
+                INSERT INTO sessions(id, job_id, status, created_at, updated_at)
+                 VALUES ('session-1','job-1','open',1,1);
+                INSERT INTO runs(id, issue_id, project_id, job_id, session_id, status, created_at, updated_at)
+                 VALUES ('run-1','issue-1','project-1','job-1','session-1','live',1,1);
+                INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+                 VALUES ('turn-pred','session-1','run-1','job-1',1,'{predecessor_state}','user_message',1,1);
+                UPDATE jobs SET current_session_id = 'session-1', current_turn_id = 'turn-pred' WHERE id = 'job-1';
+                "
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn successor_for(orch: &Orchestrator, run_id: &str) -> PermissionSuccessor {
+        let run_id = run_id.to_string();
+        orch.db
+            .local
+            .write(|conn| {
+                let run_id = run_id.clone();
+                Box::pin(async move {
+                    ensure_permission_successor_conn(conn, &run_id, "turn-pred").await
+                })
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_yielded_predecessor_mints_a_pending_successor_without_starting_it() {
+        let orch = test_orchestrator().await;
+        seed_successor_lineage(&orch, "yielded").await;
+
+        let PermissionSuccessor::Successor {
+            turn_id,
+            inserted,
+            state,
+        } = successor_for(&orch, "run-1").await
+        else {
+            panic!("a yielded predecessor mints a successor");
+        };
+        assert!(inserted);
+        assert_eq!(state, TurnState::Pending);
+        let (stored_state, run_id, reason, current) = orch
+            .db
+            .local
+            .query_one(
+                "SELECT t.state, t.run_id, t.start_reason, j.current_turn_id \
+                 FROM turns t JOIN jobs j ON j.id = t.job_id WHERE t.id = ?1",
+                params![turn_id.as_str()],
+                |row| {
+                    Ok((
+                        row.text(0)?,
+                        row.opt_text(1)?,
+                        row.text(2)?,
+                        row.opt_text(3)?,
+                    ))
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored_state, "pending", "minting never starts the turn");
+        assert_eq!(
+            run_id, None,
+            "an unstarted successor is bound to no run yet"
+        );
+        assert_eq!(reason, "permission_response");
+        assert_eq!(current.as_deref(), Some(turn_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn an_open_provider_turn_mints_nothing() {
+        let orch = test_orchestrator().await;
+        seed_successor_lineage(&orch, "running").await;
+
+        assert_eq!(
+            successor_for(&orch, "run-1").await,
+            PermissionSuccessor::ProviderTurnOpen
+        );
+        assert_eq!(
+            orch.db
+                .local
+                .query_one("SELECT COUNT(*) FROM turns", (), |row| row.i64(0))
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sibling_answer_reuses_the_existing_successor() {
+        let orch = test_orchestrator().await;
+        seed_successor_lineage(&orch, "yielded").await;
+        let PermissionSuccessor::Successor { turn_id: first, .. } =
+            successor_for(&orch, "run-1").await
+        else {
+            panic!("first answer mints");
+        };
+        orch.db
+            .local
+            .execute(
+                "UPDATE turns SET state = 'running', run_id = 'run-1' WHERE id = ?1",
+                params![first.as_str()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            successor_for(&orch, "run-1").await,
+            PermissionSuccessor::Successor {
+                turn_id: first,
+                inserted: false,
+                state: TurnState::Running,
+            },
+            "a second answer for the same predecessor mints nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_busy_job_and_a_foreign_successor_are_not_adopted() {
+        let orch = test_orchestrator().await;
+        seed_successor_lineage(&orch, "yielded").await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at) \
+                 VALUES ('turn-other','session-1','run-1','job-1',2,'running','user_message',1,1)",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            successor_for(&orch, "run-1").await,
+            PermissionSuccessor::JobBusy {
+                active_turn_id: "turn-other".to_string()
+            }
+        );
+
+        orch.db
+            .local
+            .execute(
+                "UPDATE turns SET predecessor_id = 'turn-pred', state = 'complete' WHERE id = 'turn-other'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            successor_for(&orch, "run-1").await,
+            PermissionSuccessor::ForeignSuccessor {
+                turn_id: "turn-other".to_string()
+            },
+            "a steer that already continued the predecessor is not this answer's turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_without_a_job_is_unowned() {
+        let orch = test_orchestrator().await;
+        seed_successor_lineage(&orch, "yielded").await;
+        orch.db
+            .local
+            .execute(
+                "INSERT INTO runs(id, issue_id, project_id, status, created_at, updated_at) \
+                 VALUES ('run-chat','issue-1','project-1','live',1,1)",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            successor_for(&orch, "run-chat").await,
+            PermissionSuccessor::Unowned
+        );
+    }
+
     #[test]
     fn permission_response_does_not_cold_resume_when_inline_waiter_was_present() {
         let resume = PermissionResponseResume {
@@ -4419,7 +5125,11 @@ pub(crate) mod tests {
             session_id: Some("session-1".to_string()),
             issue_id: None,
             predecessor_turn_id: Some("turn-1".to_string()),
-            successor_turn_id: Some("turn-2".to_string()),
+            successor: Some(PermissionSuccessor::Successor {
+                turn_id: "turn-2".to_string(),
+                inserted: true,
+                state: TurnState::Pending,
+            }),
             job_id: Some("job-1".to_string()),
             duplicate: false,
             withdrawn_notice: None,
@@ -4456,7 +5166,11 @@ pub(crate) mod tests {
             session_id: Some("session-1".to_string()),
             issue_id: None,
             predecessor_turn_id: Some("turn-1".to_string()),
-            successor_turn_id: Some("turn-2".to_string()),
+            successor: Some(PermissionSuccessor::Successor {
+                turn_id: "turn-2".to_string(),
+                inserted: true,
+                state: TurnState::Pending,
+            }),
             job_id: Some("job-1".to_string()),
             duplicate: false,
             withdrawn_notice: None,

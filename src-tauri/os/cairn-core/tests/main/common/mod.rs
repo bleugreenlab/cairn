@@ -152,6 +152,93 @@ pub fn orchestrator_booted_at(temp: &TempDir, db: Arc<LocalDb>, boot_at: i64) ->
         .build()
 }
 
+/// [`orchestrator`] wired to a permission-response broadcast the test holds, so
+/// it can observe what an answer delivers to a waiting provider poll.
+pub fn orchestrator_with_permission_responses(
+    temp: &TempDir,
+    db: Arc<LocalDb>,
+) -> (
+    Orchestrator,
+    tokio::sync::broadcast::Sender<(String, String)>,
+) {
+    let search_index = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(db, search_index));
+    let services = Arc::new(TestServicesBuilder::new().build());
+    let responses = tokio::sync::broadcast::channel(16).0;
+    let orch = Orchestrator::builder(db_state, services, temp.path().join("config"))
+        .permission_responses(responses.clone())
+        .build();
+    (orch, responses)
+}
+
+/// The stdin of an in-memory agent process. The backend writes one
+/// newline-terminated JSON message per wake, so the delivered prompts are the
+/// lines of what accumulates here.
+pub struct RecordingStdin(pub Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for RecordingStdin {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Register an in-memory process for `session_id` on `run_id` (owned by
+/// `job-1`), so a resume takes the warm path instead of spawning a CLI. Returns
+/// the log of prompts delivered to it.
+pub fn register_recording_process(
+    orch: &Orchestrator,
+    run_id: &str,
+    session_id: &str,
+) -> Arc<std::sync::Mutex<Vec<u8>>> {
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut processes = orch.process_state.processes.lock().unwrap();
+    let handle = cairn_core::internal::agent_process::process::RunHandle::new(
+        Arc::new(std::sync::Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(Some(
+            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(RecordingStdin(
+                delivered.clone(),
+            ))),
+        ))),
+        Some(session_id.to_string()),
+        Some("job-1".to_string()),
+    );
+    processes.register(run_id.to_string(), handle);
+    delivered
+}
+
+/// Stdin of a process whose pipe has closed: every write fails.
+pub struct BrokenStdin;
+
+impl std::io::Write for BrokenStdin {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+    }
+}
+
+/// [`register_recording_process`] for a process whose stdin is broken, so a
+/// warm launch starts its turn and then fails to deliver the prompt.
+pub fn register_broken_process(orch: &Orchestrator, run_id: &str, session_id: &str) {
+    let mut processes = orch.process_state.processes.lock().unwrap();
+    let handle = cairn_core::internal::agent_process::process::RunHandle::new(
+        Arc::new(std::sync::Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(Some(
+            cairn_llm::session::claude::ClaudeControl::boxed(Box::new(BrokenStdin)),
+        ))),
+        Some(session_id.to_string()),
+        Some("job-1".to_string()),
+    );
+    processes.register(run_id.to_string(), handle);
+}
+
 /// Attach the production executor runtime through the same advertised-message
 /// facade used by enrolled WebSocket executors.
 pub fn attached_executor_home(orch: &Orchestrator) -> PathBuf {

@@ -1007,6 +1007,17 @@ struct NodePermissionRow {
     status: String,
     response: Option<String>,
     resolution: Option<cairn_db::models::ResolutionReceipt>,
+    /// Why the answer did not resume the job, when it did not.
+    resume_error: Option<String>,
+}
+
+/// The line an answered permission carries when its answer was recorded but the
+/// job could not continue, so the refusal is visible where the answer is.
+fn resume_refusal_line(request: &NodePermissionRow) -> Option<String> {
+    request
+        .resume_error
+        .as_deref()
+        .map(|reason| format!("answered, but the resume was refused: {reason}"))
 }
 
 fn format_resolution_receipt(receipt: &cairn_db::models::ResolutionReceipt) -> String {
@@ -1037,7 +1048,7 @@ async fn load_node_permissions(
             SELECT pr.uri_segment, pr.tool_name, pr.tool_input, pr.status, pr.response,
                    pr.resolution_id, pr.resolution_surface, pr.resolution_provider,
                    pr.resolution_conversation, pr.resolution_actor,
-                   pr.responded_at, pr.created_at
+                   pr.responded_at, pr.created_at, pr.resume_error
             FROM permission_requests pr
             JOIN runs r ON pr.run_id = r.id
             WHERE COALESCE(pr.job_id, r.job_id) = ?1
@@ -1088,6 +1099,7 @@ async fn load_node_permissions(
                             .unwrap_or_else(|| row.i64(11).unwrap_or_default()),
                     }
                 }),
+                resume_error: row.opt_text(12).ok().flatten(),
             });
         }
     }
@@ -1142,6 +1154,9 @@ pub(super) async fn read_node_permissions(
             if let Some(receipt) = &request.resolution {
                 output.push_str(&format!("  {}\n", format_resolution_receipt(receipt)));
             }
+            if let Some(line) = resume_refusal_line(request) {
+                output.push_str(&format!("  \u{26a0} {line}\n"));
+            }
         }
         output.push('\n');
     }
@@ -1174,6 +1189,9 @@ pub(super) async fn read_node_permission(
     output.push_str(&format!("Status: {}\n\n", request.status));
     output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
     push_permission_resolution(&mut output, &request.status, request.response.as_deref());
+    if let Some(line) = resume_refusal_line(&request) {
+        output.push_str(&format!("## Resume\n\n{line}\n\n"));
+    }
 
     output
 }
@@ -1259,6 +1277,9 @@ pub(super) async fn read_task_permissions(
                     permission_status_text(&request.status, request.response.as_deref())
                 ));
             }
+            if let Some(line) = resume_refusal_line(request) {
+                output.push_str(&format!("  \u{26a0} {line}\n"));
+            }
         }
         output.push('\n');
     }
@@ -1294,6 +1315,9 @@ pub(super) async fn read_task_permission(
     output.push_str(&format!("Status: {}\n\n", request.status));
     output.push_str(&format!("## Request\n\n{}\n\n", request.summary));
     push_permission_resolution(&mut output, &request.status, request.response.as_deref());
+    if let Some(line) = resume_refusal_line(&request) {
+        output.push_str(&format!("## Resume\n\n{line}\n\n"));
+    }
 
     output
 }
@@ -2850,7 +2874,7 @@ pub(super) async fn render_job_chat_event(
 
 #[cfg(test)]
 mod task_permission_tests {
-    use super::{read_node_permission, read_task_permission};
+    use super::{read_node_permission, read_task_permission, read_task_permissions};
     use crate::storage::{LocalDb, MigrationRunner, TURSO_MIGRATIONS};
 
     async fn test_db() -> LocalDb {
@@ -2905,6 +2929,31 @@ mod task_permission_tests {
         assert!(
             broken.contains("not found"),
             "flat sub-task node URI must not resolve: {broken}"
+        );
+    }
+
+    /// An answer whose resume was refused says so on the permission row, in the
+    /// list and the single read, rather than only in the host log.
+    #[tokio::test]
+    async fn a_refused_resume_is_rendered_on_the_permission() {
+        let db = test_db().await;
+        seed(&db).await;
+        db.execute(
+            "UPDATE permission_requests SET status = 'denied', resume_error = 'session closed' WHERE id = 'pr1'",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let list = read_task_permissions(&db, "prj", 2, 1, "builder", "review").await;
+        assert!(
+            list.contains("answered, but the resume was refused: session closed"),
+            "{list}"
+        );
+        let single = read_task_permission(&db, "prj", 2, 1, "builder", "review", "perm-1").await;
+        assert!(
+            single.contains("## Resume") && single.contains("session closed"),
+            "{single}"
         );
     }
 }

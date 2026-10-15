@@ -144,6 +144,9 @@ pub struct SessionConfig {
     /// Pre-resolved identity for this session (includes project overrides).
     /// If set, backends use this instead of calling `orch.get_identity()`.
     pub(crate) identity: Option<crate::identity::UserIdentity>,
+    /// Durable account pin resolved before backend launch. This is metadata,
+    /// never a credential, and records which auth was frozen into the process.
+    pub(crate) account_id: Option<String>,
     /// Resolved JSON Schema to constrain the model's output natively (CAIRN-2505).
     /// Set only for node-less ephemeral calls that carry an output contract, so
     /// each backend passes the provider's native output constraint (Claude

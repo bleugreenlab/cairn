@@ -1,9 +1,8 @@
 //! Condition evaluation module for recipe branching.
 //!
-//! Supports two evaluation modes:
-//! - Programmatic: Uses evalexpr to evaluate expressions against artifact data
-//! - AI: The workflow host asks a model the node's question; this module
-//!   matches the answer to a port
+//! A condition node routes on an evalexpr expression over upstream artifact
+//! data. A question answered by a model is a decision node, evaluated in
+//! `crate::conditions` through the host's `decide`.
 
 use evalexpr::ContextWithMutableVariables;
 use serde_json::Value;
@@ -152,86 +151,7 @@ fn json_to_evalexpr_value(value: &Value) -> evalexpr::Value {
     }
 }
 
-/// Match a model's answer to an AI condition onto exactly one of its ports.
-///
-/// Case-insensitive. An answer that equals a port wins outright. Otherwise the
-/// answer must name exactly one port as whole words, so a chatty "Yes." routes
-/// to `yes` while `no` does not fire inside "not". An answer naming two ports
-/// ("no, not yes") is an error rather than a guess. A port mentioned only
-/// inside a longer port's mention does not count on its own, so with ports
-/// `approve` and `approve with changes`, "Approve with changes." names one.
-pub fn match_ai_condition_answer(answer: &str, ports: &[String]) -> Result<String, String> {
-    let trimmed = answer.trim();
-    let normalized = trimmed.to_lowercase();
-
-    if let Some(port) = ports.iter().find(|port| normalized == port.to_lowercase()) {
-        return Ok(port.clone());
-    }
-
-    let answer_tokens = answer_tokens(&normalized);
-    // (port index, start, end) for every contiguous occurrence of a port's
-    // token sequence in the answer.
-    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
-    for (index, port) in ports.iter().enumerate() {
-        let port_tokens = answer_tokens_of(port);
-        if port_tokens.is_empty() || port_tokens.len() > answer_tokens.len() {
-            continue;
-        }
-        for start in 0..=answer_tokens.len() - port_tokens.len() {
-            let end = start + port_tokens.len();
-            if answer_tokens[start..end] == port_tokens[..] {
-                spans.push((index, start, end));
-            }
-        }
-    }
-
-    let mut mentioned: Vec<usize> = Vec::new();
-    for &(index, start, end) in &spans {
-        let inside_longer = spans.iter().any(|&(other, other_start, other_end)| {
-            other != index
-                && other_start <= start
-                && end <= other_end
-                && other_end - other_start > end - start
-        });
-        if !inside_longer && !mentioned.contains(&index) {
-            mentioned.push(index);
-        }
-    }
-    mentioned.sort_unstable();
-
-    match mentioned.as_slice() {
-        [only] => Ok(ports[*only].clone()),
-        [] => Err(format!(
-            "Response '{trimmed}' didn't match any port: {ports:?}"
-        )),
-        several => {
-            let found = several
-                .iter()
-                .map(|index| ports[*index].as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(format!(
-                "Response '{trimmed}' names more than one port ({found}); expected exactly one of {ports:?}"
-            ))
-        }
-    }
-}
-
-/// Words of `text` for port matching: runs of alphanumerics, `_` and `-`.
-fn answer_tokens(text: &str) -> Vec<&str> {
-    text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn answer_tokens_of(port: &str) -> Vec<String> {
-    answer_tokens(&port.to_lowercase())
-        .into_iter()
-        .map(str::to_string)
-        .collect()
-}
-
-/// Gather context from upstream artifacts for condition evaluation.
+/// The upstream context a decision node's questions are asked about.
 pub fn serialize_context_for_ai(artifact_data: &Value) -> String {
     serde_json::to_string_pretty(artifact_data).unwrap_or_else(|_| "{}".to_string())
 }
@@ -298,89 +218,5 @@ mod tests {
         let context = serialize_context_for_ai(&data);
         assert!(context.contains("Add feature"));
         assert!(context.contains("risk"));
-    }
-
-    fn ports(names: &[&str]) -> Vec<String> {
-        names.iter().map(|name| name.to_string()).collect()
-    }
-
-    #[test]
-    fn ai_answer_matches_port_exactly() {
-        let ports = ports(&["high_risk", "low_risk"]);
-        assert_eq!(
-            match_ai_condition_answer("high_risk", &ports),
-            Ok("high_risk".to_string())
-        );
-    }
-
-    #[test]
-    fn ai_answer_matches_case_insensitively_and_trimmed() {
-        let ports = ports(&["high_risk", "low_risk"]);
-        assert_eq!(
-            match_ai_condition_answer("  LOW_RISK\n", &ports),
-            Ok("low_risk".to_string())
-        );
-    }
-
-    #[test]
-    fn ai_answer_matches_a_port_named_as_a_whole_word() {
-        let ports = ports(&["yes", "no"]);
-        assert_eq!(
-            match_ai_condition_answer("Yes.", &ports),
-            Ok("yes".to_string())
-        );
-    }
-
-    #[test]
-    fn ai_answer_naming_two_ports_is_ambiguous() {
-        let ports = ports(&["yes", "no"]);
-        let error = match_ai_condition_answer("no, not yes", &ports).unwrap_err();
-        assert!(error.contains("more than one port"), "{error}");
-        assert!(error.contains("(yes, no)"), "{error}");
-    }
-
-    #[test]
-    fn ai_answer_does_not_match_a_port_inside_a_word() {
-        let ports = ports(&["yes", "no"]);
-        let error = match_ai_condition_answer("not", &ports).unwrap_err();
-        assert!(error.contains("didn't match any port"), "{error}");
-        assert!(error.contains("'not'"), "{error}");
-    }
-
-    #[test]
-    fn ai_answer_matches_a_multi_word_port() {
-        let ports = ports(&["needs work", "ship"]);
-        assert_eq!(
-            match_ai_condition_answer("Needs work.", &ports),
-            Ok("needs work".to_string())
-        );
-    }
-
-    #[test]
-    fn ai_answer_prefers_the_longer_port_it_names_over_its_prefix() {
-        let ports = ports(&["approve", "approve with changes"]);
-        assert_eq!(
-            match_ai_condition_answer("Approve with changes.", &ports),
-            Ok("approve with changes".to_string())
-        );
-        let error =
-            match_ai_condition_answer("approve, not approve with changes", &ports).unwrap_err();
-        assert!(error.contains("(approve, approve with changes)"), "{error}");
-    }
-
-    #[test]
-    fn ai_answer_prefers_an_exact_port_over_a_contained_one() {
-        let ports = ports(&["no", "not_sure"]);
-        assert_eq!(
-            match_ai_condition_answer("not_sure", &ports),
-            Ok("not_sure".to_string())
-        );
-    }
-
-    #[test]
-    fn ai_answer_without_a_port_is_an_error() {
-        let ports = ports(&["approve", "reject"]);
-        let error = match_ai_condition_answer("maybe", &ports).unwrap_err();
-        assert!(error.contains("didn't match any port"), "{error}");
     }
 }

@@ -2719,6 +2719,7 @@ mod tests {
                 checkpoint_config: None,
                 artifact_config: None,
                 condition_config: None,
+                decision_config: None,
                 context_config: None,
             };
             let snapshot = ExecutionSnapshot::new(

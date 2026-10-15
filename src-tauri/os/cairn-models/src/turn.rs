@@ -131,11 +131,17 @@ pub enum TurnEndReason {
     UserStop,
     Crash,
     OrphanedPending,
+    /// The provider account serving the turn was depleted. The turn produced
+    /// no finished work and resumes on an explicit continuation.
+    ProviderDepleted,
     /// A launch created this turn and was then refused before it attached to
     /// a run; the launch guard cancelled it.
     LaunchRefused,
     /// The turn's execution was superseded while the turn was live.
     Superseded,
+    /// A permission answer minted this turn to continue the job in, and the
+    /// job refused to continue; nothing ever served it.
+    PermissionResumeRefused,
 }
 
 impl std::fmt::Display for TurnEndReason {
@@ -145,8 +151,10 @@ impl std::fmt::Display for TurnEndReason {
             TurnEndReason::UserStop => write!(f, "user_stop"),
             TurnEndReason::Crash => write!(f, "crash"),
             TurnEndReason::OrphanedPending => write!(f, "orphaned_pending"),
+            TurnEndReason::ProviderDepleted => write!(f, "provider_depleted"),
             TurnEndReason::LaunchRefused => write!(f, "launch_refused"),
             TurnEndReason::Superseded => write!(f, "superseded"),
+            TurnEndReason::PermissionResumeRefused => write!(f, "permission_resume_refused"),
         }
     }
 }
@@ -160,8 +168,10 @@ impl std::str::FromStr for TurnEndReason {
             "user_stop" => Ok(TurnEndReason::UserStop),
             "crash" => Ok(TurnEndReason::Crash),
             "orphaned_pending" => Ok(TurnEndReason::OrphanedPending),
+            "provider_depleted" => Ok(TurnEndReason::ProviderDepleted),
             "launch_refused" => Ok(TurnEndReason::LaunchRefused),
             "superseded" => Ok(TurnEndReason::Superseded),
+            "permission_resume_refused" => Ok(TurnEndReason::PermissionResumeRefused),
             _ => Err(format!("Unknown turn end reason: {}", s)),
         }
     }
@@ -278,6 +288,7 @@ mod tests {
             TurnEndReason::ArtifactHandoff,
             TurnEndReason::UserStop,
             TurnEndReason::Crash,
+            TurnEndReason::PermissionResumeRefused,
         ] {
             let parsed: TurnEndReason = reason.to_string().parse().unwrap();
             assert_eq!(parsed, reason);

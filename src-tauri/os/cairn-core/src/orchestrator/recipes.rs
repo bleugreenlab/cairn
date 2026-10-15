@@ -32,6 +32,23 @@ impl ConfigResource for RecipeResource {
     type Config = Recipe;
     type File = config_recipes::FileRecipe;
     type CreateInput = CreateRecipe;
+
+    /// A recipe whose decision nodes cannot be asked, or that nothing in its
+    /// scope can answer, is refused here rather than written: the loader
+    /// would drop a structurally invalid file, and a launch would refuse an
+    /// unanswerable one.
+    fn check_before_save(
+        orch: &Orchestrator,
+        file: &Self::File,
+        project_id: Option<&str>,
+    ) -> Result<(), String> {
+        let recipe_file: crate::models::RecipeFile = file.recipe.clone().into();
+        let errors = recipe_file.decision_errors();
+        if !errors.is_empty() {
+            return Err(format!("Invalid recipe: {}", errors.join(", ")));
+        }
+        orch.refuse_unanswerable_decisions(&file.recipe.nodes, project_id)
+    }
     type UpdateInput = UpdateRecipe;
 
     const ENTITY_TYPE: &'static str = "recipe";
@@ -517,7 +534,7 @@ impl Orchestrator {
             _ => return Err(format!("Unsupported format: {}", format)),
         };
 
-        let validation = recipe_file.validate();
+        let validation = self.validate_with_decisions(&recipe_file, project_id.as_deref());
         if !validation.valid {
             return Err(format!("Invalid recipe: {}", validation.errors.join(", ")));
         }
@@ -588,7 +605,24 @@ impl Orchestrator {
                 ))
             }
         };
-        Ok(file.validate())
+        Ok(self.validate_with_decisions(&file, None))
+    }
+
+    /// A recipe file's structural validation plus one check only the
+    /// workspace can make: that something can answer each decision node.
+    fn validate_with_decisions(
+        &self,
+        file: &RecipeFile,
+        project_id: Option<&str>,
+    ) -> RecipeFileValidation {
+        let mut validation = file.validate();
+        let nodes = file.clone().into_recipe(None, None).nodes;
+        let problems = self.decision_problems(&nodes, project_id);
+        if !problems.is_empty() {
+            validation.valid = false;
+            validation.errors.extend(problems);
+        }
+        validation
     }
 }
 
@@ -663,5 +697,93 @@ mod tests {
         );
 
         assert!(updated.recipe.is_system);
+    }
+
+    /// A recipe as stored before decision nodes: its AI condition loads as a
+    /// decision node, so it is checked like one.
+    const LEGACY_AI_CONDITION: &str = r#"cairnVersion: 1
+name: Legacy Condition
+trigger: manual
+nodes:
+  - id: trigger-1
+    type: trigger
+    name: Trigger
+    position: 0@0
+    config:
+      triggerType: manual
+  - id: db
+    type: condition
+    name: Touches the DB?
+    position: 200@0
+    config:
+      conditionType: ai
+      question: Does the issue touch the database?
+      ports: [yes, no]
+edges:
+  - from: trigger-1@control-out
+    to: db@control-in
+    type: control
+"#;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_decision_recipe_is_refused_until_something_can_answer_it() {
+        use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth};
+
+        let orch = crate::orchestrator::llm::tests::bare_orchestrator().await;
+
+        let validation = orch
+            .validate_recipe_file(LEGACY_AI_CONDITION, "yaml")
+            .unwrap();
+        assert!(!validation.valid);
+        let [problem] = validation.errors.as_slice() else {
+            panic!("one problem, the decision: {:?}", validation.errors);
+        };
+        assert!(
+            problem.starts_with(
+                "Decision node 'Touches the DB?' can't be answered: No decision-capable model is configured"
+            ),
+            "{problem}"
+        );
+        assert!(
+            problem.contains("Decisions API key") && problem.contains("logprobs"),
+            "names both fixes: {problem}"
+        );
+        let refused = orch
+            .import_recipe(LEGACY_AI_CONDITION, "yaml", None, None)
+            .unwrap_err();
+        assert!(refused.contains("can't be answered"), "{refused}");
+        let nodes = crate::models::RecipeFile::from_yaml(LEGACY_AI_CONDITION)
+            .unwrap()
+            .into_recipe(None, None)
+            .nodes;
+        assert!(orch.refuse_unanswerable_decisions(&nodes, None).is_err());
+
+        let jev = orch
+            .add_custom_provider(
+                "TypeSafe".into(),
+                ProviderAuth::custom_endpoint(
+                    "https://ai-gateway.vercel.sh/v1",
+                    CustomProtocol::Decisions,
+                    Some("gateway-key"),
+                    &[],
+                    CustomModelPolicy::Explicit {
+                        ids: vec!["typesafe-ai/jev".into()],
+                    },
+                    CustomSampling::default(),
+                    1,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap();
+        orch.refresh_provider_model_catalog_blocking(&cairn_llm::types::catalog::custom_key(
+            &jev.id,
+        ));
+
+        let validation = orch
+            .validate_recipe_file(LEGACY_AI_CONDITION, "yaml")
+            .unwrap();
+        assert!(validation.valid, "{:?}", validation.errors);
+        assert!(orch.refuse_unanswerable_decisions(&nodes, None).is_ok());
     }
 }

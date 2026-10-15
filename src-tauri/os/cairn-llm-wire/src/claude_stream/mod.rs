@@ -25,7 +25,10 @@ pub use event::{
     ClaudeEvent, ClaudeMessage, ContentBlock, ControlResponseInner, DeltaContent,
     MessageContentInner, OutputTokensDetails, RateLimitInfo, StreamEventInner, Usage,
 };
-pub use evidence::{result_is_rate_limited, stderr_reports_unknown_session, StreamEvidence};
+pub use evidence::{
+    result_is_rate_limited, stderr_reports_unknown_session, terminal_provider_depletion,
+    ProviderDepletion, StreamEvidence,
+};
 pub use input::{
     build_message_content, send_control_response, send_interrupt_request, send_set_model_request,
     send_set_permission_mode_request, send_update_environment_variables, send_user_message,

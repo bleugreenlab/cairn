@@ -4,6 +4,7 @@
 //! All orchestration functions take `&Orchestrator` instead of framework-specific
 //! handles (e.g. `&AppHandle`).
 
+pub mod account_events;
 pub mod account_manager;
 pub mod agents;
 pub mod attention;
@@ -19,6 +20,8 @@ pub mod config_resource;
 pub mod conflict_session;
 pub mod contended_identifiers;
 pub mod custom_providers;
+mod decide;
+pub use decide::DecisionDiagnostic;
 pub mod device_presence;
 pub mod docs;
 pub mod executor_registry; // Synced visibility; live placement remains in fleet.
@@ -35,6 +38,7 @@ pub mod session;
 mod settings;
 pub mod skills;
 mod team_attention_push;
+pub mod usage_refresh;
 pub mod wakes;
 pub mod workflow_configs;
 
@@ -477,12 +481,14 @@ impl OrchestratorBuilder {
             ),
             subscriptions: self.subscriptions,
             llm_runtime,
+            decision_observations: Arc::default(),
             mcp_binary_path: self.mcp_binary_path,
             jj_binary_path: self.jj_binary_path,
             config_dir: self.config_dir,
             schema_dir: self.schema_dir,
             mcp_callback_port: self.mcp_callback_port,
             boot_at: self.boot_at,
+            runtime: tokio::runtime::Handle::try_current().ok(),
             attached_ui: Arc::new(Mutex::new(AttachedUi::default())),
             vibe_state: self.vibe_state,
             embed_tx: Arc::new(Mutex::new(None)),
@@ -1143,6 +1149,9 @@ pub struct Orchestrator {
     /// The facet implementations every launch goes through. See
     /// [`llm::LlmRuntime`].
     llm_runtime: llm::LlmRuntime,
+    /// Which logprobs offers were seen to answer decisions, and which could
+    /// not. See [`decide::DecisionObservations`].
+    decision_observations: Arc<decide::DecisionObservations>,
 
     // === Host-specific paths (set by Tauri or cairn-server) ===
     /// Path to the cairn-cmd binary
@@ -1214,6 +1223,13 @@ pub struct Orchestrator {
     /// transcript reader died with the process that spawned it. Runtime-only;
     /// never persisted.
     pub boot_at: i64,
+    /// The Tokio runtime this orchestrator was built on, if any.
+    ///
+    /// Work is often triggered from plain OS threads (process reader and exit
+    /// watcher callbacks, attention delivery) that carry no runtime context, so
+    /// background work the orchestrator schedules must not depend on the
+    /// caller's thread. See [`Orchestrator::spawn_blocking_detached`].
+    runtime: Option<tokio::runtime::Handle>,
     /// Desktop UI attached over the runner's `/ws` channel. The window-owning
     /// Tauri process registers its own `std::process::id()` on connect and
     /// detaches on disconnect; the `process_info` tool reads the current pid so
@@ -1468,6 +1484,23 @@ impl Orchestrator {
 
     pub fn runtime_admission_api_config(&self) -> ApiConfig {
         self.api_config.clone()
+    }
+
+    /// Run blocking `task` in the background regardless of the caller's thread.
+    ///
+    /// The task lands on the blocking pool of the runtime this orchestrator was
+    /// built on, so it has runtime context for anything it spawns in turn (a
+    /// launched session's admission heartbeat, for one). An orchestrator built
+    /// off any runtime has no pool to offer, and the task gets its own thread.
+    pub(crate) fn spawn_blocking_detached(&self, task: impl FnOnce() + Send + 'static) {
+        match &self.runtime {
+            Some(runtime) => {
+                runtime.spawn_blocking(task);
+            }
+            None => {
+                std::thread::spawn(task);
+            }
+        }
     }
     /// Queue a persisted fallback era for its one-way generated-summary upgrade.
     /// Returns false when startup has not wired the worker or its bounded queue

@@ -1022,6 +1022,7 @@ mod port_model_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }
@@ -1051,6 +1052,7 @@ mod port_model_tests {
                 content: None,
             }),
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }
@@ -1082,6 +1084,7 @@ mod port_model_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }
@@ -1138,6 +1141,7 @@ mod port_model_tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: Some(ContextNodeConfig {
                 content: content.to_string(),
             }),

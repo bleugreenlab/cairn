@@ -8,10 +8,6 @@ use super::append_payload;
 use crate::mcp::handlers::{comments_artifacts, issues};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
 use crate::orchestrator::Orchestrator;
-use cairn_common::identity::{
-    Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
-    VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
-};
 use cairn_common::uri::CairnResource;
 
 pub(super) async fn dispatch(
@@ -78,55 +74,13 @@ pub(super) async fn dispatch(
                     None => format!("Would create issue in project {project}: {title}"),
                 }
             } else {
-                let (run, _) =
-                    crate::mcp::handlers::run_context::lookup_run_routed(&orch.db, request)
+                let agent =
+                    crate::mcp::handlers::run_context::authenticated_agent(&orch.db, request)
                         .await
                         .map_err(|error| build_failure(index, item, error))?;
-                let live_run_id = request.run_id.as_deref().ok_or_else(|| {
-                    build_failure(
-                        index,
-                        item,
-                        "Authenticated agent request is missing its run ID",
-                    )
-                })?;
-                if run.run_id != live_run_id {
-                    return Err(build_failure(
-                        index,
-                        item,
-                        "Authenticated agent run does not match the resolved live run",
-                    ));
-                }
-                let node =
-                    crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request)
-                        .await
-                        .map_err(|error| build_failure(index, item, error))?;
-                let author = PrincipalRef::Agent {
-                    node: node.clone(),
-                    run_id: Some(live_run_id.to_string()),
-                };
-                let now = orch.services.clock.now();
-                let verification = VerificationRecord::new(
-                    VerificationMethod::NodeSession,
-                    VerificationStatus::Verified,
-                    None,
-                    None,
-                    Some(live_run_id.to_string()),
-                    None,
-                    VerificationStrength::new("session-bound")
-                        .map_err(|error| build_failure(index, item, error.to_string()))?,
-                    now,
-                )
-                .map_err(|error| build_failure(index, item, error.to_string()))?;
-                let evidence = AppearanceEvidence::new(
-                    AppearanceTransport::ResourcePatch,
-                    Address::Resource { node },
-                    verification,
-                    now,
-                    None,
-                )
-                .map_err(|error| build_failure(index, item, error.to_string()))?;
-                let appearance = AppearanceSnapshot::new(author.clone(), evidence, vec![], None)
-                    .map_err(|error| build_failure(index, item, error.to_string()))?;
+                let (author, appearance) = agent
+                    .appearance(orch.services.clock.now())
+                    .map_err(|error| build_failure(index, item, error))?;
                 let authorship = crate::issues::crud::IssueAuthorship::new(author, appearance)
                     .map_err(|error| build_failure(index, item, error.to_string()))?;
                 let description = match payload_str(payload, "description", &[]) {

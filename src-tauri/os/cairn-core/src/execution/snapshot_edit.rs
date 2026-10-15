@@ -80,6 +80,9 @@ pub async fn update_execution_agent(
             &presets,
         )?
     };
+    // An agent definition carries no account policy, so re-resolution must not
+    // be allowed to drop the one the edit chose.
+    normalized_snapshot.provider_account = agent_snapshot.provider_account.clone();
 
     // This is the one door an agent snapshot is edited through, so it is the one
     // place that can honestly say an edit happened. The stamp is what tells a

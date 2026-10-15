@@ -3,7 +3,9 @@
 use crate::agent_process::completion::ClaudeTurnOutcome;
 use crate::backends::is_task_spawned_run;
 use crate::models::{RunStatus, TurnEndReason};
-use crate::orchestrator::lifecycle::{finalize_run, transition_to_warm_state};
+use crate::orchestrator::lifecycle::{
+    finalize_run, interrupt_run_for_provider_depletion, transition_to_warm_state,
+};
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::services::EventEmitter;
@@ -43,8 +45,12 @@ pub(crate) fn apply_claude_turn_completion(
                     }
                     return;
                 }
-                // The reader quarantines the account. Its subsequent EOF owns
-                // rate-limit rollover; retain the existing Result warm path.
+                // The reader already persisted the account's health and any
+                // replacement pin. A depleted turn is resumable work, not a
+                // completed turn, so it never takes the warm path.
+                insert_error_event(orch, run_id, session_id, &message);
+                interrupt_run_for_provider_depletion(orch, run_id);
+                return;
             }
             ClaudeTurnOutcome::Completed => {}
         }

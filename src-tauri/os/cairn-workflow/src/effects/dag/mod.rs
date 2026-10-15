@@ -35,15 +35,13 @@ use cairn_config::presets::{
 use cairn_db::turso::params;
 use uuid::Uuid;
 
-use super::types::{ConditionSpec, EffectContext, EffectSource, WorkflowEffect};
+use super::types::{EffectContext, EffectSource, WorkflowEffect};
 
 mod checkpoints;
-mod conditions;
 pub mod delegation;
 mod graph;
 
 use checkpoints::*;
-pub use conditions::*;
 use delegation::*;
 pub use graph::*;
 
@@ -180,14 +178,10 @@ pub fn reduce_dag(
                 }
             })?;
 
-            // Extract condition spec from the node config
-            let condition_spec = extract_condition_spec(&node);
-
             effects.push(WorkflowEffect::EvaluateCondition {
                 execution_id: execution_id.to_string(),
                 node_id: node.id.clone(),
                 node_name: node.name.clone(),
-                condition: condition_spec,
                 ctx: EffectContext {
                     job_id: None,
                     run_id: None,

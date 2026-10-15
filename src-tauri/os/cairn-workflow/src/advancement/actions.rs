@@ -539,9 +539,9 @@ pub async fn reevaluable_condition(
 ) -> Result<String, String> {
     let db = runtime.database(WorkflowOwner::Execution(execution_id))?;
     let node = crate::conditions::load_condition_node(&db, execution_id, node_id).await?;
-    if node.node_type != "condition" {
+    if node.node_type != "condition" && node.node_type != "decision" {
         return Err(format!(
-            "Node '{}' ({node_id}) is a {} node, not a condition",
+            "Node '{}' ({node_id}) is a {} node, not a condition or decision",
             node.name, node.node_type
         ));
     }

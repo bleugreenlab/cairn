@@ -329,6 +329,11 @@ struct PendingLaunchTurnGuard<'a> {
     /// after that point must not leave the job resting on a status only the
     /// launch asserted, so the drop re-derives it.
     wrote_running_job_id: Option<String>,
+    /// A preclaimed successor this launch started, and the end reason its caller
+    /// named for it (`ResumeContext::unwind_preclaimed_start_as`). A launch that
+    /// fails before delivering it settles it `cancelled` here, while the job's
+    /// launch lock is still held.
+    unwind_preclaimed: Option<(String, String)>,
 }
 
 impl PendingLaunchTurnGuard<'_> {
@@ -336,6 +341,22 @@ impl PendingLaunchTurnGuard<'_> {
         if self.turn_id.is_some() {
             self.run_id = Some(run_id.to_string());
         }
+    }
+
+    /// The occupancy a launch put on the process for a preclaimed successor
+    /// (owned-wait or permission) is the guard's to undo if the launch then
+    /// fails: a process that never received its prompt must not read as serving
+    /// the turn. The turn itself stays the caller's, unless the caller named an
+    /// end reason to unwind it with; then the guard settles it too, so no lock
+    /// holder ever observes a started-but-undelivered preclaimed turn.
+    fn started_preclaimed(
+        &mut self,
+        run_id: &str,
+        turn_id: &str,
+        unwind_as: Option<&crate::models::TurnEndReason>,
+    ) {
+        self.run_id = Some(run_id.to_string());
+        self.unwind_preclaimed = unwind_as.map(|reason| (turn_id.to_string(), reason.to_string()));
     }
 
     fn inserted_run(&mut self, run_id: &str) {
@@ -351,6 +372,7 @@ impl PendingLaunchTurnGuard<'_> {
         self.run_id = None;
         self.inserted_run_id = None;
         self.wrote_running_job_id = None;
+        self.unwind_preclaimed = None;
     }
 }
 
@@ -361,6 +383,29 @@ impl Drop for PendingLaunchTurnGuard<'_> {
             self.orch.process_state.transition_to_warm(&run_id);
         }
         let now = chrono::Utc::now().timestamp();
+        if let Some((turn_id, end_reason)) = self.unwind_preclaimed.take() {
+            let result = run_db({
+                let db = self.db.clone();
+                let turn_id = turn_id.clone();
+                async move {
+                    db.execute(
+                        "UPDATE turns SET state = 'cancelled', end_reason = ?1, ended_at = ?2, updated_at = ?2 WHERE id = ?3 AND state = 'running'",
+                        cairn_db::turso::params![end_reason.as_str(), now, turn_id.as_str()],
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                }
+            });
+            if let Err(error) = result {
+                log::error!(
+                    "failed to settle preclaimed successor {turn_id} after launch failure: {error}"
+                );
+            }
+            let _ = self.orch.services.emitter.emit(
+                "db-change",
+                serde_json::json!({"table": "turns", "action": "update", "turnId": turn_id}),
+            );
+        }
         if let Some(turn_id) = turn_id {
             let result = run_db({
                 let db = self.db.clone();
@@ -1726,13 +1771,21 @@ pub struct ResumeContext {
     /// bookkeeping resumes leave this absent.
     pub(crate) goal_reactivation: Option<GoalReactivation>,
     /// Reuse this pre-created, still-pending successor turn (an owned-wait
-    /// resolution's `WaitResolved` turn) instead of allocating a follow-up. It is
+    /// resolution's `WaitResolved` turn, or a late permission answer's
+    /// `permission_response` turn) instead of allocating a follow-up. It is
     /// started on the resumed run here — exactly once. Distinct from
     /// `preclaimed_retry_turn_id`, which carries automatic-retry claim semantics.
     pub(crate) preclaimed_successor_turn_id: Option<String>,
+    /// If this launch starts `preclaimed_successor_turn_id` and then fails to
+    /// deliver its prompt, settle that turn `cancelled` with this end reason
+    /// before the job's launch lock is released, rather than leaving it
+    /// `running` for the caller. Under the lock, a `running` preclaimed
+    /// successor then always means some launch delivered it.
+    pub(crate) unwind_preclaimed_start_as: Option<crate::models::TurnEndReason>,
 }
 
-/// Validate a pre-created owned-wait successor turn before `continue_job_impl`
+/// Validate a pre-created successor turn (owned-wait `WaitResolved` or
+/// `permission_response`) before `continue_job_impl`
 /// reuses it: it must belong to this job and the resolved session and still be
 /// pending (its start happens here). Rejecting a mismatch keeps a stale or
 /// foreign turn from being driven as this run's successor (CAIRN-2970).
@@ -1806,6 +1859,7 @@ pub(crate) fn continue_automatic_retry(
             supersede_pending_retry: false,
             goal_reactivation: None,
             preclaimed_successor_turn_id: None,
+            unwind_preclaimed_start_as: None,
         }),
     )
 }
@@ -2287,6 +2341,7 @@ fn continue_job_launch_locked(
         run_id: None,
         inserted_run_id: None,
         wrote_running_job_id: None,
+        unwind_preclaimed: None,
     };
 
     // ---- Transition job to Running if in terminal state -------------------
@@ -2688,18 +2743,43 @@ fn continue_job_launch_locked(
     // restarts the process (cold resume with the new model) so the persisted
     // model wins. Cross-backend changes were already handled by rotation above,
     // so any process found here is on the correct backend.
+    //
+    // The durable session pin is reconciled the same way: provider credentials
+    // are frozen into a process at spawn, so a pin that moved (an explicit
+    // continuation after depletion) restarts an idle process cold on the new
+    // account rather than reusing the spent one.
+    let desired_account_id = crate::storage::run_db_blocking({
+        let db = owning_db.clone();
+        let session_id = session_id.clone();
+        move || async move { crate::sessions::queries::get(&db, &session_id).await }
+    })?
+    .account_id;
     let mut restarted_for_model_change = false;
     let existing_run_id = match orch.process_state.find_process_by_session(&session_id) {
         Some(found_run_id) => {
-            match ensure_reused_process_model(
+            let account_decision = ensure_reused_process_account(
                 &orch.process_state,
                 &found_run_id,
-                job.model.as_deref(),
-            )? {
+                desired_account_id.as_deref(),
+            )?;
+            let decision = match account_decision {
+                ReuseDecision::Restart => ReuseDecision::Restart,
+                ReuseDecision::Reuse => ensure_reused_process_model(
+                    &orch.process_state,
+                    &found_run_id,
+                    job.model.as_deref(),
+                )?,
+            };
+            match decision {
                 ReuseDecision::Reuse => Some(found_run_id),
                 ReuseDecision::Restart => {
                     log::info!(
-                        "Model changed for session {}; evicting warm process {} and restarting",
+                        "{} changed for session {}; evicting warm process {} and restarting",
+                        if account_decision == ReuseDecision::Restart {
+                            "Provider account"
+                        } else {
+                            "Model"
+                        },
                         &session_id[..session_id.len().min(8)],
                         &found_run_id[..found_run_id.len().min(8)]
                     );
@@ -3157,6 +3237,15 @@ fn continue_job_launch_locked(
             start_turn(orch, &turn_id, &run_id)?;
         }
         pending_launch_turn.started(&run_id);
+        if let Some(successor_id) = preclaimed_successor_turn_id.as_deref() {
+            pending_launch_turn.started_preclaimed(
+                &run_id,
+                successor_id,
+                prompt_resume
+                    .as_ref()
+                    .and_then(|context| context.unwind_preclaimed_start_as.as_ref()),
+            );
+        }
         orch.process_state
             .set_current_turn_id(&run_id, Some(&turn_id));
 
@@ -4275,6 +4364,31 @@ pub(super) enum ReuseDecision {
     Restart,
 }
 
+/// Reconcile a reusable process against the session's durable account pin.
+///
+/// A process's provider credentials are immutable after spawn, so a moved pin
+/// can only be honoured by a cold restart, and only an idle child may be
+/// evicted for one.
+fn ensure_reused_process_account(
+    process_state: &crate::agent_process::process::AgentProcessState,
+    run_id: &str,
+    desired_account: Option<&str>,
+) -> Result<ReuseDecision, String> {
+    if process_state.get_account_id(run_id).as_deref() == desired_account {
+        return Ok(ReuseDecision::Reuse);
+    }
+    match process_state.get_occupancy(run_id) {
+        Some(crate::agent_process::process::RunOccupancy::Idle) | None => {
+            Ok(ReuseDecision::Restart)
+        }
+        Some(other) => Err(format!(
+            "Cannot change provider account for run {}: process is busy ({:?})",
+            &run_id[..run_id.len().min(8)],
+            other
+        )),
+    }
+}
+
 /// Reconcile a reusable warm/active process against the job's requested model.
 ///
 /// `jobs.model` and the model recorded on the live process (`RunHandle.model`,
@@ -4498,10 +4612,10 @@ pub fn reconcile_stale_active_turn_for_continue_for_test(
 mod tests {
     use super::{
         apply_reseed_seed, assemble_resume_prompt, build_reseed_seed_content,
-        ensure_reused_process_model, prepend_resume_stamp, previous_turn_end_for_resume,
-        push_job_coordinate, resolve_resume_trigger, PendingLaunchTurnGuard, PushJobCoordinate,
-        ReseedDecision, ReseedOutcome, ReuseDecision, SessionBoundary, RESEED_SEED_HEADER,
-        SYNTHETIC_CONTINUATION_PROMPT, THREAD_SEED_HEADER,
+        ensure_reused_process_account, ensure_reused_process_model, prepend_resume_stamp,
+        previous_turn_end_for_resume, push_job_coordinate, resolve_resume_trigger,
+        PendingLaunchTurnGuard, PushJobCoordinate, ReseedDecision, ReseedOutcome, ReuseDecision,
+        SessionBoundary, RESEED_SEED_HEADER, SYNTHETIC_CONTINUATION_PROMPT, THREAD_SEED_HEADER,
     };
     use crate::agent_process::process::{AgentProcessState, RunHandle, RunOccupancy};
     use crate::db::DbState;
@@ -4594,6 +4708,7 @@ mod tests {
                 run_id: None,
                 inserted_run_id: None,
                 wrote_running_job_id: None,
+                unwind_preclaimed: None,
             };
             guard.started("r");
         }
@@ -4672,6 +4787,7 @@ mod tests {
                 run_id: None,
                 inserted_run_id: None,
                 wrote_running_job_id: None,
+                unwind_preclaimed: None,
             };
             guard.started("r");
             guard.adopted();
@@ -4762,6 +4878,7 @@ mod tests {
                 run_id: None,
                 inserted_run_id: None,
                 wrote_running_job_id: None,
+                unwind_preclaimed: None,
             };
             guard.inserted_run("r");
         }
@@ -6215,6 +6332,7 @@ mod tests {
         run_id: &str,
         model: Option<&str>,
         backend: Option<&str>,
+        account_id: Option<&str>,
     ) {
         let mut processes = state.processes.lock().unwrap();
         let child = Arc::new(Mutex::new(None));
@@ -6225,7 +6343,32 @@ mod tests {
         handle.transition_to_warm();
         handle.model = model.map(|m| m.to_string());
         handle.backend = backend.map(|b| b.to_string());
+        handle.account_id = account_id.map(str::to_string);
         processes.register(run_id.to_string(), handle);
+    }
+
+    #[test]
+    fn matching_provider_account_reuses_warm_process() {
+        let state = AgentProcessState::default();
+        register_run(&state, "run-account", Some("opus"), None, Some("account-a"));
+        assert_eq!(
+            ensure_reused_process_account(&state, "run-account", Some("account-a")).unwrap(),
+            ReuseDecision::Reuse
+        );
+    }
+
+    #[test]
+    fn changed_provider_account_restarts_only_when_idle() {
+        let state = AgentProcessState::default();
+        register_run(&state, "run-account", Some("opus"), None, Some("account-a"));
+        assert_eq!(
+            ensure_reused_process_account(&state, "run-account", Some("account-b")).unwrap(),
+            ReuseDecision::Restart
+        );
+        state.begin_turn("run-account", "turn-1");
+        let error =
+            ensure_reused_process_account(&state, "run-account", Some("account-b")).unwrap_err();
+        assert!(error.contains("busy"));
     }
 
     #[test]
@@ -6372,7 +6515,7 @@ mod tests {
     #[test]
     fn matching_model_reuses_without_set_model() {
         let state = AgentProcessState::default();
-        register_run(&state, "run-1", Some("opus"), None);
+        register_run(&state, "run-1", Some("opus"), None, None);
         let decision = ensure_reused_process_model(&state, "run-1", Some("opus")).unwrap();
         assert_eq!(decision, ReuseDecision::Reuse);
         assert_eq!(state.get_model("run-1"), Some("opus".to_string()));
@@ -6381,7 +6524,7 @@ mod tests {
     #[test]
     fn no_desired_model_reuses() {
         let state = AgentProcessState::default();
-        register_run(&state, "run-1", Some("opus"), None);
+        register_run(&state, "run-1", Some("opus"), None, None);
         let decision = ensure_reused_process_model(&state, "run-1", None).unwrap();
         assert_eq!(decision, ReuseDecision::Reuse);
     }
@@ -6389,7 +6532,7 @@ mod tests {
     #[test]
     fn changed_model_requests_restart_when_idle() {
         let state = AgentProcessState::default();
-        register_run(&state, "run-1", Some("sonnet"), None);
+        register_run(&state, "run-1", Some("sonnet"), None, None);
         let decision = ensure_reused_process_model(&state, "run-1", Some("opus")).unwrap();
         assert_eq!(decision, ReuseDecision::Restart);
         // No unconfirmed in-place switch: tracked model is left unchanged; the
@@ -6402,7 +6545,7 @@ mod tests {
         // The helper no longer cares about backend (rotation handles cross-backend
         // upstream); a model change on a same-backend process always restarts.
         let state = AgentProcessState::default();
-        register_run(&state, "run-1", Some("gpt-5.4-mini"), Some("codex"));
+        register_run(&state, "run-1", Some("gpt-5.4-mini"), Some("codex"), None);
         let decision = ensure_reused_process_model(&state, "run-1", Some("gpt-5.4")).unwrap();
         assert_eq!(decision, ReuseDecision::Restart);
         assert_eq!(state.get_model("run-1"), Some("gpt-5.4-mini".to_string()));
@@ -6411,7 +6554,7 @@ mod tests {
     #[test]
     fn changed_model_errors_when_busy() {
         let state = AgentProcessState::default();
-        register_run(&state, "run-1", Some("opus"), None);
+        register_run(&state, "run-1", Some("opus"), None, None);
         // Mid-turn: a restart would kill active work → error instead.
         state.begin_turn("run-1", "turn-1");
         let err = ensure_reused_process_model(&state, "run-1", Some("sonnet")).unwrap_err();

@@ -16,15 +16,11 @@
 
 use crate::common;
 
-use std::io::Write;
 use std::sync::{Arc, Mutex};
 
-use cairn_core::internal::agent_process::process::RunHandle;
 use cairn_core::internal::execution::jobs::{continue_job_impl, in_flight_launch_for_test};
-use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::LocalDb;
 use cairn_db::turso::params;
-use cairn_llm::session::claude::ClaudeControl;
 
 /// A job one step before the wake: an open session, a live run, and a head turn
 /// in `head_turn_state`. `complete` is the idle shape both nudges observed;
@@ -90,46 +86,12 @@ async fn seed_job(db: &LocalDb, head_turn_state: &str) {
     .unwrap();
 }
 
-/// The agent's stdin, standing in for the live process. The backend writes one
-/// newline-terminated JSON message per wake (in as many syscalls as it likes),
-/// so the delivered *messages* are the lines of what accumulates here — and how
-/// many times this one agent was woken is the invariant this file exists for.
-struct RecordingStdin(Arc<Mutex<Vec<u8>>>);
-
-impl Write for RecordingStdin {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn delivered_wakes(stdin: &Arc<Mutex<Vec<u8>>>) -> usize {
     let bytes = stdin.lock().unwrap().clone();
     String::from_utf8_lossy(&bytes)
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count()
-}
-
-/// An in-memory handle for the job's session, so a resume takes the warm path
-/// instead of spawning a CLI. Returns the log of prompts delivered to it.
-fn register_process(orch: &Orchestrator, run_id: &str, session_id: &str) -> Arc<Mutex<Vec<u8>>> {
-    let delivered = Arc::new(Mutex::new(Vec::new()));
-    let mut processes = orch.process_state.processes.lock().unwrap();
-    let handle = RunHandle::new(
-        Arc::new(Mutex::new(None)),
-        Arc::new(Mutex::new(Some(ClaudeControl::boxed(Box::new(
-            RecordingStdin(delivered.clone()),
-        ))))),
-        Some(session_id.to_string()),
-        Some("job-1".to_string()),
-    );
-    processes.register(run_id.to_string(), handle);
-    delivered
 }
 
 /// The state `prepare_job` leaves behind for the interval between admission and
@@ -179,7 +141,7 @@ async fn resume_event_count(db: &LocalDb) -> i64 {
 async fn two_concurrent_resumes_mint_one_agent_context() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_job(&orch.db.local, "complete").await;
-    let delivered = register_process(&orch, "run-1", "session-1");
+    let delivered = common::register_recording_process(&orch, "run-1", "session-1");
 
     let first = orch.clone();
     let second = orch.clone();
@@ -219,7 +181,7 @@ async fn two_concurrent_resumes_mint_one_agent_context() {
 async fn a_running_turn_on_a_serving_process_is_in_flight() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_job(&orch.db.local, "running").await;
-    let _delivered = register_process(&orch, "run-1", "session-1");
+    let _delivered = common::register_recording_process(&orch, "run-1", "session-1");
     orch.process_state.begin_turn("run-1", "turn-1");
 
     assert_eq!(
@@ -248,7 +210,7 @@ async fn a_running_turn_with_no_live_process_is_not_in_flight() {
 async fn a_pending_head_turn_is_not_in_flight() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_job(&orch.db.local, "pending").await;
-    let _delivered = register_process(&orch, "run-1", "session-1");
+    let _delivered = common::register_recording_process(&orch, "run-1", "session-1");
     orch.process_state.begin_turn("run-1", "turn-1");
 
     assert_eq!(in_flight_launch_for_test(&orch, "job-1").unwrap(), None);
@@ -324,7 +286,7 @@ async fn a_resume_racing_a_cold_start_attaches_instead_of_launching() {
 async fn a_settled_job_is_not_in_flight() {
     let (_temp, orch) = common::test_orchestrator().await;
     seed_job(&orch.db.local, "complete").await;
-    let _delivered = register_process(&orch, "run-1", "session-1");
+    let _delivered = common::register_recording_process(&orch, "run-1", "session-1");
 
     assert_eq!(in_flight_launch_for_test(&orch, "job-1").unwrap(), None);
 }

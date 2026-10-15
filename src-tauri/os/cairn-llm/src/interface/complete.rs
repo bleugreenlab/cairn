@@ -1,5 +1,5 @@
 //! The facet's one door for HTTP tokens: a completion over one of the three
-//! protocol families.
+//! turn families (Chat, Messages, Responses) or the Decisions family.
 //!
 //! The seam sits at the request body on purpose. Bodies already differ per
 //! provider (OpenRouter's routing object, Ollama's host, custom sampling), and
@@ -15,6 +15,8 @@ use serde_json::Value;
 
 use crate::wire::anthropic_messages::http::MessagesEndpoint;
 use crate::wire::anthropic_messages::wire::MessagesResponse;
+use crate::wire::decisions::http::DecisionsEndpoint;
+use crate::wire::decisions::wire::DecisionsResponse;
 use crate::wire::openai_compat::http::Endpoint;
 use crate::wire::openai_compat::wire::ChatResponse;
 use crate::wire::openai_responses::http::ResponsesEndpoint;
@@ -28,6 +30,8 @@ pub enum CompletionWire<'a> {
     Chat(&'a Endpoint),
     Messages(&'a MessagesEndpoint),
     Responses(&'a ResponsesEndpoint),
+    /// Typed questions answered with probabilities; never streamed.
+    Decisions(&'a DecisionsEndpoint),
 }
 
 impl CompletionWire<'_> {
@@ -37,6 +41,7 @@ impl CompletionWire<'_> {
             Self::Chat(endpoint) => &endpoint.backend_key,
             Self::Messages(endpoint) => &endpoint.backend_key,
             Self::Responses(endpoint) => &endpoint.backend_key,
+            Self::Decisions(endpoint) => &endpoint.backend_key,
         }
     }
 
@@ -45,6 +50,7 @@ impl CompletionWire<'_> {
             Self::Chat(_) => "chat",
             Self::Messages(_) => "messages",
             Self::Responses(_) => "responses",
+            Self::Decisions(_) => "decisions",
         }
     }
 }
@@ -96,6 +102,7 @@ pub enum CompletionReply {
     Chat(ChatResponse),
     Messages(MessagesResponse),
     Responses(ResponsesResponse),
+    Decisions(DecisionsResponse),
 }
 
 fn mismatched(expected: &str, reply: &CompletionReply) -> CompletionError {
@@ -103,6 +110,7 @@ fn mismatched(expected: &str, reply: &CompletionReply) -> CompletionError {
         CompletionReply::Chat(_) => "chat",
         CompletionReply::Messages(_) => "messages",
         CompletionReply::Responses(_) => "responses",
+        CompletionReply::Decisions(_) => "decisions",
     };
     CompletionError::InvalidResponse(format!("expected a {expected} reply, got {got}"))
 }
@@ -126,6 +134,13 @@ impl CompletionReply {
         match self {
             Self::Responses(response) => Ok(response),
             other => Err(mismatched("responses", &other)),
+        }
+    }
+
+    pub fn into_decisions(self) -> Result<DecisionsResponse, CompletionError> {
+        match self {
+            Self::Decisions(response) => Ok(response),
+            other => Err(mismatched("decisions", &other)),
         }
     }
 }

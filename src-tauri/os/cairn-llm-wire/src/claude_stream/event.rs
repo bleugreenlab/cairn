@@ -32,6 +32,15 @@ pub enum ClaudeEvent {
         message: ClaudeMessage,
         #[serde(default)]
         parent_tool_use_id: Option<String>,
+        /// Structured marker set only on synthetic API-error messages emitted by
+        /// the Claude CLI. Keeping it prevents provider failures from being
+        /// inferred from ordinary assistant prose.
+        #[serde(default)]
+        is_api_error_message: bool,
+        #[serde(default)]
+        api_error_status: Option<u32>,
+        #[serde(default)]
+        error_details: Option<String>,
     },
     /// Final result with stats
     Result {
@@ -216,6 +225,23 @@ pub enum DeltaContent {
 pub struct ClaudeMessage {
     pub role: String,
     pub content: MessageContentInner,
+}
+
+impl ClaudeMessage {
+    /// Concatenate text blocks without interpreting tool payloads.
+    pub fn text(&self) -> String {
+        match &self.content {
+            MessageContentInner::Text(text) => text.clone(),
+            MessageContentInner::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

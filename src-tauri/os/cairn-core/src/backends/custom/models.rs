@@ -67,6 +67,11 @@ pub(crate) fn discover_blocking(
 fn fetch(config: &CustomProviderConfig) -> Result<Vec<ModelEntry>, String> {
     match config.protocol {
         CustomProtocol::OpenAiChatCompletions => {}
+        // Unreachable through configuration, which requires a Decisions
+        // provider to list its models; refused rather than probed regardless.
+        CustomProtocol::Decisions => {
+            return Err("a Decisions provider lists its models explicitly".to_string())
+        }
     }
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(DISCOVERY_TIMEOUT)
@@ -130,9 +135,14 @@ fn model(
         supported_parameters: vec![],
         router: false,
         architecture_modality: None,
-        wire_protocol: Some(
-            cairn_llm::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions,
-        ),
+        wire_protocol: Some(match config.protocol {
+            CustomProtocol::OpenAiChatCompletions => {
+                cairn_llm::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions
+            }
+            // No turn family serves it; the catalog's decision method says what
+            // it does serve.
+            CustomProtocol::Decisions => cairn_llm::types::catalog::DiscoveredWireProtocol::Unknown,
+        }),
     }
 }
 

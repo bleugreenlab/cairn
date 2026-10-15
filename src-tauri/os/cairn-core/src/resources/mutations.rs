@@ -7,6 +7,7 @@ mod browsers;
 mod dispatch;
 mod hash;
 mod labels;
+mod llm_accounts;
 mod mcp;
 mod memories;
 pub mod packs;
@@ -22,6 +23,9 @@ pub(crate) use blocking::{
 };
 pub(crate) use dispatch::dispatch_resource_change;
 pub(crate) use hash::hash_resource_target;
+pub(crate) use llm_accounts::{
+    authorize_sign_in, llm_account_authority, parse_llm_account_change, LlmAccountChange,
+};
 pub(crate) use mcp::workspace_mcp_authority;
 pub(crate) use projects::project_write_crossing_path;
 pub(crate) use settings::workspace_settings_authority;

@@ -283,7 +283,7 @@ pub fn start_recipe_execution_impl(
     // Build execution snapshot. Resolution is early: the snapshot stores fully
     // concrete per-agent selections rather than the inputs they came from.
     let mut snapshot = build_execution_snapshot_from_files(
-        &orch.config_dir,
+        orch,
         Some(&project_path),
         &recipe.id,
         Some(issue_id),
@@ -492,7 +492,7 @@ pub fn start_manual_execution_impl(
 
     // Build execution snapshot
     let mut snapshot = build_execution_snapshot_from_files(
-        &orch.config_dir,
+        orch,
         Some(&project_path),
         &recipe.id,
         None,
@@ -584,7 +584,7 @@ pub(crate) fn start_event_triggered_execution(
         &effective_presets,
     )?;
     let mut snapshot = build_execution_snapshot_from_files(
-        &orch.config_dir,
+        orch,
         Some(&project_path),
         &recipe.id,
         issue_id,
@@ -1235,7 +1235,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn build_execution_snapshot_from_files(
-    config_dir: &Path,
+    orch: &Orchestrator,
     project_path: Option<&Path>,
     recipe_id: &str,
     issue_id: Option<&str>,
@@ -1244,7 +1244,12 @@ fn build_execution_snapshot_from_files(
     event_payload: Option<serde_json::Value>,
     plan: &LaunchSelectionPlan,
 ) -> Result<ExecutionSnapshot, String> {
+    let config_dir = orch.config_dir.as_path();
     let recipe = get_recipe_from_files(config_dir, project_path, recipe_id)?;
+    // Every launch path builds its snapshot here, so this is where a decision
+    // node with nothing to answer it is refused: at launch, never mid-run
+    // where it would only block.
+    orch.refuse_unanswerable_decisions(&recipe.nodes, Some(project_id))?;
     let recipe_snapshot = RecipeSnapshot {
         id: recipe.id.clone(),
         name: recipe.name,
@@ -1346,6 +1351,7 @@ mod tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }

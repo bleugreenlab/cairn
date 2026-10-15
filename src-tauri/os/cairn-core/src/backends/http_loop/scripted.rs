@@ -182,6 +182,7 @@ pub(in crate::backends) fn session_config(model: &str) -> SessionConfig {
         permissions: AgentPermissions::new(Fence::Allow),
         bidirectional: false,
         identity: None,
+        account_id: None,
         output_schema: None,
         ambient: false,
         is_ephemeral_call: false,

@@ -106,6 +106,45 @@ pub fn workspace_mcp_write(
     Ok(AuthorityRequest::new(scope, mutation, summary).with_mcp_config(fingerprint))
 }
 
+/// Starting a subscription sign-in through `cairn://llm/accounts` → the same
+/// `WorkspaceSettings(accounts) + Write` place a `cairn://settings` `accounts`
+/// patch reaches.
+///
+/// A sign-in writes the credential store that section writes, and authority is
+/// keyed to the place reached rather than the carrier, so one store has one
+/// scope: a grant for either door covers the other, subject to its mutation
+/// constraint. A new account is a `Create`; re-authenticating one is an
+/// `Update`.
+pub fn provider_sign_in(
+    workspace_id: &str,
+    provider: cairn_llm::accounts::RoutedProvider,
+    account_id: Option<&str>,
+) -> AuthorityRequest {
+    let scope = AuthorityScope::new(
+        AuthorityPlace::WorkspaceSettings {
+            workspace_id: workspace_id.to_string(),
+            section: "accounts".to_string(),
+        },
+        AuthorityAction::Write,
+    );
+    let provider_name = match provider {
+        cairn_llm::accounts::RoutedProvider::Claude => "Claude",
+        cairn_llm::accounts::RoutedProvider::Codex => "Codex (ChatGPT)",
+    };
+    match account_id {
+        None => AuthorityRequest::new(
+            scope,
+            AuthorityMutation::Create,
+            format!("sign in to a {provider_name} subscription as a new workspace account"),
+        ),
+        Some(account_id) => AuthorityRequest::new(
+            scope,
+            AuthorityMutation::Update,
+            format!("re-authenticate workspace account {account_id} ({provider_name})"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,5 +207,28 @@ mod tests {
         assert!(created.summary.contains("install"), "{}", created.summary);
         let removed = mcp("linear", AuthorityMutation::Delete).unwrap();
         assert!(removed.summary.contains("remove"), "{}", removed.summary);
+    }
+
+    /// Two doors onto one credential store name one place.
+    #[test]
+    fn a_sign_in_reaches_the_settings_accounts_place() {
+        use cairn_llm::accounts::RoutedProvider;
+        let settings = workspace_settings_write("default", "accounts").unwrap();
+        let new = provider_sign_in("default", RoutedProvider::Claude, None);
+        let again = provider_sign_in("default", RoutedProvider::Codex, Some("acc_1"));
+        assert_eq!(new.scope, settings.scope);
+        assert_eq!(again.scope, settings.scope);
+        assert_eq!(
+            new.scope.shorthand(),
+            "workspace/default/settings/accounts:write"
+        );
+        assert_eq!(new.mutation, AuthorityMutation::Create);
+        assert_eq!(again.mutation, AuthorityMutation::Update);
+        assert!(
+            new.summary.contains("new workspace account"),
+            "{}",
+            new.summary
+        );
+        assert!(again.summary.contains("acc_1"), "{}", again.summary);
     }
 }

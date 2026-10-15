@@ -14,7 +14,7 @@ use crate::backends::openai_compat::wire::{ChatContent, ChatMessage};
 use crate::backends::openai_compat::{completion_body, conversation};
 use crate::backends::SessionConfig;
 use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
-use crate::credentials::{CustomProtocol, CustomSampling};
+use crate::credentials::CustomSampling;
 use crate::orchestrator::Orchestrator;
 use cairn_llm::interface::complete::{Complete, CompletionCall, CompletionReply, CompletionWire};
 use cairn_llm::turn::ChatFamily;
@@ -67,12 +67,10 @@ impl CustomAdapter {
         llm: &dyn Complete,
         request: CompletionRequest,
     ) -> Result<CompletionOutcome, CompletionError> {
-        // The single protocol Cairn serves here. Matching exhaustively rather
-        // than assuming means adding a family to `CustomProtocol` cannot
-        // silently route through the wrong transport.
-        match self.config.protocol {
-            CustomProtocol::OpenAiChatCompletions => {}
-        }
+        // A Decisions provider has no text completion to offer.
+        self.config
+            .require_turns()
+            .map_err(CompletionError::InvalidRequest)?;
         let requested_model = request.model.clone();
         let body = completion_body(&request)?;
         let started = Instant::now();

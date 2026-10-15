@@ -397,6 +397,7 @@ fn config_with(
         permissions: crate::backends::AgentPermissions::new(crate::models::Fence::Allow),
         bidirectional: false,
         identity: None,
+        account_id: None,
         output_schema,
         ambient: false,
         is_ephemeral_call: false,

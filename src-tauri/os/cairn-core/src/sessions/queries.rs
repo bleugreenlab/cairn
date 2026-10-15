@@ -263,6 +263,42 @@ mod tests {
     use super::*;
     use crate::services::testing::CapturingEmitter;
 
+    #[tokio::test]
+    async fn account_repin_compare_and_set_preserves_the_first_concurrent_winner() {
+        let db = crate::storage::migrated_test_db("session-account-repin-cas.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+               VALUES ('ws', 'Workspace', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('proj', 'ws', 'Project', 'proj', '/tmp/proj', 1, 1);
+             INSERT INTO jobs(id, project_id, status, current_session_id, created_at, updated_at)
+               VALUES ('job', 'proj', 'running', 'session', 1, 1);
+             INSERT INTO sessions(id, job_id, backend, account_id, status, sequence, created_at, updated_at)
+               VALUES ('session', 'job', 'claude', 'account-a', 'open', 1, 1, 1);",
+        )
+        .await
+        .expect("seed a pinned provider session");
+
+        assert!(
+            compare_and_set_account_id(&db, "session", "account-a", "account-b")
+                .await
+                .expect("first replacement wins")
+        );
+        assert!(
+            !compare_and_set_account_id(&db, "session", "account-a", "account-c")
+                .await
+                .expect("stale replacement loses")
+        );
+        assert_eq!(
+            get(&db, "session")
+                .await
+                .expect("read durable winner")
+                .account_id
+                .as_deref(),
+            Some("account-b")
+        );
+    }
+
     /// Seed a node whose job carries `model` and whose open session runs on
     /// `claude`, so a provider change to `codex` has somewhere to fail.
     async fn seed_provider_change(file: &str) -> LocalDb {

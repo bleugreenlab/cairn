@@ -892,6 +892,16 @@ pub(crate) const SETTINGS_THREAD_COMPACT_THRESHOLD: KeySpec = KeySpec::new(
     KeyType::Float,
     "fraction of the context window at which a warm thread session rebuilds",
 );
+pub(crate) const SETTINGS_SEED_BUDGET_TOKENS: KeySpec = KeySpec::new(
+    "seedBudgetTokens",
+    KeyType::Int,
+    "approximate token budget for non-arc thread seed context",
+);
+pub(crate) const SETTINGS_SEED_ERAS: KeySpec = KeySpec::new(
+    "seedEras",
+    KeyType::Int,
+    "number of recent era summaries rendered into a thread seed",
+);
 pub(crate) const SETTINGS_EXTERNAL_REPLIES: KeySpec = KeySpec::new(
     "externalReplies",
     KeyType::Str,
@@ -911,6 +921,11 @@ pub(crate) const SETTINGS_ROUTE_CALLS_VIA_OPENROUTER: KeySpec = KeySpec::new(
     "routeCallsViaOpenRouter",
     KeyType::Bool,
     "route tier-based ephemeral calls through OpenRouter instead of the native backend",
+);
+pub(crate) const SETTINGS_PRIVATE_DEDICATED_PROCESS_CAPACITY: KeySpec = KeySpec::new(
+    "privateDedicatedProcessCapacity",
+    KeyType::Int,
+    "operator ceiling on resident private-session backend processes; 0 clears it",
 );
 pub(crate) const SETTINGS_CHANNELS: KeySpec = KeySpec::new(
     "channels",

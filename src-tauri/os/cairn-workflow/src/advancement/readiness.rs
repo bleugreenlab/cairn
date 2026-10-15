@@ -77,7 +77,7 @@ pub async fn is_action_node_ready_with_snapshot_conn(
                     return Ok(false);
                 }
             }
-            Some("condition") => {
+            Some("condition") | Some("decision") => {
                 if !condition_edge_satisfied_conn(conn, execution_id, edge).await? {
                     return Ok(false);
                 }
@@ -321,8 +321,13 @@ pub fn find_ready_condition_nodes(
         db.read(|conn| {
             let execution_id = execution_id.clone();
             Box::pin(async move {
-                find_ready_nodes_conn(conn, &execution_id, &["condition"], "condition_evaluations")
-                    .await
+                find_ready_nodes_conn(
+                    conn,
+                    &execution_id,
+                    &["condition", "decision"],
+                    "condition_evaluations",
+                )
+                .await
             })
         })
         .await
@@ -399,6 +404,7 @@ mod tests {
             checkpoint_config: None,
             artifact_config: None,
             condition_config: None,
+            decision_config: None,
             context_config: None,
         }
     }

@@ -8,13 +8,15 @@ use crate::identity::{CredentialStoreExt, GitIdentity, UserIdentity};
 
 use super::Orchestrator;
 
-struct ProviderUsageCaptureReservation {
+/// The one measurement of an account in flight. Taken by every probe that
+/// records what it measures, so an account is never probed twice at once.
+pub(super) struct ProviderUsageCaptureReservation {
     captures: super::ProviderUsageCaptures,
     key: (String, String),
 }
 
 impl ProviderUsageCaptureReservation {
-    fn acquire(
+    pub(super) fn acquire(
         captures: super::ProviderUsageCaptures,
         provider: RoutedProvider,
         account_id: &str,
@@ -85,13 +87,15 @@ impl Orchestrator {
             .and_then(|guard| guard.as_ref().map(|store| store.resolve(None, None)))
     }
 
-    fn apply_captured_account_usage_if_current(
+    /// Record a probe's measurement of an account, unless the credential it
+    /// read was rewritten while it ran. Answers whether it was recorded.
+    pub(super) fn apply_captured_account_usage_if_current(
         &self,
         provider: RoutedProvider,
         account_id: &str,
         captured_generation: Option<String>,
         snapshot: cairn_llm::types::usage::ProviderUsageSnapshot,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         if provider == RoutedProvider::Claude {
             let current_generation = self
                 .subscriptions
@@ -100,10 +104,11 @@ impl Orchestrator {
                 log::debug!(
                     "Discarding Claude usage captured across a credential rewrite for account {account_id}"
                 );
-                return Ok(());
+                return Ok(false);
             }
         }
         self.apply_captured_account_usage(account_id, snapshot)
+            .map(|()| true)
     }
 
     pub fn resolve_provider_account(
@@ -373,27 +378,19 @@ impl Orchestrator {
         label: String,
         auth_json: String,
         project_id: Option<String>,
-    ) -> Result<AccountInfo, String> {
-        let identity = crate::backends::codex::codex_account_identity(&auth_json)?;
+        target: &cairn_llm::subscription::SignInTarget,
+    ) -> Result<AccountInfo, cairn_llm::subscription::SignInRecordError> {
         let mut store = self.get_credential_store().unwrap_or_else(|| {
             crate::identity::local::credential_store_from_git_config(&self.config_dir)
         });
-        let chatgpt_account_id = identity.chatgpt_account_id.clone();
-        let info = store.upsert_oauth_account(
-            ApiProvider::OpenAI,
+        let info = cairn_llm::subscription::store_codex_sign_in(
+            &mut store,
             label,
-            crate::credentials::OAuthLogin {
-                value: auth_json,
-                email: identity.email,
-                plan: identity.plan,
-            },
+            auth_json,
             project_id,
+            target,
             chrono::Utc::now().timestamp(),
-            |value| {
-                crate::backends::codex::codex_account_identity(value)
-                    .is_ok_and(|existing| existing.chatgpt_account_id == chatgpt_account_id)
-            },
-        );
+        )?;
         self.save_credential_store(store)?;
         self.emit_config_changed();
         self.spawn_model_catalog_refresh();
@@ -451,6 +448,10 @@ impl Orchestrator {
         account.health = Some(crate::credentials::ProviderAccountHealth {
             windows,
             blocked_until,
+            depleted: account
+                .health
+                .as_ref()
+                .and_then(|health| health.depleted.clone()),
             captured_at: chrono::Utc::now().timestamp(),
         });
         let label = account
@@ -460,6 +461,63 @@ impl Orchestrator {
         self.credential_store.persist_locked(store)?;
         self.emit_config_changed();
         Ok(label)
+    }
+
+    /// Mark credit exhaustion as sticky. Unlike a rolling provider block, this
+    /// remains unavailable until an operator explicitly retries the account.
+    pub(crate) fn record_account_credit_depletion(
+        &self,
+        id: &str,
+        detail: String,
+    ) -> Result<String, String> {
+        let mut guard = self
+            .credential_store
+            .lock()
+            .map_err(|_| "Identity store lock poisoned".to_string())?;
+        let store = guard.as_mut().ok_or("No identity store")?;
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| format!("Account not found: {id}"))?;
+        let now = chrono::Utc::now().timestamp();
+        let health = account
+            .health
+            .get_or_insert_with(crate::credentials::ProviderAccountHealth::default);
+        health.depleted = Some(crate::credentials::AccountDepletion { since: now, detail });
+        health.captured_at = now;
+        let label = account
+            .email
+            .clone()
+            .unwrap_or_else(|| account.label.clone());
+        self.credential_store.persist_locked(store)?;
+        drop(guard);
+        self.emit_config_changed();
+        Ok(label)
+    }
+
+    /// Authorize one deliberate retry by clearing sticky credit depletion.
+    /// Automatic usage probes intentionally do not call this: they cannot see a
+    /// credit top-up, and therefore cannot safely put the account in rotation.
+    pub fn clear_account_credit_depletion(&self, id: &str) -> Result<AccountInfo, String> {
+        let mut guard = self
+            .credential_store
+            .lock()
+            .map_err(|_| "Identity store lock poisoned".to_string())?;
+        let store = guard.as_mut().ok_or("No identity store")?;
+        let account = store
+            .accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| format!("Account not found: {id}"))?;
+        if let Some(health) = account.health.as_mut() {
+            health.depleted = None;
+        }
+        let info = AccountInfo::from(&*account);
+        self.credential_store.persist_locked(store)?;
+        drop(guard);
+        self.emit_config_changed();
+        Ok(info)
     }
 
     /// Probe a subscription account's remaining usage and record it.
@@ -565,6 +623,10 @@ impl Orchestrator {
             account.health = Some(crate::credentials::ProviderAccountHealth {
                 windows: snapshot.windows.clone(),
                 blocked_until: None,
+                depleted: account
+                    .health
+                    .as_ref()
+                    .and_then(|health| health.depleted.clone()),
                 captured_at: chrono::Utc::now().timestamp(),
             });
             self.credential_store.persist_locked(store)?;
@@ -840,6 +902,64 @@ impl cairn_llm::subscription::LlmHost for Orchestrator {
     fn register_secret(&self, provider: &str, key: &str, value: &str) {
         crate::security::broker::backend::register_injected(provider, key, value);
     }
+
+    fn is_managed_claude_account(&self, id: &str, project_id: Option<&str>) -> bool {
+        Orchestrator::is_managed_claude_account(self, id, project_id)
+    }
+
+    fn add_claude_profile_account(
+        &self,
+        project_id: Option<String>,
+    ) -> Result<AccountInfo, String> {
+        self.add_account(
+            ApiProvider::Anthropic,
+            "Claude".to_string(),
+            ProviderAuth::ClaudeProfile { oauth: None },
+            project_id,
+        )
+    }
+
+    fn remove_account(&self, id: &str) {
+        if let Err(error) = Orchestrator::remove_account(self, id) {
+            log::debug!("Discarding sign-in account {id}: {error}");
+        }
+    }
+
+    fn record_claude_sign_in(
+        &self,
+        id: &str,
+        email: Option<String>,
+        plan: Option<String>,
+    ) -> Result<AccountInfo, String> {
+        let connected = self.update_account_metadata(id, email, plan)?;
+        self.capture_account_usage(RoutedProvider::Claude, id.to_string());
+        Ok(connected)
+    }
+
+    fn record_codex_sign_in(
+        &self,
+        auth_json: String,
+        project_id: Option<String>,
+        target: &cairn_llm::subscription::SignInTarget,
+    ) -> Result<AccountInfo, cairn_llm::subscription::SignInRecordError> {
+        let account = self.upsert_codex_oauth_account(
+            "Codex OAuth".to_string(),
+            auth_json,
+            project_id,
+            target,
+        )?;
+        self.capture_account_usage(RoutedProvider::Codex, account.id.clone());
+        Ok(account)
+    }
+
+    fn sign_in_settled(
+        &self,
+        sign_in_ref: &str,
+        provider: RoutedProvider,
+        outcome: cairn_llm::subscription::SignInOutcome,
+    ) {
+        self.record_sign_in_settled(sign_in_ref, provider, outcome);
+    }
 }
 
 #[cfg(test)]
@@ -960,6 +1080,39 @@ mod tests {
             cairn_llm::codex::tokens::CodexRefreshFailure,
         > {
             Unsubscribed.refresh_codex(host, request)
+        }
+
+        fn start_sign_in(
+            &self,
+            host: std::sync::Arc<dyn LlmHost>,
+            request: cairn_llm::subscription::SignInRequest,
+        ) -> cairn_llm::subscription::SignInFuture<
+            Result<cairn_llm::subscription::SignInStart, cairn_llm::subscription::SignInError>,
+        > {
+            Unsubscribed.start_sign_in(host, request)
+        }
+        fn sign_in_status(
+            &self,
+            sign_in_ref: &str,
+        ) -> Result<cairn_llm::subscription::SignInStatus, cairn_llm::subscription::SignInError>
+        {
+            Unsubscribed.sign_in_status(sign_in_ref)
+        }
+        fn submit_sign_in_code(
+            &self,
+            host: std::sync::Arc<dyn LlmHost>,
+            sign_in_ref: String,
+            code: String,
+        ) -> cairn_llm::subscription::SignInFuture<
+            Result<cairn_llm::subscription::SubmitCodeResult, cairn_llm::subscription::SignInError>,
+        > {
+            Unsubscribed.submit_sign_in_code(host, sign_in_ref, code)
+        }
+        fn cancel_sign_in(&self, host: &dyn LlmHost, sign_in_ref: &str) -> bool {
+            Unsubscribed.cancel_sign_in(host, sign_in_ref)
+        }
+        fn pending_sign_ins(&self) -> Vec<cairn_llm::subscription::PendingSignIn> {
+            Unsubscribed.pending_sign_ins()
         }
     }
 
@@ -1421,6 +1574,7 @@ fi
                 "Codex OAuth".to_string(),
                 codex_auth_json("acct-one", "one@example.com", "refresh-one"),
                 None,
+                &cairn_llm::subscription::SignInTarget::NewOrMatching,
             )
             .expect("first account stored");
         let second = orch
@@ -1428,6 +1582,7 @@ fi
                 "Codex OAuth".to_string(),
                 codex_auth_json("acct-two", "two@example.com", "refresh-two"),
                 None,
+                &cairn_llm::subscription::SignInTarget::NewOrMatching,
             )
             .expect("second account stored");
 
@@ -1459,6 +1614,7 @@ fi
             "Codex OAuth".to_string(),
             codex_auth_json("acct-other", "other@example.com", "refresh-other"),
             None,
+            &cairn_llm::subscription::SignInTarget::NewOrMatching,
         )
         .expect("unrelated account stored");
         let first = orch
@@ -1466,12 +1622,18 @@ fi
                 "Codex OAuth".to_string(),
                 codex_auth_json("acct-one", "one@example.com", "refresh-one"),
                 None,
+                &cairn_llm::subscription::SignInTarget::NewOrMatching,
             )
             .expect("account stored");
 
         let reconnected_json = codex_auth_json("acct-one", "renamed@example.com", "refresh-two");
         let reconnected = orch
-            .upsert_codex_oauth_account("Codex OAuth".to_string(), reconnected_json.clone(), None)
+            .upsert_codex_oauth_account(
+                "Codex OAuth".to_string(),
+                reconnected_json.clone(),
+                None,
+                &cairn_llm::subscription::SignInTarget::NewOrMatching,
+            )
             .expect("account reconnected");
 
         assert_eq!(
@@ -1511,6 +1673,7 @@ fi
             "Codex OAuth".to_string(),
             serde_json::json!({ "auth_mode": "chatgpt", "tokens": {} }).to_string(),
             None,
+            &cairn_llm::subscription::SignInTarget::NewOrMatching,
         );
 
         assert!(stored.is_err());
@@ -1617,6 +1780,72 @@ fi
         );
         assert!(orch.is_managed_claude_account(&refreshed.id, Some("project-1")));
         assert!(orch.is_managed_claude_account(&first.id, None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sticky_credit_depletion_survives_usage_refresh_until_explicitly_cleared() {
+        let orch = test_orchestrator().await;
+        let account = orch
+            .add_account(
+                ApiProvider::Anthropic,
+                "Claude".to_string(),
+                ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .expect("profile added");
+
+        orch.record_account_credit_depletion(&account.id, "credits_required".to_string())
+            .expect("depletion stored");
+        orch.record_account_health(&account.id, vec![usage_window("weekly", None, 75.0)], None)
+            .expect("usage refresh stored");
+
+        let store = orch.get_credential_store().unwrap();
+        assert!(store
+            .accounts
+            .iter()
+            .find(|candidate| candidate.id == account.id)
+            .unwrap()
+            .health
+            .as_ref()
+            .unwrap()
+            .depleted
+            .is_some());
+        assert!(store
+            .select_routed_account(
+                RoutedProvider::Claude,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                i64::MAX,
+            )
+            .is_none());
+
+        orch.clear_account_credit_depletion(&account.id)
+            .expect("operator retry clears depletion");
+        let cleared = orch.get_credential_store().unwrap();
+        let health = cleared
+            .accounts
+            .iter()
+            .find(|candidate| candidate.id == account.id)
+            .unwrap()
+            .health
+            .as_ref()
+            .unwrap();
+        assert!(health.depleted.is_none());
+        assert_eq!(health.windows[0].remaining_percent, 75.0);
+        assert!(cleared
+            .select_routed_account(
+                RoutedProvider::Claude,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                i64::MAX,
+            )
+            .is_some());
     }
 
     #[tokio::test(flavor = "multi_thread")]

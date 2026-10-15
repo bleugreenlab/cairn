@@ -690,6 +690,7 @@ async fn seed_change_run(
             tier: None,
             backend_preference: None,
             selection: None,
+            provider_account: None,
             model: None,
             disallowed_tools: None,
             skills: None,

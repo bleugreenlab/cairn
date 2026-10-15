@@ -206,9 +206,21 @@ pub async fn authorize(
     actor: &AuthorityActor,
     request: &AuthorityRequest,
 ) -> Result<AuthorityDecision, String> {
+    authorize_recorded(actor, request)
+        .await
+        .map(|(decision, _)| decision)
+}
+
+/// [`authorize`], also answering with the id of the decision row it journaled
+/// (none for direct work, which is never journaled), so a record of what the
+/// authorized act then did can cite the decision that allowed it.
+pub async fn authorize_recorded(
+    actor: &AuthorityActor,
+    request: &AuthorityRequest,
+) -> Result<(AuthorityDecision, Option<String>), String> {
     let decision = adjudicate(actor, request, true).await?;
-    journal(actor, request, &decision).await;
-    Ok(decision)
+    let event_id = journal(actor, request, &decision).await;
+    Ok((decision, event_id))
 }
 
 async fn adjudicate(
@@ -262,10 +274,12 @@ async fn adjudicate(
 /// Append a decision to the journal. Journaling must never be the reason a
 /// legitimate mutation fails, so a write failure is logged rather than
 /// propagated — but a missing row is a real gap, so it is logged at warn.
-async fn journal(actor: &AuthorityActor, request: &AuthorityRequest, decision: &AuthorityDecision) {
-    let Some(reason) = decision.reason() else {
-        return;
-    };
+async fn journal(
+    actor: &AuthorityActor,
+    request: &AuthorityRequest,
+    decision: &AuthorityDecision,
+) -> Option<String> {
+    let reason = decision.reason()?;
     let grant_id = match decision {
         AuthorityDecision::AllowedByGrant { grant_id, .. } => Some(grant_id.clone()),
         _ => None,
@@ -303,8 +317,12 @@ async fn journal(actor: &AuthorityActor, request: &AuthorityRequest, decision: &
         appearance_snapshot,
         decided_at: now(),
     };
-    if let Err(error) = store::append_event(&actor.db, event).await {
-        log::warn!("failed to journal authorization decision: {error}");
+    match store::append_event(&actor.db, event).await {
+        Ok(id) => Some(id),
+        Err(error) => {
+            log::warn!("failed to journal authorization decision: {error}");
+            None
+        }
     }
 }
 

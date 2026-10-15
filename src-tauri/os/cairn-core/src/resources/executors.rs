@@ -263,6 +263,7 @@ fn connection_phase_label(phase: RemoteConnectionPhase) -> &'static str {
         RemoteConnectionPhase::Disconnected => "protocol disconnected",
         RemoteConnectionPhase::RemoteProcessExited => "remote executor exited",
         RemoteConnectionPhase::RetryScheduled => "retry scheduled",
+        RemoteConnectionPhase::EnvironmentEvicted => "execution environment rebuilt elsewhere",
     }
 }
 
@@ -5094,6 +5095,7 @@ mod tests {
             outcome: PlacementOutcome::Selected(Box::new(PlacementSelection {
                 cache_distance: None,
                 prediction: None,
+                memory_ceiling: None,
                 executor_name: "bglab-ub".into(),
                 executor_id: "executor-7b21ce".into(),
                 colocated: false,

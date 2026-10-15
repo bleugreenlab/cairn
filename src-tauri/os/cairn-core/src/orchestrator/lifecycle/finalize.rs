@@ -211,11 +211,7 @@ pub(crate) fn release_process_admission(orch: &Orchestrator, run_id: &str) -> bo
     let _ = orch.process_state.take_admission_claim(run_id);
     if workspace == "private-runtime" {
         if let Some(lane) = lane {
-            if let Err(error) = crate::execution::jobs::promote_private_lane(orch, &lane) {
-                log::error!(
-                    "failed to promote ordinary admission after releasing {run_id}: {error}"
-                );
-            }
+            crate::execution::jobs::promote_private_lane(orch, &lane);
         }
     }
     true
@@ -739,6 +735,28 @@ pub fn fail_run(orch: &Orchestrator, run_id: &str, reason: &str) {
         }
     }
     let _ = set_exit_reason(orch, run_id, reason);
+    finalize_run(orch, run_id, RunStatus::Crashed);
+}
+
+/// Settle a turn that ended because its provider account is depleted.
+///
+/// The turn is interrupted, never completed: the account produced no finished
+/// work, so recompute must not derive the job Complete or advance the DAG. The
+/// process holding the spent credentials is stopped before finalization, so a
+/// queued delivery that finalization flushes cold-launches on whatever account
+/// the session pin names by then — the caller persists health and the
+/// replacement pin first.
+pub(crate) fn interrupt_run_for_provider_depletion(orch: &Orchestrator, run_id: &str) {
+    let turn_id = orch
+        .process_state
+        .get_current_turn_id(run_id)
+        .or_else(|| current_turn_id_for_run(orch, run_id));
+    if let Some(turn_id) = turn_id.as_deref() {
+        if let Err(error) = interrupt_turn(orch, turn_id, Some(TurnEndReason::ProviderDepleted)) {
+            log::warn!("Failed to interrupt depleted turn {turn_id} for run {run_id}: {error}");
+        }
+    }
+    release_and_stop_process(orch, run_id);
     finalize_run(orch, run_id, RunStatus::Crashed);
 }
 

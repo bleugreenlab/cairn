@@ -1862,11 +1862,21 @@ async fn render_resource_body(
             None => crate::resources::llm::render_index(),
         },
         CairnResource::LlmCatalog => crate::resources::llm::render_catalog(orch, &params),
-        CairnResource::LlmAccounts => crate::resources::llm::render_accounts(orch, &params),
+        CairnResource::LlmAccounts => crate::resources::llm::render_accounts(
+            orch,
+            &params,
+            &orch.subscriptions().pending_sign_ins(),
+        ),
         CairnResource::LlmAccount { id } => {
             match reject_query_params("cairn://llm/accounts/{id}", &params) {
                 Some(error) => error,
-                None => crate::resources::llm::render_account(orch, &id),
+                None => {
+                    let sign_ins = crate::resources::llm::AccountSignIns {
+                        pending: orch.subscriptions().pending_sign_ins(),
+                        history: orch.account_sign_in_history(&id).await,
+                    };
+                    crate::resources::llm::render_account(orch, &id, &sign_ins)
+                }
             }
         }
         CairnResource::LlmUsage => crate::resources::llm::render_usage(orch, &params),

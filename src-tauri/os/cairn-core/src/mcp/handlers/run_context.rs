@@ -73,6 +73,56 @@ pub(crate) struct AuthenticatedAgent {
     pub job_id: String,
 }
 
+impl AuthenticatedAgent {
+    /// This run as a decision actor, and how it appeared: a resource write over
+    /// its own verified node session. The one constructor for an agent's
+    /// appearance, so every record an agent's write leaves names it the same
+    /// way.
+    pub(crate) fn appearance(
+        &self,
+        at: i64,
+    ) -> Result<
+        (
+            cairn_common::identity::PrincipalRef,
+            cairn_common::identity::AppearanceSnapshot,
+        ),
+        String,
+    > {
+        use cairn_common::identity::{
+            Address, AppearanceEvidence, AppearanceSnapshot, AppearanceTransport, PrincipalRef,
+            VerificationMethod, VerificationRecord, VerificationStatus, VerificationStrength,
+        };
+        let principal = PrincipalRef::Agent {
+            node: self.home.clone(),
+            run_id: Some(self.run_id.clone()),
+        };
+        let verification = VerificationRecord::new(
+            VerificationMethod::NodeSession,
+            VerificationStatus::Verified,
+            None,
+            None,
+            Some(self.run_id.clone()),
+            None,
+            VerificationStrength::new("session-bound").map_err(|error| error.to_string())?,
+            at,
+        )
+        .map_err(|error| error.to_string())?;
+        let evidence = AppearanceEvidence::new(
+            AppearanceTransport::ResourcePatch,
+            Address::Resource {
+                node: self.home.clone(),
+            },
+            verification,
+            at,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let appearance = AppearanceSnapshot::new(principal.clone(), evidence, vec![], None)
+            .map_err(|error| error.to_string())?;
+        Ok((principal, appearance))
+    }
+}
+
 /// Resolve the request to its live run and that run's home, and require the
 /// home to be a canonical agent home. This is what makes a write attributable to
 /// an agent node from the authenticated session alone, never from the payload.
