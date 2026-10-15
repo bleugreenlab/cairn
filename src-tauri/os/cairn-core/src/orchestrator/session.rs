@@ -339,6 +339,56 @@ fn persist_routed_account_and_resolve_identity(
     }
 }
 
+/// Log target for the routine account-selection diagnostic a routed session
+/// launch emits.
+pub(crate) const ACCOUNT_SELECTION_LOG_TARGET: &str = "cairn::account_selection";
+/// Leads each selection line; the JSON diagnostic follows it.
+const ACCOUNT_SELECTION_LOG_PREFIX: &str = "Provider account selected: ";
+
+/// Why a routed launch runs on `account_id`: the policy that chose it and how
+/// every candidate stood at that moment, keyed by run and session.
+///
+/// Routine selection is a launch fact, not a conversation event, so this is
+/// logged rather than written to the transcript. The pin itself is durable on
+/// `sessions.account_id`. Only a rollover or depletion boundary, which the
+/// operator may need to act on, warrants a transcript row.
+fn account_selection_diagnostic(
+    orch: &Orchestrator,
+    provider: crate::credentials::RoutedProvider,
+    run_id: &str,
+    session_id: &str,
+    project_id: Option<&str>,
+    account_id: &str,
+    requested_model: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let snapshot_override = snapshot_account_override(orch, run_id)?;
+    let project_override = routed_project_override(orch, provider, project_id);
+    let effective_override = snapshot_override.as_deref().or(project_override.as_deref());
+    let candidates = orch
+        .get_credential_store()
+        .map(|store| {
+            store.routed_account_diagnostics(
+                provider,
+                project_id,
+                effective_override,
+                None,
+                requested_model,
+                chrono::Utc::now().timestamp(),
+            )
+        })
+        .unwrap_or_default();
+    Ok(serde_json::json!({
+        "runId": run_id,
+        "sessionId": session_id,
+        "provider": provider.backend(),
+        "policy": effective_override.map_or("automatic", |_| "account"),
+        "selectedAccountId": account_id,
+        "model": requested_model,
+        "headroomFamily": requested_model,
+        "candidates": candidates,
+    }))
+}
+
 /// The explicit provider account an execution snapshot selects for a run's
 /// agent, or `None` for Automatic.
 pub(crate) fn snapshot_account_override(
@@ -2572,43 +2622,24 @@ pub fn start_agent_session(
         None
     };
     if let (Some(provider), Some(account_id)) = (routed_provider, resolved_account_id.as_deref()) {
-        let snapshot_override = snapshot_account_override(orch, run_id)?;
-        let project_override =
-            routed_project_override(orch, provider, session_project_id.as_deref());
-        let effective_override = snapshot_override.as_deref().or(project_override.as_deref());
-        let label = orch
-            .list_accounts(session_project_id.as_deref())
-            .into_iter()
-            .find(|account| account.id == account_id)
-            .map(|account| account.label)
-            .unwrap_or_else(|| account_id.to_string());
-        let diagnostics = orch
-            .get_credential_store()
-            .map(|store| {
-                store.routed_account_diagnostics(
-                    provider,
-                    session_project_id.as_deref(),
-                    effective_override,
-                    None,
-                    requested_model,
-                    chrono::Utc::now().timestamp(),
-                )
-            })
-            .unwrap_or_default();
-        let policy = effective_override.map_or("automatic", |_| "account");
-        let message = if effective_override.is_some() {
-            format!("Provider account selected: {label} (explicit policy).")
-        } else {
-            format!("Provider account selected: {label} (automatic balancing).")
-        };
-        let _ = crate::messages::transcript::insert_system_message_sync(
+        match account_selection_diagnostic(
             orch,
+            provider,
             run_id,
-            Some(&session_id_for_timing),
-            orch.process_state.get_current_turn_id(run_id).as_deref(),
-            &message,
-            serde_json::json!({"kind":"system:account_selection","policy":policy,"selectedAccountId":account_id,"selectedAccountLabel":label,"model":requested_model,"headroomFamily":requested_model,"candidates":diagnostics}),
-        );
+            &session_id_for_timing,
+            session_project_id.as_deref(),
+            account_id,
+            requested_model,
+        ) {
+            Ok(diagnostic) => log::info!(
+                target: ACCOUNT_SELECTION_LOG_TARGET,
+                "{ACCOUNT_SELECTION_LOG_PREFIX}{diagnostic}"
+            ),
+            Err(error) => log::warn!(
+                target: ACCOUNT_SELECTION_LOG_TARGET,
+                "Provider account {account_id} pinned for run {run_id} session {session_id_for_timing}; its selection diagnostic is unavailable: {error}"
+            ),
+        }
     }
 
     // Resolve the native output-constraint schema for a schema-constrained call.
@@ -3536,6 +3567,139 @@ mod tests {
             launched_identity.lock().unwrap().as_ref().and_then(|identity| identity.claude_auth.as_ref()),
             Some(crate::credentials::ClaudeAuth::ManagedProfile { account_id }) if account_id == &healthy.id
         ));
+    }
+
+    static ACCOUNT_SELECTION_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// Records the account-selection log target for the whole test binary; a
+    /// test reads back only the lines naming its own run.
+    struct AccountSelectionLog;
+
+    impl log::Log for AccountSelectionLog {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.target() == ACCOUNT_SELECTION_LOG_TARGET
+                && metadata.level() <= log::Level::Info
+        }
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                ACCOUNT_SELECTION_LOG
+                    .lock()
+                    .unwrap()
+                    .push(record.args().to_string());
+            }
+        }
+        fn flush(&self) {}
+    }
+
+    fn capture_account_selection_log() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&AccountSelectionLog)
+                .expect("the cairn-core test binary installs no other logger");
+            log::set_max_level(log::LevelFilter::Info);
+        });
+    }
+
+    fn logged_account_selection(run_id: &str) -> Option<serde_json::Value> {
+        ACCOUNT_SELECTION_LOG
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|line| line.strip_prefix(ACCOUNT_SELECTION_LOG_PREFIX))
+            .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .find(|diagnostic| diagnostic["runId"] == run_id)
+    }
+
+    /// Routine account selection is a launch fact, not a conversation event:
+    /// a session start under automatic balancing pins the account and logs
+    /// the selection diagnostic, and writes nothing into the transcript.
+    #[tokio::test(flavor = "current_thread")]
+    async fn automatic_balancing_session_start_logs_the_selection_without_a_transcript_row() {
+        capture_account_selection_log();
+        let db = Arc::new(migrated_db().await);
+        seed_session(&db).await;
+        db.execute_script(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES('e', 'build', 'i', 'p', 'running', 1, 1);
+             UPDATE jobs SET execution_id='e', uri_segment='builder', node_name='Builder' WHERE id='j';
+             INSERT INTO runs(id, project_id, job_id, issue_id, session_id, status, created_at, updated_at)
+               VALUES('run-auto-balance', 'p', 'j', 'i', 'sess', 'running', 1, 1);",
+        )
+        .await
+        .unwrap();
+        let orch = test_orchestrator(db.clone());
+        let accounts = ["Work Max", "Personal Max"].map(|label| {
+            orch.add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                label.to_string(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap()
+            .id
+        });
+        TEST_SESSION_BACKEND.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(CapturingClaudeBackend {
+                identity: Arc::new(std::sync::Mutex::new(None)),
+            }));
+        });
+
+        start_agent_session(
+            &orch,
+            "run-auto-balance",
+            "hello",
+            SessionStart::New {
+                session_id: "sess".to_string(),
+            },
+            Some(Model::new("opus")),
+            None,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect("session reaches the backend boundary");
+
+        let pinned = crate::sessions::queries::get(&db, "sess")
+            .await
+            .unwrap()
+            .account_id
+            .expect("automatic balancing pins an account");
+        assert!(
+            accounts.contains(&pinned),
+            "{pinned} is not a configured account"
+        );
+
+        let selection_rows: Vec<String> = db
+            .query_all(
+                "SELECT data FROM events WHERE run_id = ?1 AND event_type = 'system:message'",
+                ("run-auto-balance",),
+                |row| row.text(0),
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|data| data.contains("system:account_selection"))
+            .collect();
+        assert!(
+            selection_rows.is_empty(),
+            "routine account selection must not reach the transcript: {selection_rows:?}"
+        );
+
+        let diagnostic = logged_account_selection("run-auto-balance")
+            .expect("the selection diagnostic is logged at launch");
+        assert_eq!(diagnostic["sessionId"], "sess");
+        assert_eq!(diagnostic["provider"], "claude");
+        assert_eq!(diagnostic["policy"], "automatic");
+        assert_eq!(diagnostic["selectedAccountId"], pinned.as_str());
+        assert_eq!(diagnostic["model"], "opus");
+        assert_eq!(diagnostic["headroomFamily"], "opus");
+        assert_eq!(
+            diagnostic["candidates"].as_array().map(Vec::len),
+            Some(accounts.len())
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
