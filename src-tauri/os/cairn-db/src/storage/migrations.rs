@@ -138,6 +138,15 @@ macro_rules! shared_tail_permission_resume_error {
     };
 }
 
+/// cairn/4977: a terminal settled because its process was proven gone records
+/// why, since its exit code cannot. `job_terminals` is carried by both lineages,
+/// so the column is written once and composed into both.
+macro_rules! shared_tail_terminal_exit_reason {
+    () => {
+        migration!("0252_terminal_exit_reason")
+    };
+}
+
 /// How each execution bound to a machine. Runner-transient state keyed by a
 /// runner incarnation, like the workflow journal, so it never syncs to a team
 /// replica.
@@ -1285,6 +1294,7 @@ macro_rules! team_lineage {
             shared_tail_condition_evaluation_outcome!(),
             shared_tail_post_feed_watch_as_fact_clause!(),
             shared_tail_permission_resume_error!(),
+            shared_tail_terminal_exit_reason!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1540,6 +1550,7 @@ macro_rules! private_lineage {
             private_account_credential_events!(),
             shared_tail_permission_resume_error!(),
             private_thread_compaction_unconfirmed_start_trigger!(),
+            shared_tail_terminal_exit_reason!(),
         ]
     };
 }
@@ -3186,6 +3197,7 @@ mod tests {
                 "account_credential_events",
                 "permission_resume_error",
                 "thread_compaction_unconfirmed_start_trigger",
+                "terminal_exit_reason",
             ]
         );
         assert_eq!(
@@ -6311,6 +6323,8 @@ mod tests {
                 // cairn/4936: `permission_requests` is shared project state, so
                 // the resume refusal reaches both lineages.
                 "permission_resume_error",
+                // cairn/4977: a terminal's process-lost reason, in both.
+                "terminal_exit_reason",
             ]
         );
         assert_eq!(

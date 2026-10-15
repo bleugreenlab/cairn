@@ -667,6 +667,7 @@ async fn queueable_node_delivers_wake_without_resuming_or_spawning() {
         Some(0),
         Some(12),
         Some("ok"),
+        None,
     )
     .await
     .unwrap();
@@ -763,6 +764,7 @@ fn terminal_exit_message_carries_slug_code_runtime_uri_and_tail() {
         Some(2),
         Some(125),
         Some("error: boom"),
+        None,
     );
     assert!(msg.contains("run-1"), "{msg}");
     assert!(msg.contains("exit code 2"), "{msg}");
@@ -1021,6 +1023,7 @@ async fn terminal_exit_wake_fires_once_then_is_consumed() {
         Some(0),
         Some(3),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -1038,9 +1041,10 @@ async fn terminal_exit_wake_fires_once_then_is_consumed() {
         "a non-matching exit must leave the one-shot subscription intact"
     );
 
-    let action = route_terminal_exit_async(&orch, "run-1", uri, Some(0), Some(12), Some("ok"))
-        .await
-        .unwrap();
+    let action =
+        route_terminal_exit_async(&orch, "run-1", uri, Some(0), Some(12), Some("ok"), None)
+            .await
+            .unwrap();
     assert_eq!(action, WakeRouteAction::Delivered);
 
     // The one-shot subscription is consumed on first matching fire.
@@ -1055,10 +1059,32 @@ async fn terminal_exit_wake_fires_once_then_is_consumed() {
     );
 
     // A second exit event for the same terminal finds nothing.
-    let again = route_terminal_exit_async(&orch, "run-1", uri, Some(0), None, None)
+    let again = route_terminal_exit_async(&orch, "run-1", uri, Some(0), None, None, None)
         .await
         .unwrap();
     assert_eq!(again, WakeRouteAction::Dropped);
+}
+
+/// A terminal Cairn settled after its process was lost has no exit code, and
+/// its exit wake leads with why it ended instead of an "exit code unknown" that
+/// reads like a finished command.
+#[test]
+fn terminal_exit_message_leads_with_a_recorded_reason() {
+    let msg = format_terminal_exit_message(
+        "tests",
+        "cairn://p/p/1/1/builder/terminal/tests",
+        None,
+        Some(3240),
+        Some("Compiling cairn-core"),
+        Some("process lost: executor bgsrv-ub no longer reports this terminal's process"),
+    );
+    assert!(
+        msg.starts_with("[Terminal exit] `tests` ended — process lost: executor bgsrv-ub"),
+        "{msg}"
+    );
+    assert!(!msg.contains("exit code unknown"), "{msg}");
+    assert!(msg.contains("54m00s") || msg.contains("0h54m"), "{msg}");
+    assert!(msg.contains("Compiling cairn-core"), "{msg}");
 }
 
 #[test]
@@ -1166,6 +1192,7 @@ async fn terminal_output_subscription_also_wakes_on_exit() {
         Some(1),
         Some(3),
         Some("error: build failed"),
+        None,
     )
     .await
     .unwrap();

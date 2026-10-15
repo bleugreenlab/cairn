@@ -1317,36 +1317,21 @@ async fn refresh_residencies_for_branch(
                 );
                 continue;
             }
-            if kind == cairn_common::executor_protocol::ResidencyFailureKind::NotFound {
-                match crate::terminal_host::resolve_missing_terminal_lease(
-                    db,
-                    &residency_holder,
-                    &incarnation_id,
-                    cell_epoch,
-                )
-                .await
-                {
-                    Ok(true) => {
-                        log::warn!("terminal lease {residency_holder} no longer exists on an executor; cleared its persisted fence");
-                        if let Some(run_id) = latest_run_for_job(db, &job_id) {
-                            let note = format!(
-                                "[Terminal ended] Cairn's executor no longer reports terminal lease {residency_holder}. Its stale lease binding was cleared; restart the terminal to acquire a fresh checkout."
-                            );
-                            if let Err(error) =
-                                queue_system_direct(orch, &run_id, &note, DeliveryUrgency::Passive)
-                            {
-                                log::error!("could not notify terminal owner {job_id} after its lease ended: {error}");
-                            }
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        failed += 1;
-                        log::error!(
-                            "could not clear missing terminal lease {residency_holder}: {error}"
-                        );
-                    }
-                }
+            // A lease its executor no longer has, or has moved to a newer cell
+            // epoch, holds none of the processes this branch's running
+            // terminals were bound to, so there is no checkout of theirs left to
+            // refresh. Those terminals are not this path's to settle: terminal
+            // liveness reconciliation ends each one through the ordinary exit
+            // with the reason its executor gave, which is what a waiting agent
+            // needs, rather than a blocking note about a refresh that is moot.
+            if matches!(
+                kind,
+                cairn_common::executor_protocol::ResidencyFailureKind::NotFound
+                    | cairn_common::executor_protocol::ResidencyFailureKind::StaleEpoch
+            ) {
+                log::info!(
+                    "terminal lease {residency_holder} at cell epoch {cell_epoch} is no longer current on its executor ({diagnostic}); terminal liveness reconciliation settles the terminals bound to it"
+                );
                 continue;
             }
             failed += 1;

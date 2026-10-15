@@ -32,6 +32,10 @@ pub struct TerminalReadResult {
     status: String,
     /// Exit code if the terminal has exited.
     exit_code: Option<i32>,
+    /// Why the terminal ended, present only when Cairn settled it after
+    /// proving its process gone ("process lost: ...").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_reason: Option<String>,
     /// Bytes returned in this read.
     new_bytes: usize,
     /// Total bytes in the terminal buffer.
@@ -157,6 +161,7 @@ pub(crate) async fn handle_read_resource(
         &parsed.slug,
         &info.status,
         info.exit_code,
+        info.exit_reason.as_deref(),
         runtime_secs,
         idle_secs,
         total_bytes,
@@ -172,6 +177,7 @@ pub(crate) async fn handle_read_resource(
         output: body,
         status: info.status,
         exit_code: info.exit_code,
+        exit_reason: info.exit_reason,
         new_bytes,
         total_bytes,
         runtime_secs,
@@ -223,6 +229,7 @@ fn terminal_error_json(message: String) -> String {
         output: message,
         status: "error".to_string(),
         exit_code: None,
+        exit_reason: None,
         new_bytes: 0,
         total_bytes: 0,
         runtime_secs: None,
@@ -240,11 +247,14 @@ fn unix_now() -> i64 {
 
 /// Human-readable status banner shown as the first line of a terminal read.
 /// Distinguishes "running but quiet" (running + age of last output) from "dead"
-/// (exited + code) so a polling agent has something actionable.
+/// (exited + code, or the reason Cairn recorded when no code exists) so a
+/// polling agent has something actionable.
+#[allow(clippy::too_many_arguments)]
 fn format_status_banner(
     slug: &str,
     status: &str,
     exit_code: Option<i32>,
+    exit_reason: Option<&str>,
     runtime_secs: Option<i64>,
     idle_secs: Option<i64>,
     total_bytes: usize,
@@ -265,6 +275,9 @@ fn format_status_banner(
         match exit_code {
             Some(code) => parts.push(format!("exited code {code}")),
             None => parts.push(status.to_string()),
+        }
+        if let Some(reason) = exit_reason {
+            parts.push(reason.to_string());
         }
         if let Some(rt) = runtime_secs {
             parts.push(format!("ran {}", fmt_duration(rt)));
@@ -318,6 +331,7 @@ struct TerminalInfo {
     /// Owning job id, used to locate the persisted scratch log for a job-scoped
     /// agent terminal. `None` for a project terminal (no log file).
     job_id: Option<String>,
+    exit_reason: Option<String>,
 }
 
 async fn lookup_terminal_info(
@@ -342,7 +356,7 @@ async fn lookup_terminal_info(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail, jt.job_id
+                        SELECT jt.session_id, jt.status, jt.exit_code, jt.created_at, jt.exited_at, jt.output_tail, jt.job_id, jt.exit_reason
                         FROM job_terminals jt
                         JOIN projects p ON jt.project_id = p.id
                         WHERE p.key = ?1
@@ -378,7 +392,7 @@ async fn lookup_terminal_info(
                 let mut rows = conn
                     .query(
                         "
-                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail, job_id
+                        SELECT session_id, status, exit_code, created_at, exited_at, output_tail, job_id, exit_reason
                         FROM job_terminals
                         WHERE job_id = ?1 AND slug = ?2
                         LIMIT 1
@@ -398,6 +412,7 @@ async fn lookup_terminal_info(
                     exited_at: row.opt_i64(4)?,
                     output_tail: row.opt_text(5)?,
                     job_id: row.opt_text(6)?,
+                    exit_reason: row.opt_text(7)?,
                 })
             })
             .transpose()
@@ -1064,17 +1079,40 @@ mod tests {
     #[test]
     fn banner_distinguishes_running_quiet_from_exited() {
         let running_quiet =
-            format_status_banner("ci", "running", None, Some(70), Some(40), 1024, None);
+            format_status_banner("ci", "running", None, None, Some(70), Some(40), 1024, None);
         assert!(running_quiet.contains("running"));
         assert!(running_quiet.contains("elapsed"));
         assert!(running_quiet.contains("last output"));
 
-        let running_no_output = format_status_banner("ci", "running", None, Some(5), None, 0, None);
+        let running_no_output =
+            format_status_banner("ci", "running", None, None, Some(5), None, 0, None);
         assert!(running_no_output.contains("no output yet"));
 
-        let exited = format_status_banner("ci", "exited", Some(0), Some(83), None, 2048, None);
+        let exited =
+            format_status_banner("ci", "exited", Some(0), None, Some(83), None, 2048, None);
         assert!(exited.contains("exited code 0"));
         assert!(exited.contains("ran"));
+    }
+
+    /// A terminal Cairn settled because its process was lost has no exit code,
+    /// and its banner must say why rather than leave a bare `exited`.
+    #[test]
+    fn banner_states_why_a_terminal_without_an_exit_code_ended() {
+        let lost = format_status_banner(
+            "tests",
+            "exited",
+            None,
+            Some("process lost: executor bgsrv-ub no longer reports this terminal's process"),
+            Some(3240),
+            None,
+            512,
+            None,
+        );
+        assert!(lost.contains("exited"), "{lost}");
+        assert!(
+            lost.contains("process lost: executor bgsrv-ub"),
+            "the banner must carry the recorded reason: {lost}"
+        );
     }
 
     #[test]
@@ -1082,16 +1120,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let existing = dir.path().join("dev.log");
         std::fs::write(&existing, b"x").unwrap();
-        let with_log =
-            format_status_banner("dev", "exited", Some(0), Some(10), None, 1, Some(&existing));
+        let with_log = format_status_banner(
+            "dev",
+            "exited",
+            Some(0),
+            None,
+            Some(10),
+            None,
+            1,
+            Some(&existing),
+        );
         assert!(
             with_log.contains(&format!("log: {}", existing.display())),
             "{with_log}"
         );
 
         let missing = dir.path().join("gone.log");
-        let without_log =
-            format_status_banner("dev", "exited", Some(0), Some(10), None, 1, Some(&missing));
+        let without_log = format_status_banner(
+            "dev",
+            "exited",
+            Some(0),
+            None,
+            Some(10),
+            None,
+            1,
+            Some(&missing),
+        );
         assert!(!without_log.contains("log:"), "{without_log}");
     }
 

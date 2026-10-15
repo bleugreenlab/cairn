@@ -1,10 +1,14 @@
 //! Shared PTY and persisted terminal host logic for Cairn hosts.
 
 use crate::db::DbState;
+use crate::fleet::SnapshotReceipt;
 use crate::mcp::handlers::slug::slugify;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
-use cairn_common::executor_protocol::ResidencyFence;
+use cairn_common::executor_protocol::{
+    PersistentCellState, ResidencyFailureKind, ResidencyFence, ResidencyHolder, ResidencyOperation,
+    ResidencyResult, ResidentProcessStatus,
+};
 use cairn_db::turso::params;
 use cairn_session::terminals::clear_unadvertised_exited_terminal_lease_bindings;
 pub use cairn_session::terminals::{
@@ -234,13 +238,483 @@ async fn reconcile_terminal_lifecycle(orch: &Orchestrator) -> Result<u64, String
 pub fn schedule_terminal_lifecycle_recovery(orch: Orchestrator) {
     TERMINAL_OWNER_RECOVERY_STARTED.get_or_init(Instant::now);
     tokio::spawn(async move {
+        let mut liveness = ProcessLossWatch::default();
         loop {
             if let Err(error) = reconcile_terminal_lifecycle(&orch).await {
                 tracing::warn!(%error, "terminal lifecycle reconciliation failed");
             }
+            if let Err(error) = reconcile_running_terminal_liveness(&orch, &mut liveness).await {
+                tracing::warn!(%error, "terminal liveness reconciliation failed");
+            }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+/// Why Cairn knows a running terminal's process no longer exists even though no
+/// exit for it ever arrived.
+///
+/// Every variant is something an executor stated about the environment the
+/// terminal was bound to. None is inferred from silence: a process that has
+/// printed nothing for an hour is still `Running` in its executor's state and
+/// is never one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProcessLoss {
+    /// The environment's cell is at a newer epoch under the same incarnation.
+    /// An epoch advances only when an executor re-adopts the cell after it
+    /// restarted or leases it afresh, and no process survives either.
+    EpochAdvanced {
+        executor: String,
+        from: u64,
+        to: u64,
+    },
+    /// The owner's environment exists under another incarnation: the one this
+    /// process ran in was released and replaced.
+    EnvironmentReplaced { executor: String },
+    /// The cell holds a newer generation of the process at this key.
+    GenerationSuperseded {
+        executor: String,
+        from: u64,
+        to: u64,
+    },
+    /// The cell no longer lists the process at all.
+    ProcessAbsent { executor: String },
+    /// The executor says the process is no longer running, but that exit never
+    /// reached the terminal.
+    ExitUndelivered {
+        executor: String,
+        exit_code: Option<i32>,
+    },
+    /// The environment is held nowhere: the executor that held it answered
+    /// that it no longer does (`Some`), or no connected executor advertises it
+    /// and no route records one as holding it (`None`).
+    LeaseGone { executor: Option<String> },
+}
+
+impl ProcessLoss {
+    /// The typed reason recorded on the terminal and carried by its exit wake,
+    /// a `waitFor` on its exit, and a read of it.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            Self::EpochAdvanced { executor, from, to } => format!(
+                "process lost: executor {executor} restarted or re-leased this terminal's \
+                 environment (cell epoch {from} became {to}), and no process survives that"
+            ),
+            Self::EnvironmentReplaced { executor } => format!(
+                "process lost: this terminal's environment on executor {executor} was \
+                 released and replaced"
+            ),
+            Self::GenerationSuperseded { executor, from, to } => format!(
+                "process lost: executor {executor} replaced this terminal's process \
+                 (generation {from} became {to})"
+            ),
+            Self::ProcessAbsent { executor } => {
+                format!(
+                    "process lost: executor {executor} no longer reports this terminal's process"
+                )
+            }
+            Self::ExitUndelivered {
+                executor,
+                exit_code,
+            } => {
+                let code = exit_code
+                    .map(|code| format!(" with exit code {code}"))
+                    .unwrap_or_default();
+                format!(
+                    "process lost: executor {executor} reports this terminal's process ended{code}, \
+                     but its exit never reached Cairn"
+                )
+            }
+            Self::LeaseGone {
+                executor: Some(executor),
+            } => format!(
+                "process lost: executor {executor} no longer holds this terminal's environment"
+            ),
+            Self::LeaseGone { executor: None } => {
+                "process lost: no executor holds this terminal's environment any more".into()
+            }
+        }
+    }
+
+    /// The exit status to record. Only an executor that reported the exit
+    /// itself knows one; every other loss has no status to give.
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        match self {
+            Self::ExitUndelivered { exit_code, .. } => *exit_code,
+            _ => None,
+        }
+    }
+
+    fn executor(&self) -> Option<&str> {
+        match self {
+            Self::EpochAdvanced { executor, .. }
+            | Self::EnvironmentReplaced { executor }
+            | Self::GenerationSuperseded { executor, .. }
+            | Self::ProcessAbsent { executor }
+            | Self::ExitUndelivered { executor, .. } => Some(executor),
+            Self::LeaseGone { executor } => executor.as_deref(),
+        }
+    }
+}
+
+/// What a set of advertised cells says about one running terminal's process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TerminalLiveness {
+    /// The executor holding the terminal's environment reports it running.
+    Alive,
+    /// Nothing here can answer, or the answer belongs to another path: the
+    /// executor is away, the advertisement predates the process, or recovery
+    /// owns the death. The terminal stays running.
+    Unknown,
+    /// The advertisement contradicts the terminal being alive.
+    Lost(ProcessLoss),
+}
+
+/// A running terminal's complete binding to the executor process behind it.
+#[derive(Debug, Clone)]
+pub(crate) struct ResidentTerminalBinding {
+    pub(crate) id: String,
+    /// Also the executor's process key for this terminal.
+    pub(crate) session_id: String,
+    pub(crate) holder: String,
+    pub(crate) incarnation_id: String,
+    pub(crate) cell_epoch: u64,
+    pub(crate) process_generation: u64,
+}
+
+fn cell_executor_name(cell: &PersistentCellState) -> String {
+    cell.executor_display_name
+        .clone()
+        .unwrap_or_else(|| cell.executor_id.clone())
+}
+
+/// Judge one running terminal against a set of advertised cells.
+///
+/// The cells may be the fleet's cached snapshot, which can predate the
+/// terminal's own start, so a `Lost` verdict from them is a suspicion that
+/// [`reconcile_running_terminal_liveness`] confirms against fresh evidence
+/// before acting. Judged against the cell a fenced probe just returned, the
+/// same verdict is that evidence.
+///
+/// `holder_routed` says whether the fleet still records some executor as
+/// holding the terminal's environment. A route outlives its executor's link, so
+/// a recorded route with no advertised cell is a machine that is away and may
+/// return with the process intact.
+pub(crate) fn judge_terminal_process(
+    terminal: &ResidentTerminalBinding,
+    cells: &[PersistentCellState],
+    holder_routed: bool,
+) -> TerminalLiveness {
+    let held: Vec<(&PersistentCellState, &str)> = cells
+        .iter()
+        .filter_map(|cell| {
+            let residency = cell.residency.as_ref()?;
+            (residency.holder.storage_key() == terminal.holder)
+                .then_some((cell, residency.incarnation_id.as_str()))
+        })
+        .collect();
+
+    if let Some((cell, _)) = held.iter().find(|(cell, incarnation)| {
+        *incarnation == terminal.incarnation_id && cell.cell_epoch == terminal.cell_epoch
+    }) {
+        let executor = cell_executor_name(cell);
+        let Some(process) = cell.occupancy.processes.get(&terminal.session_id) else {
+            return TerminalLiveness::Lost(ProcessLoss::ProcessAbsent { executor });
+        };
+        if process.generation > terminal.process_generation {
+            return TerminalLiveness::Lost(ProcessLoss::GenerationSuperseded {
+                executor,
+                from: terminal.process_generation,
+                to: process.generation,
+            });
+        }
+        if process.generation < terminal.process_generation {
+            // An advertisement older than the start that bound this generation.
+            return TerminalLiveness::Unknown;
+        }
+        return match &process.status {
+            ResidentProcessStatus::Starting | ResidentProcessStatus::Running { .. } => {
+                TerminalLiveness::Alive
+            }
+            // A death the executor attributes to losing itself, inside the
+            // epoch the terminal is fenced to, reaches the terminal's own
+            // handler, which hands it to recovery to be started again.
+            // Settling it here would take that restart away.
+            ResidentProcessStatus::Exited {
+                executor_lost: true,
+                ..
+            } => TerminalLiveness::Unknown,
+            ResidentProcessStatus::Exited { exit_code, .. } => {
+                TerminalLiveness::Lost(ProcessLoss::ExitUndelivered {
+                    executor,
+                    exit_code: *exit_code,
+                })
+            }
+            ResidentProcessStatus::Stopped => {
+                TerminalLiveness::Lost(ProcessLoss::ExitUndelivered {
+                    executor,
+                    exit_code: None,
+                })
+            }
+        };
+    }
+
+    if let Some((cell, _)) = held.iter().find(|(cell, incarnation)| {
+        *incarnation == terminal.incarnation_id && cell.cell_epoch > terminal.cell_epoch
+    }) {
+        return TerminalLiveness::Lost(ProcessLoss::EpochAdvanced {
+            executor: cell_executor_name(cell),
+            from: terminal.cell_epoch,
+            to: cell.cell_epoch,
+        });
+    }
+
+    if let Some((cell, _)) = held
+        .iter()
+        .find(|(_, incarnation)| *incarnation != terminal.incarnation_id)
+    {
+        return TerminalLiveness::Lost(ProcessLoss::EnvironmentReplaced {
+            executor: cell_executor_name(cell),
+        });
+    }
+
+    if held.is_empty() && !holder_routed {
+        return TerminalLiveness::Lost(ProcessLoss::LeaseGone { executor: None });
+    }
+    TerminalLiveness::Unknown
+}
+
+/// Confirm a suspected loss from the executor's answer to a fenced renewal sent
+/// after the suspicion arose.
+///
+/// The answer is authoritative and causally fresh: the executor reads its own
+/// current state under the fence, so it reflects every start it has already
+/// acknowledged. A renewal is what the terminal's heartbeat sends anyway, and
+/// it changes nothing about a residency that is not active, so asking cannot
+/// revive an environment awaiting reclaim.
+pub(crate) fn confirm_suspected_loss(
+    terminal: &ResidentTerminalBinding,
+    suspected: &ProcessLoss,
+    answer: &ResidencyResult,
+) -> Option<ProcessLoss> {
+    match answer {
+        // The fence still matches: judge the process in the cell as it is now.
+        ResidencyResult::State { cell } => {
+            // An executor's own answer does not name the machine; the fleet
+            // stamps that on advertisements, like the one behind the suspicion.
+            let mut cell = cell.clone();
+            if cell.executor_display_name.is_none() && cell.executor_id.is_empty() {
+                cell.executor_display_name = suspected.executor().map(ToOwned::to_owned);
+            }
+            match judge_terminal_process(terminal, std::slice::from_ref(&cell), true) {
+                TerminalLiveness::Lost(loss) => Some(loss),
+                TerminalLiveness::Alive | TerminalLiveness::Unknown => None,
+            }
+        }
+        // The executor holds this environment under a newer epoch or another
+        // incarnation, so nothing from the terminal's own can still run.
+        ResidencyResult::Failed {
+            kind: ResidencyFailureKind::StaleEpoch,
+            ..
+        } => Some(match suspected {
+            ProcessLoss::EpochAdvanced { .. } | ProcessLoss::EnvironmentReplaced { .. } => {
+                suspected.clone()
+            }
+            other => ProcessLoss::EnvironmentReplaced {
+                executor: other.executor().unwrap_or("unknown").to_string(),
+            },
+        }),
+        // The executor the fleet routed to holds no such environment at all.
+        ResidencyResult::Failed {
+            kind: ResidencyFailureKind::NotFound,
+            ..
+        } => Some(ProcessLoss::LeaseGone {
+            executor: suspected.executor().map(ToOwned::to_owned),
+        }),
+        // Unreachable, not active, refused for admission: none of these says
+        // anything about whether the process runs.
+        _ => None,
+    }
+}
+
+/// The fresh evidence a lease that nothing advertises must wait for.
+///
+/// A loss with an advertised cell is confirmed by probing that cell's executor.
+/// A lease no connected executor advertises and no route records cannot be
+/// probed, because there is nowhere to send the probe, and the cached snapshot
+/// that shows its absence may predate the terminal's start. So the absence must
+/// survive [`Self::FRESH_SNAPSHOTS`] further snapshots from every connected
+/// executor. An executor keeps at most one outbound snapshot, superseded rather
+/// than queued and taken by its single writer only when sent, so the first
+/// snapshot to arrive after the suspicion may be one that was already waiting,
+/// but the second was built after the first had been sent, and therefore after
+/// the start response that preceded the suspicion.
+#[derive(Debug, Default)]
+pub(crate) struct ProcessLossWatch {
+    unroutable_since: HashMap<String, HashMap<String, SnapshotReceipt>>,
+}
+
+impl ProcessLossWatch {
+    const FRESH_SNAPSHOTS: u64 = 2;
+
+    /// Record that `terminal_id`'s lease looks gone with nowhere to probe, and
+    /// answer whether every connected executor has since delivered enough
+    /// fresh snapshots for that absence to be true.
+    pub(crate) fn unroutable_loss_confirmed(
+        &mut self,
+        terminal_id: &str,
+        receipts: &HashMap<String, SnapshotReceipt>,
+    ) -> bool {
+        let Some(baseline) = self.unroutable_since.get(terminal_id) else {
+            self.unroutable_since
+                .insert(terminal_id.to_string(), receipts.clone());
+            return false;
+        };
+        !receipts.is_empty()
+            && receipts.iter().all(|(executor, now)| {
+                let delivered = match baseline.get(executor) {
+                    Some(then) if then.generation == now.generation => {
+                        now.received.saturating_sub(then.received)
+                    }
+                    // A link opened since the suspicion: everything it
+                    // delivered postdates it.
+                    _ => now.received,
+                };
+                delivered >= Self::FRESH_SNAPSHOTS
+            })
+    }
+
+    pub(crate) fn clear(&mut self, terminal_id: &str) {
+        self.unroutable_since.remove(terminal_id);
+    }
+
+    fn retain_running(&mut self, running: &HashSet<&str>) {
+        self.unroutable_since
+            .retain(|id, _| running.contains(id.as_str()));
+    }
+}
+
+async fn running_resident_terminals(db: &LocalDb) -> DbResult<Vec<ResidentTerminalBinding>> {
+    db.read(|conn| {
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT id, session_id, residency_holder, residency_incarnation_id, cell_epoch,
+                            process_generation
+                     FROM job_terminals
+                     WHERE status = 'running' AND residency_holder IS NOT NULL
+                       AND residency_incarnation_id IS NOT NULL AND cell_epoch IS NOT NULL
+                       AND process_generation IS NOT NULL",
+                    (),
+                )
+                .await?;
+            let mut terminals = Vec::new();
+            while let Some(row) = rows.next().await? {
+                terminals.push(ResidentTerminalBinding {
+                    id: row.text(0)?,
+                    session_id: row.text(1)?,
+                    holder: row.text(2)?,
+                    incarnation_id: row.text(3)?,
+                    cell_epoch: row.i64(4)? as u64,
+                    process_generation: row.i64(5)? as u64,
+                });
+            }
+            Ok(terminals)
+        })
+    })
+    .await
+}
+
+/// Settle every running executor-backed terminal whose process its executor has
+/// shown to be gone.
+///
+/// A terminal's exit normally arrives as a process event fenced to the exact
+/// cell epoch the terminal started in. Some deaths never produce such an event:
+/// an executor that restarts reports its lost processes only under the cell's
+/// new epoch, and an environment released or replaced underneath a terminal
+/// reports nothing for it at all. Without this pass those rows stayed `running`
+/// indefinitely, and a `waitFor` on their exit never resolved.
+///
+/// The fleet's cached snapshot only raises a suspicion, because it can predate
+/// the terminal's start. A suspicion is acted on only once fresh evidence
+/// confirms it: a fenced probe of the executor that advertises the environment,
+/// or, where nothing advertises it, absence that persists through snapshots
+/// provably built after the suspicion ([`ProcessLossWatch`]).
+///
+/// Returns how many terminals this pass settled.
+pub(crate) async fn reconcile_running_terminal_liveness(
+    orch: &Orchestrator,
+    watch: &mut ProcessLossWatch,
+) -> Result<u64, String> {
+    let terminals = running_resident_terminals(&orch.db.local)
+        .await
+        .map_err(|error| error.to_string())?;
+    watch.retain_running(&terminals.iter().map(|t| t.id.as_str()).collect());
+    if terminals.is_empty() {
+        return Ok(0);
+    }
+    let cells = orch.fleet.snapshot().cells;
+    let mut settled = 0;
+    for terminal in terminals {
+        let holder = ResidencyHolder::parse_storage_key(&terminal.holder);
+        // A holder this build cannot parse is one it cannot look up a route
+        // for, so it is treated as routed: unknown, never lost.
+        let holder_routed = holder
+            .as_ref()
+            .is_none_or(|holder| orch.fleet.residency_route_executor(holder).is_some());
+        let confirmed = match judge_terminal_process(&terminal, &cells, holder_routed) {
+            TerminalLiveness::Alive | TerminalLiveness::Unknown => {
+                watch.clear(&terminal.id);
+                None
+            }
+            TerminalLiveness::Lost(loss @ ProcessLoss::LeaseGone { executor: None }) => watch
+                .unroutable_loss_confirmed(&terminal.id, &orch.fleet.snapshot_receipts())
+                .then_some(loss),
+            TerminalLiveness::Lost(suspected) => {
+                watch.clear(&terminal.id);
+                let Some(holder) = holder else {
+                    continue;
+                };
+                let answer = orch
+                    .fleet
+                    .operate_residency(
+                        orch,
+                        ResidencyOperation::Renew {
+                            fence: ResidencyFence {
+                                holder,
+                                incarnation_id: terminal.incarnation_id.clone(),
+                                cell_epoch: terminal.cell_epoch,
+                            },
+                        },
+                    )
+                    .await;
+                confirm_suspected_loss(&terminal, &suspected, &answer)
+            }
+        };
+        let Some(loss) = confirmed else {
+            continue;
+        };
+        let reason = loss.reason();
+        match crate::mcp::handlers::terminal::settle_lost_terminal(
+            orch,
+            &terminal.session_id,
+            loss.exit_code(),
+            &reason,
+        )
+        .await
+        {
+            Ok(true) => {
+                settled += 1;
+                watch.clear(&terminal.id);
+                tracing::warn!(terminal_id = %terminal.id, %reason, "settled a running terminal whose process is gone");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(terminal_id = %terminal.id, %error, "could not settle a terminal whose process is gone");
+            }
+        }
+    }
+    Ok(settled)
 }
 
 #[cfg(test)]

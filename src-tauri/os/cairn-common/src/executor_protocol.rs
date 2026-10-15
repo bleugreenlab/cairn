@@ -4071,6 +4071,17 @@ pub struct LearnedResourceEstimate {
 /// same way. A runner talking to an older executor therefore gets nothing
 /// wrong, and two executors of different versions behave identically under it.
 ///
+/// cairn/4977 settles running terminals whose process is gone without a bump.
+/// The runner counts the snapshots each executor link delivers (runner state,
+/// never sent) and confirms a suspected loss either from the executor's answer
+/// to the existing fenced `Renew`, which every version computes from its own
+/// state the same way (`State`, `StaleEpoch`, `NotFound`, `InvalidState`), or
+/// from absence persisting across two snapshots received after the suspicion.
+/// The second relies only on the executor holding a single outbound snapshot
+/// that is superseded rather than queued, which every executor version that
+/// speaks this protocol already does. Nothing new crosses the boundary, so a
+/// runner talking to an older executor gets nothing wrong.
+///
 /// cairn/4981 changes how long the runner waits for a claimed attempt's
 /// result, without a bump. The end-to-end watchdog, a fixed budget summed from
 /// declared item timeouts and executor phase budgets, is replaced by a wait

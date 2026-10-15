@@ -101,6 +101,7 @@ pub(crate) async fn reconcile_exited_terminal_wakes(orch: &Orchestrator) -> Resu
             row.as_ref().and_then(|row| row.exit_code),
             runtime_secs,
             reconciled_terminal_tail(row.as_ref()),
+            row.as_ref().and_then(|row| row.exit_reason.as_deref()),
         )
         .await?;
         routed += 1;
@@ -1610,6 +1611,9 @@ pub(crate) struct TerminalWakeRow {
     /// The live PTY session id, used to reach the session's in-memory output
     /// buffer and phrase-watcher registry when subscribing an output wake.
     pub session_id: Option<String>,
+    /// Why the terminal ended, when its exit code cannot say: set only for a
+    /// terminal Cairn settled after proving its process gone.
+    pub exit_reason: Option<String>,
 }
 
 /// Look up a terminal by job scope + slug for wake subscription.
@@ -1626,7 +1630,8 @@ pub(crate) async fn lookup_terminal_for_wake(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
+                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
+                            exit_reason
                      FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
                     params![job_id.as_str(), slug.as_str()],
                 )
@@ -1652,7 +1657,8 @@ async fn lookup_terminal_for_wake_target(
             let mut rows = match job_id.as_deref() {
                 Some(job_id) => {
                     conn.query(
-                        "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
+                        "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
+                                exit_reason
                          FROM job_terminals WHERE job_id = ?1 AND slug = ?2 LIMIT 1",
                         params![job_id, slug.as_str()],
                     )
@@ -1660,7 +1666,8 @@ async fn lookup_terminal_for_wake_target(
                 }
                 None => {
                     conn.query(
-                        "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
+                        "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
+                                exit_reason
                          FROM job_terminals
                          WHERE project_id = ?1 AND job_id IS NULL AND slug = ?2 LIMIT 1",
                         params![project_id.as_str(), slug.as_str()],
@@ -1684,7 +1691,8 @@ async fn lookup_terminal_for_wake_by_session_id(
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id
+                    "SELECT status, exit_code, created_at, exited_at, output_tail, session_id,
+                            exit_reason
                      FROM job_terminals WHERE session_id = ?1 LIMIT 1",
                     params![session_id.as_str()],
                 )
@@ -1708,6 +1716,7 @@ async fn terminal_wake_row_from_rows(
         exited_at: row.opt_i64(3)?,
         output_tail: row.opt_text(4)?,
         session_id: row.opt_text(5)?,
+        exit_reason: row.opt_text(6)?,
     }))
 }
 
@@ -1790,6 +1799,7 @@ pub(crate) async fn subscribe_terminal_exit_wake_once(
             exit_row.exit_code,
             runtime_secs,
             exit_row.output_tail.as_deref(),
+            exit_row.exit_reason.as_deref(),
         )
         .await?;
         Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued)
@@ -1854,6 +1864,7 @@ pub(crate) async fn subscribe_terminal_output_wake_once(
             exit_row.exit_code,
             runtime_secs,
             exit_row.output_tail.as_deref(),
+            exit_row.exit_reason.as_deref(),
         )
         .await?;
         return Ok(TerminalWakeSubscriptionOutcome::ExitAlreadyQueued);
@@ -1936,23 +1947,27 @@ async fn mark_terminal_exited_and_load_context(
     job_id: Option<String>,
     exit_code: Option<i32>,
     output_tail: Option<String>,
+    exit_reason: Option<String>,
 ) -> DbResult<Option<TerminalExitContext>> {
     db.write(|conn| {
         let terminal_session_id = terminal_session_id.clone();
         let job_id = job_id.clone();
         let output_tail = output_tail.clone();
+        let exit_reason = exit_reason.clone();
         Box::pin(async move {
             let now = chrono::Utc::now().timestamp();
             let transitioned = conn
                 .execute(
                     "UPDATE job_terminals
-                 SET status = 'exited', exit_code = ?2, exited_at = ?3, output_tail = ?4
+                 SET status = 'exited', exit_code = ?2, exited_at = ?3, output_tail = ?4,
+                     exit_reason = ?5
                  WHERE session_id = ?1 AND status = 'running'",
                     params![
                         terminal_session_id.as_str(),
                         exit_code.map(|code| code as i64),
                         now,
-                        output_tail.as_deref()
+                        output_tail.as_deref(),
+                        exit_reason.as_deref()
                     ],
                 )
                 .await?;
@@ -2149,7 +2164,10 @@ fn remove_pty_session(pty_state: &crate::services::PtyState, session_id: &str) {
 /// transitioned (already exited, or gone) it is a pure no-op beyond dropping the
 /// session — no second `pty-exit`, wake, or injection. This makes finalize
 /// idempotent across every caller (reader EOF, promoted watcher, external kill,
-/// fence-deny, reader-error) at the DB boundary.
+/// fence-deny, reader-error, proven process loss) at the DB boundary.
+///
+/// `exit_reason` is recorded only when the exit code cannot explain the end on
+/// its own. Returns whether this call performed the transition.
 #[allow(clippy::too_many_arguments)]
 fn finalize_terminal_session(
     orch: &Orchestrator,
@@ -2160,7 +2178,8 @@ fn finalize_terminal_session(
     job_id: Option<String>,
     process_ref: &str,
     detail_uri: &str,
-) {
+    exit_reason: Option<&str>,
+) -> bool {
     let output_tail = capture_output_tail(buffer);
 
     let context = match block_on_background_db(mark_terminal_exited_and_load_context(
@@ -2169,6 +2188,7 @@ fn finalize_terminal_session(
         job_id,
         exit_code,
         output_tail.clone(),
+        exit_reason.map(ToOwned::to_owned),
     )) {
         Ok(Some(context)) => context,
         // No running row matched: another path already finalized (or the row is
@@ -2176,12 +2196,12 @@ fn finalize_terminal_session(
         // second pty-exit/wake/injection.
         Ok(None) => {
             remove_pty_session(&orch.pty_state, session_id);
-            return;
+            return false;
         }
         Err(error) => {
             log::warn!("failed to mark terminal exited for {process_ref}: {error}");
             remove_pty_session(&orch.pty_state, session_id);
-            return;
+            return false;
         }
     };
 
@@ -2210,6 +2230,7 @@ fn finalize_terminal_session(
         exit_code,
         runtime_secs,
         output_tail.as_deref(),
+        exit_reason,
     ) {
         log::warn!("failed to route terminal-exit wake for {process_ref}: {error}");
     }
@@ -2228,6 +2249,7 @@ fn finalize_terminal_session(
     // The process is dead and finalize has captured everything it needs from the
     // session (buffer/exit were passed in). Drop it from the live map.
     remove_pty_session(&orch.pty_state, session_id);
+    true
 }
 
 /// Stop an executor-hosted terminal from a synchronous lifecycle path. The
@@ -2247,6 +2269,114 @@ pub fn finalize_terminal_by_session_id(
     })
     .join()
     .map_err(|_| "terminal finalize thread panicked".to_string())?
+}
+
+/// Settle a running terminal whose process Cairn has proven gone although its
+/// exit never arrived, recording `reason` as why it ended.
+///
+/// This is the ordinary end of a terminal reached by another route, so it runs
+/// through the one finalizer: the row becomes `exited`, `pty-exit` and the
+/// `terminal_exit` wake fire, and a `waitFor` on the exit resolves — each
+/// carrying the reason. The reason is also written into the transcript, so a
+/// later read of the terminal shows where it stopped and why. Nothing is
+/// released: the process is already gone, and the environment it ran in belongs
+/// to its owner, not to this terminal.
+///
+/// Returns whether this call settled the terminal; `false` means another path
+/// already ended it.
+pub(crate) async fn settle_lost_terminal(
+    orch: &Orchestrator,
+    session_id: &str,
+    exit_code: Option<i32>,
+    reason: &str,
+) -> Result<bool, String> {
+    let row = orch
+        .db
+        .local
+        .query_opt(
+            "SELECT job_id, project_id, slug, command, residency_holder
+             FROM job_terminals WHERE session_id = ?1 AND status = 'running'",
+            params![session_id.to_string()],
+            |row| {
+                Ok((
+                    row.opt_text(0)?,
+                    row.opt_text(1)?,
+                    row.text(2)?,
+                    row.text(3)?,
+                    row.opt_text(4)?,
+                ))
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some((job_id, project_id, slug, command, residency_holder)) = row else {
+        return Ok(false);
+    };
+    let resource = match (job_id.as_deref(), project_id.as_deref()) {
+        (Some(job_id), _) => terminal_resource_for_job(&orch.db.local, job_id, slug.clone()).await,
+        (None, Some(project_id)) => {
+            terminal_resource_for_project(&orch.db.local, project_id, slug.clone()).await
+        }
+        (None, None) => Err("terminal row names neither a job nor a project".into()),
+    };
+    // An owner that no longer resolves still has a running row that must stop
+    // claiming to run; it settles with nothing to route the wake to.
+    let (process_ref, detail_uri) = match resource {
+        Ok(resource) => (resource_slug(&resource), resource.to_uri()),
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "settling a lost terminal whose owner no longer resolves");
+            (slug.clone(), String::new())
+        }
+    };
+
+    let transcript = orch
+        .pty_state
+        .sessions
+        .lock()
+        .ok()
+        .and_then(|sessions| sessions.get(session_id).cloned())
+        .and_then(|session| {
+            let session = session.lock().ok()?;
+            Some((session.output_buffer.clone()?, session.output_log.clone()?))
+        });
+    let buffer = match transcript {
+        Some((buffer, log)) => {
+            emit_terminal_data(
+                &*orch.services.emitter,
+                session_id,
+                &format!("\r\nCairn ended this terminal: {reason}.\r\n"),
+                &buffer,
+                &log,
+            );
+            buffer
+        }
+        None => Arc::new(Mutex::new(VecDeque::new())),
+    };
+    if let Some(holder) = residency_holder {
+        if let Ok(mut handlers) = orch.pty_state.lifetime_handlers.lock() {
+            handlers.remove(&(holder, session_id.to_string()));
+        }
+    }
+    orch.pty_state.forget_terminal_restart(&detail_uri);
+
+    let finalize_orch = orch.clone();
+    let session_id = session_id.to_string();
+    let reason = reason.to_string();
+    tokio::task::spawn_blocking(move || {
+        finalize_terminal_session(
+            &finalize_orch,
+            &session_id,
+            exit_code,
+            &buffer,
+            &command,
+            job_id,
+            &process_ref,
+            &detail_uri,
+            Some(&reason),
+        )
+    })
+    .await
+    .map_err(|error| format!("terminal settle task failed: {error}"))
 }
 
 #[derive(Clone, Debug)]
@@ -2710,6 +2840,7 @@ async fn spawn_terminal_session(
                     event_job.clone(),
                     &event_process_ref,
                     &event_uri,
+                    None,
                 );
                 let release_orch = event_orch.clone();
                 let release_binding = crate::services::LeaseTerminalBinding {
@@ -5278,6 +5409,7 @@ mod terminal_finalize_tests {
             Some("j".to_string()),
             "run-1",
             &uri,
+            None,
         );
 
         let (status, code, tail) = block_on(read_terminal(&orch.db.local, "s1"));
@@ -5295,6 +5427,7 @@ mod terminal_finalize_tests {
             Some("j".to_string()),
             "run-1",
             &uri,
+            None,
         );
         let (status2, code2, _) = block_on(read_terminal(&orch.db.local, "s1"));
         assert_eq!(status2, "exited");
@@ -5317,6 +5450,7 @@ mod terminal_finalize_tests {
             Some("j".to_string()),
             Some(0),
             Some("tail".to_string()),
+            None,
         ))
         .unwrap();
         assert!(first.is_some(), "first mark transitions a running row");
@@ -5327,6 +5461,7 @@ mod terminal_finalize_tests {
             Some("j".to_string()),
             Some(5),
             Some("tail".to_string()),
+            None,
         ))
         .unwrap();
         assert!(
@@ -5500,6 +5635,7 @@ mod terminal_finalize_tests {
             exited_at: Some(2),
             output_tail: None,
             session_id: Some("silent".to_string()),
+            exit_reason: None,
         };
         assert_eq!(reconciled_terminal_tail(Some(&silent_exit)), None);
         assert_eq!(
@@ -5820,5 +5956,720 @@ mod terminal_finalize_tests {
         // An ordinary exit, or a restart that did not hold, never consults
         // recovery at all: the terminal is over.
         assert_eq!(exit_disposition(false, None), ExitDisposition::Finalize);
+    }
+
+    use crate::fleet::SnapshotReceipt;
+    use crate::terminal_host::{
+        confirm_suspected_loss, judge_terminal_process, reconcile_running_terminal_liveness,
+        ProcessLoss, ProcessLossWatch, ResidentTerminalBinding, TerminalLiveness,
+    };
+
+    /// The cell an executor advertises for the terminal fixture's environment,
+    /// holding one process at `epoch` in `status`.
+    fn cell_holding(
+        fence: &ResidencyFence,
+        process_key: &str,
+        epoch: u64,
+        generation: u64,
+        status: ResidentProcessStatus,
+    ) -> PersistentCellState {
+        let mut cell = test_terminal_slot(fence);
+        cell.cell_epoch = epoch;
+        cell.executor_id = "colocated".into();
+        cell.executor_display_name = Some("bgsrv-ub".into());
+        let mut process = cell
+            .occupancy
+            .processes
+            .remove("main")
+            .expect("terminal fixture process");
+        process.generation = generation;
+        process.status = status;
+        cell.occupancy
+            .processes
+            .insert(process_key.to_string(), process);
+        cell
+    }
+
+    fn running_status() -> ResidentProcessStatus {
+        ResidentProcessStatus::Running {
+            started_at_unix_ms: 1,
+            process_group_id: Some(4242),
+            ownership: None,
+        }
+    }
+
+    /// The fixture environment before any terminal has started in it.
+    fn pre_start_cell(fence: &ResidencyFence) -> PersistentCellState {
+        let mut cell = test_terminal_slot(fence);
+        cell.occupancy.processes.clear();
+        cell
+    }
+
+    /// Answer one fenced operation from the executor's own state, the way
+    /// `cairn-exec` does: a fence naming no residency here is `NotFound`, one
+    /// naming another epoch or incarnation is `StaleEpoch`, a renewal of a
+    /// residency that is not active is refused, and anything else answers with
+    /// the cell as it is now.
+    fn answer_fenced(
+        cell: &mut PersistentCellState,
+        operation: ResidencyOperation,
+    ) -> ResidencyResult {
+        let failed = |kind, diagnostic: &str| ResidencyResult::Failed {
+            kind,
+            diagnostic: diagnostic.into(),
+            cell_outcome: None,
+        };
+        let fence = match &operation {
+            ResidencyOperation::StartProcess { fence, .. }
+            | ResidencyOperation::Renew { fence }
+            | ResidencyOperation::StopProcess { fence, .. }
+            | ResidencyOperation::Release { fence } => fence.clone(),
+            _ => return ResidencyResult::State { cell: cell.clone() },
+        };
+        let active = match cell
+            .residency
+            .as_ref()
+            .filter(|residency| residency.holder == fence.holder)
+        {
+            None => return failed(ResidencyFailureKind::NotFound, "residency not found"),
+            Some(residency)
+                if cell.cell_epoch != fence.cell_epoch
+                    || residency.incarnation_id != fence.incarnation_id =>
+            {
+                return failed(ResidencyFailureKind::StaleEpoch, "stale residency fence")
+            }
+            Some(residency) => residency.phase == ResidencyPhase::Active,
+        };
+        match operation {
+            ResidencyOperation::StartProcess { process_key, .. } => {
+                let mut process = test_terminal_slot(&fence)
+                    .occupancy
+                    .processes
+                    .remove("main")
+                    .expect("terminal fixture process");
+                process.status = running_status();
+                cell.occupancy.processes.insert(process_key, process);
+                if let Some(residency) = cell.residency.as_mut() {
+                    residency.state_revision += 1;
+                }
+            }
+            ResidencyOperation::Renew { .. } if !active => {
+                return failed(
+                    ResidencyFailureKind::InvalidState,
+                    "only an active residency may be renewed",
+                )
+            }
+            _ => {}
+        }
+        ResidencyResult::State { cell: cell.clone() }
+    }
+
+    /// A fake executor that keeps one cell's real state and answers fenced
+    /// operations from it, but advertises that state only when the test calls
+    /// [`Self::post`]. Withholding snapshots is how a test leaves the fleet's
+    /// cached advertisement stale while the executor itself moves on.
+    struct StatefulExecutor {
+        orch: Orchestrator,
+        generation: u64,
+        cell: Arc<Mutex<PersistentCellState>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl StatefulExecutor {
+        fn attach(orch: &Orchestrator, cell: PersistentCellState) -> Self {
+            let pool: Arc<Fleet> = orch.fleet.clone();
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let generation = pool.attach_executor(sender);
+            let cell = Arc::new(Mutex::new(cell));
+            let state = cell.clone();
+            let task = tokio::spawn(async move {
+                while let Some(message) = receiver.recv().await {
+                    let ExecutorMessage::ResidencyRequest {
+                        correlation_id,
+                        operation,
+                        ..
+                    } = message
+                    else {
+                        continue;
+                    };
+                    let result = answer_fenced(&mut state.lock().unwrap(), operation);
+                    pool.handle_executor_message(
+                        "colocated",
+                        generation,
+                        ExecutorMessage::ResidencyResponse {
+                            correlation_id,
+                            result,
+                        },
+                    );
+                }
+            });
+            let executor = Self {
+                orch: orch.clone(),
+                generation,
+                cell,
+                task,
+            };
+            executor.post();
+            executor
+        }
+
+        /// Deliver one snapshot of the executor's current state.
+        fn post(&self) {
+            let cell = self.cell.lock().unwrap().clone();
+            self.orch.fleet.set_executor_snapshot(
+                "colocated",
+                self.generation,
+                FleetSnapshot {
+                    cells: vec![cell],
+                    ..Default::default()
+                },
+                ExecutorSubstrateReport::default(),
+            );
+        }
+
+        /// Change the executor's own state without advertising it.
+        fn mutate(&self, change: impl FnOnce(&mut PersistentCellState)) {
+            change(&mut self.cell.lock().unwrap());
+        }
+    }
+
+    impl Drop for StatefulExecutor {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn spawn_node_terminal(
+        orch: &Orchestrator,
+        target: TerminalResourceTarget,
+        command: &str,
+    ) -> String {
+        spawn_terminal_session(
+            orch,
+            CairnResource::NodeTerminal {
+                project: "p".into(),
+                number: 7,
+                exec_seq: 2,
+                node_id: "builder".into(),
+                slug: target.slug.clone(),
+            },
+            target,
+            command.into(),
+            None,
+            None,
+            None,
+            ResidentPtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn exit_reason(db: &LocalDb, session_id: &str) -> Option<String> {
+        db.query_opt(
+            "SELECT exit_reason FROM job_terminals WHERE session_id = ?1",
+            params![session_id.to_string()],
+            |row| row.opt_text(0),
+        )
+        .await
+        .unwrap()
+        .flatten()
+    }
+
+    /// The review finding on cairn/4977. The fleet's cached advertisement can
+    /// predate a terminal's start and then stop refreshing while the link stays
+    /// up, so it shows the new process as absent for as long as nothing new
+    /// arrives. Re-reading that same cache is not evidence, however long it
+    /// goes on: only the executor's own fresh answer is. When that answer later
+    /// says the process really is gone, the terminal settles.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_pre_start_snapshot_never_settles_a_live_terminal() {
+        let db = crate::storage::migrated_test_db("term_stale_pre_start.db").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("tests");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, target, "cargo test --release").await;
+
+        // The executor runs the process; the cached advertisement, taken before
+        // the start and never refreshed, does not show it.
+        assert!(orch.fleet.snapshot().cells[0]
+            .occupancy
+            .processes
+            .contains_key(&session_id));
+
+        let mut watch = ProcessLossWatch::default();
+        for _ in 0..5 {
+            assert_eq!(
+                reconcile_running_terminal_liveness(&orch, &mut watch)
+                    .await
+                    .unwrap(),
+                0,
+                "a stale advertisement is a suspicion the executor answers, not a verdict"
+            );
+        }
+        assert_eq!(
+            read_terminal(&orch.db.local, &session_id).await.0,
+            "running"
+        );
+        assert_eq!(exit_reason(&orch.db.local, &session_id).await, None);
+        assert!(emitter.events_named("pty-exit").is_empty());
+
+        // Now the process is genuinely gone from the executor, still with no
+        // snapshot to say so.
+        executor.mutate(|cell| {
+            cell.occupancy.processes.remove(&session_id);
+        });
+        assert_eq!(
+            reconcile_running_terminal_liveness(&orch, &mut watch)
+                .await
+                .unwrap(),
+            1
+        );
+        let (status, code, _) = read_terminal(&orch.db.local, &session_id).await;
+        assert_eq!(status, "exited");
+        assert_eq!(code, None);
+        let reason = exit_reason(&orch.db.local, &session_id).await.unwrap();
+        assert!(
+            reason.starts_with("process lost: executor Local executor no longer reports"),
+            "{reason}"
+        );
+        assert_eq!(emitter.events_named("pty-exit").len(), 1);
+    }
+
+    /// cairn/4977, replayed. An executor restarts under a running `cargo test`:
+    /// the restarted executor adopts the environment's cell at the next epoch and
+    /// reports the process lost, but only under that new epoch, which the
+    /// terminal's own exit handler (fenced to the epoch it started in) discards.
+    /// Nothing else ever looked at a running row, so the terminal said
+    /// `running` indefinitely and an agent waiting on its exit waited with it.
+    /// The executor's refusal of the terminal's stale fence confirms the loss,
+    /// and the terminal settles with a typed reason that releases the wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_whose_executor_restarted_under_it_settles_as_process_lost() {
+        let db = crate::storage::migrated_test_db("term_process_lost.db").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("tests");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id =
+            spawn_node_terminal(&orch, target, "cargo test provider_limit_holds").await;
+        executor.post();
+
+        let wait = tokio::spawn(crate::mcp::handlers::owned_wait::trigger(
+            orch.clone(),
+            orch.db.local.clone(),
+            crate::mcp::handlers::durable_suspend::Record {
+                id: "wait-1".into(),
+                job_id: "j".into(),
+                run_id: "run-1".into(),
+                session_id: "session-1".into(),
+                turn_id: "turn-1".into(),
+                tool_use_id: "tool-1".into(),
+                condition: crate::mcp::handlers::durable_suspend::Condition::Terminal {
+                    uri: cairn_common::uri::build_node_terminal_uri("p", 7, 2, "builder", "tests"),
+                    slug: "tests".into(),
+                    on: crate::mcp::handlers::run::TerminalWaitEvent::Exit,
+                    phrase: None,
+                },
+                deadline: None,
+                created: chrono::Utc::now().timestamp_millis(),
+            },
+        ));
+        let mut watch = ProcessLossWatch::default();
+        assert_eq!(
+            reconcile_running_terminal_liveness(&orch, &mut watch)
+                .await
+                .unwrap(),
+            0
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!wait.is_finished(), "a running terminal has not exited");
+
+        // The executor restarts: same incarnation, next cell epoch, the
+        // terminal's process reported lost, the cell idle and reclaimable.
+        executor.mutate(|cell| {
+            cell.cell_epoch += 1;
+            cell.lifecycle = PersistentCellLifecycle::Idle;
+            cell.residency.as_mut().unwrap().phase = ResidencyPhase::AwaitingReclaim;
+            cell.occupancy
+                .processes
+                .get_mut(&session_id)
+                .unwrap()
+                .status = ResidentProcessStatus::Exited {
+                finished_at_unix_ms: 2,
+                exit_code: None,
+                restartable: true,
+                executor_lost: true,
+            };
+        });
+        executor.post();
+
+        // The lost-process event the fleet synthesizes from that snapshot
+        // carries the new epoch and does not reach the terminal. This is the gap.
+        assert_eq!(
+            read_terminal(&orch.db.local, &session_id).await.0,
+            "running",
+            "the re-epoched exit is fenced out of the terminal's own handler"
+        );
+
+        assert_eq!(
+            reconcile_running_terminal_liveness(&orch, &mut watch)
+                .await
+                .unwrap(),
+            1
+        );
+        let (status, code, tail) = read_terminal(&orch.db.local, &session_id).await;
+        assert_eq!(status, "exited");
+        assert_eq!(code, None, "a lost process has no exit status to report");
+        let reason = exit_reason(&orch.db.local, &session_id)
+            .await
+            .expect("a settled lost terminal records why it ended");
+        assert!(reason.starts_with("process lost:"), "{reason}");
+        // The fleet names each advertised cell after the connection that
+        // posted it, so the reason names the machine an operator knows.
+        assert!(
+            reason.contains("executor Local executor"),
+            "names the executor: {reason}"
+        );
+        assert!(
+            reason.contains("epoch 7 became 8"),
+            "names the epoch change: {reason}"
+        );
+        assert!(
+            tail.unwrap_or_default()
+                .contains("Cairn ended this terminal"),
+            "the transcript says where and why it stopped"
+        );
+        assert_eq!(emitter.events_named("pty-exit").len(), 1);
+
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(5), wait)
+            .await
+            .expect("the exit wait resolves once the terminal settles")
+            .unwrap()
+            .unwrap();
+        let resolved: serde_json::Value = serde_json::from_str(&resolved).unwrap();
+        assert_eq!(resolved["outcome"], "exited");
+        assert!(
+            resolved["exitReason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("process lost:")),
+            "the waiting agent is told why: {resolved}"
+        );
+
+        // Settling is idempotent: a later pass finds nothing running.
+        assert_eq!(
+            reconcile_running_terminal_liveness(&orch, &mut watch)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(emitter.events_named("pty-exit").len(), 1);
+    }
+
+    /// Silence is not death. A process its executor reports running stays
+    /// running however many passes go by with no output, and an executor that
+    /// has merely gone away (its route still recorded, its cells no longer
+    /// advertised) proves nothing either.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_live_terminal_is_never_settled() {
+        let db = crate::storage::migrated_test_db("term_silent_live.db").await;
+        let (orch, emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("tests");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, target, "cargo test --release").await;
+        executor.post();
+
+        let mut watch = ProcessLossWatch::default();
+        for _ in 0..5 {
+            executor.post();
+            assert_eq!(
+                reconcile_running_terminal_liveness(&orch, &mut watch)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+
+        assert!(orch
+            .fleet
+            .disconnect_advertised_executor("colocated", executor.generation));
+        for _ in 0..5 {
+            assert_eq!(
+                reconcile_running_terminal_liveness(&orch, &mut watch)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        assert_eq!(
+            read_terminal(&orch.db.local, &session_id).await.0,
+            "running"
+        );
+        assert_eq!(exit_reason(&orch.db.local, &session_id).await, None);
+        assert!(emitter.events_named("pty-exit").is_empty());
+    }
+
+    /// A lease the executor gave up, with nothing left to probe: no connected
+    /// executor advertises it and no route records one. Its absence is acted on
+    /// only once it survives two snapshots received after it was first seen.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_released_lease_settles_only_after_fresh_snapshots_agree() {
+        let db = crate::storage::migrated_test_db("term_lease_gone.db").await;
+        let (orch, _emitter) = test_orchestrator_with_emitter(db);
+        seed(&orch.db.local).await;
+        let (target, fence) = test_terminal_target("tests");
+        let executor = StatefulExecutor::attach(&orch, pre_start_cell(&fence));
+        let session_id = spawn_node_terminal(&orch, target, "bun run dev").await;
+        executor.post();
+
+        executor.mutate(|cell| {
+            cell.residency = None;
+            cell.occupancy.processes.clear();
+        });
+        executor.post();
+
+        let mut watch = ProcessLossWatch::default();
+        for expected_settled in [0, 0, 1] {
+            assert_eq!(
+                reconcile_running_terminal_liveness(&orch, &mut watch)
+                    .await
+                    .unwrap(),
+                expected_settled
+            );
+            executor.post();
+        }
+        assert_eq!(read_terminal(&orch.db.local, &session_id).await.0, "exited");
+        assert_eq!(
+            exit_reason(&orch.db.local, &session_id).await.as_deref(),
+            Some("process lost: no executor holds this terminal's environment any more")
+        );
+    }
+
+    fn binding(fence: &ResidencyFence) -> ResidentTerminalBinding {
+        ResidentTerminalBinding {
+            id: "t".into(),
+            session_id: "sess".into(),
+            holder: fence.holder.storage_key(),
+            incarnation_id: fence.incarnation_id.clone(),
+            cell_epoch: fence.cell_epoch,
+            process_generation: 2,
+        }
+    }
+
+    /// Each verdict an advertisement can produce. Only a statement that
+    /// contradicts the terminal being alive is a loss; whatever cannot answer,
+    /// or belongs to recovery, is `Unknown`.
+    #[test]
+    fn liveness_is_judged_only_from_what_the_executor_states() {
+        let (_, fence) = test_terminal_target("tests");
+        let terminal = binding(&fence);
+        let at = |epoch, generation, status| {
+            vec![cell_holding(&fence, "sess", epoch, generation, status)]
+        };
+        let exited = |executor_lost| ResidentProcessStatus::Exited {
+            finished_at_unix_ms: 1,
+            exit_code: Some(101),
+            restartable: true,
+            executor_lost,
+        };
+
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(7, 2, running_status()), true),
+            TerminalLiveness::Alive
+        );
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(7, 2, ResidentProcessStatus::Starting), true),
+            TerminalLiveness::Alive
+        );
+        // An advertisement from before this generation started proves nothing.
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(7, 1, running_status()), true),
+            TerminalLiveness::Unknown
+        );
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(7, 3, running_status()), true),
+            TerminalLiveness::Lost(ProcessLoss::GenerationSuperseded {
+                executor: "bgsrv-ub".into(),
+                from: 2,
+                to: 3
+            })
+        );
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(7, 2, exited(false)), true),
+            TerminalLiveness::Lost(ProcessLoss::ExitUndelivered {
+                executor: "bgsrv-ub".into(),
+                exit_code: Some(101)
+            })
+        );
+        // A same-epoch death the executor blames on losing itself is the
+        // terminal handler's to hand to recovery, which may restart it.
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(7, 2, exited(true)), true),
+            TerminalLiveness::Unknown
+        );
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(8, 2, running_status()), true),
+            TerminalLiveness::Lost(ProcessLoss::EpochAdvanced {
+                executor: "bgsrv-ub".into(),
+                from: 7,
+                to: 8
+            })
+        );
+
+        let mut absent = cell_holding(&fence, "other-terminal", 7, 2, running_status());
+        assert_eq!(
+            judge_terminal_process(&terminal, std::slice::from_ref(&absent), true),
+            TerminalLiveness::Lost(ProcessLoss::ProcessAbsent {
+                executor: "bgsrv-ub".into()
+            })
+        );
+        absent.residency.as_mut().unwrap().incarnation_id = "replacement".into();
+        assert_eq!(
+            judge_terminal_process(&terminal, std::slice::from_ref(&absent), true),
+            TerminalLiveness::Lost(ProcessLoss::EnvironmentReplaced {
+                executor: "bgsrv-ub".into()
+            })
+        );
+
+        // Nothing advertised: a recorded route is a machine that is away, no
+        // route at all is a lease that looks gone.
+        assert_eq!(
+            judge_terminal_process(&terminal, &[], true),
+            TerminalLiveness::Unknown
+        );
+        assert_eq!(
+            judge_terminal_process(&terminal, &[], false),
+            TerminalLiveness::Lost(ProcessLoss::LeaseGone { executor: None })
+        );
+        // An advertisement from an older epoch is not a contradiction.
+        assert_eq!(
+            judge_terminal_process(&terminal, &at(6, 2, running_status()), true),
+            TerminalLiveness::Unknown
+        );
+    }
+
+    /// What the executor's fresh answer to a fenced renewal does with a
+    /// suspicion: its current cell is judged afresh, a refused stale fence or
+    /// an absent residency confirms the loss, and an answer that says nothing
+    /// about the process (unreachable, not active) confirms nothing.
+    #[test]
+    fn a_fresh_executor_answer_decides_a_suspicion() {
+        let (_, fence) = test_terminal_target("tests");
+        let terminal = binding(&fence);
+        let suspected = ProcessLoss::ProcessAbsent {
+            executor: "bgsrv-ub".into(),
+        };
+        let failed = |kind| ResidencyResult::Failed {
+            kind,
+            diagnostic: "x".into(),
+            cell_outcome: None,
+        };
+
+        let mut running = cell_holding(&fence, "sess", 7, 2, running_status());
+        running.executor_id = String::new();
+        running.executor_display_name = None;
+        assert_eq!(
+            confirm_suspected_loss(
+                &terminal,
+                &suspected,
+                &ResidencyResult::State {
+                    cell: running.clone()
+                }
+            ),
+            None,
+            "the executor still runs it"
+        );
+        running.occupancy.processes.clear();
+        assert_eq!(
+            confirm_suspected_loss(
+                &terminal,
+                &suspected,
+                &ResidencyResult::State { cell: running }
+            ),
+            Some(suspected.clone()),
+            "a fresh cell without the process confirms it, named after the advertisement"
+        );
+
+        let advanced = ProcessLoss::EpochAdvanced {
+            executor: "bgsrv-ub".into(),
+            from: 7,
+            to: 8,
+        };
+        assert_eq!(
+            confirm_suspected_loss(
+                &terminal,
+                &advanced,
+                &failed(ResidencyFailureKind::StaleEpoch)
+            ),
+            Some(advanced.clone())
+        );
+        assert_eq!(
+            confirm_suspected_loss(
+                &terminal,
+                &suspected,
+                &failed(ResidencyFailureKind::StaleEpoch)
+            ),
+            Some(ProcessLoss::EnvironmentReplaced {
+                executor: "bgsrv-ub".into()
+            })
+        );
+        assert_eq!(
+            confirm_suspected_loss(
+                &terminal,
+                &suspected,
+                &failed(ResidencyFailureKind::NotFound)
+            ),
+            Some(ProcessLoss::LeaseGone {
+                executor: Some("bgsrv-ub".into())
+            })
+        );
+        for kind in [
+            ResidencyFailureKind::Unavailable,
+            ResidencyFailureKind::InvalidState,
+            ResidencyFailureKind::Admission,
+        ] {
+            assert_eq!(
+                confirm_suspected_loss(&terminal, &suspected, &failed(kind)),
+                None
+            );
+        }
+    }
+
+    /// An unprobeable absence needs two snapshots from every connected
+    /// executor after it was first seen; a link opened since counts from zero.
+    #[test]
+    fn an_unroutable_loss_waits_for_two_fresh_snapshots_from_every_executor() {
+        let receipts = |entries: &[(&str, u64, u64)]| {
+            entries
+                .iter()
+                .map(|(executor, generation, received)| {
+                    (
+                        executor.to_string(),
+                        SnapshotReceipt {
+                            generation: *generation,
+                            received: *received,
+                        },
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let mut watch = ProcessLossWatch::default();
+        assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 10), ("b", 1, 4)])));
+        assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 11), ("b", 1, 6)])));
+        assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 12), ("b", 2, 1)])));
+        assert!(watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 12), ("b", 2, 2)])));
+
+        // Seen alive in between: the count starts over.
+        watch.clear("t");
+        assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 12)])));
+        assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[("a", 1, 13)])));
+        // No connected executor can ever vouch for an absence.
+        assert!(!watch.unroutable_loss_confirmed("t", &receipts(&[])));
     }
 }

@@ -17,19 +17,27 @@ fn fmt_runtime(secs: i64) -> String {
 }
 
 /// The rich resume message an agent sees when a subscribed terminal exits:
-/// slug, exit code, runtime, the canonical URI to read, and a short output tail.
+/// slug, exit code (or, for a terminal Cairn settled without a delivered exit,
+/// the recorded reason), runtime, the canonical URI to read, and a short output
+/// tail.
 pub(crate) fn format_terminal_exit_message(
     slug: &str,
     detail_uri: &str,
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
+    reason: Option<&str>,
 ) -> String {
-    let code = match exit_code {
-        Some(code) => format!("exit code {code}"),
-        None => "exit code unknown".to_string(),
+    let mut out = match reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+        Some(reason) => format!("[Terminal exit] `{slug}` ended — {reason}."),
+        None => {
+            let code = match exit_code {
+                Some(code) => format!("exit code {code}"),
+                None => "exit code unknown".to_string(),
+            };
+            format!("[Terminal exit] `{slug}` finished — {code}.")
+        }
     };
-    let mut out = format!("[Terminal exit] `{slug}` finished — {code}.");
     if let Some(rt) = runtime_secs {
         out.push_str(&format!(" Ran {}.", fmt_runtime(rt)));
     }
@@ -46,6 +54,7 @@ fn terminal_exit_event(
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
+    reason: Option<&str>,
 ) -> WakeEvent {
     WakeEvent {
         // The match key is the terminal's canonical URI, NOT the bare slug:
@@ -58,7 +67,14 @@ fn terminal_exit_event(
         fact_kind: FACT_KIND_TERMINAL_EXIT.to_string(),
         detail_uri: Some(detail_uri.to_string()),
         delivery: WakeDelivery::Broadcast {
-            message: format_terminal_exit_message(slug, detail_uri, exit_code, runtime_secs, tail),
+            message: format_terminal_exit_message(
+                slug,
+                detail_uri,
+                exit_code,
+                runtime_secs,
+                tail,
+                reason,
+            ),
         },
         urgency: DeliveryUrgency::Queue,
         muted: MutedDelivery::Drop,
@@ -73,10 +89,11 @@ pub(crate) fn route_terminal_exit(
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
+    reason: Option<&str>,
 ) -> Result<WakeRouteAction, String> {
     route_wake_sync(
         orch,
-        terminal_exit_event(slug, detail_uri, exit_code, runtime_secs, tail),
+        terminal_exit_event(slug, detail_uri, exit_code, runtime_secs, tail, reason),
     )
 }
 
@@ -89,10 +106,11 @@ pub async fn route_terminal_exit_async(
     exit_code: Option<i32>,
     runtime_secs: Option<i64>,
     tail: Option<&str>,
+    reason: Option<&str>,
 ) -> Result<WakeRouteAction, String> {
     route_wake(
         orch,
-        terminal_exit_event(slug, detail_uri, exit_code, runtime_secs, tail),
+        terminal_exit_event(slug, detail_uri, exit_code, runtime_secs, tail, reason),
     )
     .await
 }

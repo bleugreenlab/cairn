@@ -129,12 +129,17 @@ pub(super) async fn delete(
 ) -> Result<String, String> {
     reject(r, id, p)?;
     let project = match p {
-        Some(key) => Some(crate::mcp::handlers::skills_resources::project_path_by_key(o, key).await?),
+        Some(key) => {
+            Some(crate::mcp::handlers::skills_resources::project_path_by_key(o, key).await?)
+        }
         None => None,
     };
     let path = project
         .as_ref()
-        .map_or_else(|| o.config_dir.join("routes"), |project| project.join(".cairn/routes"))
+        .map_or_else(
+            || o.config_dir.join("routes"),
+            |project| project.join(".cairn/routes"),
+        )
         .join(format!("{id}.yaml"));
     if !path.exists() {
         return Err(format!("Route not found: {id}"));

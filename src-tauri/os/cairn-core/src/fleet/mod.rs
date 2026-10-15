@@ -1959,6 +1959,11 @@ struct ExecutorConnectionState {
     generation: u64,
     sender: mpsc::UnboundedSender<ExecutorMessage>,
     snapshot: FleetSnapshot,
+    /// Snapshots this link has delivered. An executor holds at most one
+    /// outbound snapshot, superseded rather than queued, so the second one
+    /// received after any moment was built after that moment: this count is
+    /// how a reader proves an advertisement is causally fresh.
+    snapshots_received: u64,
     last_progress_unix_ms: u64,
     health: ExecutorSubstrateReport,
     executor_build_id: Option<String>,
@@ -1980,6 +1985,14 @@ struct ExecutorConnectionState {
     /// clocks diverge only when the executor itself has gone quiet — which is
     /// what makes this the deciding diagnostic when a link stalls.
     pump_tick: Arc<AtomicU64>,
+}
+
+/// One executor link's snapshot count, read by [`Fleet::snapshot_receipts`].
+/// Counts restart with each link generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SnapshotReceipt {
+    pub generation: u64,
+    pub received: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2574,6 +2587,7 @@ impl Fleet {
             generation,
             sender,
             snapshot: FleetSnapshot::default(),
+            snapshots_received: 0,
             last_progress_unix_ms: unix_time_ms(),
             health: ExecutorSubstrateReport::default(),
             executor_build_id,
@@ -4199,6 +4213,7 @@ impl Fleet {
             execution.executor_id = executor_id.to_string();
         }
         let snapshot_changed = entry.snapshot != snapshot;
+        entry.snapshots_received = entry.snapshots_received.saturating_add(1);
         let reconciled_process_events = snapshot
             .cells
             .iter()
@@ -4868,6 +4883,22 @@ impl Fleet {
             })
             .reduce(occupancy::MachineOccupancy::or_earlier)
             .unwrap_or(occupancy::MachineOccupancy::Unforecastable)
+    }
+
+    /// How many snapshots each connected executor's current link has delivered.
+    pub(crate) fn snapshot_receipts(&self) -> HashMap<String, SnapshotReceipt> {
+        self.lock_connections()
+            .iter()
+            .map(|(executor_id, connection)| {
+                (
+                    executor_id.clone(),
+                    SnapshotReceipt {
+                        generation: connection.generation,
+                        received: connection.snapshots_received,
+                    },
+                )
+            })
+            .collect()
     }
 
     pub fn snapshot(&self) -> FleetSnapshot {
@@ -17227,6 +17258,7 @@ mod tests {
                 generation: 1,
                 sender,
                 snapshot: FleetSnapshot::default(),
+                snapshots_received: 0,
                 last_progress_unix_ms: observed_at_unix_ms,
                 health: ExecutorSubstrateReport {
                     applied_policy: cairn_common::executor_protocol::ExecutorRuntimePolicy {

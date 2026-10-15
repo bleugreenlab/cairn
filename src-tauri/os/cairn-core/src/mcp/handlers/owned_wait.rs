@@ -508,16 +508,50 @@ async fn terminal(
     phrase: Option<&str>,
 ) -> Result<Option<String>, String> {
     let (j, s) = (job.to_string(), slug.to_string());
-    let row=db.read(|c|{let (j,s)=(j.clone(),s.clone());Box::pin(async move{let mut r=c.query("SELECT session_id,status,exit_code,output_tail FROM job_terminals WHERE job_id=?1 AND slug=?2",params![j,s]).await?;r.next().await?.map(|x|Ok((x.text(0)?,x.text(1)?,x.opt_i64(2)?,x.opt_text(3)?))).transpose()})}).await.map_err(|e|e.to_string())?;
-    let Some((sid, status, code, tail)) = row else {
+    let row = db
+        .read(|c| {
+            let (j, s) = (j.clone(), s.clone());
+            Box::pin(async move {
+                let mut r = c
+                    .query(
+                        "SELECT session_id, status, exit_code, output_tail, exit_reason
+                         FROM job_terminals WHERE job_id = ?1 AND slug = ?2",
+                        params![j, s],
+                    )
+                    .await?;
+                r.next()
+                    .await?
+                    .map(|x| {
+                        Ok((
+                            x.text(0)?,
+                            x.text(1)?,
+                            x.opt_i64(2)?,
+                            x.opt_text(3)?,
+                            x.opt_text(4)?,
+                        ))
+                    })
+                    .transpose()
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some((sid, status, code, tail, reason)) = row else {
         return Err(format!("Terminal not found: {uri}"));
     };
     let exited = status == "exited";
+    // A terminal Cairn settled after proving its process gone says why, so the
+    // waiting agent learns the command did not finish rather than reading a
+    // missing exit code as one.
+    let with_reason = |mut value: serde_json::Value| {
+        if let Some(reason) = reason.as_deref() {
+            value["exitReason"] = serde_json::json!(reason);
+        }
+        value.to_string()
+    };
     if matches!(on, TerminalWaitEvent::Exit) && exited {
-        return Ok(Some(
-            serde_json::json!({"outcome":"exited","terminal":uri,"exitCode":code,"excerpt":tail})
-                .to_string(),
-        ));
+        return Ok(Some(with_reason(
+            serde_json::json!({"outcome":"exited","terminal":uri,"exitCode":code,"excerpt":tail}),
+        )));
     }
     if matches!(on, TerminalWaitEvent::Output) {
         let live = orch
@@ -539,7 +573,9 @@ async fn terminal(
             }
         }
         if exited {
-            return Ok(Some(serde_json::json!({"outcome":"terminal_exited","terminal":uri,"phrase":phrase,"exitCode":code,"excerpt":tail}).to_string()));
+            return Ok(Some(with_reason(
+                serde_json::json!({"outcome":"terminal_exited","terminal":uri,"phrase":phrase,"exitCode":code,"excerpt":tail}),
+            )));
         }
     }
     Ok(None)
