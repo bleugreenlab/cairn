@@ -217,6 +217,8 @@ async fn load_diff_coords(db: &LocalDb, job_id: &str) -> DbResult<Option<DiffCoo
 pub struct BranchRange {
     pub base: String,
     pub tip: String,
+    /// The integration target's head the merge base was taken against.
+    pub target_head: String,
 }
 
 /// Resolve what a branch itself changed, live from the store at read time.
@@ -255,6 +257,7 @@ pub async fn live_branch_range(
     Ok(BranchRange {
         base: resolved.base,
         tip: resolved.left,
+        target_head: resolved.right,
     })
 }
 

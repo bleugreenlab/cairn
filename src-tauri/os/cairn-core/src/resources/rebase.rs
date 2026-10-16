@@ -37,7 +37,7 @@ use cairn_common::query::QueryParam;
 use super::common::{connect_and_find_node_job, find_query_value, node_branch};
 use crate::orchestrator::conflict_session::{
     assess_session_tip, load_active_session, load_latest_session, ConflictSession, MarkerState,
-    SessionFile, TipAssessment, Unproven,
+    ReplayState, SessionFile, TipAssessment, Unproven,
 };
 use crate::orchestrator::replay_base::{load_base_candidates, resolve_base, BaseSource};
 use crate::orchestrator::Orchestrator;
@@ -163,7 +163,12 @@ pub(super) async fn read_node_rebase(
     };
 
     let rendered = match request.view {
-        RebaseView::Summary => render_summary(orch, project, number, exec_seq, node_id, &session),
+        RebaseView::Summary => {
+            let standing = load_live_standing(orch, &conn, &job.id, &branch, &session).await;
+            render_summary(
+                orch, project, number, exec_seq, node_id, &session, &standing,
+            )
+        }
         RebaseView::Merged => {
             render_merged(orch, project, number, exec_seq, node_id, &session, &request)
         }
@@ -381,6 +386,123 @@ async fn load_base_standing(
     })
 }
 
+/// Where a branch with an open session stands NOW, read live from the store.
+///
+/// The session's coordinates are frozen at the advance that recorded it. The
+/// node diff measures from the live fork point, and the base may have moved
+/// again since; without these three live facts beside the frozen ones, the page
+/// and the diff disagree with nothing saying which is stale.
+struct LiveStanding {
+    base_branch: String,
+    /// The base's head now.
+    head: String,
+    /// The branch tip's merge-base with that head: the base the node diff uses.
+    fork_point: Option<String>,
+    /// Whether the session's `ours` is still in the branch's ancestry.
+    ours_in_ancestry: Option<bool>,
+    /// Each distinct incoming side the tip's resolved files were resolved
+    /// against, with the files resolved against it.
+    resolved_against: BTreeMap<String, Vec<String>>,
+}
+
+async fn load_live_standing(
+    orch: &Orchestrator,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    branch: &str,
+    session: &ConflictSession,
+) -> Result<LiveStanding, String> {
+    let base = load_base_standing(orch, conn, job_id, branch).await?;
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = std::path::PathBuf::from(&session.store_path);
+    let tip = crate::jj::bookmark_commit(&jj, &store, branch);
+    let fork_point = tip.as_deref().and_then(|tip| {
+        crate::jj::revset_commit(
+            &jj,
+            &store,
+            &format!("heads(::{tip} & ::{})", base.destination),
+        )
+    });
+    let ours_in_ancestry = session
+        .ours
+        .as_deref()
+        .map(|ours| crate::jj::branch_carries_commit(&jj, &store, branch, ours));
+    let basis = tip
+        .as_deref()
+        .and_then(|tip| session.resolution_basis_at(&jj, &store, tip).ok())
+        .unwrap_or_else(|| session.resolution_basis.clone());
+    let mut resolved_against: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (path, side) in basis {
+        resolved_against.entry(side.theirs).or_default().push(path);
+    }
+    Ok(LiveStanding {
+        base_branch: base.base_branch,
+        head: base.destination,
+        fork_point,
+        ours_in_ancestry,
+        resolved_against,
+    })
+}
+
+/// The page's statement of what is stale: the session's recorded destination
+/// beside the base's live head and the branch's live fork point, a branch
+/// rewritten since recording, and what the committed tip was resolved against.
+fn standing_section(session: &ConflictSession, standing: &Result<LiveStanding, String>) -> String {
+    let standing = match standing {
+        Ok(standing) => standing,
+        Err(why) => {
+            return format!(
+                "\n## Where the branch stands now\n\nThe base's live head and this branch's fork \
+                 point could not be read ({why}), so the coordinates below may describe an older \
+                 merge than a replay would perform.\n"
+            )
+        }
+    };
+    let recorded = session.destination_commit.as_str();
+    let fork = standing.fork_point.as_deref().unwrap_or("unavailable");
+    let mut out = format!(
+        "\n## Where the branch stands now\n\n| | commit |\n|---|---|\n| this session was recorded \
+         against | `{recorded}` |\n| `{base}` now | `{head}` |\n| your branch's fork point with \
+         `{base}` (the node diff's base) | `{fork}` |\n",
+        base = standing.base_branch,
+        head = standing.head,
+    );
+    if recorded != standing.head {
+        out.push_str(&format!(
+            "\n⚠️ This session was recorded against `{recorded}`; `{base}` is now `{head}`; your \
+             branch's fork point is `{fork}`. The three-way coordinates below describe the \
+             recorded merge. A replay lands on `{head}`, not `{recorded}`.\n",
+            base = standing.base_branch,
+            head = standing.head,
+        ));
+    }
+    if standing.ours_in_ancestry == Some(false) {
+        out.push_str(
+            "\n⚠️ The branch was rewritten since this session was recorded: the recorded `ours` is \
+             no longer in its ancestry, so the coordinates below name commits the branch no \
+             longer carries.\n",
+        );
+    }
+    if !standing.resolved_against.is_empty() {
+        out.push_str("\nYour committed tip's resolutions:\n\n");
+        for (theirs, paths) in &standing.resolved_against {
+            let paths: Vec<String> = paths.iter().map(|path| format!("`{path}`")).collect();
+            out.push_str(&format!(
+                "- resolved against `{theirs}`: {}\n",
+                paths.join(", ")
+            ));
+        }
+        out.push_str(&format!(
+            "\nA take-committed-tip replay carries each forward onto `{head}`: a file the base has \
+             not touched since lands as you committed it, a file it changed elsewhere has those \
+             changes merged in, and a file where it changed the region you resolved is refused \
+             and shown here again.\n",
+            head = standing.head,
+        ));
+    }
+    out
+}
+
 /// The page for a branch that has never had a conflict session at all.
 ///
 /// The old text — "this branch has never hit a conflicting base advance,
@@ -533,6 +655,7 @@ fn render_summary(
     exec_seq: i32,
     node_id: &str,
     session: &ConflictSession,
+    standing: &Result<LiveStanding, String>,
 ) -> String {
     let base = format!("cairn://p/{project}/{number}/{exec_seq}/{node_id}/rebase");
     let conflicting: Vec<&SessionFile> = session.conflicting().collect();
@@ -583,7 +706,7 @@ fn render_summary(
         "# Rebase session for `{branch}`\n{version_note}\n{incoming}, and the automatic replay of your branch \
          onto it recorded a conflict and did not land the new base. Your branch remains on its \
          pre-advance content, but replay machinery may rewrite its store commit identity; the \
-         coordinates below are current.\n\n{condition}\n{status}\n{markers}\n\n## Three-way \
+         coordinates below are current.\n\n{condition}\n{status}\n{markers}\n{standing}\n## Three-way \
          coordinates\n\n{coords}\nThese are immutable commits. Read any file as of either side \
          with `?branch=<commit>`, or read the merge:\n\n- `{base}?view=merged` — the two sides \
          merged line-wise, with everything non-overlapping already resolved. Add `file=PATH` for \
@@ -599,6 +722,7 @@ fn render_summary(
         incoming = incoming_line(session),
         markers = marker_line(session),
         status = status_line(session),
+        standing = standing_section(session, standing),
         coords = coordinates_block(session),
         resolution_section = resolution_section(assessment.as_ref(), &base),
         dropped_section = dropped_work_section(assessment.as_ref(), &base),
@@ -1101,18 +1225,24 @@ fn status_line(session: &ConflictSession) -> String {
     let requested = crate::clock::stamp(progress.requested_at)
         .map(|stamp| format!(", requested {stamp}"))
         .unwrap_or_default();
-    if progress.running {
-        format!(
-            "\n**Status:** replay IN PROGRESS onto `{}`{requested}. It runs under the store lock; \
-             nothing runs in your slot.\n",
-            session.destination_commit
-        )
-    } else {
-        format!(
-            "\n**Status:** replay QUEUED onto `{}`{requested}. The durable reconcile worker picks \
-             it up; nothing runs in your slot, and re-requesting does not make it sooner.\n",
-            session.destination_commit
-        )
+    let destination = progress.destination.as_str();
+    match progress.state {
+        ReplayState::Running => format!(
+            "\n**Status:** replay IN PROGRESS onto `{destination}`{requested}. It runs under the \
+             store lock; nothing runs in your slot.\n"
+        ),
+        ReplayState::Queued => format!(
+            "\n**Status:** replay QUEUED onto `{destination}`{requested}. The durable reconcile \
+             worker picks it up; nothing runs in your slot, and re-requesting does not make it \
+             sooner.\n"
+        ),
+        ReplayState::Superseded => format!(
+            "\n**Status:** a replay was requested onto `{destination}`{requested}, but the \
+             reconcile work this session was recorded under has since been SUPERSEDED by a newer \
+             base, so this line no longer tracks that request. Its outcome is either a fresh \
+             session on this page or a published branch; if neither has appeared, request the \
+             replay again.\n"
+        ),
     }
 }
 
@@ -1319,6 +1449,82 @@ mod tests {
         assert!(
             standing(None).superseded_note().is_empty(),
             "a branch whose recorded base is alive has nothing to explain"
+        );
+    }
+
+    fn live(head: &str, ours_in_ancestry: bool) -> Result<LiveStanding, String> {
+        Ok(LiveStanding {
+            base_branch: "main".to_string(),
+            head: head.to_string(),
+            fork_point: Some("fork0000".to_string()),
+            ours_in_ancestry: Some(ours_in_ancestry),
+            resolved_against: [("a337fa4d".to_string(), vec!["migrations.rs".to_string()])]
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    fn recorded_session() -> ConflictSession {
+        ConflictSession {
+            intent_id: "intent".to_string(),
+            bookmark: "agent/test".to_string(),
+            project_id: "project".to_string(),
+            store_path: "/store".to_string(),
+            target_branch: "main".to_string(),
+            destination_commit: "a337fa4d".to_string(),
+            diagnostic_version: crate::orchestrator::conflict_session::CONFLICT_DIAGNOSTIC_VERSION,
+            condition: "content_conflict".to_string(),
+            base: Some("fork0000".to_string()),
+            ours: Some("c9bcf33c".to_string()),
+            theirs: Some("a337fa4d".to_string()),
+            conflicted_tip: None,
+            incoming: Default::default(),
+            marker_state: MarkerState::NotMaterialized,
+            marker_diagnostic: None,
+            resolution_state: Some("open".to_string()),
+            updated_at: 0,
+            replay_requested_at: None,
+            item_status: None,
+            intent_status: None,
+            files: Vec::new(),
+            resolution_basis: Default::default(),
+            replay_requested_tip: None,
+            replay_requested_destination: None,
+        }
+    }
+
+    /// The specimen's page: recorded against a337fa4d while main is at
+    /// b5461a3b. It names both, and the fork point the node diff uses, instead
+    /// of reading as a current account.
+    #[test]
+    fn a_session_recorded_against_an_older_base_says_so_beside_the_live_coordinates() {
+        let section = standing_section(&recorded_session(), &live("b5461a3b", true));
+        assert!(
+            section.contains("`a337fa4d`") && section.contains("`b5461a3b`"),
+            "{section}"
+        );
+        assert!(section.contains("fork point is `fork0000`"), "{section}");
+        assert!(
+            section.contains("A replay lands on `b5461a3b`"),
+            "{section}"
+        );
+        // The tip moved off `ours`, so it was resolved against this session's
+        // own incoming side.
+        assert!(
+            section.contains("resolved against `a337fa4d`: `migrations.rs`")
+                && section.contains("carries each forward onto `b5461a3b`"),
+            "{section}"
+        );
+        assert!(!section.contains("rewritten"), "{section}");
+
+        let current = standing_section(&recorded_session(), &live("a337fa4d", false));
+        assert!(
+            !current.contains("A replay lands on"),
+            "nothing stale: {current}"
+        );
+        assert!(
+            current.contains("rewritten since this session was recorded"),
+            "{current}"
         );
     }
 

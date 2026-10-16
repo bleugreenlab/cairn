@@ -83,31 +83,119 @@ pub(crate) async fn publish_managed_branch(
         .map_err(|error| format!("stale publication retry failed: {error}"))
 }
 
+/// What a replay measures the branch's own work from, path by path.
+///
+/// The fork — the live merge-base of the tip and the destination — is right for
+/// every path the branch simply edited. It is wrong for a path the branch
+/// RESOLVED against a newer base: that resolution is a linear commit holding the
+/// newer base's content without the newer base in its ancestry, so measured from
+/// the fork the absorbed content reads as the branch's own. Such a path is
+/// measured from the side it was resolved against instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReplayBaseline {
+    pub(crate) fork: String,
+    pub(crate) basis: crate::orchestrator::conflict_session::ResolutionBasis,
+}
+
+impl ReplayBaseline {
+    pub(crate) fn fork_only(fork: &str) -> Self {
+        Self {
+            fork: fork.to_string(),
+            basis: Default::default(),
+        }
+    }
+
+    /// The side `path` was resolved against, when a resolution covered it.
+    pub(crate) fn resolved_against(&self, path: &str) -> Option<&str> {
+        self.basis.get(path).map(|side| side.theirs.as_str())
+    }
+
+    /// What the branch's work on `path` is measured from.
+    pub(crate) fn baseline_for(&self, path: &str) -> &str {
+        self.resolved_against(path).unwrap_or(&self.fork)
+    }
+
+    /// This baseline with the basis narrowed to the paths `tip` provably holds
+    /// the resolved side of: restoring the tip's file whole over the basis's
+    /// merge drops nothing from it.
+    ///
+    /// A session's basis is a claim about the branch's commits, and only an
+    /// explicit replay has had that claim checked by the request guard. An
+    /// automatic advance gets it checked here, per path, because measuring an
+    /// unresolved file from the newer side would read the newer side's lines as
+    /// deletions the branch made.
+    pub(crate) fn verified(self, jj: &crate::jj::JjEnv, store: &Path, tip: &str) -> Self {
+        let mut by_side: BTreeMap<
+            &crate::orchestrator::conflict_session::ResolvedSide,
+            Vec<String>,
+        > = BTreeMap::new();
+        for (path, side) in &self.basis {
+            by_side.entry(side).or_default().push(path.clone());
+        }
+        let held: BTreeSet<String> = by_side
+            .into_iter()
+            .flat_map(|(side, paths)| {
+                crate::jj::assess_paths(jj, store, &side.base, tip, &side.theirs, &paths)
+            })
+            .filter(|assessment| assessment.verdict == crate::jj::RestoreVerdict::Lossless)
+            .map(|assessment| assessment.path)
+            .collect();
+        Self {
+            basis: self
+                .basis
+                .into_iter()
+                .filter(|(path, _)| held.contains(path))
+                .collect(),
+            fork: self.fork,
+        }
+    }
+}
+
 /// Resolve the one conflict shape this subsystem owns: every conflicting path is
 /// a registered migration registry, and retaining destination then branch entries
 /// is proven lossless before and after the candidate is committed.
+///
+/// Each path merges from its [`ReplayBaseline`]. Merged from the stale fork, a
+/// registry the branch already resolved against an earlier base would see that
+/// base's entries on both sides and keep them twice.
 fn try_union_registry_conflict(
     jj: &crate::jj::JjEnv,
     store: &Path,
     branch: &str,
     destination: &str,
     diagnostic: &crate::jj::ConflictDiagnostic,
+    baseline: &ReplayBaseline,
 ) -> Result<Option<crate::jj::ReconcileReport>, String> {
     let paths = diagnostic.conflicting_paths();
     let allowed = crate::orchestrator::contended_identifiers::union_resolvable_paths();
     if paths.is_empty() || paths.iter().any(|path| !allowed.contains(path)) {
         return Ok(None);
     }
-    let (Some(base), Some(ours), Some(theirs)) = (
+    let (Some(fork), Some(ours), Some(theirs)) = (
         diagnostic.base.as_deref(),
         diagnostic.ours.as_deref(),
         diagnostic.theirs.as_deref(),
     ) else {
         return Ok(None);
     };
-    let sides = crate::jj::read_sides_for_paths(jj, store, base, ours, theirs, &paths);
+    let base_for = |path: &str| baseline.resolved_against(path).unwrap_or(fork).to_string();
+    let sides_at = |tip: &str| -> Vec<(String, Result<crate::jj::MergeSides, String>)> {
+        paths
+            .iter()
+            .flat_map(|path| {
+                crate::jj::read_sides_for_paths(
+                    jj,
+                    store,
+                    &base_for(path),
+                    tip,
+                    theirs,
+                    std::slice::from_ref(path),
+                )
+            })
+            .collect()
+    };
     let mut plan = crate::orchestrator::contended_identifiers::ResolutionPlan::default();
-    for (path, sides) in sides {
+    for (path, sides) in sides_at(ours) {
         let Ok(sides) = sides else {
             return Ok(None);
         };
@@ -141,9 +229,7 @@ fn try_union_registry_conflict(
         apply_resolution_plan(jj, store, branch, ours, &plan)?;
         let committed = crate::jj::bookmark_commit(jj, store, branch)
             .ok_or_else(|| format!("registry union commit left `{branch}` unresolved"))?;
-        for (_, sides) in
-            crate::jj::read_sides_for_paths(jj, store, base, &committed, theirs, &paths)
-        {
+        for (_, sides) in sides_at(&committed) {
             let sides = sides.map_err(|error| {
                 format!("could not prove committed registry union lossless: {error}")
             })?;
@@ -153,12 +239,14 @@ fn try_union_registry_conflict(
                 );
             }
         }
+        // The committed union already holds the destination's entries, so the
+        // replay lands it whole.
         crate::jj::reconcile_resolved_sibling_without_publication(
             jj,
             store,
             destination,
             branch,
-            &paths,
+            &crate::jj::ResolutionCarry::from_tip(&committed, &paths),
         )
     })();
     match result {
@@ -323,13 +411,13 @@ async fn persist_pre_rebase_obligations(
     project_id: &str,
     store: &Path,
     bookmark: &str,
-    fork: &str,
+    baseline: &ReplayBaseline,
     pre_tip: &str,
     base: &str,
 ) -> Result<BTreeSet<String>, String> {
     use crate::orchestrator::contended_identifiers as contended;
 
-    let changes = registered_changes(jj, store, fork, pre_tip)?;
+    let changes = registered_changes(jj, store, &baseline.fork, pre_tip)?;
     let stored: BTreeMap<String, contended::Obligation> =
         contended::load_obligations(db, project_id, store, bookmark)
             .await?
@@ -350,7 +438,7 @@ async fn persist_pre_rebase_obligations(
             jj,
             store,
             constant,
-            fork,
+            baseline,
             pre_tip,
             base,
             previous.map(|obligation| obligation.delta),
@@ -391,15 +479,20 @@ struct ConstantEvidence {
     resolved: crate::orchestrator::contended_identifiers::ConstantResolution,
 }
 
-/// Read a constant at the fork, the pre-rebase tip and the base, and resolve it
-/// by the constant's own [`DeltaEvidence`] rule.
+/// Read a constant at the branch's baseline, the pre-rebase tip and the base,
+/// and resolve it by the constant's own [`DeltaEvidence`] rule.
+///
+/// The baseline is the fork unless the branch resolved the constant's file
+/// against a newer base, in which case it is that base: a resolution that took
+/// the base's value contributed nothing, and measured from the fork it would
+/// read as a bump.
 ///
 /// [`DeltaEvidence`]: crate::orchestrator::contended_identifiers::DeltaEvidence
 fn constant_evidence(
     jj: &crate::jj::JjEnv,
     store: &Path,
     constant: &crate::orchestrator::contended_identifiers::MonotonicConstant,
-    fork: &str,
+    baseline: &ReplayBaseline,
     pre_tip: &str,
     base: &str,
     stored_delta: Option<u64>,
@@ -412,7 +505,7 @@ fn constant_evidence(
             .ok_or_else(|| format!("could not read {} at `{revision}`", constant.constant))?;
         Ok((text, value))
     };
-    let (fork_text, fork_value) = read(fork)?;
+    let (fork_text, fork_value) = read(baseline.baseline_for(constant.file))?;
     let (branch_text, branch_value) = read(pre_tip)?;
     let (base_text, base_value) = read(base)?;
     let (authored, absorbed, resolved) = match constant.evidence.heading_prefix() {
@@ -452,7 +545,7 @@ fn constant_evidence(
 fn plan_post_rebase_resolution(
     jj: &crate::jj::JjEnv,
     store: &Path,
-    fork: &str,
+    baseline: &ReplayBaseline,
     pre_tip: &str,
     base: &str,
     rebased_tip: &str,
@@ -524,7 +617,7 @@ fn plan_post_rebase_resolution(
             jj,
             store,
             constant,
-            fork,
+            baseline,
             pre_tip,
             base,
             previous.map(|obligation| obligation.delta),
@@ -650,6 +743,121 @@ fn apply_resolution_plan(
             Some(bookmark),
         )?;
         Ok(())
+    })
+}
+
+/// A committed resolution carried onto one replay destination, and the paths
+/// that could not be.
+struct CarryPlan {
+    carry: crate::jj::ResolutionCarry,
+    refused: Vec<(String, String)>,
+}
+
+impl CarryPlan {
+    fn describe_refusals(&self) -> String {
+        let mut out = String::from(
+            "Your committed resolution was not carried onto the new base for these file(s), so \
+             they were left to the merge — which is why this replay did not land:\n",
+        );
+        for (path, why) in &self.refused {
+            out.push_str(&format!("- `{path}`: {why}\n"));
+        }
+        out.push_str(
+            "Resolve them against the new base (cairn:~/rebase now shows both sides) and request \
+             the replay again. Every other conflicting file kept your resolution.",
+        );
+        out
+    }
+}
+
+/// Carry a session's committed resolution onto `destination`, path by path.
+///
+/// Each conflicting path is merged three ways: the side it was resolved
+/// against, the committed tip, and the destination. A destination that has not
+/// touched the path since takes the committed file whole — today's restore,
+/// exactly right. One that changed it elsewhere has those changes merged in.
+/// One that changed the very region the agent resolved has produced a conflict
+/// nobody has resolved, and is refused unless the file is a registration
+/// registry, whose entries commute and are unioned (the lineage renumber after
+/// the rebase then separates any colliding numbers). An incoming hunk is
+/// therefore always kept: merged in, unioned in, or the replay is refused.
+///
+/// The committed side is the tip the request was assessed at; the rebase
+/// refuses if the branch has moved off it since.
+fn plan_resolution_carry(
+    jj: &crate::jj::JjEnv,
+    store: &Path,
+    session: &crate::orchestrator::conflict_session::ConflictSession,
+    destination: &str,
+    live_tip: &str,
+) -> Result<CarryPlan, String> {
+    use crate::jj::{Carried, CarriedContent};
+
+    let committed = session
+        .replay_requested_tip
+        .clone()
+        .unwrap_or_else(|| live_tip.to_string());
+    let fork = branch_fork_point(jj, store, &committed, destination).ok_or_else(|| {
+        format!("the fork point of `{committed}` and `{destination}` did not resolve")
+    })?;
+    let baseline = ReplayBaseline {
+        fork,
+        basis: session.resolution_basis_at(jj, store, &committed)?,
+    };
+    // Every path the replay has to place, not only the current conflicts: a
+    // path an earlier replay carried and then rolled back is no longer
+    // conflicting here, and leaving it out would let it conflict again.
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for path in session.replay_paths(&baseline.basis) {
+        groups
+            .entry(baseline.baseline_for(&path).to_string())
+            .or_default()
+            .push(path);
+    }
+    let registries = crate::orchestrator::contended_identifiers::union_resolvable_paths();
+    let mut carried = Vec::new();
+    let mut refused = Vec::new();
+    for (resolved_against, paths) in groups {
+        for (path, outcome) in crate::jj::carry_paths(
+            jj,
+            store,
+            &resolved_against,
+            &committed,
+            destination,
+            &paths,
+        ) {
+            match outcome {
+                Ok(Carried::Unchanged) => carried.push((path, CarriedContent::FromTip)),
+                Ok(Carried::Merged(text)) => carried.push((path, CarriedContent::Text(text))),
+                Ok(Carried::Conflicted { .. }) if registries.contains(&path) => {
+                    let read = |revision: &str| text_at_revision(jj, store, revision, &path);
+                    let union = crate::jj::union_completion_candidate(
+                        &read(&resolved_against)?,
+                        &read(&committed)?,
+                        &read(destination)?,
+                    );
+                    carried.push((path, CarriedContent::Text(union)));
+                }
+                Ok(Carried::Conflicted { .. }) => {
+                    let why = match baseline.resolved_against(&path) {
+                        Some(theirs) => format!(
+                            "`{destination}` changed the region you resolved against `{theirs}`"
+                        ),
+                        None => "your branch has not resolved this file against any base yet"
+                            .to_string(),
+                    };
+                    refused.push((path, why));
+                }
+                Ok(Carried::Unjudged(why)) | Err(why) => refused.push((path, why)),
+            }
+        }
+    }
+    Ok(CarryPlan {
+        carry: crate::jj::ResolutionCarry {
+            expected_pre_tip: committed,
+            paths: carried,
+        },
+        refused,
     })
 }
 
@@ -2694,6 +2902,10 @@ pub(crate) async fn request_branch_replay(
     // than before it is done. The refusal is not a dead end — it hands back the
     // exact content that makes the same request correct.
     let mut caveats: Vec<String> = Vec::new();
+    // The tip the guard judged. The worker carries THIS tip's content and
+    // refuses a branch that has moved off it, so a resolution is never applied
+    // to commits nobody assessed.
+    let mut request_tip: Option<String> = None;
     if let Some(session) = session.as_ref().filter(|_| take_committed_tip) {
         // Read-only, and deliberately outside the store lock: every object it
         // reads is immutable, and the one mutable thing (the bookmark) is
@@ -2713,6 +2925,12 @@ pub(crate) async fn request_branch_replay(
         let proof = crate::orchestrator::conflict_session::assess_session_tip_exhaustively(
             &jj, store, session,
         );
+        request_tip = match &proof {
+            crate::orchestrator::conflict_session::RestoreProof::Assessed(assessment) => {
+                Some(assessment.tip.clone())
+            }
+            _ => crate::jj::bookmark_commit(&jj, store, branch),
+        };
         match crate::orchestrator::conflict_session::decide_replay(&proof, drop_incoming_reason) {
             ReplayDecision::Proceed => {}
             ReplayDecision::Refuse(refusal) => return Err(refusal),
@@ -2822,6 +3040,20 @@ pub(crate) async fn request_branch_replay(
     // after the base moves to a new destination.
     let deadline = tokio::time::Instant::now()
         + std::time::Duration::from_secs((RECONCILE_LEASE_SECONDS + 30) as u64);
+    // Recorded BEFORE the work is queued: the worker reads the requested tip
+    // back, and must never find the previous request's, or none at all. A
+    // sessionless request has no item row to carry it yet; the reconcile pass
+    // it queues writes one.
+    if let Some(session) = session.as_ref() {
+        crate::orchestrator::conflict_session::record_replay_request(
+            db,
+            &session.intent_id,
+            branch,
+            request_tip.as_deref(),
+            &destination,
+        )
+        .await;
+    }
     let mut reopen_destination = destination.clone();
     // Every destination this request was re-aimed at, so the summary can name a
     // race instead of leaving it to look like a failed resolution.
@@ -2859,12 +3091,19 @@ pub(crate) async fn request_branch_replay(
         wait_for_reconcile_slot(db, &store, &base_branch, &reopen_destination, deadline).await?;
     }
 
-    // The request itself is the one fact nothing else records, and without it a
-    // read of cairn:~/rebase looks identical before and after asking. A
-    // sessionless request has no item row to carry the timestamp yet; the
-    // reconcile pass it just queued writes one.
-    if let Some(session) = session.as_ref() {
-        mark_replay_requested(db, &session.intent_id, branch).await;
+    // Re-aimed at a newer base while queued: the page names where it went.
+    if let Some(session) = session
+        .as_ref()
+        .filter(|_| reopen_destination != destination)
+    {
+        crate::orchestrator::conflict_session::record_replay_request(
+            db,
+            &session.intent_id,
+            branch,
+            request_tip.as_deref(),
+            &reopen_destination,
+        )
+        .await;
     }
 
     let mut summary = preamble;
@@ -2889,24 +3128,6 @@ pub(crate) async fn request_branch_replay(
         summary.push_str(caveat);
     }
     Ok(summary)
-}
-
-/// Record that an agent asked for a replay, so the resource can say one is
-/// outstanding. Advisory: a failure here must not fail a request the reconcile
-/// worker has already accepted.
-async fn mark_replay_requested(db: &LocalDb, intent_id: &str, bookmark: &str) {
-    if let Err(error) = db
-        .execute(
-            "UPDATE jj_reconcile_items SET replay_requested_at = ?3
-             WHERE intent_id = ?1 AND bookmark = ?2",
-            // Unix seconds, matching every other timestamp on this table so the
-            // resource can render it with the same `clock::stamp`.
-            params![intent_id, bookmark, chrono::Utc::now().timestamp()],
-        )
-        .await
-    {
-        log::warn!("replay request for `{bookmark}`: could not record the request time: {error}");
-    }
 }
 
 struct ReplayProject {
@@ -3025,6 +3246,7 @@ async fn execute_reconcile_claim(
     let mut before: HashMap<String, String> = HashMap::new();
     let mut after: HashMap<String, String> = HashMap::new();
     let mut contended_resolution_notes: HashMap<String, String> = HashMap::new();
+    let mut carry_notes: HashMap<String, String> = HashMap::new();
     let mut report = crate::jj::ReconcileReport::default();
     let mut any_branch_deferred = false;
 
@@ -3102,32 +3324,51 @@ async fn execute_reconcile_claim(
             }
         }
 
+        // The open session, if any, is what knows which base the branch's
+        // committed tip was resolved against. Automatic and explicit replays
+        // both measure from it; only an explicit one may carry content.
+        let open_session =
+            crate::orchestrator::conflict_session::load_active_session(db, branch).await?;
         let pre_tip = current_tip.clone();
         let fork = pre_tip
             .as_deref()
             .and_then(|tip| branch_fork_point(&jj, &store, tip, &pinned_dest));
-        let mut contended_context: Option<(String, String, BTreeSet<String>)> = None;
+        let mut contended_context: Option<(ReplayBaseline, String, BTreeSet<String>)> = None;
         let pre_resolution_failure = match (fork, pre_tip) {
-            (Some(fork), Some(pre_tip)) => match persist_pre_rebase_obligations(
-                &jj,
-                db,
-                &claim.project_id,
-                &store,
-                branch,
-                &fork,
-                &pre_tip,
-                &pinned_dest,
-            )
-            .await
-            {
-                Ok(changes) => {
-                    contended_context = Some((fork, pre_tip, changes));
-                    None
+            (Some(fork), Some(pre_tip)) => {
+                let baseline = ReplayBaseline {
+                    fork,
+                    basis: open_session
+                        .as_ref()
+                        .map(|session| {
+                            session
+                                .resolution_basis_at(&jj, &store, &pre_tip)
+                                .unwrap_or_else(|_| session.resolution_basis.clone())
+                        })
+                        .unwrap_or_default(),
                 }
-                Err(error) => Some(format!(
-                    "contended identifier preflight refused before graph mutation: {error}"
-                )),
-            },
+                .verified(&jj, &store, &pre_tip);
+                match persist_pre_rebase_obligations(
+                    &jj,
+                    db,
+                    &claim.project_id,
+                    &store,
+                    branch,
+                    &baseline,
+                    &pre_tip,
+                    &pinned_dest,
+                )
+                .await
+                {
+                    Ok(changes) => {
+                        contended_context = Some((baseline, pre_tip, changes));
+                        None
+                    }
+                    Err(error) => Some(format!(
+                        "contended identifier preflight refused before graph mutation: {error}"
+                    )),
+                }
+            }
             _ => Some(
                 "contended identifier preflight could not resolve the branch tip and fork point; \
                  the base advance was left untouched"
@@ -3142,7 +3383,7 @@ async fn execute_reconcile_claim(
         // may already name the resolved tip as `ours`, so tip inequality cannot
         // identify resolution intent reliably (the live CAIRN-3412 shape).
         let resolution_session = if label.starts_with("resolved replay requested for ") {
-            crate::orchestrator::conflict_session::load_active_session(db, branch).await?
+            open_session.clone()
         } else {
             None
         };
@@ -3257,26 +3498,57 @@ async fn execute_reconcile_claim(
                     before.insert(branch.clone(), commit);
                 }
             }
-            let resolution_paths = resolution_session
-                .as_ref()
-                .map(|session| {
-                    session
-                        .conflicting()
-                        .map(|file| file.path.clone())
-                        .collect::<Vec<_>>()
-                })
-                .filter(|paths| !paths.is_empty());
+            // Carry the committed resolution onto THIS destination, under the
+            // same lock as the rebase it feeds, so nothing can move between
+            // the plan and its use.
+            let carry_plan = match (resolution_session.as_ref(), before.get(branch)) {
+                (Some(session), Some(live_tip))
+                    if session.conflicting().next().is_some()
+                        || !session.resolution_basis.is_empty() =>
+                {
+                    Some(plan_resolution_carry(
+                        &jj,
+                        &store,
+                        session,
+                        &pinned_dest,
+                        live_tip,
+                    ))
+                }
+                _ => None,
+            };
             let item_report = if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
-            } else if let Some(paths) = resolution_paths.as_deref() {
-                crate::jj::reconcile_resolved_sibling_without_publication(
-                    &jj,
-                    &store,
-                    &pinned_dest,
-                    branch,
-                    paths,
-                )
-                .map_err(|error| format!("jj resolved sibling replay ({label}) failed: {error}"))?
+            } else if let Some(carry_plan) = carry_plan {
+                match carry_plan {
+                    Ok(plan) => {
+                        if !plan.refused.is_empty() {
+                            let note = plan.describe_refusals();
+                            log::info!("jj reconcile ({label}): `{branch}` {note}");
+                            carry_notes.insert(branch.clone(), note);
+                        }
+                        crate::jj::reconcile_resolved_sibling_without_publication(
+                            &jj,
+                            &store,
+                            &pinned_dest,
+                            branch,
+                            &plan.carry,
+                        )
+                        .map_err(|error| {
+                            format!("jj resolved sibling replay ({label}) failed: {error}")
+                        })?
+                    }
+                    Err(error) => {
+                        let mut refused = crate::jj::ReconcileReport::default();
+                        refused.failed.push(crate::jj::ReconcileFailure {
+                            branch: branch.clone(),
+                            error: format!(
+                                "your committed resolution could not be carried onto \
+                                 `{pinned_dest}`, so the branch was left untouched: {error}"
+                            ),
+                        });
+                        refused
+                    }
+                }
             } else {
                 let item = vec![branch.clone()];
                 crate::jj::reconcile_siblings_without_publication(&jj, &store, &pinned_dest, &item)
@@ -3319,12 +3591,19 @@ async fn execute_reconcile_claim(
                     .await;
                 let _phase =
                     guard.phase(format!("prove and replay registry union branch={branch}"));
+                let baseline = contended_context
+                    .as_ref()
+                    .map(|(baseline, _, _)| baseline.clone())
+                    .unwrap_or_else(|| {
+                        ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap_or_default())
+                    });
                 match try_union_registry_conflict(
                     &jj,
                     &store,
                     branch,
                     &pinned_dest,
                     &diagnostic,
+                    &baseline,
                 ) {
                     Ok(Some(resolved)) => {
                         item_report = resolved;
@@ -3405,7 +3684,7 @@ async fn execute_reconcile_claim(
         // Any refusal removes the clean classification, leaves every obligation
         // outstanding, and therefore takes the existing waking failure path.
         if item_report.rebased_clean.contains(branch) {
-            if let Some((fork, pre_tip, changes)) = contended_context.as_ref() {
+            if let Some((baseline, pre_tip, changes)) = contended_context.as_ref() {
                 let rebased_tip = after
                     .get(branch)
                     .cloned()
@@ -3425,7 +3704,7 @@ async fn execute_reconcile_claim(
                     let plan = plan_post_rebase_resolution(
                         &jj,
                         &store,
-                        fork,
+                        baseline,
                         pre_tip,
                         &pinned_dest,
                         &rebased_tip,
@@ -3626,7 +3905,16 @@ async fn execute_reconcile_claim(
         // land on it, and the marker state must be recorded from what the
         // executor confirmed before any wake is composed.
         if let Some(diagnostic) = item_report.conflict_diagnostics.get(branch) {
-            record_conflict_session(db, intent_id, branch, diagnostic, &notes.incoming).await?;
+            // Inherited from the session open before this pass: which paths of
+            // the tip that just failed were resolved against what.
+            let basis = crate::orchestrator::conflict_session::inherited_basis(
+                &jj,
+                &store,
+                open_session.as_ref(),
+                diagnostic.ours.as_deref(),
+            );
+            record_conflict_session(db, intent_id, branch, diagnostic, &notes.incoming, &basis)
+                .await?;
             supersede_stale_sessions(db, branch, intent_id).await?;
             let (state, marker_diagnostic, dispositions) =
                 materialize_markers_for_branch(orch, db, &claim.project_id, branch, diagnostic)
@@ -3741,6 +4029,7 @@ async fn execute_reconcile_claim(
                 })
                 .collect(),
             marker_states,
+            carry_notes,
         };
         notify_conflicted_siblings(
             orch,
@@ -4359,6 +4648,9 @@ where
 struct ConflictEvidence {
     diagnostics: HashMap<String, crate::jj::ConflictDiagnostic>,
     marker_states: HashMap<String, MarkerState>,
+    /// For an explicit replay, which committed resolutions could not be
+    /// carried onto the destination, and why.
+    carry_notes: HashMap<String, String>,
 }
 
 fn notify_conflicted_siblings(
@@ -4390,7 +4682,11 @@ fn notify_conflicted_siblings(
             .get(&branch)
             .copied()
             .unwrap_or_default();
-        let message = append_conflict_diagnostic(note, diagnostic, marker_state);
+        let mut message = append_conflict_diagnostic(note, diagnostic, marker_state);
+        if let Some(carry_note) = evidence.carry_notes.get(&branch) {
+            message.push_str("\n\n");
+            message.push_str(carry_note);
+        }
         // The delivery key carries the diagnostic's fingerprint, so a resumed or
         // double-fired reconcile at the SAME base cannot re-wake the agent, while
         // a genuinely new base advance — different coordinates — correctly does.
@@ -5868,9 +6164,16 @@ mod tests {
             pr_number: Some(2893),
             issue: Some("cairn-3337".to_string()),
         };
-        record_conflict_session(&db, &claim.id, branch, &diagnostic, &incoming)
-            .await
-            .unwrap();
+        record_conflict_session(
+            &db,
+            &claim.id,
+            branch,
+            &diagnostic,
+            &incoming,
+            &Default::default(),
+        )
+        .await
+        .unwrap();
 
         let session = crate::orchestrator::conflict_session::load_active_session(&db, branch)
             .await
@@ -5955,6 +6258,7 @@ mod tests {
                 branch,
                 &diagnostic,
                 &IncomingIdentity::default(),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -5988,6 +6292,131 @@ mod tests {
                 .is_none(),
             "absorbing the base closes the session"
         );
+    }
+
+    fn list_conflict(ours: &str, theirs: &str) -> crate::jj::ConflictDiagnostic {
+        crate::jj::ConflictDiagnostic {
+            base: Some("fork".to_string()),
+            ours: Some(ours.to_string()),
+            theirs: Some(theirs.to_string()),
+            conflicted_tip: None,
+            condition: crate::jj::ConflictCondition::ContentConflict,
+            incoming: vec![crate::jj::IncomingFile {
+                path: "list.txt".to_string(),
+                status: "M".to_string(),
+                classification: crate::jj::IncomingClassification::Conflicting,
+            }],
+        }
+    }
+
+    /// Record a conflict the way the worker does, inheriting from the session
+    /// open before it. `changed` stands in for the store's answer to which
+    /// conflicting paths changed since that session's `ours`.
+    async fn record_on_intent(
+        db: &LocalDb,
+        intent_id: &str,
+        ours: &str,
+        theirs: &str,
+        changed: &[&str],
+    ) {
+        let previous = crate::orchestrator::conflict_session::load_active_session(db, "agent/test")
+            .await
+            .unwrap();
+        let basis = previous
+            .map(|previous| {
+                previous.basis_after(&changed.iter().map(|path| path.to_string()).collect())
+            })
+            .unwrap_or_default();
+        persist_reconcile_item(
+            db,
+            ReconcileItemUpdate {
+                intent_id,
+                bookmark: "agent/test",
+                observed_tip: Some(ours),
+                status: "graph_moved",
+                failure_kind: None,
+                outcome_kind: Some("conflicted"),
+                fingerprint: None,
+                diagnostic: None,
+            },
+        )
+        .await
+        .unwrap();
+        record_conflict_session(
+            db,
+            intent_id,
+            "agent/test",
+            &list_conflict(ours, theirs),
+            &IncomingIdentity::default(),
+            &basis,
+        )
+        .await
+        .unwrap();
+        supersede_stale_sessions(db, "agent/test", intent_id)
+            .await
+            .unwrap();
+    }
+
+    /// The resolution basis survives every way a session is re-recorded: the
+    /// agent committing during a session (including the same-intent re-detect,
+    /// whose previous session is the row being overwritten), and a later
+    /// advance recording over the unmoved resolution.
+    #[tokio::test]
+    async fn a_recorded_session_inherits_the_basis_its_tip_was_resolved_against() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let store = Path::new("/store");
+        let load = || async {
+            crate::orchestrator::conflict_session::load_active_session(&db, "agent/test")
+                .await
+                .unwrap()
+                .expect("an open session")
+        };
+
+        let d1 = claim_reconcile_intent(&db, "/repo", store, "main", "d1", "local_merge")
+            .await
+            .unwrap()
+            .unwrap();
+        let resolved_against =
+            |session: &crate::orchestrator::conflict_session::ConflictSession| {
+                session
+                    .resolution_basis
+                    .get("list.txt")
+                    .map(|side| (side.base.clone(), side.theirs.clone()))
+            };
+        record_on_intent(&db, &d1.id, "c1", "d1", &[]).await;
+        let first = load().await;
+        assert_eq!(resolved_against(&first), None, "nothing resolved yet");
+
+        // Re-detected under the same intent, now with the resolution as `ours`.
+        record_on_intent(&db, &d1.id, "resolved", "d1", &["list.txt"]).await;
+        let redetected = load().await;
+        assert_eq!(redetected.ours.as_deref(), Some("resolved"));
+        assert_eq!(
+            resolved_against(&redetected),
+            Some(("fork".to_string(), "d1".to_string()))
+        );
+        db.execute(
+            "UPDATE jj_reconcile_intents SET status = 'completed' WHERE id = ?1",
+            (d1.id.as_str(),),
+        )
+        .await
+        .unwrap();
+
+        // A newer advance records over the unmoved resolution.
+        let d2 = claim_reconcile_intent(&db, "/repo", store, "main", "d2", "local_merge")
+            .await
+            .unwrap()
+            .unwrap();
+        record_on_intent(&db, &d2.id, "resolved", "d2", &[]).await;
+        let newer = load().await;
+        assert_eq!(newer.theirs.as_deref(), Some("d2"));
+        assert_eq!(
+            resolved_against(&newer),
+            Some(("fork".to_string(), "d1".to_string())),
+            "still resolved against D1, never its own D2"
+        );
+        assert!(newer.replay_requested_tip.is_none());
     }
 
     #[tokio::test]
@@ -8039,6 +8468,8 @@ mod real_store_collision_tests {
     struct Fixture {
         _home: TempDir,
         _repo: TempDir,
+        home: PathBuf,
+        repo: PathBuf,
         workspaces: TempDir,
         jj: crate::jj::JjEnv,
         store: PathBuf,
@@ -8093,10 +8524,14 @@ mod real_store_collision_tests {
         git(&["commit", "-q", "-m", "base"]);
 
         let jj = crate::jj::environment(bin, home.path());
-        let store = home.path().join("jj-stores/collision");
+        // Where an orchestrator configured at `home` looks for this repo's
+        // store, so the end-to-end replay tests drive the same one.
+        let store = crate::jj::project_store_dir(home.path(), repo.path());
         crate::jj::ensure_project_store(&jj, &store, repo.path()).unwrap();
         let fork = crate::jj::bookmark_commit(&jj, &store, "main").unwrap();
         Fixture {
+            home: home.path().to_path_buf(),
+            repo: repo.path().to_path_buf(),
             _home: home,
             _repo: repo,
             workspaces,
@@ -8185,9 +8620,16 @@ mod real_store_collision_tests {
             diagnostic.conflicting_paths(),
             vec!["src-tauri/os/cairn-db/src/storage/migrations.rs"]
         );
-        let report = try_union_registry_conflict(&fx.jj, &fx.store, branch, "main", &diagnostic)
-            .unwrap()
-            .expect("registered conflict has no human path");
+        let report = try_union_registry_conflict(
+            &fx.jj,
+            &fx.store,
+            branch,
+            "main",
+            &diagnostic,
+            &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+        )
+        .unwrap()
+        .expect("registered conflict has no human path");
         assert_eq!(report.rebased_clean, vec![branch.to_string()]);
         assert!(report.conflicted.is_empty());
 
@@ -8196,7 +8638,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fx.fork,
+            &ReplayBaseline::fork_only(&fx.fork),
             &pre_tip,
             &destination,
             &union_tip,
@@ -8361,7 +8803,14 @@ mod real_store_collision_tests {
         );
 
         let changes = persist_pre_rebase_obligations(
-            &fx.jj, &db, "p", &fx.store, branch, &fork, &pre_tip, &base,
+            &fx.jj,
+            &db,
+            "p",
+            &fx.store,
+            branch,
+            &ReplayBaseline::fork_only(&fork),
+            &pre_tip,
+            &base,
         )
         .await
         .unwrap();
@@ -8383,7 +8832,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fork,
+            &ReplayBaseline::fork_only(&fork),
             &pre_tip,
             &base,
             &rebased,
@@ -8459,7 +8908,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fork,
+            &ReplayBaseline::fork_only(&fork),
             &pre_tip,
             &base,
             &rebased,
@@ -8541,7 +8990,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fork,
+            &ReplayBaseline::fork_only(&fork),
             &pre_tip,
             &base,
             &rebased,
@@ -8657,7 +9106,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fork,
+            &ReplayBaseline::fork_only(&fork),
             &pre_tip,
             &base,
             &rebased,
@@ -8701,7 +9150,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fork,
+            &ReplayBaseline::fork_only(&fork),
             &pre_tip,
             &base,
             &rebased,
@@ -8869,7 +9318,7 @@ mod real_store_collision_tests {
         let plan = plan_post_rebase_resolution(
             &fx.jj,
             &fx.store,
-            &fx.fork,
+            &ReplayBaseline::fork_only(&fx.fork),
             &second_pre_tip,
             &first_tip,
             &rebased,
@@ -8880,6 +9329,684 @@ mod real_store_collision_tests {
         assert!(plan.is_empty(), "{plan:?}");
         assert_eq!(plan.discharged, vec![PROTOCOL_LABEL.to_string()]);
         assert_eq!(protocol_value(&fx, &rebased), 11);
+    }
+
+    // ── End to end: request_branch_replay through the durable worker ────────
+    //
+    // cairn/4987's acceptance criterion. Each scenario drives the real request
+    // path and the real reconcile worker against a real store and database:
+    // automatic advances record sessions, the agent commits a linear
+    // resolution, the base advances again, and the replay must never land a
+    // tree missing what the newer base added.
+
+    const LIST: &str = "list.txt";
+    const MIGRATIONS: &str = "src-tauri/os/cairn-db/src/storage/migrations.rs";
+    const JOB: &str = "job-replay";
+    const BRANCH: &str = "agent/replay";
+    const MAIN_LINE: &str = "agent/main-line";
+
+    struct Replay {
+        fx: Fixture,
+        db: Arc<LocalDb>,
+        orch: Orchestrator,
+        main_ws: PathBuf,
+        branch_ws: PathBuf,
+    }
+
+    /// A store, a database holding one job on `BRANCH`, and an orchestrator
+    /// pointed at both. `base_files` are committed to main before the branch
+    /// is cut.
+    async fn replay_harness(bin: &str, name: &str, base_files: &[(&str, &str)]) -> Replay {
+        use crate::db::DbState;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+
+        let fx = fixture(bin);
+        let main_ws = main_line(&fx);
+        if !base_files.is_empty() {
+            let base = commit(&fx, &main_ws, MAIN_LINE, base_files, "base files");
+            set_main(&fx, &base);
+        }
+        let branch_ws = fx.workspaces.path().join("replay");
+        crate::jj::add_workspace(&fx.jj, &fx.store, &branch_ws, BRANCH, "main", None).unwrap();
+
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        let repo = fx.repo.to_string_lossy().replace('\'', "''");
+        db.execute_script(&format!(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+               VALUES ('proj-1', 'default', 'Project', 'proj', '{repo}', 'main', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, created_at, updated_at)
+               VALUES ('issue-1', 'proj-1', 1, 'Issue', 'active', 1, 1);
+             INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('exec-1', 'recipe-default', 'issue-1', 'proj-1', 'running', 1, 1);
+             INSERT INTO jobs (id, execution_id, recipe_node_id, issue_id, project_id, status, branch, base_branch, created_at, updated_at)
+               VALUES ('{JOB}', 'exec-1', 'node', 'issue-1', 'proj-1', 'running', '{BRANCH}', 'main', 1, 1);
+             INSERT INTO runs (id, issue_id, project_id, job_id, status, created_at, updated_at)
+               VALUES ('run-replay', 'issue-1', 'proj-1', '{JOB}', 'live', 1, 1);"
+        ))
+        .await
+        .unwrap();
+        let orch = Orchestrator::builder(
+            Arc::new(DbState::new(
+                db.clone(),
+                Arc::new(SearchIndex::open_or_create(fx.home.join("search")).unwrap()),
+            )),
+            Arc::new(TestServicesBuilder::new().build()),
+            fx.home.clone(),
+        )
+        .jj_binary_path(bin)
+        .build();
+        Replay {
+            fx,
+            db,
+            orch,
+            main_ws,
+            branch_ws,
+        }
+    }
+
+    /// Write `files` in a workspace, seal them, and return the bookmark's new
+    /// commit.
+    fn commit(
+        fx: &Fixture,
+        workspace: &Path,
+        bookmark: &str,
+        files: &[(&str, &str)],
+        message: &str,
+    ) -> String {
+        // A store-side rebase that was rolled back still advanced the op log
+        // under this workspace.
+        let _ = crate::jj::update_stale(&fx.jj, workspace);
+        for (path, content) in files {
+            let target = workspace.join(path);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(target, content).unwrap();
+        }
+        crate::jj::seal(&fx.jj, workspace, message, None).unwrap();
+        crate::jj::bookmark_commit(&fx.jj, &fx.store, bookmark).unwrap()
+    }
+
+    fn branch_tip(r: &Replay) -> String {
+        crate::jj::bookmark_commit(&r.fx.jj, &r.fx.store, BRANCH).unwrap()
+    }
+
+    /// Wait until no reconcile intent is held by a worker.
+    ///
+    /// The bound only turns a wedged worker into a failure instead of a hang.
+    /// It is generous because a pass is a few dozen jj subprocesses, and on a
+    /// loaded machine running the whole suite in parallel one pass has been
+    /// measured past two minutes.
+    async fn wait_for_worker(r: &Replay) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_secs(600) {
+            let running = r
+                .db
+                .query_text(
+                    "SELECT CAST(COUNT(*) AS TEXT) FROM jj_reconcile_intents WHERE status = 'running'",
+                    (),
+                )
+                .await
+                .unwrap();
+            if running.as_deref() == Some("0") {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        panic!(
+            "the reconcile worker never released its intent within {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The automatic base advance a merge on main triggers.
+    async fn automatic_advance(r: &Replay) {
+        let notes = BaseAdvanceNotes {
+            conflict: build_jj_conflict_note("main", None, None),
+            clean: build_jj_clean_note("main", None, None),
+            incoming: IncomingIdentity {
+                base_branch: "main".to_string(),
+                ..IncomingIdentity::default()
+            },
+        };
+        let outcome = reconcile_base_advance(
+            &r.orch,
+            &r.db,
+            "proj-1",
+            "merged job (test)",
+            &r.fx.repo.to_string_lossy(),
+            "main",
+            "main",
+            vec![SiblingJob {
+                id: JOB.to_string(),
+                branch: Some(BRANCH.to_string()),
+                base_commit: None,
+            }],
+            notes,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.eligible, 1, "the advance claimed the branch");
+        wait_for_worker(r).await;
+    }
+
+    async fn request_take_committed_tip(r: &Replay) -> String {
+        let answer = request_branch_replay(&r.orch, &r.db, JOB, BRANCH, None, true, None)
+            .await
+            .unwrap_or_else(|refusal| panic!("the request was refused: {refusal}"));
+        wait_for_worker(r).await;
+        answer
+    }
+
+    async fn open_session(
+        r: &Replay,
+    ) -> Option<crate::orchestrator::conflict_session::ConflictSession> {
+        crate::orchestrator::conflict_session::load_active_session(&r.db, BRANCH)
+            .await
+            .unwrap()
+    }
+
+    /// Scenario 1's shared start: the branch appends X, D1 appends A at the
+    /// same spot, the advance records a session, and the agent commits the
+    /// resolution A-then-X as an ordinary linear commit on the old fork.
+    async fn same_spot_resolution(bin: &str, name: &str) -> (Replay, String, String) {
+        let r = replay_harness(bin, name, &[(LIST, "head\n")]).await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nX\n")],
+            "branch appends X",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\n")],
+            "D1 appends A",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("D1 conflicts and records a session");
+        assert_eq!(
+            session
+                .conflicting()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![LIST]
+        );
+        assert_eq!(session.theirs.as_deref(), Some(d1.as_str()));
+        let resolved = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nA\nX\n")],
+            "resolve against D1",
+        );
+        (r, d1, resolved)
+    }
+
+    /// The refusal shape scenario 1 requires when D2 appends at the spot the
+    /// agent resolved: the branch is untouched, D2 is not in its ancestry, and
+    /// the fresh session against D2 still knows the tip was resolved against
+    /// D1, so the agent's next resolution is judged correctly.
+    async fn assert_refused_with_fresh_session(r: &Replay, d1: &str, d2: &str, tip: &str) {
+        assert_eq!(
+            branch_tip(r),
+            tip,
+            "a refused replay leaves the branch untouched"
+        );
+        assert!(
+            !crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, d2),
+            "no tree landed on D2"
+        );
+        let session = open_session(r).await.expect("a fresh session against D2");
+        assert_eq!(session.theirs.as_deref(), Some(d2));
+        assert_eq!(session.ours.as_deref(), Some(tip));
+        assert_eq!(resolved_against(&session, LIST).as_deref(), Some(d1));
+    }
+
+    fn resolved_against(
+        session: &crate::orchestrator::conflict_session::ConflictSession,
+        path: &str,
+    ) -> Option<String> {
+        session
+            .resolution_basis
+            .get(path)
+            .map(|side| side.theirs.clone())
+    }
+
+    /// Scenario 1a, the specimen path: the session recorded against D1 is still
+    /// open when the request lands, and main is already at D2.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_resolution_against_d1_is_not_restored_over_d2s_same_spot_append() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let (r, d1, resolved) = same_spot_resolution(&bin, "replay-1a.db").await;
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\nB\n")],
+            "D2 appends B",
+        );
+        set_main(&r.fx, &d2);
+
+        request_take_committed_tip(&r).await;
+        assert_refused_with_fresh_session(&r, &d1, &d2, &resolved).await;
+
+        // The agent resolves the new pair of sides and the replay lands both.
+        let rebased_resolution = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(LIST, "head\nA\nB\nX\n")],
+            "resolve against D2",
+        );
+        assert_ne!(rebased_resolution, resolved);
+        request_take_committed_tip(&r).await;
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d2
+        ));
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nB\nX\n");
+        assert!(
+            open_session(&r).await.is_none(),
+            "the landed replay closes the session"
+        );
+    }
+
+    /// Scenario 1b: an automatic advance onto D2 records a session whose `ours`
+    /// IS the resolution, before the request. The guard must still judge the
+    /// tip against D1, the side it was resolved against.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_session_recorded_over_the_resolution_still_knows_it_was_made_against_d1() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let (r, d1, resolved) = same_spot_resolution(&bin, "replay-1b.db").await;
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\nB\n")],
+            "D2 appends B",
+        );
+        set_main(&r.fx, &d2);
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("D2 conflicts with the resolution");
+        assert_eq!(session.ours.as_deref(), Some(resolved.as_str()));
+        assert_eq!(resolved_against(&session, LIST), Some(d1.clone()));
+
+        request_take_committed_tip(&r).await;
+        assert_refused_with_fresh_session(&r, &d1, &d2, &resolved).await;
+    }
+
+    /// Review regression on 1b: after the session is re-recorded over the
+    /// resolution, the agent commits only an UNRELATED file. That moves the tip
+    /// but says nothing about `list.txt`, which must stay resolved against D1 —
+    /// promoted to D2, the guard would certify `head A X` against D2 and the
+    /// carry would restore it whole, dropping B.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_commit_to_an_unrelated_file_does_not_promote_a_resolution_to_d2() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let (r, d1, _resolved) = same_spot_resolution(&bin, "replay-1b-unrelated.db").await;
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "head\nA\nB\n")],
+            "D2 appends B",
+        );
+        set_main(&r.fx, &d2);
+        automatic_advance(&r).await;
+        assert!(open_session(&r).await.is_some());
+        let unrelated = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("other.txt", "unrelated\n")],
+            "an unrelated change",
+        );
+
+        request_take_committed_tip(&r).await;
+        assert_refused_with_fresh_session(&r, &d1, &d2, &unrelated).await;
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "head\nA\nX\n");
+    }
+
+    /// Review regression: two resolved files, and D2 changes the resolved
+    /// region of only one. The replay carries `f`, refuses `g`, and rolls back
+    /// both, so the next session conflicts on `g` alone. When the agent
+    /// re-resolves `g`, the replay must still place `f` — or it conflicts on
+    /// `f` again and the two files trade places forever.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_carried_file_rolled_back_with_its_neighbour_lands_on_the_next_retry() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(
+            &bin,
+            "replay-two-file.db",
+            &[("f.txt", "head\n"), ("g.txt", "head\n")],
+        )
+        .await;
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("f.txt", "head\nX\n"), ("g.txt", "head\nX\n")],
+            "branch appends X to both",
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("f.txt", "head\nA\n"), ("g.txt", "head\nA\n")],
+            "D1 appends A to both",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let resolved = commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("f.txt", "head\nA\nX\n"), ("g.txt", "head\nA\nX\n")],
+            "resolve both against D1",
+        );
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("g.txt", "head\nA\nB\n")],
+            "D2 appends B to g only",
+        );
+        set_main(&r.fx, &d2);
+
+        request_take_committed_tip(&r).await;
+        assert_eq!(branch_tip(&r), resolved, "g's refusal rolls f back too");
+        let retried = open_session(&r).await.expect("a session against D2");
+        assert!(retried.conflicting().any(|file| file.path == "g.txt"));
+        assert_eq!(resolved_against(&retried, "f.txt"), Some(d1.clone()));
+        assert_eq!(resolved_against(&retried, "g.txt"), Some(d1.clone()));
+
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("g.txt", "head\nA\nB\nX\n")],
+            "resolve g against D2",
+        );
+        request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d2),
+            "the retry landed: {:?}",
+            open_session(&r).await.map(|session| session
+                .conflicting()
+                .map(|file| file.path.clone())
+                .collect::<Vec<_>>())
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, "f.txt"), "head\nA\nX\n");
+        assert_eq!(text_at(&r.fx, BRANCH, "g.txt"), "head\nA\nB\nX\n");
+        assert!(open_session(&r).await.is_none());
+    }
+
+    /// Scenario 1c: D2 changes the same file somewhere the resolution did not
+    /// touch, so the resolution is carried onto it and all three changes land.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_resolution_is_merged_with_d2s_change_elsewhere_in_the_file() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let (r, _d1, _resolved) = same_spot_resolution(&bin, "replay-1c.db").await;
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(LIST, "B\nhead\nA\n")],
+            "D2 prepends B",
+        );
+        set_main(&r.fx, &d2);
+
+        request_take_committed_tip(&r).await;
+        assert!(crate::jj::branch_carries_commit(
+            &r.fx.jj,
+            &r.fx.store,
+            BRANCH,
+            &d2
+        ));
+        assert_eq!(text_at(&r.fx, BRANCH, LIST), "B\nhead\nA\nX\n");
+        assert!(open_session(&r).await.is_none());
+    }
+
+    /// Scenario 2, the specimen's own file: the branch resolved D1's migration
+    /// registration and renumbered its own, then D2 registered a migration at
+    /// the number the branch took. The landed registry holds every entry once
+    /// and every number names one file.
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_registry_resolution_against_d1_keeps_d2s_registration_and_renumbers() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = replay_harness(&bin, "replay-2.db", &[("other.txt", "one\n")]).await;
+        add_migration(&r.branch_ws, "0228_branch");
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[("other.txt", "one\nbranch\n")],
+            "branch",
+        );
+        add_migration(&r.main_ws, "0228_destination");
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("other.txt", "one\nmain\n")],
+            "D1",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        let session = open_session(&r)
+            .await
+            .expect("a non-registry path keeps it a session");
+        assert_eq!(
+            session
+                .conflicting()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["other.txt", MIGRATIONS]
+        );
+
+        // The agent's resolution, the specimen's 39ecbb51: D1's registration
+        // kept, its own renumbered past it, as one linear commit.
+        let _ = crate::jj::update_stale(&r.fx.jj, &r.branch_ws);
+        std::fs::rename(
+            r.branch_ws
+                .join("src-tauri/turso_migrations/0228_branch.sql"),
+            r.branch_ws
+                .join("src-tauri/turso_migrations/0230_branch.sql"),
+        )
+        .unwrap();
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[
+                ("other.txt", "one\nmain\nbranch\n"),
+                (
+                    MIGRATIONS,
+                    "fn migrations() {\n    vec![\n        migration!(\"0227_before\"),\n        migration!(\"0228_destination\"),\n        migration!(\"0230_branch\"),\n        migration!(\"0229_after\"),\n    ];\n}\n",
+                ),
+            ],
+            "resolve against D1",
+        );
+        add_migration(&r.main_ws, "0230_d2");
+        let d2 = commit(&r.fx, &r.main_ws, MAIN_LINE, &[], "D2 registers 0230");
+        set_main(&r.fx, &d2);
+
+        request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d2),
+            "the replay landed"
+        );
+        let registry = text_at(&r.fx, BRANCH, MIGRATIONS);
+        for (stem, expected) in [
+            ("0228_destination", 1),
+            ("0230_d2", 1),
+            ("0231_branch", 1),
+            ("0230_branch", 0),
+            ("0228_branch", 0),
+        ] {
+            assert_eq!(
+                registry.matches(&format!("\"{stem}\"")).count(),
+                expected,
+                "{stem} in:\n{registry}"
+            );
+        }
+        let files =
+            crate::jj::paths_under_at(&r.fx.jj, &r.fx.store, BRANCH, "src-tauri/turso_migrations")
+                .unwrap();
+        let numbers: Vec<&str> = files
+            .iter()
+            .map(|path| &path["src-tauri/turso_migrations/".len()..][..4])
+            .collect();
+        let unique: BTreeSet<&str> = numbers.iter().copied().collect();
+        assert_eq!(
+            numbers.len(),
+            unique.len(),
+            "one file per number: {files:?}"
+        );
+        assert!(
+            files.contains("src-tauri/turso_migrations/0231_branch.sql"),
+            "{files:?}"
+        );
+        assert_eq!(text_at(&r.fx, BRANCH, "other.txt"), "one\nmain\nbranch\n");
+    }
+
+    /// Scenario 4, cairn/4916's take-committed-tip specimens. The branch and D1
+    /// both append to the protocol file, so D1 records a session; D2 is an
+    /// unrelated change, so the base is still at D1's number when the replay
+    /// lands.
+    async fn protocol_resolution(bin: &str, name: &str, branch_bumps: bool) -> Replay {
+        let r = replay_harness(bin, name, &[]).await;
+        let fork_text = text_at(&r.fx, "main", PROTOCOL);
+        let branch_text = if branch_bumps {
+            format!(
+                "{}/// Version 11 adds the branch's change.\n",
+                fork_text.replace(
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 10;",
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 11;"
+                )
+            )
+        } else {
+            format!("{fork_text}pub const BRANCH_ONLY: u32 = 1;\n")
+        };
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(PROTOCOL, &branch_text)],
+            "branch",
+        );
+        bump_with_heading(&r.fx, &r.main_ws, 11);
+        let main_text = format!(
+            "{}pub const MAIN_ONLY: u32 = 1;\n",
+            std::fs::read_to_string(r.main_ws.join(PROTOCOL)).unwrap()
+        );
+        let d1 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[(PROTOCOL, &main_text)],
+            "D1",
+        );
+        set_main(&r.fx, &d1);
+        automatic_advance(&r).await;
+        assert!(
+            open_session(&r).await.is_some(),
+            "both appends conflict and record a session"
+        );
+
+        // The resolution takes D1's whole file, main's 11 included, and adds
+        // the branch's own work: either nothing numbered, or a bump to 12 with
+        // its paragraph renumbered to match.
+        let resolved_text = if branch_bumps {
+            format!(
+                "{}/// Version 12 adds the branch's change.\n",
+                main_text.replace(
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 11;",
+                    "EXECUTOR_PROTOCOL_VERSION: u32 = 12;"
+                )
+            )
+        } else {
+            format!("{main_text}pub const BRANCH_ONLY: u32 = 1;\n")
+        };
+        commit(
+            &r.fx,
+            &r.branch_ws,
+            BRANCH,
+            &[(PROTOCOL, &resolved_text)],
+            "resolve",
+        );
+        let d2 = commit(
+            &r.fx,
+            &r.main_ws,
+            MAIN_LINE,
+            &[("unrelated.txt", "moved\n")],
+            "D2",
+        );
+        set_main(&r.fx, &d2);
+        request_take_committed_tip(&r).await;
+        assert!(
+            crate::jj::branch_carries_commit(&r.fx.jj, &r.fx.store, BRANCH, &d2),
+            "the replay landed"
+        );
+        r
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_resolution_that_took_mains_protocol_number_bumps_nothing() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = protocol_resolution(&bin, "replay-4a.db", false).await;
+        assert_eq!(
+            protocol_value(&r.fx, BRANCH),
+            11,
+            "{}",
+            text_at(&r.fx, BRANCH, PROTOCOL)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial_test::serial(jj)]
+    async fn a_real_bump_resolved_against_mains_number_lands_one_above_it() {
+        let Some(bin) = crate::jj::tests::jj_bin() else {
+            return;
+        };
+        let r = protocol_resolution(&bin, "replay-4b.db", true).await;
+        let text = text_at(&r.fx, BRANCH, PROTOCOL);
+        assert_eq!(protocol_value(&r.fx, BRANCH), 12, "{text}");
+        assert!(
+            text.contains("/// Version 12 adds the branch's change.\n"),
+            "{text}"
+        );
+        assert!(!text.contains("Version 13"), "{text}");
     }
 
     #[test]
@@ -8918,11 +10045,16 @@ mod real_store_collision_tests {
             panic!("outside path must conflict")
         };
         assert_eq!(diagnostic.conflicting_paths(), vec!["outside.txt"]);
-        assert!(
-            try_union_registry_conflict(&fx.jj, &fx.store, branch, "main", &diagnostic)
-                .unwrap()
-                .is_none()
-        );
+        assert!(try_union_registry_conflict(
+            &fx.jj,
+            &fx.store,
+            branch,
+            "main",
+            &diagnostic,
+            &ReplayBaseline::fork_only(diagnostic.base.as_deref().unwrap()),
+        )
+        .unwrap()
+        .is_none());
         assert_eq!(
             crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
             Some(pre_tip.as_str())

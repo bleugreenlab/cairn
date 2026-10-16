@@ -617,6 +617,106 @@ struct ReconcilePublication {
     flattened: bool,
 }
 
+/// Where a branch this pass rebased stood immediately before the rebase, so a
+/// classification that cannot keep the rebased result can put it back.
+pub(crate) struct RebaseRollback {
+    pub(crate) pre_op: String,
+    pub(crate) pre_tip: Option<String>,
+}
+
+/// Whether a flatten refusal came from one of its guards — a positive finding
+/// that this tree must not be folded — rather than from jj failing to run. The
+/// prefixes are the ones [`flatten_branch_recovery`] writes for its guards.
+fn flatten_refusal_is_guard(error: &str) -> bool {
+    error.starts_with("flatten guard:") || error.starts_with("flatten footprint guard:")
+}
+
+/// Undo this pass's rebase of a branch whose conflicted history could not be
+/// flattened, and say truthfully why.
+///
+/// Left in place, the branch would sit on a rebased tip with conflict-flagged
+/// ancestors under a `conflicted` label that names no path, and nothing would
+/// open a session for it. A guard refusal is a finding about the tree, so it is
+/// recorded as a conflict with coordinates captured before the rollback erases
+/// them. Anything else is jj failing to act — a store lock, a transient process
+/// error — and is recorded as a failure, which the durable worker retries.
+pub(crate) fn roll_back_refused_flatten(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    dest: &str,
+    rollback: &RebaseRollback,
+    refusal: String,
+    report: &mut ReconcileReport,
+) {
+    let diagnostic = flatten_refusal_is_guard(&refusal).then(|| {
+        let paths: Vec<String> =
+            conflicted_commits(jj, store, &format!("({dest})..bookmarks(exact:{branch:?})"))
+                .into_iter()
+                .flat_map(|commit| commit.files)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        capture_conflict_diagnostic(jj, store, branch, dest, rollback.pre_tip.as_deref(), paths)
+    });
+    if let Err(error) = restore_operation(jj, store, &rollback.pre_op) {
+        log::error!(
+            "jj reconcile: flatten of {branch} was refused ({refusal}) and the rebase could not be \
+             rolled back to {}: {error}",
+            rollback.pre_op
+        );
+        record_failure(
+            report,
+            branch,
+            format!(
+                "flatten of the rebased branch was refused ({refusal}), and rolling the rebase \
+                 back to operation {} also failed: {error}. The branch may sit on conflict-flagged \
+                 history; do not publish it.",
+                rollback.pre_op
+            ),
+        );
+        return;
+    }
+    if let Err(error) = export_bookmark_advance(
+        jj,
+        store,
+        true,
+        branch,
+        "jj git export (refused flatten rolled back)",
+    ) {
+        record_failure(
+            report,
+            branch,
+            format!("flatten refused ({refusal}); rolled back, but the export failed: {error}"),
+        );
+        return;
+    }
+    match diagnostic {
+        Some(diagnostic) => {
+            log::warn!(
+                "jj reconcile: flatten of {branch} refused by guard ({refusal}); rebase rolled \
+                 back and recorded as a conflict"
+            );
+            record_conflict(report, branch, diagnostic);
+        }
+        None => {
+            log::warn!(
+                "jj reconcile: flatten of {branch} could not run ({refusal}); rebase rolled back \
+                 and left for retry"
+            );
+            record_failure(
+                report,
+                branch,
+                format!(
+                    "the rebased branch carries conflict-flagged history that must be flattened, \
+                     and the flatten could not run: {refusal}. The rebase was rolled back, so the \
+                     branch is unchanged; it is retried."
+                ),
+            );
+        }
+    }
+}
+
 /// Classify one sibling that is already positioned on `dest_commit` (either it was
 /// just rebased there, or it already descended from it) into the reconcile report,
 /// applying proactive flatten recovery for the clean-tip / conflicted-intermediate
@@ -634,6 +734,7 @@ fn classify_reconciled_sibling(
     branch: &str,
     dest_commit: Option<&str>,
     publication: ReconcilePublication,
+    rollback: Option<&RebaseRollback>,
     report: &mut ReconcileReport,
 ) {
     let state = dest_commit.and_then(|dest| flatten_state(jj, store, dest, branch).ok());
@@ -713,15 +814,22 @@ fn classify_reconciled_sibling(
                     );
                     report.rebased_clean.push(branch.to_string());
                 }
-                Err(e) => {
-                    // Guard failure: a footprint-unsafe flatten. Fall back to a
-                    // conflicted classification so the agent is interrupted rather
-                    // than the branch silently wedged.
-                    log::warn!(
-                        "jj reconcile: flatten of {branch} refused by guard ({e}); classifying conflicted"
-                    );
-                    report.conflicted.push(branch.to_string());
-                }
+                Err(e) => match rollback {
+                    // This pass moved the branch, so it puts it back.
+                    Some(rollback) => {
+                        roll_back_refused_flatten(jj, store, branch, dest, rollback, e, report)
+                    }
+                    // The branch already sat on this dest before the pass and was
+                    // not moved by it. Fall back to a conflicted classification so
+                    // the agent is interrupted rather than the branch silently
+                    // wedged.
+                    None => {
+                        log::warn!(
+                            "jj reconcile: flatten of {branch} refused ({e}); classifying conflicted"
+                        );
+                        report.conflicted.push(branch.to_string());
+                    }
+                },
             }
         }
     }
@@ -765,7 +873,8 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
 }
 
 /// Rebase one sibling onto the reconcile dest, recording the outcome. Returns
-/// whether the caller should go on to classify the sibling.
+/// where the branch stood before the rebase when the caller should go on to
+/// classify the sibling, and `None` when the outcome is already recorded.
 ///
 /// `RebasedOverConflictedAncestry` deliberately continues to classification: that
 /// is the clean-tip / conflicted-intermediate shape, and
@@ -776,19 +885,28 @@ fn rebase_sibling(
     store: &Path,
     branch: &str,
     integration_branch: &str,
-    resolution_paths: &[String],
+    resolution: Option<&ResolutionCarry>,
     report: &mut ReconcileReport,
-) -> bool {
-    match rebase_branch_onto_with_resolution(
-        jj,
-        store,
-        branch,
-        integration_branch,
-        resolution_paths,
-    ) {
-        Ok(RebaseOutcome::Rebased) => true,
-        Ok(RebaseOutcome::RebasedOverConflictedAncestry { paths }) => {
-            log::info!(
+) -> Option<RebaseRollback> {
+    // Captured before the rebase so a classification that cannot keep the
+    // result can return the store to exactly here. Exact under the per-store
+    // lock every caller holds.
+    let rollback = match operation_id(jj, store) {
+        Ok(pre_op) => RebaseRollback {
+            pre_op,
+            pre_tip: bookmark_commit(jj, store, branch),
+        },
+        Err(error) => {
+            record_failure(report, branch, error);
+            return None;
+        }
+    };
+    let proceed =
+        match rebase_branch_onto_with_resolution(jj, store, branch, integration_branch, resolution)
+        {
+            Ok(RebaseOutcome::Rebased) => true,
+            Ok(RebaseOutcome::RebasedOverConflictedAncestry { paths }) => {
+                log::info!(
                 "jj reconcile: {branch} rebased clean-tip over conflicted history ({}); handing it \
                  to flatten recovery",
                 if paths.is_empty() {
@@ -797,18 +915,21 @@ fn rebase_sibling(
                     paths.join(", ")
                 }
             );
-            true
-        }
-        Ok(RebaseOutcome::Conflicted { diagnostic }) => {
-            record_conflict(report, branch, diagnostic);
-            false
-        }
-        Err(error) => {
-            log::warn!("jj reconcile: rebase {branch} onto {integration_branch} failed: {error}");
-            record_failure(report, branch, error);
-            false
-        }
-    }
+                true
+            }
+            Ok(RebaseOutcome::Conflicted { diagnostic }) => {
+                record_conflict(report, branch, diagnostic);
+                false
+            }
+            Err(error) => {
+                log::warn!(
+                    "jj reconcile: rebase {branch} onto {integration_branch} failed: {error}"
+                );
+                record_failure(report, branch, error);
+                false
+            }
+        };
+    proceed.then_some(rollback)
 }
 
 /// Reconcile runner-owned sibling bookmarks onto the locally advanced integration
@@ -836,7 +957,7 @@ pub fn reconcile_resolved_sibling_without_publication(
     store: &Path,
     integration_branch: &str,
     sibling: &str,
-    resolution_paths: &[String],
+    resolution: &ResolutionCarry,
 ) -> Result<ReconcileReport, String> {
     let siblings = vec![sibling.to_string()];
     reconcile_siblings_with_publication(
@@ -845,7 +966,7 @@ pub fn reconcile_resolved_sibling_without_publication(
         integration_branch,
         &siblings,
         false,
-        Some((sibling, resolution_paths)),
+        Some((sibling, resolution)),
     )
 }
 
@@ -855,7 +976,7 @@ fn reconcile_siblings_with_publication(
     integration_branch: &str,
     siblings: &[String],
     publish: bool,
-    resolution: Option<(&str, &[String])>,
+    resolution: Option<(&str, &ResolutionCarry)>,
 ) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
     // Resolve the rebase dest to a concrete commit id ONCE up front: it may be a
@@ -909,42 +1030,28 @@ fn reconcile_siblings_with_publication(
             .unwrap_or(false);
         let mut push_clean = !already_on_dest;
         let mut trivial_fast_forward = false;
+        let mut rollback = None;
+        let carry = resolution
+            .filter(|(resolved, _)| *resolved == branch)
+            .map(|(_, carry)| carry);
 
         if !already_on_dest {
-            if let Some(dest) = dest_commit.as_deref() {
-                if branch_is_ancestor_of(jj, store, branch, dest) {
-                    if let Err(error) = fast_forward_bookmark(jj, store, branch, dest) {
-                        log::warn!("jj reconcile: fast-forward {branch} to {dest} failed: {error}");
-                        record_failure(&mut report, branch, error);
-                        continue;
-                    }
-                    push_clean = false;
-                    trivial_fast_forward = true;
-                } else if !rebase_sibling(
-                    jj,
-                    store,
-                    branch,
-                    integration_branch,
-                    resolution
-                        .filter(|(resolved, _)| *resolved == branch)
-                        .map(|(_, paths)| paths)
-                        .unwrap_or(&[]),
-                    &mut report,
-                ) {
+            let fast_forward_to = dest_commit
+                .as_deref()
+                .filter(|dest| branch_is_ancestor_of(jj, store, branch, dest));
+            if let Some(dest) = fast_forward_to {
+                if let Err(error) = fast_forward_bookmark(jj, store, branch, dest) {
+                    log::warn!("jj reconcile: fast-forward {branch} to {dest} failed: {error}");
+                    record_failure(&mut report, branch, error);
                     continue;
                 }
-            } else if !rebase_sibling(
-                jj,
-                store,
-                branch,
-                integration_branch,
-                resolution
-                    .filter(|(resolved, _)| *resolved == branch)
-                    .map(|(_, paths)| paths)
-                    .unwrap_or(&[]),
-                &mut report,
-            ) {
-                continue;
+                push_clean = false;
+                trivial_fast_forward = true;
+            } else {
+                match rebase_sibling(jj, store, branch, integration_branch, carry, &mut report) {
+                    Some(before) => rollback = Some(before),
+                    None => continue,
+                }
             }
         }
 
@@ -963,6 +1070,7 @@ fn reconcile_siblings_with_publication(
                 clean: push_clean && publish,
                 flattened: publish,
             },
+            rollback.as_ref(),
             &mut report,
         );
     }

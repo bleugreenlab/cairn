@@ -21,6 +21,7 @@ use crate::jj::{
     assess_paths, ConflictCondition, ConflictDiagnostic, DroppedWork, IncomingClassification,
     JjEnv, PathAssessment, RestoreVerdict,
 };
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// How many conflicting paths one assessment will look at.
@@ -154,6 +155,77 @@ pub(crate) struct ConflictSession {
     /// The owning intent's lifecycle: pending, running, completed, superseded.
     pub(crate) intent_status: Option<String>,
     pub(crate) files: Vec<SessionFile>,
+    /// What each path of the branch's `ours` was resolved against, carried over
+    /// from the session open before this one. See
+    /// [`ConflictSession::resolution_basis_at`].
+    pub(crate) resolution_basis: ResolutionBasis,
+    /// The tip a take-committed-tip request was assessed at.
+    pub(crate) replay_requested_tip: Option<String>,
+    /// The destination that request was actually queued onto, which can be
+    /// newer than `destination_commit`.
+    pub(crate) replay_requested_destination: Option<String>,
+}
+
+/// The merge base and incoming side one path was resolved against.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ResolvedSide {
+    pub(crate) base: String,
+    pub(crate) theirs: String,
+}
+
+/// What each path of a branch's committed resolution was made against.
+///
+/// A resolution is a linear commit. It holds the incoming side's content
+/// without that side in its ancestry, so every merge-base computed afterwards
+/// still names the stale fork. Without this, a later replay reads the absorbed
+/// content as the branch's own work, or restores it whole over a newer base.
+///
+/// Per path, because evidence of a resolution is per path: a commit that
+/// touches one file says nothing about the others, and a path resolved against
+/// an earlier base keeps that basis until its own content changes again.
+pub(crate) type ResolutionBasis = BTreeMap<String, ResolvedSide>;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredPathBasis {
+    path: String,
+    base: String,
+    theirs: String,
+}
+
+fn encode_basis(basis: &ResolutionBasis) -> Result<Option<String>, String> {
+    if basis.is_empty() {
+        return Ok(None);
+    }
+    let rows: Vec<StoredPathBasis> = basis
+        .iter()
+        .map(|(path, side)| StoredPathBasis {
+            path: path.clone(),
+            base: side.base.clone(),
+            theirs: side.theirs.clone(),
+        })
+        .collect();
+    serde_json::to_string(&rows)
+        .map(Some)
+        .map_err(|error| format!("encode resolution basis: {error}"))
+}
+
+/// An undecodable basis reads as empty: every path is then judged against the
+/// session's own sides and the carry refuses anything it cannot place, which is
+/// the safe direction.
+fn decode_basis(json: Option<&str>) -> ResolutionBasis {
+    json.and_then(|json| serde_json::from_str::<Vec<StoredPathBasis>>(json).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            (
+                row.path,
+                ResolvedSide {
+                    base: row.base,
+                    theirs: row.theirs,
+                },
+            )
+        })
+        .collect()
 }
 
 impl ConflictSession {
@@ -193,12 +265,80 @@ impl ConflictSession {
     /// missing, which is why this is a surfacing problem and not a data one.
     pub(crate) fn replay_progress(&self) -> Option<ReplayProgress> {
         let requested_at = self.replay_requested_at?;
-        let running = self.intent_status.as_deref() == Some("running")
-            || self.item_status.as_deref() == Some("graph_moved");
+        let state = if self.intent_status.as_deref() == Some("superseded") {
+            ReplayState::Superseded
+        } else if self.intent_status.as_deref() == Some("running")
+            || self.item_status.as_deref() == Some("graph_moved")
+        {
+            ReplayState::Running
+        } else {
+            ReplayState::Queued
+        };
         Some(ReplayProgress {
             requested_at,
-            running,
+            state,
+            destination: self
+                .replay_requested_destination
+                .clone()
+                .unwrap_or_else(|| self.destination_commit.clone()),
         })
+    }
+
+    /// The basis after the branch re-resolved `changed` while this session was
+    /// open: each of this session's conflicting paths among them was resolved
+    /// against this session's sides, and every other path keeps what it had.
+    /// Pure, so the per-path rule is provable without a store.
+    pub(crate) fn basis_after(&self, changed: &BTreeSet<String>) -> ResolutionBasis {
+        let mut basis = self.resolution_basis.clone();
+        if let (Some(base), Some(theirs)) = (self.base.as_ref(), self.theirs.as_ref()) {
+            for file in self
+                .conflicting()
+                .filter(|file| changed.contains(&file.path))
+            {
+                basis.insert(
+                    file.path.clone(),
+                    ResolvedSide {
+                        base: base.clone(),
+                        theirs: theirs.clone(),
+                    },
+                );
+            }
+        }
+        basis
+    }
+
+    /// What each path of `tip` was resolved against.
+    ///
+    /// A conflicting path whose content changed between this session's `ours`
+    /// and `tip` was re-resolved while this session was open, so against this
+    /// session's sides. Any other path — including every path of a commit that
+    /// only touched unrelated files — keeps the basis this session inherited.
+    pub(crate) fn resolution_basis_at(
+        &self,
+        jj: &JjEnv,
+        store: &Path,
+        tip: &str,
+    ) -> Result<ResolutionBasis, String> {
+        let Some(ours) = self.ours.as_deref() else {
+            return Ok(self.resolution_basis.clone());
+        };
+        let paths: Vec<String> = self.conflicting().map(|file| file.path.clone()).collect();
+        let changed = crate::jj::paths_changed_between(jj, store, ours, tip, &paths)?;
+        Ok(self.basis_after(&changed))
+    }
+
+    /// Every path a take-committed-tip replay has to place: the paths this
+    /// session conflicts on, and every path an earlier resolution covered. A
+    /// path carried by an earlier replay and then rolled back with it is no
+    /// longer conflicting here, and dropping it would let the next replay
+    /// conflict on it again.
+    pub(crate) fn replay_paths(&self, basis: &ResolutionBasis) -> Vec<String> {
+        self.conflicting()
+            .map(|file| file.path.clone())
+            .chain(basis.keys().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// Whether this session was written by a build that agrees with this one
@@ -212,11 +352,25 @@ impl ConflictSession {
 }
 
 /// An outstanding replay request and how far it has got.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct ReplayProgress {
     pub(crate) requested_at: i64,
+    pub(crate) state: ReplayState,
+    /// Where the request was queued: the base's head when it was asked, not
+    /// necessarily the destination this session was recorded against.
+    pub(crate) destination: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayState {
+    /// Waiting for the reconcile worker.
+    Queued,
     /// The reconcile worker has claimed the intent and is acting on it.
-    pub(crate) running: bool,
+    Running,
+    /// The intent this session was recorded under was replaced by one at a
+    /// newer destination. Its own status no longer describes the request, so
+    /// it is not reported as queued.
+    Superseded,
 }
 
 /// What the branch's LIVE tip means for this session.
@@ -324,6 +478,10 @@ pub(crate) enum RestoreProof {
     /// unresolvable bookmark, a store that would not answer. Carries the reason,
     /// written for the requester.
     Unavailable(String),
+    /// None of this session's conflicting files has changed since the conflict
+    /// was recorded, and no earlier session recorded a resolution of any of
+    /// them. There is no resolution to take, so a stated reason cannot make one.
+    NothingResolved { theirs: String },
 }
 
 /// The same assessment over EVERY conflicting path, for the replay guard.
@@ -355,8 +513,25 @@ pub(crate) fn assess_session_tip_exhaustively(
             session.bookmark
         ));
     };
-    RestoreProof::Assessed(assess_against_tip(
-        jj, store, session, base, theirs, tip, None,
+    let basis = match session.resolution_basis_at(jj, store, &tip) {
+        Ok(basis) => basis,
+        Err(error) => {
+            return RestoreProof::Unavailable(format!(
+                "which conflicting files changed since the conflict was recorded could not be \
+                 read ({error})"
+            ))
+        }
+    };
+    if !session
+        .conflicting()
+        .any(|file| basis.contains_key(&file.path))
+    {
+        return RestoreProof::NothingResolved {
+            theirs: theirs.to_string(),
+        };
+    }
+    RestoreProof::Assessed(assess_against_basis(
+        jj, store, session, base, &basis, tip, None,
     ))
 }
 
@@ -369,34 +544,58 @@ fn assess_session_tip_within(
     if session.is_base_drift() {
         return None;
     }
-    let (base, theirs) = (session.base.as_deref()?, session.theirs.as_deref()?);
+    session.theirs.as_deref()?;
+    let base = session.base.as_deref()?;
     let tip = crate::jj::bookmark_commit(jj, store, &session.bookmark)?;
-    Some(assess_against_tip(
-        jj, store, session, base, theirs, tip, limit,
+    // A read reports what it sees. A store that cannot say which files changed
+    // still leaves what the session inherited.
+    let basis = session
+        .resolution_basis_at(jj, store, &tip)
+        .unwrap_or_else(|_| session.resolution_basis.clone());
+    Some(assess_against_basis(
+        jj, store, session, base, &basis, tip, limit,
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn assess_against_tip(
+/// Assess every path the replay has to place against what it was resolved
+/// against: a path the basis covers against its own recorded sides, any other
+/// against the session's. Order is path order.
+fn assess_against_basis(
     jj: &JjEnv,
     store: &Path,
     session: &ConflictSession,
-    base: &str,
-    theirs: &str,
+    session_base: &str,
+    basis: &ResolutionBasis,
     tip: String,
     limit: Option<usize>,
 ) -> TipAssessment {
-    let all: Vec<String> = session
-        .conflicting()
-        .map(|file| file.path.clone())
-        .collect();
+    let all = session.replay_paths(basis);
     let limit = limit.unwrap_or(all.len());
     let truncated = all.len().saturating_sub(limit);
     let assessed: Vec<String> = all.into_iter().take(limit).collect();
+    let session_side = ResolvedSide {
+        base: session_base.to_string(),
+        theirs: session.theirs.clone().unwrap_or_default(),
+    };
+    let mut groups: BTreeMap<&ResolvedSide, Vec<String>> = BTreeMap::new();
+    for path in &assessed {
+        groups
+            .entry(basis.get(path).unwrap_or(&session_side))
+            .or_default()
+            .push(path.clone());
+    }
+    let mut verdicts: std::collections::HashMap<String, PathAssessment> = groups
+        .into_iter()
+        .flat_map(|(side, paths)| assess_paths(jj, store, &side.base, &tip, &side.theirs, &paths))
+        .map(|assessment| (assessment.path.clone(), assessment))
+        .collect();
 
     TipAssessment {
         moved: session.ours.as_deref() != Some(tip.as_str()),
-        paths: assess_paths(jj, store, base, &tip, theirs, &assessed),
+        paths: assessed
+            .iter()
+            .filter_map(|path| verdicts.remove(path))
+            .collect(),
         truncated,
         tip,
     }
@@ -419,10 +618,22 @@ pub(crate) enum ReplayDecision {
 /// Pure, and separated from the request path on purpose: this is the whole
 /// safety contract of the mechanism, and it should be provable without a store,
 /// a database, or a fixture. Every arm that is not a completed proof of safety
-/// refuses unless the requester states a reason.
+/// refuses unless the requester states a reason — except a tip with nothing
+/// resolved, where no reason can supply a resolution that does not exist.
 pub(crate) fn decide_replay(proof: &RestoreProof, stated_reason: Option<&str>) -> ReplayDecision {
     let blocker = match proof {
         RestoreProof::NothingToProve => return ReplayDecision::Proceed,
+        RestoreProof::NothingResolved { theirs } => {
+            return ReplayDecision::Refuse(format!(
+                "Refusing this replay: you have committed nothing since this conflict was recorded \
+                 against `{theirs}`, so there is no resolution to take. \
+                 `resolution:\"take-committed-tip\"` lands the conflicting files as your branch \
+                 last committed them, which here is simply your side of the conflict.\n\nWrite the \
+                 merged files, commit them, and request again — `cairn:~/rebase?view=merged` hands \
+                 you each complete merged file. To move the branch without taking content from \
+                 either side, request a plain `{{action:\"replay\"}}` instead."
+            ))
+        }
         RestoreProof::Unavailable(why) => format!(
             "Refusing this replay: `resolution:\"take-committed-tip\"` restores each conflicting \
              file WHOLE from your branch's committed tip, and whether that keeps everything both \
@@ -524,13 +735,19 @@ fn unproven_refusal(unproven: &[(&str, Unproven)]) -> String {
 /// written the item row, so the UPDATE always has a row to land on. A conflict
 /// re-detected at the same destination overwrites in place rather than
 /// accumulating: the coordinates are the same merge, so there is one session.
+///
+/// `basis` is what this session inherits; see [`inherited_basis`]. The caller
+/// computes it from the session open BEFORE this write, which may be the very
+/// row being overwritten (a conflict re-detected under the same intent).
 pub(crate) async fn record_conflict_session(
     db: &LocalDb,
     intent_id: &str,
     bookmark: &str,
     diagnostic: &ConflictDiagnostic,
     incoming: &IncomingIdentity,
+    basis: &ResolutionBasis,
 ) -> Result<(), String> {
+    let basis_json = encode_basis(basis)?;
     db.execute(
         "UPDATE jj_reconcile_items SET
            diagnostic_version = ?3,
@@ -547,7 +764,10 @@ pub(crate) async fn record_conflict_session(
            -- A fresh conflict means any earlier replay request has resolved into
            -- a new situation, so a surviving timestamp would describe a request
            -- nobody is waiting on.
-           replay_requested_at = NULL
+           replay_requested_at = NULL,
+           replay_requested_tip = NULL,
+           replay_requested_destination = NULL,
+           resolution_basis_json = ?14
          WHERE intent_id = ?1 AND bookmark = ?2",
         params![
             intent_id,
@@ -563,6 +783,7 @@ pub(crate) async fn record_conflict_session(
             incoming.base_branch.as_str(),
             MarkerState::NotMaterialized.as_str(),
             ResolutionState::Open.as_str(),
+            basis_json.as_deref(),
         ],
     )
     .await
@@ -597,6 +818,71 @@ pub(crate) async fn record_conflict_session(
     Ok(())
 }
 
+/// The resolution basis a newly recorded session inherits from the session open
+/// before it.
+///
+/// The new session's `ours` is the tip the rebase just failed with. Each of the
+/// previous session's conflicting paths whose content changed since that
+/// session's `ours` was re-resolved against that session's sides; every other
+/// path keeps what the previous session already knew. A store that cannot say
+/// which paths changed keeps the previous basis unchanged, which can only make
+/// a later replay refuse, never lose.
+pub(crate) fn inherited_basis(
+    jj: &JjEnv,
+    store: &Path,
+    previous: Option<&ConflictSession>,
+    new_ours: Option<&str>,
+) -> ResolutionBasis {
+    let (Some(previous), Some(new_ours)) = (previous, new_ours) else {
+        return previous
+            .map(|previous| previous.resolution_basis.clone())
+            .unwrap_or_default();
+    };
+    previous
+        .resolution_basis_at(jj, store, new_ours)
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "conflict session for `{}`: could not tell which files changed since `{}` ({error}); \
+                 keeping the earlier resolution basis",
+                previous.bookmark,
+                previous.ours.as_deref().unwrap_or("?")
+            );
+            previous.resolution_basis.clone()
+        })
+}
+
+/// Record that an agent asked for a take-committed-tip or plain replay: when,
+/// at which tip, and onto which destination. Advisory: a failure here must not
+/// fail a request the reconcile worker has already accepted, except that the
+/// worker reads the tip back and refuses a branch that has moved since.
+pub(crate) async fn record_replay_request(
+    db: &LocalDb,
+    intent_id: &str,
+    bookmark: &str,
+    tip: Option<&str>,
+    destination: &str,
+) {
+    if let Err(error) = db
+        .execute(
+            "UPDATE jj_reconcile_items SET replay_requested_at = ?3, replay_requested_tip = ?4,
+               replay_requested_destination = ?5
+             WHERE intent_id = ?1 AND bookmark = ?2",
+            // Unix seconds, matching every other timestamp on this table so the
+            // resource can render it with the same `clock::stamp`.
+            params![
+                intent_id,
+                bookmark,
+                chrono::Utc::now().timestamp(),
+                tip,
+                destination
+            ],
+        )
+        .await
+    {
+        log::warn!("replay request for `{bookmark}`: could not record the request: {error}");
+    }
+}
+
 /// Supersede every other open session for this branch, so exactly one is active.
 ///
 /// A base that advances twice produces two intents; the older session's
@@ -625,7 +911,8 @@ const SESSION_COLUMNS: &str = "i.intent_id, i.bookmark, n.project_id, n.store_pa
      n.target_branch, n.destination_commit, i.diagnostic_version, i.conflict_condition, \
      i.base_commit, i.ours_commit, i.theirs_commit, i.conflicted_tip, i.incoming_pr_number, \
      i.incoming_issue, i.incoming_base_branch, i.marker_state, i.marker_diagnostic, \
-     i.resolution_state, i.updated_at, i.replay_requested_at, i.status, n.status";
+     i.resolution_state, i.updated_at, i.replay_requested_at, i.status, n.status, \
+     i.resolution_basis_json, i.replay_requested_tip, i.replay_requested_destination";
 
 /// The active resolution session for a branch, if one is open.
 pub(crate) async fn load_active_session(
@@ -708,6 +995,9 @@ async fn load_session(
                     item_status: row.opt_text(20)?,
                     intent_status: row.opt_text(21)?,
                     files: Vec::new(),
+                    resolution_basis: decode_basis(row.opt_text(22)?.as_deref()),
+                    replay_requested_tip: row.opt_text(23)?,
+                    replay_requested_destination: row.opt_text(24)?,
                 }))
             })
         })
@@ -1023,6 +1313,144 @@ mod tests {
                 "the caveat repeats the stated reason: {caveat}"
             );
         }
+    }
+
+    fn session(ours: &str, theirs: &str, conflicting: &[&str]) -> ConflictSession {
+        ConflictSession {
+            intent_id: "intent".to_string(),
+            bookmark: "agent/test".to_string(),
+            project_id: "project".to_string(),
+            store_path: "/store".to_string(),
+            target_branch: "main".to_string(),
+            destination_commit: theirs.to_string(),
+            diagnostic_version: CONFLICT_DIAGNOSTIC_VERSION,
+            condition: ConflictCondition::ContentConflict.as_str().to_string(),
+            base: Some("fork".to_string()),
+            ours: Some(ours.to_string()),
+            theirs: Some(theirs.to_string()),
+            conflicted_tip: None,
+            incoming: IncomingIdentity::default(),
+            marker_state: MarkerState::NotMaterialized,
+            marker_diagnostic: None,
+            resolution_state: Some("open".to_string()),
+            updated_at: 0,
+            replay_requested_at: None,
+            item_status: None,
+            intent_status: None,
+            files: conflicting
+                .iter()
+                .map(|path| SessionFile {
+                    path: path.to_string(),
+                    status: "M".to_string(),
+                    classification: IncomingClassification::Conflicting.as_str().to_string(),
+                    marker_disposition: None,
+                })
+                .collect(),
+            resolution_basis: ResolutionBasis::new(),
+            replay_requested_tip: None,
+            replay_requested_destination: None,
+        }
+    }
+
+    fn side(theirs: &str) -> ResolvedSide {
+        ResolvedSide {
+            base: "fork".to_string(),
+            theirs: theirs.to_string(),
+        }
+    }
+
+    fn changed(paths: &[&str]) -> BTreeSet<String> {
+        paths.iter().map(|path| path.to_string()).collect()
+    }
+
+    /// A conflicting file the agent changed while the D1 session was open was
+    /// resolved against D1; one it did not touch has no resolution.
+    #[test]
+    fn only_a_path_whose_own_content_changed_takes_the_sessions_sides() {
+        let open = session("c1", "d1", &["f.txt", "g.txt"]);
+        let basis = open.basis_after(&changed(&["f.txt", "unrelated.txt"]));
+        assert_eq!(basis.get("f.txt"), Some(&side("d1")));
+        assert_eq!(basis.get("g.txt"), None, "g was not touched");
+        assert_eq!(basis.get("unrelated.txt"), None, "not a conflicting path");
+    }
+
+    /// The review's finding: a session recorded over a resolution made against
+    /// D1 must not promote that path to its own D2 because the agent committed
+    /// some OTHER file. The path keeps D1 until its own content changes; the
+    /// same rule covers a conflict re-detected under the same intent, whose
+    /// previous session is the row being overwritten.
+    #[test]
+    fn a_commit_to_another_file_keeps_each_paths_earlier_basis() {
+        let mut over_resolution = session("resolved", "d2", &["list.txt"]);
+        over_resolution
+            .resolution_basis
+            .insert("list.txt".to_string(), side("d1"));
+        let after_unrelated = over_resolution.basis_after(&changed(&["other.txt"]));
+        assert_eq!(after_unrelated.get("list.txt"), Some(&side("d1")));
+        let after_reresolving = over_resolution.basis_after(&changed(&["list.txt"]));
+        assert_eq!(after_reresolving.get("list.txt"), Some(&side("d2")));
+    }
+
+    /// A path an earlier replay carried and then rolled back is no longer
+    /// conflicting, and still has to be placed by the next replay.
+    #[test]
+    fn the_replay_places_every_resolved_path_not_only_the_current_conflicts() {
+        let mut retried = session("resolved", "d2", &["g.txt"]);
+        retried
+            .resolution_basis
+            .insert("f.txt".to_string(), side("d1"));
+        retried
+            .resolution_basis
+            .insert("g.txt".to_string(), side("d1"));
+        assert_eq!(
+            retried.replay_paths(&retried.resolution_basis),
+            vec!["f.txt".to_string(), "g.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_stored_basis_round_trips_and_an_unreadable_one_is_empty() {
+        let mut basis = ResolutionBasis::new();
+        basis.insert("list.txt".to_string(), side("d1"));
+        let json = encode_basis(&basis).unwrap();
+        assert_eq!(decode_basis(json.as_deref()), basis);
+        assert_eq!(encode_basis(&ResolutionBasis::new()).unwrap(), None);
+        assert!(decode_basis(Some("not json")).is_empty());
+    }
+
+    /// Nothing committed since the conflict means nothing to take, and a stated
+    /// reason cannot conjure a resolution.
+    #[test]
+    fn a_tip_with_nothing_resolved_is_refused_even_with_a_stated_reason() {
+        let proof = RestoreProof::NothingResolved {
+            theirs: "d1".to_string(),
+        };
+        for reason in [None, Some("trust me")] {
+            let ReplayDecision::Refuse(refusal) = decide_replay(&proof, reason) else {
+                panic!("nothing resolved must refuse with {reason:?}");
+            };
+            assert!(refusal.contains("committed nothing"), "{refusal}");
+            assert!(refusal.contains("`d1`"), "{refusal}");
+        }
+    }
+
+    /// The intent a session was recorded under can be superseded while the
+    /// request it carries is still outstanding; that is not "queued", and the
+    /// destination named is where the request went.
+    #[test]
+    fn a_superseded_intent_is_not_reported_as_queued_onto_its_old_destination() {
+        let mut asked = session("resolved", "d1", &["list.txt"]);
+        asked.replay_requested_at = Some(1);
+        asked.replay_requested_destination = Some("d2".to_string());
+        asked.intent_status = Some("superseded".to_string());
+        let progress = asked.replay_progress().expect("a request is outstanding");
+        assert_eq!(progress.state, ReplayState::Superseded);
+        assert_eq!(progress.destination, "d2");
+
+        asked.intent_status = Some("pending".to_string());
+        assert_eq!(asked.replay_progress().unwrap().state, ReplayState::Queued);
+        asked.replay_requested_destination = None;
+        assert_eq!(asked.replay_progress().unwrap().destination, "d1");
     }
 
     /// A stated reason is not a licence to skip the check: a proof that already

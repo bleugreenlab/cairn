@@ -183,6 +183,25 @@ macro_rules! shared_tail_retire_issue_dependencies {
     };
 }
 
+/// cairn/4977: a terminal settled because its process was proven gone records
+/// why, since its exit code cannot. `job_terminals` is carried by both lineages,
+/// so the column is written once and composed into both.
+macro_rules! shared_tail_terminal_exit_reason {
+    () => {
+        migration!("0252_terminal_exit_reason")
+    };
+}
+
+/// cairn/4987: the base and incoming side a conflict session's committed
+/// resolution was resolved against, and the tip and destination of an
+/// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
+/// both lineages, so the columns are written once and composed into both.
+macro_rules! shared_tail_reconcile_resolution_basis {
+    () => {
+        migration!("0258_reconcile_resolution_basis")
+    };
+}
+
 /// How each execution bound to a machine. Runner-transient state keyed by a
 /// runner incarnation, like the workflow journal, so it never syncs to a team
 /// replica.
@@ -1343,6 +1362,7 @@ macro_rules! team_lineage {
             shared_tail_provider_limit_holds!(),
             shared_tail_execution_after_gates!(),
             shared_tail_retire_issue_dependencies!(),
+            shared_tail_reconcile_resolution_basis!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1604,6 +1624,7 @@ macro_rules! private_lineage {
             shared_tail_provider_limit_holds!(),
             shared_tail_execution_after_gates!(),
             shared_tail_retire_issue_dependencies!(),
+            shared_tail_reconcile_resolution_basis!(),
         ]
     };
 }
@@ -3274,6 +3295,7 @@ mod tests {
                 "provider_limit_holds",
                 "execution_after_gates",
                 "retire_issue_dependencies",
+                "reconcile_resolution_basis",
             ]
         );
         assert_eq!(
@@ -6542,6 +6564,8 @@ mod tests {
                 // cairn/4735: `issue_dependencies` is shared project state, so
                 // its retirement into `after:` gates reaches both lineages.
                 "retire_issue_dependencies",
+                // cairn/4987: a conflict session's resolution basis, in both.
+                "reconcile_resolution_basis",
             ]
         );
         assert_eq!(

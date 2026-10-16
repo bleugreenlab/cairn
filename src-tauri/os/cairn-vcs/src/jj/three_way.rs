@@ -602,6 +602,191 @@ pub fn assess_paths(
         .collect()
 }
 
+/// What carrying one path's committed resolution onto a newer destination
+/// produces.
+///
+/// A resolution is made against one incoming side and committed linearly, so it
+/// holds that side's content without that side in its ancestry. When the base
+/// has advanced again by replay time, restoring the committed file whole would
+/// overwrite everything the newer destination added to it. Carrying it instead
+/// merges the newer destination's changes in, three-way, with the side the
+/// resolution was made against as the base: the agent's resolution is what
+/// changed on one side, and the destination's further work on the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Carried {
+    /// The destination holds exactly what the resolution was made against, so
+    /// the committed file is already the complete answer and a whole-file
+    /// restore is exact. Also the only arm a binary path can reach.
+    Unchanged,
+    /// The destination changed this path only where the resolution did not:
+    /// the committed resolution with those changes merged in.
+    Merged(String),
+    /// The destination changed the region the resolution covers. Nobody has
+    /// resolved this pair of sides yet.
+    Conflicted { text: String, regions: usize },
+    /// Not judgeable line-wise. Carries the reason, written for the agent.
+    Unjudged(String),
+}
+
+/// Carry one path's committed resolution from the side it was resolved against
+/// onto a newer destination. Pure; see [`Carried`] for the arms.
+pub fn carry_resolution(
+    resolved_against: &FileContent,
+    committed: &FileContent,
+    destination: &FileContent,
+) -> Carried {
+    match (resolved_against, destination) {
+        (FileContent::Text(before), FileContent::Text(now)) if before == now => {
+            return Carried::Unchanged
+        }
+        (FileContent::Absent, FileContent::Absent) => return Carried::Unchanged,
+        _ => {}
+    }
+    if let FileContent::Absent = destination {
+        return Carried::Unjudged(
+            "the base deleted this path after your resolution was made, so there is no newer \
+             version to carry your resolution onto"
+                .to_string(),
+        );
+    }
+    if let FileContent::Absent = committed {
+        return Carried::Unjudged(
+            "your resolution deletes this path, and the base has changed it since that \
+             resolution was made"
+                .to_string(),
+        );
+    }
+    let (Some(base), Some(ours), Some(theirs)) = (
+        resolved_against.mergeable(),
+        committed.mergeable(),
+        destination.mergeable(),
+    ) else {
+        return Carried::Unjudged(
+            "one side of this path is not UTF-8 text, and the base has changed it since your \
+             resolution was made"
+                .to_string(),
+        );
+    };
+    match merge_preview(base, ours, theirs) {
+        MergePreview::Clean(text) => Carried::Merged(text),
+        MergePreview::Conflicted { text, regions } => Carried::Conflicted { text, regions },
+    }
+}
+
+/// Carry every named path's resolution from `resolved_against` onto
+/// `destination`, reading the three sides from the store.
+///
+/// A binary path cannot be compared through [`FileContent`], so whether it
+/// changed between the two sides is asked of jj directly. Any path that probe
+/// mentions at all counts as changed: "unchanged" licenses a whole-file
+/// restore, so the doubtful direction is the one that refuses it.
+pub fn carry_paths(
+    jj: &JjEnv,
+    store: &Path,
+    resolved_against: &str,
+    committed: &str,
+    destination: &str,
+    paths: &[String],
+) -> Vec<(String, Result<Carried, String>)> {
+    let sides = read_sides_for_paths(jj, store, resolved_against, committed, destination, paths);
+    let needs_probe: Vec<String> = sides
+        .iter()
+        .filter(|(_, sides)| {
+            sides.as_ref().is_ok_and(|sides| {
+                matches!(sides.base, FileContent::Binary)
+                    || matches!(sides.theirs, FileContent::Binary)
+            })
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    let binary_changed = if needs_probe.is_empty() {
+        Ok(BTreeSet::new())
+    } else {
+        paths_mentioned_in_diff(jj, store, resolved_against, destination, &needs_probe)
+    };
+    sides
+        .into_iter()
+        .map(|(path, sides)| {
+            let carried = sides.and_then(|sides| {
+                if needs_probe.contains(&path) {
+                    let changed = binary_changed.as_ref().map_err(Clone::clone)?;
+                    if !changed.contains(&path) {
+                        return Ok(Carried::Unchanged);
+                    }
+                }
+                Ok(carry_resolution(&sides.base, &sides.ours, &sides.theirs))
+            });
+            (path, carried)
+        })
+        .collect()
+}
+
+/// Which of `paths` differ in content between two commits, by exact name.
+///
+/// The per-path evidence that a branch re-resolved a file: a commit that only
+/// touched other files leaves every one of these unchanged. A path renamed away
+/// is reported under its new name and so reads as unchanged here, which keeps
+/// the earlier resolution's claim rather than inventing a new one.
+pub fn paths_changed_between(
+    jj: &JjEnv,
+    store: &Path,
+    from: &str,
+    to: &str,
+    paths: &[String],
+) -> Result<BTreeSet<String>, String> {
+    if paths.is_empty() || from == to {
+        return Ok(BTreeSet::new());
+    }
+    let mut args = vec![
+        "diff",
+        "--ignore-working-copy",
+        "--name-only",
+        "--from",
+        from,
+        "--to",
+        to,
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    let listed = jj.run(store, &args, "jj diff --name-only (re-resolved paths)")?;
+    let named: BTreeSet<&str> = listed.lines().map(str::trim).collect();
+    Ok(paths
+        .iter()
+        .filter(|path| named.contains(path.as_str()))
+        .cloned()
+        .collect())
+}
+
+/// Which of `paths` a `from`..`to` summary diff mentions, by substring, so a
+/// rename's rendering still counts as a mention of both its ends.
+fn paths_mentioned_in_diff(
+    jj: &JjEnv,
+    store: &Path,
+    from: &str,
+    to: &str,
+    paths: &[String],
+) -> Result<BTreeSet<String>, String> {
+    let mut args = vec![
+        "diff",
+        "--ignore-working-copy",
+        "--summary",
+        "--from",
+        from,
+        "--to",
+        to,
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    let summary = jj
+        .run(store, &args, "jj diff --summary (resolution carry probe)")
+        .map_err(|error| format!("could not tell whether the base changed this path: {error}"))?;
+    Ok(paths
+        .iter()
+        .filter(|path| summary.lines().any(|line| line.contains(path.as_str())))
+        .cloned()
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +823,74 @@ mod tests {
             "{candidate}"
         );
         assert!(candidate.contains("incoming-footer"), "{candidate}");
+    }
+
+    fn text(value: &str) -> FileContent {
+        FileContent::Text(value.to_string())
+    }
+
+    #[test]
+    fn a_destination_still_at_the_resolved_side_takes_the_resolution_whole() {
+        let resolved_against = text("head\nA\n");
+        assert_eq!(
+            carry_resolution(&resolved_against, &text("head\nA\nX\n"), &resolved_against),
+            Carried::Unchanged
+        );
+        assert_eq!(
+            carry_resolution(&FileContent::Absent, &text("new\n"), &FileContent::Absent),
+            Carried::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_destination_change_away_from_the_resolution_is_merged_in() {
+        // Resolved against A at the tail; the newer base added B at the top.
+        let carried = carry_resolution(
+            &text("head\nbody\nA\n"),
+            &text("head\nbody\nA\nX\n"),
+            &text("B\nhead\nbody\nA\n"),
+        );
+        assert_eq!(
+            carried,
+            Carried::Merged("B\nhead\nbody\nA\nX\n".to_string())
+        );
+    }
+
+    #[test]
+    fn a_destination_change_in_the_resolved_region_is_a_new_conflict() {
+        // Resolved A-then-X at the tail; the newer base appended B at the same spot.
+        let carried = carry_resolution(
+            &text("head\nA\n"),
+            &text("head\nA\nX\n"),
+            &text("head\nA\nB\n"),
+        );
+        let Carried::Conflicted { text, regions } = carried else {
+            panic!("same-spot appends cannot both be kept by a line merge: {carried:?}");
+        };
+        assert_eq!(regions, 1);
+        assert!(text.contains("X") && text.contains("B"), "{text}");
+    }
+
+    #[test]
+    fn a_deletion_or_binary_side_that_changed_is_unjudged() {
+        assert!(matches!(
+            carry_resolution(&text("a\n"), &text("a\nb\n"), &FileContent::Absent),
+            Carried::Unjudged(_)
+        ));
+        assert!(matches!(
+            carry_resolution(&text("a\n"), &FileContent::Absent, &text("a\nc\n")),
+            Carried::Unjudged(_)
+        ));
+        // Binary content carries no bytes to compare, so the pure function can
+        // never call it unchanged; `carry_paths` asks the store instead.
+        assert!(matches!(
+            carry_resolution(
+                &FileContent::Binary,
+                &FileContent::Binary,
+                &FileContent::Binary
+            ),
+            Carried::Unjudged(_)
+        ));
     }
 
     fn sides(base: &str, ours: &str, theirs: &str) -> MergeSides {

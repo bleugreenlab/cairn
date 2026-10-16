@@ -230,6 +230,10 @@ struct DiffData {
     /// The commit this diff is rendered against: the live fork point of the
     /// branch and its integration target, or an archived range's recorded base.
     fork_point: Option<String>,
+    /// The base branch's head now, for a live range. Rendered beside the fork
+    /// point because the two differ whenever the base has advanced past the
+    /// branch, and a page naming only one reads as the other.
+    base_head: Option<String>,
     current_revision: Option<String>,
     branch: Option<String>,
     commits_ahead: Option<i32>,
@@ -408,7 +412,7 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
             return None;
         }
     };
-    let (base, tip) = (range.base, range.tip);
+    let (base, tip, base_head) = (range.base, range.tip, range.target_head);
     let store = ObjectStore::new(repo, None).ok()?;
     let patch = render_range_diff(&store, &base, &tip).ok()?;
     let file_diffs = render_range_file_diffs(&store, &base, &tip).ok()?;
@@ -449,6 +453,7 @@ async fn load_live_data(orch: &Orchestrator, coords: &DiffCoords) -> Option<Diff
         },
         base_branch: coords.base_branch.clone(),
         fork_point: Some(base),
+        base_head: Some(base_head),
         current_revision: Some(tip),
         branch: coords.branch.clone(),
         commits_ahead: Some(commits_ahead),
@@ -531,6 +536,7 @@ async fn load_archived_data(
         content_source,
         base_branch: coords.base_branch.clone(),
         fork_point: Some(base.clone()),
+        base_head: None,
         current_revision: Some(tip.clone()),
         branch: coords.branch.clone(),
         commits_ahead: Some(commits_ahead),
@@ -563,6 +569,7 @@ async fn load_cache_data(
         },
         base_branch: coords.base_branch.clone(),
         fork_point: None,
+        base_head: None,
         current_revision: None,
         branch: coords.branch.clone(),
         commits_ahead: None,
@@ -598,10 +605,18 @@ fn render_summary(
     };
     let mut out = format!("# Workspace Diff - {project}/{number} / {node_id}\n\n");
     out.push_str(&format!(
-        "- Base: `{}` at `{}`\n",
+        "- Fork point with `{}`: `{}`",
         data.base_branch,
         short(data.fork_point.as_deref())
     ));
+    if let Some(head) = data.base_head.as_deref() {
+        out.push_str(&format!(
+            " (`{}` tip: `{}`)",
+            data.base_branch,
+            short(Some(head))
+        ));
+    }
+    out.push('\n');
     out.push_str(&format!(
         "- Current: `@- {}`",
         short(data.current_revision.as_deref())
@@ -1014,6 +1029,7 @@ mod tests {
             content_source,
             base_branch: "main".to_string(),
             fork_point: Some("0123456789abcdef".to_string()),
+            base_head: Some("abcdefabcdef0123".to_string()),
             current_revision: Some("fedcba9876543210".to_string()),
             branch: Some("agent/cairn-42-builder".to_string()),
             commits_ahead: Some(1),

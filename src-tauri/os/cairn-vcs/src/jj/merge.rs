@@ -717,7 +717,134 @@ pub fn rebase_branch_onto(
     branch: &str,
     dest: &str,
 ) -> Result<RebaseOutcome, String> {
-    rebase_branch_onto_with_resolution(jj, store, branch, dest, &[])
+    rebase_branch_onto_with_resolution(jj, store, branch, dest, None)
+}
+
+/// What a committed resolution puts at one path of the rebased tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarriedContent {
+    /// The pre-rebase tip's file, whole. Exact only when the destination still
+    /// holds what the resolution was made against.
+    FromTip,
+    /// This content: the resolution carried onto the destination.
+    Text(String),
+}
+
+/// An explicitly requested replay's committed resolution, already carried onto
+/// the destination it will land on.
+///
+/// Built only by the durable conflict-session replay. An automatic rebase
+/// passes none and keeps the fail-closed rollback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolutionCarry {
+    /// The tip the carry was computed from. A branch found anywhere else is
+    /// refused before the graph moves: content computed from one tip, laid over
+    /// another, is exactly the silent overwrite this exists to prevent.
+    pub expected_pre_tip: String,
+    /// Each carried path and what lands there. A session path absent from this
+    /// list is deliberately left to jj's own merge, so a conflict there rolls
+    /// the replay back.
+    pub paths: Vec<(String, CarriedContent)>,
+}
+
+impl ResolutionCarry {
+    /// Every path restored whole from the expected tip.
+    pub fn from_tip(expected_pre_tip: &str, paths: &[String]) -> Self {
+        Self {
+            expected_pre_tip: expected_pre_tip.to_string(),
+            paths: paths
+                .iter()
+                .map(|path| (path.clone(), CarriedContent::FromTip))
+                .collect(),
+        }
+    }
+}
+
+/// Lay a carry plan's content into the rebased tip commit itself, the way
+/// `jj restore --into` does: the tip's own tree changes, and no commit is added
+/// above it. Text content is first sealed into a scratch commit off `pre_tip`,
+/// because jj restores trees between commits and has no way to write bytes at
+/// a revision; the scratch commit is abandoned once its tree has been copied.
+fn apply_resolution_carry(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    pre_tip: &str,
+    carry: &ResolutionCarry,
+) -> Result<(), String> {
+    let branch_revset = format!("bookmarks(exact:{branch:?})");
+    let restore = |from: &str, paths: &[&str], label: &str| -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut args = vec![
+            "restore",
+            "--from",
+            from,
+            "--into",
+            branch_revset.as_str(),
+            "--ignore-working-copy",
+            "--",
+        ];
+        args.extend_from_slice(paths);
+        jj.run(store, &args, label).map(|_| ())
+    };
+
+    let from_tip: Vec<&str> = carry
+        .paths
+        .iter()
+        .filter(|(_, content)| *content == CarriedContent::FromTip)
+        .map(|(path, _)| path.as_str())
+        .collect();
+    restore(
+        pre_tip,
+        &from_tip,
+        "jj restore (committed conflict resolution)",
+    )?;
+
+    let texts: Vec<(&str, &str)> = carry
+        .paths
+        .iter()
+        .filter_map(|(path, content)| match content {
+            CarriedContent::Text(text) => Some((path.as_str(), text.as_str())),
+            CarriedContent::FromTip => None,
+        })
+        .collect();
+    if texts.is_empty() {
+        return Ok(());
+    }
+    let text_paths: Vec<&str> = texts.iter().map(|(path, _)| *path).collect();
+    let scratch = with_transient_workspace(jj, store, pre_tip, |workspace| {
+        for (path, text) in &texts {
+            let target = workspace.join(path);
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("create `{}`: {error}", parent.display()))?;
+            }
+            std::fs::write(&target, text)
+                .map_err(|error| format!("write carried `{path}`: {error}"))?;
+        }
+        seal_paths(
+            jj,
+            workspace,
+            "Carry committed conflict resolution onto the replay destination",
+            None,
+            &text_paths,
+            None,
+        )
+        .map(|sealed| sealed.sha)
+    })?;
+    restore(
+        &scratch,
+        &text_paths,
+        "jj restore (carried conflict resolution)",
+    )?;
+    jj.run(
+        store,
+        &["abandon", &scratch, "--ignore-working-copy"],
+        "jj abandon (carried resolution scratch commit)",
+    )
+    .map(|_| ())
 }
 
 /// Name the cause of a rebase refused for rewriting immutable commits, because
@@ -765,16 +892,30 @@ fn explain_immutable_rebase_refusal(
 
 /// Rebase a branch while honoring an explicitly identified committed resolution.
 ///
-/// `resolution_paths` is supplied only by the explicit durable conflict-session
-/// replay operation. A normal automatic rebase passes no paths and retains the
+/// `resolution` is supplied only by the explicit durable conflict-session
+/// replay operation. A normal automatic rebase passes none and retains the
 /// fail-closed rollback behavior.
 pub(crate) fn rebase_branch_onto_with_resolution(
     jj: &JjEnv,
     store: &Path,
     branch: &str,
     dest: &str,
-    resolution_paths: &[String],
+    resolution: Option<&ResolutionCarry>,
 ) -> Result<RebaseOutcome, String> {
+    if let Some(carry) = resolution {
+        let live = bookmark_commit(jj, store, branch);
+        if live.as_deref() != Some(carry.expected_pre_tip.as_str()) {
+            return Err(format!(
+                "resolved replay of `{branch}` refused before moving anything: the replay was \
+                 requested with the branch at `{}`, and it is now at `{}`. Your resolution was \
+                 checked against the first, so it is not applied to the second. Re-read \
+                 cairn:~/rebase and request the replay again.",
+                carry.expected_pre_tip,
+                live.as_deref().unwrap_or("<unresolved>")
+            ));
+        }
+    }
+
     // An untracked origin copy of this branch's own history freezes the commits
     // it reaches (see `track_own_remote_of_same_lineage`), and the rebase below
     // would be refused as rewriting immutable commits. Heal it first; a failure
@@ -802,22 +943,14 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         ));
     }
 
-    if branch_has_conflict(jj, store, branch)? && !resolution_paths.is_empty() {
+    let carry = resolution.filter(|carry| !carry.paths.is_empty());
+    if let Some(carry) =
+        carry.filter(|_| matches!(branch_has_conflict(jj, store, branch), Ok(true) | Err(_)))
+    {
         let resolution = pre_tip
             .as_deref()
             .ok_or_else(|| format!("resolved rebase: branch `{branch}` had no pre-rebase tip"))?;
-        let branch_revset = format!("bookmarks(exact:{branch:?})");
-        let mut args = vec![
-            "restore",
-            "--from",
-            resolution,
-            "--into",
-            &branch_revset,
-            "--ignore-working-copy",
-            "--",
-        ];
-        args.extend(resolution_paths.iter().map(String::as_str));
-        if let Err(error) = jj.run(store, &args, "jj restore (committed conflict resolution)") {
+        if let Err(error) = apply_resolution_carry(jj, store, branch, resolution, carry) {
             restore_operation(jj, store, &pre_op).map_err(|rollback| {
                 format!(
                     "resolved rebase of `{branch}` failed while applying the committed tip ({error}), and rollback to {pre_op} also failed: {rollback}"
@@ -836,8 +969,8 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         }
         if !branch_has_conflict(jj, store, branch)? {
             log::info!(
-                "jj rebase: honored committed tip resolution for `{branch}` on {} path(s)",
-                resolution_paths.len()
+                "jj rebase: carried committed resolution for `{branch}` on {} path(s)",
+                carry.paths.len()
             );
         }
     }
@@ -1031,7 +1164,7 @@ pub fn merge_side_patch(
 /// the rebase: an instrument must never be able to break the machinery it
 /// measures. What it must NOT do is guess — conflict membership comes from jj's
 /// real rebase result (`conflicting`), never from path overlap.
-fn capture_conflict_diagnostic(
+pub(crate) fn capture_conflict_diagnostic(
     jj: &JjEnv,
     store: &Path,
     branch: &str,

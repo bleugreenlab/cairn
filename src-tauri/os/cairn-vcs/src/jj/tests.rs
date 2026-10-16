@@ -207,8 +207,13 @@ fn committed_tip_resolution_lands_same_hunk_replay() {
         )
         .unwrap();
 
+    let tip = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
     let report = reconcile_resolved_sibling_without_publication(
-        &fx.jj, &fx.store, "main", fx.branch, &paths,
+        &fx.jj,
+        &fx.store,
+        "main",
+        fx.branch,
+        &ResolutionCarry::from_tip(&tip, &paths),
     )
     .unwrap();
     assert_eq!(report.rebased_clean, vec![fx.branch.to_string()]);
@@ -2343,9 +2348,14 @@ fn a_whole_file_restore_that_would_drop_incoming_work_is_detected_and_remediable
     );
 
     // And the replay that restore drives lands a file containing both sides.
-    let report =
-        reconcile_resolved_sibling_without_publication(&jj, &store, "main", branch, &paths)
-            .unwrap();
+    let report = reconcile_resolved_sibling_without_publication(
+        &jj,
+        &store,
+        "main",
+        branch,
+        &ResolutionCarry::from_tip(&resolved_tip, &paths),
+    )
+    .unwrap();
     assert_eq!(report.rebased_clean, vec![branch.to_string()]);
     let landed = String::from_utf8(file_show(&jj, &store, branch, "shared.rs").unwrap()).unwrap();
     assert!(
@@ -3602,6 +3612,109 @@ fn flatten_abandons_orphaned_change_id_commits() {
 /// shape is FLATTENED by `reconcile_siblings` (not left wedged), classified
 /// `rebased_clean`, and pushed so its PR head advances on origin — the branch is
 /// pushable/mergeable with no hand-run jj.
+/// A flatten refused after THIS pass rebased the branch puts the branch back
+/// where the pass found it, and says truthfully why: a guard refusal is a
+/// conflict with paths, a jj failure is a retried failure. Before, both left
+/// the branch on the rebased tip under a `conflicted` label naming nothing
+/// (cairn/4987's 11:07 specimen, where the cause was a packed-ref lock).
+#[test]
+#[serial_test::serial(jj)]
+fn a_refused_flatten_rolls_the_rebase_back_and_says_why() {
+    let Some(bin) = jj_bin() else {
+        eprintln!(
+            "skipping a_refused_flatten_rolls_the_rebase_back_and_says_why: jj not resolvable"
+        );
+        return;
+    };
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(&bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+
+    let int = "agent/CAIRN-4987-coordinator-0";
+    add_workspace(&jj, &store, &wts.path().join("coord"), int, "main", None).unwrap();
+    let sibling = "agent/CAIRN-4987-builder-0";
+    let ws = wts.path().join("sib");
+    add_workspace(&jj, &store, &ws, sibling, int, None).unwrap();
+    std::fs::write(ws.join("shared.rs"), "sibling-edit\n").unwrap();
+    seal(&jj, &ws, "sibling edits shared", None).unwrap();
+
+    let advance = |file: &str, content: &str| {
+        jj.run(&store, &["new", int], "new on int").unwrap();
+        std::fs::write(store.join(file), content).unwrap();
+        jj.run(&store, &["describe", "-m", "int advances"], "describe")
+            .unwrap();
+        jj.run(&store, &["bookmark", "set", int, "-r", "@"], "advance int")
+            .unwrap();
+    };
+    // Give the sibling conflicted history with a resolving tip.
+    advance("shared.rs", "integration-advanced\n");
+    rebase_recording_conflict(&jj, &store, sibling, int);
+    update_stale(&jj, &ws).unwrap();
+    std::fs::write(ws.join("shared.rs"), "resolved\n").unwrap();
+    seal(&jj, &ws, "resolve conflict", None).unwrap();
+    // A further, unrelated advance that this pass rebases the sibling onto.
+    advance("unrelated.rs", "later\n");
+    let dest = bookmark_commit(&jj, &store, int).unwrap();
+    let pre_tip = bookmark_commit(&jj, &store, sibling).unwrap();
+
+    for (refusal, expect_conflict) in [
+        ("flatten footprint guard: would delete base file(s)", true),
+        (
+            "jj new (squash base) failed: The lock for the packed-ref file could not be obtained",
+            false,
+        ),
+    ] {
+        let rollback = RebaseRollback {
+            pre_op: operation_id(&jj, &store).unwrap(),
+            pre_tip: Some(pre_tip.clone()),
+        };
+        assert!(matches!(
+            rebase_branch_onto(&jj, &store, sibling, int).unwrap(),
+            RebaseOutcome::RebasedOverConflictedAncestry { .. }
+        ));
+        assert_ne!(bookmark_commit(&jj, &store, sibling).unwrap(), pre_tip);
+
+        let mut report = ReconcileReport::default();
+        roll_back_refused_flatten(
+            &jj,
+            &store,
+            sibling,
+            &dest,
+            &rollback,
+            refusal.to_string(),
+            &mut report,
+        );
+        assert_eq!(
+            bookmark_commit(&jj, &store, sibling).as_deref(),
+            Some(pre_tip.as_str()),
+            "the branch is back where the pass found it ({refusal})"
+        );
+        if expect_conflict {
+            assert_eq!(report.conflicted, vec![sibling.to_string()]);
+            let diagnostic = &report.conflict_diagnostics[sibling];
+            assert_eq!(
+                diagnostic.conflicting_paths(),
+                vec!["shared.rs".to_string()]
+            );
+            assert_eq!(diagnostic.ours.as_deref(), Some(pre_tip.as_str()));
+            assert!(report.failed.is_empty());
+        } else {
+            assert!(report.conflicted.is_empty(), "a lock is not a conflict");
+            assert_eq!(report.failed.len(), 1);
+            assert!(report.failed[0].error.contains("packed-ref"));
+            assert_eq!(
+                reconcile_failure_kind(&report.failed[0].error),
+                "transient_process",
+                "so the durable worker retries it"
+            );
+        }
+    }
+}
+
 #[test]
 #[serial_test::serial(jj)]
 fn reconcile_siblings_flattens_intermediate_only_sibling() {
