@@ -1,7 +1,7 @@
 //! The one writer to a live Codex thread: its turns, interrupts, and native goal.
 
 use crate::codex::app_server::AppServerClient;
-use crate::interface::session::{SessionControl, SessionInput};
+use crate::interface::session::{ServerReply, SessionControl, SessionInput};
 #[cfg(test)]
 use crate::wire::codex_app_server::goal::GoalClearResponse;
 use crate::wire::codex_app_server::goal::{parse_response, Goal, GoalResponse, GoalStatus};
@@ -348,6 +348,10 @@ impl SessionControl for CodexControl {
 
     fn set_permission_mode(&mut self, _mode: &str) -> Result<(), String> {
         Err("Changing Codex permission mode mid-session is not yet supported".to_string())
+    }
+
+    fn reply(&mut self, id: &Value, reply: ServerReply) -> Result<(), String> {
+        self.client.reply(id, reply)
     }
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {

@@ -338,7 +338,8 @@ pub mod codex {
                 Notification::AuthTokensRefreshRequest { id } => {
                     vec![SessionEvent::ServerRequest {
                         id: id.clone(),
-                        method: "account/chatgptAuthTokens/refresh".to_string(),
+                        method: crate::wire::codex_app_server::AUTH_TOKENS_REFRESH_METHOD
+                            .to_string(),
                         params: message.get("params").cloned().unwrap_or(Value::Null),
                     }]
                 }

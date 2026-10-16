@@ -10,7 +10,8 @@
 //! - A [`SessionProvider`] is *how* a CLI conversation is opened: a new one,
 //!   a resume of its own, or a fork of another's ([`SessionStart`]).
 //! - A [`SessionControl`] is the only way to write to a live session: its
-//!   first turn, later messages, an interrupt, a model or permission change.
+//!   first turn, later messages, an interrupt, a model or permission change,
+//!   a renewed credential, and the answer to a request the session raised.
 //!
 //! A session never holds its own credentials. Everything secret arrives from
 //! the caller in [`SecretEnv`] (or, for Codex, a caller-supplied login) and
@@ -485,6 +486,16 @@ pub type SharedControl = Arc<Mutex<Option<Box<dyn SessionControl>>>>;
 /// What a [`SharedControl`] that has been emptied answers.
 pub const NO_SESSION_CONTROL: &str = "Session control not available";
 
+/// A host's answer to a [`crate::session::events::SessionEvent::ServerRequest`]:
+/// the JSON-RPC `result`, or an `error` with its code and message.
+///
+/// Deliberately not `Debug`: a token request's answer carries an access token.
+#[derive(Clone, PartialEq)]
+pub enum ServerReply {
+    Result(Value),
+    Error { code: i32, message: String },
+}
+
 /// The only writer to a live session.
 pub trait SessionControl: Send + Any {
     /// The conversation's first turn. It is its own operation because each
@@ -503,6 +514,11 @@ pub trait SessionControl: Send + Any {
     /// A provider or mode that cannot take one says so.
     fn update_credential(&mut self, _env: &SecretEnv, _generation: u64) -> Result<(), String> {
         Err("this session cannot take a credential update".to_string())
+    }
+    /// Answer the server request the session raised as `id`. A provider whose
+    /// sessions raise none says so.
+    fn reply(&mut self, _id: &Value, _reply: ServerReply) -> Result<(), String> {
+        Err("this session takes no replies".to_string())
     }
     /// Provider-specific operations (Codex goals) downcast through here.
     fn as_any_mut(&mut self) -> &mut dyn Any;

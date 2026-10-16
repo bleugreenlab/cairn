@@ -4,6 +4,10 @@ use serde_json::Value;
 
 use super::items::extract_app_server_delta;
 
+/// The server request an app-server sends when the ChatGPT tokens it was given
+/// stop working; the host answers with fresh ones or the turn waits.
+pub const AUTH_TOKENS_REFRESH_METHOD: &str = "account/chatgptAuthTokens/refresh";
+
 /// Stands in for a field the notification omitted, so a reader sees the same
 /// absence it would have seen through a JSON pointer.
 const ABSENT: &Value = &Value::Null;
@@ -117,7 +121,7 @@ impl<'a> Notification<'a> {
         if let (Some(method), Some(id)) = (method, msg.get("id")) {
             if msg.get("result").is_none() && msg.get("error").is_none() {
                 return match method {
-                    "account/chatgptAuthTokens/refresh" => Self::AuthTokensRefreshRequest { id },
+                    AUTH_TOKENS_REFRESH_METHOD => Self::AuthTokensRefreshRequest { id },
                     _ => Self::ServerRequest { id, method },
                 };
             }

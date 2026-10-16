@@ -603,6 +603,181 @@ pub mod testing {
         }
     }
 
+    /// Stands in for the refresh authority over a managed Codex account. Each
+    /// renewal is recorded ([`RenewingCodex::asked`]) and answered with the
+    /// next credential for the ChatGPT account the request names: the n-th
+    /// renewal answers access token `at-<n+1>`, as for a session that started
+    /// on `at-1`. One built [`RenewingCodex::refusing`] answers every renewal
+    /// as unrecoverable instead. Every other subscription question gets
+    /// [`Unsubscribed`]'s answer.
+    #[derive(Debug, Clone, Default)]
+    pub struct RenewingCodex {
+        asked: Arc<Mutex<Vec<CodexRefreshRequest>>>,
+        refuse: bool,
+    }
+
+    impl RenewingCodex {
+        /// An authority that can no longer renew the account.
+        pub fn refusing() -> Self {
+            Self {
+                refuse: true,
+                ..Self::default()
+            }
+        }
+
+        /// Every renewal this authority was asked for, in order.
+        pub fn asked(&self) -> Vec<CodexRefreshRequest> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    impl Subscriptions for RenewingCodex {
+        fn claude_home(&self, host: &dyn ModelHost, account_id: &str) -> Option<PathBuf> {
+            Unsubscribed.claude_home(host, account_id)
+        }
+
+        fn prepare_claude_home(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+        ) -> Result<PathBuf, String> {
+            Unsubscribed.prepare_claude_home(host, account_id)
+        }
+
+        fn claude_home_signed_in(&self, host: &dyn ModelHost, account_id: &str) -> bool {
+            Unsubscribed.claude_home_signed_in(host, account_id)
+        }
+
+        fn release_claude_home(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+        ) -> Result<(), String> {
+            Unsubscribed.release_claude_home(host, account_id)
+        }
+
+        fn claude_session_credential(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+        ) -> Result<ClaudeSessionCredential, String> {
+            Unsubscribed.claude_session_credential(host, account_id)
+        }
+
+        fn renew_claude_credentials(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.renew_claude_credentials(host)
+        }
+
+        fn claude_credential_rejected(
+            &self,
+            host: &dyn ModelHost,
+            account_id: &str,
+            generation: u64,
+        ) -> Result<ClaudeSessionCredential, String> {
+            Unsubscribed.claude_credential_rejected(host, account_id, generation)
+        }
+
+        fn migrate_claude_homes(&self, host: &dyn ModelHost) -> Vec<String> {
+            Unsubscribed.migrate_claude_homes(host)
+        }
+
+        fn probe_usage(
+            &self,
+            host: &dyn ModelHost,
+            provider: RoutedProvider,
+            account_id: Option<&str>,
+        ) -> (ProviderUsageSnapshot, Option<String>) {
+            Unsubscribed.probe_usage(host, provider, account_id)
+        }
+
+        fn credential_generation(
+            &self,
+            host: &dyn ModelHost,
+            provider: RoutedProvider,
+            account_id: &str,
+        ) -> Option<String> {
+            Unsubscribed.credential_generation(host, provider, account_id)
+        }
+
+        fn consume_usage_reset(
+            &self,
+            host: &dyn ModelHost,
+            provider: RoutedProvider,
+            account_id: Option<&str>,
+        ) -> Result<ProviderUsageResetResult, String> {
+            Unsubscribed.consume_usage_reset(host, provider, account_id)
+        }
+
+        fn codex_session_login(
+            &self,
+            host: &dyn ModelHost,
+            auth: &CodexAuthState,
+        ) -> Result<Secret<Value>, String> {
+            Unsubscribed.codex_session_login(host, auth)
+        }
+
+        fn refresh_codex(
+            &self,
+            _host: &dyn ModelHost,
+            request: CodexRefreshRequest,
+        ) -> Result<(String, CodexAccountRef), CodexRefreshFailure> {
+            let renewal = {
+                let mut asked = self.asked.lock().unwrap();
+                asked.push(request.clone());
+                asked.len() + 1
+            };
+            let account = CodexAccountRef {
+                cairn_account_id: request
+                    .cairn_account_id
+                    .unwrap_or_else(|| "codex-test".to_string()),
+                chatgpt_account_id: request.chatgpt_account_id.clone(),
+                label: "Renewing Codex".to_string(),
+                email: None,
+            };
+            if self.refuse {
+                return Err(CodexRefreshFailure::unrecoverable(
+                    Some(&account),
+                    "the scripted authority renews nothing",
+                ));
+            }
+            let published = serde_json::json!({"tokens": {
+                "id_token": format!("id-{renewal}"),
+                "access_token": format!("at-{renewal}"),
+                "account_id": request.chatgpt_account_id,
+            }});
+            Ok((published.to_string(), account))
+        }
+
+        fn start_sign_in(
+            &self,
+            host: Arc<dyn ModelHost>,
+            request: SignInRequest,
+        ) -> SignInFuture<Result<SignInStart, SignInError>> {
+            Unsubscribed.start_sign_in(host, request)
+        }
+
+        fn sign_in_status(&self, sign_in_ref: &str) -> Result<SignInStatus, SignInError> {
+            Unsubscribed.sign_in_status(sign_in_ref)
+        }
+
+        fn submit_sign_in_code(
+            &self,
+            host: Arc<dyn ModelHost>,
+            sign_in_ref: String,
+            code: String,
+        ) -> SignInFuture<Result<SubmitCodeResult, SignInError>> {
+            Unsubscribed.submit_sign_in_code(host, sign_in_ref, code)
+        }
+
+        fn cancel_sign_in(&self, host: &dyn ModelHost, sign_in_ref: &str) -> bool {
+            Unsubscribed.cancel_sign_in(host, sign_in_ref)
+        }
+
+        fn pending_sign_ins(&self) -> Vec<PendingSignIn> {
+            Unsubscribed.pending_sign_ins()
+        }
+    }
+
     /// The stand-in PKCE verifier every scripted sign-in holds.
     pub const SIGN_IN_VERIFIER: &str = "pkce-verifier-never-shown";
     /// What a scripted Claude sign-in reports on completion.

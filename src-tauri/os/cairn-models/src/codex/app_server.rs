@@ -9,6 +9,8 @@ use serde_json::{json, Value};
 
 use cairn_platform::services::process::{ChildProcess, ProcessSpawner, SpawnConfig};
 
+use crate::interface::session::ServerReply;
+
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 type PendingMap = HashMap<u64, Sender<Result<Value, String>>>;
@@ -269,6 +271,14 @@ impl AppServerClient {
         }))
     }
 
+    /// Answer the server request `id` with `reply`.
+    pub fn reply(&self, id: &Value, reply: ServerReply) -> Result<(), String> {
+        match reply {
+            ServerReply::Result(result) => self.respond(id, result),
+            ServerReply::Error { code, message } => self.respond_error(id, code, &message),
+        }
+    }
+
     /// Force the app-server transport closed.
     ///
     /// Normal user Stop uses `turn/interrupt`, which hard-aborts the active turn
@@ -381,5 +391,58 @@ mod tests {
         )
         .expect("app-server should spawn");
         drop(client);
+    }
+
+    /// Every line written to the app-server's stdin.
+    struct Written(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Written {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_reply_is_sent_as_a_json_rpc_result_or_error() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let client = AppServerClient {
+            child: Arc::new(Mutex::new(None)),
+            writer: Arc::new(Mutex::new(Some(Box::new(Written(written.clone()))))),
+            next_id: Arc::new(Mutex::new(1)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            notification_rx: unbounded().1,
+            mcp_servers: Vec::new(),
+        };
+
+        client
+            .reply(&json!(42), ServerReply::Result(json!({"ok": true})))
+            .unwrap();
+        client
+            .reply(
+                &json!("req-7"),
+                ServerReply::Error {
+                    code: -32000,
+                    message: "refused".to_string(),
+                },
+            )
+            .unwrap();
+
+        let written = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let lines: Vec<Value> = written
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                json!({"jsonrpc": "2.0", "id": 42, "result": {"ok": true}}),
+                json!({"jsonrpc": "2.0", "id": "req-7",
+                    "error": {"code": -32000, "message": "refused"}}),
+            ]
+        );
     }
 }

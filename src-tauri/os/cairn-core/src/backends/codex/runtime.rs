@@ -2,7 +2,6 @@ use super::permissions::{
     decline_codex_native_file_change, handle_codex_approval_request,
     handle_codex_mcp_server_elicitation_request,
 };
-use super::refresh_codex_tokens_for_session;
 use super::CodexBackend;
 use crate::agent_process::completion::SessionTurnCompletion;
 use crate::agent_process::stream::TranscriptEvent;
@@ -12,6 +11,7 @@ use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::storage::{LocalDb, RowExt};
 use cairn_models::codex::app_server::AppServerClient;
+use cairn_models::codex::token_requests::token_request_reply;
 use cairn_models::codex::tokens::CodexAuthState;
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
@@ -493,40 +493,11 @@ impl CodexHost for CodexReaderHost {
             .client
             .as_ref()
             .ok_or_else(|| "Codex reader has no transport".to_string())?;
-        let oauth_state = &self.oauth_state;
         let orch = &self.session.orch;
-        if let Some(state_arc) = oauth_state.as_ref() {
-            match refresh_codex_tokens_for_session(orch, state_arc) {
-                Ok(new_tokens) => {
-                    if let Some(account_id) = new_tokens.chatgpt_account_id {
-                        client.respond(
-                            id_value,
-                            serde_json::json!({
-                                "accessToken": new_tokens.access_token,
-                                "chatgptAccountId": account_id,
-                            }),
-                        )
-                    } else {
-                        client.respond_error(
-                                                id_value,
-                                                -32000,
-                                                "Codex token refresh did not provide a ChatGPT account id; reconnect that account from Settings → Providers",
-                                            )
-                    }
-                }
-                // The authority has already named the
-                // account and graded the failure; wrapping a
-                // reconnect instruction around it would undo
-                // that.
-                Err(err) => client.respond_error(id_value, -32000, &err.operator_message()),
-            }
-        } else {
-            client.respond_error(
-                                    id_value,
-                                    -32000,
-                                    "Codex OAuth tokens unavailable; connect a ChatGPT account from Settings → Providers",
-                                )
-        }
+        client.reply(
+            id_value,
+            token_request_reply(orch, orch.subscriptions(), self.oauth_state.as_ref()),
+        )
     }
     fn capture_output(&self, value: Value) {
         let orch = &self.session.orch;

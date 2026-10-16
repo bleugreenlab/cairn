@@ -64,9 +64,9 @@ impl std::error::Error for OneShotError {}
 
 const TOOL_ATTEMPT: &str = "tool-free response attempted a tool/approval";
 
-/// A token refresh is not a tool: a pooled thread's is answered by its pool,
-/// and one that reaches a one-shot is declined and the turn goes on.
-const AUTH_REFRESH: &str = "account/chatgptAuthTokens/refresh";
+// A token refresh is not a tool: a pooled thread's is answered by its pool,
+// and one that reaches a one-shot is declined and the turn goes on.
+use crate::wire::codex_app_server::AUTH_TOKENS_REFRESH_METHOD as AUTH_REFRESH;
 
 fn kill(process: &ProcessHandle) {
     if let Ok(mut guard) = process.lock() {

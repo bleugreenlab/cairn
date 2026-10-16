@@ -1127,21 +1127,6 @@ mod goal_status_tests {
     }
 }
 
-/// Renew a session's managed credential through the installed subscription
-/// support, and adopt the result. The session's view never advances past what
-/// the credential store durably holds.
-pub(super) fn refresh_codex_tokens_for_session(
-    orch: &crate::orchestrator::Orchestrator,
-    state_arc: &std::sync::Arc<std::sync::Mutex<cairn_models::codex::tokens::CodexAuthState>>,
-) -> Result<
-    cairn_models::codex::tokens::CodexOAuthTokens,
-    cairn_models::codex::tokens::CodexRefreshFailure,
-> {
-    cairn_models::codex::tokens::refresh_session_tokens(orch, state_arc, |request| {
-        orch.subscriptions().refresh_codex(orch, request)
-    })
-}
-
 /// Cairn's own `CODEX_HOME`, `~/.cairn/codex`, shared by every Codex process
 /// Cairn spawns so the user's `~/.codex` is never read (see
 /// `cairn_models::session::codex::home`).
