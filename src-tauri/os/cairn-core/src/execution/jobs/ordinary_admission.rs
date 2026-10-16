@@ -847,6 +847,7 @@ fn start_leased(
     let run_id = snapshot.run_id.clone();
     let session_id = snapshot.session_id.clone();
     let job_id = snapshot.job_id.clone();
+    let turn_id = snapshot.turn_id.clone();
     let result = start_leased_inner(orch, &lease, snapshot);
     if let Err(error) = &result {
         // Enqueue already returned success to the launch source, so nothing
@@ -866,8 +867,21 @@ fn start_leased(
             let orch = orch.clone();
             let job_id = job_id.clone();
             let error = error.clone();
+            let turn_id = turn_id.clone();
+            let run_id = run_id.clone();
             run_db(async move {
-                super::mark_job_start_failed(&orch, &owning, &job_id, &error, false).await;
+                if crate::orchestrator::wakes::restore_provider_hold_after_admission_failure(
+                    &orch, &owning, &turn_id, chrono::Utc::now().timestamp(),
+                ).await? {
+                    // The process launch failed, but its provider-held work did
+                    // not. Record the physical failure without a work verdict.
+                    owning.execute(
+                        "UPDATE runs SET status='crashed', error_message=?1, exit_reason='session_start_failed', updated_at=?2 WHERE id=?3",
+                        cairn_db::turso::params![error, chrono::Utc::now().timestamp(), run_id],
+                    ).await.map_err(|error| error.to_string())?;
+                } else {
+                    super::mark_job_start_failed(&orch, &owning, &job_id, &error, false).await;
+                }
                 Ok::<(), String>(())
             })
         });

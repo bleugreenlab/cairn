@@ -33,7 +33,7 @@ pub(crate) use backend_turn::{
 
 pub(crate) use child_stall::{render_stall_push_body, sweep_stalled_children};
 pub(crate) use common::set_exit_reason;
-pub use finalize::{fail_run, finalize_run, transition_to_warm_state};
+pub use finalize::{fail_run, finalize_run, transition_to_warm_state, warm_provider_held_run};
 pub(crate) use finalize::{
     finalize_run_for_operator_compact, finalize_run_for_recovery,
     interrupt_run_for_provider_depletion, memory_review_turn_ended, record_run_failure_if_active,

@@ -47,7 +47,8 @@ use cairn_models::types::catalog::DiscoveredModel;
 
 use cairn_session::backends::claude::*;
 pub use cairn_session::backends::claude::{
-    claude_call_concurrency_ceiling, CLAUDE_CALL_MAX_CONCURRENCY,
+    claude_call_concurrency_ceiling, dispatch_claude_result, ClaudeResultContext,
+    CLAUDE_CALL_MAX_CONCURRENCY,
 };
 
 /// Refusal shown only when no Claude credential is configured.
@@ -235,6 +236,387 @@ mod tests {
     }
 }
 
+/// Parse only the CLI's known limit sentence. Callers must first establish an
+/// actual terminal HTTP 429; arbitrary error prose is not retry evidence.
+fn parse_claude_reset_boundary(text: &str, now: i64) -> Option<i64> {
+    let clause = [
+        "You've hit your session limit",
+        "You've hit your usage limit",
+        "You've hit your weekly limit",
+    ]
+    .into_iter()
+    .find_map(|prefix| text.trim().strip_prefix(prefix))?
+    .trim()
+    .strip_prefix('·')?
+    .trim()
+    .strip_prefix("resets ")?;
+    let (clock, zone) = match clause.split_once(" (") {
+        Some((clock, zone)) => (clock, Some(zone.strip_suffix(')')?)),
+        None => (clause, None),
+    };
+    let (digits, meridiem) = if let Some(clock) = clock.strip_suffix("am") {
+        (clock, Some(false))
+    } else if let Some(clock) = clock.strip_suffix("pm") {
+        (clock, Some(true))
+    } else {
+        (clock, None)
+    };
+    let (hour, minute) = match digits.split_once(':') {
+        Some((hour, minute)) if minute.len() == 2 => (hour, minute),
+        None if meridiem.is_some() => (digits, "00"),
+        _ => return None,
+    };
+    if hour.is_empty()
+        || hour.len() > 2
+        || !hour
+            .bytes()
+            .chain(minute.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut hour: u32 = hour.parse().ok()?;
+    let minute: u32 = minute.parse().ok()?;
+    if let Some(pm) = meridiem {
+        if !(1..=12).contains(&hour) {
+            return None;
+        }
+        hour = hour % 12 + if pm { 12 } else { 0 };
+    }
+    let time = chrono::NaiveTime::from_hms_opt(hour, minute, 0)?;
+    match zone {
+        Some(zone) => next_reset_in_zone(time, now, zone.parse::<chrono_tz::Tz>().ok()?),
+        None => next_reset_in_zone(time, now, chrono::Local),
+    }
+}
+
+fn next_reset_in_zone<T: chrono::TimeZone>(
+    time: chrono::NaiveTime,
+    now: i64,
+    zone: T,
+) -> Option<i64> {
+    use chrono::TimeZone;
+    let today = chrono::Utc
+        .timestamp_opt(now, 0)
+        .single()?
+        .with_timezone(&zone)
+        .date_naive();
+    let latest = now.checked_add(7 * 24 * 60 * 60)?;
+    for days in 0..=7 {
+        let date = today.checked_add_days(chrono::Days::new(days))?;
+        let local = zone.from_local_datetime(&date.and_time(time));
+        // On a fall-back day both wall-clock occurrences are possible; use the
+        // earliest still-future one. A skipped spring-forward time is not guessed.
+        let candidates = match local {
+            chrono::LocalResult::Single(value) => vec![value.timestamp()],
+            chrono::LocalResult::Ambiguous(a, b) => vec![a.timestamp(), b.timestamp()],
+            chrono::LocalResult::None => return None,
+        };
+        if let Some(at) = candidates
+            .into_iter()
+            .filter(|at| *at > now && *at <= latest)
+            .min()
+        {
+            return Some(at);
+        }
+    }
+    None
+}
+
+fn hold_claude_provider_limit(
+    host: &ClaudeReaderHost,
+    data: &serde_json::Value,
+    depletion: ProviderDepletion,
+    block_recorded: bool,
+    blocking_reset: Option<i64>,
+    now: i64,
+) -> Result<bool, String> {
+    use crate::orchestrator::wakes::{yield_and_arm_provider_limit_hold, ProviderLimitObservation};
+    let text = data.get("result").and_then(serde_json::Value::as_str);
+    let parsed = text.and_then(|text| parse_claude_reset_boundary(text, now));
+    let (reset, source) = if let Some(reset) = blocking_reset {
+        (Some(reset), "rate_limit_event")
+    } else if let Some(reset) = parsed {
+        (Some(reset), "result_text")
+    } else {
+        (None, "unknown")
+    };
+    let credits = matches!(depletion, ProviderDepletion::Credits);
+    // Fail over before holding: a limit on one account is a reason to wait only
+    // when no other eligible account can take the work. The declared reset is
+    // the account's quarantine either way.
+    let rotation = rotate_depleted_account(
+        &host.orch,
+        &host.run_db,
+        &host.run_id,
+        host.session_id.as_deref(),
+        if credits {
+            ProviderDepletion::Credits
+        } else {
+            ProviderDepletion::RollingWindow { resets_at: reset }
+        },
+        block_recorded,
+    );
+    let quarantined = rotation.is_some();
+    let switched_to = rotation
+        .as_ref()
+        .and_then(|rotation| rotation.replacement.clone());
+    let explicitly_pinned = rotation
+        .as_ref()
+        .is_some_and(|rotation| rotation.explicitly_pinned);
+    let (reset, source) = if switched_to.is_some() {
+        (Some(now), "account_switch")
+    } else if credits {
+        // Credits do not refill on a clock Cairn can see.
+        (None, "credits_depleted")
+    } else {
+        (reset, source)
+    };
+    let db = host.run_db.clone();
+    let run = host.run_id.clone();
+    let (job_id, turn_id, pinned_account) = run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT r.job_id, t.id, s.account_id FROM runs r
+                 JOIN turns t ON t.run_id = r.id
+                 LEFT JOIN sessions s ON s.id = r.session_id
+                 WHERE r.id = ?1 ORDER BY t.sequence DESC LIMIT 1",
+                        (run.as_str(),),
+                    )
+                    .await?;
+                let row = rows
+                    .next()
+                    .await?
+                    .ok_or_else(|| DbError::internal("provider hold has no owning turn"))?;
+                Ok((row.text(0)?, row.text(1)?, row.opt_text(2)?))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
+    })?;
+    // The session pin may already name the replacement; the hold belongs to the
+    // account that was refused.
+    let account_id = rotation
+        .as_ref()
+        .map(|rotation| rotation.target.account_id.clone())
+        .or_else(|| host.orch.process_state.get_account_id(&host.run_id))
+        .or(pinned_account);
+    // Hold even when no account is registered: identity uncertainty is not success.
+    let observation = ProviderLimitObservation {
+        job_id,
+        run_id: host.run_id.clone(),
+        turn_id: turn_id.clone(),
+        backend: "claude".to_string(),
+        account_id: account_id.clone(),
+        retry_not_before: reset,
+        boundary_source: source.to_string(),
+        observed_text: text.map(str::to_string),
+        now,
+    };
+    let db = host.run_db.clone();
+    let emitter = host.orch.services.emitter.clone();
+    let held_turn = turn_id.clone();
+    let armed = run_backend_db(CLAUDE_BACKEND_NAME, async move {
+        let hold = yield_and_arm_provider_limit_hold(&db, observation).await?;
+        let change = cairn_db::changes::turn_db_change_for_id(&db, &held_turn, "update").await;
+        let _ = emitter.emit("db-change", change);
+        Ok::<_, String>(hold)
+    });
+    let hold = match armed {
+        Ok(hold) => hold,
+        Err(error) => {
+            // Neither the yield nor its hold landed. Settle the turn the way an
+            // exhausted account does: unfinished and resumable on an explicit
+            // continuation, never a completion and never an unowned yield.
+            crate::orchestrator::lifecycle::interrupt_run_for_provider_depletion(
+                &host.orch,
+                &host.run_id,
+            );
+            return Err(error);
+        }
+    };
+    crate::orchestrator::lifecycle::warm_provider_held_run(&host.orch, &host.run_id);
+    // The warm process carries the exhausted account's credentials; the resumed
+    // turn must cold-start on the replacement pin.
+    if switched_to.is_some()
+        && matches!(
+            host.orch.process_state.get_occupancy(&host.run_id),
+            Some(crate::agent_process::process::RunOccupancy::Idle)
+        )
+    {
+        crate::orchestrator::lifecycle::release_and_stop_process(&host.orch, &host.run_id);
+    }
+    if hold.observed_count == 1 {
+        let account = rotation
+            .as_ref()
+            .map(|rotation| rotation.old_label.clone())
+            .unwrap_or_else(|| "Claude".to_string());
+        let stamp = |at: i64| crate::clock::stamp(at).unwrap_or_else(|| at.to_string());
+        let content = if let Some((_, to)) = &switched_to {
+            format!("{account} reached its usage limit. Switched this session to {to}; the unfinished work will continue on it automatically.")
+        } else if explicitly_pinned {
+            let why = if credits {
+                "has no usage credits left"
+            } else {
+                "reached its usage limit"
+            };
+            match reset {
+                Some(at) => format!("The Claude account chosen for this execution, {account}, {why}. Work is held until its reset at {}, then will continue automatically. To resume sooner, choose another account or Automatic, then continue.", stamp(at)),
+                None => format!("The Claude account chosen for this execution, {account}, {why}. Work remains held; choose another account or Automatic, then continue."),
+            }
+        } else {
+            let none_left = if quarantined {
+                " and no other eligible Claude account is available"
+            } else {
+                ""
+            };
+            match reset {
+                _ if credits => format!("{account} has no usage credits left{none_left}. Work remains held until an operator continues it."),
+                Some(at) => format!("{account} reached its usage limit{none_left}. Work is held until the provider reset at {}, then will continue automatically.", stamp(at)),
+                None => format!("{account} reached its usage limit{none_left}, without a readable reset time. Work remains held until an operator continues it."),
+            }
+        };
+        let (to_id, to_label) = switched_to.clone().unzip();
+        crate::messages::transcript::insert_system_message_sync(
+            &host.orch,
+            &host.run_id,
+            host.session_id.as_deref(),
+            Some(&turn_id),
+            &content,
+            serde_json::json!({"provider":"claude","kind":"provider_limit_hold",
+                "retryNotBefore":reset,"boundarySource":source,
+                "depletionKind": if credits { "credits" } else { "rolling_window" },
+                "fromAccountId":account_id,
+                "fromAccountLabel":rotation.as_ref().map(|rotation| rotation.old_label.clone()),
+                "toAccountId":to_id,"toAccountLabel":to_label,
+                "explicitlyPinned":explicitly_pinned}),
+        )?;
+    }
+    Ok(quarantined)
+}
+
+#[cfg(test)]
+mod reset_boundary_tests {
+    use super::parse_claude_reset_boundary as parse;
+    use chrono::{TimeZone, Timelike};
+
+    #[test]
+    fn recorded_reset_resolves_in_the_declared_zone() {
+        assert_eq!(
+            parse(
+                "You've hit your session limit · resets 2:40pm (America/New_York)",
+                1788545269
+            ),
+            Some(1788547200)
+        );
+        assert_eq!(
+            parse(
+                "You've hit your session limit · resets 2:40pm (America/Los_Angeles)",
+                1788545269
+            ),
+            Some(1788558000)
+        );
+        assert_eq!(
+            parse(
+                "You've hit your usage limit · resets 14:40 (America/New_York)",
+                1788545269
+            ),
+            Some(1788547200)
+        );
+    }
+
+    #[test]
+    fn missing_zone_uses_host_wall_clock() {
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 9, 4, 10, 0, 0)
+            .single()
+            .unwrap();
+        let result = parse(
+            "You've hit your session limit · resets 11am",
+            now.timestamp(),
+        )
+        .unwrap();
+        let local = chrono::Local.timestamp_opt(result, 0).single().unwrap();
+        assert_eq!(local.date_naive(), now.date_naive());
+        assert_eq!(local.hour(), 11);
+    }
+
+    #[test]
+    fn elapsed_reset_rolls_to_the_next_day_and_noon_midnight_are_distinct() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 4, 14, 0, 0)
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            parse("You've hit your session limit · resets 12am (UTC)", now),
+            Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 9, 5, 0, 0, 0)
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        assert_eq!(
+            parse("You've hit your session limit · resets 12pm (UTC)", now),
+            Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 9, 5, 12, 0, 0)
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+    }
+
+    #[test]
+    fn arbitrary_prose_invalid_clock_and_unknown_zone_are_uncertainty() {
+        for text in [
+            "You've hit your usage limit",
+            "An arbitrary error resets 2:40pm (America/New_York)",
+            "You've hit your session limit · resets 25:00 (UTC)",
+            "You've hit your session limit · resets 0pm (UTC)",
+            "You've hit your session limit · resets 1:5pm (UTC)",
+            "You've hit your session limit · resets 2:60pm (UTC)",
+            "You've hit your session limit · resets 2pm (Unknown/Zone)",
+            "You've hit your session limit · resets 2pm (UTC) extra",
+        ] {
+            assert_eq!(parse(text, 1788545269), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn ambiguous_reset_uses_next_occurrence_and_skipped_time_is_unknown() {
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 11, 1, 5, 45, 0)
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            parse(
+                "You've hit your session limit · resets 1:30am (America/New_York)",
+                now
+            ),
+            Some(
+                chrono::Utc
+                    .with_ymd_and_hms(2026, 11, 1, 6, 30, 0)
+                    .unwrap()
+                    .timestamp()
+            )
+        );
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 3, 8, 6, 0, 0)
+            .unwrap()
+            .timestamp();
+        assert_eq!(
+            parse(
+                "You've hit your session limit · resets 2:30am (America/New_York)",
+                now
+            ),
+            None
+        );
+    }
+}
+
 /// Whether a stored `runs.status` names a run that still owns its process.
 /// Parsed through [`RunStatus`] so legacy spellings map to their canonical
 /// state and no status literal is compared here.
@@ -399,16 +781,31 @@ fn account_label(accounts: &[crate::credentials::AccountInfo], account_id: &str)
 /// `health_recorded` is true when this turn's blocking `rate_limit_event`
 /// already recorded the provider's own block, which a reset-less re-probe
 /// quarantine must not overwrite.
-fn handle_provider_depletion(
+/// What depletion bookkeeping did to a run's account: the depleted account's
+/// health is recorded, and the session is repinned to a replacement when routing
+/// policy allows one and an eligible account remains.
+struct AccountRotation {
+    target: RateLimitRetryTarget,
+    old_label: String,
+    /// `(account id, label)` the session is now pinned to.
+    replacement: Option<(String, String)>,
+    explicitly_pinned: bool,
+}
+
+/// Record a depleted account's health, then repin the session away from it.
+/// Health is written first so routing already sees the account as unavailable
+/// when it picks the replacement. `None` when the run has no account or the
+/// bookkeeping could not be persisted.
+fn rotate_depleted_account(
     orch: &Orchestrator,
     run_db: &Arc<LocalDb>,
     run_id: &str,
     session_id: Option<&str>,
     depletion: ProviderDepletion,
     health_recorded: bool,
-) -> bool {
+) -> Option<AccountRotation> {
     let Ok(Some(target)) = rate_limit_retry_target(orch, run_db, run_id, session_id) else {
-        return false;
+        return None;
     };
     let persisted = match depletion {
         ProviderDepletion::Credits => orch
@@ -430,7 +827,7 @@ fn handle_provider_depletion(
     };
     if let Err(error) = persisted {
         log::warn!("Failed to persist Claude account depletion: {error}");
-        return false;
+        return None;
     }
 
     let accounts = orch.list_accounts(target.project_id.as_deref());
@@ -456,7 +853,7 @@ fn handle_provider_depletion(
             )
         })
         .flatten();
-    let (replacement_id, replacement_label) = if let Some((replacement_id, _)) = replacement {
+    let replacement = if let Some((replacement_id, _)) = replacement {
         let repinned = crate::storage::run_db_blocking({
             let db = run_db.clone();
             let session_id = target.session_id.clone();
@@ -475,7 +872,7 @@ fn handle_provider_depletion(
         match repinned {
             Ok(true) => {
                 let label = account_label(&accounts, &replacement_id);
-                (Some(replacement_id), Some(label))
+                Some((replacement_id, label))
             }
             // A concurrent repin won; report the durable winner.
             Ok(false) => {
@@ -486,17 +883,45 @@ fn handle_provider_depletion(
                 })
                 .ok()
                 .and_then(|session| session.account_id);
-                let winner_label = winner.as_deref().map(|id| account_label(&accounts, id));
-                (winner, winner_label)
+                winner.map(|id| {
+                    let label = account_label(&accounts, &id);
+                    (id, label)
+                })
             }
             Err(error) => {
                 log::warn!("Failed to atomically repin depleted Claude account: {error}");
-                return false;
+                return None;
             }
         }
     } else {
-        (None, None)
+        None
     };
+    Some(AccountRotation {
+        target,
+        old_label,
+        replacement,
+        explicitly_pinned,
+    })
+}
+
+fn handle_provider_depletion(
+    orch: &Orchestrator,
+    run_db: &Arc<LocalDb>,
+    run_id: &str,
+    session_id: Option<&str>,
+    depletion: ProviderDepletion,
+    health_recorded: bool,
+) -> bool {
+    let Some(AccountRotation {
+        target,
+        old_label,
+        replacement,
+        explicitly_pinned,
+    }) = rotate_depleted_account(orch, run_db, run_id, session_id, depletion, health_recorded)
+    else {
+        return false;
+    };
+    let (replacement_id, replacement_label) = replacement.unzip();
 
     let kind = match depletion {
         ProviderDepletion::Credits => "credits",
@@ -2319,6 +2744,24 @@ impl ClaudeHost for ClaudeReaderHost {
             block_recorded,
         )
     }
+    fn provider_limit_result(
+        &self,
+        data: &serde_json::Value,
+        depletion: ProviderDepletion,
+        block_recorded: bool,
+        blocking_reset: Option<i64>,
+        now: i64,
+    ) -> bool {
+        let result =
+            hold_claude_provider_limit(self, data, depletion, block_recorded, blocking_reset, now);
+        if let Err(error) = &result {
+            // A failed durable write must never fall through to successful completion.
+            self.error(&format!(
+                "Could not persist the provider limit hold: {error}. Work remains unfinished."
+            ));
+        }
+        result.unwrap_or(false)
+    }
     fn context_snapshot(&self, snapshot: ContextTokenState) {
         self.orch.store_context_token_snapshot(snapshot);
     }
@@ -2507,7 +2950,7 @@ fn settle_active_run_as_crashed(
     }
 }
 
-fn claude_runtime(
+pub fn claude_runtime(
     orch: &Orchestrator,
     emitter: &Arc<dyn crate::services::EventEmitter>,
     run_id: &str,

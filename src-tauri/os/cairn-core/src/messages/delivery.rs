@@ -166,9 +166,9 @@ pub(crate) fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
     run_db_blocking(move || async move { head_turn_active(db, &job_id).await }).unwrap_or(false)
 }
 
-/// A yielded head turn carrying one of these reasons means the agent is blocked
-/// on its OWN pending work and is therefore self-suspended — not idle, and not
-/// wakeable by any external push. The set is exhaustive over `TurnYieldReason`
+/// These yielded turns have an owner for their resumption: pending agent work,
+/// a safety pause, or a provider-capacity hold. External pushes cannot resolve
+/// that wait; explicit operator continuation remains authoritative. The set is exhaustive over `TurnYieldReason`
 /// (`models::turn`): a sub-agent task/batch wait or a dependency wait yields
 /// `dependency_wait`, the agent's own open question/prompt yields `user_input`,
 /// and its own pending permission yields `permission`. Verify against the writers
@@ -177,7 +177,12 @@ pub(crate) fn head_turn_active_sync(db: &LocalDb, job_id: &str) -> bool {
 fn is_self_suspend_reason(reason: &str) -> bool {
     matches!(
         reason,
-        "user_input" | "permission" | "dependency_wait" | "wait" | "safety_pause"
+        "user_input"
+            | "permission"
+            | "dependency_wait"
+            | "wait"
+            | "safety_pause"
+            | "provider_limit"
     )
 }
 
@@ -1166,7 +1171,13 @@ mod tests {
 
         // Every durable-wait yield is a self-suspend: an own task/dependency
         // wait, an own question, an own permission, and a `waitFor` / long `run`.
-        for reason in ["dependency_wait", "user_input", "permission", "wait"] {
+        for reason in [
+            "dependency_wait",
+            "user_input",
+            "permission",
+            "wait",
+            "provider_limit",
+        ] {
             set_head_turn(&db, "job-1", "yielded", Some(reason)).await;
             assert_eq!(
                 head_turn(&db, "job-1").await.unwrap(),
@@ -1222,6 +1233,22 @@ mod tests {
             still_pending.len(),
             1,
             "the gated wake push stays queued to ride along on the next resume"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn provider_limit_hold_defers_external_waking_push() {
+        let db = migrated_db().await;
+        seed_run(&db, "run-1", "job-1").await;
+        seed_waking_push(&db, "job-1").await;
+        set_head_turn(&db, "job-1", "yielded", Some("provider_limit")).await;
+        assert!(collect_pending_for_flush(&db, "run-1").is_none());
+        assert_eq!(
+            crate::orchestrator::attention_push::list_pending(&db, "job-1")
+                .await
+                .unwrap()
+                .len(),
+            1
         );
     }
 

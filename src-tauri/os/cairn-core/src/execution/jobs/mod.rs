@@ -46,6 +46,12 @@ pub(crate) use private_lane::{
     describe_job_launch, describe_lane, describe_shortfall, private_lane_budgets,
     promote_private_lanes_blocking, withdraw_orphaned_ordinary_admissions, PrivateLaneLedger,
 };
+/// Drive queued private admission deterministically without a scheduler task.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn promote_private_lanes_for_test(orch: &Orchestrator) {
+    private_lane::promote_private_lanes_blocking(orch);
+}
+
 mod team_admission_lifecycle;
 #[cfg(test)]
 pub(crate) use persistence::prepare_session_for_test;

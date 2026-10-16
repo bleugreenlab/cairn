@@ -250,7 +250,11 @@ pub async fn turn_facts(conn: &cairn_db::turso::Connection, job_id: &str) -> DbR
                (SELECT state FROM turns
                 WHERE job_id = ?1 AND start_reason != 'memory_review'
                   AND state IN ('complete', 'failed')
-                ORDER BY created_at DESC, sequence DESC LIMIT 1)",
+                ORDER BY created_at DESC, sequence DESC LIMIT 1),
+               EXISTS (
+                 SELECT 1 FROM jobs j JOIN turns t ON t.id=j.current_turn_id AND t.job_id=j.id
+                 WHERE j.id=?1 AND t.state='yielded' AND t.yield_reason='provider_limit'
+               )",
             (job_id,),
         )
         .await?;
@@ -258,8 +262,20 @@ pub async fn turn_facts(conn: &cairn_db::turso::Connection, job_id: &str) -> DbR
         return Ok(TurnFacts::default());
     };
     let state = |raw: Option<String>| raw.and_then(|s| s.parse::<TurnState>().ok());
-    let work_state = state(row.opt_text(0)?);
-    let latest_state = state(row.opt_text(1)?);
+    // An unserved launch remains as a cancelled audit row after the provider
+    // resolver restores its yielded head. That newer row is not new work and
+    // must not hide the explicitly owned, still-live head.
+    let provider_held = row.i64(3)? != 0;
+    let work_state = if provider_held {
+        Some(TurnState::Yielded)
+    } else {
+        state(row.opt_text(0)?)
+    };
+    let latest_state = if provider_held {
+        Some(TurnState::Yielded)
+    } else {
+        state(row.opt_text(1)?)
+    };
     let outcome_state = state(row.opt_text(2)?);
     Ok(TurnFacts {
         work_state,
@@ -1897,6 +1913,31 @@ mod gate_tests {
             condition_config: None,
             decision_config: None,
             context_config: None,
+        }
+    }
+
+    #[test]
+    fn provider_yield_is_live_work_without_an_authoritative_outcome() {
+        let turn = TurnFacts {
+            work_state: Some(TurnState::Yielded),
+            live: true,
+            ..Default::default()
+        };
+        assert!(!turn.has_work_outcome());
+        for active_run in [false, true] {
+            let facts = JobFacts {
+                dag_ready: true,
+                upstream_failed: false,
+                live_turn: turn.work_live(active_run),
+                turn_failed: matches!(turn.work_state, Some(TurnState::Failed)),
+                turn_complete: matches!(turn.work_state, Some(TurnState::Complete)),
+                checkpoint: CheckpointGate::None,
+                resolution: Resolution::Confirmed,
+                requires_output: true,
+                artifact_present: true,
+                long_running: false,
+            };
+            assert_eq!(derive_job_status(&facts), JobStatus::Running);
         }
     }
 

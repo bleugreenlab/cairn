@@ -69,6 +69,12 @@ pub(crate) async fn delete_owned_jobs(
     )
     .await?;
 
+    conn.execute(
+        &format!("DELETE FROM provider_limit_holds WHERE job_id IN ({jobs}) OR run_id IN ({runs})"),
+        params![owner_id],
+    )
+    .await?;
+
     for table in ["events", "prompts", "permission_requests"] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE run_id IN ({runs})"),

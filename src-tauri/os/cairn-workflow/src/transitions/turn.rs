@@ -124,6 +124,32 @@ pub async fn yield_turn(
     Ok(())
 }
 
+/// Yield a running turn inside the caller's write transaction, so whatever owns
+/// the wait can be recorded atomically with the yielded head. Returns whether the
+/// turn was running; the caller decides whether any other state is acceptable.
+pub async fn yield_running_turn_conn(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+    reason: TurnYieldReason,
+    now: i64,
+) -> crate::storage::DbResult<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE turns
+             SET state = ?1, yield_reason = ?2, end_reason = NULL, ended_at = ?3, updated_at = ?3
+             WHERE id = ?4 AND state = ?5",
+            params![
+                TurnState::Yielded.to_string(),
+                reason.to_string(),
+                now,
+                turn_id,
+                TurnState::Running.to_string()
+            ],
+        )
+        .await?;
+    Ok(changed > 0)
+}
+
 pub async fn interrupt_turn(
     db: &LocalDb,
     turn_id: &str,

@@ -416,6 +416,13 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                     log::error!("Failed to load thread automations: {error}");
                     Vec::new()
                 });
+        let mut provider_holds = Vec::new();
+        for db in orch.db.all_dbs().await {
+            match crate::orchestrator::wakes::load_active_provider_limit_holds(&db).await {
+                Ok(holds) => provider_holds.extend(holds),
+                Err(error) => log::error!("Failed to load provider limit holds: {error}"),
+            }
+        }
         let now = Utc::now();
 
         // Compute every recipe's next fire time up front and keep the WHOLE
@@ -444,6 +451,10 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             .iter()
             .map(|(_, fire)| *fire)
             .chain(next_wake_due)
+            .chain(provider_holds.iter().filter_map(|hold| {
+                hold.next_due_at()
+                    .and_then(|at| DateTime::<Utc>::from_timestamp(at, 0))
+            }))
             .chain(
                 automations
                     .iter()
@@ -490,6 +501,21 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                     .await
             {
                 log::error!("Failed to fire wake schedule '{}': {}", schedule.id, error);
+                fire_error = true;
+            }
+        }
+        for hold in provider_holds {
+            if hold.due_at(wake.timestamp()).is_none() {
+                continue;
+            }
+            if let Err(error) = crate::orchestrator::wakes::resolve_provider_limit_hold(
+                &orch,
+                &hold,
+                wake.timestamp(),
+            )
+            .await
+            {
+                log::error!("Failed to resolve provider hold '{}': {error}", hold.id);
                 fire_error = true;
             }
         }

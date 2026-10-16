@@ -94,6 +94,7 @@ pub enum TurnYieldReason {
     DependencyWait,
     Wait,
     SafetyPause,
+    ProviderLimit,
 }
 
 impl std::fmt::Display for TurnYieldReason {
@@ -104,6 +105,7 @@ impl std::fmt::Display for TurnYieldReason {
             TurnYieldReason::DependencyWait => write!(f, "dependency_wait"),
             TurnYieldReason::Wait => write!(f, "wait"),
             TurnYieldReason::SafetyPause => write!(f, "safety_pause"),
+            TurnYieldReason::ProviderLimit => write!(f, "provider_limit"),
         }
     }
 }
@@ -118,6 +120,7 @@ impl std::str::FromStr for TurnYieldReason {
             "dependency_wait" => Ok(TurnYieldReason::DependencyWait),
             "wait" => Ok(TurnYieldReason::Wait),
             "safety_pause" => Ok(TurnYieldReason::SafetyPause),
+            "provider_limit" => Ok(TurnYieldReason::ProviderLimit),
             _ => Err(format!("Unknown yield reason: {}", s)),
         }
     }
@@ -273,6 +276,17 @@ mod tests {
     }
 
     #[test]
+    fn provider_limit_yield_serializes_as_its_durable_reason() {
+        let reason = TurnYieldReason::ProviderLimit;
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(json, "\"provider_limit\"");
+        assert_eq!(
+            serde_json::from_str::<TurnYieldReason>(&json).unwrap(),
+            reason
+        );
+    }
+
+    #[test]
     fn roundtrip_yield_reason_display_parse() {
         for reason in [
             TurnYieldReason::UserInput,
@@ -280,6 +294,7 @@ mod tests {
             TurnYieldReason::DependencyWait,
             TurnYieldReason::Wait,
             TurnYieldReason::SafetyPause,
+            TurnYieldReason::ProviderLimit,
         ] {
             let s = reason.to_string();
             let parsed: TurnYieldReason = s.parse().unwrap();

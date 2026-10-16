@@ -13,6 +13,21 @@ use super::review_push::{
     detach_onto_runtime, emit_for_turn_end, spawn_checks_settled_edge, spawn_turn_end_checks,
 };
 
+/// Warm a run whose current turn is durably yielded to a provider-owned hold.
+/// The hold's owner writes the yield and the hold together; this only parks the
+/// process and refreshes the projection. The work is unfinished, so it must not
+/// publish a turn-end verdict or check wave. The yielded turn remains the job
+/// head until the hold resolves it.
+pub fn warm_provider_held_run(orch: &Orchestrator, run_id: &str) -> bool {
+    let warmed = orch.process_state.transition_to_warm(run_id);
+    if let Some(job_id) = job_id_for_run(orch, run_id) {
+        if let Err(error) = crate::execution::advancement::recompute_job(orch, &job_id) {
+            log::error!("Failed to recompute yielded job {job_id}: {error}");
+        }
+    }
+    warmed
+}
+
 /// Transition a run to warm state after successful turn completion.
 ///
 /// The Run stays `Live` in the DB — no durable status change.
@@ -910,6 +925,35 @@ fn finalize_run_inner(
         .process_state
         .get_current_turn_id(run_id)
         .or_else(|| current_turn_id_for_run(orch, run_id));
+    let provider_held = if let Some(turn_id) = turn_id.as_deref() {
+        run_db_blocking({
+            let dbs = orch.db.clone();
+            let turn_id = turn_id.to_string();
+            move || async move {
+                let db = crate::execution::routing::owning_db_for_turn(&dbs, &turn_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                db.query_opt_text(
+                    "SELECT id FROM turns WHERE id = ?1 AND state = 'yielded' AND yield_reason = 'provider_limit'",
+                    (turn_id,),
+                ).await.map(|id| id.is_some()).map_err(|error| error.to_string())
+            }
+        })?
+    } else {
+        false
+    };
+    // Eviction ends the physical run, not the held work. In particular it must
+    // not journal a result, publish a check wave, or wake a waiting parent.
+    if provider_held {
+        if !matches!(
+            run_status(orch, run_id).as_deref(),
+            Some("exited" | "crashed")
+        ) {
+            transition_run(orch, run_id, status)?;
+        }
+        crate::execution::jobs::on_call_run_finalized(orch, run_id);
+        return Ok(());
+    }
     let had_active_turn = turn_id.is_some();
     if let Some(ref turn_id) = turn_id {
         if let Some(turn_state) = turn_state(orch, turn_id) {
@@ -1551,6 +1595,22 @@ mod ordering_tests {
     //! parent review. Guarded structurally because the ordering is load-bearing
     //! and a silent reorder would reintroduce the race.
     const SOURCE: &str = include_str!("finalize.rs");
+
+    #[test]
+    fn provider_yield_never_publishes_a_turn_end_wave() {
+        let body = SOURCE
+            .split("pub fn warm_provider_held_run(")
+            .nth(1)
+            .unwrap()
+            .split("pub fn transition_to_warm_state(")
+            .next()
+            .unwrap();
+        assert!(body.contains("transition_to_warm(run_id)"));
+        assert!(body.contains("recompute_job(orch"));
+        assert!(!body.contains("spawn_turn_end_checks("));
+        assert!(!body.contains("spawn_checks_settled_edge("));
+        assert!(!body.contains("emit_for_turn_end("));
+    }
 
     fn assert_spawn_before_recompute(func_signature: &str) {
         let start = SOURCE

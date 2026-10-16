@@ -137,6 +137,22 @@ macro_rules! shared_tail_condition_evaluation_outcome {
     };
 }
 
+/// cairn/4977: a terminal settled because its process was proven gone records
+/// why, since its exit code cannot. `job_terminals` is carried by both lineages,
+/// so the column is written once and composed into both.
+macro_rules! shared_tail_terminal_exit_reason {
+    () => {
+        migration!("0252_terminal_exit_reason")
+    };
+}
+
+// Holds describe unfinished project work, not a runner-local timer.
+macro_rules! shared_tail_provider_limit_holds {
+    () => {
+        migration!("0255_provider_limit_holds")
+    };
+}
+
 /// cairn/4936: an answered permission whose job could not be continued records
 /// why on the request row, so the refusal is visible where the answer is.
 /// `permission_requests` is project-scoped shared state carried by both
@@ -144,15 +160,6 @@ macro_rules! shared_tail_condition_evaluation_outcome {
 macro_rules! shared_tail_permission_resume_error {
     () => {
         migration!("0250_permission_resume_error")
-    };
-}
-
-/// cairn/4977: a terminal settled because its process was proven gone records
-/// why, since its exit code cannot. `job_terminals` is carried by both lineages,
-/// so the column is written once and composed into both.
-macro_rules! shared_tail_terminal_exit_reason {
-    () => {
-        migration!("0252_terminal_exit_reason")
     };
 }
 
@@ -1313,6 +1320,7 @@ macro_rules! team_lineage {
             shared_tail_permission_resume_error!(),
             shared_tail_terminal_exit_reason!(),
             shared_tail_prompt_withdrawal!(),
+            shared_tail_provider_limit_holds!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1571,6 +1579,7 @@ macro_rules! private_lineage {
             shared_tail_terminal_exit_reason!(),
             private_ref_store_maintenance!(),
             shared_tail_prompt_withdrawal!(),
+            shared_tail_provider_limit_holds!(),
         ]
     };
 }
@@ -1969,6 +1978,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("pr_node_port_fires", TableScope::ProjectScoped),
     ("projects", TableScope::ProjectScoped),
     ("prompts", TableScope::ProjectScoped),
+    ("provider_limit_holds", TableScope::ProjectScoped),
     // Which records this install withholds from serving, and why. Private for
     // the same reason as the incident tables above.
     (
@@ -2647,6 +2657,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "run_id", "turn_id", "job_id"],
     },
     RekeyTableManifest {
+        table: "provider_limit_holds",
+        id_columns: &["id", "job_id", "run_id", "turn_id"],
+    },
+    RekeyTableManifest {
         table: "queued_messages",
         id_columns: &["id", "job_id"],
     },
@@ -3230,6 +3244,7 @@ mod tests {
                 "terminal_exit_reason",
                 "ref_store_maintenance",
                 "prompt_withdrawal",
+                "provider_limit_holds",
             ]
         );
         assert_eq!(
@@ -3249,6 +3264,138 @@ mod tests {
             1
         );
         Ok(db)
+    }
+
+    #[tokio::test]
+    async fn provider_limit_holds_enforce_lifecycle_schema_in_both_lineages() {
+        for (team, migrations) in [(false, TURSO_MIGRATIONS), (true, TEAM_MIGRATIONS)] {
+            let temp = tempdir().unwrap();
+            let db = LocalDb::open(temp.path().join("provider-holds.db"))
+                .await
+                .unwrap();
+            MigrationRunner::new(migrations.to_vec())
+                .run(&db)
+                .await
+                .unwrap();
+            if team {
+                db.execute_script(
+                    "INSERT INTO teams(id, name, created_at, updated_at) VALUES ('team', 'Team', 1, 1);
+                     INSERT INTO projects(id, team_id, name, key, repo_path, created_at, updated_at)
+                       VALUES ('project', 'team', 'Project', 'project', '/tmp/project', 1, 1);",
+                ).await.unwrap();
+            } else {
+                db.execute_script(
+                    "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+                       VALUES ('project', 'default', 'Project', 'project', '/tmp/project', 1, 1);",
+                ).await.unwrap();
+            }
+            db.execute_script(
+                "INSERT INTO jobs(id, project_id, status, created_at, updated_at)
+                   VALUES ('job', 'project', 'running', 1, 1);
+                 INSERT INTO runs(id, job_id, created_at, updated_at)
+                   VALUES ('run', 'job', 1, 1);
+                 INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, created_at, updated_at)
+                   VALUES ('turn', 'session', 'run', 'job', 1, 'yielded', 1, 1);",
+            ).await.unwrap();
+            let insert = "INSERT INTO provider_limit_holds
+                (id, job_id, run_id, turn_id, backend, boundary_source, created_at, updated_at)
+                VALUES (?1, 'job', 'run', 'turn', 'claude', 'unknown', 1, 1)";
+            db.execute(insert, ("hold",)).await.unwrap();
+            let defaults = db
+                .query_one(
+                    "SELECT state, observed_count, launch_attempts,
+                        retry_not_before IS NULL, account_id IS NULL, resolved_at IS NULL
+                 FROM provider_limit_holds",
+                    (),
+                    |row| {
+                        Ok((
+                            row.text(0)?,
+                            row.i64(1)?,
+                            row.i64(2)?,
+                            row.i64(3)?,
+                            row.i64(4)?,
+                            row.i64(5)?,
+                        ))
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(defaults, ("active".to_string(), 1, 0, 1, 1, 1));
+            assert!(db.execute(insert, ("duplicate",)).await.is_err());
+            for (index, state) in ["resolved", "cancelled", "superseded"]
+                .into_iter()
+                .enumerate()
+            {
+                db.execute(
+                    "UPDATE provider_limit_holds SET state = ?1 WHERE state = 'active'",
+                    (state,),
+                )
+                .await
+                .unwrap();
+                db.execute(insert, (format!("replacement-{index}"),))
+                    .await
+                    .unwrap();
+            }
+            for source in ["rate_limit_event", "result_text", "unknown"] {
+                db.execute(
+                    "UPDATE provider_limit_holds SET boundary_source = ?1",
+                    (source,),
+                )
+                .await
+                .unwrap();
+            }
+            assert!(db
+                .execute(
+                    "UPDATE provider_limit_holds SET boundary_source = 'guess'",
+                    ()
+                )
+                .await
+                .is_err());
+            assert!(db
+                .execute("UPDATE provider_limit_holds SET state = 'complete'", ())
+                .await
+                .is_err());
+            assert!(db
+                .execute("UPDATE provider_limit_holds SET turn_id = 'missing'", ())
+                .await
+                .is_err());
+            assert!(db
+                .execute("UPDATE provider_limit_holds SET run_id = 'missing'", ())
+                .await
+                .is_err());
+            assert!(db
+                .execute("UPDATE provider_limit_holds SET job_id = 'missing'", ())
+                .await
+                .is_err());
+            db.execute(
+                "UPDATE provider_limit_holds SET retry_not_before = 10 WHERE state = 'active'",
+                (),
+            )
+            .await
+            .unwrap();
+            assert_eq!(query_i64(&db, "SELECT COUNT(*) FROM provider_limit_holds WHERE state = 'active' AND retry_not_before IS NOT NULL AND retry_not_before <= 10").await.unwrap(), 1);
+            let plan = db
+                .query_all(
+                    "EXPLAIN QUERY PLAN SELECT retry_not_before FROM provider_limit_holds
+                 WHERE state = 'active' AND retry_not_before IS NOT NULL
+                 ORDER BY retry_not_before",
+                    (),
+                    |row| row.text(3),
+                )
+                .await
+                .unwrap()
+                .join(" ");
+            assert!(plan.contains("idx_provider_limit_holds_due"), "{plan}");
+            db.execute("DELETE FROM turns WHERE id = 'turn'", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                query_i64(&db, "SELECT COUNT(*) FROM provider_limit_holds")
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[tokio::test]
@@ -6355,10 +6502,10 @@ mod tests {
                 // cairn/4936: `permission_requests` is shared project state, so
                 // the resume refusal reaches both lineages.
                 "permission_resume_error",
-                // cairn/4977: a terminal's process-lost reason, in both.
                 "terminal_exit_reason",
                 // cairn/4955: questions can be withdrawn in both.
                 "prompt_withdrawal",
+                "provider_limit_holds",
             ]
         );
         assert_eq!(

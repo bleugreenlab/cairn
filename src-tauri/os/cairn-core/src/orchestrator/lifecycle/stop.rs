@@ -942,6 +942,17 @@ fn descendant_running_run_ids_for_job(orch: &Orchestrator, job_id: &str) -> Vec<
     .unwrap_or_default()
 }
 
+fn cancel_provider_holds(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::orchestrator::wakes::cancel_provider_limit_holds_for_job(&db, &job_id).await
+    })
+}
+
 /// Cancel any open `ask_user` prompt on the job and terminalize its live
 /// (`pending`/`running`/`yielded`) turns in one write. Cancelling the open prompt
 /// clears the issue's NeedsInput attention; terminalizing the live turns drops a
@@ -951,6 +962,7 @@ fn cancel_open_input_and_live_turns_for_job(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<(), String> {
+    cancel_provider_holds(orch, job_id)?;
     let dbs = orch.db.clone();
     let job_id = job_id.to_string();
     run_db_blocking(move || async move {
@@ -1034,6 +1046,11 @@ fn stop_session_with_pause_intent(
     intent: PauseIntent,
 ) -> Result<(), String> {
     let cancel_owned_waits = reason.is_operator_stop();
+    if cancel_owned_waits {
+        if let Some(job_id) = job_id_for_run(orch, run_id) {
+            cancel_provider_holds(orch, &job_id)?;
+        }
+    }
     stop_active_turn_for_run(orch, run_id, cancel_owned_waits);
 
     // Send interrupt via the backend-aware stdin handler. For Codex this pauses
