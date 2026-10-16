@@ -4171,7 +4171,23 @@ pub struct LearnedResourceEstimate {
 /// shape or meaning: a heartbeat could already precede the opening snapshot,
 /// because the writer never ordered the two, so a runner talking to an older
 /// executor gets nothing wrong.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 143;
+///
+/// Version 144 (cairn/4998) changes what the pressure tier reclaims and whether
+/// a full volume can latch admission. The managed-cache rung is now handed the
+/// volume's own deficit below the pressure line, down to a floor in the
+/// pressure band and to nothing in the critical band, where 143 trimmed caches
+/// only above their budget or for an admission's ask and wiped warm build
+/// targets instead. And a sweep on a full volume now releases a reserve file
+/// the executor keeps for its own bookkeeping, and survives an out-of-space
+/// error on one entry, where a 143 executor latches `StorageCleanupFailed` and
+/// declines every admission. So equivalent machines on 143 and 144 reclaim and
+/// admit differently, the disagreement about usable capacity v139 and v143
+/// were minted for. The wire addition is defaulted:
+/// [`StoragePressureReport::withheld`] names, by [`StorageWithheldReason`],
+/// what a pass left in place, and `heldBytes` is now its sum, which counts
+/// cells fenced in place and managed caches (including the roots whose
+/// writers keep their own retention) as well as in-window quarantines.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 144;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -4416,8 +4432,8 @@ const _: () = assert!(
 const _: () = assert!(EXECUTOR_LINK_KEEPALIVE_IDLE_MS > EXECUTOR_HEARTBEAT_INTERVAL_MS);
 // Kernels take keepalive timings in whole seconds.
 const _: () = assert!(
-    EXECUTOR_LINK_KEEPALIVE_IDLE_MS % 1_000 == 0
-        && EXECUTOR_LINK_KEEPALIVE_INTERVAL_MS % 1_000 == 0
+    EXECUTOR_LINK_KEEPALIVE_IDLE_MS.is_multiple_of(1_000)
+        && EXECUTOR_LINK_KEEPALIVE_INTERVAL_MS.is_multiple_of(1_000)
 );
 
 /// How long the runner tolerates a link that beats on time while the facts
@@ -5735,8 +5751,9 @@ pub enum DiskReliefOutlook {
     Relieved,
     /// The last pressure pass ran every rung policy permits and fell short.
     /// `heldBytes` is what Cairn still holds that it may not reclaim now
-    /// (quarantine trees inside their forensic window, occupied trees); the
-    /// rest of the volume is not Cairn's.
+    /// (quarantine trees inside their forensic window, cells fenced behind
+    /// surviving processes, managed caches in use or under the pressure
+    /// floor); the rest of the volume is outside Cairn's accounting.
     Unrelieved { held_bytes: u64 },
     /// The storage sweep failed and admission is latched until it succeeds.
     CleanupFailed,
@@ -9201,11 +9218,62 @@ pub struct StoragePressureReport {
     /// pressure cadence early.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rearm_below_free_bytes: Option<u64>,
-    /// Bytes Cairn holds that policy forbade reclaiming in this pass.
+    /// Bytes Cairn holds that policy forbade reclaiming in this pass: the sum
+    /// of [`Self::withheld`] from a peer that reports it.
     #[serde(default)]
     pub held_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub occupied_skips: Vec<OccupiedTreeSkip>,
+    /// What the pass left on the volume that Cairn holds, by the reason it
+    /// could not or would not take it. Empty from a peer that predates it.
+    ///
+    /// Absence of a reason reads as "nothing left to do", so a pass that falls
+    /// short names every class of bytes it did not reach: that is what tells
+    /// the operator whether the remaining relief is Cairn's or theirs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<StorageWithheld>,
+}
+
+/// One class of Cairn-held bytes a pressure pass left in place.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageWithheld {
+    pub reason: StorageWithheldReason,
+    pub bytes: u64,
+    /// Trees, cells, or cache partitions.
+    pub count: usize,
+    /// The class is present but nothing has sized it yet, so `bytes` is a
+    /// floor, not a measurement. Present rather than omitted, because an
+    /// omitted class reads as nothing held.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmeasured: bool,
+}
+
+/// Why a pressure pass left Cairn-held bytes in place.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum StorageWithheldReason {
+    /// Quarantine trees inside their forensic window, after the pressure tier
+    /// took what build output it could from them. Released when the window
+    /// expires.
+    ForensicWindow,
+    /// Build cells fenced in place because processes from an ended epoch still
+    /// run in them. The executor signals only processes it can prove it
+    /// launched, so these are released when those processes exit.
+    FencedCells,
+    /// Managed caches written inside the active window, or held by a build, a
+    /// reader, or a publication. Released when that use ends.
+    CachesInUse,
+    /// Managed caches the pass did not take: its ask was met first, or the
+    /// pressure band's floor kept them. The critical band reaches below the
+    /// floor.
+    CachesKept,
+    /// Cairn-managed caches whose writers do not take the executor's leases
+    /// (CI targets, the immutable asset cache, the sccache daemon's store,
+    /// which enforces its own ceiling). Accounted, never deleted by the
+    /// executor; sized as of the last accounting walk, and `count` is the
+    /// roots present. Released only by their owners' own retention.
+    CachesOwnerRetained,
 }
 
 /// One quarantine whose build output the pressure tier removed.
@@ -14293,6 +14361,12 @@ mod tests {
                 outcome: StoragePressureOutcome::Unrelieved,
                 rearm_below_free_bytes: Some(1),
                 held_bytes: 3,
+                withheld: vec![StorageWithheld {
+                    reason: StorageWithheldReason::FencedCells,
+                    bytes: 3,
+                    count: 1,
+                    unmeasured: false,
+                }],
                 occupied_skips: vec![OccupiedTreeSkip {
                     path: "build-slots/p/slot-4.quarantine-2".into(),
                     pid: Some(1653),

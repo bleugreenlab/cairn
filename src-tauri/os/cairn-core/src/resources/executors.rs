@@ -28,7 +28,8 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::executor_protocol::{
     DiskDecline, DiskReliefOutlook, OccupancyLineageReport, OccupancyRule, OccupiedTreeSkip,
-    QuarantineTargetStrip, StorageReclaimRung, StorageRungReclaim,
+    QuarantineTargetStrip, StorageReclaimRung, StorageRungReclaim, StorageWithheld,
+    StorageWithheldReason,
 };
 
 /// This runner's own private agent-session lanes. Kept at collection scope
@@ -1310,15 +1311,19 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                 bytes(categories.temporary_other_bytes),
             ));
             if let Some(volume) = machine.volume.value() {
+                // Unaccounted, never "not Cairn's": the walk covers what
+                // Cairn manages, and Cairn's processes write outside it too.
+                // A full volume whose remainder read as someone else's was
+                // in fact holding a reclaimed target's binaries open.
                 if accounting.is_partial() {
                     out.push_str(&format!(
-                        "- Not Cairn's: not inferred — accounting is partial ({} entries skipped)\n",
+                        "- Outside Cairn's accounting: not inferred — accounting is partial ({} entries skipped)\n",
                         accounting.skipped_count()
                     ));
                 } else {
                     let used = volume.total_bytes.saturating_sub(volume.free_bytes);
                     out.push_str(&format!(
-                        "- Not Cairn's (inferred: volume used minus Cairn's accounting): ~{} of the volume's {} used\n",
+                        "- Outside Cairn's accounting (inferred: volume used minus Cairn's accounting): ~{} of the volume's {} used. Not necessarily another owner's: the walk does not count an earlier executor installation's home, deleted files a running process still holds open, toolchain and package caches Cairn does not manage, system temporary directories, or filesystem snapshots\n",
                         bytes(used.saturating_sub(accounting.used_bytes)),
                         bytes(used)
                     ));
@@ -1380,6 +1385,9 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                     ))
                     .unwrap_or_default()
             ));
+            for withheld in &pressure.withheld {
+                out.push_str(&format!("- Not reclaimed: {}\n", withheld_line(withheld)));
+            }
             for skip in &pressure.occupied_skips {
                 out.push_str(&format!(
                     "- Skipped: `{}` {}\n",
@@ -1409,6 +1417,51 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
         out.push_str(&occupancy_lineage_line(lineage));
     }
     out
+}
+
+/// One class of bytes a pressure pass left in place, naming why and what
+/// releases it, so the reader can tell relief that is Cairn's to give from
+/// relief that is theirs.
+fn withheld_line(withheld: &StorageWithheld) -> String {
+    let count = |one: &str, many: &str| {
+        format!(
+            "{} {}",
+            withheld.count,
+            if withheld.count == 1 { one } else { many }
+        )
+    };
+    let size = if withheld.unmeasured {
+        "an unmeasured amount".to_string()
+    } else {
+        bytes(withheld.bytes)
+    };
+    match withheld.reason {
+        StorageWithheldReason::ForensicWindow => format!(
+            "{size} in {} inside the forensic window; released when the window expires",
+            count("quarantine", "quarantines")
+        ),
+        StorageWithheldReason::FencedCells => format!(
+            "{size} in {} fenced behind processes from an ended epoch, which the executor will not signal because nothing proves it launched them; released when they exit, so ending them is the operator's (each cell's Quarantine line under Pool slots names them)",
+            count("cell", "cells")
+        ),
+        StorageWithheldReason::CachesInUse => format!(
+            "{size} in {} in use (written in the last ten minutes, or held by a build, a reader, or a publication); released when that use ends",
+            count("managed cache", "managed caches")
+        ),
+        StorageWithheldReason::CachesKept => format!(
+            "{size} in {} the pass did not take (its ask was met first, or the pressure band's floor kept them); the critical band reaches below the floor",
+            count("managed cache", "managed caches")
+        ),
+        StorageWithheldReason::CachesOwnerRetained => format!(
+            "{size} in {} whose writers keep their own retention (CI targets, the asset cache, the sccache store), {}; the executor accounts them but never deletes them, so trimming them is their owner's or the operator's",
+            count("managed cache root", "managed cache roots"),
+            if withheld.unmeasured {
+                "not yet sized by an accounting walk"
+            } else {
+                "as of the last accounting walk"
+            }
+        ),
+    }
 }
 
 /// Why the pressure tier left a tree alone, naming the rule that fired and
@@ -2880,6 +2933,7 @@ mod storage_section_tests {
         Measurement, OccupiedTreeSkip, PersistentCellLifecycle, QuarantineTargetStrip,
         SkippedEntry, SkippedEntryOperation, SkippedEntryReason, SlotState, StoragePressureBand,
         StoragePressureOutcome, StoragePressureReport, StorageReclaimRung, StorageRungReclaim,
+        StorageWithheld, StorageWithheldReason,
     };
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -2944,7 +2998,7 @@ mod storage_section_tests {
         );
         assert!(
             rendered
-                .contains("Not Cairn's (inferred: volume used minus Cairn's accounting): ~1.4 TiB"),
+                .contains("Outside Cairn's accounting (inferred: volume used minus Cairn's accounting): ~1.4 TiB"),
             "{rendered}"
         );
         assert!(
@@ -2978,7 +3032,7 @@ mod storage_section_tests {
         let rendered = render_executor(&executor);
         assert!(
             rendered
-                .contains("Not Cairn's: not inferred — accounting is partial (1 entries skipped)"),
+                .contains("Outside Cairn's accounting: not inferred — accounting is partial (1 entries skipped)"),
             "{rendered}"
         );
         assert!(!rendered.contains("inferred: volume used"), "{rendered}");
@@ -3004,6 +3058,7 @@ mod storage_section_tests {
             outcome: StoragePressureOutcome::Unrelieved,
             rearm_below_free_bytes: Some(46 * GIB),
             held_bytes: 5 * GIB,
+            withheld: Vec::new(),
             occupied_skips: vec![
                 OccupiedTreeSkip {
                     path: "build-slots/cairn/slot-1290.quarantine-1".into(),
@@ -3054,6 +3109,52 @@ mod storage_section_tests {
             rendered.contains("`build-slots/cairn/slot-1268.quarantine-1` 22.0 GiB 3m ago"),
             "{rendered}"
         );
+    }
+
+    /// The bgsrv-mac reading of cairn/4998: a critical pass that falls short
+    /// names what it left and why, and `held by policy` counts the fenced cell
+    /// the page lists under Pool slots, not only in-window quarantines.
+    #[test]
+    fn an_unrelieved_critical_pass_names_every_class_of_bytes_it_left_in_place() {
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        let withheld = |reason, bytes, count| StorageWithheld {
+            reason,
+            bytes,
+            count,
+            unmeasured: false,
+        };
+        let withheld = vec![
+            withheld(StorageWithheldReason::ForensicWindow, GIB / 2, 2),
+            withheld(StorageWithheldReason::FencedCells, 31 * GIB, 1),
+            withheld(StorageWithheldReason::CachesInUse, 3 * GIB, 1),
+            withheld(StorageWithheldReason::CachesKept, 0, 0),
+            withheld(StorageWithheldReason::CachesOwnerRetained, GIB, 1),
+        ];
+        executor.health.disk.pressure = Some(StoragePressureReport {
+            at_unix_ms: at - 60_000,
+            band: StoragePressureBand::Critical,
+            target_bytes: 127 * GIB,
+            free_bytes_before: GIB / 8,
+            free_bytes_after: 70 * GIB,
+            reclaimed_by_rung: Vec::new(),
+            outcome: StoragePressureOutcome::Unrelieved,
+            rearm_below_free_bytes: Some(62 * GIB),
+            held_bytes: withheld.iter().map(|withheld| withheld.bytes).sum(),
+            withheld,
+            occupied_skips: Vec::new(),
+        });
+        let rendered = render_executor(&executor);
+        for expected in [
+            "Unrelieved; 35.5 GiB held by policy",
+            "- Not reclaimed: 1.0 GiB in 1 managed cache root whose writers keep their own retention",
+            "- Not reclaimed: 512.0 MiB in 2 quarantines inside the forensic window; released when the window expires",
+            "- Not reclaimed: 31.0 GiB in 1 cell fenced behind processes from an ended epoch, which the executor will not signal",
+            "- Not reclaimed: 3.0 GiB in 1 managed cache in use",
+            "- Not reclaimed: 0 B in 0 managed caches the pass did not take",
+        ] {
+            assert!(rendered.contains(expected), "missing {expected:?} in {rendered}");
+        }
     }
 
     /// Every skip names the rule that fired and what would release it; a strip
@@ -3137,6 +3238,7 @@ mod storage_section_tests {
             outcome: StoragePressureOutcome::Unrelieved,
             rearm_below_free_bytes: None,
             held_bytes: 0,
+            withheld: Vec::new(),
             occupied_skips: skips.iter().map(|(skip, _)| skip.clone()).collect(),
         });
         let login = |pid| WithheldProcess {
