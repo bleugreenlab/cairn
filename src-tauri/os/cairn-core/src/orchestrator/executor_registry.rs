@@ -120,6 +120,7 @@ mod tests {
             observed_at_unix_ms: 1,
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
+            last_refresh: None,
         };
         upsert_executor(&db, &advertisement, 3, "online").await;
         upsert_executor(&db, &advertisement, 3, "offline").await;

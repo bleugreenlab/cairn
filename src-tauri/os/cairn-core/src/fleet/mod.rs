@@ -183,9 +183,18 @@ fn placement_prediction(
 }
 
 fn candidate_load(entry: &ExecutorConnectionState) -> ExecutionLoadContext {
+    load_context(&entry.snapshot, &entry.health.host)
+}
+
+/// What a candidate machine is carrying, in the shape an execution records the
+/// load it ran under, so a forecast and its eventual observation compare like
+/// with like.
+fn load_context(
+    snapshot: &FleetSnapshot,
+    host: &cairn_common::executor_protocol::HostHealth,
+) -> ExecutionLoadContext {
     let (compile, light) =
-        entry
-            .snapshot
+        snapshot
             .executing_requests
             .iter()
             .fold((0_u32, 0_u32), |counts, request| {
@@ -198,12 +207,14 @@ fn candidate_load(entry: &ExecutorConnectionState) -> ExecutionLoadContext {
     ExecutionLoadContext {
         co_resident_compile_jobs: compile,
         co_resident_light_jobs: light,
-        cpu_utilization_millis: entry
-            .health
-            .host
+        cpu_utilization_millis: host
             .cpu_admission
             .utilization
             .map(|value| (value.clamp(0.0, 1.0) * 1_000.0).round() as u32),
+        io_pressure_full_millis: host
+            .io_pressure
+            .value()
+            .map(|pressure| pressure.full_avg10_millis),
     }
 }
 
@@ -1985,6 +1996,9 @@ struct ExecutorConnectionState {
     /// clocks diverge only when the executor itself has gone quiet — which is
     /// what makes this the deciding diagnostic when a link stalls.
     pump_tick: Arc<AtomicU64>,
+    /// The network path this connection took, when the runner's executor
+    /// listener accepted it.
+    link_path: Option<cairn_common::executor_protocol::ExecutorLinkPath>,
 }
 
 /// One executor link's snapshot count, read by [`Fleet::snapshot_receipts`].
@@ -2510,6 +2524,7 @@ impl Fleet {
             observed_at_unix_ms: unix_time_ms(),
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
+            last_refresh: None,
         };
         // The colocated machine pins no listener certificate and places no
         // rotation hold, so the one failure a remote attach can report cannot
@@ -2596,6 +2611,7 @@ impl Fleet {
             drained,
             preparation_refusals: HashMap::new(),
             pump_tick: Arc::new(AtomicU64::new(unix_time_ms())),
+            link_path: None,
         };
         // A refusal outlives the link only while the machine still advertises
         // the environment it was recorded against: a re-attach with the
@@ -3199,6 +3215,23 @@ impl Fleet {
             received_at_unix_ms: unix_time_ms(),
             process,
         });
+    }
+
+    /// Record the network path a connection took, as the runner's accepted
+    /// socket saw it. Only the generation that took it is stamped.
+    pub fn record_link_path(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        path: cairn_common::executor_protocol::ExecutorLinkPath,
+    ) {
+        if let Some(entry) = self
+            .lock_connections()
+            .get_mut(executor_id)
+            .filter(|entry| entry.generation == generation)
+        {
+            entry.link_path = Some(path);
+        }
     }
 
     pub fn record_remote_connection_transition(
@@ -5157,6 +5190,7 @@ impl Fleet {
             .values()
             .map(|entry| ExecutorInspection {
                 name: executor_public_name(entry),
+                link_path: entry.link_path,
                 recent_placements: self.placements_naming(&entry.identity.executor_id),
                 colocated: entry.colocated,
                 health: executor_health_snapshot(entry, captured_at_unix_ms, &expected_build_ids),
@@ -17357,6 +17391,7 @@ mod tests {
                     observed_at_unix_ms,
                     liveness_observed_at_unix_ms: None,
                     facts_stale_refresh_blocked: None,
+                    last_refresh: None,
                 },
                 generation: 1,
                 sender,
@@ -17375,6 +17410,7 @@ mod tests {
                 colocated: id == COLOCATED_EXECUTOR_ID,
                 preparation_refusals: HashMap::new(),
                 pump_tick: Arc::new(AtomicU64::new(1)),
+                link_path: None,
             },
         )
     }
@@ -28083,5 +28119,46 @@ mod handoff_tests {
             .await
             .unwrap();
         assert_eq!(claims, 0, "no answer was claimed for a withdrawn request");
+    }
+}
+
+#[cfg(test)]
+mod load_context_tests {
+    use super::*;
+    use cairn_common::executor_protocol::{HostHealth, IoPressure, Measurement, MeasurementGap};
+
+    /// A forecast sees the candidate's advertised storage pressure, and a
+    /// machine that cannot measure it is unknown there, never quiet.
+    #[test]
+    fn a_candidate_load_carries_the_advertised_io_pressure_or_none() {
+        let measured = HostHealth {
+            io_pressure: Measurement::measured(
+                1,
+                IoPressure {
+                    full_avg10_millis: 235,
+                    full_avg60_millis: 190,
+                    slowest_device: None,
+                },
+            ),
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            load_context(&FleetSnapshot::default(), &measured).io_pressure_full_millis,
+            Some(235)
+        );
+
+        let unmeasured = HostHealth {
+            io_pressure: Measurement::unavailable(1, MeasurementGap::UnsupportedPlatform),
+            ..HostHealth::default()
+        };
+        assert_eq!(
+            load_context(&FleetSnapshot::default(), &unmeasured).io_pressure_full_millis,
+            None
+        );
+        assert_eq!(
+            load_context(&FleetSnapshot::default(), &HostHealth::default()).io_pressure_full_millis,
+            None,
+            "an executor too old to report it"
+        );
     }
 }

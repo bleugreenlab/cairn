@@ -2911,7 +2911,8 @@ pub enum ContentionFallback {
     ProfileLookupFailed,
 }
 
-/// Co-resident work and measured CPU at the instant an execution began.
+/// Co-resident work and measured CPU and storage pressure at the instant an
+/// execution began.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionLoadContext {
@@ -2920,6 +2921,10 @@ pub struct ExecutionLoadContext {
     /// CPU utilization in thousandths, preserving an integer wire shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_utilization_millis: Option<u32>,
+    /// [`IoPressure::full_avg10_millis`], or `None` where it was not measured,
+    /// which is never the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub io_pressure_full_millis: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4147,6 +4152,25 @@ pub struct LearnedResourceEstimate {
 /// executor reports the host default, which is exactly what every runner has
 /// recorded until now, so a runner talking to it gets nothing wrong beyond the
 /// stale vintage this change exists to correct on newer executors.
+///
+/// cairn/4997 changes how the executor carries its link and what it reports
+/// about the link and the host, without a bump. Every wire addition is an
+/// optional field defaulted on decode, and no struct it lands in refuses
+/// unknown fields: [`ExecutorAdvertisement::last_refresh`],
+/// [`HostHealth::io_pressure`] (a `NotSampled` gap when absent, never a zero),
+/// [`ExecutionLoadContext::io_pressure_full_millis`], and
+/// [`ExecutorInspection::link_path`], which only the runner produces. An older
+/// executor leaves the first three absent, and a runner reads that as "not
+/// reported", which is what every runner assumed until now; an older runner
+/// ignores them. The executor's other changes are internal to it: it ranks
+/// direct routes ahead of tailnet routes when dialing, handles frames that
+/// need pool state on a worker off the link in the same arrival order, builds
+/// the opening snapshot there rather than before its first beat, and sets TCP
+/// keepalive and `TCP_USER_TIMEOUT` on its socket
+/// ([`EXECUTOR_LINK_TRANSPORT_GIVE_UP_MS`]). None of that changes a frame's
+/// shape or meaning: a heartbeat could already precede the opening snapshot,
+/// because the writer never ordered the two, so a runner talking to an older
+/// executor gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 143;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -4337,6 +4361,64 @@ pub const EXECUTOR_HEARTBEAT_INTERVAL_MS: u64 = 30_000;
 /// stays observable to subscribers well before remediation fires; the two
 /// thresholds must not collapse into each other.
 pub const EXECUTOR_LINK_STALL_REMEDIATION_MS: u64 = 150_000;
+
+const _: () = assert!(EXECUTOR_LINK_STALL_REMEDIATION_MS >= 5 * EXECUTOR_HEARTBEAT_INTERVAL_MS);
+
+/// How long either end's kernel keeps an executor link's TCP connection open
+/// once its peer has stopped answering.
+///
+/// The application's evidenced-silence verdict always decides first, because it
+/// is the verdict that records a reason: the runner's stall bound above for a
+/// link that beats nothing. The kernel is the backstop for a peer that is gone
+/// and so cannot be heard from at all, and a path stall shorter than the stall
+/// bound is a pause, not a bounce. Before this was stated the give-up was each
+/// operating system's unstated default: Linux retransmits unacknowledged data
+/// for roughly fifteen minutes, and without keepalive an idle half-open
+/// connection was never noticed by either end.
+///
+/// One heartbeat past the stall bound, so the kernel never ends a link the
+/// application would still call merely quiet.
+///
+/// Applied by [`crate::link_transport::apply_give_up`] to the executor's dialed
+/// socket and the runner's accepted one: keepalive on both, plus
+/// `TCP_USER_TIMEOUT` (the bound on unacknowledged data) on Linux. macOS has no
+/// per-socket knob for its unacknowledged-data budget in the portable socket
+/// API, so a macOS end gives up on unacknowledged data at its kernel's
+/// retransmit exhaustion, which this change does not measure; keepalive still
+/// bounds the idle half-open case there.
+///
+/// Ending a link sooner is not a kill path: an executor that loses its runner
+/// keeps its cells running and redials, and the runner settles held work
+/// against the next session's first snapshot.
+pub const EXECUTOR_LINK_TRANSPORT_GIVE_UP_MS: u64 =
+    EXECUTOR_LINK_STALL_REMEDIATION_MS + EXECUTOR_HEARTBEAT_INTERVAL_MS;
+
+/// How long an executor link sits idle before its kernel sends the first
+/// keepalive probe. Two beats: a link that is beating is never idle this long,
+/// so keepalive only ever probes a connection whose peer has fallen silent.
+pub const EXECUTOR_LINK_KEEPALIVE_IDLE_MS: u64 = 2 * EXECUTOR_HEARTBEAT_INTERVAL_MS;
+
+/// The spacing between keepalive probes once they start.
+pub const EXECUTOR_LINK_KEEPALIVE_INTERVAL_MS: u64 = 15_000;
+
+/// How many unanswered keepalive probes end the connection, derived so that
+/// idle plus every probe interval lands exactly on the give-up.
+pub const EXECUTOR_LINK_KEEPALIVE_COUNT: u32 = ((EXECUTOR_LINK_TRANSPORT_GIVE_UP_MS
+    - EXECUTOR_LINK_KEEPALIVE_IDLE_MS)
+    / EXECUTOR_LINK_KEEPALIVE_INTERVAL_MS) as u32;
+
+const _: () = assert!(EXECUTOR_LINK_TRANSPORT_GIVE_UP_MS > EXECUTOR_LINK_STALL_REMEDIATION_MS);
+const _: () = assert!(
+    EXECUTOR_LINK_KEEPALIVE_IDLE_MS
+        + EXECUTOR_LINK_KEEPALIVE_INTERVAL_MS * EXECUTOR_LINK_KEEPALIVE_COUNT as u64
+        == EXECUTOR_LINK_TRANSPORT_GIVE_UP_MS
+);
+const _: () = assert!(EXECUTOR_LINK_KEEPALIVE_IDLE_MS > EXECUTOR_HEARTBEAT_INTERVAL_MS);
+// Kernels take keepalive timings in whole seconds.
+const _: () = assert!(
+    EXECUTOR_LINK_KEEPALIVE_IDLE_MS % 1_000 == 0
+        && EXECUTOR_LINK_KEEPALIVE_INTERVAL_MS % 1_000 == 0
+);
 
 /// How long the runner tolerates a link that beats on time while the facts
 /// those beats carry stay frozen, before it bounces the connection.
@@ -5118,6 +5200,55 @@ pub struct LivenessRefreshBlocked {
     pub phase_entered_unix_ms: u64,
 }
 
+/// The two ends of one executor link's TCP connection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutorLinkPath {
+    /// Where the executor connected from.
+    pub executor: std::net::SocketAddr,
+    /// The runner's address the executor reached.
+    pub runner: std::net::SocketAddr,
+}
+
+impl ExecutorLinkPath {
+    /// Whether the link rides a tailnet tunnel rather than a direct route.
+    pub fn through_tunnel(&self) -> bool {
+        crate::link_transport::is_tunnel_address(self.executor.ip())
+            || crate::link_transport::is_tunnel_address(self.runner.ip())
+    }
+}
+
+/// How long the executor's last completed liveness refresh pass took, phase by
+/// phase, through the phase before it published.
+///
+/// Carried on every beat rather than logged only when slow, because a pass's
+/// duration is how stale the facts it published were on arrival, and the slow
+/// phase is most of the diagnosis: a pass that spent a minute waiting for pool
+/// state behind a stalled write and one that spent a minute doing work look the
+/// same in the advertisement's stamp alone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LivenessRefreshTimings {
+    pub pass_started_unix_ms: u64,
+    /// From the pass's start to its publishing.
+    pub pass_ms: u64,
+    /// Every phase the pass completed before publishing, in the order it ran.
+    #[serde(default)]
+    pub phases: Vec<LivenessRefreshPhaseTiming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LivenessRefreshPhaseTiming {
+    pub phase: LivenessRefreshPhase,
+    pub elapsed_ms: u64,
+    /// Of `elapsed_ms`, how long the phase waited to acquire pool state, for a
+    /// phase that takes it once. `None` for a phase whose wait was not
+    /// measured, which is not a claim that it did not wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool_state_wait_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutorAdvertisement {
@@ -5153,6 +5284,11 @@ pub struct ExecutorAdvertisement {
     /// and it is the state the stall watchdog was written for.
     #[serde(default)]
     pub facts_stale_refresh_blocked: Option<LivenessRefreshBlocked>,
+    /// How long the pass that produced these facts took, and where the time
+    /// went. `None` from an executor too old to report it, and before a
+    /// machine's first pass completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refresh: Option<LivenessRefreshTimings>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -8691,6 +8827,49 @@ pub struct HostHealth {
     pub tokio_worker_count: Option<usize>,
     pub tokio_alive_tasks: Option<usize>,
     pub tokio_global_queue_depth: Option<usize>,
+    /// How stalled the host's storage is. A machine whose disk is timing out
+    /// writes is slower for a build than its idle cores say, and nothing else
+    /// this report carries shows it. Defaulted, and so an unsampled gap rather
+    /// than a zero, from an executor too old to report it.
+    #[serde(default)]
+    pub io_pressure: Measurement<IoPressure>,
+}
+
+/// The host's storage stall, as Linux's pressure-stall information and block
+/// device counters report it.
+///
+/// Kernel I/O timeout and error counts are deliberately absent: their only
+/// source is the kernel log, and whether an unprivileged process may read it
+/// is a property of each host's configuration rather than something an
+/// executor can promise.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct IoPressure {
+    /// Thousandths of wall time in which every non-idle task was stalled on
+    /// I/O at once (PSI `full`), averaged over ten seconds.
+    pub full_avg10_millis: u32,
+    /// The same, averaged over sixty seconds.
+    pub full_avg60_millis: u32,
+    /// The whole device whose writes were slowest over the last sample window,
+    /// or `None` before a window exists or when no device wrote or held I/O.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slowest_device: Option<DeviceWriteLatency>,
+}
+
+/// One block device's writes across a sample window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceWriteLatency {
+    pub device: String,
+    /// Mean milliseconds each write completed in the window took. `None` for a
+    /// device that completed no I/O at all while busy for nearly the whole
+    /// window: stalled rather than slow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_write_ms: Option<u64>,
+    pub writes: u64,
+    /// I/Os in progress on the device when the window closed.
+    pub in_flight: u64,
+    pub window_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -9619,6 +9798,11 @@ pub struct ExecutorInspection {
     /// The public address of this machine, and the only name a placement
     /// request needs.
     pub name: String,
+    /// The network path the current link takes, as the runner's accepted
+    /// socket saw it. `None` for a link the runner's executor listener did not
+    /// accept, which is the colocated executor's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_path: Option<ExecutorLinkPath>,
     /// Placement decisions this machine took part in, newest first — the ones it
     /// won and the ones it was passed over for. An operator asking why a machine
     /// is idle reads the rejection reason here rather than inferring it.
@@ -13368,6 +13552,7 @@ mod tests {
             observed_at_unix_ms: 4,
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
+            last_refresh: None,
         }
     }
 
@@ -13981,6 +14166,20 @@ mod tests {
             tokio_worker_count: Some(4),
             tokio_alive_tasks: Some(12),
             tokio_global_queue_depth: Some(0),
+            io_pressure: Measurement::measured(
+                5,
+                IoPressure {
+                    full_avg10_millis: 235,
+                    full_avg60_millis: 190,
+                    slowest_device: Some(DeviceWriteLatency {
+                        device: "nvme1n1".into(),
+                        mean_write_ms: Some(4_200),
+                        writes: 10,
+                        in_flight: 4,
+                        window_ms: 15_000,
+                    }),
+                },
+            ),
         };
         let machine = MachineTelemetry {
             cpu: Measurement::measured(

@@ -254,6 +254,7 @@ mod tests {
         let report = ExecutorSubstrateReport::default();
         ExecutorInspection {
             name: name.to_string(),
+            link_path: None,
             recent_placements: Vec::new(),
             colocated: false,
             health: ExecutorHealthSnapshot {
@@ -285,6 +286,7 @@ mod tests {
                     observed_at_unix_ms: 0,
                     liveness_observed_at_unix_ms: None,
                     facts_stale_refresh_blocked: None,
+                    last_refresh: None,
                 },
                 admission: report.admission,
                 queues: Vec::new(),

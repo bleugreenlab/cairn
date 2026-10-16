@@ -688,6 +688,20 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
 
     out.push_str("## Link\n");
     out.push_str(&format!("- Status: {}\n", link_summary(executor)));
+    // A machine riding a tunnel inherits the tunnel's stalls as link losses,
+    // which is invisible from either end without this line.
+    if let Some(path) = &executor.link_path {
+        out.push_str(&format!(
+            "- Path: {} ({} → {})\n",
+            if path.through_tunnel() {
+                "tailnet"
+            } else {
+                "direct"
+            },
+            path.executor.ip(),
+            path.runner
+        ));
+    }
     out.push_str(&format!(
         "- Last heartbeat: {}\n",
         age(health.heartbeat_age_ms)
@@ -724,6 +738,12 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             age(executor
                 .captured_at_unix_ms
                 .saturating_sub(blocked.pass_started_unix_ms)),
+        ));
+    }
+    if let Some(refresh) = &health.advertisement.last_refresh {
+        out.push_str(&format!(
+            "- Last refresh: {}\n",
+            render_refresh_timings(refresh)
         ));
     }
     out.push_str(&format!(
@@ -781,6 +801,17 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             )
         })
     ));
+    out.push_str(&format!(
+        "- I/O pressure: {}\n",
+        reading(
+            &health.host.io_pressure,
+            executor.captured_at_unix_ms,
+            render_io_pressure
+        )
+    ));
+    out.push_str(
+        "- Kernel I/O timeouts: not measured; the kernel log is their only source, and whether it is readable varies by host\n",
+    );
     out.push('\n');
 
     out.push_str(&render_storage(executor));
@@ -2465,6 +2496,82 @@ fn slot_project_name(cell: &cairn_common::executor_protocol::PersistentCellState
         .unwrap_or_else(|| "name unavailable".into())
 }
 
+/// The last completed refresh pass, and every phase of it long enough to
+/// matter, separating time spent queueing for pool state from time spent
+/// working: the first is a machine waiting on a holder, the second a phase
+/// that is itself slow.
+fn render_refresh_timings(
+    refresh: &cairn_common::executor_protocol::LivenessRefreshTimings,
+) -> String {
+    /// Phases shorter than this are noise beside the ones worth reading.
+    const SHOWN_FROM_MS: u64 = 100;
+    let phases: Vec<String> = refresh
+        .phases
+        .iter()
+        .filter(|timing| timing.elapsed_ms >= SHOWN_FROM_MS)
+        .map(|timing| {
+            let waited = timing
+                .pool_state_wait_ms
+                .filter(|waited| *waited >= SHOWN_FROM_MS)
+                .map(|waited| {
+                    format!(
+                        ", of which {} waiting for pool state",
+                        refresh_duration(waited)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                "{} {}{waited}",
+                timing.phase.label(),
+                refresh_duration(timing.elapsed_ms)
+            )
+        })
+        .collect();
+    if phases.is_empty() {
+        refresh_duration(refresh.pass_ms)
+    } else {
+        format!(
+            "{} ({})",
+            refresh_duration(refresh.pass_ms),
+            phases.join("; ")
+        )
+    }
+}
+
+fn render_io_pressure(pressure: &cairn_common::executor_protocol::IoPressure) -> String {
+    let share = |millis: u32| format!("{:.1}%", f64::from(millis) / 10.0);
+    let mut line = format!(
+        "{} of time fully stalled (10 s), {} (60 s)",
+        share(pressure.full_avg10_millis),
+        share(pressure.full_avg60_millis)
+    );
+    if let Some(device) = &pressure.slowest_device {
+        line.push_str(&match device.mean_write_ms {
+            Some(mean) => format!(
+                "; slowest device {} mean write {}, {} I/Os in flight",
+                device.device,
+                refresh_duration(mean),
+                device.in_flight
+            ),
+            None => format!(
+                "; {} stalled: no I/O completed in {} while busy throughout, {} I/Os in flight",
+                device.device,
+                refresh_duration(device.window_ms),
+                device.in_flight
+            ),
+        });
+    }
+    line
+}
+
+fn refresh_duration(ms: u64) -> String {
+    if ms >= 1_000 {
+        format!("{:.1} s", ms as f64 / 1_000.0)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
 fn age(ms: u64) -> String {
     if ms < 1_000 {
         return format!("{ms}ms ago");
@@ -3496,6 +3603,7 @@ mod tests {
         };
         ExecutorInspection {
             name: name.into(),
+            link_path: None,
             recent_placements: Vec::new(),
             colocated,
             health: ExecutorHealthSnapshot {
@@ -3527,6 +3635,7 @@ mod tests {
                     observed_at_unix_ms: CAPTURED_AT - 4_000,
                     liveness_observed_at_unix_ms: Some(CAPTURED_AT - 5_000),
                     facts_stale_refresh_blocked: None,
+                    last_refresh: None,
                 },
                 admission: ExecutorSubstrateReport::default().admission,
                 queues: Vec::new(),
@@ -4965,6 +5074,140 @@ mod tests {
         );
         assert!(
             rendered.contains("stands still until it returns"),
+            "{rendered}"
+        );
+    }
+
+    /// A slow pass is read off the page rather than the journal, with the time
+    /// it spent waiting for pool state told apart from the time it worked.
+    #[test]
+    fn the_last_refresh_pass_renders_its_slow_phases_and_their_pool_state_waits() {
+        use cairn_common::executor_protocol::{
+            LivenessRefreshPhase, LivenessRefreshPhaseTiming, LivenessRefreshTimings,
+        };
+        let mut executor = inspection("bbs", false);
+        let timing = |phase, elapsed_ms, pool_state_wait_ms| LivenessRefreshPhaseTiming {
+            phase,
+            elapsed_ms,
+            pool_state_wait_ms,
+        };
+        executor.health.advertisement.last_refresh = Some(LivenessRefreshTimings {
+            pass_started_unix_ms: CAPTURED_AT - 100_000,
+            pass_ms: 88_192,
+            phases: vec![
+                timing(LivenessRefreshPhase::ExpireResidencies, 30_001, None),
+                timing(LivenessRefreshPhase::EvictIdleManifests, 2, None),
+                timing(LivenessRefreshPhase::Snapshot, 40, Some(38)),
+                timing(LivenessRefreshPhase::SubstrateReport, 58_190, Some(58_100)),
+                timing(LivenessRefreshPhase::WarmRoots, 1, None),
+            ],
+        });
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- Last refresh: 88.2 s (expiring residencies 30.0 s; sampling substrate health 58.2 s, of which 58.1 s waiting for pool state)\n"
+            ),
+            "{rendered}"
+        );
+
+        executor.health.advertisement.last_refresh = Some(LivenessRefreshTimings {
+            pass_started_unix_ms: CAPTURED_AT - 30_000,
+            pass_ms: 14,
+            phases: vec![timing(LivenessRefreshPhase::Snapshot, 3, Some(0))],
+        });
+        assert!(
+            render_executor(&executor).contains("- Last refresh: 14 ms\n"),
+            "a quick pass is one number"
+        );
+
+        executor.health.advertisement.last_refresh = None;
+        assert!(!render_executor(&executor).contains("Last refresh"));
+    }
+
+    /// Which route a remote link took reads off the page.
+    #[test]
+    fn a_remote_link_names_its_path() {
+        use cairn_common::executor_protocol::ExecutorLinkPath;
+        let mut executor = inspection("bbs", false);
+        executor.link_path = Some(ExecutorLinkPath {
+            executor: "100.99.188.99:51234".parse().unwrap(),
+            runner: "100.75.184.96:3846".parse().unwrap(),
+        });
+        assert!(
+            render_executor(&executor)
+                .contains("- Path: tailnet (100.99.188.99 → 100.75.184.96:3846)\n"),
+            "{}",
+            render_executor(&executor)
+        );
+        executor.link_path = Some(ExecutorLinkPath {
+            executor: "10.10.10.10:51234".parse().unwrap(),
+            runner: "10.10.10.51:3846".parse().unwrap(),
+        });
+        assert!(render_executor(&executor)
+            .contains("- Path: direct (10.10.10.10 → 10.10.10.51:3846)\n"));
+        executor.link_path = None;
+        assert!(!render_executor(&executor).contains("- Path:"));
+    }
+
+    /// A drive timing out writes is visible on the page beside CPU and memory,
+    /// and a platform without the reading says so rather than showing a quiet
+    /// disk.
+    #[test]
+    fn io_pressure_renders_beside_cpu_and_memory_or_names_its_gap() {
+        use cairn_common::executor_protocol::{DeviceWriteLatency, IoPressure, MeasurementGap};
+        let mut executor = inspection("bbs", false);
+        executor.health.host.io_pressure = Measurement::measured(
+            CAPTURED_AT - 3_000,
+            IoPressure {
+                full_avg10_millis: 230,
+                full_avg60_millis: 190,
+                slowest_device: Some(DeviceWriteLatency {
+                    device: "nvme1n1".into(),
+                    mean_write_ms: Some(4_200),
+                    writes: 10,
+                    in_flight: 4,
+                    window_ms: 15_000,
+                }),
+            },
+        );
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "- I/O pressure: 23.0% of time fully stalled (10 s), 19.0% (60 s); slowest device nvme1n1 mean write 4.2 s, 4 I/Os in flight (measured 3s ago)\n"
+            ),
+            "{rendered}"
+        );
+
+        executor.health.host.io_pressure = Measurement::measured(
+            CAPTURED_AT - 3_000,
+            IoPressure {
+                full_avg10_millis: 990,
+                full_avg60_millis: 700,
+                slowest_device: Some(DeviceWriteLatency {
+                    device: "nvme1n1".into(),
+                    mean_write_ms: None,
+                    writes: 0,
+                    in_flight: 4,
+                    window_ms: 30_000,
+                }),
+            },
+        );
+        assert!(
+            render_executor(&executor).contains(
+                "; nvme1n1 stalled: no I/O completed in 30.0 s while busy throughout, 4 I/Os in flight (measured 3s ago)\n"
+            ),
+            "a stalled device is named as stalled"
+        );
+
+        executor.health.host.io_pressure =
+            Measurement::unavailable(CAPTURED_AT - 3_000, MeasurementGap::UnsupportedPlatform);
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("- I/O pressure: unavailable: this platform has no reading\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- Kernel I/O timeouts: not measured;"),
             "{rendered}"
         );
     }

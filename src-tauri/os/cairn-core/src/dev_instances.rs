@@ -2001,6 +2001,7 @@ mod tests {
             observed_at_unix_ms: 0,
             liveness_observed_at_unix_ms: None,
             facts_stale_refresh_blocked: None,
+            last_refresh: None,
         };
         let generation = orch
             .fleet

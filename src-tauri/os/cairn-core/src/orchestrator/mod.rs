@@ -3538,6 +3538,7 @@ mod tests {
                 observed_at_unix_ms: 0,
                 liveness_observed_at_unix_ms: Some(0),
                 facts_stale_refresh_blocked: None,
+                last_refresh: None,
             },
             admission: AdmissionHealth::default(),
             queues: Vec::new(),
