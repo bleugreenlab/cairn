@@ -1017,6 +1017,11 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
             ));
         }
     }
+    out.push_str(&render_stopped_commands(
+        &health.stopped_commands,
+        &capabilities.os,
+        executor.captured_at_unix_ms,
+    ));
     out.push('\n');
 
     out.push_str("## Occupancy\n");
@@ -2549,6 +2554,62 @@ fn slot_project_name(cell: &cairn_common::executor_protocol::PersistentCellState
         .unwrap_or_else(|| "name unavailable".into())
 }
 
+/// The commands this machine ended, and what each teardown left alive.
+///
+/// Said only when there is something to say, except where the machine cannot
+/// stop a stalled command at all: there the absence of stops is not evidence
+/// that nothing stalled, and the reader is owed that.
+fn render_stopped_commands(
+    stopped: &[cairn_common::executor_protocol::StoppedCommandReport],
+    os: &str,
+    captured_at_unix_ms: u64,
+) -> String {
+    let stall_detection = matches!(os, "macos" | "linux");
+    if stopped.is_empty() && stall_detection {
+        return String::new();
+    }
+    let mut out = String::from("\n## Stopped commands\n");
+    if !stall_detection {
+        out.push_str(
+            "- Stall detection: unavailable on this platform (it cannot read a command tree's CPU, and output silence alone is not evidence of a stall); only cancellation stops a command here\n",
+        );
+    }
+    for stop in stopped.iter().rev() {
+        let groups = if stop.signalled_groups.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; signalled groups {}",
+                stop.signalled_groups
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let survivors = if stop.surviving_pids.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " — STILL RUNNING: pids {} (each fences its cell until it exits)",
+                stop.surviving_pids
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        out.push_str(&format!(
+            "- {} ({}, request {}): {}{groups}{survivors}\n",
+            stop.header,
+            age(captured_at_unix_ms.saturating_sub(stop.stopped_at_unix_ms)),
+            stop.request_id,
+            stop.cause.describe(),
+        ));
+    }
+    out
+}
+
 /// The last completed refresh pass, and every phase of it long enough to
 /// matter, separating time spent queueing for pool state from time spent
 /// working: the first is a machine waiting on a holder, the second a phase
@@ -3752,6 +3813,7 @@ mod tests {
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),
                 build_skew: None,
+                stopped_commands: Vec::new(),
             },
             executor_build_id: Some("build-abc".into()),
             last_update: None,
@@ -5386,6 +5448,49 @@ mod tests {
             rendered.contains("STILL ON DISK: retirement failed"),
             "{rendered}"
         );
+    }
+
+    /// A stop names the command, the evidence that justified it, and anything
+    /// its teardown could not end, so a surviving pid is visible here rather
+    /// than only in the host's process table.
+    #[test]
+    fn a_stopped_command_names_its_cause_and_its_survivors() {
+        let mut executor = inspection("bglab-mac", false);
+        assert!(
+            !render_executor(&executor).contains("## Stopped commands"),
+            "a machine that stopped nothing says nothing"
+        );
+        executor.health.stopped_commands =
+            vec![cairn_common::executor_protocol::StoppedCommandReport {
+                request_id: "req-1".into(),
+                header: "rust-tests".into(),
+                cause: cairn_common::executor_protocol::CommandStop::Silent {
+                    quiet_ms: 900_000,
+                    last_output_unix_ms: None,
+                    cpu_ms_in_window: Some(40),
+                },
+                stopped_at_unix_ms: CAPTURED_AT - 120_000,
+                signalled_groups: vec![4120, 4133],
+                surviving_pids: vec![4133],
+            }];
+        let rendered = render_executor(&executor);
+        assert!(rendered.contains("## Stopped commands"), "{rendered}");
+        assert!(rendered.contains("- rust-tests (2m ago, request req-1): no output and no CPU progress across its process tree for 900s"), "{rendered}");
+        assert!(
+            rendered.contains("signalled groups 4120, 4133"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("STILL RUNNING: pids 4133"), "{rendered}");
+    }
+
+    #[test]
+    fn a_platform_without_stall_detection_says_so() {
+        let rendered = render_stopped_commands(&[], "windows", CAPTURED_AT);
+        assert!(
+            rendered.contains("Stall detection: unavailable"),
+            "{rendered}"
+        );
+        assert!(render_stopped_commands(&[], "macos", CAPTURED_AT).is_empty());
     }
 
     #[test]

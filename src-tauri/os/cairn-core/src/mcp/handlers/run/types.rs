@@ -429,6 +429,7 @@ mod tests {
             verdict_arch: None,
             verdict_environment_hash: None,
             toolchain_fingerprint: None,
+            stop: None,
         };
 
         let encoded = serde_json::to_string(&vec![wire]).unwrap();

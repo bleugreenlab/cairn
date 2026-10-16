@@ -480,6 +480,7 @@ mod tests {
                 verdict_environment_hash: None,
                 sandbox: None,
                 containment: None,
+                stop: None,
             },
             mutation_delta: None,
             sandbox_denials: vec![],

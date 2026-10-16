@@ -190,6 +190,8 @@ pub(crate) fn build_check_batch_wire(
                 env: item.env.clone(),
                 stdin: None,
                 timeout_ms: item.timeout_ms,
+                // Set by the fleet when it shapes the batch, per cadence.
+                silence_bound_ms: 0,
                 command_resource_identity: Some(resource_identity(&item.resource_identity)),
                 verdict_environment_names: item.verdict_environment_names.clone(),
             },

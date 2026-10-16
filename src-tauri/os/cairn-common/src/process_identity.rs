@@ -319,6 +319,17 @@ pub fn process_group_members(_process_group_id: u32) -> Result<Vec<ProcessAnchor
 /// a pid that is still in use as a group id, so a group a recorded member has
 /// stayed in has existed continuously since that member was seen there, and is
 /// the group the leader led.
+///
+/// The fence is a check, not a handle, and the gap between the last check and
+/// the signal is not closed. If the anchor is the group's last member and exits
+/// inside it, the group ends and its number becomes free; signalling a
+/// stranger then needs the kernel to hand the number to a new group before the
+/// very next syscall. Both kernels allocate pids in sequence and skip numbers in
+/// use, so that is a wrap of the whole pid space (99,999 on macOS, `pid_max` on
+/// Linux) between two adjacent syscalls. The anchor's start token is therefore
+/// checked last, after its group, to keep the gap to exactly those two calls.
+/// Darwin offers no unprivileged process handle that would close it; on Linux
+/// a caller that can hold a pidfd should signal through that instead.
 #[cfg(unix)]
 pub fn signal_anchored_group(
     process_group_id: u32,
@@ -329,6 +340,10 @@ pub fn signal_anchored_group(
         process_presence(anchor.pid, &anchor.start_token) == ProcessPresence::Present
             && unsafe { libc::getpgid(anchor.pid as libc::pid_t) }
                 == process_group_id as libc::pid_t
+            // Again, immediately before the signal: an anchor that exited
+            // between the first check and `getpgid` is caught here, so the
+            // pid `getpgid` answered for is the anchor's.
+            && process_presence(anchor.pid, &anchor.start_token) == ProcessPresence::Present
     }) else {
         return Ok(None);
     };

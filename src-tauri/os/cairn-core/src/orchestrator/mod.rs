@@ -3595,6 +3595,7 @@ mod tests {
             command_processes: Default::default(),
             evicted_cells: Vec::new(),
             build_skew: None,
+            stopped_commands: Vec::new(),
         }
     }
 

@@ -7713,10 +7713,25 @@ impl Fleet {
             .and_then(|selector| selector.containment.clone())
     }
 
+    /// How long a write-cadence check's process tree may show no output and no
+    /// CPU progress before its executor stops it as stalled.
+    ///
+    /// A bound on evidence, not on duration: a check that keeps printing or
+    /// keeps computing never meets it however long it runs, and it is never
+    /// derived from a duration estimate or a default timeout. It is generous
+    /// because legitimate quiet work exists — a long link step, a build that
+    /// prints nothing until it finishes — and short enough that a wedged test
+    /// stops holding a cell within the working session that started it.
+    pub(crate) const WRITE_CHECK_SILENCE_BOUND_MS: u64 = 15 * 60 * 1_000;
+    /// The same bound for the review cadence, whose fuller suites include the
+    /// longest quiet phases.
+    pub(crate) const REVIEW_CHECK_SILENCE_BOUND_MS: u64 = 30 * 60 * 1_000;
+
     fn check_process_batch(
         mut items: Vec<ProcessBatchItem>,
         runner_context_id: Option<String>,
         containment: Option<cairn_common::executor_protocol::WorkloadEnvelope>,
+        silence_bound_ms: u64,
     ) -> ProcessBatch {
         let mut files: Vec<ProcessBatchFile> = Vec::new();
         for item in &mut items {
@@ -7724,6 +7739,9 @@ impl Fleet {
             // duration estimates inform placement, but elapsed time cannot turn a
             // live check into a failure.
             item.timeout_ms = 0;
+            // What can: evidence that the check's tree has stopped making
+            // progress. See `WRITE_CHECK_SILENCE_BOUND_MS`.
+            item.silence_bound_ms = silence_bound_ms;
             for (content_env, file_env) in [
                 (
                     "CAIRN_CHECK_CHANGED_FILES_CONTENT",
@@ -7946,6 +7964,7 @@ impl Fleet {
                 newly_claimed.into_iter().map(|item| item.process).collect(),
                 runner_context_id.clone(),
                 Self::check_batch_containment(&request),
+                Self::REVIEW_CHECK_SILENCE_BOUND_MS,
             );
             let pool = self.clone();
             let orch = orch.clone();
@@ -8214,6 +8233,7 @@ impl Fleet {
             items,
             Some(runner_context_id.clone()),
             Self::check_batch_containment(&request),
+            Self::WRITE_CHECK_SILENCE_BOUND_MS,
         );
         let outcome = self.submit_execution(orch, request, Some(batch)).await;
         output_guard::flush_batch_output(orch, &output, flushed_context.as_ref());
@@ -12661,6 +12681,7 @@ fn executor_health_snapshot(
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
         evicted_cells: entry.health.evicted_cells.clone(),
+        stopped_commands: entry.health.stopped_commands.clone(),
         build_skew: expected_build_ids
             .get(&entry.identity.executor_id)
             .zip(entry.executor_build_id.as_ref())
@@ -13444,6 +13465,9 @@ fn serialize_process_batch(
             // apply no bound of its own while the socket above it applied a
             // smaller one, which is how a suite's output was lost.
             timeout_ms: crate::mcp::handlers::run::clamp_run_item_timeout_ms(timeout).into(),
+            // An agent's batch is stopped by cancellation alone: its owner is
+            // present to end it, and a quiet interactive command is normal.
+            silence_bound_ms: 0,
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
         });
@@ -14658,6 +14682,7 @@ mod tests {
             timeout_ms: 1_000,
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
+            silence_bound_ms: 0,
         }
     }
 
@@ -14769,6 +14794,7 @@ mod tests {
             timeout_ms: 1_000,
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
+            silence_bound_ms: 0,
         };
 
         // An inline TypeScript item resolves to a direct `bun` program.
@@ -15306,6 +15332,7 @@ mod tests {
             Vec::new(),
             Some("ctx".into()),
             Fleet::check_batch_containment(&request),
+            Fleet::WRITE_CHECK_SILENCE_BOUND_MS,
         );
         assert_eq!(
             batch.containment,
@@ -15329,6 +15356,7 @@ mod tests {
             Vec::new(),
             Some("ctx".into()),
             Fleet::check_batch_containment(&request),
+            Fleet::WRITE_CHECK_SILENCE_BOUND_MS,
         );
         assert_eq!(batch.containment, None);
 
@@ -16954,7 +16982,12 @@ mod tests {
         // CAIRN_SANDBOXED, which turns the whole review lane structurally red on
         // every branch — CAIRN-3124. Mutation containment belongs to
         // MutationPolicy, not to this knob.
-        let batch = Fleet::check_process_batch(Vec::new(), Some("ctx".into()), None);
+        let batch = Fleet::check_process_batch(
+            Vec::new(),
+            Some("ctx".into()),
+            None,
+            Fleet::WRITE_CHECK_SILENCE_BOUND_MS,
+        );
         assert_eq!(batch.sandbox_mode, ProcessSandboxMode::Unconfined);
         assert!(batch.sequential, "checks run in deterministic plan order");
         assert!(
@@ -16986,9 +17019,11 @@ mod tests {
             timeout_ms: 1,
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
+            silence_bound_ms: 0,
         };
 
-        let batch = Fleet::check_process_batch(vec![item], None, None);
+        let batch =
+            Fleet::check_process_batch(vec![item], None, None, Fleet::WRITE_CHECK_SILENCE_BOUND_MS);
         assert_eq!(batch.files.len(), 2);
         assert_eq!(batch.files[0].env, "CAIRN_CHECK_CHANGED_FILES");
         assert_eq!(batch.files[0].contents, "src/lib.rs");
@@ -17008,6 +17043,7 @@ mod tests {
             env: Vec::new(),
             stdin: None,
             timeout_ms,
+            silence_bound_ms: 0,
             command_resource_identity: None,
             verdict_environment_names: Vec::new(),
         };
@@ -17016,6 +17052,7 @@ mod tests {
             vec![item("learned", 180_000), item("unmeasured", 900_000)],
             None,
             None,
+            Fleet::REVIEW_CHECK_SILENCE_BOUND_MS,
         );
 
         assert!(
@@ -17023,6 +17060,12 @@ mod tests {
             "configured and learned duration bounds both lose kill authority"
         );
         assert!(batch.timeout_bases.is_empty());
+        // The only authority a check item keeps is the stall bound, and it is
+        // the cadence's, whatever duration the item declared or learned.
+        assert!(batch
+            .items
+            .iter()
+            .all(|item| item.silence_bound_ms == Fleet::REVIEW_CHECK_SILENCE_BOUND_MS));
     }
 
     #[tokio::test]
@@ -24557,6 +24600,7 @@ mod tests {
                 sandbox: None,
                 toolchain_fingerprint: None,
                 containment: None,
+                stop: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -25334,6 +25378,7 @@ mod tests {
                 sandbox: None,
                 toolchain_fingerprint: None,
                 containment: None,
+                stop: None,
             },
             mutation_delta: None,
             sandbox_denials: Vec::new(),
@@ -25558,6 +25603,7 @@ mod tests {
                     verdict_arch: None,
                     toolchain_fingerprint: None,
                     verdict_environment_hash: None,
+                    stop: None,
                 }
             };
             let marker = |selection: &str| {

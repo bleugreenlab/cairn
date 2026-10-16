@@ -1764,6 +1764,7 @@ mod tests {
             sandbox: None,
             toolchain_fingerprint: None,
             containment: None,
+            stop: None,
         };
         let (left, right) = tokio::join!(
             update_profile(
@@ -1840,6 +1841,7 @@ mod tests {
             sandbox: None,
             toolchain_fingerprint: None,
             containment: None,
+            stop: None,
         };
 
         observe_completed(
@@ -2177,6 +2179,7 @@ mod tests {
             sandbox: None,
             toolchain_fingerprint: None,
             containment: None,
+            stop: None,
         }
     }
 

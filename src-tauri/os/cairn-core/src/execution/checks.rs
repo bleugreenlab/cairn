@@ -1668,6 +1668,9 @@ fn split_write_check_batch_outcome(
                     let results = items
                         .into_iter()
                         .map(|item| {
+                            if let Some(stop) = &item.stop {
+                                return Err(stopped_command_failure(stop, &item.body));
+                            }
                             let provenance = metadata.for_batch_item(&item);
                             let mut output = item.body;
                             append_sandbox_denial_evidence(&mut output, &item.sandbox_denials);
@@ -3175,6 +3178,13 @@ pub(crate) enum SubstrateFailureShape {
     Storage,
     /// Cairn cancelled the check before it produced a verdict.
     Cancelled,
+    /// The check ran, then its process tree stopped making progress — no
+    /// output and no meaningful CPU for the cadence's silence bound — and its
+    /// executor stopped it. Distinct from `Result` because the outcome is
+    /// known (Cairn ended the command), and from a red because nothing about
+    /// the tree was decided: a wedged test says where to look, not whether
+    /// the change is good.
+    CommandStalled,
 }
 
 impl SubstrateFailureShape {
@@ -3205,6 +3215,9 @@ impl SubstrateFailureShape {
             }
             Self::Storage => "Cairn's own storage for this check failed.",
             Self::Cancelled => "Cairn cancelled this check before it produced a verdict.",
+            Self::CommandStalled => {
+                "This check stopped making progress, so Cairn stopped it before it produced a verdict."
+            }
         }
     }
 
@@ -3410,6 +3423,11 @@ fn infra_repair_domain(
             | SubstrateFailureShape::OutcomeUnknown
             | SubstrateFailureShape::Storage
             | SubstrateFailureShape::Cancelled => InfraRepairDomain::Head,
+            // A stalled command is the suite's own: some test or step in it
+            // waited on something that never came. That is a defect in the
+            // command at this head, owned by whoever owns the suite, and no
+            // machine repair or fleet change touches it.
+            SubstrateFailureShape::CommandStalled => InfraRepairDomain::Head,
         };
     }
     // No substrate failure means the command RAN and its own output named the
@@ -7769,11 +7787,44 @@ fn append_tracked_modification_evidence(
     ));
 }
 
+/// What a check the executor stopped is recorded as: never a red and never a
+/// reusable verdict. A stall names the request's own last output and how long
+/// it was quiet, so the reader looks at this command rather than at whatever
+/// the machine was doing when it was read; a cancellation is a withdrawal.
+fn stopped_command_failure(
+    stop: &cairn_common::executor_protocol::CommandStop,
+    output: &str,
+) -> CheckExecutionFailure {
+    match stop {
+        cairn_common::executor_protocol::CommandStop::Silent { .. } => {
+            CheckExecutionFailure::substrate(
+                SubstrateFailureShape::CommandStalled,
+                format!(
+                    "stopped by its executor: {}. The process tree it left, if any, is listed under Stopped commands on the executor's page.
+
+{output}",
+                    stop.describe()
+                ),
+            )
+        }
+        cairn_common::executor_protocol::CommandStop::Cancelled => CheckExecutionFailure::substrate(
+            SubstrateFailureShape::Cancelled,
+            "cell request was cancelled while its command ran",
+        ),
+    }
+}
+
 fn check_result_from_cell_outcome(
     outcome: CellOutcome,
     publication: Option<crate::fleet::PublicationCoordination>,
 ) -> Result<CheckExecResult, CheckExecutionFailure> {
     match outcome {
+        CellOutcome::Completed {
+            output, metadata, ..
+        } if metadata.stop.is_some() => Err(stopped_command_failure(
+            metadata.stop.as_ref().expect("guarded"),
+            &output,
+        )),
         CellOutcome::Completed {
             exit_code,
             mut output,
@@ -8379,10 +8430,11 @@ mod tests {
             (Shape::OutcomeUnknown, Domain::Head),
             (Shape::Storage, Domain::Head),
             (Shape::Cancelled, Domain::Head),
+            (Shape::CommandStalled, Domain::Head),
         ];
         assert_eq!(
             table.len(),
-            11,
+            12,
             "a new substrate shape must be classified in this table, not defaulted"
         );
         for (shape, expected) in table {
@@ -11998,6 +12050,7 @@ cairn-common = { path = "../cairn-common" }
                 sandbox: None,
                 toolchain_fingerprint: None,
                 containment: None,
+                stop: None,
             },
             mutation_delta: Some(Box::new(cairn_common::executor_protocol::MutationDelta {
                 base_commit: "base".to_string(),
@@ -12033,6 +12086,116 @@ cairn-common = { path = "../cairn-common" }
                 ReviewTreeGateResult::InfrastructureFailure(_)
             ));
         }
+    }
+
+    /// A check its executor stopped for stalling is a named non-verdict on both
+    /// paths a result arrives by, whatever exit code the killed process left,
+    /// and its diagnostic is the request's own evidence: how long it was quiet
+    /// and when it last wrote, not what the machine is doing now.
+    #[tokio::test]
+    async fn a_stalled_command_is_a_named_non_verdict_on_both_paths() {
+        let stop = cairn_common::executor_protocol::CommandStop::Silent {
+            quiet_ms: 900_000,
+            last_output_unix_ms: Some(1_792_000_000_000),
+            cpu_ms_in_window: Some(12),
+        };
+        let metadata: cairn_common::executor_protocol::CellExecutionMeta =
+            serde_json::from_value(serde_json::json!({
+                "slotId": "slot", "cellEpoch": 1,
+                "startedAtUnixMs": 1, "finishedAtUnixMs": 2,
+            }))
+            .unwrap();
+        let stalled = |failure: &CheckExecutionFailure| match failure {
+            CheckExecutionFailure::Substrate(substrate) => {
+                assert_eq!(substrate.shape, SubstrateFailureShape::CommandStalled);
+                assert!(
+                    substrate.diagnostic.contains("for 900s"),
+                    "{}",
+                    substrate.diagnostic
+                );
+                assert!(
+                    substrate.diagnostic.contains("last output at"),
+                    "{}",
+                    substrate.diagnostic
+                );
+                assert!(
+                    substrate.diagnostic.contains("the tail"),
+                    "{}",
+                    substrate.diagnostic
+                );
+            }
+            other => panic!("a stalled command became {other:?}"),
+        };
+
+        // One check of a coalesced batch, narrowed to its own outcome.
+        let mut item_metadata = metadata.clone();
+        item_metadata.stop = Some(stop.clone());
+        let failure = check_result_from_cell_outcome(
+            CellOutcome::Completed {
+                request_id: "request".into(),
+                attempt_id: "attempt".into(),
+                exit_code: Some(137),
+                output: "the tail".into(),
+                timed_out: false,
+                metadata: item_metadata,
+                mutation_delta: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+            },
+            None,
+        )
+        .expect_err("a stopped command is not a verdict");
+        stalled(&failure);
+
+        // The write cadence's typed batch outcome.
+        let item = serde_json::json!({
+            "header": "rust-tests", "body": "the tail", "succeeded": false,
+            "suspended": false, "exitCode": 137, "startedAtUnixMs": 1,
+            "finishedAtUnixMs": 2, "durationMs": 1, "stop": serde_json::to_value(&stop).unwrap(),
+        });
+        let (results, _) = split_write_check_batch_outcome(
+            CellOutcome::Completed {
+                request_id: "request".into(),
+                attempt_id: "attempt".into(),
+                exit_code: Some(1),
+                output: serde_json::to_string(&vec![item]).unwrap(),
+                timed_out: false,
+                metadata,
+                mutation_delta: None,
+                sandbox_denials: Vec::new(),
+                tracked_modifications: None,
+            },
+            1,
+        );
+        stalled(
+            results[0]
+                .as_ref()
+                .expect_err("a stopped command is not a verdict"),
+        );
+
+        // Never a red: the merge gate reads it as infrastructure, not as a
+        // result about the tree.
+        let db = cache_db().await;
+        let results = run_planned_checks(
+            db,
+            "project-a",
+            "tree-stalled",
+            "job-a",
+            &[(plan("rust", "cargo test"), "input-stalled".to_string())],
+            "tool",
+            CheckExecMode::Shared,
+            None,
+            move |_, _, _| {
+                let failure = failure.clone();
+                async move { Err::<CheckExecResult, _>(failure) }
+            },
+            |_| {},
+        )
+        .await;
+        assert!(matches!(
+            review_tree_gate_result(results),
+            ReviewTreeGateResult::InfrastructureFailure(_)
+        ));
     }
 
     /// Every reason a cell can refuse to start, mapped to the condition class an
@@ -12277,6 +12440,7 @@ cairn-common = { path = "../cairn-common" }
             SubstrateFailureShape::Result,
             SubstrateFailureShape::Storage,
             SubstrateFailureShape::Cancelled,
+            SubstrateFailureShape::CommandStalled,
         ] {
             assert!(!shape.is_transient(), "{shape:?} is not relieved by time");
         }
@@ -12516,6 +12680,7 @@ cairn-common = { path = "../cairn-common" }
             SubstrateFailureShape::Storage,
             SubstrateFailureShape::Result,
             SubstrateFailureShape::Cancelled,
+            SubstrateFailureShape::CommandStalled,
             SubstrateFailureShape::Dispatch,
             SubstrateFailureShape::EnvironmentRetired,
         ] {
@@ -12691,7 +12856,7 @@ cairn-common = { path = "../cairn-common" }
     /// against whichever one a specimen happens to use. The match below makes
     /// the list exhaustive by construction: a new shape stops compiling here
     /// until it is added.
-    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 11] = [
+    const ALL_SUBSTRATE_SHAPES: [SubstrateFailureShape; 12] = [
         SubstrateFailureShape::Dispatch,
         SubstrateFailureShape::Capacity,
         SubstrateFailureShape::MachineUnreachable,
@@ -12703,6 +12868,7 @@ cairn-common = { path = "../cairn-common" }
         SubstrateFailureShape::OutcomeUnknown,
         SubstrateFailureShape::Storage,
         SubstrateFailureShape::Cancelled,
+        SubstrateFailureShape::CommandStalled,
     ];
 
     /// The bound is on the COMPOSED message, so it has to hold for every lead
@@ -12726,7 +12892,8 @@ cairn-common = { path = "../cairn-common" }
                 | SubstrateFailureShape::Result
                 | SubstrateFailureShape::OutcomeUnknown
                 | SubstrateFailureShape::Storage
-                | SubstrateFailureShape::Cancelled => {}
+                | SubstrateFailureShape::Cancelled
+                | SubstrateFailureShape::CommandStalled => {}
             }
 
             let message = SubstrateFailure::new(shape, &log).agent_message();
@@ -13003,6 +13170,7 @@ cairn-common = { path = "../cairn-common" }
             sandbox: None,
             toolchain_fingerprint: None,
             containment: None,
+            stop: None,
         };
         let results = run_planned_checks(
             db.clone(),
@@ -13412,6 +13580,7 @@ cairn-common = { path = "../cairn-common" }
                 sandbox: None,
                 toolchain_fingerprint: None,
                 containment: None,
+                stop: None,
             }),
             publication: None,
         })

@@ -4187,7 +4187,24 @@ pub struct LearnedResourceEstimate {
 /// what a pass left in place, and `heldBytes` is now its sum, which counts
 /// cells fenced in place and managed caches (including the roots whose
 /// writers keep their own retention) as well as in-window quarantines.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 144;
+///
+/// Version 145 (cairn/4414) gives the executor authority to stop a command
+/// that has stopped making progress, and makes it reap a stopped or cancelled
+/// command's whole process tree on macOS. [`ProcessBatchItem::silence_bound_ms`]
+/// names how long a command's tree may go without output and without CPU
+/// progress, and the runner sets it for check items only. An item the executor
+/// ends that way returns [`ProcessBatchItemOutcome::stop`] (mirrored on
+/// [`CellExecutionMeta::stop`] by `for_batch_item`), which the runner records as
+/// a named non-verdict rather than a red, and the executor lists the stop, the
+/// groups it signalled and any survivors in
+/// [`ExecutorSubstrateReport::stopped_commands`]. Cancelling a running command
+/// already ended its leader and its own process group; on macOS it now also
+/// signals the groups of descendants recorded while their ancestry still linked
+/// them, which is where nextest puts each test. Mixed versions degrade safely:
+/// a 144 runner sends no bound, so a 145 executor stops nothing for silence,
+/// and a 144 executor ignores the bound and never reports a stop, which is the
+/// behaviour every runner has had until now.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 145;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -6174,6 +6191,11 @@ pub struct CellExecutionMeta {
     /// Edge observations for the execution seam actually used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub containment: Option<ContainmentObservations>,
+    /// Why the executor ended this command, when it did. Carried on the
+    /// metadata so that every reader of a per-item outcome learns it from the
+    /// one derivation, [`CellExecutionMeta::for_batch_item`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<CommandStop>,
 }
 
 /// The width a command was granted and how that grant was applied on the
@@ -6346,6 +6368,7 @@ impl CellExecutionMeta {
         meta.allocation = self.allocation.as_ref().map(|allocation| {
             allocation.reobserved(item.granted_units, item.cpu, item.duration_ms)
         });
+        meta.stop = item.stop.clone();
         meta
     }
 }
@@ -9697,6 +9720,10 @@ pub struct ExecutorSubstrateReport {
     /// last. Bounded, and cleared by nothing but a restart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_cells: Vec<EvictedCellReport>,
+    /// Commands this executor stopped, most recent last. Bounded, and cleared
+    /// by nothing but a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stopped_commands: Vec<StoppedCommandReport>,
 }
 
 /// What a machine has committed, counted by the machine.
@@ -9845,6 +9872,8 @@ pub struct ExecutorHealthSnapshot {
     pub command_processes: CommandProcessHealth,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_cells: Vec<EvictedCellReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stopped_commands: Vec<StoppedCommandReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_skew: Option<BuildSkew>,
 }
@@ -12015,10 +12044,109 @@ pub struct ProcessBatchItem {
     /// Elapsed-time kill bound in milliseconds. Zero means unbounded and is used
     /// by checks, whose duration estimates inform placement but never termination.
     pub timeout_ms: u64,
+    /// How long the command's whole process tree may go without evidence of
+    /// progress before the executor stops it, in milliseconds. Zero disables
+    /// the stall stop; cancellation still ends the command.
+    ///
+    /// This is a bound on evidence, not a budget on time. The clock it measures
+    /// restarts whenever the command writes output, whenever its tree burns a
+    /// meaningful amount of CPU, and whenever the executor is the one holding
+    /// the command up by not reading its output. A command that is slow but
+    /// working never reaches it, however long it runs. On a platform that
+    /// cannot read the tree's CPU the stall stop does not apply at all: output
+    /// silence alone is what a long quiet link step looks like.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub silence_bound_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_resource_identity: Option<CommandResourceIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdict_environment_names: Vec<String>,
+}
+
+/// Why the executor ended a command that had not ended itself, when neither its
+/// own exit nor its elapsed-time bound did it.
+///
+/// A stop is Cairn abandoning a command, never a result about the command's
+/// tree, and readers must not turn it into one: a stalled check is a named
+/// non-verdict, and a cancelled one is a withdrawal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "cause",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum CommandStop {
+    /// The command's process tree wrote no output and burned less than the
+    /// executor's progress threshold of CPU for `quiet_ms`, while nothing on the
+    /// executor's side was holding it up.
+    Silent {
+        quiet_ms: u64,
+        /// When the command last wrote anything. `None` when it wrote nothing
+        /// at all after it started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_output_unix_ms: Option<u64>,
+        /// CPU the whole tree used across the quiet window, as sampled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_ms_in_window: Option<u64>,
+    },
+    /// The request the command belonged to was withdrawn while it ran.
+    Cancelled,
+}
+
+impl CommandStop {
+    /// One line naming the cause from the facts that justified it. Never the
+    /// elapsed-time wording: a stopped command did not time out.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Silent {
+                quiet_ms,
+                last_output_unix_ms,
+                cpu_ms_in_window,
+            } => {
+                let cpu = cpu_ms_in_window
+                    .map(|cpu| format!(" (it used {}ms of CPU in that window)", cpu))
+                    .unwrap_or_default();
+                let last = match last_output_unix_ms {
+                    Some(at) => {
+                        let seconds = (at / 1_000) % 86_400;
+                        format!(
+                            "last output at {:02}:{:02}:{:02}Z",
+                            seconds / 3_600,
+                            seconds / 60 % 60,
+                            seconds % 60
+                        )
+                    }
+                    None => "it wrote no output after it started".to_string(),
+                };
+                format!(
+                    "no output and no CPU progress across its process tree for {}s{cpu}; {last}",
+                    quiet_ms / 1_000
+                )
+            }
+            Self::Cancelled => "cancelled by its requester while it ran".to_string(),
+        }
+    }
+}
+
+/// One command this executor stopped, as the executor page lists it.
+///
+/// Bounded and most recent last, so a machine that keeps stopping a command
+/// shows that, and a set of processes the stop could not end is visible without
+/// anyone reading the host's process table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StoppedCommandReport {
+    pub request_id: String,
+    pub header: String,
+    pub cause: CommandStop,
+    pub stopped_at_unix_ms: u64,
+    /// Process groups the teardown signalled, the command's own first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signalled_groups: Vec<u32>,
+    /// Processes of the command's tree still alive when the teardown's budget
+    /// ran out. Each one fences the cell it ran in until it is gone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub surviving_pids: Vec<u32>,
 }
 
 /// Typed result for one command in a build-cell process batch.
@@ -12065,6 +12193,10 @@ pub struct ProcessBatchItemOutcome {
     pub toolchain_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_environment_hash: Option<String>,
+    /// Set when the executor ended this command rather than the command ending
+    /// itself. A stopped item is not a verdict, whatever its exit code says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<CommandStop>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -14700,6 +14832,7 @@ mod tests {
                     runner_build_id: "runner".into(),
                     executor_build_id: "executor".into(),
                 }),
+                stopped_commands: Vec::new(),
             }],
             occupancy: CellLifecycleCensus {
                 total: 1,
@@ -14799,6 +14932,7 @@ mod tests {
                         verdict_environment_hash: None,
                         sandbox: None,
                         containment: None,
+                        stop: None,
                     }),
                     cached: false,
                     subscriber_count: 1,
@@ -16030,6 +16164,7 @@ mod tests {
                 verdict_environment_hash: None,
                 sandbox: None,
                 containment: None,
+                stop: None,
             },
             mutation_delta: Some(Box::new(MutationDelta {
                 base_commit: "b".into(),
