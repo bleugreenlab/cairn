@@ -579,9 +579,19 @@ async fn merge_remote_pr_via_github(
 
     // FAIL-CLOSED: on any failure, surface it and mark/advance NOTHING locally.
     let github_started = std::time::Instant::now();
-    api::merge_pr(http, &auth, &owner, &repo, pr_number, &method)
+    let merge_commit = api::merge_pr(http, &auth, &owner, &repo, pr_number, &method)
         .await
         .map_err(|e| map_github_merge_error(&source_branch, &target_branch, e))?;
+    // Origin moved the moment GitHub answered. Record it before anything else
+    // so a default-branch read between now and the store import says it is
+    // behind instead of passing the pre-merge tree off as current.
+    if let Some(merge_commit) = merge_commit.as_deref() {
+        orch.default_branch_sync.record_tip(
+            &merge_context.project_id,
+            merge_commit,
+            crate::orchestrator::default_branch_sync::Source::Merge,
+        );
+    }
     log::info!(
         "merge_pr_for_job[{job_id}]: GitHub merge_pr took {:?}",
         github_started.elapsed()
@@ -622,19 +632,16 @@ async fn merge_remote_pr_via_github(
     let reconcile_ctx = merge_context;
     let orch_clone = orch.clone();
     tokio::spawn(async move {
-        // In-flight siblings: fetch origin into the shared store and rebase each
-        // onto the advanced `<base>@origin` tip. This is the external-advance
-        // reconcile the `push` webhook would also drive; the commit-id guard makes
-        // the double-fire idempotent.
-        if let Err(e) = crate::orchestrator::base_advance::reconcile_external_default_advance(
+        // Fetch origin into the shared store and rebase in-flight siblings onto
+        // the advanced `<base>@origin` tip. The `push` webhook for this same
+        // merge lands on the same single-flight sync, which waits for this one
+        // rather than racing it; failures are recorded where reads report them.
+        crate::orchestrator::default_branch_sync::sync(
             &orch_clone,
             &reconcile_ctx.project_id,
             &target_branch,
         )
-        .await
-        {
-            log::warn!("Post-GitHub-merge sibling reconcile failed: {e}");
-        }
+        .await;
         // File capture, user-checkout fast-forward pull (forced — no local fold
         // moved it), worktree teardown, PR refresh.
         reconcile_after_merge(

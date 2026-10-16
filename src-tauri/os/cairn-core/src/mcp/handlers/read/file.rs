@@ -1410,6 +1410,7 @@ pub(crate) async fn produce_file_segment(
         }
     };
 
+    let mut revision_label = None;
     let branch_context = if branch.is_some() || logical_project_target {
         let repo_path = match branch_repo_path(&resolved_target.relative_path) {
             Ok(path) => path.to_string(),
@@ -1423,6 +1424,22 @@ pub(crate) async fn produce_file_segment(
             Ok(resolution) => resolution,
             Err(error) => return Produced::Segment(error_segment(uri, error.to_string())),
         };
+        // Only an explicitly named revision is stamped: a read of the session's
+        // own branch is the tree the agent is working in, not a claim about
+        // another one.
+        if branch.is_some() {
+            revision_label = Some(
+                crate::orchestrator::default_branch_sync::revision_label(
+                    orch,
+                    &resolution.project_id,
+                    &resolution.rev,
+                    &resolution.default_branch,
+                    &resolution.repository_path,
+                    &resolution.commit_id,
+                )
+                .await,
+            );
+        }
         let repository_path = resolution.object_repository_path;
         let service = match super::object_read::ObjectReadService::new(
             repository_path.clone(),
@@ -1441,6 +1458,11 @@ pub(crate) async fn produce_file_segment(
         })
     } else {
         None
+    };
+    let segment_meta = |uri: String, kind: SegmentKind, unit: NaturalUnit| {
+        let mut meta = SegmentMeta::new(uri, kind, unit);
+        meta.revision = revision_label.clone();
+        meta
     };
 
     match projection {
@@ -1481,7 +1503,7 @@ pub(crate) async fn produce_file_segment(
                 Ok(projection) => projection,
                 Err(error) => return Produced::Segment(error_segment(uri, error)),
             };
-            let mut meta = SegmentMeta::new(uri, SegmentKind::Glob, NaturalUnit::File);
+            let mut meta = segment_meta(uri, SegmentKind::Glob, NaturalUnit::File);
             // `[N files]` describes a body that *is* the file list, so only
             // `files_with_matches` carries it; a `count` tally or `content` dump
             // reports no suffix. The count is the projection's own, so a pattern
@@ -1578,7 +1600,7 @@ pub(crate) async fn produce_file_segment(
                 Ok(window) => window,
                 Err(error) => return Produced::Segment(error_segment(uri, error)),
             };
-            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            let mut meta = segment_meta(uri, SegmentKind::Grep, NaturalUnit::Match);
             // A `content`/`count` body over one named file has no useful file
             // dimension — the caller named the file. A `files_with_matches` body
             // *is* the file dimension, so it always reports one, and a match is
@@ -1623,7 +1645,7 @@ pub(crate) async fn produce_file_segment(
                     target.is_dir(),
                 )
             };
-            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            let mut meta = segment_meta(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(rendered.matches);
             if is_directory {
                 meta.file_count = Some(rendered.files);
@@ -1659,7 +1681,7 @@ pub(crate) async fn produce_file_segment(
                     target.is_dir(),
                 )
             };
-            let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+            let mut meta = segment_meta(uri, SegmentKind::Grep, NaturalUnit::Match);
             meta.match_count = Some(rendered.matches);
             if is_directory {
                 meta.file_count = Some(rendered.files);
@@ -1705,7 +1727,7 @@ pub(crate) async fn produce_file_segment(
                 };
                 return Produced::Segment(ReadSegment::text(
                     body,
-                    SegmentMeta::new(uri, SegmentKind::Directory, NaturalUnit::Line),
+                    segment_meta(uri, SegmentKind::Directory, NaturalUnit::Line),
                 ));
             }
 
@@ -1736,7 +1758,7 @@ pub(crate) async fn produce_file_segment(
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes);
                 let mut segment = ReadSegment::text(
                     String::new(),
-                    SegmentMeta::new(uri, SegmentKind::Image, NaturalUnit::Line),
+                    segment_meta(uri, SegmentKind::Image, NaturalUnit::Line),
                 );
                 segment.images.push(ImageBlock::inline(mime_type, data));
                 return Produced::Segment(segment);
@@ -1768,7 +1790,7 @@ pub(crate) async fn produce_file_segment(
                 return match summary {
                     Ok(body) => Produced::Segment(ReadSegment::text(
                         body,
-                        SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line),
+                        segment_meta(uri, SegmentKind::File, NaturalUnit::Line),
                     )),
                     Err(error) => Produced::Segment(error_segment(
                         uri,
@@ -1798,7 +1820,7 @@ pub(crate) async fn produce_file_segment(
                 None
             };
 
-            let mut meta = SegmentMeta::new(uri, SegmentKind::File, NaturalUnit::Line);
+            let mut meta = segment_meta(uri, SegmentKind::File, NaturalUnit::Line);
             meta.total_units = Some(response.total_lines);
             meta.shown_units = response.shown_lines;
             meta.offset = response.offset;

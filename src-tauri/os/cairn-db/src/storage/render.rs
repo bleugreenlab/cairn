@@ -467,9 +467,16 @@ fn header(meta: &SegmentMeta, shown: usize, truncated: bool) -> String {
         SegmentKind::Duplicate => return format!("=== {} [duplicate] ===", meta.uri),
         _ => {}
     }
-    match segment_suffix(meta, shown) {
+    let suffix = segment_suffix(meta, shown).or_else(|| truncated.then(|| "truncated".into()));
+    // The revision leads: which tree answered comes before how much of it is
+    // shown, so a stale or mid-sync read cannot pass as a current one.
+    let suffix = match (meta.revision.as_deref(), suffix) {
+        (Some(revision), Some(suffix)) => Some(format!("{revision}; {suffix}")),
+        (Some(revision), None) => Some(revision.to_string()),
+        (None, suffix) => suffix,
+    };
+    match suffix {
         Some(suffix) => format!("=== {} [{}] ===", meta.uri, suffix),
-        None if truncated => format!("=== {} [truncated] ===", meta.uri),
         None => format!("=== {} ===", meta.uri),
     }
 }
@@ -1389,6 +1396,64 @@ mod tests {
     fn empty_file_has_bare_header() {
         let r = render_segment(file_seg("file:empty.rs", "", 0, 0), 10_000);
         assert_eq!(r.text, "=== file:empty.rs ===");
+    }
+
+    #[test]
+    fn a_revision_label_leads_the_count_suffix() {
+        let mut seg = file_seg("file:x.rs?branch=agent/foo", "     1\ta\n     2\tb", 340, 0);
+        seg.meta.revision = Some("agent/foo@1a2b3c4d committed 12m ago".into());
+        let r = render_segment(seg, 10_000);
+        assert!(
+            r.text.starts_with(
+                "=== file:x.rs?branch=agent/foo [agent/foo@1a2b3c4d committed 12m ago; lines 1\u{2013}2 of 340] ==="
+            ),
+            "{}",
+            r.text
+        );
+
+        let uri = "file:src?grep=needle&branch=main";
+        let mut meta = SegmentMeta::new(uri, SegmentKind::Grep, NaturalUnit::Match);
+        meta.match_count = Some(1);
+        meta.file_count = Some(1);
+        meta.revision =
+            Some("main@086a7e5f STALE: origin main is 9e77a275 (sync in progress 1m40s)".into());
+        let r = render_segment(ReadSegment::text("src/a.rs:1:needle", meta), 10_000);
+        assert!(r.text.starts_with(
+            "=== file:src?grep=needle&branch=main [main@086a7e5f STALE: origin main is 9e77a275 (sync in progress 1m40s); 1 matches in 1 files] ==="
+        ));
+    }
+
+    #[test]
+    fn a_revision_label_stands_alone_when_there_is_no_count() {
+        let mut seg = file_seg("file:empty.rs?branch=main", "", 0, 0);
+        seg.meta.revision = Some("main@9e77a275 committed 2m ago, origin checked 31s ago".into());
+        let r = render_segment(seg, 10_000);
+        assert_eq!(
+            r.text,
+            "=== file:empty.rs?branch=main [main@9e77a275 committed 2m ago, origin checked 31s ago] ==="
+        );
+    }
+
+    /// The label is composed from metadata alone, so a transcript rebuilt from
+    /// the archived envelope renders the same header the live read did; and a
+    /// segment without one serializes exactly as it did before the field
+    /// existed.
+    #[test]
+    fn revision_round_trips_through_the_archived_envelope() {
+        let mut seg = file_seg("file:x.rs?branch=main", "     1\ta", 1, 0);
+        seg.meta.revision = Some("main@9e77a275 committed 2m ago".into());
+        let live = render_segment(seg.clone(), 10_000);
+        let archived: ReadSegment =
+            serde_json::from_str(&serde_json::to_string(&seg).unwrap()).unwrap();
+        assert_eq!(render_segment(archived, 10_000).text, live.text);
+
+        let plain = file_seg("file:x.rs", "     1\ta", 1, 0);
+        assert!(!serde_json::to_string(&plain.meta)
+            .unwrap()
+            .contains("revision"));
+        let legacy: SegmentMeta =
+            serde_json::from_str(&serde_json::to_string(&plain.meta).unwrap()).unwrap();
+        assert_eq!(legacy.revision, None);
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod conflict_session;
 pub mod contended_identifiers;
 pub mod custom_providers;
 mod decide;
+pub(crate) mod default_branch_sync;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;
 pub mod docs;
@@ -526,6 +527,7 @@ impl OrchestratorBuilder {
             job_launch_claims: Arc::new(Mutex::new(HashMap::new())),
             jj_store_locks: Arc::new(Mutex::new(HashMap::new())),
             jj_store_lock_metrics: Arc::new(Mutex::new(HashMap::new())),
+            default_branch_sync: Arc::default(),
             build_service_children: Arc::new(Mutex::new(HashMap::new())),
             build_service_reconcile: Arc::new(Mutex::new(())),
             build_service_runtime: Arc::new(Mutex::new(HashMap::new())),
@@ -1395,6 +1397,12 @@ pub struct Orchestrator {
     /// reconciles from different executions on the same project store serialize.
     jj_store_locks: Arc<Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
     jj_store_lock_metrics: Arc<Mutex<HashMap<String, JjStoreLockMetrics>>>,
+
+    /// What this process knows about each project's default branch on origin,
+    /// the single-flight sync toward it, and the per-repository fetch locks.
+    /// See `orchestrator::default_branch_sync`.
+    pub(crate) default_branch_sync:
+        Arc<crate::orchestrator::default_branch_sync::DefaultBranchSyncRegistry>,
 
     /// Launcher handles for supervised Managed Build Service daemons, keyed by
     /// service name. The default sccache daemon runs in the FOREGROUND as Cairn's
@@ -2639,10 +2647,10 @@ impl Orchestrator {
     }
 
     /// Reconcile in-flight default-branch workspaces once at startup for remote
-    /// advances that landed while the app was closed. Live default-branch pushes
-    /// are handled by the GitHub webhook, and no-remote projects have no external
-    /// source of default-branch movement to poll, so there is deliberately no
-    /// recurring timer here.
+    /// advances that landed while the app was closed. Live advances reach the
+    /// store through `default_branch_sync`: the GitHub `push` webhook, Cairn's
+    /// own merge path, and a polling floor that `spawn_default_advance_reconcile`
+    /// starts after this catch-up, which bounds the lag when the relay is absent.
     ///
     /// Must be called from within a tokio runtime context.
     pub async fn run_default_advance_reconcile(&self) {
@@ -2668,6 +2676,7 @@ impl Orchestrator {
                 .await;
             crate::execution::checks_main::spawn_all_current(&orch).await;
             orch.spawn_reconcile_intent_sweep();
+            crate::orchestrator::default_branch_sync::spawn_default_branch_poll(&orch);
         });
     }
 

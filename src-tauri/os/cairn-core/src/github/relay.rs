@@ -267,6 +267,63 @@ pub enum ProcessEventOutcome {
     Ignored,
     UnmappedMention,
     Routed,
+    /// A push to a repository's default branch, handed to the default-branch
+    /// sync in the background.
+    DefaultBranchPush,
+}
+
+/// The `push` fields the default-branch sync needs, when this is a push to the
+/// repository's own default branch.
+fn default_branch_push(event_type: &str, payload: &Value) -> Option<DefaultBranchPush> {
+    if event_type != "push" || payload["deleted"].as_bool() == Some(true) {
+        return None;
+    }
+    let push = DefaultBranchPush {
+        repository: payload["repository"]["full_name"].as_str()?.to_string(),
+        git_ref: payload["ref"].as_str()?.to_string(),
+        default_branch: payload["repository"]["default_branch"]
+            .as_str()?
+            .to_string(),
+        after: payload["after"].as_str()?.to_string(),
+    };
+    crate::projects::remote::is_default_branch_push(&push.git_ref, &push.default_branch)
+        .then_some(push)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefaultBranchPush {
+    repository: String,
+    git_ref: String,
+    default_branch: String,
+    after: String,
+}
+
+/// Map a default-branch push onto its project, fast-forward the operator's
+/// checkout when that is safe, and tell the default-branch sync where origin
+/// now points.
+async fn handle_default_branch_push(
+    orch: &Orchestrator,
+    push: &DefaultBranchPush,
+) -> Result<crate::projects::remote::PushRemoteSyncOutcome, String> {
+    let outcome = crate::projects::remote::pull_project_on_default_branch_push(
+        &orch.db.local,
+        orch.services.git.as_ref(),
+        &push.repository,
+        &push.git_ref,
+        &push.default_branch,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    if let crate::projects::remote::PushRemoteSyncOutcome::Pulled { project_id, .. } = &outcome {
+        crate::orchestrator::default_branch_sync::observe_remote_tip(
+            orch,
+            project_id,
+            &push.after,
+            crate::orchestrator::default_branch_sync::Source::Push,
+        )
+        .await;
+    }
+    Ok(outcome)
 }
 
 pub async fn process_event(
@@ -276,6 +333,26 @@ pub async fn process_event(
     payload: &Value,
     app_slug: &str,
 ) -> Result<ProcessEventOutcome, String> {
+    if let Some(push) = default_branch_push(event_type, payload) {
+        // Like minting, the relay's obligation ends at handing the push off:
+        // the checkout pull and store sync run detached, so a slow fetch can
+        // never hold the relay cursor.
+        let orch = orch.clone();
+        tokio::spawn(async move {
+            match handle_default_branch_push(&orch, &push).await {
+                Ok(outcome) => log::debug!(
+                    "GitHub relay event {event_id}: default-branch push to {} at {}: {outcome:?}",
+                    push.repository,
+                    push.after
+                ),
+                Err(error) => log::warn!(
+                    "GitHub relay event {event_id}: default-branch push to {} failed: {error}",
+                    push.repository
+                ),
+            }
+        });
+        return Ok(ProcessEventOutcome::DefaultBranchPush);
+    }
     let TriggerDecision::Comment(comment) = trigger_for_event(event_type, payload, app_slug) else {
         log::debug!(
             "Ignoring GitHub relay event {event_id}: type={event_type}, action={}",
@@ -546,6 +623,117 @@ mod tests {
             Some("unknown/repository")
         );
         assert!(credentials.relay_last_unmapped_at.is_some());
+    }
+
+    fn push(git_ref: &str, repository: &str) -> Value {
+        json!({
+            "ref": git_ref,
+            "after": "9e77a2750000000000000000000000000000000b",
+            "deleted": false,
+            "repository": {"full_name": repository, "default_branch": "main"}
+        })
+    }
+
+    #[test]
+    fn only_a_push_to_the_default_branch_is_a_default_branch_push() {
+        let push_event =
+            default_branch_push("push", &push("refs/heads/main", "acme/repo")).unwrap();
+        assert_eq!(push_event.after, "9e77a2750000000000000000000000000000000b");
+        assert_eq!(push_event.repository, "acme/repo");
+        assert_eq!(
+            default_branch_push("push", &push("refs/heads/feature", "acme/repo")),
+            None
+        );
+        let mut deleted = push("refs/heads/main", "acme/repo");
+        deleted["deleted"] = json!(true);
+        assert_eq!(default_branch_push("push", &deleted), None);
+        assert_eq!(
+            default_branch_push("issue_comment", &push("refs/heads/main", "acme/repo")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_branch_push_for_a_mapped_project_reaches_the_sync() {
+        use crate::services::testing::MockGitClient;
+
+        let db = Arc::new(migrated_test_db("relay-default-push.db").await);
+        db.execute(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, default_branch, created_at, updated_at)
+             VALUES ('proj', 'default', 'Project', 'PROJ', '/repos/proj', 'main', 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        let mut git = MockGitClient::new();
+        git.expect_remote_get_url()
+            .returning(|_| Ok("git@github.com:acme/repo.git".into()));
+        // A dirty operator checkout is left alone; the store sync still runs.
+        git.expect_status()
+            .returning(|_| Ok(" M src/lib.rs".into()));
+        git.expect_fetch_origin()
+            .returning(|_| Err("git fetch origin failed: offline".into()));
+        let temp = tempfile::tempdir().unwrap().keep();
+        let orch = Orchestrator::builder(
+            Arc::new(crate::db::DbState::new(
+                db.clone(),
+                Arc::new(crate::storage::SearchIndex::open_or_create(temp.join("search")).unwrap()),
+            )),
+            Arc::new(
+                crate::services::testing::TestServicesBuilder::new()
+                    .with_git(git)
+                    .build(),
+            ),
+            temp.join("config"),
+        )
+        .build();
+
+        let mapped = default_branch_push("push", &push("refs/heads/main", "acme/repo")).unwrap();
+        let outcome = handle_default_branch_push(&orch, &mapped).await.unwrap();
+        assert!(matches!(
+            outcome,
+            crate::projects::remote::PushRemoteSyncOutcome::Pulled { ref project_id, .. } if project_id == "proj"
+        ));
+        let state = orch.default_branch_sync.snapshot("proj").unwrap();
+        assert_eq!(
+            state.remote_tip.as_deref(),
+            Some("9e77a2750000000000000000000000000000000b")
+        );
+        assert_eq!(
+            state.remote_tip_source,
+            Some(crate::orchestrator::default_branch_sync::Source::Push)
+        );
+
+        let unmapped = default_branch_push("push", &push("refs/heads/main", "other/repo")).unwrap();
+        assert_eq!(
+            handle_default_branch_push(&orch, &unmapped).await.unwrap(),
+            crate::projects::remote::PushRemoteSyncOutcome::NoMatchingProject
+        );
+    }
+
+    #[tokio::test]
+    async fn process_event_hands_a_default_branch_push_off_and_still_routes_mentions() {
+        let (orch, _) = test_orchestrator("relay-push-outcome.db").await;
+        let outcome = process_event(
+            &orch,
+            102,
+            "push",
+            &push("refs/heads/main", "acme/repo"),
+            "cairn-app",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ProcessEventOutcome::DefaultBranchPush);
+        let outcome = process_event(
+            &orch,
+            103,
+            "push",
+            &push("refs/heads/feature", "acme/repo"),
+            "cairn-app",
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, ProcessEventOutcome::Ignored);
     }
 
     #[test]

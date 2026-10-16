@@ -23,6 +23,9 @@ pub(crate) struct BranchResolution {
     pub rev: String,
     pub commit_id: String,
     pub default_commit_id: String,
+    /// The project's configured default branch, which `rev` names when the
+    /// caller asked for `main`.
+    pub default_branch: String,
 }
 
 /// Compensate a branch allocation that never sealed a commit. The bookmark is
@@ -364,6 +367,7 @@ pub(crate) async fn resolve_current_for_read(
         rev,
         commit_id,
         default_commit_id,
+        default_branch: project.default_branch,
     })
 }
 
@@ -507,8 +511,12 @@ async fn resolve_coordinate_repairing_conflicts(
 pub(crate) struct RunBranchResolution {
     pub project_id: String,
     pub repository_path: PathBuf,
+    /// The repository `commit_id` was resolved in: the managed jj store when
+    /// one exists, otherwise the project checkout.
+    pub revision_store: PathBuf,
     pub rev: String,
     pub commit_id: String,
+    pub default_branch: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -674,6 +682,7 @@ pub(crate) async fn resolve_for_read(
         rev,
         commit_id,
         default_commit_id,
+        default_branch: project.default_branch,
     })
 }
 
@@ -743,12 +752,15 @@ pub(crate) async fn resolve_for_run(
         resolve_coordinate_repairing_conflicts(orch, revision_store, &rev, &project.default_branch)
             .await
             .map_err(|error| map_coordinate_error(error, &requested))?;
+    let revision_store = revision_store.to_path_buf();
 
     Ok(RunBranchResolution {
         project_id: project.project_id,
         repository_path,
+        revision_store,
         rev,
         commit_id,
+        default_branch: project.default_branch,
     })
 }
 

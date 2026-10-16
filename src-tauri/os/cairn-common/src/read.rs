@@ -192,6 +192,13 @@ pub struct SegmentMeta {
     /// retained lines back into truthful record counts and continuation offsets.
     #[serde(default)]
     pub record_prelude_lines: Option<usize>,
+    /// For a read served from a named revision (`?branch=`), the preformatted
+    /// label naming what was read: the coordinate, its short commit, the
+    /// commit's age, and for the default branch how fresh the store's copy of
+    /// origin is. Formatted by the producer at read time so header composition
+    /// stays a pure function of this metadata, identical live and archived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
     pub truncated: bool,
     /// True when a sub-line character fallback was used (single-huge-line case).
     pub char_continuation: bool,
@@ -213,6 +220,7 @@ impl SegmentMeta {
             unit_noun: None,
             grep_shown: None,
             record_prelude_lines: None,
+            revision: None,
             truncated: false,
             char_continuation: false,
         }

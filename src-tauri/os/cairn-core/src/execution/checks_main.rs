@@ -225,11 +225,17 @@ async fn run(
     // before reaching this cadence; main attestation must not inherit that gap or
     // successfully attest the stale local bookmark.
     if orch.services.git.remote_get_url(&repo_root).is_ok() {
-        let git = orch.services.git.clone();
-        let fetch_root = repo_root.clone();
-        tokio::task::spawn_blocking(move || git.fetch_origin(&fetch_root))
-            .await
-            .map_err(|error| format!("main-attestation fetch task failed: {error}"))??;
+        crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+            orch,
+            &repo_root,
+            Some(crate::orchestrator::default_branch_sync::FetchRecord {
+                project_id,
+                default_branch,
+                source: crate::orchestrator::default_branch_sync::Source::Fetch,
+            }),
+        )
+        .await
+        .map_err(|error| format!("main-attestation fetch failed: {error}"))?;
         let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
         let guard = orch
             .acquire_jj_store_lock(&store, "main-attestation canonical refresh")

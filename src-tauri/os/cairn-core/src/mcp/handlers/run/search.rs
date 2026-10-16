@@ -934,6 +934,7 @@ mod tests {
             rev: "branch".to_string(),
             commit_id: "head".to_string(),
             default_commit_id: "base".to_string(),
+            default_branch: "main".to_string(),
         }
     }
 
@@ -985,6 +986,7 @@ mod tests {
             rev: "branch".to_string(),
             commit_id: head,
             default_commit_id: base,
+            default_branch: "main".to_string(),
         };
         (dir, resolution)
     }

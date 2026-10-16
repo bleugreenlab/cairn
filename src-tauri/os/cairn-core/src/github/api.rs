@@ -502,7 +502,7 @@ pub(crate) async fn merge_pr(
     repo: &str,
     pr_number: i32,
     merge_method: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let url = format!(
         "{}/repos/{}/{}/pulls/{}/merge",
         GITHUB_API_BASE, owner, repo, pr_number
@@ -521,7 +521,12 @@ pub(crate) async fn merge_pr(
         ));
     }
 
-    Ok(())
+    // The merge commit GitHub just wrote to the base branch. Absent only if
+    // the response body is not what GitHub documents; the merge still stands.
+    Ok(resp
+        .json::<serde_json::Value>()
+        .ok()
+        .and_then(|body| body["sha"].as_str().map(str::to_string)))
 }
 
 /// Delete a branch via REST API.
@@ -1069,7 +1074,19 @@ mod tests {
         let http = mock_with_token_and("pulls/42/merge", 200);
         let auth = test_authority();
         let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash").await;
-        assert!(result.is_ok());
+        assert_eq!(result, Ok(None), "an empty body still merged");
+    }
+
+    #[tokio::test]
+    async fn merge_pr_reports_the_merge_commit() {
+        let http = mock_with_token_and_body(
+            "pulls/42/merge",
+            200,
+            serde_json::json!({"sha": "9e77a275", "merged": true, "message": "Pull Request successfully merged"}),
+        );
+        let auth = test_authority();
+        let result = merge_pr(&http, &auth, "owner", "repo", 42, "squash").await;
+        assert_eq!(result, Ok(Some("9e77a275".to_string())));
     }
 
     #[tokio::test]

@@ -583,6 +583,65 @@ async fn resolve_coordinate_inner(
     resolve_symbol_at(&repo, coordinate).map(|id| id.hex())
 }
 
+/// What a read surface needs to say about the commit it served: when that
+/// commit was made, and whether it already contains another commit (typically
+/// origin's last observed tip).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitStamp {
+    /// Committer timestamp, in seconds since the Unix epoch.
+    pub committed_at: i64,
+    /// Whether the stamped commit is, or descends from, the commit `contains`
+    /// named. `Some(false)` when that commit is not in the store at all, since
+    /// a commit the store has never seen cannot be in what it served. `None`
+    /// when nothing was asked or the id was not a commit id.
+    pub contains: Option<bool>,
+}
+
+/// Stamp `commit_id` with its committer time and, optionally, whether it
+/// contains `contains`, from one repository load. Read-only and fetch-free: it
+/// reports what the store already holds and never asks a remote.
+pub async fn commit_stamp(
+    repository_path: &Path,
+    commit_id: &str,
+    contains: Option<&str>,
+) -> Result<CommitStamp, CoordinateResolutionError> {
+    let repository_path = repository_path.to_path_buf();
+    let commit_id = commit_id.trim().to_string();
+    let contains = contains.map(|id| id.trim().to_string());
+    tokio::task::spawn_blocking(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?
+            .block_on(async {
+                let repo = load_repo_at_head(&repository_path).await?;
+                let id = CommitId::try_from_hex(&commit_id)
+                    .ok_or_else(|| CoordinateResolutionError::Invalid(commit_id.clone()))?;
+                let commit = repo.store().get_commit(&id).map_err(|error| {
+                    CoordinateResolutionError::Absent {
+                        coordinate: commit_id.clone(),
+                        diagnostic: error.to_string(),
+                    }
+                })?;
+                let committed_at = commit.committer().timestamp.timestamp.0.div_euclid(1000);
+                let contains = match contains.as_deref().map(CommitId::try_from_hex) {
+                    None | Some(None) => None,
+                    Some(Some(ancestor)) if ancestor == id => Some(true),
+                    Some(Some(ancestor)) => Some(
+                        repo.index().has_id(&ancestor).unwrap_or(false)
+                            && repo.index().is_ancestor(&ancestor, &id).unwrap_or(false),
+                    ),
+                };
+                Ok(CommitStamp {
+                    committed_at,
+                    contains,
+                })
+            })
+    })
+    .await
+    .map_err(|error| CoordinateResolutionError::Repository(error.to_string()))?
+}
+
 /// Load a store's workspace through the crate's one settings seam, for the
 /// maintenance pass that rewrites its operation log.
 pub(crate) fn load_workspace(repository_path: &Path) -> Result<Workspace, String> {
@@ -1471,6 +1530,48 @@ mod tests {
             "delta\n",
         )
     }
+    #[test]
+    fn commit_stamp_reports_committer_time_and_containment() {
+        let (dir, commit, _, _) = fixture();
+        let path = dir.path().to_str().unwrap();
+        let head = command("git", &["-C", path, "rev-parse", "HEAD"]);
+        let parent = command("git", &["-C", path, "rev-parse", "HEAD^"]);
+        let expected_time: i64 = command("git", &["-C", path, "show", "-s", "--format=%ct", &head])
+            .parse()
+            .unwrap();
+        let stamp = runtime()
+            .block_on(commit_stamp(dir.path(), &head, Some(&head)))
+            .unwrap();
+        assert_eq!(stamp.committed_at, expected_time);
+        assert_eq!(stamp.contains, Some(true), "a commit contains itself");
+        let contains = |served: &str, tip: Option<&str>| {
+            runtime()
+                .block_on(commit_stamp(dir.path(), served, tip))
+                .unwrap()
+                .contains
+        };
+        assert_eq!(
+            contains(&head, Some(&parent)),
+            Some(true),
+            "a descendant contains its ancestor"
+        );
+        assert_eq!(
+            contains(&parent, Some(&head)),
+            Some(false),
+            "an ancestor does not contain its descendant: a read served there is behind"
+        );
+        assert_eq!(
+            contains(&commit, Some("9e77a2750000000000000000000000000000000b")),
+            Some(false),
+            "a commit the store has never seen is not contained"
+        );
+        assert_eq!(contains(&commit, None), None);
+        assert!(matches!(
+            runtime().block_on(commit_stamp(dir.path(), "not-hex", None)),
+            Err(CoordinateResolutionError::Invalid(_))
+        ));
+    }
+
     #[test]
     fn resolves_sha_change_prefix_and_bookmark_without_a_command_runner() {
         let (dir, commit, change, ambiguous) = fixture();

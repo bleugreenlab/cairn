@@ -225,7 +225,14 @@ async fn store_merge_child_inner(
             if let Err(e) = crate::jj::track_bookmark(&jj, &store, target_branch) {
                 log::debug!("jj store merge: track {target_branch} (continuing): {e}");
             }
-            if let Err(e) = crate::jj::fetch_remote(&jj, &store, "origin") {
+            // The caller holds the store lock; the fetch lock is only ever
+            // taken inside it, never the other way round.
+            let fetched =
+                crate::orchestrator::default_branch_sync::with_fetch_lock(orch, &store, || async {
+                    crate::jj::fetch_remote(&jj, &store, "origin")
+                })
+                .await;
+            if let Err(e) = fetched {
                 log::warn!(
                     "jj store merge: fetch origin before rebase-then-fold (continuing): {e}"
                 );

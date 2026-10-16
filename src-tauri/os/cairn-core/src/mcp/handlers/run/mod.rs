@@ -2445,6 +2445,23 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
     } else {
         None
     };
+    // Builders verify constants through `run branch:main` as often as through
+    // `read ?branch=main`, so the result names the tree it ran against with the
+    // same label a read header carries.
+    let revision_label = match branch_target.as_ref() {
+        Some(target) => Some(
+            crate::orchestrator::default_branch_sync::revision_label(
+                orch,
+                &target.project_id,
+                &target.rev,
+                &target.default_branch,
+                &target.revision_store,
+                &target.commit_id,
+            )
+            .await,
+        ),
+        None => None,
+    };
 
     // Resolve every item before any placement or managed-workspace preparation.
     // This is the dispatch seam where process-shaped searches can be served by
@@ -2818,6 +2835,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
                 run_context,
                 commit_msg: payload.commit_msg,
                 verdict_only: branch_target.is_some(),
+                revision_label,
                 selector: payload.executor.clone(),
                 logical_resolution,
                 store_lock,
@@ -2907,6 +2925,7 @@ pub async fn handle_run(orch: &Orchestrator, request: &McpCallbackRequest) -> St
         run_context,
         commit_msg: payload.commit_msg,
         verdict_only: branch_target.is_some(),
+        revision_label,
         selector: None,
         logical_resolution,
         store_lock,
@@ -3334,6 +3353,8 @@ struct RunBatchSettlement {
     commit_msg: Option<String>,
     /// A `branch:` run: a verdict about another revision, never published.
     verdict_only: bool,
+    /// For a `branch:` run, the label naming the revision it ran against.
+    revision_label: Option<String>,
     /// The caller's own executor selector, for the note a detached batch earns.
     selector: Option<ExecutorSelector>,
     logical_resolution: Option<super::branch::BranchResolution>,
@@ -4301,6 +4322,9 @@ async fn settle_run_batch(
         .await;
     }
     let mut result = compose_run_output(&outcomes);
+    if let Some(label) = &s.revision_label {
+        result = format!("ran against {label}\n\n{result}");
+    }
     let residence_note = [residence.note(s.selector.as_ref()), placement_note]
         .into_iter()
         .flatten()

@@ -68,6 +68,16 @@ pub trait GitClient: Send + Sync {
     /// Fetch origin into the ordinary Git repository.
     fn fetch_origin(&self, repo: &Path) -> Result<(), String>;
 
+    /// Ask `remote` where its `branch` points without fetching anything:
+    /// `git ls-remote <remote> refs/heads/<branch>`. `Ok(None)` means the
+    /// remote answered and has no such branch.
+    fn ls_remote_branch(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+    ) -> Result<Option<String>, String>;
+
     /// Clone a remote repository into the target directory.
     fn clone(&self, remote_url: &str, target_dir: &Path) -> Result<(), String>;
 
@@ -126,6 +136,16 @@ pub trait GitClient: Send + Sync {
 
     /// Resolve paths by checking out our side.
     fn checkout_ours(&self, repo: &Path, paths: Vec<String>) -> Result<(), String>;
+}
+
+/// The object id `ls-remote` reported for exactly `refname`. A pattern-matched
+/// `ls-remote` can also list refs that merely end in the same path
+/// (`refs/heads/x/main`), so only the exact name counts.
+fn parse_ls_remote_tip(stdout: &str, refname: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let (sha, name) = line.split_once('\t')?;
+        (name.trim() == refname && !sha.trim().is_empty()).then(|| sha.trim().to_string())
+    })
 }
 
 /// Production git client using the git CLI.
@@ -464,6 +484,32 @@ impl GitClient for RealGitClient {
         }
     }
 
+    fn ls_remote_branch(
+        &self,
+        repo: &Path,
+        remote: &str,
+        branch: &str,
+    ) -> Result<Option<String>, String> {
+        let refname = format!("refs/heads/{branch}");
+        let output = crate::process::bounded_command_output(
+            self.git_command()
+                .args(["ls-remote", remote, &refname])
+                .current_dir(repo),
+            crate::process::NETWORK_TIMEOUT,
+            "git ls-remote",
+        )?;
+        if !output.status.success() {
+            return Err(format!(
+                "git ls-remote {remote} {refname} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(parse_ls_remote_tip(
+            &String::from_utf8_lossy(&output.stdout),
+            &refname,
+        ))
+    }
+
     fn set_remote(&self, repo: &Path, name: &str, url: &str) -> Result<(), String> {
         let set_output = self.run_git_strs(repo, &["remote", "set-url", name, url])?;
         if set_output.success {
@@ -631,6 +677,47 @@ mod tests {
         assert_eq!(cloned.success, output.success);
         assert_eq!(cloned.stdout, output.stdout);
         assert_eq!(cloned.stderr, output.stderr);
+    }
+
+    #[test]
+    fn ls_remote_tip_matches_only_the_exact_ref() {
+        let stdout = "aaa\trefs/heads/team/main\nbbb\trefs/heads/main\n";
+        assert_eq!(
+            parse_ls_remote_tip(stdout, "refs/heads/main").as_deref(),
+            Some("bbb")
+        );
+        assert_eq!(parse_ls_remote_tip("", "refs/heads/main"), None);
+    }
+
+    #[test]
+    fn real_ls_remote_branch_reports_the_remote_tip_without_fetching() {
+        let temp = tempfile::tempdir().unwrap();
+        let git = RealGitClient;
+        let origin = temp.path().join("origin");
+        let local = temp.path().join("local");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&local).unwrap();
+        git.init_repo(&origin, "main").unwrap();
+        std::fs::write(origin.join("f"), "1\n").unwrap();
+        git.add_all(&origin).unwrap();
+        git.commit(&origin, "one").unwrap();
+        git.init_repo(&local, "main").unwrap();
+        git.set_remote(&local, "origin", &origin.to_string_lossy())
+            .unwrap();
+
+        let tip = git.rev_parse(&origin, vec!["HEAD".to_string()]).unwrap();
+        assert_eq!(
+            git.ls_remote_branch(&local, "origin", "main").unwrap(),
+            Some(tip)
+        );
+        assert_eq!(
+            git.ls_remote_branch(&local, "origin", "absent").unwrap(),
+            None
+        );
+        assert!(
+            !git.remote_branch_exists(&local, "main").unwrap(),
+            "ls-remote must not write a remote-tracking ref"
+        );
     }
 
     #[test]

@@ -62,8 +62,10 @@ pub(crate) async fn publish_managed_branch(
 
     let fetch_store = store.to_path_buf();
     let fetch_branch = branch.to_string();
-    tokio::task::spawn_blocking(move || {
-        crate::jj::fetch_remote_branch_via_git(&fetch_store, "origin", &fetch_branch)
+    crate::orchestrator::default_branch_sync::with_fetch_lock(orch, store, || {
+        tokio::task::spawn_blocking(move || {
+            crate::jj::fetch_remote_branch_via_git(&fetch_store, "origin", &fetch_branch)
+        })
     })
     .await
     .map_err(|error| format!("stale publication fetch worker failed: {error}"))??;
@@ -1088,10 +1090,10 @@ struct BaseAdvanceNotes {
 }
 
 #[derive(Debug)]
-struct DefaultReconcileProject {
-    id: String,
-    repo_path: String,
-    default_branch: String,
+pub(crate) struct DefaultReconcileProject {
+    pub(crate) id: String,
+    pub(crate) repo_path: String,
+    pub(crate) default_branch: String,
 }
 
 /// Queue non-waking notifications for in-flight siblings whose changes overlap
@@ -1450,9 +1452,22 @@ async fn reconcile_jj_downstream(
         let repo = Path::new(repo_path);
         if project_has_origin(orch, repo) {
             let ctx = format!("merged job {}", merged_job.id);
-            match fetch_origin_outside_store_lock(orch, repo).await {
+            let record = crate::orchestrator::default_branch_sync::FetchRecord {
+                project_id: &merged_job.project_id,
+                default_branch: base_branch,
+                source: crate::orchestrator::default_branch_sync::Source::Fetch,
+            };
+            match crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+                orch,
+                repo,
+                Some(record),
+            )
+            .await
+            {
                 Ok(()) => {
-                    reconcile_store_default_bookmark(
+                    // Logged inside; the merged-job path has no sync state to
+                    // report it to, and the next poll re-checks the bookmark.
+                    let _ = reconcile_store_default_bookmark(
                         orch,
                         db,
                         &merged_job.project_id,
@@ -1460,7 +1475,7 @@ async fn reconcile_jj_downstream(
                         base_branch,
                         &ctx,
                     )
-                    .await
+                    .await;
                 }
                 Err(error) => log::warn!(
                     "{ctx}: git fetch origin failed; skipping default bookmark reconcile: {error}"
@@ -1579,7 +1594,9 @@ fn remote_default_revset(default_branch: &str) -> String {
 /// legitimately holds sealed work origin has not seen and is left untouched.
 ///
 /// Non-fatal end to end. A reconciliation failure is operator-facing diagnostic
-/// output; it never becomes a message to an agent and never fails the caller.
+/// output; it never becomes a message to an agent. The result is returned so
+/// the default-branch sync can report a store whose `main` did not move as
+/// stale and retry it, instead of reading `<default>@origin` as success.
 async fn reconcile_store_default_bookmark(
     orch: &Orchestrator,
     db: &LocalDb,
@@ -1587,12 +1604,12 @@ async fn reconcile_store_default_bookmark(
     repo_path: &Path,
     branch: &str,
     ctx: &str,
-) {
+) -> Result<(), String> {
     if !branch_is_project_default(db, project_id, branch).await {
         log::debug!(
             "{ctx}: `{branch}` is not project {project_id}'s default branch; not reconciling it onto origin"
         );
-        return;
+        return Ok(());
     }
     let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
@@ -1602,51 +1619,41 @@ async fn reconcile_store_default_bookmark(
     let _phase = guard.phase("default bookmark reconcile");
     if let Err(error) = crate::jj::ensure_store_initialized(&jj, &store, repo_path) {
         log::warn!("{ctx}: ensure jj store failed; skipping default bookmark reconcile: {error}");
-        return;
+        return Err(format!("ensure jj store failed: {error}"));
     }
     match crate::jj::reconcile_tracked_bookmark(&jj, &store, branch) {
-        Ok(outcome) => log::debug!("{ctx}: default bookmark `{branch}` reconcile: {outcome:?}"),
-        Err(error) => log::error!(
-            "{ctx}: default bookmark `{branch}` did not reconcile against origin: {error}"
-        ),
+        Ok(outcome) => {
+            log::debug!("{ctx}: default bookmark `{branch}` reconcile: {outcome:?}");
+            Ok(())
+        }
+        Err(error) => {
+            log::error!(
+                "{ctx}: default bookmark `{branch}` did not reconcile against origin: {error}"
+            );
+            Err(format!(
+                "default bookmark `{branch}` did not reconcile against origin: {error}"
+            ))
+        }
     }
 }
 
-async fn fetch_origin_outside_store_lock(
-    orch: &Orchestrator,
-    repo_path: &Path,
-) -> Result<(), String> {
-    let git = orch.services.git.clone();
-    let repo_path = repo_path.to_path_buf();
-    tokio::task::spawn_blocking(move || git.fetch_origin(&repo_path))
-        .await
-        .map_err(|error| format!("git fetch origin task failed: {error}"))?
-}
-
-/// Reconcile in-flight siblings after the project's default branch advanced
-/// **outside Cairn** (a non-Cairn PR merged in the GitHub UI, or a direct push to
-/// the default branch), detected via the GitHub `push` webhook. Thin wrapper over
-/// [`reconcile_default_advance`] with the `Remote` source.
-pub(crate) async fn reconcile_external_default_advance(
-    orch: &Orchestrator,
-    project_id: &str,
-    default_branch: &str,
-) -> Result<(), String> {
-    reconcile_default_advance(orch, project_id, default_branch).await
-}
-
-/// Shared body for live default-branch-advance reconcile. Mirrors the Cairn-merge
-/// path: gate on in-flight siblings, bring the advanced tip into the shared store,
-/// then auto-rebase every in-flight sibling on that branch onto the new tip over
-/// the shared store — push the cleanly-rebased ones, record conflicts
-/// non-blocking, and notify the siblings this reconcile actually rewrote — a
-/// waking `Steer` note to a conflicted sibling, a passive ride-along note to a
-/// cleanly-rebased one (the before/after commit-id guard in
-/// `reconcile_base_advance` gates both). This reconciliation is driven by
-/// an observed remote advance, independently of main-checkout lifecycle. Non-fatal
-/// end to end — every failure is logged
-/// and swallowed so the webhook handler does not error on it.
-async fn reconcile_default_advance(
+/// Bring origin's advanced default branch into the shared store and reconcile
+/// everything downstream of it: the default bookmark, externally merged
+/// obligations, and every in-flight sibling, which is auto-rebased onto the new
+/// tip — cleanly-rebased ones pushed, conflicts recorded non-blocking, and each
+/// sibling this reconcile actually rewrote notified (a waking `Steer` note when
+/// conflicted, a passive ride-along note when clean; the before/after commit-id
+/// guard in `reconcile_base_advance` gates both).
+///
+/// Reached only through `default_branch_sync::sync`, which single-flights it per
+/// project. Its triggers are the GitHub `push` webhook, the default-branch poll
+/// floor, and Cairn's own GitHub merge path; startup catch-up has its own
+/// before/after variant below.
+///
+/// Returns `Err` when the store could not be brought to origin (the fetch or the
+/// import failed), so the caller can say the store is stale and why. Failures
+/// past that point are logged and do not make the store's copy of origin wrong.
+pub(crate) async fn reconcile_default_advance(
     orch: &Orchestrator,
     project_id: &str,
     default_branch: &str,
@@ -1685,10 +1692,16 @@ async fn reconcile_default_advance(
     // refs before entering the jj critical section. Git object writes are
     // content-addressed and additive; jj observes the fetched refs only when the
     // locked import below runs, preserving the store's single-writer discipline.
-    if let Err(error) = fetch_origin_outside_store_lock(orch, repo_path_path).await {
-        log::warn!("external advance on {default_branch}: git fetch origin failed: {error}");
-        return Ok(());
-    }
+    crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+        orch,
+        repo_path_path,
+        Some(crate::orchestrator::default_branch_sync::FetchRecord {
+            project_id,
+            default_branch,
+            source: crate::orchestrator::default_branch_sync::Source::Fetch,
+        }),
+    )
+    .await?;
     // Provision and import the store before anything downstream depends on it
     // resolving. A store that cannot be provisioned aborts the whole reconcile
     // rather than letting the sibling pass fail on an unresolvable dest.
@@ -1699,12 +1712,12 @@ async fn reconcile_default_advance(
             .acquire_jj_store_lock(&store, format!("external import on {default_branch}"))
             .await;
         let _phase = store_guard.phase("git ref import");
-        if let Err(error) = crate::jj::ensure_project_store(&jj, &store, repo_path_path) {
-            log::warn!("external advance on {default_branch}: ensure store failed: {error}");
-            return Ok(());
-        }
+        crate::jj::ensure_project_store(&jj, &store, repo_path_path)
+            .map_err(|error| format!("importing origin into the store failed: {error}"))?;
     }
-    reconcile_store_default_bookmark(
+    // A bookmark that did not move is reported after the downstream work, which
+    // rebases onto `<default>@origin` and does not need it.
+    let bookmark = reconcile_store_default_bookmark(
         orch,
         &db,
         project_id,
@@ -1717,7 +1730,7 @@ async fn reconcile_default_advance(
     let siblings = load_sibling_jobs(&db, project_id, default_branch, EXCLUDE_NONE).await?;
     if siblings.is_empty() {
         log::debug!("external advance on {default_branch}: no in-flight siblings to reconcile");
-        return Ok(());
+        return bookmark;
     }
 
     let notes = BaseAdvanceNotes {
@@ -1741,6 +1754,7 @@ async fn reconcile_default_advance(
     )
     .await
     .map(|_| ())
+    .and(bookmark)
 }
 
 /// One-time startup catch-up for remote default-branch advances that landed while
@@ -1800,7 +1814,17 @@ async fn reconcile_startup_remote_default_advance(
         crate::jj::revset_commit(&jj, &store, &remote_default)
     };
 
-    if let Err(error) = fetch_origin_outside_store_lock(orch, repo_path).await {
+    if let Err(error) = crate::orchestrator::default_branch_sync::fetch_origin_serialized(
+        orch,
+        repo_path,
+        Some(crate::orchestrator::default_branch_sync::FetchRecord {
+            project_id: &project.id,
+            default_branch: &project.default_branch,
+            source: crate::orchestrator::default_branch_sync::Source::Startup,
+        }),
+    )
+    .await
+    {
         log::warn!("{ctx}: git fetch origin failed: {error}");
         return Ok(());
     }
@@ -1810,7 +1834,9 @@ async fn reconcile_startup_remote_default_advance(
     // that conflicts with what origin did while Cairn was closed, and the old
     // shape — gated on in-flight siblings, gated again on the tip having moved —
     // meant a restart could not heal it either.
-    reconcile_store_default_bookmark(
+    // Logged inside; a bookmark left behind here is what the poll's local
+    // bookmark check catches and re-syncs.
+    let _ = reconcile_store_default_bookmark(
         orch,
         db,
         &project.id,
@@ -4945,7 +4971,7 @@ async fn branch_is_project_default(db: &LocalDb, project_id: &str, branch: &str)
     }
 }
 
-async fn load_project_default_branch(
+pub(crate) async fn load_project_default_branch(
     db: &LocalDb,
     project_id: &str,
 ) -> Result<Option<String>, String> {
@@ -4971,7 +4997,10 @@ async fn load_project_default_branch(
 
 /// The git-backed checkout path for a project (the source of the jj-managed
 /// signal and the anchor for the shared jj store).
-async fn load_project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<String>, String> {
+pub(crate) async fn load_project_repo_path(
+    db: &LocalDb,
+    project_id: &str,
+) -> Result<Option<String>, String> {
     let project_id = project_id.to_string();
     db.read(|conn| {
         let project_id = project_id.clone();
@@ -4993,7 +5022,7 @@ async fn load_project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option
 /// checkout (`repo_path`) and a known `default_branch`. Remote presence is checked
 /// against live git config after this query so local-only projects stay cheap to
 /// skip and cloud-only projects never enter the path.
-async fn load_projects_for_default_reconcile(
+pub(crate) async fn load_projects_for_default_reconcile(
     orch: &Orchestrator,
 ) -> Result<Vec<(Arc<LocalDb>, DefaultReconcileProject)>, String> {
     let mut all_projects = Vec::new();
@@ -7769,7 +7798,7 @@ mod tests {
         let orch = Arc::new(test_orchestrator(db, git));
         let reconcile_orch = orch.clone();
         let reconcile = tokio::spawn(async move {
-            reconcile_external_default_advance(&reconcile_orch, "proj-1", "integration").await
+            reconcile_default_advance(&reconcile_orch, "proj-1", "integration").await
         });
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(2))
@@ -7785,7 +7814,9 @@ mod tests {
         .expect("publication acquires the canonical store lock while reconcile fetch is stalled");
 
         release_tx.send(()).unwrap();
-        reconcile.await.unwrap().unwrap();
+        // `/repo` is not a real repository, so the import after the fetch
+        // fails; what this test owns is that the fetch held no store lock.
+        let _ = reconcile.await.unwrap();
     }
 
     /// THE REGRESSION. A merge lands on origin with NOTHING else in flight, which
@@ -7858,7 +7889,7 @@ mod tests {
         let landed = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
         git(proj.path(), &["push", "-q", "-f", "origin", "HEAD:main"]);
 
-        reconcile_external_default_advance(&orch, "proj-jj", "main")
+        reconcile_default_advance(&orch, "proj-jj", "main")
             .await
             .unwrap();
 
