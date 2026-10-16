@@ -699,12 +699,12 @@ mod tests {
 
     #[test]
     fn an_advertised_alias_resolves_to_its_canonical_key() {
-        let mut aliased = key("dependsOn", "array");
-        aliased.aliases = vec!["depends_on".to_string()];
+        let mut aliased = key("labelIds", "array");
+        aliased.aliases = vec!["label_ids".to_string()];
         let patch = action("patch issue", "patch", Vec::new(), vec![aliased]);
         assert_eq!(
-            build_payload(&patch, "depends_on=cairn://p/cairn/1").unwrap(),
-            serde_json::json!({"dependsOn": ["cairn://p/cairn/1"]})
+            build_payload(&patch, "label_ids=bug").unwrap(),
+            serde_json::json!({"labelIds": ["bug"]})
         );
     }
 

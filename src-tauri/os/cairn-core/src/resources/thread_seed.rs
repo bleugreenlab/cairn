@@ -1460,6 +1460,16 @@ struct ChildStatus {
     checks: Vec<(String, String)>,
     unanswered_questions: i64,
     last_activity_at: Option<i64>,
+    /// One gate-census line per held execution (`exec N — held, waiting on
+    /// ...`). A child whose only execution is held derives Backlog and has no
+    /// nodes, so without these it would read exactly like a child nobody
+    /// started.
+    held: Vec<String>,
+    /// One census line per gated execution that can never start (`exec N —
+    /// won't start: superseded by exec M`). Detail only: such an execution
+    /// is not something the child waits on, so it earns no `held` marker and
+    /// does not keep a failed child live.
+    wont_start: Vec<String>,
 }
 
 /// Statuses that end an issue. A child in one of these is history: its turns may
@@ -1467,16 +1477,24 @@ struct ChildStatus {
 const TERMINAL_ISSUE_STATUSES: [&str; 3] = ["merged", "closed", "failed"];
 
 impl ChildStatus {
+    /// Whether this child is live work rather than history. A failed child
+    /// with a held rerun is waiting on its gates, not finished: it keeps its
+    /// detail lines, stays out of the resolved-history cap, and keeps its
+    /// turns out of era compaction.
     fn is_open(&self) -> bool {
         !TERMINAL_ISSUE_STATUSES.contains(&self.status.as_str())
+            || (self.status == "failed" && !self.held.is_empty())
     }
 
     /// The one line that addresses a child: where it lives, where it stands,
     /// what it is. Every census renders this; what a census decides is whether
     /// an open child also gets its detail block underneath.
     fn census_line(&self) -> String {
+        // The held marker rides on the address line, not the detail block, so
+        // a collapsed census that drops detail still says a child is held.
+        let held = if self.held.is_empty() { "" } else { " · held" };
         format!(
-            "- `{}` **{}** · {}\n",
+            "- `{}` **{}**{held} · {}\n",
             self.uri,
             self.status,
             one_line(&self.title)
@@ -1572,6 +1590,9 @@ fn render_children(children: &[ChildStatus], now: i64) -> String {
             if !detail.is_empty() {
                 out.push_str(&format!("  {detail}\n"));
             }
+            for line in child.held.iter().chain(&child.wont_start) {
+                out.push_str(&format!("  {line}\n"));
+            }
         }
     }
     if terminal.len() > CENSUS_TERMINAL_CHILDREN {
@@ -1625,10 +1646,37 @@ async fn load_children(
             checks: Vec::new(),
             unanswered_questions: 0,
             last_activity_at: None,
+            held: Vec::new(),
+            wont_start: Vec::new(),
         });
     }
     if children.is_empty() {
         return Ok(children);
+    }
+
+    // Held executions are read strictly, like the enumeration itself: a held
+    // child produces no attention on its own, so the census line is the only
+    // place a thread learns it is waiting.
+    let child_ids: Vec<String> = at.keys().cloned().collect();
+    let gated = crate::execution::gates::census::gated_executions_for_issues_conn(conn, &child_ids)
+        .await
+        .map_err(|error| error.to_string())?;
+    for (issue_id, executions) in gated {
+        if let Some(child) = at
+            .get(&issue_id)
+            .map(|index| &mut children[*index])
+            // A merged or closed child's resolution already ended its work;
+            // a gated execution left on it is not something to wait on, and
+            // its history line already says the child is done.
+            .filter(|child| !matches!(child.status.as_str(), "merged" | "closed"))
+        {
+            child.held = executions.held.into_iter().map(|held| held.line).collect();
+            child.wont_start = executions
+                .wont_start
+                .into_iter()
+                .map(|held| held.line)
+                .collect();
+        }
     }
 
     // The newest execution's top-level nodes. An older execution's nodes describe
@@ -2081,8 +2129,8 @@ mod tests {
     /// question, and recent activity.
     async fn make_open_child_live(db: &LocalDb) {
         db.execute_script(
-            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-               VALUES ('e-open-old','build','i-open','p','complete',1,1);
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES ('e-open-old','build','i-open','p','complete',1,1,'superseded');
              INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
                VALUES ('e-open','build','i-open','p','running',2,2);
              INSERT INTO jobs(id, execution_id, issue_id, project_id, status, uri_segment, node_name, created_at, updated_at)
@@ -2128,6 +2176,69 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A child whose only execution is held derives Backlog and has no nodes.
+    /// The census must still say it is held and name what it waits on, or the
+    /// thread reads it as a child nobody started.
+    #[tokio::test]
+    async fn the_census_names_a_held_childs_gates_and_their_evidence() {
+        use crate::execution::gates::census::test_support::{hold_execution, HELD_SUMMARY};
+        let db = thread_fixture("thread-seed-held-child.db").await;
+        db.execute_script(
+            "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+               VALUES ('i-held','p',22,'Rerun after the fix','backlog','none',1,1,'t-thread');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-held','build','i-held','p','held',3,1);",
+        )
+        .await
+        .unwrap();
+        hold_execution(&db, "e-held").await;
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        assert!(
+            seed.content.contains(&format!(
+                "- `cairn://p/prj/22` **backlog** · held · Rerun after the fix\n  exec 1 — {HELD_SUMMARY}\n"
+            )),
+            "the held child's census is wrong: {}",
+            seed.content
+        );
+    }
+
+    /// A failed child with a held rerun is waiting, not history: it keeps its
+    /// gate lines and is never cut by the resolved-history cap, however many
+    /// finished children sort ahead of it.
+    #[tokio::test]
+    async fn a_failed_child_with_a_held_rerun_is_live_not_history() {
+        use crate::execution::gates::census::test_support::{hold_execution, HELD_SUMMARY};
+        let db = thread_fixture("thread-seed-failed-held.db").await;
+        let mut script = String::new();
+        for n in 0..(CENSUS_TERMINAL_CHILDREN as i64 + 2) {
+            script.push_str(&format!(
+                "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+                   VALUES ('i-old-{n}','p',{},'Old work {n}','merged','none',1,1,'t-thread');\n",
+                100 + n
+            ));
+        }
+        script.push_str(
+            "INSERT INTO issues(id, project_id, number, title, status, attention, created_at, updated_at, parent_thread_id)
+               VALUES ('i-retry','p',500,'Retry once green','failed','none',1,1,'t-thread');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES ('e-failed','build','i-retry','p','failed',1,1,'superseded');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-rerun','build','i-retry','p','held',2,2);",
+        );
+        db.execute_script(&script).await.unwrap();
+        hold_execution(&db, "e-rerun").await;
+
+        let seed = compose_thread_seed(&db, THREAD_JOB, NOW).await.unwrap();
+        assert!(
+            seed.content.contains(&format!(
+                "- `cairn://p/prj/500` **failed** · held · Retry once green\n  exec 2 — {HELD_SUMMARY}\n"
+            )),
+            "the failed+held child lost its census: {}",
+            seed.content
+        );
     }
 
     #[tokio::test]

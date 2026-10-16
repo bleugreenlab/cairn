@@ -44,10 +44,35 @@ pub async fn insert_system_direct_push_with_key_conn(
     urgency: DeliveryUrgency,
     push_key: Option<&str>,
 ) -> Result<(String, crate::push::Wake), DbError> {
+    let message_id = uuid::Uuid::new_v4().to_string();
+    insert_system_direct_push_with_message_id_conn(
+        conn,
+        recipient_job_id,
+        recipient_run_id,
+        content,
+        urgency,
+        push_key,
+        &message_id,
+    )
+    .await
+}
+
+/// [`insert_system_direct_push_with_key_conn`] with a caller-chosen message id,
+/// for a caller whose message row is its own durable delivery record: the push
+/// can be dismissed (deleted) while pending, the message row is not.
+pub async fn insert_system_direct_push_with_message_id_conn(
+    conn: &cairn_db::turso::Connection,
+    recipient_job_id: &str,
+    recipient_run_id: &str,
+    content: &str,
+    urgency: DeliveryUrgency,
+    push_key: Option<&str>,
+    message_id: &str,
+) -> Result<(String, crate::push::Wake), DbError> {
     use crate::push::Boundary;
 
     let now = chrono::Utc::now().timestamp();
-    let message_id = uuid::Uuid::new_v4().to_string();
+    let message_id = message_id.to_string();
     conn.execute(
         "INSERT INTO messages (
             id, channel_type, channel_id, sender_run_id, sender_name,

@@ -32,6 +32,7 @@ pub mod creation;
 pub mod dag;
 pub mod delegation;
 pub mod dispatch;
+pub mod gates;
 pub mod inputs;
 pub mod jobs;
 pub mod model_routing;

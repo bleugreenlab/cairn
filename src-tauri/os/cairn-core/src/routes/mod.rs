@@ -25,9 +25,11 @@ pub use index::{invalidate_trigger_index, FactLogHandle};
 pub use lifecycle::{mint_attention, spawn_attention_minter};
 pub use log::{mint, spawn_mint, spawn_mint_deferred, Mint, MintOwned};
 pub(crate) use mentions::structural_mentions;
+pub(crate) use predicate::value_matches;
 pub use predicate::{
     explain_clause, matches, Audience, Fact, FactFieldShape, FactRegistry, FactSourceShape,
-    FieldKind, FieldSpec, FieldVocabulary, LogDedupe, Presence, SourceSpec, TriggerClause,
+    FactSurface, FieldKind, FieldSpec, FieldVocabulary, LogDedupe, Presence, SourceSpec,
+    TriggerClause,
 };
 pub use references::validate_references;
 pub use worker::spawn_fact_log_worker;

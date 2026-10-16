@@ -60,6 +60,7 @@ pub(crate) async fn start_execution_from_collection(
     continuity: Option<crate::models::Continuity>,
     overrides: Option<crate::models::LaunchDeltas>,
     intent: crate::execution::recipe::LaunchIntent,
+    after: Vec<crate::routes::TriggerClause>,
 ) -> Result<String, String> {
     // Route the issue lookup to the database that OWNS the project: a team
     // project's issue rows live wholly in its synced replica (CAIRN-2181), so
@@ -92,7 +93,28 @@ pub(crate) async fn start_execution_from_collection(
         overrides.map(crate::models::LaunchCustomization::Deltas),
         crate::models::TriggerType::Manual,
         intent,
+        &after,
     )?;
+
+    // Creation-time evaluation: a gate filed after something that has already
+    // happened releases now, not on an event long past. The execution row is
+    // durable either way, so a failed evaluation is the next tick's to retry,
+    // not this write's to refuse.
+    let evaluation = if execution.status == crate::models::ExecutionStatus::Held {
+        Some(
+            crate::execution::gates::sweep::evaluate_execution(orch, &execution.id)
+                .await
+                .unwrap_or_else(|error| {
+                    log::warn!(
+                        "held execution {} could not be evaluated at creation: {error}",
+                        execution.id
+                    );
+                    Default::default()
+                }),
+        )
+    } else {
+        None
+    };
 
     // Wake any in-flight `watch` so the driving loop re-derives state promptly.
     orch.wake_for_issue(&issue_id).await;
@@ -100,6 +122,18 @@ pub(crate) async fn start_execution_from_collection(
     let key = cairn_common::uri::canonical_project(project_key);
     let issue_uri = cairn_common::uri::build_issue_uri(&key, number);
     let seq = execution.seq.unwrap_or(0);
+    if let Some(evaluation) = evaluation.filter(|evaluation| !evaluation.released) {
+        return Ok(held_filing_summary(
+            &key,
+            number,
+            seq,
+            &execution.recipe_id,
+            &issue_uri,
+            &evaluation,
+            matches!(intent, crate::execution::recipe::LaunchIntent::NewAttempt)
+                .then_some(superseded),
+        ));
+    }
     // Say what starting this did to the issue's lineage. Starting an ordinary
     // execution IS the supersede decision, so the result has to report it — the
     // caller does not get a second chance to notice (CAIRN-4665).
@@ -124,6 +158,155 @@ pub(crate) async fn start_execution_from_collection(
         "Started execution {} for {}-{} (recipe '{}').{} Watch {} for attention.",
         seq, key, number, execution.recipe_id, standing, issue_uri
     ))
+}
+
+/// What filing a held execution reports: that it is held, what it waits on and
+/// what the evidence says about each gate, what it will do to the issue's
+/// attempt when it starts, and the way out if waiting is wrong.
+///
+/// `next_attempt` is `Some(owner_now)` for a held next attempt: it fenced
+/// nothing at filing, and takes the attempt from whichever execution owns it
+/// at release.
+fn held_filing_summary(
+    key: &str,
+    number: i32,
+    seq: i32,
+    recipe_id: &str,
+    issue_uri: &str,
+    evaluation: &crate::execution::gates::sweep::Evaluation,
+    next_attempt: Option<Option<i64>>,
+) -> String {
+    let attempt = match next_attempt {
+        Some(Some(owner)) => format!(
+            " Filing it fenced nothing: execution {owner} keeps running, and this one takes the \
+             issue's attempt from whichever execution owns it when it starts."
+        ),
+        Some(None) => {
+            " When it starts it takes the issue's attempt from whichever execution owns it then."
+                .to_string()
+        }
+        None => String::new(),
+    };
+    let waiting = if evaluation.waiting.is_empty() {
+        "every gate is satisfied".to_string()
+    } else {
+        format!("after {}", evaluation.waiting.join("; after "))
+    };
+    let foreclosed = if evaluation.foreclosed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " {} of its gates can never be satisfied as written; the filing thread has been told.",
+            evaluation.foreclosed.len()
+        )
+    };
+    format!(
+        "Filed execution {seq} for {key}-{number} (recipe '{recipe_id}') HELD: no jobs and no \
+         slot until {waiting}. It starts on its own when the last gate is satisfied.{attempt}\
+         {foreclosed} Release it early with patch {{release:true}} on \
+         {issue_uri}/executions/{seq}."
+    )
+}
+
+/// A change to a held execution's gates, from a patch on
+/// `cairn://p/PROJECT/NUMBER/executions/{seq}`.
+#[derive(Debug, Clone)]
+pub(crate) enum GatePatch {
+    /// `{release: true}`: start now, recording who decided not to wait.
+    Release,
+    /// `{after: [...]}`: the full replacement gate list.
+    Replace(Vec<crate::routes::TriggerClause>),
+}
+
+/// Apply a [`GatePatch`].
+///
+/// Both forms act only on a HELD execution. Release is a one-way door: adding a
+/// gate to a running execution would be a second, weaker hold with no defined
+/// meaning, and removing one would rewrite why it started.
+pub(crate) async fn patch_execution_gates(
+    orch: &Orchestrator,
+    request: &CallbackRequest,
+    project_key: &str,
+    number: i32,
+    exec_seq: i32,
+    patch: GatePatch,
+    dry_run: bool,
+) -> Result<String, String> {
+    let owning_db = orch.db.for_project(project_key).await;
+    let execution_id = resolve_execution_id(&owning_db, project_key, number, exec_seq).await?;
+    let label = format!(
+        "execution {exec_seq} on {}",
+        cairn_common::uri::build_issue_uri(
+            &cairn_common::uri::canonical_project(project_key),
+            number
+        )
+    );
+    let state = crate::execution::gates::authoring::hold_state(&owning_db, &execution_id).await?;
+    crate::execution::gates::authoring::require_held(&state, &label)?;
+
+    match patch {
+        GatePatch::Release => {
+            if dry_run {
+                return Ok(format!("Would release {label} early"));
+            }
+            let principal = acting_principal(orch, request).await;
+            let released = crate::execution::gates::sweep::release(
+                orch,
+                &execution_id,
+                crate::execution::gates::sweep::ReleaseCause::Override {
+                    principal: principal.clone(),
+                },
+            )
+            .await?;
+            if !released {
+                return Err(format!(
+                    "{label} was released by someone else first; it is already running"
+                ));
+            }
+            Ok(format!(
+                "Released {label} early: its jobs exist and it advances now. Recorded as an \
+                 override by {principal}."
+            ))
+        }
+        GatePatch::Replace(clauses) => {
+            let gates = crate::execution::gates::authoring::canonical_predicates(
+                &clauses,
+                "payload.after",
+            )?;
+            if dry_run {
+                return Ok(format!(
+                    "Would replace the gates on held {label} with {} gate(s)",
+                    gates.len()
+                ));
+            }
+            crate::execution::gates::authoring::replace_gates(orch, &execution_id, &gates, &label)
+                .await
+        }
+    }
+}
+
+/// Who is acting on this request, as a serialized principal: the calling agent
+/// node for an agent's write, this installation for a caller with no run (the
+/// CLI, the UI).
+async fn acting_principal(orch: &Orchestrator, request: &CallbackRequest) -> serde_json::Value {
+    let principal = match request.run_id.as_deref() {
+        Some(run_id) => {
+            match crate::mcp::handlers::run_context::lookup_home_uri_routed(&orch.db, request).await
+            {
+                Ok(node) => cairn_common::identity::PrincipalRef::Agent {
+                    node,
+                    run_id: Some(run_id.to_string()),
+                },
+                Err(_) => cairn_common::identity::PrincipalRef::Machine {
+                    device_id: orch.anon_device_manager.device_id(),
+                },
+            }
+        }
+        None => cairn_common::identity::PrincipalRef::Machine {
+            device_id: orch.anon_device_manager.device_id(),
+        },
+    };
+    serde_json::to_value(&principal).unwrap_or(serde_json::Value::Null)
 }
 
 /// The `seq` of the execution that owns this issue's attempt right now, for the

@@ -28,20 +28,32 @@ pub fn create_jobs_for_execution(db: Arc<LocalDb>, execution_id: &str) -> Result
     run_advancement_db(async move {
         db.write(|conn| {
             let execution_id = execution_id.clone();
-            Box::pin(async move {
-                let snapshot = load_execution_snapshot_conn(conn, &execution_id).await?;
-                let node_ids: HashSet<String> = snapshot
-                    .recipe
-                    .nodes
-                    .iter()
-                    .map(|node| node.id.clone())
-                    .collect();
-                create_jobs_for_new_nodes_conn(conn, &execution_id, &node_ids, &snapshot).await
-            })
+            Box::pin(async move { create_jobs_for_execution_conn(conn, &execution_id).await })
         })
         .await
         .map_err(|e| format!("Failed to create jobs for execution: {e}"))
     })
+}
+
+/// Mint one job per node of the execution's frozen recipe, inside the caller's
+/// transaction.
+///
+/// Releasing a held execution needs this at connection level: the guarded
+/// `released_at` update and the jobs it licenses must commit together, because
+/// an execution with `released_at` set and no jobs is exactly what the status
+/// projection reads as `complete`.
+pub async fn create_jobs_for_execution_conn(
+    conn: &cairn_db::turso::Connection,
+    execution_id: &str,
+) -> DbResult<Vec<Job>> {
+    let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
+    let node_ids: HashSet<String> = snapshot
+        .recipe
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect();
+    create_jobs_for_new_nodes_conn(conn, execution_id, &node_ids, &snapshot).await
 }
 
 pub async fn create_jobs_for_new_nodes_conn(

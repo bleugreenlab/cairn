@@ -248,10 +248,6 @@ pub async fn update_status(
         _ => return Err(unsettable_status_refusal(status)),
     }
 
-    if is_terminal_state {
-        crate::execution::advancement::release_dependent_executions(orch, id).await?;
-    }
-
     let issue = crud::get(&owning_db, id)
         .await
         .map_err(|e| e.to_string())?
@@ -432,6 +428,11 @@ pub(crate) async fn resolve_terminal(
     settle_work_left_on_closed_sessions(orch, owning_db, &closed_sessions).await;
 
     settle_job_projection_for_issue(orch, owning_db, issue_id).await;
+
+    // Every terminal resolution comes through here — the status patch, a PR
+    // merge or close, the recipe action — so this is where `issue_resolution`
+    // and `pr_state` gates hear about it.
+    crate::execution::gates::sweep::notify_gate_evidence_changed();
 
     Ok(())
 }

@@ -18,7 +18,15 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 
 const EXECUTION_COLUMNS: &str = "id, recipe_id, issue_id, project_id, status, started_at,
     completed_at, snapshot, seq, initiator_sub, initiator_org_id,
-    triggered_by, runner_device_id, lifecycle";
+    triggered_by, runner_device_id, lifecycle, released_at, release_override_json";
+
+/// How many columns [`EXECUTION_COLUMNS`] selects.
+///
+/// A query that appends joined columns after that block reads them at
+/// `EXECUTION_COLUMN_COUNT + n`, so adding a column to the block moves them
+/// automatically. `execution_column_count_matches_the_column_list` holds this
+/// honest — the coupling used to be a comment, and a comment does not fail.
+const EXECUTION_COLUMN_COUNT: usize = 16;
 
 const ACTION_RUN_COLUMNS: &str = "id, execution_id, recipe_node_id, action_config_id,
     issue_id, project_id, status, inputs, output, error_message, started_at, completed_at,
@@ -215,6 +223,7 @@ pub fn list_triggered_executions_for_execution(
                         triggered_by,
                         started_at: row.i64(3)?,
                         completed_at: row.opt_i64(6)?,
+                        gate_census: None,
                     },
                 ))
             },
@@ -252,19 +261,27 @@ async fn list_all_executions_async(
     let project_id = filters.project_id.clone();
     let triggered_by = filters.triggered_by.clone();
 
+    // The `held` filter means WAITING: the projection also derives `held` for a
+    // gated execution that can never start (superseded, or its issue resolved),
+    // so the shared predicate narrows it in both the count and the page.
     let total = db
         .query_one(
-            "SELECT COUNT(*)
+            concat!(
+                "SELECT COUNT(*)
              FROM executions e
              LEFT JOIN issues i ON i.id = e.issue_id
              LEFT JOIN projects p ON p.id = e.project_id
              WHERE (?1 IS NULL OR e.status = ?1)
+               AND (?1 IS NULL OR ?1 <> 'held' OR (",
+                cairn_db::awaiting_release_sql!(),
+                "))
                AND (?2 IS NULL OR e.project_id = ?2 OR i.project_id = ?2)
                AND (
                  ?3 IS NULL
                  OR (?3 = 'issue' AND e.issue_id IS NOT NULL)
                  OR (?3 <> 'issue' AND e.issue_id IS NULL)
-               )",
+               )"
+            ),
             params![
                 status.as_deref(),
                 project_id.as_deref(),
@@ -283,6 +300,7 @@ async fn list_all_executions_async(
                  LEFT JOIN issues i ON i.id = e.issue_id
                  LEFT JOIN projects p ON p.id = e.project_id
                  WHERE (?1 IS NULL OR e.status = ?1)
+                   AND (?1 IS NULL OR ?1 <> 'held' OR ({awaiting_release}))
                    AND (?2 IS NULL OR e.project_id = ?2 OR i.project_id = ?2)
                    AND (
                      ?3 IS NULL
@@ -291,7 +309,8 @@ async fn list_all_executions_async(
                    )
                  ORDER BY e.started_at DESC
                  LIMIT ?4 OFFSET ?5",
-                prefixed_execution_columns = prefixed_execution_columns("e")
+                prefixed_execution_columns = prefixed_execution_columns("e"),
+                awaiting_release = cairn_db::awaiting_release_sql!()
             ),
             params![
                 status.as_deref(),
@@ -301,15 +320,15 @@ async fn list_all_executions_async(
                 offset
             ],
             |row| {
-                // The three joined columns (i.number, i.project_id, p.name) follow
-                // the EXECUTION_COLUMNS block, so their indices track its width:
-                // 14 execution columns (0..=13, through lifecycle) put the
-                // joins at 14, 15, 16.
+                // i.number, i.project_id and p.name follow the EXECUTION_COLUMNS
+                // block, so their indices track its width rather than being
+                // spelled out.
                 Ok((
                     db_execution_from_row(row)?,
-                    row.opt_i64(14)?.map(|value| value as i32),
-                    row.opt_text(15)?,
-                    row.opt_text(16)?,
+                    row.opt_i64(EXECUTION_COLUMN_COUNT)?
+                        .map(|value| value as i32),
+                    row.opt_text(EXECUTION_COLUMN_COUNT + 1)?,
+                    row.opt_text(EXECUTION_COLUMN_COUNT + 2)?,
                 ))
             },
         )
@@ -340,6 +359,7 @@ async fn list_all_executions_async(
             seq: db_exec.seq,
             runner_device_id: db_exec.runner_device_id,
             lifecycle: db_exec.lifecycle.parse().unwrap_or_default(),
+            gate_census: None,
         });
     }
 
@@ -391,6 +411,15 @@ async fn get_execution_detail_async(
         .map(Job::try_from)
         .collect::<Result<Vec<_>, _>>()?;
     let action_runs = load_action_runs_for_execution(db, &execution_id).await?;
+    let gates = {
+        let execution_id = execution_id.clone();
+        db.read(move |conn| {
+            let execution_id = execution_id.clone();
+            Box::pin(async move { crate::gates::store::list_gates_conn(conn, &execution_id).await })
+        })
+        .await
+        .map_err(|e| format!("Failed to load execution gates: {e}"))?
+    };
     let issue_id = execution.issue_id.clone();
 
     Ok(ExecutionDetail {
@@ -403,6 +432,7 @@ async fn get_execution_detail_async(
         project_name,
         jobs,
         action_runs,
+        gates,
     })
 }
 
@@ -756,6 +786,8 @@ fn db_execution_from_row(row: &cairn_db::turso::Row) -> DbResult<DbExecution> {
         triggered_by: row.text(11)?,
         runner_device_id: row.opt_text(12)?,
         lifecycle: row.text(13)?,
+        released_at: row.opt_i64(14)?,
+        release_override_json: row.opt_text(15)?,
     })
 }
 
@@ -783,6 +815,19 @@ fn db_action_run_from_row(row: &cairn_db::turso::Row) -> Result<DbActionRun, DbE
 mod tests {
     use super::*;
     use crate::storage::{MigrationRunner, TURSO_MIGRATIONS};
+
+    /// Queries that append joined columns after the EXECUTION_COLUMNS block read
+    /// them at offsets derived from this count. When the block grows and the
+    /// count does not, those reads silently return the wrong column — which is
+    /// exactly what a hardcoded offset did when `released_at` was added.
+    #[test]
+    fn execution_column_count_matches_the_column_list() {
+        assert_eq!(
+            EXECUTION_COLUMN_COUNT,
+            EXECUTION_COLUMNS.split(',').count(),
+            "EXECUTION_COLUMN_COUNT must equal the number of columns EXECUTION_COLUMNS selects"
+        );
+    }
 
     async fn exec(db: &LocalDb, sql: &'static str) {
         db.write(|conn| {
@@ -853,5 +898,54 @@ mod tests {
             Some("Cairn"),
             "project_name must map p.name"
         );
+    }
+
+    /// The `held` filter selects and counts only executions still waiting to
+    /// start. A superseded gated row and one on a merged issue both project
+    /// `held`, but neither will ever start, so neither is in the filter.
+    #[tokio::test]
+    async fn the_held_filter_counts_and_pages_only_waiting_executions() {
+        let db = migrated_db().await;
+        exec(
+            &db,
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+             VALUES ('proj-1','default','Cairn','cairn','/tmp/repo',1,1)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO issues(id, project_id, number, title, status, created_at, updated_at, merged_at)
+             VALUES ('open','proj-1',1,'Open','backlog',1,1,NULL),
+                    ('done','proj-1',2,'Done','merged',1,1,5)",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+             VALUES ('waiting','r','open','proj-1','held',3,2,'pending'),
+                    ('fenced','r','open','proj-1','held',2,1,'superseded'),
+                    ('resolved','r','done','proj-1','held',1,1,'pending')",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+             VALUES ('g1','waiting',0,'{}',1), ('g2','fenced',0,'{}',1), ('g3','resolved',0,'{}',1)",
+        )
+        .await;
+
+        let held = ExecutionFilters {
+            status: Some("held".into()),
+            ..ExecutionFilters::default()
+        };
+        let result = list_all_executions_async(&db, &held, 10, 0).await.unwrap();
+        let ids: Vec<&str> = result.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["waiting"]);
+        assert_eq!(result.total, 1, "the count agrees with the page");
+
+        let all = list_all_executions_async(&db, &ExecutionFilters::default(), 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(all.total, 3, "won't-start rows are still listed under All");
     }
 }

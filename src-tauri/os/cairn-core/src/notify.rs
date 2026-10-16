@@ -51,8 +51,13 @@ impl Notifier {
         self.emit_change("events");
     }
 
-    pub(crate) fn artifact(&self, _a: &models::Artifact) {
+    pub(crate) fn artifact(&self, a: &models::Artifact) {
         self.emit_change("artifacts");
+        // Every artifact write announces itself here, so this is the one place
+        // a confirmation can tell held executions their evidence moved.
+        if a.confirmed {
+            crate::execution::gates::sweep::notify_gate_evidence_changed();
+        }
     }
 
     pub fn comment(&self, _c: &models::Comment) {
@@ -151,9 +156,8 @@ mod tests {
             closed_at: None,
             parent_issue_id: None,
             parent_thread_id: None,
-            unmet_dependency_count: 0,
-            depends_on: Vec::new(),
-            unmet_depends_on: Vec::new(),
+            held_executions: Vec::new(),
+            wont_start_executions: Vec::new(),
             labels: Vec::new(),
         }
     }

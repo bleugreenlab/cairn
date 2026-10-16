@@ -1089,7 +1089,9 @@ pub fn store_check_result(db: Arc<LocalDb>, result: CheckResultCacheWrite) -> Re
         })
         .await
         .map_err(|e| format!("Failed to store check result cache row: {e}"))
-    })
+    })?;
+    crate::execution::gates::sweep::notify_gate_evidence_changed();
+    Ok(())
 }
 
 /// List every cached check result for a project at one sealed tree identity,
@@ -1924,7 +1926,9 @@ pub(crate) fn record_fresh_check_observation(
                 Ok(())
             })
         }).await.map_err(|e| format!("Failed to record fresh check observation: {e}"))
-    })
+    })?;
+    crate::execution::gates::sweep::notify_gate_evidence_changed();
+    Ok(())
 }
 
 /// Record reuse at another commit without mutating either the source observation
@@ -1970,7 +1974,9 @@ pub(crate) fn record_cached_check_observation(
         })
         .await
         .map_err(|e| format!("Failed to record cached check observation: {e}"))
-    })
+    })?;
+    crate::execution::gates::sweep::notify_gate_evidence_changed();
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

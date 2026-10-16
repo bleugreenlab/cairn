@@ -395,10 +395,18 @@ fn due_at(
 /// Restart-safe and double-fire-safe via the executions-table dedupe in
 /// [`last_scheduled_fire`]: a fired schedule writes an execution row whose
 /// `started_at` moves the next computed fire into the future.
+///
+/// The same tick sweeps held executions' `after:` gates (see
+/// [`crate::execution::gates::sweep`]): first thing every iteration, so a
+/// restart re-evaluates every held execution at once, and with the soonest
+/// `notBefore` folded into the sleep bound so a clock gate releases on time.
 async fn run_scheduler_loop(orch: Orchestrator) {
     log::info!("Recipe scheduler started");
 
     loop {
+        if let Err(error) = crate::execution::gates::sweep::sweep(&orch).await {
+            log::error!("Failed to sweep execution gates: {error}");
+        }
         // Resolve the OS timezone each iteration so wall-clock schedules track
         // timezone changes and DST transitions.
         let timezone = get_timezone();
@@ -447,6 +455,10 @@ async fn run_scheduler_loop(orch: Orchestrator) {
             })
             .filter_map(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0))
             .min();
+        let next_gate_due =
+            crate::execution::gates::sweep::next_gate_due_after(&orch, now.timestamp())
+                .await
+                .and_then(|timestamp| DateTime::<Utc>::from_timestamp(timestamp, 0));
         let soonest = next_fires
             .iter()
             .map(|(_, fire)| *fire)
@@ -455,6 +467,7 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                 hold.next_due_at()
                     .and_then(|at| DateTime::<Utc>::from_timestamp(at, 0))
             }))
+            .chain(next_gate_due)
             .chain(
                 automations
                     .iter()
@@ -609,6 +622,7 @@ async fn fire_scheduled_recipe(
         // The scheduler just created this issue, so there is no prior attempt to
         // supersede; `NewAttempt` is a no-op on a fresh issue's lineage.
         crate::execution::recipe::LaunchIntent::NewAttempt,
+        &[],
     )?;
 
     // Wake any in-flight `watch` on the issue, mirroring the executions-collection
@@ -655,7 +669,12 @@ fn describe_schedule(config: &ScheduleConfig) -> String {
 
 /// Spawn the scheduler as a detached background loop. Called by the always-on
 /// hosts (runner and non-inert server), never the thin desktop app.
+///
+/// The gate notifier is installed here rather than with the orchestrator: a
+/// host that does not run the scheduler cannot run executions, so it cannot
+/// release one either.
 pub(crate) fn spawn_recipe_scheduler(orch: Orchestrator) {
+    crate::execution::gates::sweep::install_sweep_notifier(orch.clone());
     tokio::spawn(run_scheduler_loop(orch));
 }
 

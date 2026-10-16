@@ -862,27 +862,6 @@ async fn cached_checkpoint_pass_does_not_execute_or_add_history() {
 }
 
 #[tokio::test]
-async fn dependent_team_execution_uses_private_outbox_for_restart_replay() {
-    let (runtime, host, _dir) = fixture(true).await;
-    seed(&host.owning, vec![node("agent", "agent")], vec![]).await;
-    host.owning.execute_script("INSERT INTO issues(id,project_id,number,title,status,progress,attention,merged_at,created_at,updated_at) VALUES('resolved','p',2,'Resolved','merged','complete','none',2,1,2);
-        INSERT INTO issue_dependencies(issue_id,depends_on_uri,created_at) VALUES('issue','cairn://p/proj/2',1);").await.unwrap();
-    assert_eq!(
-        count(
-            &host.owning,
-            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'effect_outbox'"
-        )
-        .await,
-        0,
-        "real team schemas exclude the private outbox"
-    );
-    advancement::release_dependent_executions(&runtime, "resolved")
-        .await
-        .unwrap();
-    assert_eq!(count(&runtime.private_db,"SELECT COUNT(*) FROM effect_outbox WHERE kind = 'advance_dag' AND dedupe_key = 'exec' AND state = 'pending'").await,1,"dependent advancement must survive loss of the in-memory effect channel");
-}
-
-#[tokio::test]
 async fn checkpoint_retry_requires_new_head_and_keeps_attempt_history() {
     let (runtime, host, _dir) = fixture(true).await;
     let mut checkpoint = node("check", "checkpoint");

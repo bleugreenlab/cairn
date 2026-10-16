@@ -132,6 +132,14 @@ pub fn create_jobs_for_execution(
 /// handler so both go through the same path. Advancement is enqueued on the
 /// orchestrator effect queue; hosts without an effect queue (`effect_tx == None`)
 /// get the execution + jobs created and must advance the DAG themselves.
+///
+/// A launch with `after:` gates is split here. Its first half inserts the
+/// execution and its gates and STOPS: no jobs, so no admission request and no
+/// slot. The second half — job creation and the advancement tail below — is
+/// [`crate::execution::gates::sweep::release`], applied to the same row once
+/// every gate is true. The returned execution is `Held`; the caller evaluates it
+/// at once (`gates::sweep::evaluate_execution`) so a gate already true releases
+/// immediately, and the notifier poke here covers a caller that does not.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_recipe_execution_and_advance(
     orch: &Orchestrator,
@@ -145,8 +153,10 @@ pub(crate) fn start_recipe_execution_and_advance(
     customization: Option<LaunchCustomization>,
     trigger_type: TriggerType,
     intent: LaunchIntent,
+    after: &[crate::routes::TriggerClause],
 ) -> Result<Execution, String> {
-    let execution = start_recipe_execution_impl(
+    let gates = crate::execution::gates::authoring::canonical_predicates(after, "after")?;
+    let execution = launch_recipe_execution(
         orch,
         issue_id,
         recipe_id,
@@ -160,7 +170,13 @@ pub(crate) fn start_recipe_execution_and_advance(
         continuity,
         trigger_type,
         intent,
+        &gates,
     )?;
+    if !gates.is_empty() {
+        orch.notifier.emit_change("executions");
+        crate::execution::gates::sweep::notify_gate_evidence_changed();
+        return Ok(execution);
+    }
     let _jobs = create_jobs_for_execution(orch, &execution.id)?;
     orch.notifier.emit_change("executions");
     orch.notifier.emit_change("jobs");
@@ -214,6 +230,46 @@ pub fn start_recipe_execution_impl(
     // `NewAttempt` supersedes every prior canonical execution of the issue in
     // the same transaction that inserts this one.
     intent: LaunchIntent,
+) -> Result<Execution, String> {
+    launch_recipe_execution(
+        orch,
+        issue_id,
+        recipe_id,
+        project_id,
+        customization,
+        backend,
+        initiator,
+        initiated_via,
+        runner_device_id,
+        branch_target,
+        continuity,
+        trigger_type,
+        intent,
+        &[],
+    )
+}
+
+/// [`start_recipe_execution_impl`] with `after:` gates: `gates` are canonical
+/// predicate JSON, already validated. Non-empty gates insert the execution
+/// HELD, with its gate rows, in the same transaction as the insert — a held
+/// execution must never be observable without the gates that make it held,
+/// because with no gates and no jobs the projection derives `complete`.
+#[allow(clippy::too_many_arguments)]
+fn launch_recipe_execution(
+    orch: &Orchestrator,
+    issue_id: &str,
+    recipe_id: Option<&str>,
+    project_id: &str,
+    customization: Option<LaunchCustomization>,
+    backend: Option<&str>,
+    initiator: Option<Initiator>,
+    initiated_via: Option<&str>,
+    runner_device_id: Option<String>,
+    branch_target: Option<BranchTarget>,
+    continuity: Option<Continuity>,
+    trigger_type: TriggerType,
+    intent: LaunchIntent,
+    gates: &[String],
 ) -> Result<Execution, String> {
     let now = chrono::Utc::now().timestamp() as i32;
     let this_device = orch.anon_device_manager.device_id();
@@ -421,17 +477,30 @@ pub fn start_recipe_execution_impl(
 
     let snapshot_json = snapshot.to_json()?;
 
+    // Gates whose evidence is already in wait on nothing, so the cycle refusal
+    // must not count them. Resolved before the transaction: evidence reads route
+    // to other databases.
+    let satisfied = if gates.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let (orch, gates) = (orch.clone(), gates.to_vec());
+        run_recipe_db(async move {
+            Ok(crate::execution::gates::authoring::already_satisfied(&orch, &gates).await)
+        })?
+    };
+
     // Phase 1: sequence, fence, cascade, and insert as one transaction.
     let exec_id = ids::mint_child(issue_id);
     let launch = insert_issue_execution_atomic(
         db.clone(),
+        orch.db.clone(),
         issue_id.to_string(),
         NewExecution {
             id: exec_id.clone(),
             recipe_id: recipe.id.clone(),
             issue_id: Some(issue_id.to_string()),
             project_id: None,
-            status: "running".to_string(),
+            status: if gates.is_empty() { "running" } else { "held" }.to_string(),
             started_at: now,
             completed_at: None,
             snapshot: Some(snapshot_json),
@@ -448,6 +517,10 @@ pub fn start_recipe_execution_impl(
             Some("external") => canonical::SupersessionActor::external(None),
             _ => canonical::SupersessionActor::operator_ui(),
         },
+        LaunchGates {
+            predicates: gates.to_vec(),
+            satisfied,
+        },
     )?;
 
     // Phase 2, after the fence has committed.
@@ -458,7 +531,11 @@ pub fn start_recipe_execution_impl(
         recipe_id: recipe.id,
         issue_id: Some(issue_id.to_string()),
         project_id: None,
-        status: ExecutionStatus::Running,
+        status: if gates.is_empty() {
+            ExecutionStatus::Running
+        } else {
+            ExecutionStatus::Held
+        },
         started_at: now as i64,
         completed_at: None,
         seq: Some(launch.seq),
@@ -466,6 +543,11 @@ pub fn start_recipe_execution_impl(
         triggered_by: trigger_type,
         runner_device_id: Some(owner_device),
         lifecycle: launch.lifecycle,
+        // An ungated launch is never held, so there is nothing to release it
+        // from; a gated one has not been released yet.
+        released_at: None,
+        release_override_json: None,
+        gate_census: None,
     })
 }
 
@@ -541,6 +623,9 @@ pub fn start_manual_execution_impl(
         status: ExecutionStatus::Running,
         started_at: now as i64,
         completed_at: None,
+        released_at: None,
+        release_override_json: None,
+        gate_census: None,
         seq: None,
         initiator: initiator.clone(),
         triggered_by: TriggerType::Manual,
@@ -627,10 +712,12 @@ pub(crate) fn start_event_triggered_execution(
         Some(issue_id) => {
             let launch = insert_issue_execution_atomic(
                 db.clone(),
+                orch.db.clone(),
                 issue_id.to_string(),
                 new_execution,
                 LaunchIntent::AutomaticTrigger,
                 canonical::SupersessionActor::system(),
+                LaunchGates::default(),
             )?;
             stop_superseded_agents(orch, &launch.supersessions);
             (Some(launch.seq), launch.lifecycle)
@@ -644,6 +731,9 @@ pub(crate) fn start_event_triggered_execution(
     Ok(Execution {
         id: exec_id,
         recipe_id: recipe.id.clone(),
+        released_at: None,
+        release_override_json: None,
+        gate_census: None,
         issue_id: issue_id.map(|s| s.to_string()),
         project_id: if issue_id.is_none() {
             Some(project_id.to_string())
@@ -994,6 +1084,59 @@ struct NewExecution {
     lifecycle: crate::models::ExecutionLifecycle,
 }
 
+/// Test seam: file a held execution as if the satisfaction preflight had
+/// observed `satisfied`, so a test can take the evidence away between that
+/// observation and the transaction that acts on it.
+#[cfg(test)]
+pub(crate) fn file_held_with_observed_satisfaction(
+    orch: &Orchestrator,
+    db: Arc<LocalDb>,
+    issue_id: &str,
+    recipe_id: &str,
+    snapshot: String,
+    gates: Vec<String>,
+    satisfied: std::collections::HashSet<String>,
+) -> Result<String, String> {
+    let exec_id = ids::mint_child(issue_id);
+    insert_issue_execution_atomic(
+        db,
+        orch.db.clone(),
+        issue_id.to_string(),
+        NewExecution {
+            id: exec_id.clone(),
+            recipe_id: recipe_id.to_string(),
+            issue_id: Some(issue_id.to_string()),
+            project_id: None,
+            status: "held".to_string(),
+            started_at: 1,
+            completed_at: None,
+            snapshot: Some(snapshot),
+            seq: None,
+            initiator: None,
+            triggered_by: TriggerType::Manual.to_string(),
+            runner_device_id: orch.anon_device_manager.device_id(),
+            lifecycle: crate::models::ExecutionLifecycle::Canonical,
+        },
+        LaunchIntent::NewAttempt,
+        canonical::SupersessionActor::operator_ui(),
+        LaunchGates {
+            predicates: gates,
+            satisfied,
+        },
+    )?;
+    Ok(exec_id)
+}
+
+/// The `after:` gates a launch is filed with: their canonical predicate JSON,
+/// and the subset the satisfaction preflight already observed satisfied. The
+/// two travel together because that observation is what waives a predicate's
+/// wait edge, and it is latched on the gate row in the same transaction.
+#[derive(Default)]
+struct LaunchGates {
+    predicates: Vec<String>,
+    satisfied: std::collections::HashSet<String>,
+}
+
 /// What starting an issue's execution actually did to its lineage.
 struct IssueLaunch {
     seq: i32,
@@ -1012,17 +1155,46 @@ struct IssueLaunch {
 /// A `ParallelAlternative` takes the next sequence and generation but supersedes
 /// nothing and is inserted `parallel`, so it can never be mistaken for the
 /// issue's implementation.
+///
+/// `gates` are the `after:` gates of a held launch (empty for an unheld one).
+/// Their wait-cycle refusal and their rows land in this same transaction: the
+/// refusal so two concurrent filings cannot each pass and together close a
+/// cycle, the rows so the execution is never visible without what holds it.
+///
+/// A held `NewAttempt` supersedes NOTHING here. It is inserted `pending`, outside
+/// the canonical slot, and takes the attempt when it is released — from
+/// whatever owns it then (`gates::sweep::release_conn`). Fencing at filing would
+/// stop the very run a "re-run after X merges" is waiting to follow, and if that
+/// run has finished by release time there is nothing to fence at all.
 fn insert_issue_execution_atomic(
     db: Arc<LocalDb>,
+    dbs: Arc<crate::db::DbState>,
     issue_id: String,
     mut execution: NewExecution,
     intent: LaunchIntent,
     actor: crate::execution::canonical::SupersessionActor,
+    gates: LaunchGates,
 ) -> Result<IssueLaunch, String> {
+    let LaunchGates {
+        predicates: gates,
+        satisfied,
+    } = gates;
+    if !gates.is_empty() && intent == LaunchIntent::AutomaticTrigger {
+        return Err(
+            "an automatic launch cannot be held: `after:` gates are set by whoever files the \
+             execution"
+                .to_string(),
+        );
+    }
+    let own_db = db.clone();
     run_recipe_db(async move {
         db.write(move |conn| {
             let issue_id = issue_id.clone();
             let actor = actor.clone();
+            let gates = gates.clone();
+            let satisfied = satisfied.clone();
+            let dbs = dbs.clone();
+            let own_db = own_db.clone();
             let mut execution = NewExecution {
                 id: execution.id.clone(),
                 recipe_id: execution.recipe_id.clone(),
@@ -1040,11 +1212,16 @@ fn insert_issue_execution_atomic(
             };
             Box::pin(async move {
                 let now = chrono::Utc::now().timestamp();
+                crate::execution::gates::authoring::refuse_cycles_conn(
+                    conn, &dbs, &own_db, &issue_id, None, &gates, &satisfied,
+                )
+                .await?;
                 let seq = crate::execution::canonical::next_seq_conn(conn, &issue_id).await?;
+                let held = !gates.is_empty();
 
                 // The fence is published BEFORE the successor exists, so there is
                 // never an instant at which two rows read canonical.
-                let supersessions = if intent.supersedes() {
+                let supersessions = if intent.supersedes() && !held {
                     crate::execution::canonical::supersede_canonical_conn(
                         conn,
                         &issue_id,
@@ -1062,6 +1239,7 @@ fn insert_issue_execution_atomic(
                 // finds nobody holding it -- and since it never supersedes, that
                 // means nobody held it to begin with.
                 let lifecycle = match intent {
+                    LaunchIntent::NewAttempt if held => crate::models::ExecutionLifecycle::Pending,
                     LaunchIntent::NewAttempt => crate::models::ExecutionLifecycle::Canonical,
                     LaunchIntent::ParallelAlternative => {
                         crate::models::ExecutionLifecycle::Parallel
@@ -1082,6 +1260,34 @@ fn insert_issue_execution_atomic(
                 execution.seq = Some(seq);
                 execution.lifecycle = lifecycle;
                 insert_execution_conn(conn, &execution).await?;
+                if held {
+                    let gate_ids = cairn_workflow::gates::store::insert_gates_conn(
+                        conn,
+                        execution.id.as_str(),
+                        &gates,
+                        now,
+                    )
+                    .await?;
+                    // The satisfaction that waived a wait edge above is latched
+                    // with the gate: evidence that goes away before the first
+                    // sweep must not leave behind the very edge the refusal
+                    // skipped because it was met.
+                    for (gate_id, predicate) in gate_ids.iter().zip(&gates) {
+                        if satisfied.contains(predicate) {
+                            cairn_workflow::gates::store::record_outcome_conn(
+                                conn,
+                                gate_id,
+                                "satisfied",
+                                Some(now),
+                            )
+                            .await?;
+                        }
+                    }
+                    // A held filing beside live work must not drag the issue's
+                    // projection; one on a fresh issue projects it backlog.
+                    crate::transitions::outcome::recompute_issue_status_conn(conn, &issue_id)
+                        .await?;
+                }
 
                 Ok(IssueLaunch {
                     seq,
@@ -1106,7 +1312,7 @@ fn insert_issue_execution_atomic(
 /// That is also why there is no reconciler behind it. A crash between the fence
 /// and this loop costs at most one turn of an agent whose work already cannot
 /// land — a bounded, self-closing cost, not a correctness hole.
-fn stop_superseded_agents(
+pub(crate) fn stop_superseded_agents(
     orch: &Orchestrator,
     supersessions: &[crate::execution::canonical::Supersession],
 ) {

@@ -54,16 +54,17 @@ pub struct Issue {
     pub merged_at: Option<i64>,
     /// Timestamp when the issue was closed (resolution)
     pub closed_at: Option<i64>,
-    /// Number of dependencies that have not reached Merged or Closed.
+    /// This issue's executions that are filed with `after:` gates, not yet
+    /// released, and still able to start, each with its rendered gate census. A held execution has no
+    /// jobs and its issue derives Backlog, so without this an issue waiting on
+    /// a gate that never comes true would look like an issue nobody started.
     #[serde(default)]
-    pub unmet_dependency_count: i64,
-    /// Canonical issue URIs this issue depends on.
+    pub held_executions: Vec<crate::HeldExecution>,
+    /// This issue's gated, unreleased executions that can never start —
+    /// superseded, or on an issue already merged or closed. Listed apart from
+    /// `held_executions` so a dead execution never reads as one still waiting.
     #[serde(default)]
-    pub depends_on: Vec<String>,
-    /// Canonical issue URIs of dependencies that have not yet reached Merged or
-    /// Closed — what this issue is currently blocked on.
-    #[serde(default)]
-    pub unmet_depends_on: Vec<String>,
+    pub wont_start_executions: Vec<crate::HeldExecution>,
     /// Parent issue this issue branches from and wakes on attention.
     #[serde(default)]
     pub parent_issue_id: Option<String>,
@@ -254,8 +255,6 @@ pub struct UpdateIssue {
     pub description: Option<String>,
     #[serde(alias = "model")]
     pub backend_override: Option<Option<String>>, // Nested Option to support clearing
-    /// Full replacement dependency list when provided.
-    pub depends_on: Option<Vec<String>>,
     /// Full replacement label list when provided.
     #[serde(default)]
     pub label_ids: Option<Vec<String>>,

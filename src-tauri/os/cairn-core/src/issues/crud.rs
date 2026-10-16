@@ -241,18 +241,16 @@ fn issue_from_row(row: &cairn_db::turso::Row) -> DbResult<Issue> {
         closed_at: row.opt_i64(15)?,
         parent_issue_id: row.opt_text(16)?,
         parent_thread_id: row.opt_text(17)?,
-        unmet_dependency_count: 0,
-        depends_on: Vec::new(),
-        unmet_depends_on: Vec::new(),
+        held_executions: Vec::new(),
+        wont_start_executions: Vec::new(),
         labels: Vec::new(),
     })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RelationQuery {
-    Dependencies,
-    ResolvedDependencies,
     Labels,
+    HeldExecutions,
 }
 
 async fn hydrate_issue_relations(
@@ -275,26 +273,16 @@ async fn hydrate_issue_relations_with_observer(
         .iter()
         .map(|issue| issue.id.clone())
         .collect::<Vec<_>>();
-    observe_query(RelationQuery::Dependencies);
-    let mut dependencies = relations::list_dependency_uris_for_issues(conn, &issue_ids).await?;
-    let dependency_uris = dependencies
-        .values()
-        .flat_map(|uris| uris.iter().cloned())
-        .collect::<Vec<_>>();
-    let resolved = if dependency_uris.is_empty() {
-        Default::default()
-    } else {
-        observe_query(RelationQuery::ResolvedDependencies);
-        relations::resolve_issue_uris(conn, &dependency_uris).await?
-    };
     observe_query(RelationQuery::Labels);
     let mut labels = attach::list_labels_for_issues(conn, &issue_ids).await?;
+    observe_query(RelationQuery::HeldExecutions);
+    let mut gated =
+        crate::execution::gates::census::gated_executions_for_issues_conn(conn, &issue_ids).await?;
 
     for issue in issues {
-        issue.depends_on = dependencies.remove(&issue.id).unwrap_or_default();
-        issue.unmet_depends_on =
-            relations::filter_unmet_dependencies_from_resolved(&issue.depends_on, &resolved)?;
-        issue.unmet_dependency_count = issue.unmet_depends_on.len() as i64;
+        let gated = gated.remove(&issue.id).unwrap_or_default();
+        issue.held_executions = gated.held;
+        issue.wont_start_executions = gated.wont_start;
         issue.labels = labels.remove(&issue.id).unwrap_or_default();
     }
     Ok(())
@@ -582,7 +570,6 @@ pub async fn update(
         title,
         description,
         backend_override,
-        depends_on,
         label_ids,
     } = input;
     let backend_present = backend_override.is_some();
@@ -594,7 +581,6 @@ pub async fn update(
         let title = title.clone();
         let description = description.clone();
         let backend_value = backend_value.clone();
-        let depends_on = depends_on.clone();
         let label_ids = label_ids.clone();
         Box::pin(async move {
             conn.execute(
@@ -614,11 +600,6 @@ pub async fn update(
                 ],
             )
             .await?;
-            if let Some(dependencies) = depends_on {
-                relations::replace_dependencies(conn, &id, &dependencies, now)
-                    .await
-                    .map_err(DbError::Row)?;
-            }
             if let Some(labels) = label_ids {
                 attach::replace_issue_labels(conn, &id, &labels, now)
                     .await
@@ -995,15 +976,6 @@ mod tests {
             VALUES('x-one', 'p-two', 1, 'External', 'active', 'active', 'none', 5, 5);
             UPDATE issues SET parent_issue_id = 'parent' WHERE id IN ('i-one', 'i-two');
 
-            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
-            VALUES('i-one', 'cairn://p/ONE/2', 10);
-            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
-            VALUES('i-one', 'cairn://p/TWO/1', 20);
-            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
-            VALUES('i-one', 'cairn://p/MISSING/9', 30);
-            INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
-            VALUES('i-two', 'cairn://p/ONE/3', 40);
-
             INSERT INTO labels(id, workspace_id, name, color, created_at, updated_at)
             VALUES('label-zulu', 'default', 'zulu', '#111111', 1, 1);
             INSERT INTO labels(id, workspace_id, name, color, created_at, updated_at)
@@ -1038,15 +1010,6 @@ mod tests {
 
         let issue_one = issues.iter().find(|issue| issue.id == "i-one").unwrap();
         assert_eq!(
-            issue_one.depends_on,
-            vec!["cairn://p/ONE/2", "cairn://p/TWO/1", "cairn://p/MISSING/9"]
-        );
-        assert_eq!(
-            issue_one.unmet_depends_on,
-            vec!["cairn://p/two/1", "cairn://p/missing/9"]
-        );
-        assert_eq!(issue_one.unmet_dependency_count, 2);
-        assert_eq!(
             issue_one
                 .labels
                 .iter()
@@ -1056,9 +1019,6 @@ mod tests {
         );
 
         let issue_two = issues.iter().find(|issue| issue.id == "i-two").unwrap();
-        assert_eq!(issue_two.depends_on, vec!["cairn://p/ONE/3"]);
-        assert!(issue_two.unmet_depends_on.is_empty());
-        assert_eq!(issue_two.unmet_dependency_count, 0);
         assert_eq!(issue_two.labels[0].name, "Beta");
 
         let single = get(&db, "i-one").await.unwrap().unwrap();
@@ -1075,8 +1035,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["i-two", "i-one"]
         );
-        assert_eq!(children[1].depends_on, issue_one.depends_on);
-        assert_eq!(children[1].unmet_depends_on, issue_one.unmet_depends_on);
         assert_eq!(children[1].labels, issue_one.labels);
     }
 
@@ -1121,6 +1079,40 @@ mod tests {
         assert_eq!(single.parent_thread_id.as_deref(), Some("t-one"));
     }
 
+    /// Every issue read carries its held executions with their rendered gates,
+    /// which is what the issue list and sidebar display.
+    #[tokio::test]
+    async fn hydrated_issues_carry_their_held_executions() {
+        use crate::execution::gates::census::test_support::{hold_execution, HELD_SUMMARY};
+        let db = seeded_relation_db().await;
+        db.execute_script(
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES ('e-done','r','i-one','p-one','complete',1,1,'superseded');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-held','r','i-one','p-one','held',2,2);",
+        )
+        .await
+        .unwrap();
+        hold_execution(&db, "e-held").await;
+
+        let (one, two) = db
+            .read(|conn| {
+                Box::pin(async move {
+                    Ok((
+                        load_optional_conn(conn, "i-one").await?.unwrap(),
+                        load_optional_conn(conn, "i-two").await?.unwrap(),
+                    ))
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(one.held_executions.len(), 1);
+        assert_eq!(one.held_executions[0].execution_id, "e-held");
+        assert_eq!(one.held_executions[0].seq, Some(2));
+        assert_eq!(one.held_executions[0].census.summary, HELD_SUMMARY);
+        assert!(two.held_executions.is_empty());
+    }
+
     #[tokio::test]
     async fn relation_hydration_query_count_is_bounded_by_families() {
         let db = seeded_relation_db().await;
@@ -1158,11 +1150,7 @@ mod tests {
             .await
             .unwrap();
 
-        let expected = vec![
-            RelationQuery::Dependencies,
-            RelationQuery::ResolvedDependencies,
-            RelationQuery::Labels,
-        ];
+        let expected = vec![RelationQuery::Labels, RelationQuery::HeldExecutions];
         assert_eq!(all_queries, expected);
         assert_eq!(one_query, expected);
     }

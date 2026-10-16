@@ -104,7 +104,6 @@ async fn update_dismiss_restore_and_backend_override_round_trip() {
             title: Some("Updated".to_string()),
             description: Some("new description".to_string()),
             backend_override: Some(Some("gpt-5.3-codex".to_string())),
-            depends_on: None,
             label_ids: None,
         },
     )
@@ -123,7 +122,6 @@ async fn update_dismiss_restore_and_backend_override_round_trip() {
             title: None,
             description: None,
             backend_override: Some(None),
-            depends_on: None,
             label_ids: None,
         },
     )
@@ -361,112 +359,5 @@ async fn delete_db_removes_issue_owned_records() {
         )
         .await,
         0
-    );
-}
-
-#[tokio::test]
-async fn update_dependencies_replaces_and_hydrates_issue_models() {
-    let (_temp, db, project_id) = project_fixture("DEP").await;
-    let blocker = create_issue_at(&db, &project_id, "Blocker", 100).await;
-    let dependent = create_issue_at(&db, &project_id, "Dependent", 200).await;
-
-    let updated = crud::update(
-        &db,
-        &FixedClock(300),
-        UpdateIssue {
-            id: dependent.id.clone(),
-            title: None,
-            description: None,
-            backend_override: None,
-            depends_on: Some(vec![format!("cairn://p/dep/{}", blocker.number)]),
-            label_ids: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(updated.depends_on, vec!["cairn://p/dep/1"]);
-    assert_eq!(updated.updated_at, 300);
-    let loaded = crud::get(&db, &dependent.id).await.unwrap().unwrap();
-    assert_eq!(loaded.depends_on, vec!["cairn://p/dep/1"]);
-    let listed = crud::list(&db, &project_id).await.unwrap();
-    assert_eq!(
-        listed
-            .iter()
-            .find(|issue| issue.id == dependent.id)
-            .unwrap()
-            .depends_on,
-        vec!["cairn://p/dep/1"]
-    );
-
-    let cleared = crud::update(
-        &db,
-        &FixedClock(400),
-        UpdateIssue {
-            id: dependent.id.clone(),
-            title: None,
-            description: None,
-            backend_override: None,
-            depends_on: Some(Vec::new()),
-            label_ids: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    assert!(cleared.depends_on.is_empty());
-    assert!(crud::get(&db, &dependent.id)
-        .await
-        .unwrap()
-        .unwrap()
-        .depends_on
-        .is_empty());
-}
-
-#[tokio::test]
-async fn failed_dependency_update_keeps_existing_dependencies() {
-    let (_temp, db, project_id) = project_fixture("BAD").await;
-    let blocker = create_issue_at(&db, &project_id, "Blocker", 100).await;
-    let dependent = create_issue_at(&db, &project_id, "Dependent", 200).await;
-
-    crud::update(
-        &db,
-        &FixedClock(300),
-        UpdateIssue {
-            id: dependent.id.clone(),
-            title: None,
-            description: None,
-            backend_override: None,
-            depends_on: Some(vec![format!("cairn://p/bad/{}", blocker.number)]),
-            label_ids: None,
-        },
-    )
-    .await
-    .unwrap();
-
-    let error = crud::update(
-        &db,
-        &FixedClock(400),
-        UpdateIssue {
-            id: dependent.id.clone(),
-            title: None,
-            description: None,
-            backend_override: None,
-            depends_on: Some(vec!["not-an-issue-uri".to_string()]),
-            label_ids: None,
-        },
-    )
-    .await
-    .unwrap_err()
-    .to_string();
-
-    assert!(error.contains("dependency URI must be a canonical issue URI"));
-    assert_eq!(
-        crud::get(&db, &dependent.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .depends_on,
-        vec!["cairn://p/bad/1"]
     );
 }

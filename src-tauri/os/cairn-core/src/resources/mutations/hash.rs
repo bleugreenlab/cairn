@@ -128,26 +128,12 @@ pub(crate) async fn hash_resource_target(
                         let title = row.text(1)?;
                         let description = row.opt_text(2)?;
                         let updated_at = row.opt_i64(3)?;
-                        let mut dep_rows = conn
-                            .query(
-                                "SELECT d.depends_on_uri
-                                 FROM issue_dependencies d
-                                 WHERE d.issue_id = ?1
-                                 ORDER BY d.depends_on_uri ASC",
-                                (issue_id.as_str(),),
-                            )
-                            .await?;
-                        let mut dependencies = Vec::new();
-                        while let Some(dep_row) = dep_rows.next().await? {
-                            dependencies.push(dep_row.text(0)?);
-                        }
                         Ok(serde_json::json!({
                             "kind":"issue",
                             "id": issue_id,
                             "title": title,
                             "description": description,
                             "updated_at": updated_at,
-                            "depends_on": dependencies,
                         }))
                     }
                     CairnResource::IssueMessages { project, number } => {

@@ -142,12 +142,6 @@ pub async fn is_job_ready_conn(conn: &cairn_db::turso::Connection, job: &DbJob) 
         return Ok(false);
     }
 
-    if let Some(issue_id) = job.issue_id.as_deref() {
-        if !cairn_db::relations::dependencies_ready(conn, issue_id).await? {
-            return Ok(false);
-        }
-    }
-
     Ok(true)
 }
 
@@ -472,7 +466,7 @@ mod tests {
         }
     }
 
-    async fn seed(conn: &cairn_db::turso::Connection, dep_status: &str) {
+    async fn seed(conn: &cairn_db::turso::Connection) {
         conn.execute(
             "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w-1','W',1,1)",
             (),
@@ -480,31 +474,22 @@ mod tests {
         .await
         .unwrap();
         conn.execute("INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at) VALUES ('p-1','w-1','P','cairn','/tmp/p',1,1)", ()).await.unwrap();
-        conn.execute("INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES ('dep','p-1',1,'Dep',?1,?1,'none',1,1)", params![dep_status]).await.unwrap();
         conn.execute("INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at) VALUES ('child','p-1',2,'Child','active','active','none',1,1)", ()).await.unwrap();
-        cairn_db::relations::replace_dependencies(
-            conn,
-            "child",
-            &["cairn://p/cairn/1".to_string()],
-            1,
-        )
-        .await
-        .unwrap();
         let snapshot_json = snapshot("child").to_json().unwrap();
         conn.execute("INSERT INTO executions (id, recipe_id, issue_id, project_id, status, started_at, snapshot) VALUES ('e-1','recipe-1','child','p-1','running',1,?1)", params![snapshot_json]).await.unwrap();
     }
 
+    /// Readiness is the DAG's alone. An issue-scoped job is not held by any
+    /// other issue's state: an execution that must wait is filed held through
+    /// its `after:` gates, before it has any job to hold.
     #[tokio::test]
-    async fn issue_dependencies_gate_issue_scoped_jobs() {
+    async fn an_issue_scoped_job_is_ready_on_dag_grounds_alone() {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed(conn, "active").await;
-                assert!(!is_job_ready_conn(conn, &job(Some("child"))).await.unwrap());
-                conn.execute("UPDATE issues SET status = 'merged' WHERE id = 'dep'", ())
-                    .await
-                    .unwrap();
+                seed(conn).await;
                 assert!(is_job_ready_conn(conn, &job(Some("child"))).await.unwrap());
+                assert!(is_job_ready_conn(conn, &job(None)).await.unwrap());
                 Ok(())
             })
         })
@@ -517,8 +502,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                // deps merged -> the child's DAG-ready gate is satisfiable.
-                seed(conn, "merged").await;
+                seed(conn).await;
                 // A pending, DAG-ready job is imminent work -> not settled.
                 conn.execute(
                     "INSERT INTO jobs(id, execution_id, recipe_node_id, issue_id, project_id, status, created_at, updated_at)
@@ -568,7 +552,7 @@ mod tests {
         let db = test_db().await;
         db.write(|conn| {
             Box::pin(async move {
-                seed(conn, "merged").await;
+                seed(conn).await;
                 assert!(is_job_ready_conn(conn, &job(Some("child"))).await.unwrap());
                 for status in ["merged", "closed"] {
                     conn.execute(
@@ -582,20 +566,6 @@ mod tests {
                         "a pending job on a {status} issue must never be claimed"
                     );
                 }
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn jobs_without_issues_skip_issue_dependency_gate() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed(conn, "active").await;
-                assert!(is_job_ready_conn(conn, &job(None)).await.unwrap());
                 Ok(())
             })
         })

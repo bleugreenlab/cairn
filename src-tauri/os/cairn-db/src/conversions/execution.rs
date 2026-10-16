@@ -32,6 +32,9 @@ impl TryFrom<crate::db_records::DbExecution> for Execution {
             triggered_by,
             runner_device_id: db.runner_device_id,
             lifecycle: db.lifecycle.parse().unwrap_or_default(),
+            released_at: db.released_at,
+            release_override_json: db.release_override_json,
+            gate_census: None,
         })
     }
 }
@@ -56,7 +59,23 @@ mod tests {
             triggered_by: "manual".to_string(),
             runner_device_id: None,
             lifecycle: "canonical".to_string(),
+            released_at: None,
+            release_override_json: None,
         }
+    }
+
+    #[test]
+    fn execution_status_held_round_trips() {
+        use cairn_domain::ExecutionStatus;
+        assert_eq!(ExecutionStatus::Held.to_string(), "held");
+        assert_eq!(
+            "held".parse::<ExecutionStatus>().unwrap(),
+            ExecutionStatus::Held
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionStatus::Held).unwrap(),
+            "\"held\""
+        );
     }
 
     #[test]

@@ -186,8 +186,6 @@ pub(super) async fn dispatch(
                     ));
                 }
             }
-            let depends_on =
-                parse_string_array_field(index, item, payload, "depends_on", &["dependsOn"])?;
             let labels = parse_string_array_field(index, item, payload, "labels", &[])?;
             // `status` is the resolution the UI's IssueMenu sets. Only the two
             // settable resolutions are accepted here: `backlog` is a derived
@@ -291,7 +289,6 @@ pub(super) async fn dispatch(
                     issues::IssuePatchFields {
                         title,
                         description,
-                        depends_on,
                         labels,
                         status,
                         confirm,
@@ -422,7 +419,7 @@ fn parse_create_execution_spec(
         build_failure(
             index,
             item,
-            "payload.execution must be an object {recipe?, backend?, overrides?}",
+            "payload.execution must be an object {recipe?, backend?, overrides?, after?}",
         )
     })?;
     let str_field = |key: &str| -> ResourceMutationResult<Option<String>> {
@@ -449,6 +446,12 @@ fn parse_create_execution_spec(
                     .replace("payload.overrides", "payload.execution.overrides");
                 failure
             },
+        )?,
+        after: super::executions::parse_after_clauses(
+            index,
+            item,
+            obj.get("after"),
+            "payload.execution.after",
         )?,
     }))
 }

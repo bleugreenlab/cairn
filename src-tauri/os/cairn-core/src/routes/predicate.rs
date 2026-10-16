@@ -1,5 +1,8 @@
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+
+use crate::execution::gates::vocabulary::{GateFact, GateVocabulary};
 
 /// One clause in the `when` grammar: an AND of field tests over a named fact
 /// source. Clauses OR with each other wherever a list of them appears — a
@@ -242,21 +245,59 @@ impl SourceSpec {
     }
 }
 
+/// Which question a fact source answers, and therefore which authoring surface
+/// composes from it.
+///
+/// One registry holds the whole fact space. The surface says what a source is
+/// FOR, not which registry it lives in: a `Trigger` source is matched against a
+/// live event by [`matches`], a `Gate` source is level-resolved by query in
+/// [`crate::execution::gates::vocabulary`]. Keeping both in one registry is what
+/// stops a second predicate vocabulary growing beside this one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactSurface {
+    Trigger,
+    Gate,
+}
+
+#[derive(Debug, Clone)]
+struct TriggerSource {
+    /// Declaration order, so a refusal can name the vocabulary in the order it
+    /// is documented rather than in hash order.
+    order: usize,
+    spec: SourceSpec,
+}
+
+/// The whole fact space, across both surfaces.
+///
+/// The two halves are stored differently on purpose. Trigger sources are field
+/// declarations plus how the fact log stores them — dispatch matches them
+/// generically, so there is no per-source code to own. A gate source carries a
+/// RESOLVER, so the registry HOLDS the gate vocabulary rather than copying field
+/// metadata out of it: registering a resolver is then the same act as
+/// registering its authoring metadata, and there is exactly one place either can
+/// be added. Copying would make `register` update the resolver a sweep uses
+/// while leaving the shape an author is offered stale — two registries wearing
+/// one name.
 #[derive(Debug, Clone)]
 pub struct FactRegistry {
-    sources: HashMap<&'static str, SourceSpec>,
+    triggers: HashMap<&'static str, TriggerSource>,
+    gates: GateVocabulary,
 }
 
 const FILE_CHANGE_STATUSES: &[&str] = &["added", "modified", "deleted", "renamed"];
 
 /// The value vocabulary for one fact field. Fields not named here are free text.
 fn vocabulary_for(source: &str, field: &str) -> FieldVocabulary {
+    use crate::execution::gates::vocabulary::{GATE_PR_STATES, GATE_RESOLUTIONS, GATE_VERDICTS};
     match (source, field) {
         ("file_changed", "status") => FieldVocabulary::Enum(FILE_CHANGE_STATUSES),
         (_, "status") => FieldVocabulary::Enum(ISSUE_STATUSES),
         (_, "attention") => FieldVocabulary::Enum(ISSUE_ATTENTIONS),
         (_, "label") => FieldVocabulary::Labels,
         (_, "project") => FieldVocabulary::Projects,
+        (_, "resolution") => FieldVocabulary::Enum(GATE_RESOLUTIONS),
+        (_, "state") => FieldVocabulary::Enum(GATE_PR_STATES),
+        (_, "verdict") => FieldVocabulary::Enum(GATE_VERDICTS),
         _ => FieldVocabulary::Free,
     }
 }
@@ -393,15 +434,21 @@ impl Default for FactRegistry {
                 ("mentions", List, STORED),
             ]),
         };
+        let triggers = [
+            ("attention", attention),
+            ("thread_stream", thread),
+            ("github_comment", github_comment),
+            ("file_changed", file_changed),
+            ("post_created", post_created),
+            ("post_commented", post_commented),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(order, (fact, spec))| (fact, TriggerSource { order, spec }))
+        .collect();
         Self {
-            sources: HashMap::from([
-                ("attention", attention),
-                ("thread_stream", thread),
-                ("github_comment", github_comment),
-                ("file_changed", file_changed),
-                ("post_created", post_created),
-                ("post_commented", post_commented),
-            ]),
+            triggers,
+            gates: GateVocabulary::default(),
         }
     }
 }
@@ -423,41 +470,112 @@ pub struct FactFieldShape {
 }
 
 impl FactRegistry {
+    /// The TRIGGER sources, which is what the settings surface composes its
+    /// trigger controls from. Gate facts are level-resolved and belong to the
+    /// `after:` authoring surface, not to this one.
     pub fn describe(&self) -> Vec<FactSourceShape> {
-        let mut sources: Vec<FactSourceShape> = self
-            .sources
-            .iter()
-            .map(|(fact, spec)| {
-                let mut fields: Vec<_> = spec
-                    .fields
-                    .iter()
-                    .map(|(name, field)| FactFieldShape {
-                        name,
-                        kind: field.kind,
-                        vocabulary: vocabulary_for(fact, name),
-                    })
-                    .collect();
-                fields.sort_by_key(|field| field.name);
-                FactSourceShape { fact, fields }
-            })
-            .collect();
+        self.describe_surface(FactSurface::Trigger)
+    }
+
+    /// A registry over a custom gate vocabulary. The trigger half is fixed —
+    /// those sources are dispatch's, not an author's — so this is the whole of
+    /// what an extension can change.
+    pub fn with_gates(gates: GateVocabulary) -> Self {
+        Self {
+            gates,
+            ..Self::default()
+        }
+    }
+
+    /// Register a gate fact. This is the ONE registration point: the resolver a
+    /// sweep will call and the shape an author is offered are the same object,
+    /// so they cannot be added to one surface and missing from the other.
+    pub fn register_gate(&mut self, fact: Arc<dyn GateFact>) {
+        self.gates.register(fact);
+    }
+
+    /// The gate vocabulary this registry resolves `after:` predicates through.
+    pub fn gates(&self) -> &GateVocabulary {
+        &self.gates
+    }
+
+    pub fn describe_surface(&self, surface: FactSurface) -> Vec<FactSourceShape> {
+        let shape = |fact: &'static str, fields: Vec<(&'static str, FieldKind)>| {
+            let mut fields: Vec<_> = fields
+                .into_iter()
+                .map(|(name, kind)| FactFieldShape {
+                    name,
+                    kind,
+                    vocabulary: vocabulary_for(fact, name),
+                })
+                .collect();
+            fields.sort_by_key(|field| field.name);
+            FactSourceShape { fact, fields }
+        };
+        let mut sources: Vec<FactSourceShape> = match surface {
+            FactSurface::Trigger => self
+                .triggers
+                .iter()
+                .map(|(fact, source)| {
+                    let fields = source
+                        .spec
+                        .fields
+                        .iter()
+                        .map(|(name, field)| (*name, field.kind))
+                        .collect();
+                    shape(fact, fields)
+                })
+                .collect(),
+            // Projected from the vocabulary rather than stored, so a resolver
+            // registered at runtime is described here without a second write.
+            FactSurface::Gate => self
+                .gates
+                .sources()
+                .iter()
+                .map(|source| shape(source.fact(), source.fields().to_vec()))
+                .collect(),
+        };
         sources.sort_by_key(|source| source.fact);
         sources
     }
 
+    /// The fact names on one surface, in declaration order — the list a refusal
+    /// names so an author learns the vocabulary from being refused.
+    pub fn fact_names(&self, surface: FactSurface) -> Vec<&'static str> {
+        match surface {
+            FactSurface::Trigger => {
+                let mut sources: Vec<(usize, &'static str)> = self
+                    .triggers
+                    .iter()
+                    .map(|(fact, source)| (source.order, *fact))
+                    .collect();
+                sources.sort_by_key(|(order, _)| *order);
+                sources.into_iter().map(|(_, fact)| fact).collect()
+            }
+            FactSurface::Gate => self.gates.fact_names(),
+        }
+    }
+
     pub fn source_has_field(&self, source: &str, field: &str) -> bool {
-        self.sources
-            .get(source)
-            .is_some_and(|spec| spec.fields.contains_key(field))
+        if let Some(trigger) = self.triggers.get(source) {
+            return trigger.spec.fields.contains_key(field);
+        }
+        self.gates
+            .sources()
+            .iter()
+            .find(|gate| gate.fact() == source)
+            .is_some_and(|gate| gate.fields().iter().any(|(name, _)| *name == field))
     }
 
+    /// How the fact log stores and delivers one TRIGGER source. Gate facts are
+    /// resolved by query, never logged, so they have no spec.
     pub fn source(&self, source: &str) -> Option<&SourceSpec> {
-        self.sources.get(source)
+        self.triggers.get(source).map(|trigger| &trigger.spec)
     }
 
-    /// Every registered source name, sorted.
+    /// Every trigger source name, sorted.
     pub fn source_names(&self) -> Vec<&'static str> {
-        let mut names: Vec<_> = self.sources.keys().copied().collect();
+        let mut names = self.fact_names(FactSurface::Trigger);
         names.sort_unstable();
         names
     }
@@ -467,10 +585,13 @@ impl FactRegistry {
         source: &str,
         clause: &BTreeMap<String, Value>,
     ) -> Result<(), String> {
+        // A gate fact is level-resolved, so there is no stream to match it
+        // against and a route may not name one.
         let fields = &self
-            .sources
+            .triggers
             .get(source)
             .ok_or_else(|| format!("unknown fact source '{source}'"))?
+            .spec
             .fields;
         for key in clause.keys() {
             if key == "fact" || key == "presence" {
@@ -522,7 +643,10 @@ fn clause_matches(clause: &BTreeMap<String, Value>, fact: &Fact<'_>) -> bool {
 /// One field test. An array on either side means membership: a list field
 /// matches a scalar it contains or an array it intersects, and a scalar field
 /// matches an array that contains it. Scalar against scalar is equality.
-fn value_matches(actual: &Value, expected: &Value) -> bool {
+/// Shared unchanged with the `after:` gate vocabulary, so
+/// `resolution: ["merged", "closed"]` means there exactly what it means in a
+/// route trigger.
+pub(crate) fn value_matches(actual: &Value, expected: &Value) -> bool {
     match (actual, expected) {
         (Value::Array(actual), Value::Array(expected)) => {
             let set: HashSet<_> = actual.iter().collect();
@@ -933,5 +1057,137 @@ mod tests {
             .validate_clause("missing", &bad)
             .unwrap_err()
             .contains("unknown fact"));
+    }
+
+    #[test]
+    fn the_gate_facts_live_in_this_registry_and_stay_off_the_trigger_surface() {
+        let registry = FactRegistry::default();
+        assert_eq!(
+            registry.fact_names(FactSurface::Gate),
+            vec![
+                "issue_resolution",
+                "pr_state",
+                "artifact_confirmed",
+                "check_verdict",
+                "clock",
+            ]
+        );
+        // A gate fact is level-resolved, not matched against a stream, so a
+        // route may not name one as its trigger, and the fact log has no spec
+        // for it.
+        for fact in registry.fact_names(FactSurface::Gate) {
+            assert!(registry
+                .validate_clause(fact, &BTreeMap::new())
+                .unwrap_err()
+                .contains("unknown fact source"));
+            assert!(registry.source(fact).is_none(), "{fact} has a log spec");
+            assert!(!registry.source_names().contains(&fact));
+        }
+        assert_eq!(
+            registry
+                .describe()
+                .iter()
+                .map(|s| s.fact)
+                .collect::<Vec<_>>(),
+            vec![
+                "attention",
+                "file_changed",
+                "github_comment",
+                "post_commented",
+                "post_created",
+                "thread_stream"
+            ]
+        );
+    }
+
+    #[test]
+    fn trigger_fact_names_follow_declaration_order() {
+        let registry = FactRegistry::default();
+        assert_eq!(
+            registry.fact_names(FactSurface::Trigger),
+            vec![
+                "attention",
+                "thread_stream",
+                "github_comment",
+                "file_changed",
+                "post_created",
+                "post_commented"
+            ]
+        );
+        assert_eq!(
+            registry.source_names(),
+            vec![
+                "attention",
+                "file_changed",
+                "github_comment",
+                "post_commented",
+                "post_created",
+                "thread_stream"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_registry_describes_exactly_what_the_gate_vocabulary_declares() {
+        // One declaration for a gate fact's fields: the resolver's own
+        // `fields()`. If these ever disagree, the registry describes a field the
+        // resolver refuses or misses one it accepts.
+        let registry = FactRegistry::default();
+        for source in registry.gates().sources() {
+            let described = registry
+                .describe_surface(FactSurface::Gate)
+                .into_iter()
+                .find(|shape| shape.fact == source.fact())
+                .unwrap_or_else(|| panic!("{} is not in the shared registry", source.fact()));
+            let mut declared: Vec<&str> = source.fields().iter().map(|(name, _)| *name).collect();
+            declared.sort();
+            assert_eq!(
+                described
+                    .fields
+                    .iter()
+                    .map(|field| field.name)
+                    .collect::<Vec<_>>(),
+                declared,
+                "{} drifted",
+                source.fact()
+            );
+        }
+    }
+
+    #[test]
+    fn registering_a_resolver_extends_the_shared_registry_not_a_copy_of_it() {
+        // The contract the whole `after:` extension point rests on: registering
+        // ONE resolver must move the authoring surface too. A registry that
+        // copied field metadata at construction would pass every test above and
+        // still fail this one, because the copy is taken before the resolver
+        // exists.
+        use crate::execution::gates::vocabulary::test_support::DecisionFact;
+
+        let mut registry = FactRegistry::default();
+        assert!(!registry.fact_names(FactSurface::Gate).contains(&"decision"));
+
+        registry.register_gate(std::sync::Arc::new(DecisionFact));
+
+        assert!(registry.fact_names(FactSurface::Gate).contains(&"decision"));
+        assert!(registry.source_has_field("decision", "state"));
+        let described = registry
+            .describe_surface(FactSurface::Gate)
+            .into_iter()
+            .find(|shape| shape.fact == "decision")
+            .expect("a registered resolver is described by the shared registry");
+        assert_eq!(
+            described
+                .fields
+                .iter()
+                .map(|field| field.name)
+                .collect::<Vec<_>>(),
+            vec!["decision", "state"]
+        );
+        // And it is still refused on the trigger surface, which registering a
+        // gate resolver must not widen.
+        assert!(registry
+            .validate_clause("decision", &BTreeMap::new())
+            .unwrap_err()
+            .contains("unknown fact source"));
     }
 }

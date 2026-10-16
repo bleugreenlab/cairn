@@ -13,6 +13,7 @@ pub mod condition;
 pub mod conditions;
 pub mod dag;
 pub mod effects;
+pub mod gates;
 pub mod inputs;
 pub mod journal;
 pub mod node_segments;

@@ -19,6 +19,10 @@ pub struct DbExecution {
     pub runner_device_id: Option<String>,
     /// CAIRN-4665 canonical lineage: `canonical` | `superseded` | `parallel`.
     pub lifecycle: String,
+    /// cairn/4735 `after:` gates: NULL while held.
+    pub released_at: Option<i64>,
+    /// Manual early release provenance: `{principal, at}`.
+    pub release_override_json: Option<String>,
 }
 
 #[derive(Debug)]

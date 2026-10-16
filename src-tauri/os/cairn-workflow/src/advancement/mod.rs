@@ -16,7 +16,6 @@ use crate::runtime::{WorkflowOwner, WorkflowRuntime};
 
 mod actions;
 mod core;
-mod dependents;
 mod inputs;
 mod job_creation;
 mod persistence;
@@ -33,10 +32,10 @@ pub use actions::{
     rerun_checkpoint_job, wake_upstream_after_checkpoint_failure,
 };
 pub use core::advance_execution_impl;
-pub use dependents::release_dependent_executions;
 pub use inputs::{format_resolved_inputs, ResolvedInput};
 pub use job_creation::{
-    create_jobs_for_execution, create_jobs_for_new_nodes, create_jobs_for_new_nodes_conn,
+    create_jobs_for_execution, create_jobs_for_execution_conn, create_jobs_for_new_nodes,
+    create_jobs_for_new_nodes_conn,
 };
 pub use persistence::{load_job, load_project_repo_path, run_advancement_db};
 pub use readiness::{

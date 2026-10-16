@@ -2145,6 +2145,56 @@ async fn delete_removes_issue() {
         .is_none());
 }
 
+/// The issue-level dependency edge is retired. A payload still naming it is
+/// refused -- in either spelling, on any resource, previewed or applied -- with
+/// the `after:` shape that replaced it, never silently dropped: a dropped key
+/// would report success for a hold that no longer exists.
+#[tokio::test]
+async fn a_depends_on_key_is_refused_with_the_after_shape_that_replaced_it() {
+    let orch = seeded_orch().await;
+    let (_, number) = seed_issue(&orch).await;
+    let cases = [
+        (
+            format!("cairn://p/cairn/{number}"),
+            ChangeMode::Patch,
+            serde_json::json!({"depends_on": ["cairn://p/cairn/1"]}),
+        ),
+        (
+            format!("cairn://p/cairn/{number}"),
+            ChangeMode::Patch,
+            serde_json::json!({"title": "t", "dependsOn": []}),
+        ),
+        (
+            format!("cairn://p/cairn/{number}/executions"),
+            ChangeMode::Append,
+            serde_json::json!({"recipe": "planbuild", "depends_on": ["cairn://p/cairn/1"]}),
+        ),
+        (
+            "cairn://p/cairn/issues".to_string(),
+            ChangeMode::Append,
+            serde_json::json!({"title": "t", "depends_on": ["cairn://p/cairn/1"]}),
+        ),
+    ];
+    for (target, mode, payload) in cases {
+        let item = change_item(&target, mode, Some(payload.clone()));
+        for error in [
+            apply(&orch, &item).await.unwrap_err().error,
+            preview(&orch, &item).await.unwrap_err().error,
+        ] {
+            assert!(
+                error.starts_with("depends_on retired into after:"),
+                "{target} {payload}: {error}"
+            );
+            assert!(
+                error.contains(
+                    r#"after:[{fact:"issue_resolution",issue:"cairn://p/PROJECT/OTHER",resolution:"merged"}]"#
+                ),
+                "the refusal shows the corrected shape: {error}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn delete_rejects_payload() {
     let orch = seeded_orch().await;

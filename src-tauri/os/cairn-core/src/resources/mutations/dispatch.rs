@@ -181,6 +181,9 @@ fn gate_resource_change(
     item: &ChangeItem,
     resource: &CairnResource,
 ) -> ResourceMutationResult<&'static MutationSpec> {
+    if let Some(refusal) = crate::issues::retired_depends_on(item.payload.as_ref()) {
+        return Err(build_failure(index, item, refusal));
+    }
     let kind = resource.kind();
     let candidates = candidate_specs(kind, item.mode);
     if candidates.is_empty() {

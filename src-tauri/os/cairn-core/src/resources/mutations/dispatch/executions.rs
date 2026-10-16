@@ -62,6 +62,12 @@ pub(super) async fn dispatch(
                 None => None,
             };
             let overrides = parse_launch_overrides(index, item, item.payload.as_ref())?;
+            let after = parse_after_clauses(
+                index,
+                item,
+                item.payload.as_ref().and_then(|p| p.get("after")),
+                "payload.after",
+            )?;
             // CAIRN-4665: the default is the issue's next ATTEMPT, which
             // supersedes whichever execution owns the issue now. A caller that
             // wants a second opinion running beside the canonical one must
@@ -84,7 +90,12 @@ pub(super) async fn dispatch(
             };
             if dry_run {
                 format!(
-                    "Would start an execution for {project}/{number}{}",
+                    "Would {} an execution for {project}/{number}{}",
+                    if after.is_empty() {
+                        "start"
+                    } else {
+                        "file a held"
+                    },
                     recipe
                         .map(|r| format!(" (recipe '{r}')"))
                         .unwrap_or_default()
@@ -100,6 +111,7 @@ pub(super) async fn dispatch(
                     continuity,
                     overrides,
                     intent,
+                    after,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?
@@ -117,6 +129,15 @@ pub(super) async fn dispatch(
                 .payload
                 .as_ref()
                 .ok_or_else(|| build_failure(index, item, "mode=patch requires payload"))?;
+
+            if let Some(patch) = parse_gate_patch(index, item, payload)? {
+                let summary = executions::patch_execution_gates(
+                    orch, request, project, *number, *exec_seq, patch, dry_run,
+                )
+                .await
+                .map_err(|error| build_failure(index, item, error))?;
+                return Ok(Some(summary));
+            }
 
             if payload.get("reevaluate").is_some() {
                 let node_id =
@@ -162,6 +183,69 @@ pub(super) async fn dispatch(
         _ => return Ok(None),
     };
     Ok(Some(summary))
+}
+
+/// Parse an `after` array of gate clause objects, refusing prose, malformed
+/// clauses, and unknown facts at write time with the corrected object. Shared by
+/// both launch doors and the gate patch, so one grammar is refused one way.
+pub(super) fn parse_after_clauses(
+    index: usize,
+    item: &ChangeItem,
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> ResourceMutationResult<Vec<crate::routes::TriggerClause>> {
+    let clauses = crate::execution::gates::authoring::parse_after(value, key)
+        .map_err(|error| build_failure(index, item, error))?;
+    crate::execution::gates::authoring::canonical_predicates(&clauses, key)
+        .map_err(|error| build_failure(index, item, error))?;
+    Ok(clauses)
+}
+
+/// The gate half of an execution patch: `{release: true}` or `{after: [...]}`,
+/// one at a time, and never mixed with a snapshot edit or a re-evaluation, so a
+/// write cannot half-apply.
+fn parse_gate_patch(
+    index: usize,
+    item: &ChangeItem,
+    payload: &serde_json::Value,
+) -> ResourceMutationResult<Option<executions::GatePatch>> {
+    let release = payload.get("release");
+    let after = payload.get("after");
+    if release.is_none() && after.is_none() {
+        return Ok(None);
+    }
+    if ["agent", "snapshot", "reevaluate"]
+        .iter()
+        .any(|key| payload.get(key).is_some())
+        || (release.is_some() && after.is_some())
+    {
+        return Err(build_failure(
+            index,
+            item,
+            "payload.release and payload.after each stand alone: send {release:true} to start a \
+             held execution now, or {after:[...]} to replace its gates, in separate changes",
+        ));
+    }
+    if let Some(release) = release {
+        return match release {
+            serde_json::Value::Bool(true) => Ok(Some(executions::GatePatch::Release)),
+            _ => Err(build_failure(
+                index,
+                item,
+                "payload.release must be true; to keep an execution held, omit it",
+            )),
+        };
+    }
+    let after = match after {
+        Some(serde_json::Value::Null) => Some(&serde_json::Value::Array(Vec::new())),
+        other => other,
+    };
+    Ok(Some(executions::GatePatch::Replace(parse_after_clauses(
+        index,
+        item,
+        after,
+        "payload.after",
+    )?)))
 }
 
 /// Parse the optional `overrides` object shared by both launch doors: an append

@@ -97,18 +97,6 @@ async fn insert_issue_with_status_and_time(
     id
 }
 
-async fn insert_dependency(db: &LocalDb, issue_id: &str, depends_on_uri: &str) {
-    let issue_id = issue_id.to_string();
-    let depends_on_uri = depends_on_uri.to_string();
-    db.execute(
-        "INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at)
-         VALUES (?1, ?2, 1)",
-        params![issue_id.as_str(), depends_on_uri.as_str()],
-    )
-    .await
-    .unwrap();
-}
-
 async fn insert_file_change(
     db: &LocalDb,
     project_id: &str,
@@ -446,7 +434,7 @@ async fn project_root_is_overview_and_project_issues_is_collection() {
 }
 
 #[tokio::test]
-async fn issue_read_renders_dependencies_and_possibly_related_issues() {
+async fn issue_read_renders_possibly_related_issues() {
     let fixture = issue_project_fixture("rel").await;
     let current_id = fixture
         .insert_issue_with_status_and_time(1, "Current work", "active", 3)
@@ -457,7 +445,6 @@ async fn issue_read_renders_dependencies_and_possibly_related_issues() {
     let related_id = fixture
         .insert_issue_with_status_and_time(3, "Related work", "active", 1)
         .await;
-    insert_dependency(&fixture.db, &current_id, &build_issue_uri("rel", 2)).await;
     insert_file_change(
         &fixture.db,
         &fixture.project_id,
@@ -485,11 +472,7 @@ async fn issue_read_renders_dependencies_and_possibly_related_issues() {
 
     let output = read_resource(&fixture.orch, build_issue_uri("rel", 1)).await;
 
-    assert!(output.contains("## dependencies"));
-    assert!(
-        output.contains("[rel-2](cairn://p/rel/2) [○] Active blocker"),
-        "{output}"
-    );
+    assert!(!output.contains("## dependencies"), "{output}");
     assert!(output.contains("## possibly related"));
     assert!(output.contains("[Related work](cairn://p/rel/3) — 1 file overlap"));
     assert!(!output.contains("[Current work](cairn://p/rel/1) —"));
@@ -497,61 +480,35 @@ async fn issue_read_renders_dependencies_and_possibly_related_issues() {
 }
 
 #[tokio::test]
-async fn project_issues_filters_by_status_and_dependency_readiness() {
+async fn project_issues_filters_by_status_and_refuses_the_retired_ready_filter() {
     let fixture = issue_project_fixture("fil").await;
-    let active_blocker_id = fixture
-        .insert_issue_with_status_and_time(1, "Active blocker", "active", 1)
-        .await;
-    let closed_blocker_id = fixture
-        .insert_issue_with_status_and_time(2, "Closed blocker", "closed", 2)
-        .await;
-    let ready_id = fixture
-        .insert_issue_with_status_and_time(3, "Ready dependent", "active", 3)
-        .await;
-    let blocked_id = fixture
-        .insert_issue_with_status_and_time(4, "Blocked dependent", "active", 4)
+    fixture
+        .insert_issue_with_status_and_time(3, "Active issue", "active", 3)
         .await;
     fixture
         .insert_issue_with_status_and_time(5, "Waiting issue", "waiting", 5)
         .await;
-    insert_dependency(&fixture.db, &ready_id, &build_issue_uri("fil", 2)).await;
-    insert_dependency(&fixture.db, &blocked_id, &build_issue_uri("fil", 1)).await;
 
-    let ready_output = fixture.read_project_issues(Some("ready=true")).await;
-    let blocked_output = fixture.read_project_issues(Some("ready=false")).await;
     let waiting_output = fixture.read_project_issues(Some("status=waiting")).await;
-    let invalid_output = fixture.read_project_issues(Some("ready=maybe")).await;
+    let ready_output = fixture.read_project_issues(Some("ready=true")).await;
     let unknown_output = fixture.read_project_issues(Some("search=dep")).await;
 
-    assert_contains_all(
-        &ready_output,
-        &[
-            "filtered by ready=true",
-            "Ready dependent",
-            "Active blocker",
-            "Closed blocker",
-        ],
-    );
-    assert_not_contains_any(&ready_output, &["Blocked dependent"]);
-    assert_contains_all(
-        &blocked_output,
-        &["filtered by ready=false", "Blocked dependent"],
-    );
-    assert_not_contains_any(&blocked_output, &["Ready dependent"]);
     assert_contains_all(
         &waiting_output,
         &["filtered by status=waiting", "Waiting issue"],
     );
-    assert_not_contains_any(&waiting_output, &["Ready dependent"]);
-    assert!(invalid_output.contains("Invalid ready query parameter: maybe"));
+    assert_not_contains_any(&waiting_output, &["Active issue"]);
+    assert_contains_all(
+        &ready_output,
+        &["Unsupported query parameter 'ready'", "after:"],
+    );
     assert_contains_all(
         &unknown_output,
         &[
             "Unsupported query parameter 'search' for project issues",
-            "Supported parameters: status, limit, offset, sort, ready, label, labels",
+            "Supported parameters: status, limit, offset, sort, label, labels",
         ],
     );
-    let _ = (active_blocker_id, closed_blocker_id);
 }
 
 #[tokio::test]

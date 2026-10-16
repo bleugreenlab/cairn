@@ -13,6 +13,12 @@ use crate::{ActionRun, Job};
 pub enum ExecutionStatus {
     #[default]
     Running,
+    /// Filed with unmet `after:` gates and not yet released: no jobs, no
+    /// admission request, no slot. Derived from "has gates AND `released_at` IS
+    /// NULL" exactly as `Running` is derived from "has non-terminal jobs" — a
+    /// held execution has ZERO jobs, so without this the job counts fall
+    /// through to the terminal arms and call it `Complete`.
+    Held,
     Complete,
     Failed,
 }
@@ -21,6 +27,7 @@ impl std::fmt::Display for ExecutionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ExecutionStatus::Running => write!(f, "running"),
+            ExecutionStatus::Held => write!(f, "held"),
             ExecutionStatus::Complete => write!(f, "complete"),
             ExecutionStatus::Failed => write!(f, "failed"),
         }
@@ -33,12 +40,130 @@ impl std::str::FromStr for ExecutionStatus {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "running" => Ok(ExecutionStatus::Running),
+            "held" => Ok(ExecutionStatus::Held),
             "complete" => Ok(ExecutionStatus::Complete),
             "failed" => Ok(ExecutionStatus::Failed),
             "paused" => Ok(ExecutionStatus::Running),
             other => Err(format!("unknown execution status: {}", other)),
         }
     }
+}
+
+/// One `after:` gate: a predicate an execution waits on before it starts.
+///
+/// The row shape, not a rendering. "Never true in practice" is the median case
+/// for some predicates, so `last_outcome` is what lets a census say *which*
+/// state each gate is in rather than only that the execution is waiting — a
+/// gate that is merely quiet is indistinguishable from one that is invisible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionGate {
+    pub id: String,
+    pub execution_id: String,
+    /// Authored order, so a census renders gates the way their filer wrote them.
+    pub seq: i64,
+    /// One canonicalized `TriggerClause`.
+    pub predicate_json: String,
+    /// Latched the first time the predicate resolved true; never cleared, so
+    /// release stays a one-way door.
+    pub satisfied_at: Option<i64>,
+    /// The most recent resolution: `satisfied` | `refuted` | `no_evidence`.
+    pub last_outcome: Option<String>,
+    /// Latched when the predicate became permanently unsatisfiable. Foreclosure
+    /// holds; it does not release or cancel.
+    pub foreclosed_at: Option<i64>,
+    pub foreclosed_reason: Option<String>,
+    pub created_at: i64,
+}
+
+impl ExecutionGate {
+    pub fn is_satisfied(&self) -> bool {
+        self.satisfied_at.is_some()
+    }
+
+    pub fn is_foreclosed(&self) -> bool {
+        self.foreclosed_at.is_some()
+    }
+}
+
+/// Where one gate's evidence stands, in the terms every census uses.
+///
+/// `Foreclosed` outranks the stored `last_outcome`: a gate that can never be
+/// satisfied must say so rather than repeat its last quiet resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateEvidenceState {
+    /// Nothing has borne on the predicate yet — including a gate no sweep has
+    /// resolved at all.
+    NoEvidence,
+    /// The fact reached a value that contradicts the predicate.
+    Refuted,
+    /// No future event can satisfy the predicate.
+    Foreclosed,
+    /// Latched true.
+    Satisfied,
+}
+
+/// One gate as a census shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GateCensusEntry {
+    pub gate_id: String,
+    /// The predicate in prose, e.g. `check rust-tests passed on cairn://p/cairn/4724`.
+    pub predicate: String,
+    pub state: GateEvidenceState,
+    /// The evidence-state phrase, e.g. `no verdict yet`, `evidence says no`, or
+    /// `can never be satisfied: <reason>`.
+    pub evidence: String,
+}
+
+/// Who released a held execution early, and when.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseOverride {
+    pub principal: String,
+    pub at: Option<i64>,
+}
+
+/// An execution's `after:` gates, rendered for display.
+///
+/// Produced by exactly one renderer — `cairn-core`'s
+/// `execution::gates::census` — and carried on DTOs, so no surface (Rust
+/// resource or React view) turns a predicate into words on its own. Two
+/// renderers would drift, and a held execution that reads differently in two
+/// places is half as visible as one that reads the same everywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionGateCensus {
+    /// Waiting to start: gated, not yet released, and still live — exactly the
+    /// set the gate sweep would release. Only these are held.
+    pub held: bool,
+    /// Present when the execution is gated and unreleased but can never start:
+    /// why, e.g. `superseded by exec 3` or `cairn/4724 merged`. Such an
+    /// execution is not held, and no surface may show it as waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wont_start: Option<String>,
+    /// One line, without the execution's own label: `held, waiting on <gate>
+    /// (<evidence>); ...`, `won't start: <reason>`, or how a released
+    /// execution came to start.
+    pub summary: String,
+    /// Every gate in authored order, satisfied ones included.
+    pub gates: Vec<GateCensusEntry>,
+    /// Present only when someone released this execution without waiting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_override: Option<ReleaseOverride>,
+}
+
+/// A gated, unreleased execution as an issue-level surface lists it: waiting
+/// to start when `census.held`, never starting when `census.wont_start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeldExecution {
+    pub execution_id: String,
+    pub seq: Option<i64>,
+    /// `exec N — <summary>`, the line every text surface prints for it.
+    pub line: String,
+    pub census: ExecutionGateCensus,
 }
 
 /// Whether an execution owns its issue's current attempt.
@@ -60,6 +185,12 @@ pub enum ExecutionLifecycle {
     /// A declared alternative. Runs freely, never claims to be the issue's
     /// implementation, and is never fenced by a successor.
     Parallel,
+    /// Filed HELD as the issue's next attempt, and not yet released. It stays
+    /// out of the canonical slot while it waits, so filing it fences nothing:
+    /// release takes the attempt, superseding whatever owns it AT THAT MOMENT,
+    /// in the same transaction that mints its jobs. "Re-run after X merges"
+    /// must not stop the run that is still going.
+    Pending,
 }
 
 impl ExecutionLifecycle {
@@ -75,6 +206,7 @@ impl std::fmt::Display for ExecutionLifecycle {
             ExecutionLifecycle::Canonical => write!(f, "canonical"),
             ExecutionLifecycle::Superseded => write!(f, "superseded"),
             ExecutionLifecycle::Parallel => write!(f, "parallel"),
+            ExecutionLifecycle::Pending => write!(f, "pending"),
         }
     }
 }
@@ -87,6 +219,7 @@ impl std::str::FromStr for ExecutionLifecycle {
             "canonical" => Ok(ExecutionLifecycle::Canonical),
             "superseded" => Ok(ExecutionLifecycle::Superseded),
             "parallel" => Ok(ExecutionLifecycle::Parallel),
+            "pending" => Ok(ExecutionLifecycle::Pending),
             other => Err(format!("unknown execution lifecycle: {}", other)),
         }
     }
@@ -143,6 +276,21 @@ pub struct Execution {
     /// Written only by `execution::canonical`; never recomputed.
     #[serde(default)]
     pub lifecycle: ExecutionLifecycle,
+    /// When this execution's `after:` gates released it. `None` while held.
+    /// Together with "has at least one gate" this is the whole held predicate,
+    /// and the guarded transition on it is the exactly-once release primitive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<i64>,
+    /// Set only on a manual early release: `{principal, at}`. Its presence is
+    /// what distinguishes "the predicates came true" from "someone decided not
+    /// to wait".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_override_json: Option<String>,
+    /// The rendered gate census, for an execution filed with `after:` gates.
+    /// Hydrated by `cairn-core` at the read boundary; `None` both for an
+    /// ungated execution and for one read below that boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_census: Option<ExecutionGateCensus>,
 }
 
 /// What a condition evaluation did.
@@ -262,6 +410,9 @@ pub struct ExecutionListItem {
     /// Canonical/superseded/parallel standing (CAIRN-4665).
     #[serde(default)]
     pub lifecycle: ExecutionLifecycle,
+    /// See [`Execution::gate_census`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_census: Option<ExecutionGateCensus>,
 }
 
 /// A lightweight execution record for the triggered-execution indicator on job rows.
@@ -274,6 +425,9 @@ pub struct TriggeredExecution {
     pub triggered_by: TriggerType,
     pub started_at: i64,
     pub completed_at: Option<i64>,
+    /// See [`Execution::gate_census`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_census: Option<ExecutionGateCensus>,
 }
 
 /// Filters for listing executions
@@ -307,6 +461,9 @@ pub struct ExecutionDetail {
     pub project_name: Option<String>,
     pub jobs: Vec<Job>,
     pub action_runs: Vec<ActionRun>,
+    /// The `after:` gates this execution was filed with, in authored order.
+    /// Empty for every execution filed without them.
+    pub gates: Vec<ExecutionGate>,
 }
 
 #[cfg(test)]

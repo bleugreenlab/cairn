@@ -3,8 +3,8 @@
 use cairn_db::turso::params;
 
 use super::common::{
-    connect_for_read, find_query_value, lookup_project_by_key, parse_optional_bool_param,
-    parse_optional_i64_param, parse_optional_usize_param, storage_error,
+    connect_for_read, find_query_value, lookup_project_by_key, parse_optional_i64_param,
+    parse_optional_usize_param, storage_error,
 };
 
 use crate::attachments::{AttachmentKind, AttachmentRow};
@@ -100,10 +100,16 @@ async fn load_recent_project_issue_summaries(
 
 #[derive(Debug, Clone)]
 struct ProjectIssueSummary {
+    id: String,
     number: i32,
     title: String,
     status: String,
     labels: Vec<String>,
+    /// Gate-census lines for this issue's held executions.
+    held: Vec<String>,
+    /// Gate-census lines for its gated executions that can never start,
+    /// printed after the held ones and reading `won't start: ...`.
+    wont_start: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,16 +131,13 @@ struct ProjectIssuesQuery {
     offset: i64,
     sort_field: ProjectIssuesSortField,
     sort_dir: ProjectIssuesSortDir,
-    ready: Option<bool>,
     label: Option<String>,
     labels: Option<Vec<String>>,
 }
 
-const PROJECT_ISSUES_SUPPORTED_PARAMS: &[&str] = &[
-    "status", "limit", "offset", "sort", "ready", "label", "labels",
-];
-const PROJECT_ISSUES_SUPPORTED_PARAMS_TEXT: &str =
-    "status, limit, offset, sort, ready, label, labels";
+const PROJECT_ISSUES_SUPPORTED_PARAMS: &[&str] =
+    &["status", "limit", "offset", "sort", "label", "labels"];
+const PROJECT_ISSUES_SUPPORTED_PARAMS_TEXT: &str = "status, limit, offset, sort, label, labels";
 const PROJECT_ISSUES_ALLOWED_STATUSES: &[&str] = &[
     "backlog", "active", "waiting", "merged", "closed", "failed", "complete",
 ];
@@ -147,7 +150,6 @@ impl Default for ProjectIssuesQuery {
             offset: 0,
             sort_field: ProjectIssuesSortField::Updated,
             sort_dir: ProjectIssuesSortDir::Desc,
-            ready: None,
             label: None,
             labels: None,
         }
@@ -156,6 +158,9 @@ impl Default for ProjectIssuesQuery {
 
 impl ProjectIssuesQuery {
     fn parse(params: &[QueryParam]) -> Result<Self, String> {
+        if params.iter().any(|param| param.key == "ready") {
+            return Err("Unsupported query parameter 'ready' for project issues: it filtered on issue dependencies, which are retired into `after:` gates on executions. An issue whose execution is waiting shows it as held, with each gate named, in this list and in the issue overview.".to_string());
+        }
         if let Some(unsupported) = params
             .iter()
             .find(|param| !PROJECT_ISSUES_SUPPORTED_PARAMS.contains(&param.key.as_str()))
@@ -179,12 +184,6 @@ impl ProjectIssuesQuery {
         if let Some(value) = find_query_value(params, "sort") {
             (query.sort_field, query.sort_dir) = parse_project_issues_sort(value)?;
         }
-        query.ready = parse_optional_bool_param(params, "ready").map_err(|error| {
-            error.replace(
-                "Invalid boolean for query parameter 'ready'",
-                "Invalid ready query parameter",
-            )
-        })?;
         if let Some(value) = find_query_value(params, "label") {
             if value.trim().is_empty() {
                 return Err("Invalid label query parameter: value must not be empty".to_string());
@@ -208,10 +207,7 @@ impl ProjectIssuesQuery {
     }
 
     fn has_filters(&self) -> bool {
-        self.statuses.is_some()
-            || self.ready.is_some()
-            || self.label.is_some()
-            || self.labels.is_some()
+        self.statuses.is_some() || self.label.is_some() || self.labels.is_some()
     }
 }
 
@@ -278,32 +274,6 @@ fn quoted_sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-fn ready_sql_condition(ready: bool) -> &'static str {
-    if ready {
-        "AND NOT EXISTS (
-            SELECT 1
-            FROM issue_dependencies d
-            LEFT JOIN projects dep_p ON d.depends_on_uri LIKE 'cairn://p/' || dep_p.key || '/%'
-            LEFT JOIN issues dep_i
-                ON dep_i.project_id = dep_p.id
-                AND d.depends_on_uri = 'cairn://p/' || dep_p.key || '/' || dep_i.number
-            WHERE d.issue_id = i.id
-              AND (dep_i.id IS NULL OR LOWER(dep_i.status) NOT IN ('closed', 'merged'))
-        )"
-    } else {
-        "AND EXISTS (
-            SELECT 1
-            FROM issue_dependencies d
-            LEFT JOIN projects dep_p ON d.depends_on_uri LIKE 'cairn://p/' || dep_p.key || '/%'
-            LEFT JOIN issues dep_i
-                ON dep_i.project_id = dep_p.id
-                AND d.depends_on_uri = 'cairn://p/' || dep_p.key || '/' || dep_i.number
-            WHERE d.issue_id = i.id
-              AND (dep_i.id IS NULL OR LOWER(dep_i.status) NOT IN ('closed', 'merged'))
-        )"
-    }
-}
-
 /// Build the dynamic `WHERE` filter suffix (everything after
 /// `WHERE i.project_id = ?1`) shared by the page query and its `COUNT(*)`. All
 /// filter values are inlined as quoted SQL literals; only `project_id` (?1),
@@ -317,10 +287,6 @@ fn issue_filter_clause(query: &ProjectIssuesQuery) -> String {
             .collect::<Vec<_>>()
             .join(", ");
         clause.push_str(&format!(" AND LOWER(i.status) IN ({status_list})"));
-    }
-    if let Some(ready) = query.ready {
-        clause.push(' ');
-        clause.push_str(ready_sql_condition(ready));
     }
     let label_filters = query
         .label
@@ -371,7 +337,7 @@ async fn load_project_issue_summaries(
     };
     let sql = format!(
         "
-        SELECT i.number, i.title, i.status, GROUP_CONCAT(l.name, char(31))
+        SELECT i.number, i.title, i.status, GROUP_CONCAT(l.name, char(31)), i.id
         FROM issues i
         LEFT JOIN issue_labels il ON il.issue_id = i.id
         LEFT JOIN labels l ON l.id = il.label_id
@@ -390,9 +356,15 @@ async fn load_project_issue_summaries(
         .await
         .map_err(|error| storage_error("Failed to load project issues", error.into()))?
     {
-        let (number, title, status, labels) =
-            (row.i64(0), row.text(1), row.text(2), row.opt_text(3));
-        let (Ok(number), Ok(title), Ok(status), Ok(labels)) = (number, title, status, labels)
+        let (number, title, status, labels, id) = (
+            row.i64(0),
+            row.text(1),
+            row.text(2),
+            row.opt_text(3),
+            row.text(4),
+        );
+        let (Ok(number), Ok(title), Ok(status), Ok(labels), Ok(id)) =
+            (number, title, status, labels, id)
         else {
             continue;
         };
@@ -403,11 +375,31 @@ async fn load_project_issue_summaries(
             .map(ToOwned::to_owned)
             .collect();
         issues.push(ProjectIssueSummary {
+            id,
             number: number as i32,
             title,
             status,
             labels,
+            held: Vec::new(),
+            wont_start: Vec::new(),
         });
+    }
+
+    let issue_ids: Vec<String> = issues.iter().map(|issue| issue.id.clone()).collect();
+    let mut gated =
+        crate::execution::gates::census::gated_executions_for_issues_conn(conn, &issue_ids)
+            .await
+            .map_err(|error| storage_error("Failed to load held executions", error))?;
+    for issue in &mut issues {
+        let gated = gated.remove(&issue.id).unwrap_or_default();
+        let lines = |executions: Vec<crate::models::HeldExecution>| {
+            executions
+                .into_iter()
+                .map(|execution| execution.line)
+                .collect()
+        };
+        issue.held = lines(gated.held);
+        issue.wont_start = lines(gated.wont_start);
     }
 
     Ok((issues, total))
@@ -452,6 +444,9 @@ fn render_project_issue_entries(
             issue.title,
             labels
         ));
+        for line in issue.held.iter().chain(&issue.wont_start) {
+            output.push_str(&format!("  - {line}\n"));
+        }
     }
 
     output
@@ -790,6 +785,8 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         issue_stats.merged,
         issue_stats.closed
     ));
+
+    output.push_str(&render_held_executions(&conn, &canonical_key, &project_id).await);
 
     output.push_str(&render_main_attestation(orch, &project_id));
 
@@ -1160,6 +1157,65 @@ fn difference(now: u64, then: u64) -> String {
         std::cmp::Ordering::Less => format!("{} fewer", thousands(then - now)),
         std::cmp::Ordering::Equal => "the same number of".to_string(),
     }
+}
+
+/// Every held execution on an open issue, each naming what it waits on and what
+/// the evidence says, and apart from them every gated execution on an open
+/// issue that can never start (superseded while it waited).
+///
+/// A held execution has no jobs and its issue derives Backlog, so it appears in
+/// no activity listing and raises no attention — a gate that never comes true is
+/// otherwise silent. This section is how the project overview keeps it visible.
+/// The won't-start list is what keeps a dead execution from posing as a
+/// waiting one. Silent only when there is neither.
+async fn render_held_executions(
+    conn: &cairn_db::turso::Connection,
+    project_key: &str,
+    project_id: &str,
+) -> String {
+    let held =
+        match crate::execution::gates::census::held_executions_for_project_conn(conn, project_id)
+            .await
+        {
+            Ok(held) => held,
+            // Saying the census could not be read is better than omitting it:
+            // an absent section reads as "nothing is held".
+            Err(error) => {
+                return format!("## Held executions\n\nCould not read held executions: {error}\n\n")
+            }
+        };
+    let (waiting, wont_start): (Vec<_>, Vec<_>) =
+        held.iter().partition(|entry| entry.execution.census.held);
+    let entry_line = |entry: &crate::execution::gates::census::ProjectHeldExecution| {
+        format!(
+            "- [{}-{}]({}) {} — {}\n",
+            cairn_common::uri::canonical_project(project_key),
+            entry.issue_number,
+            build_issue_uri(project_key, entry.issue_number as i32),
+            entry.issue_title,
+            entry.execution.line
+        )
+    };
+    let mut out = String::new();
+    if !waiting.is_empty() {
+        out.push_str("## Held executions\n\n");
+        out.push_str("Filed with `after:` gates and not yet started.\n\n");
+        for entry in waiting {
+            out.push_str(&entry_line(entry));
+        }
+        out.push('\n');
+    }
+    if !wont_start.is_empty() {
+        out.push_str("## Won't start\n\n");
+        out.push_str(
+            "Filed with `after:` gates but superseded before release: these will never start.\n\n",
+        );
+        for entry in wont_start {
+            out.push_str(&entry_line(entry));
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ============================================================================
@@ -1643,12 +1699,11 @@ mod project_issues_query_tests {
     }
 
     #[test]
-    fn parses_status_limit_sort_and_ready() {
+    fn parses_status_limit_and_sort() {
         let query = ProjectIssuesQuery::parse(&[
             param("status", "backlog,active"),
             param("limit", "10"),
             param("sort", "updated_desc"),
-            param("ready", "1"),
         ])
         .unwrap();
 
@@ -1659,7 +1714,6 @@ mod project_issues_query_tests {
         assert_eq!(query.limit, 10);
         assert_eq!(query.sort_field, ProjectIssuesSortField::Updated);
         assert_eq!(query.sort_dir, ProjectIssuesSortDir::Desc);
-        assert_eq!(query.ready, Some(true));
     }
 
     #[test]
@@ -1678,9 +1732,6 @@ mod project_issues_query_tests {
         assert!(ProjectIssuesQuery::parse(&[param("limit", "0")])
             .unwrap_err()
             .contains("Invalid limit query parameter"));
-        assert!(ProjectIssuesQuery::parse(&[param("ready", "maybe")])
-            .unwrap_err()
-            .contains("Invalid ready query parameter"));
         assert!(ProjectIssuesQuery::parse(&[param("status", "open")])
             .unwrap_err()
             .contains("Invalid status query parameter"));
@@ -1690,8 +1741,14 @@ mod project_issues_query_tests {
     fn rejects_unknown_params_with_supported_list() {
         let error = ProjectIssuesQuery::parse(&[param("foo", "bar")]).unwrap_err();
         assert!(error.contains("Unsupported query parameter 'foo' for project issues"));
-        assert!(error
-            .contains("Supported parameters: status, limit, offset, sort, ready, label, labels"));
+        assert!(error.contains("Supported parameters: status, limit, offset, sort, label, labels"));
+    }
+
+    #[test]
+    fn the_retired_ready_filter_points_to_after_gates() {
+        let error = ProjectIssuesQuery::parse(&[param("ready", "true")]).unwrap_err();
+        assert!(error.contains("'ready'"), "{error}");
+        assert!(error.contains("after:"), "{error}");
     }
 
     async fn test_db() -> LocalDb {
@@ -1741,6 +1798,76 @@ mod project_issues_query_tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A held execution's gates and their evidence reach both the project
+    /// overview and the `/issues` collection, and an issue whose execution
+    /// finished normally reads as nothing held.
+    #[tokio::test]
+    async fn held_executions_reach_the_project_overview_and_issue_list() {
+        use crate::db::DbState;
+        use crate::execution::gates::census::test_support::{hold_execution, HELD_SUMMARY};
+        use crate::orchestrator::OrchestratorBuilder;
+        use crate::services::testing::TestServicesBuilder;
+        use crate::storage::SearchIndex;
+        use std::sync::Arc;
+
+        let db = test_db().await;
+        db.write(|conn| {
+            Box::pin(async move {
+                seed_project(conn).await;
+                // Project lookup is by canonical (lowercase) key.
+                conn.execute("UPDATE projects SET key = 'lbl'", ()).await?;
+                seed_issue(conn, "i-held", 1, "Rerun after the fix").await;
+                seed_issue(conn, "i-done", 2, "Finished work").await;
+                conn.execute(
+                    "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+                     VALUES ('e-held','r','i-held','p-labels','held',1,1),
+                            ('e-done','r','i-done','p-labels','complete',1,1)",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        hold_execution(&db, "e-held").await;
+
+        let issues = produce_project_issues(&db, "lbl", &[]).await.unwrap().body;
+        assert!(
+            issues.contains(&format!(
+                "Rerun after the fix\n  - exec 1 — {HELD_SUMMARY}\n"
+            )),
+            "{issues}"
+        );
+        assert!(issues.contains("Finished work\n"), "{issues}");
+        assert_eq!(issues.matches("exec 1 —").count(), 1, "{issues}");
+
+        let root = tempdir().unwrap().keep();
+        let config_dir = root.join("config");
+        std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+        let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+        let orch = OrchestratorBuilder::new(
+            Arc::new(DbState::new(Arc::new(db), search_index)),
+            Arc::new(TestServicesBuilder::new().build()),
+            config_dir,
+        )
+        .build();
+        let overview = read_project(&orch, "lbl").await;
+        assert!(
+            overview.contains(
+                "## Held executions\n\nFiled with `after:` gates and not yet started.\n\n- ["
+            ),
+            "{overview}"
+        );
+        assert!(
+            overview.contains(&format!(
+                "(cairn://p/lbl/1) Rerun after the fix — exec 1 — {HELD_SUMMARY}\n"
+            )),
+            "{overview}"
+        );
+        assert!(!overview.contains("Finished work —"), "{overview}");
     }
 
     #[tokio::test]

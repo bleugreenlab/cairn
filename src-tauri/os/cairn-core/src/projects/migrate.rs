@@ -312,7 +312,6 @@ const COPY_ORDER: &[TableCopySpec] = &[
         "issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR thread_id IN (SELECT id FROM threads WHERE project_id = ?1)",
     ),
     spec("doc_references", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
-    spec("issue_dependencies", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
     spec("issue_labels", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
     spec("issue_workspaces", "issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),
     spec("executions", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1)"),

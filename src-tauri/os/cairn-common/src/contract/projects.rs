@@ -335,10 +335,6 @@ pub(crate) const PROJECT_ISSUES_CONTRACT: ResourceContract =
                 values: "updated_desc|created_asc|created_desc|updated_asc",
             },
             ProjectionSpec {
-                key: "ready",
-                values: "true|false",
-            },
-            ProjectionSpec {
                 key: "label",
                 values: "<name|slug>",
             },

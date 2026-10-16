@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use crate::turso::params;
 use cairn_common::uri::{build_issue_uri, parse_uri, CairnResource};
-use serde::{Deserialize, Serialize};
 
 use crate::models::IssueStatus;
 use crate::storage::{DbError, DbResult, LocalDb, RowExt};
@@ -15,17 +14,6 @@ pub struct IssueRef {
     pub number: i32,
     pub title: String,
     pub status: IssueStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DependencyRef {
-    uri: String,
-    project_key: String,
-    number: i32,
-    title: String,
-    status: IssueStatus,
-    met: bool,
 }
 
 fn issue_ref_from_row(
@@ -50,116 +38,15 @@ fn issue_ref_from_row(
 pub fn canonicalize_issue_uri(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err("dependency URI must be a non-empty string".to_string());
+        return Err("issue URI must be a non-empty string".to_string());
     }
 
     match parse_uri(trimmed) {
         Some(CairnResource::Issue { project, number }) => Ok(build_issue_uri(&project, number)),
         _ => Err(format!(
-            "dependency URI must be a canonical issue URI like cairn://p/CAIRN/123: {trimmed}"
+            "issue URI must be a canonical issue URI like cairn://p/CAIRN/123: {trimmed}"
         )),
     }
-}
-
-pub fn is_complete_status(status: &IssueStatus) -> bool {
-    matches!(status, IssueStatus::Closed | IssueStatus::Merged)
-}
-
-pub async fn list_dependency_uris(
-    conn: &crate::turso::Connection,
-    issue_id: &str,
-) -> DbResult<Vec<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT depends_on_uri FROM issue_dependencies WHERE issue_id = ?1 ORDER BY created_at ASC, depends_on_uri ASC",
-            params![issue_id],
-        )
-        .await?;
-    let mut dependencies = Vec::new();
-    while let Some(row) = rows.next().await? {
-        dependencies.push(row.text(0)?);
-    }
-    Ok(dependencies)
-}
-
-pub async fn list_dependency_uris_for_issues(
-    conn: &crate::turso::Connection,
-    issue_ids: &[String],
-) -> DbResult<HashMap<String, Vec<String>>> {
-    if issue_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let issue_ids_json = serde_json::to_string(issue_ids)
-        .map_err(|error| DbError::internal(format!("failed to serialize issue ids: {error}")))?;
-    let mut rows = conn
-        .query(
-            "SELECT issue_id, depends_on_uri
-             FROM issue_dependencies
-             WHERE issue_id IN (SELECT value FROM json_each(?1))
-             ORDER BY issue_id ASC, created_at ASC, depends_on_uri ASC",
-            params![issue_ids_json],
-        )
-        .await?;
-    let mut dependencies = HashMap::<String, Vec<String>>::new();
-    while let Some(row) = rows.next().await? {
-        dependencies
-            .entry(row.text(0)?)
-            .or_default()
-            .push(row.text(1)?);
-    }
-    Ok(dependencies)
-}
-
-pub async fn list_dependent_issue_ids(
-    conn: &crate::turso::Connection,
-    depends_on_uri: &str,
-) -> DbResult<Vec<String>> {
-    let canonical = canonicalize_issue_uri(depends_on_uri).map_err(DbError::Row)?;
-    let mut rows = conn
-        .query(
-            "SELECT DISTINCT issue_id FROM issue_dependencies WHERE depends_on_uri = ?1 ORDER BY issue_id ASC",
-            params![canonical.as_str()],
-        )
-        .await?;
-    let mut issue_ids = Vec::new();
-    while let Some(row) = rows.next().await? {
-        issue_ids.push(row.text(0)?);
-    }
-    Ok(issue_ids)
-}
-
-pub async fn list_issue_dependencies(
-    conn: &crate::turso::Connection,
-    issue_id: &str,
-) -> DbResult<Vec<DependencyRef>> {
-    let mut dependencies = Vec::new();
-    for uri in list_dependency_uris(conn, issue_id).await? {
-        let canonical = canonicalize_issue_uri(&uri).map_err(DbError::Row)?;
-        let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
-            continue;
-        };
-        let project_key = cairn_common::uri::canonical_project(project);
-        match resolve_issue_uri(conn, &canonical).await? {
-            Some(resolved) => dependencies.push(DependencyRef {
-                uri: resolved.uri,
-                project_key: resolved.project_key,
-                number: resolved.number,
-                title: resolved.title,
-                met: is_complete_status(&resolved.status),
-                status: resolved.status,
-            }),
-            None => dependencies.push(DependencyRef {
-                uri: canonical,
-                project_key,
-                number,
-                title: "Missing issue".to_string(),
-                status: IssueStatus::Backlog,
-                met: false,
-            }),
-        }
-    }
-    Ok(dependencies)
 }
 
 pub async fn resolve_issue_uri(
@@ -188,74 +75,6 @@ pub async fn resolve_issue_uri(
         .await?
         .map(|row| issue_ref_from_row(&row, canonical.clone(), project_key.clone(), 0))
         .transpose()
-}
-
-pub async fn resolve_issue_uris(
-    conn: &crate::turso::Connection,
-    uris: &[String],
-) -> DbResult<HashMap<String, IssueRef>> {
-    let mut requested = Vec::new();
-    let mut seen = HashSet::new();
-    for uri in uris {
-        let canonical = canonicalize_issue_uri(uri).map_err(DbError::Row)?;
-        if !seen.insert(canonical.clone()) {
-            continue;
-        }
-        let Some(CairnResource::Issue { project, number }) = parse_uri(&canonical) else {
-            continue;
-        };
-        requested.push(serde_json::json!({
-            "uri": canonical,
-            "project_key": cairn_common::uri::canonical_project(project),
-            "number": number,
-        }));
-    }
-    if requested.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let requested_json = serde_json::to_string(&requested).map_err(|error| {
-        DbError::internal(format!("failed to serialize dependency lookups: {error}"))
-    })?;
-    let mut rows = conn
-        .query(
-            "WITH requested AS (
-                 SELECT json_extract(value, '$.uri') AS uri,
-                        json_extract(value, '$.project_key') AS project_key,
-                        CAST(json_extract(value, '$.number') AS INTEGER) AS number
-                 FROM json_each(?1)
-             )
-             SELECT requested.uri, requested.project_key,
-                    i.id, i.number, i.title, i.status
-             FROM requested
-             JOIN projects p ON p.key = requested.project_key COLLATE NOCASE
-             JOIN issues i ON i.project_id = p.id AND i.number = requested.number",
-            params![requested_json],
-        )
-        .await?;
-    let mut resolved = HashMap::new();
-    while let Some(row) = rows.next().await? {
-        let uri = row.text(0)?;
-        let project_key = row.text(1)?;
-        resolved.insert(uri.clone(), issue_ref_from_row(&row, uri, project_key, 2)?);
-    }
-    Ok(resolved)
-}
-
-pub fn filter_unmet_dependencies_from_resolved(
-    uris: &[String],
-    resolved: &HashMap<String, IssueRef>,
-) -> DbResult<Vec<String>> {
-    let mut unmet = Vec::new();
-    for uri in uris {
-        let canonical = canonicalize_issue_uri(uri).map_err(DbError::Row)?;
-        match resolved.get(&canonical) {
-            Some(issue) if is_complete_status(&issue.status) => {}
-            Some(issue) => unmet.push(issue.uri.clone()),
-            None => unmet.push(canonical),
-        }
-    }
-    Ok(unmet)
 }
 
 pub async fn issue_uri_for_id(conn: &crate::turso::Connection, issue_id: &str) -> DbResult<String> {
@@ -415,49 +234,6 @@ pub async fn resolve_parent_branch(
     Ok(Some(row.text(0)?))
 }
 
-async fn validate_no_cycle(
-    conn: &crate::turso::Connection,
-    current_uri: &str,
-    proposed_dependencies: &[String],
-) -> Result<(), String> {
-    let current_uri = canonicalize_issue_uri(current_uri)?;
-    let mut visited = HashSet::new();
-    let mut stack: Vec<(String, Vec<String>)> = proposed_dependencies
-        .iter()
-        .map(|dependency| {
-            let canonical = canonicalize_issue_uri(dependency)?;
-            Ok((canonical.clone(), vec![current_uri.clone(), canonical]))
-        })
-        .collect::<Result<_, String>>()?;
-
-    while let Some((uri, path)) = stack.pop() {
-        if uri == current_uri {
-            return Err(format!("dependency cycle: {}", path.join(" -> ")));
-        }
-        if !visited.insert(uri.clone()) {
-            continue;
-        }
-
-        let Some(resolved) = resolve_issue_uri(conn, &uri)
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            continue;
-        };
-        let outgoing = list_dependency_uris(conn, &resolved.issue_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        for next in outgoing {
-            let canonical_next = canonicalize_issue_uri(&next)?;
-            let mut next_path = path.clone();
-            next_path.push(canonical_next.clone());
-            stack.push((canonical_next, next_path));
-        }
-    }
-
-    Ok(())
-}
-
 /// Reject setting `child_issue_id`'s parent to `proposed_parent_id` when that
 /// would form a parent-chain cycle. Each issue has at most one parent, so this
 /// is a bounded linear walk up from the proposed parent; a self-parent is caught
@@ -490,76 +266,6 @@ pub async fn validate_no_parent_cycle(
         };
     }
     Ok(())
-}
-
-pub async fn replace_dependencies(
-    conn: &crate::turso::Connection,
-    issue_id: &str,
-    dependencies: &[String],
-    now: i64,
-) -> Result<Vec<String>, String> {
-    let current_uri = issue_uri_for_id(conn, issue_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut canonical = Vec::with_capacity(dependencies.len());
-    let mut seen = HashSet::new();
-    for dependency in dependencies {
-        let uri = canonicalize_issue_uri(dependency)?;
-        if uri == current_uri {
-            return Err(format!("dependency cycle: {current_uri} -> {uri}"));
-        }
-        if seen.insert(uri.clone()) {
-            canonical.push(uri);
-        }
-    }
-
-    validate_no_cycle(conn, &current_uri, &canonical).await?;
-
-    conn.execute(
-        "DELETE FROM issue_dependencies WHERE issue_id = ?1",
-        params![issue_id],
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-
-    for uri in &canonical {
-        conn.execute(
-            "INSERT INTO issue_dependencies (issue_id, depends_on_uri, created_at) VALUES (?1, ?2, ?3)",
-            params![issue_id, uri.as_str(), now],
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    }
-
-    Ok(canonical)
-}
-
-/// Filter a pre-listed set of dependency URIs down to those that have not yet
-/// reached a complete status (Merged/Closed), preserving order. Unresolvable
-/// URIs count as unmet and are returned in canonical form for display.
-async fn filter_unmet_dependencies(
-    conn: &crate::turso::Connection,
-    uris: &[String],
-) -> DbResult<Vec<String>> {
-    let resolved = resolve_issue_uris(conn, uris).await?;
-    filter_unmet_dependencies_from_resolved(uris, &resolved)
-}
-/// Canonical issue URIs of this issue's dependencies that have not yet reached
-/// Merged or Closed. These are what the issue is currently "blocked on".
-async fn unmet_dependency_uris(
-    conn: &crate::turso::Connection,
-    issue_id: &str,
-) -> DbResult<Vec<String>> {
-    let uris = list_dependency_uris(conn, issue_id).await?;
-    filter_unmet_dependencies(conn, &uris).await
-}
-
-async fn unmet_dependency_count(conn: &crate::turso::Connection, issue_id: &str) -> DbResult<i64> {
-    Ok(unmet_dependency_uris(conn, issue_id).await?.len() as i64)
-}
-
-pub async fn dependencies_ready(conn: &crate::turso::Connection, issue_id: &str) -> DbResult<bool> {
-    Ok(unmet_dependency_count(conn, issue_id).await? == 0)
 }
 
 #[cfg(test)]
@@ -619,162 +325,6 @@ mod tests {
         );
         assert!(canonicalize_issue_uri("cairn://p/cairn/messages").is_err());
         assert!(canonicalize_issue_uri("").is_err());
-    }
-
-    #[tokio::test]
-    async fn replace_dependencies_deduplicates_canonical_uris() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn, "p-cairn", "cairn").await;
-                seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
-                seed_issue(conn, "p-cairn", "i-b", 2, "B", "backlog").await;
-                seed_issue(conn, "p-cairn", "i-c", 3, "C", "backlog").await;
-
-                let replaced = replace_dependencies(
-                    conn,
-                    "i-a",
-                    &[
-                        " cairn://p/cairn/2 ".to_string(),
-                        "cairn://p/cairn/3".to_string(),
-                        "cairn://p/cairn/2".to_string(),
-                    ],
-                    2,
-                )
-                .await
-                .unwrap();
-
-                assert_eq!(replaced, vec!["cairn://p/cairn/2", "cairn://p/cairn/3"]);
-                assert_eq!(list_dependency_uris(conn, "i-a").await.unwrap(), replaced);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn replace_dependencies_rejects_cross_project_cycle() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn, "p-cairn", "cairn").await;
-                seed_project(conn, "p-agg", "agg").await;
-                seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
-                seed_issue(conn, "p-agg", "i-b", 2, "B", "backlog").await;
-                replace_dependencies(conn, "i-a", &["cairn://p/agg/2".to_string()], 2)
-                    .await
-                    .unwrap();
-                let error =
-                    replace_dependencies(conn, "i-b", &["cairn://p/cairn/1".to_string()], 3)
-                        .await
-                        .unwrap_err();
-                assert!(error.contains("dependency cycle"));
-                assert!(error.contains("cairn://p/agg/2"));
-                assert!(error.contains("cairn://p/cairn/1"));
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn dependencies_ready_requires_resolved_complete_dependencies() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn, "p-cairn", "cairn").await;
-                seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
-                seed_issue(conn, "p-cairn", "i-b", 2, "B", "active").await;
-                replace_dependencies(conn, "i-a", &["cairn://p/cairn/2".to_string()], 2)
-                    .await
-                    .unwrap();
-                assert!(!dependencies_ready(conn, "i-a").await.unwrap());
-                assert_eq!(unmet_dependency_count(conn, "i-a").await.unwrap(), 1);
-                conn.execute("UPDATE issues SET status = 'closed' WHERE id = 'i-b'", ())
-                    .await
-                    .unwrap();
-                assert!(dependencies_ready(conn, "i-a").await.unwrap());
-                assert_eq!(unmet_dependency_count(conn, "i-a").await.unwrap(), 0);
-                replace_dependencies(conn, "i-a", &["cairn://p/MISSING/99".to_string()], 3)
-                    .await
-                    .unwrap();
-                assert!(!dependencies_ready(conn, "i-a").await.unwrap());
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn unmet_dependency_uris_returns_only_incomplete_and_missing_dependencies() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn, "p-cairn", "cairn").await;
-                seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
-                seed_issue(conn, "p-cairn", "i-b", 2, "B", "merged").await;
-                seed_issue(conn, "p-cairn", "i-c", 3, "C", "active").await;
-                replace_dependencies(
-                    conn,
-                    "i-a",
-                    &[
-                        "cairn://p/cairn/2".to_string(),
-                        "cairn://p/cairn/3".to_string(),
-                        "cairn://p/cairn/99".to_string(),
-                    ],
-                    2,
-                )
-                .await
-                .unwrap();
-
-                // #2 is merged (met); #3 is active and #99 is missing (both unmet).
-                let unmet = unmet_dependency_uris(conn, "i-a").await.unwrap();
-                assert_eq!(
-                    unmet,
-                    vec![
-                        "cairn://p/cairn/3".to_string(),
-                        "cairn://p/cairn/99".to_string(),
-                    ]
-                );
-                assert_eq!(unmet_dependency_count(conn, "i-a").await.unwrap(), 2);
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn list_dependent_issue_ids_finds_same_and_cross_project_dependents() {
-        let db = test_db().await;
-        db.write(|conn| {
-            Box::pin(async move {
-                seed_project(conn, "p-cairn", "cairn").await;
-                seed_project(conn, "p-agg", "AGG").await;
-                seed_issue(conn, "p-cairn", "i-a", 1, "A", "backlog").await;
-                seed_issue(conn, "p-cairn", "i-b", 2, "B", "backlog").await;
-                seed_issue(conn, "p-agg", "i-c", 3, "C", "backlog").await;
-                replace_dependencies(conn, "i-b", &["cairn://p/cairn/1".to_string()], 2)
-                    .await
-                    .unwrap();
-                replace_dependencies(conn, "i-c", &["cairn://p/cairn/1".to_string()], 2)
-                    .await
-                    .unwrap();
-
-                assert_eq!(
-                    list_dependent_issue_ids(conn, "cairn://p/cairn/1")
-                        .await
-                        .unwrap(),
-                    vec!["i-b".to_string(), "i-c".to_string()]
-                );
-                Ok(())
-            })
-        })
-        .await
-        .unwrap();
     }
 
     #[tokio::test]

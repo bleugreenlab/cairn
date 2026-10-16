@@ -163,6 +163,26 @@ macro_rules! shared_tail_permission_resume_error {
     };
 }
 
+/// cairn/4735: `after:` gates on an execution. `execution_gates` describes
+/// ProjectScoped executions and must be readable wherever they live, and the
+/// two release columns land on `executions` itself, so the whole change is
+/// shared and composes into both lineages.
+macro_rules! shared_tail_execution_after_gates {
+    () => {
+        migration!("0256_execution_after_gates")
+    };
+}
+
+/// cairn/4735: retire `depends_on` into `after:` gates. Each dependency edge on
+/// an issue with an execution becomes a satisfied gate on its newest execution;
+/// the rest are dropped with the table. `issue_dependencies` exists in both
+/// lineages, so the conversion and the drop are shared.
+macro_rules! shared_tail_retire_issue_dependencies {
+    () => {
+        migration!("0257_retire_issue_dependencies")
+    };
+}
+
 /// How each execution bound to a machine. Runner-transient state keyed by a
 /// runner incarnation, like the workflow journal, so it never syncs to a team
 /// replica.
@@ -1321,6 +1341,8 @@ macro_rules! team_lineage {
             shared_tail_terminal_exit_reason!(),
             shared_tail_prompt_withdrawal!(),
             shared_tail_provider_limit_holds!(),
+            shared_tail_execution_after_gates!(),
+            shared_tail_retire_issue_dependencies!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1580,6 +1602,8 @@ macro_rules! private_lineage {
             private_ref_store_maintenance!(),
             shared_tail_prompt_withdrawal!(),
             shared_tail_provider_limit_holds!(),
+            shared_tail_execution_after_gates!(),
+            shared_tail_retire_issue_dependencies!(),
         ]
     };
 }
@@ -1937,6 +1961,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("event_vibes", TableScope::ProjectScoped),
     ("events", TableScope::ProjectScoped),
     ("execution_trigger_sources", TableScope::ProjectScoped),
+    // cairn/4735: the `after:` gates holding an execution. They are read
+    // wherever the execution they hold is read -- the status projection derives
+    // `held` from their presence -- so they share its scope.
+    ("execution_gates", TableScope::ProjectScoped),
     ("executions", TableScope::ProjectScoped),
     ("attachments", TableScope::ProjectScoped),
     ("file_changes", TableScope::ProjectScoped),
@@ -1944,7 +1972,6 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // schema because destructive changes to synced replica tables break Turso
     // sync triggers; see 0225_attachments.sql.
     ("image_refs", TableScope::ProjectScoped),
-    ("issue_dependencies", TableScope::ProjectScoped),
     ("issue_labels", TableScope::ProjectScoped),
     ("issue_workspaces", TableScope::ProjectScoped),
     ("issues", TableScope::ProjectScoped),
@@ -2495,6 +2522,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "source_job_id", "triggered_execution_id"],
     },
     RekeyTableManifest {
+        table: "execution_gates",
+        id_columns: &["id", "execution_id"],
+    },
+    RekeyTableManifest {
         table: "executions",
         id_columns: &["id", "issue_id", "project_id"],
     },
@@ -2509,10 +2540,6 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "image_refs",
         id_columns: &["project_id"],
-    },
-    RekeyTableManifest {
-        table: "issue_dependencies",
-        id_columns: &["issue_id"],
     },
     RekeyTableManifest {
         table: "issue_labels",
@@ -3245,6 +3272,8 @@ mod tests {
                 "ref_store_maintenance",
                 "prompt_withdrawal",
                 "provider_limit_holds",
+                "execution_after_gates",
+                "retire_issue_dependencies",
             ]
         );
         assert_eq!(
@@ -6506,6 +6535,13 @@ mod tests {
                 // cairn/4955: questions can be withdrawn in both.
                 "prompt_withdrawal",
                 "provider_limit_holds",
+                // cairn/4735: `after:` gates hang off ProjectScoped executions
+                // and the release columns land on `executions` itself, so the
+                // gate substrate reaches both lineages.
+                "execution_after_gates",
+                // cairn/4735: `issue_dependencies` is shared project state, so
+                // its retirement into `after:` gates reaches both lineages.
+                "retire_issue_dependencies",
             ]
         );
         assert_eq!(
@@ -6856,6 +6892,286 @@ mod tests {
                 // `target` is a closed enum; its presence is the contract.
                 let _ = target;
             }
+        }
+    }
+
+    /// The two claims 0256 rests on.
+    ///
+    /// 1. **No backfill is needed.** `execution_gates` is a new table, so no
+    ///    execution that predates the migration has a gate, so none is held and
+    ///    the status projection's new first branch is a no-op for all of them.
+    ///    Asserted rather than assumed.
+    /// 2. **`held` is additive.** `executions.status` is a bare `TEXT NOT NULL`
+    ///    with no CHECK constraint, so a new status value needs no table
+    ///    rebuild — which matters because `executions` is a synced replica table
+    ///    and a create-copy-drop-rename rebuild of one breaks Turso sync
+    ///    triggers. Writing the value is the proof.
+    #[tokio::test]
+    async fn execution_gates_hold_nothing_that_predates_them() {
+        let db = migrated_db().await.unwrap();
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at)
+               VALUES ('gates-workspace', 'Gates', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('gates-project', 'gates-workspace', 'Gates', 'gates', '/tmp/gates', 1, 1);
+             INSERT INTO executions(id, recipe_id, project_id, status, started_at)
+               VALUES ('gates-exec', 'recipe', 'gates-project', 'running', 1);",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM execution_gates")
+                .await
+                .unwrap(),
+            0,
+            "a fresh lineage has no gates, so no execution is held and no backfill is owed"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM executions WHERE released_at IS NOT NULL"
+            )
+            .await
+            .unwrap(),
+            0,
+            "released_at starts NULL everywhere; only a release sets it"
+        );
+
+        // `held` is additive: no CHECK to widen, so the value simply persists.
+        db.execute(
+            "UPDATE executions SET status = 'held' WHERE id = 'gates-exec'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            query_text(&db, "SELECT status FROM executions WHERE id = 'gates-exec'")
+                .await
+                .unwrap(),
+            "held"
+        );
+        assert_eq!(
+            query_i64(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name = 'executions'
+                    AND sql LIKE '%CHECK%'"
+            )
+            .await
+            .unwrap(),
+            0,
+            "executions carries no CHECK constraint, so a new status value needs no rebuild"
+        );
+
+        // Gates cascade with the execution they hold.
+        db.execute(
+            "INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+             VALUES ('gates-gate', 'gates-exec', 0, '{\"fact\":\"clock\"}', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute("DELETE FROM executions WHERE id = 'gates-exec'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM execution_gates")
+                .await
+                .unwrap(),
+            0,
+            "a gate cannot outlive the execution it holds"
+        );
+    }
+
+    /// 0257 retires `issue_dependencies` into `after:` gates.
+    ///
+    /// Every edge on an issue that has an execution survives as history: a gate
+    /// on that issue's NEWEST execution, latched satisfied, in the canonical
+    /// stored form, so it holds nothing. An execution that was not already held
+    /// is marked released first, or a gate on it would project it `held`. An
+    /// execution that IS held keeps its own gates in charge. Edges on an issue
+    /// with no execution are dropped, and the table goes in both lineages.
+    #[tokio::test]
+    async fn retiring_issue_dependencies_keeps_history_and_holds_nothing() {
+        let temp = tempdir().unwrap();
+        let db = LocalDb::open(temp.path().join("retire-dependencies.db"))
+            .await
+            .unwrap();
+        let before = TURSO_MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version != "0257")
+            .copied()
+            .collect::<Vec<_>>();
+        MigrationRunner::new(before).run(&db).await.unwrap();
+        db.execute_script(
+            "INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('w', 'W', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p', 'w', 'Cairn', 'cairn', '/tmp/cairn', 1, 1);
+             INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('q', 'w', 'Other', 'other', '/tmp/other', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES ('a', 'p', 1, 'Merged target', 'merged', 'complete', 'none', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES ('b', 'p', 2, 'Live target', 'active', 'active', 'none', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES ('c', 'p', 3, 'Ran twice', 'complete', 'complete', 'none', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES ('d', 'p', 4, 'Never ran', 'backlog', 'backlog', 'none', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES ('e', 'p', 5, 'Held', 'backlog', 'backlog', 'none', 1, 1);
+             INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+               VALUES ('x', 'q', 7, 'Elsewhere', 'closed', 'complete', 'none', 1, 1);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES ('c-old', 'r', 'c', 'p', 'complete', 10, 1, 'superseded');
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('teamABC123~00000000-0000-4000-8000-000000000001', 'r', 'c', 'p', 'complete', 20, 2);
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+               VALUES ('e-held', 'r', 'e', 'p', 'held', 30, 1);
+             INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+               VALUES ('e-own', 'e-held', 0, '{\"fact\":\"clock\",\"notBefore\":\"2099-01-01T00:00:00Z\"}', 30);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('c', 'cairn://p/CAIRN/1', 1);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('c', 'cairn://p/cairn/1', 1);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('c', 'cairn://p/cairn/2', 1);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('c', 'cairn://p/other/7', 1);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('c', 'cairn://p/missing/9', 1);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('d', 'cairn://p/cairn/1', 1);
+             INSERT INTO issue_dependencies(issue_id, depends_on_uri, created_at) VALUES ('e', 'cairn://p/cairn/1', 1);",
+        )
+        .await
+        .unwrap();
+
+        let applied = MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        assert_eq!(applied, vec!["0257_retire_issue_dependencies".to_string()]);
+
+        let gates = |execution_id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_all(
+                    "SELECT id, seq, predicate_json, satisfied_at IS NOT NULL, last_outcome
+                       FROM execution_gates WHERE execution_id = ?1 ORDER BY seq",
+                    (execution_id,),
+                    |row| {
+                        Ok((
+                            row.text(0)?,
+                            row.i64(1)?,
+                            row.text(2)?,
+                            row.i64(3)? == 1,
+                            row.opt_text(4)?,
+                        ))
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // The newest execution carries every distinct target, case-folded to
+        // one predicate per issue, in canonical form, each latched satisfied --
+        // the live target and the missing one included: history, not a hold.
+        let newest = gates("teamABC123~00000000-0000-4000-8000-000000000001").await;
+        assert_eq!(
+            newest
+                .iter()
+                .map(|(_, seq, predicate, satisfied, outcome)| (
+                    *seq,
+                    predicate.as_str(),
+                    *satisfied,
+                    outcome.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    r#"{"fact":"issue_resolution","issue":"cairn://p/cairn/1"}"#,
+                    true,
+                    Some("satisfied")
+                ),
+                (
+                    1,
+                    r#"{"fact":"issue_resolution","issue":"cairn://p/cairn/2"}"#,
+                    true,
+                    Some("satisfied")
+                ),
+                (
+                    2,
+                    r#"{"fact":"issue_resolution","issue":"cairn://p/missing/9"}"#,
+                    true,
+                    Some("satisfied")
+                ),
+                (
+                    3,
+                    r#"{"fact":"issue_resolution","issue":"cairn://p/other/7"}"#,
+                    true,
+                    Some("satisfied")
+                ),
+            ]
+        );
+        // A gate id inherits its execution's team prefix over a canonical v4
+        // UUID, exactly as `mint_child` would have minted it.
+        for (id, ..) in &newest {
+            assert_eq!(
+                cairn_common::ids::parse_route_scope(id),
+                Ok(cairn_common::ids::RouteScope::Team(
+                    "teamABC123".to_string()
+                )),
+                "{id}"
+            );
+        }
+        assert!(gates("c-old").await.is_empty(), "only the newest execution");
+
+        // Released at its own start, so it is not held and no sweep restarts it.
+        let released = |execution_id: &'static str| {
+            let db = &db;
+            async move {
+                db.query_all(
+                    "SELECT released_at FROM executions WHERE id = ?1",
+                    (execution_id,),
+                    |row| row.opt_i64(0),
+                )
+                .await
+                .unwrap()
+                .remove(0)
+            }
+        };
+        assert_eq!(
+            released("teamABC123~00000000-0000-4000-8000-000000000001").await,
+            Some(20)
+        );
+        assert_eq!(released("c-old").await, None, "untouched: it has no gate");
+
+        // A held execution keeps its own gate in charge; the migrated one is
+        // appended after it, satisfied, and the execution stays unreleased.
+        let held = gates("e-held").await;
+        assert_eq!(held.len(), 2);
+        assert_eq!((held[0].0.as_str(), held[0].3), ("e-own", false));
+        assert_eq!((held[1].1, held[1].3), (1, true));
+        assert_eq!(released("e-held").await, None);
+        // A bare local id is a canonical v4 UUID.
+        assert!(cairn_common::ids::parse_route_scope(&format!("teamABC123~{}", held[1].0)).is_ok());
+
+        // The never-run issue's edge is dropped: four gates on the newest
+        // execution, one appended to the held one, one that was already there.
+        assert_eq!(
+            query_i64(&db, "SELECT COUNT(*) FROM execution_gates")
+                .await
+                .unwrap(),
+            6
+        );
+        for lineage in [&db, &migrated_team_db().await.1] {
+            assert_eq!(
+                query_i64(
+                    lineage,
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'issue_dependencies'"
+                )
+                .await
+                .unwrap(),
+                0,
+                "issue_dependencies is gone from both lineages"
+            );
         }
     }
 

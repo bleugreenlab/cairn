@@ -23,36 +23,6 @@ struct IssuePrSummary {
     resolved_at: Option<i64>,
 }
 
-async fn render_dependencies_block(conn: &cairn_db::turso::Connection, issue_id: &str) -> String {
-    let dependencies = match relations::list_dependency_uris(conn, issue_id).await {
-        Ok(dependencies) => dependencies,
-        Err(_) => return String::new(),
-    };
-    if dependencies.is_empty() {
-        return String::new();
-    }
-
-    let mut output = String::from("## dependencies\n");
-    for uri in dependencies {
-        match relations::resolve_issue_uri(conn, &uri).await {
-            Ok(Some(resolved)) => {
-                let marker = if relations::is_complete_status(&resolved.status) {
-                    "✓"
-                } else {
-                    "○"
-                };
-                output.push_str(&format!(
-                    "- [{}-{}]({}) [{}] {}\n",
-                    resolved.project_key, resolved.number, resolved.uri, marker, resolved.title
-                ));
-            }
-            _ => output.push_str(&format!("- [{}]({}) [?] unresolved\n", uri, uri)),
-        }
-    }
-    output.push('\n');
-    output
-}
-
 /// The canonical URI of a thread, from its id.
 async fn thread_uri_for_id(conn: &cairn_db::turso::Connection, thread_id: &str) -> Option<String> {
     let mut rows = conn
@@ -419,7 +389,6 @@ pub(super) async fn read_issue(
         }
     }
 
-    output.push_str(&render_dependencies_block(&conn, &issue_id).await);
     output.push_str(&render_possibly_related_block(&conn, &issue_id).await);
 
     // Nodes - grouped by execution
@@ -455,9 +424,32 @@ pub(super) async fn read_issue(
         return output;
     }
 
+    // A held execution has no nodes, so its gate census is the only thing
+    // under its line — and the only thing saying why it has none.
+    let mut gate_census = match crate::execution::gates::census::census_for_executions_conn(
+        &conn,
+        &executions
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await
+    {
+        Ok(census) => census,
+        // Absent census lines would read as "nothing is held"; say instead
+        // that they could not be read.
+        Err(error) => {
+            output.push_str(&format!("  (gate census unavailable: {error})\n"));
+            Default::default()
+        }
+    };
+
     for (exec_id, exec_seq) in &executions {
         let exec_seq = *exec_seq as i32;
         output.push_str(&format!("├─ `/{}`\n", exec_seq));
+        if let Some(census) = gate_census.remove(exec_id) {
+            output.push_str(&format!("│  {}\n", census.summary));
+        }
 
         // Get jobs for this execution
         let job_sql = format!(
@@ -634,7 +626,35 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
 
     let mut output = format!("# Executions for {}/{}\n\n", project_key, number);
     let mut found = false;
-    match conn
+    let mut issue_execution_ids: Vec<String> = Vec::new();
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT id FROM executions WHERE issue_id = ?1",
+            (issue_id.as_str(),),
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            if let Ok(id) = row.text(0) {
+                issue_execution_ids.push(id);
+            }
+        }
+    }
+    // Read before the listing query opens its cursor: a second statement on
+    // this connection while that cursor is live empties the listing.
+    let mut gate_census = match crate::execution::gates::census::census_for_executions_conn(
+        &conn,
+        &issue_execution_ids,
+    )
+    .await
+    {
+        Ok(census) => census,
+        Err(error) => {
+            output.push_str(&format!("(gate census unavailable: {error})\n"));
+            Default::default()
+        }
+    };
+    let listing = conn
         .query(
             "SELECT e.seq, e.status, e.triggered_by,
                     (SELECT r.error_message
@@ -643,60 +663,68 @@ pub(super) async fn read_issue_executions(db: &LocalDb, project_key: &str, numbe
                        AND r.exit_reason = 'job_preparation_failed'
                        AND r.error_message IS NOT NULL
                      ORDER BY r.created_at DESC LIMIT 1),
-                    e.lifecycle
+                    e.lifecycle,
+                    e.id
              FROM executions e
              WHERE e.issue_id = ?1 ORDER BY e.seq ASC",
             (issue_id.as_str(),),
         )
-        .await
+        .await;
+    // A failed query must not read as an issue with no executions: that
+    // is how a broken column reference once made every issue look as if
+    // its executions had been deleted.
+    let mut rows = match listing {
+        Ok(rows) => rows,
+        Err(error) => return storage_error("Failed to load executions", error.into()),
+    };
     {
-        // A failed query must not read as an issue with no executions: that
-        // is how a broken column reference once made every issue look as if
-        // its executions had been deleted.
-        Err(e) => return storage_error("Failed to load executions", e.into()),
-        Ok(mut rows) => {
-            while let Ok(Some(row)) = rows.next().await {
-                found = true;
-                let seq = row.opt_i64(0).ok().flatten().unwrap_or(0);
-                let status = row.text(1).unwrap_or_default();
-                let triggered_by = row.opt_text(2).ok().flatten().unwrap_or_default();
-                let error = row.opt_text(3).ok().flatten();
-                // Canonical standing (CAIRN-4665). Secondary evidence, not the
-                // enforcement: the fence refuses a superseded execution's turns and
-                // effects whether or not this line renders.
-                let lifecycle = row.opt_text(4).ok().flatten().unwrap_or_default();
-                let standing = match lifecycle.as_str() {
-                    "superseded" => {
-                        " — superseded; it no longer owns this issue's attempt".to_string()
-                    }
-                    "parallel" => {
-                        " — declared parallel alternative; not this issue's implementation"
-                            .to_string()
-                    }
-                    _ => String::new(),
-                };
-                output.push_str(&format!(
-                    "- execution {} [{}] (triggered: {}){}",
-                    seq, status, triggered_by, standing
-                ));
-                if let Some(error) = error {
-                    let cause = error
-                        .lines()
-                        .find(|line| !line.trim().is_empty())
-                        .unwrap_or(&error);
-                    output.push_str(&format!(" — {}\n", cause.trim()));
-                    output.push_str(
-                        "  <details><summary>Full preparation error</summary>\n\n  ```text\n",
-                    );
-                    for line in error.lines() {
-                        output.push_str("  ");
-                        output.push_str(line);
-                        output.push('\n');
-                    }
-                    output.push_str("  ```\n  </details>\n");
-                } else {
+        while let Ok(Some(row)) = rows.next().await {
+            found = true;
+            let census = row.text(5).ok().and_then(|id| gate_census.remove(&id));
+            let seq = row.opt_i64(0).ok().flatten().unwrap_or(0);
+            // The projection keeps `held` for a gated execution that can never
+            // start (it never ran); the census is what says it is not waiting.
+            let status = match census.as_ref().and_then(|c| c.wont_start.as_ref()) {
+                Some(_) => "won't start".to_string(),
+                None => row.text(1).unwrap_or_default(),
+            };
+            let census = census
+                .map(|census| format!(" — {}", census.summary))
+                .unwrap_or_default();
+            let triggered_by = row.opt_text(2).ok().flatten().unwrap_or_default();
+            let error = row.opt_text(3).ok().flatten();
+            // Canonical standing (CAIRN-4665). Secondary evidence, not the
+            // enforcement: the fence refuses a superseded execution's turns and
+            // effects whether or not this line renders.
+            let lifecycle = row.opt_text(4).ok().flatten().unwrap_or_default();
+            let standing = match lifecycle.as_str() {
+                "superseded" => " — superseded; it no longer owns this issue's attempt".to_string(),
+                "parallel" => {
+                    " — declared parallel alternative; not this issue's implementation".to_string()
+                }
+                _ => String::new(),
+            };
+            output.push_str(&format!(
+                "- execution {} [{}] (triggered: {}){}{}",
+                seq, status, triggered_by, standing, census
+            ));
+            if let Some(error) = error {
+                let cause = error
+                    .lines()
+                    .find(|line| !line.trim().is_empty())
+                    .unwrap_or(&error);
+                output.push_str(&format!(" — {}\n", cause.trim()));
+                output.push_str(
+                    "  <details><summary>Full preparation error</summary>\n\n  ```text\n",
+                );
+                for line in error.lines() {
+                    output.push_str("  ");
+                    output.push_str(line);
                     output.push('\n');
                 }
+                output.push_str("  ```\n  </details>\n");
+            } else {
+                output.push('\n');
             }
         }
     }
@@ -1530,6 +1558,92 @@ mod execution_snapshot_read_tests {
         })
         .await
         .unwrap();
+    }
+
+    /// The issue's executions collection names a held execution's gates and
+    /// their evidence, and leaves the ungated execution beside it alone.
+    #[tokio::test]
+    async fn execution_collection_renders_a_held_execution_with_its_gates() {
+        use crate::execution::gates::census::test_support::{hold_execution, HELD_SUMMARY};
+        let db = test_db().await;
+        seed(&db).await;
+        // A re-run supersedes the attempt before it; one canonical per issue.
+        exec(
+            &db,
+            "UPDATE executions SET lifecycle = 'superseded' WHERE id = 'exec-1'",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, triggered_by)
+             VALUES ('exec-held','r','issue-1','proj-1','held',2,4,'manual')",
+        )
+        .await;
+        hold_execution(&db, "exec-held").await;
+
+        let out = read_issue_executions(&db, "cairn", 1).await;
+        assert!(
+            out.contains(&format!(
+                "- execution 4 [held] (triggered: manual) — {HELD_SUMMARY}\n"
+            )),
+            "{out}"
+        );
+        assert!(out.contains("no verdict yet") && out.contains("evidence says no"));
+        let ungated = out
+            .lines()
+            .find(|line| line.starts_with("- execution 3 "))
+            .expect("the ungated execution is still listed");
+        assert!(!ungated.contains("held"), "{ungated}");
+    }
+
+    /// A gated execution that can never start keeps the projected `held`
+    /// status, but the collection must not label it so: superseded, or on a
+    /// merged issue, it reads `won't start` in both the label and the census.
+    #[tokio::test]
+    async fn execution_collection_never_labels_a_wont_start_execution_held() {
+        use crate::execution::gates::census::test_support::hold_execution;
+        let db = test_db().await;
+        seed(&db).await;
+        exec(
+            &db,
+            "UPDATE executions SET lifecycle = 'superseded' WHERE id = 'exec-1'",
+        )
+        .await;
+        exec(
+            &db,
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, triggered_by, lifecycle)
+             VALUES ('exec-held','r','issue-1','proj-1','held',2,4,'manual','superseded')",
+        )
+        .await;
+        hold_execution(&db, "exec-held").await;
+
+        let out = read_issue_executions(&db, "cairn", 1).await;
+        let line = out
+            .lines()
+            .find(|line| line.starts_with("- execution 4 "))
+            .expect("the gated execution is listed");
+        assert!(line.starts_with("- execution 4 [won't start] "), "{line}");
+        assert!(line.ends_with("won't start: superseded"), "{line}");
+        assert!(!out.contains("[held]"), "{out}");
+
+        exec(
+            &db,
+            "UPDATE executions SET lifecycle = 'pending' WHERE id = 'exec-held'",
+        )
+        .await;
+        exec(
+            &db,
+            "UPDATE issues SET status = 'merged', merged_at = 5 WHERE id = 'issue-1'",
+        )
+        .await;
+        let out = read_issue_executions(&db, "cairn", 1).await;
+        assert!(
+            out.contains(
+                "- execution 4 [won't start] (triggered: manual) — won't start: cairn/1 merged"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("[held]"), "{out}");
     }
 
     #[tokio::test]

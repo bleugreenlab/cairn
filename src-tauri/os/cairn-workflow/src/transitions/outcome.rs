@@ -31,6 +31,49 @@ pub async fn recompute_execution_status_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
 ) -> DbResult<()> {
+    // FIRST, before any job count: an execution filed with `after:` gates and
+    // not yet released is HELD, whatever its (empty) job set says.
+    //
+    // This has to come first because a held execution has ZERO jobs. Reaching
+    // the counts below with an empty job set falls straight through to the
+    // terminal arms and derives `complete` — an execution that reports finished
+    // successfully before it has started, on an issue the issue projection then
+    // calls done. Ordering is the whole guard.
+    //
+    // `held` belongs here precisely BECAUSE status is a projection: it derives
+    // from "has gates AND not released" exactly as `running` derives from "has
+    // non-terminal jobs". Note that satisfying every gate is not release —
+    // release is the guarded transition on `released_at`, which is also what
+    // mints the jobs — so an execution stays held until that transition lands.
+    //
+    // Deliberately NOT narrowed to `cairn_db::awaiting_release_sql!`. A gated
+    // execution that can never start (superseded, or its issue resolved) still
+    // has zero jobs, and every other arm below would call that never-started
+    // work `complete` or `failed` — and drag the issue roll-up with it. `held`
+    // is the only value here that claims nothing ran. Whether it is WAITING is
+    // the gate census's to say, through the shared predicate, and it renders
+    // such an execution as `won't start`, never as held.
+    let held_gates = count(
+        conn,
+        "
+        SELECT COUNT(*)
+        FROM execution_gates
+        WHERE execution_id = ?1
+          AND (SELECT released_at FROM executions WHERE id = ?1) IS NULL
+        ",
+        execution_id,
+    )
+    .await?;
+
+    if held_gates > 0 {
+        conn.execute(
+            "UPDATE executions SET status = 'held' WHERE id = ?1",
+            (execution_id,),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let non_terminal_jobs = count(
         conn,
         "
@@ -348,6 +391,15 @@ async fn issue_progress_attention(
             statuses.push(row.text(0)?);
         }
         if statuses.is_empty() {
+            IssueProgress::Backlog
+        } else if statuses.iter().all(|status| status == "held") {
+            // Held executions are filed but un-started: no jobs, no admission
+            // request, no slot. An issue whose executions are all held is
+            // exactly as un-started as an issue carrying no execution at all,
+            // so it projects the same way — never Active, and never the
+            // Complete the terminal fall-through would otherwise hand it.
+            // A held execution filed beside a real one does not reach here, so
+            // it cannot drag a finished issue backwards.
             IssueProgress::Backlog
         } else if statuses.iter().any(|status| status == "running") {
             IssueProgress::Active
@@ -697,6 +749,192 @@ mod tests {
                 .as_deref(),
             Some("needs_input")
         );
+    }
+
+    /// Seed an issue carrying one execution with ZERO jobs, optionally gated
+    /// and optionally released. `status` starts at a deliberately wrong value so
+    /// every assertion below is on what the projection derived, not on what the
+    /// seed wrote.
+    async fn seed_gated_execution(db: &LocalDb, gates: &[(&str, Option<i64>)], released: bool) {
+        db.execute_script(
+            "
+            INSERT INTO workspaces(id, name, created_at, updated_at)
+              VALUES('w', 'W', 1, 1);
+            INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
+              VALUES('p', 'w', 'Project', 'proj', '/tmp/repo', 1, 1);
+            INSERT INTO issues(id, project_id, number, title, status, progress, attention, created_at, updated_at)
+              VALUES('i', 'p', 1, 'Issue', 'backlog', 'backlog', 'none', 1, 1);
+            INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
+              VALUES('e', 'recipe', 'i', 'p', 'running', 1, 1);
+            ",
+        )
+        .await
+        .unwrap();
+        for (seq, (id, satisfied_at)) in gates.iter().enumerate() {
+            db.execute(
+                "INSERT INTO execution_gates(id, execution_id, seq, predicate_json, satisfied_at, created_at)
+                 VALUES(?1, 'e', ?2, '{\"fact\":\"issue_resolution\"}', ?3, 1)",
+                params![*id, seq as i64, *satisfied_at],
+            )
+            .await
+            .unwrap();
+        }
+        if released {
+            db.execute("UPDATE executions SET released_at = 100 WHERE id = 'e'", ())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn derived_execution_status(db: &LocalDb) -> String {
+        db.query_one("SELECT status FROM executions WHERE id = 'e'", (), |row| {
+            row.text(0)
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn recompute_execution_and_issue(db: &LocalDb) {
+        db.write(|conn| {
+            Box::pin(async move {
+                recompute_execution_status_conn(conn, "e").await?;
+                recompute_issue_status_conn(conn, "i").await
+            })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The projection trap. A held execution has zero jobs, and the job counts
+    /// run first, so before the gate branch existed this execution fell straight
+    /// through to the terminal arms and derived as `complete` — with
+    /// `completed_at` stamped — and the issue projection then called the issue
+    /// done. A gate that reports finished work that never started is worse than
+    /// no gate at all, so the gate facts are read BEFORE the job counts.
+    #[tokio::test]
+    async fn a_gated_execution_with_no_jobs_is_held_not_complete() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", None)], false).await;
+
+        recompute_execution_and_issue(&db).await;
+
+        assert_eq!(
+            derived_execution_status(&db).await,
+            "held",
+            "an execution with an unsatisfied gate and no jobs must derive as held"
+        );
+        assert_eq!(
+            db.query_opt_i64("SELECT completed_at FROM executions WHERE id = 'e'", ())
+                .await
+                .unwrap(),
+            None,
+            "a held execution has not completed and must carry no completion stamp"
+        );
+        assert_eq!(
+            issue_status_attention(&db).await,
+            ("backlog".to_string(), "none".to_string()),
+            "an issue whose only execution is held is un-started work: backlog, \
+             never active and never complete"
+        );
+    }
+
+    /// A gated execution fenced before release never ran, so it must not derive
+    /// a terminal status: beside an unstarted successor, `complete` would make
+    /// the whole issue read as done. It stays `held` in the projection; the
+    /// gate census is what renders it as won't-start rather than waiting.
+    #[tokio::test]
+    async fn a_superseded_gated_execution_never_derives_terminal() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", None)], false).await;
+        db.execute_script(
+            "UPDATE executions SET lifecycle = 'superseded' WHERE id = 'e';
+             INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES('e2', 'recipe', 'i', 'p', 'held', 2, 2, 'pending');
+             INSERT INTO execution_gates(id, execution_id, seq, predicate_json, created_at)
+               VALUES('g2', 'e2', 0, '{\"fact\":\"issue_resolution\"}', 2);",
+        )
+        .await
+        .unwrap();
+
+        recompute_execution_and_issue(&db).await;
+
+        assert_eq!(derived_execution_status(&db).await, "held");
+        assert_eq!(
+            db.query_opt_i64("SELECT completed_at FROM executions WHERE id = 'e'", ())
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            issue_status_attention(&db).await.0,
+            "backlog",
+            "nothing on this issue has started"
+        );
+    }
+
+    /// One satisfied gate out of two is still held: `after:` is an AND.
+    #[tokio::test]
+    async fn a_partly_satisfied_gate_set_stays_held() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", Some(50)), ("g2", None)], false).await;
+
+        recompute_execution_and_issue(&db).await;
+
+        assert_eq!(derived_execution_status(&db).await, "held");
+    }
+
+    /// Release is the whole of the transition. `released_at` is set, so the same
+    /// row — gates and all, satisfied or not — derives from its jobs exactly as
+    /// any other execution does. Held is not sticky.
+    #[tokio::test]
+    async fn a_released_execution_derives_from_its_jobs_again() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", Some(50))], true).await;
+
+        recompute_execution_and_issue(&db).await;
+
+        assert_eq!(
+            derived_execution_status(&db).await,
+            "complete",
+            "a released execution is an ordinary execution"
+        );
+    }
+
+    /// The new branch is a no-op for every execution that predates gates: no
+    /// gate rows, so the job counts decide exactly as before. This is the whole
+    /// backfill argument in executable form.
+    #[tokio::test]
+    async fn an_ungated_execution_is_untouched_by_the_held_branch() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[], false).await;
+
+        recompute_execution_and_issue(&db).await;
+
+        assert_eq!(derived_execution_status(&db).await, "complete");
+        assert_eq!(issue_status_attention(&db).await.0, "complete");
+    }
+
+    /// A held execution filed onto an issue that already finished one does not
+    /// drag that issue backwards. Only an issue whose executions are ALL held
+    /// reads as backlog.
+    #[tokio::test]
+    async fn a_held_execution_beside_a_completed_one_leaves_the_issue_complete() {
+        let db = migrated_db().await;
+        seed_gated_execution(&db, &[("g1", None)], false).await;
+        db.execute_script(
+            // Superseded, because the held execution 'e' is the issue's current
+            // attempt — 0230's partial unique index allows exactly one
+            // canonical execution per issue.
+            "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, lifecycle)
+               VALUES('e0', 'recipe', 'i', 'p', 'complete', 1, 0, 'superseded');",
+        )
+        .await
+        .unwrap();
+
+        recompute_execution_and_issue(&db).await;
+
+        assert_eq!(derived_execution_status(&db).await, "held");
+        assert_eq!(issue_status_attention(&db).await.0, "complete");
     }
 
     #[tokio::test]

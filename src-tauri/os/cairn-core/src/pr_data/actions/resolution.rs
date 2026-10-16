@@ -288,10 +288,6 @@ pub async fn resolve_pr_node(
         }
     }
 
-    if let Some(issue_id) = merge_context.issue_id.as_deref() {
-        crate::execution::advancement::release_dependent_executions(orch, issue_id).await?;
-    }
-
     let port = match resolution {
         PrNodeResolution::Merge => "merge",
         PrNodeResolution::Close => "close",

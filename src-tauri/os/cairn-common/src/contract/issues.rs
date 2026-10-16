@@ -22,12 +22,6 @@ pub(crate) const ISSUE_CONTRACT: ResourceContract =
                 optional: &[
                     TITLE,
                     DESCRIPTION,
-                    KeySpec::with_aliases(
-                        "depends_on",
-                        &["dependsOn"],
-                        KeyType::Array,
-                        "full replacement array of issue URIs",
-                    ),
                     LABELS,
                     KeySpec::new(
                         "status",
@@ -359,7 +353,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
         kind: ResourceKind::IssueExecutions,
         uri_template: "cairn://p/{project}/{number}/executions",
         name: "Issue executions",
-        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped.",
+        description: "Executions for an issue. Append {recipe, backend?, branch?, continuity?, lifecycle?, overrides?, after?} to start a new execution programmatically. Starting an ordinary execution IS the decision to supersede whichever execution owns this issue's attempt now: that one is fenced (its nodes take no further turns and its effects are refused) and its agents are stopped. With `after` the execution is filed HELD and starts only when every gate clause is satisfied.",
         read_projections: NO_PROJECTIONS,
         related: NO_RELATED,
         cross_actions: NO_CROSS_ACTIONS,
@@ -392,6 +386,7 @@ pub(crate) const ISSUE_EXECUTIONS_CONTRACT: ResourceContract =
                     "canonical|parallel — defaults to canonical, this issue's next attempt, which supersedes and fences the execution that owns the attempt now. `parallel` declares an alternative that runs beside the canonical one, never claims to be the issue's implementation, and is never fenced by a successor",
                 ),
                 LAUNCH_OVERRIDES,
+                AFTER_GATES,
             ],
             label: "start execution",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions\",mode:\"append\",payload:{recipe:\"planbuild\",overrides:{without:[\"review\"]}}}]})",
@@ -435,6 +430,28 @@ pub(crate) const ISSUE_EXECUTION_CONTRACT: ResourceContract =
             optional: &[],
             label: "re-evaluate blocked condition",
             example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/2\",mode:\"patch\",payload:{reevaluate:\"check-risk\"}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[KeySpec::new(
+                "release",
+                KeyType::Bool,
+                "true starts a HELD execution now, without waiting for its gates; recorded as an override with the acting principal",
+            )],
+            optional: &[],
+            label: "release held execution early",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/2\",mode:\"patch\",payload:{release:true}}]})",
+        },
+        MutationSpec {
+            mode: ChangeMode::Patch,
+            required: &[KeySpec::new(
+                "after",
+                KeyType::Array,
+                "full replacement list of a HELD execution's gate clauses; a kept clause keeps its evidence, and [] starts it now. Refused once the execution has been released",
+            )],
+            optional: &[],
+            label: "replace held execution's gates",
+            example: "write({changes:[{target:\"cairn://p/PROJECT/NUMBER/executions/2\",mode:\"patch\",payload:{after:[{fact:\"issue_resolution\",issue:\"cairn://p/PROJECT/12\",resolution:\"merged\"}]}}]})",
         }],
     };
 

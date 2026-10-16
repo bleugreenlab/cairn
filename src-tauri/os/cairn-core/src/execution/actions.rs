@@ -1235,7 +1235,6 @@ async fn handle_close_issue(
     )
     .await
     .map_err(|e| format!("Failed to resolve issue as closed: {}", e))?;
-    crate::execution::advancement::release_dependent_executions(orch, issue_id).await?;
 
     let issue = crate::issues::crud::get(&db, issue_id)
         .await

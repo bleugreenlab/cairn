@@ -27,6 +27,10 @@ pub struct CreateExecutionSpec {
     /// review" is one call rather than a create, a start, and a patch that
     /// arrives after the jobs are already minted.
     pub(crate) overrides: Option<crate::models::LaunchDeltas>,
+    /// `after:` gates: when non-empty the execution is filed HELD, starting only
+    /// once every gate is satisfied. "Create the issue and a held execution on
+    /// it" in one call.
+    pub(crate) after: Vec<crate::routes::TriggerClause>,
 }
 
 /// Persist a new issue and emit the standard side effects (embed, sync,
@@ -212,6 +216,7 @@ pub async fn create_issue_in_project(
             // The issue was created by this same call, so nothing owns its
             // attempt yet.
             crate::execution::recipe::LaunchIntent::NewAttempt,
+            spec.after,
         )
         .await
         {
@@ -470,7 +475,6 @@ pub(crate) fn canonicalize_parent_uri(value: &str) -> Result<String, String> {
 pub(crate) struct IssuePatchFields {
     pub(crate) title: Option<String>,
     pub(crate) description: Option<String>,
-    pub(crate) depends_on: Option<Vec<String>>,
     pub(crate) labels: Option<Vec<String>>,
     /// Resolution to apply via [`crate::issues::status::update_status`]. Only
     /// `merged`/`closed` are accepted at the URI layer; callers validate before
@@ -499,7 +503,6 @@ async fn update_issue_row(
         let project_id = project_id.clone();
         let title = patch.title.clone();
         let description = patch.description.clone();
-        let depends_on = patch.depends_on.clone();
         let labels = patch.labels.clone();
         let parent = patch.parent.clone();
         Box::pin(async move {
@@ -532,11 +535,6 @@ async fn update_issue_row(
             )
             .await?;
 
-            if let Some(dependencies) = depends_on {
-                relations::replace_dependencies(conn, &issue_id, &dependencies, now as i64)
-                    .await
-                    .map_err(DbError::Row)?;
-            }
             let created_labels = match labels {
                 Some(labels) => attach::replace_issue_labels(conn, &issue_id, &labels, now as i64)
                     .await
@@ -619,7 +617,6 @@ pub(crate) async fn update_issue_by_project_number(
 ) -> Result<String, String> {
     if patch.title.is_none()
         && patch.description.is_none()
-        && patch.depends_on.is_none()
         && patch.labels.is_none()
         && patch.status.is_none()
         && patch.parent.is_none()
@@ -835,7 +832,6 @@ mod tests {
             IssuePatchFields {
                 title: None,
                 description: None,
-                depends_on: None,
                 labels: None,
                 status: None,
                 confirm: false,
@@ -869,7 +865,6 @@ mod tests {
             IssuePatchFields {
                 title: None,
                 description: None,
-                depends_on: None,
                 labels: None,
                 status: None,
                 confirm: false,

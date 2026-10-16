@@ -1335,21 +1335,6 @@ pub(super) fn parse_optional_usize_param(
         .transpose()
 }
 
-pub(super) fn parse_optional_bool_param(
-    params: &[QueryParam],
-    key: &str,
-) -> Result<Option<bool>, String> {
-    find_query_value(params, key)
-        .map(|value| match value {
-            "" | "true" | "1" => Ok(true),
-            "false" | "0" => Ok(false),
-            _ => Err(format!(
-                "Invalid boolean for query parameter '{key}': {value}"
-            )),
-        })
-        .transpose()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
