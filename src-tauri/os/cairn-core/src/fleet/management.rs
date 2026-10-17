@@ -1416,6 +1416,7 @@ mod tests {
                 display_name: first.display_name.clone(),
                 project_ids: first.project_ids.clone(),
                 bootstrapped_at_unix_ms: None,
+                legacy_retired_at_unix_ms: None,
                 legacy_tunnel_port: None,
                 extra_ssh_args: first.extra_ssh_args.clone(),
             },

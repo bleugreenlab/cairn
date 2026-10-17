@@ -2028,9 +2028,21 @@ async fn render_resource_body(
                         // account for. The runner keeps its account only while
                         // the machine is unattached, so this is an absence to
                         // state rather than an empty log to render.
-                        (Some("attach-log"), _) => format!(
-                            "No attach log for executor `{name}`: it is attached and its link is up. The runner keeps an attach account only for a machine that is not reporting."
-                        ),
+                        (Some("attach-log"), _) => {
+                            let mut out = format!(
+                                "No attach log for executor `{name}`: it is attached and its link is up. The runner keeps an attach account only for a machine that is not reporting.\n"
+                            );
+                            // A retirement runs while the link is up, so its
+                            // account is rendered whatever the link's state.
+                            let retired = orch
+                                .fleet
+                                .remote_retirement(&executor.health.identity.executor_id);
+                            if !retired.is_empty() {
+                                out.push('\n');
+                                out.push_str(&crate::resources::executors::retirement_lines(&retired));
+                            }
+                            out
+                        }
                         _ => unreachable!("executor projection was validated above"),
                     },
                     // A name that addresses an enrolled machine addresses

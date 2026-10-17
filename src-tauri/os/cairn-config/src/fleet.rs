@@ -429,6 +429,13 @@ pub struct RemoteExecutorConfig {
     /// record, unlike link state, is what lets startup identify that cutover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrapped_at_unix_ms: Option<u64>,
+    /// When this runner last confirmed that the machine runs no pre-inversion
+    /// executor installation: no pre-rename runner service left, and every
+    /// legacy home's executor generation proven released. Machines bootstrapped
+    /// before cairn/5002 lack it, which is how the runner's start pass knows to
+    /// retire what their cutover left running; a ceremony stamps it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_retired_at_unix_ms: Option<u64>,
     /// The reverse-tunnel port a runner used to open back to itself, before the
     /// executor became the side that dials.
     ///

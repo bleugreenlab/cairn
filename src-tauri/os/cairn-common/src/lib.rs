@@ -28,6 +28,7 @@ pub mod process_identity;
 pub mod protocol;
 pub mod query;
 pub mod read;
+pub mod retired_home;
 pub mod run_contract;
 pub mod runtime;
 pub mod scratch;

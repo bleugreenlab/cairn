@@ -92,6 +92,199 @@ pub struct LegacyIdentity {
     pub run_value: Option<String>,
 }
 
+impl LegacyIdentity {
+    fn of(label: &str, unit_name: &str, run_value: &str) -> Self {
+        Self {
+            label: Some(label.to_string()),
+            unit_name: Some(unit_name.to_string()),
+            run_value: Some(run_value.to_string()),
+        }
+    }
+
+    /// The name this platform's service manager knows it by.
+    pub fn platform_name(&self) -> Option<&str> {
+        if cfg!(target_os = "macos") {
+            self.label.as_deref()
+        } else if cfg!(windows) {
+            self.run_value.as_deref()
+        } else {
+            self.unit_name.as_deref()
+        }
+    }
+}
+
+/// The runner's service identity (cairn/4377 onward).
+pub const RUNNER_LABEL: &str = "computer.cairn.orch";
+pub const RUNNER_UNIT: &str = "cairn-orch.service";
+pub const RUNNER_RUN_VALUE: &str = "CairnOrch";
+/// The identity the runner registered under before cairn/4377. On a machine
+/// enrolled before the transport inversion it is also what supervised the
+/// executor that machine ran, which is why the executor's own retirement keys
+/// on it.
+pub const PRE_RENAME_RUNNER_LABEL: &str = "computer.cairn.runner";
+pub const PRE_RENAME_RUNNER_UNIT: &str = "cairn-runner.service";
+pub const PRE_RENAME_RUNNER_RUN_VALUE: &str = "CairnRunner";
+
+pub fn runner_identity() -> LegacyIdentity {
+    LegacyIdentity::of(RUNNER_LABEL, RUNNER_UNIT, RUNNER_RUN_VALUE)
+}
+
+pub fn pre_rename_runner_identity() -> LegacyIdentity {
+    LegacyIdentity::of(
+        PRE_RENAME_RUNNER_LABEL,
+        PRE_RENAME_RUNNER_UNIT,
+        PRE_RENAME_RUNNER_RUN_VALUE,
+    )
+}
+
+/// A process ended through a held handle, with the creation time it was
+/// verified by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminatedProcess {
+    pub pid: u32,
+    pub start_token: String,
+}
+
+/// What a registration says it launches, read from the registration itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnitDescription {
+    pub program: Option<PathBuf>,
+    pub args: Vec<String>,
+    /// The Cairn home it runs against: `CAIRN_HOME` in its environment, or
+    /// `--data-dir` in its arguments.
+    pub cairn_home: Option<PathBuf>,
+}
+
+/// A service registered on this machine under some identity, with the service
+/// manager's account of its process.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegisteredUnit {
+    /// The identity's name on this platform.
+    pub name: String,
+    /// The registration file, where the platform keeps one.
+    pub location: Option<PathBuf>,
+    /// Its program, arguments, and home. Default when the registration is
+    /// loaded but its file is gone.
+    pub description: UnitDescription,
+    pub runtime: Option<ServiceRuntime>,
+    /// The literal registration value, where it is one (the Windows Run
+    /// value), which is how the process it launched is recognized.
+    pub command_line: Option<String>,
+}
+
+/// Split a command line into words, honoring double quotes. Backslashes are
+/// literal, which is what both a systemd `ExecStart=` path and a Windows Run
+/// value need.
+fn split_command_line(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            ch if ch.is_whitespace() && !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut current));
+                    started = false;
+                }
+            }
+            ch => {
+                current.push(ch);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(current);
+    }
+    words
+}
+
+/// Read a launchd plist as `plutil -convert json -o - <plist>` renders it.
+pub fn parse_launchd_plist_json(json: &str) -> Result<UnitDescription, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|error| format!("parse plist json: {error}"))?;
+    let mut words: Vec<String> = value
+        .get("ProgramArguments")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let program = value
+        .get("Program")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| (!words.is_empty()).then(|| PathBuf::from(words.remove(0))));
+    let cairn_home = value
+        .get("EnvironmentVariables")
+        .and_then(|env| env.get("CAIRN_HOME"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| data_dir_argument(&words));
+    Ok(UnitDescription {
+        program,
+        args: words,
+        cairn_home,
+    })
+}
+
+/// Read a systemd unit's `ExecStart=` and `Environment=CAIRN_HOME=`.
+pub fn parse_systemd_unit(unit: &str) -> UnitDescription {
+    let mut description = UnitDescription::default();
+    let mut env_home = None;
+    for line in unit.lines() {
+        let line = line.trim();
+        if let Some(command) = line.strip_prefix("ExecStart=") {
+            // systemd's executable prefixes (`-`, `@`, `+`, `!`, `:`) are not
+            // part of the path.
+            let command = command.trim_start_matches(['-', '@', '+', '!', ':']);
+            let mut words = split_command_line(command);
+            if !words.is_empty() {
+                description.program = Some(PathBuf::from(words.remove(0)));
+            }
+            description.args = words;
+        } else if let Some(assignments) = line.strip_prefix("Environment=") {
+            for assignment in split_command_line(assignments) {
+                if let Some(home) = assignment.strip_prefix("CAIRN_HOME=") {
+                    env_home =
+                        Some(PathBuf::from(home)).filter(|home| !home.as_os_str().is_empty());
+                }
+            }
+        }
+    }
+    description.cairn_home = env_home.or_else(|| data_dir_argument(&description.args));
+    description
+}
+
+/// Read a Windows Run-key value: a quoted program path and its arguments.
+pub fn parse_run_value(value: &str) -> UnitDescription {
+    let mut words = split_command_line(value);
+    let program = (!words.is_empty()).then(|| PathBuf::from(words.remove(0)));
+    UnitDescription {
+        program,
+        cairn_home: data_dir_argument(&words),
+        args: words,
+    }
+}
+
+fn data_dir_argument(args: &[String]) -> Option<PathBuf> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == "--data-dir" {
+            args.get(index + 1).map(PathBuf::from)
+        } else {
+            arg.strip_prefix("--data-dir=").map(PathBuf::from)
+        }
+    })
+}
+
 /// What the service manager does when the supervised process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Supervision {
@@ -509,6 +702,28 @@ pub fn runtime(spec: &ServiceSpec) -> Option<ServiceRuntime> {
 /// the platform keeps them: launchd's error log, or the systemd user journal.
 pub fn recent_log(spec: &ServiceSpec, lines: usize) -> Option<String> {
     sys::recent_log(spec, lines).filter(|log| !log.trim().is_empty())
+}
+
+/// The service registered on this machine under `identity`, if any, read from
+/// its registration and its manager. Present when either the registration file
+/// exists or the manager has it loaded.
+pub fn describe_unit(identity: &LegacyIdentity) -> Result<Option<RegisteredUnit>, String> {
+    sys::describe_unit(identity)
+}
+
+/// Stop the service registered under `identity` and remove its registration.
+/// The same path the runner's install takes for its pre-rename identity, and
+/// what the executor's legacy retirement takes for that identity's supervisor.
+/// Nothing registered is not an error.
+pub fn evict_legacy(identity: &LegacyIdentity) -> Result<(), String> {
+    sys::evict_legacy(identity)
+}
+
+/// End the processes a Windows Run value started, matched on executable and
+/// argument tail. Windows only, because removing a Run value stops nothing.
+#[cfg(windows)]
+pub fn terminate_run_value_processes(command_line: &str) -> Result<Vec<TerminatedProcess>, String> {
+    sys::terminate_run_value_processes(command_line)
 }
 
 /// Self-heal an installed registration that has drifted from what this binary

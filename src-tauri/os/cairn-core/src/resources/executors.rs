@@ -28,8 +28,8 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::executor_protocol::{
     DiskDecline, DiskReliefOutlook, OccupancyLineageReport, OccupancyRule, OccupiedTreeSkip,
-    QuarantineTargetStrip, StorageReclaimRung, StorageRungReclaim, StorageWithheld,
-    StorageWithheldReason,
+    QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, StorageReclaimRung,
+    StorageRungReclaim, StorageWithheld, StorageWithheldReason,
 };
 
 /// This runner's own private agent-session lanes. Kept at collection scope
@@ -146,12 +146,30 @@ pub(crate) fn render_attach_log(remote: &EnrolledRemote, captured_at_unix_ms: u6
     if let Some(uptime) = attempt.held_for_ms {
         out.push_str(&format!("- Link held: {}\n", held(uptime)));
     }
-    out.push_str(&format!("- Cause: {}\n\n", attempt.summary));
+    out.push_str(&format!("- Cause: {}\n", attempt.summary));
+    out.push_str(&retirement_lines(&remote.retired));
+    out.push('\n');
     match &attempt.detail {
         Some(detail) => out.push_str(&format!("```text\n{detail}\n```\n")),
         None => out.push_str("The runner recorded no session output beyond the cause above.\n"),
     }
     out
+}
+
+/// What retiring a machine's pre-inversion executor found and did, as the
+/// attach log states it. Empty when no retirement has run.
+pub(crate) fn retirement_lines(retired: &[String]) -> String {
+    match retired {
+        [] => String::new(),
+        [only] => format!("- Retired: {only}\n"),
+        lines => {
+            let mut out = String::from("- Retired:\n");
+            for line in lines {
+                out.push_str(&format!("  - {line}\n"));
+            }
+            out
+        }
+    }
 }
 
 fn render_connection_timeline(
@@ -1304,8 +1322,16 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                         .join(", ")
                 )
             };
+            let retired_homes = if categories.retired_homes_bytes > 0 {
+                format!(
+                    " · retired executor homes {}",
+                    bytes(categories.retired_homes_bytes)
+                )
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "- Cairn holds {} (logical bytes, accounting {}): live cells {} · external caches {} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}\n",
+                "- Cairn holds {} (logical bytes, accounting {}): live cells {} · external caches {} · quarantines {} · managed objects {} · warm caches {} · other {}{other_top}{retired_homes}\n",
                 bytes(accounting.used_bytes),
                 age(captured.saturating_sub(machine.disk_accounting.measured_at_unix_ms)),
                 bytes(categories.live_cells_bytes),
@@ -1315,6 +1341,9 @@ fn render_storage(executor: &ExecutorInspection) -> String {
                 bytes(categories.warm_caches_bytes),
                 bytes(categories.temporary_other_bytes),
             ));
+            for home in &accounting.retired_homes {
+                out.push_str(&retired_home_line(home));
+            }
             if let Some(volume) = machine.volume.value() {
                 // Unaccounted, never "not Cairn's": the walk covers what
                 // Cairn manages, and Cairn's processes write outside it too.
@@ -1343,6 +1372,69 @@ fn render_storage(executor: &ExecutorInspection) -> String {
     out
 }
 
+/// One retired executor home: a named component with its bytes, never folded
+/// into the unaccounted remainder, and what the ladder is doing with it.
+fn retired_home_line(home: &RetiredHomeAccounting) -> String {
+    let at = |unix_ms: u64| {
+        crate::clock::stamp_millis_with_seconds(unix_ms as i64)
+            .unwrap_or_else(|| "an unknown time".to_string())
+    };
+    let what = match &home.state {
+        RetiredHomeState::Reclaiming => format!("{}, reclaiming", bytes(home.bytes)),
+        RetiredHomeState::Held {
+            pids,
+            unknown,
+            detail,
+        } => {
+            let who = if *unknown {
+                "left in place: whether a process uses it could not be determined".to_string()
+            } else {
+                match pids.as_slice() {
+                    [] => "left in place: held by a live process".to_string(),
+                    [pid] => format!("held by 1 process (pid {pid})"),
+                    pids => format!(
+                        "held by {} processes (pids {})",
+                        pids.len(),
+                        pids.iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                }
+            };
+            let detail = detail
+                .as_deref()
+                .map(|detail| format!(" — {detail}"))
+                .unwrap_or_default();
+            format!(
+                "{}, {who}; reclaimed once it is released{detail}",
+                bytes(home.bytes)
+            )
+        }
+        RetiredHomeState::RetainedRunnerState {
+            bytes_freed,
+            at_unix_ms,
+        } => format!(
+            "reclaimed {} at {}; {} retained: runner state (cairn.db), the operator's to remove",
+            bytes(*bytes_freed),
+            at(*at_unix_ms),
+            bytes(home.bytes)
+        ),
+        RetiredHomeState::Refused { reason } => {
+            format!("{}, left alone: {reason}", bytes(home.bytes))
+        }
+        RetiredHomeState::Reclaimed {
+            bytes_freed,
+            at_unix_ms,
+        } => format!("reclaimed {} at {}", bytes(*bytes_freed), at(*at_unix_ms)),
+    };
+    format!(
+        "- Retired executor home {} (retired {}): {what}\n",
+        home.path,
+        at(home.retired_at_unix_ms)
+    )
+}
+
 /// The pressure tier's own account: what the last pass asked for, what each
 /// rung gave, whether that was enough, and which trees it left alone.
 fn render_storage_pressure(executor: &ExecutorInspection) -> String {
@@ -1368,12 +1460,18 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                 .iter()
                 .fold(0_u64, |sum, entry| sum.saturating_add(entry.bytes));
             let retired = by_rung(StorageReclaimRung::RetiredCells);
+            let retired_homes = by_rung(StorageReclaimRung::RetiredHomes);
             out.push_str(&format!(
-                "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} (retired trees {} · managed caches {} · quarantine targets {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
+                "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} ({}retired trees {} · managed caches {} · quarantine targets {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
                 age(captured.saturating_sub(pressure.at_unix_ms)),
                 pressure.band,
                 bytes(pressure.target_bytes),
                 bytes(total),
+                if retired_homes.bytes > 0 {
+                    format!("retired executor homes {} · ", bytes(retired_homes.bytes))
+                } else {
+                    String::new()
+                },
                 bytes(by_rung(StorageReclaimRung::RetiredTrees).bytes),
                 bytes(by_rung(StorageReclaimRung::ManagedCaches).bytes),
                 bytes(by_rung(StorageReclaimRung::QuarantineTargets).bytes),
@@ -3018,6 +3116,7 @@ mod storage_section_tests {
             DiskAccounting {
                 used_bytes: 346 * GIB,
                 categories: DiskCategoryAccounting {
+                    retired_homes_bytes: 0,
                     managed_objects_bytes: 0,
                     live_cells_bytes: 24 * GIB,
                     warm_caches_bytes: 0,
@@ -3097,6 +3196,86 @@ mod storage_section_tests {
             "{rendered}"
         );
         assert!(!rendered.contains("inferred: volume used"), "{rendered}");
+    }
+
+    /// A retired executor home is a named component with its bytes, inside
+    /// Cairn's accounting, in whatever state the ladder left it.
+    #[test]
+    fn each_retired_executor_home_is_named_with_its_bytes_and_state() {
+        use cairn_common::executor_protocol::{RetiredHomeAccounting, RetiredHomeState};
+        let mut executor = tight_local();
+        let at = executor.captured_at_unix_ms;
+        let mut accounting = executor
+            .health
+            .machine
+            .disk_accounting
+            .value()
+            .unwrap()
+            .clone();
+        let home = |path: &str, bytes: u64, state| RetiredHomeAccounting {
+            path: path.into(),
+            bytes,
+            retired_at_unix_ms: at,
+            state,
+        };
+        accounting.categories.retired_homes_bytes = 225 * GIB;
+        accounting.retired_homes = vec![
+            home(
+                "/home/bleu/.cairn-executor",
+                224 * GIB,
+                RetiredHomeState::Reclaiming,
+            ),
+            home(
+                "/home/bleu/.cairn-b",
+                3 * GIB,
+                RetiredHomeState::Held {
+                    pids: vec![1, 2, 3],
+                    unknown: false,
+                    detail: None,
+                },
+            ),
+            home(
+                "/home/bleu/.cairn",
+                GIB,
+                RetiredHomeState::RetainedRunnerState {
+                    bytes_freed: 37 * GIB,
+                    at_unix_ms: at,
+                },
+            ),
+            home(
+                "/Users/dev/.cairn-executor",
+                0,
+                RetiredHomeState::Reclaimed {
+                    bytes_freed: 193 * GIB,
+                    at_unix_ms: at,
+                },
+            ),
+            home(
+                "/srv/odd",
+                GIB,
+                RetiredHomeState::Refused {
+                    reason: "it is a symbolic link".into(),
+                },
+            ),
+        ];
+        executor.health.machine.disk_accounting = Measurement::measured(at, accounting);
+        let rendered = render_executor(&executor);
+        for expected in [
+            "retired executor homes 225.0 GiB",
+            "- Retired executor home /home/bleu/.cairn-executor (retired ",
+            "): 224.0 GiB, reclaiming",
+            "3.0 GiB, held by 3 processes (pids 1, 2, 3); reclaimed once it is released",
+            "reclaimed 37.0 GiB at ",
+            "1.0 GiB retained: runner state (cairn.db), the operator's to remove",
+            "/Users/dev/.cairn-executor (retired ",
+            "reclaimed 193.0 GiB at ",
+            "1.0 GiB, left alone: it is a symbolic link",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "missing {expected:?} in {rendered}"
+            );
+        }
     }
 
     /// An unrelieved pass says what it asked for, what each rung gave, what it
@@ -4612,6 +4791,7 @@ mod tests {
                 "ssh unreachable (ssh: connect to host bglab-ub port 22: No route to host)",
             )),
             last_seen_unix_ms: Some(REMOTE_CAPTURED_AT - 7_200_000),
+            retired: Vec::new(),
             connection_timeline: Vec::new(),
             drained: false,
         }
@@ -4874,6 +5054,38 @@ mod tests {
         assert!(log.contains("probe 7"), "{log}");
         assert!(log.contains("fatal: Not a valid commit name"), "{log}");
         assert!(log.contains("Link held: 7m"), "{log}");
+    }
+
+    /// The retirement account sits beside the attempt's cause, one fact per
+    /// line, and is absent when no retirement ran.
+    #[test]
+    fn an_attach_log_states_what_retiring_the_legacy_executor_did() {
+        let mut remote = enrolled_after(
+            "bbs",
+            RemoteLinkState::NeverConnected {
+                since_bootstrap_unix_ms: REMOTE_CAPTURED_AT - 60_000,
+            },
+            "installed; not dialled in",
+        );
+        assert!(!render_attach_log(&remote, REMOTE_CAPTURED_AT).contains("Retired"));
+        remote.retired = vec![
+            "supervisor cairn-runner.service (pid 812) running /usr/bin/cairn-executor: stopped and removed".into(),
+            "home /home/bleu/.cairn-executor: generation released".into(),
+        ];
+        let log = render_attach_log(&remote, REMOTE_CAPTURED_AT);
+        let cause = log.find("- Cause:").unwrap();
+        let retired = log
+            .find("- Retired:\n  - supervisor cairn-runner.service (pid 812)")
+            .expect(&log);
+        assert!(cause < retired, "{log}");
+        assert!(
+            log.contains("  - home /home/bleu/.cairn-executor: generation released\n"),
+            "{log}"
+        );
+
+        remote.retired = vec!["nothing found: no pre-inversion supervisor or executor home".into()];
+        assert!(render_attach_log(&remote, REMOTE_CAPTURED_AT)
+            .contains("- Retired: nothing found: no pre-inversion supervisor or executor home\n"));
     }
 
     #[test]

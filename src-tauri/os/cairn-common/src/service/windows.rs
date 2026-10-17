@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_SZ,
 };
 
-use super::{windows_run_command, ServiceSpec};
+use super::{parse_run_value, windows_run_command, LegacyIdentity, RegisteredUnit, ServiceSpec};
 
 const RUN_KEY_SUBPATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
@@ -152,8 +152,231 @@ fn spawn_daemon(spec: &ServiceSpec) {
 }
 
 fn cleanup_legacy(spec: &ServiceSpec) {
-    if let Some(legacy) = spec.legacy.as_ref().and_then(|l| l.run_value.as_deref()) {
-        let _ = delete_run_value_named(legacy);
+    if let Some(legacy) = spec.legacy.as_ref() {
+        let _ = evict_legacy(legacy);
+    }
+}
+
+/// The Run value registered under `identity`. The Run key keeps no account of
+/// the process it started, so there is no runtime; the value itself is
+/// returned as the command line that process was started with.
+pub fn describe_unit(identity: &LegacyIdentity) -> Result<Option<RegisteredUnit>, String> {
+    let Some(name) = identity.run_value.as_deref() else {
+        return Ok(None);
+    };
+    let Some(value) = try_read_run_value(name)? else {
+        return Ok(None);
+    };
+    Ok(Some(RegisteredUnit {
+        name: name.to_string(),
+        location: None,
+        description: parse_run_value(&value),
+        runtime: None,
+        command_line: Some(value),
+    }))
+}
+
+/// Delete the Run value. This stops nothing: what it started at logon keeps
+/// running, which [`terminate_run_value_processes`] ends (cairn/4845).
+pub fn evict_legacy(identity: &LegacyIdentity) -> Result<(), String> {
+    match identity.run_value.as_deref() {
+        Some(name) => delete_run_value_named(name),
+        None => Ok(()),
+    }
+}
+
+/// End every process a Run value launched, and what each started: same
+/// executable, same argument tail. The argument tail is what tells one
+/// instance from another ([`refresh_if_stale`]), so a process of the same
+/// program running against a different home is not touched.
+///
+/// A pid read from a process listing names nothing by the time it is acted
+/// on, so each one is opened first and every check runs through the held
+/// handle, which keeps the pid from being reused until it is closed: the
+/// process must have existed when the listing was taken (its creation time is
+/// no later than that), a root must still run the Run value's executable, and
+/// a descendant must have been created no earlier than the parent it was
+/// listed under. It is then terminated and waited on through the same handle,
+/// and reported with its creation time as its start token.
+pub fn terminate_run_value_processes(
+    command_line: &str,
+) -> Result<Vec<super::TerminatedProcess>, String> {
+    let program = parse_run_value(command_line)
+        .program
+        .ok_or_else(|| "the Run value names no program".to_string())?;
+    let listed_at_ms = now_unix_ms();
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine)",
+        ])
+        .stdin(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("enumerate processes: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "enumerate processes: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let processes: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("parse process list: {error}"))?;
+    let field = |process: &serde_json::Value, name: &str| {
+        process
+            .get(name)
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as u32)
+    };
+    let wanted_tail = argument_tail(command_line).trim().to_string();
+    let program = program.to_string_lossy().to_lowercase();
+    let roots: Vec<u32> = processes
+        .iter()
+        .filter(|process| {
+            let executable = process.get("ExecutablePath").and_then(serde_json::Value::as_str);
+            let line = process.get("CommandLine").and_then(serde_json::Value::as_str);
+            matches!((executable, line), (Some(executable), Some(line))
+                if executable.to_lowercase() == program && argument_tail(line).trim() == wanted_tail)
+        })
+        .filter_map(|process| field(process, "ProcessId"))
+        .collect();
+    let mut ended = Vec::new();
+    // (pid, the verified creation time of the parent it was listed under)
+    let mut queue: std::collections::VecDeque<(u32, Option<u64>)> =
+        roots.into_iter().map(|pid| (pid, None)).collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some((pid, parent_created)) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let expected = parent_created.is_none().then_some(program.as_str());
+        let Some(open) = OpenedProcess::open(pid)? else {
+            continue;
+        };
+        let created = open.created_unix_ms()?;
+        if created > listed_at_ms || parent_created.is_some_and(|parent| created < parent) {
+            continue;
+        }
+        if let Some(expected) = expected {
+            if open.image_path()?.to_lowercase() != expected {
+                continue;
+            }
+        }
+        // Children first in the listing order, through this verified parent.
+        for child in processes
+            .iter()
+            .filter(|process| field(process, "ParentProcessId") == Some(pid))
+            .filter_map(|process| field(process, "ProcessId"))
+        {
+            queue.push_back((child, Some(created)));
+        }
+        open.terminate_and_wait()?;
+        ended.push(super::TerminatedProcess {
+            pid,
+            start_token: created.to_string(),
+        });
+    }
+    Ok(ended)
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// A process held open by handle, so its pid cannot be reused while held.
+struct OpenedProcess(windows_sys::Win32::Foundation::HANDLE, u32);
+
+impl OpenedProcess {
+    /// `None` when no such process exists any more.
+    fn open(pid: u32) -> Result<Option<Self>, String> {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                0,
+                pid,
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(None);
+            }
+            return Err(format!("open process {pid}: {error}"));
+        }
+        Ok(Some(Self(handle, pid)))
+    }
+
+    fn created_unix_ms(&self) -> Result<u64, String> {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetProcessTimes;
+        let zero = || FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let (mut created, mut exited, mut kernel, mut user) = (zero(), zero(), zero(), zero());
+        if unsafe { GetProcessTimes(self.0, &mut created, &mut exited, &mut kernel, &mut user) }
+            == 0
+        {
+            return Err(format!(
+                "read the creation time of process {}: {}",
+                self.1,
+                std::io::Error::last_os_error()
+            ));
+        }
+        // 100ns intervals since 1601-01-01.
+        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+        Ok((ticks / 10_000).saturating_sub(11_644_473_600_000))
+    }
+
+    fn image_path(&self) -> Result<String, String> {
+        use windows_sys::Win32::System::Threading::{
+            QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        };
+        let mut buffer = vec![0u16; 32_768];
+        let mut size = buffer.len() as u32;
+        if unsafe {
+            QueryFullProcessImageNameW(self.0, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut size)
+        } == 0
+        {
+            return Err(format!(
+                "read the image of process {}: {}",
+                self.1,
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(String::from_utf16_lossy(&buffer[..size as usize]))
+    }
+
+    fn terminate_and_wait(&self) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        if unsafe { TerminateProcess(self.0, 1) } == 0 {
+            let error = std::io::Error::last_os_error();
+            // Already exiting: the wait below decides.
+            tracing::debug!(pid = self.1, %error, "TerminateProcess refused");
+        }
+        if unsafe { WaitForSingleObject(self.0, 5_000) } != WAIT_OBJECT_0 {
+            return Err(format!(
+                "process {} did not exit after it was terminated",
+                self.1
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OpenedProcess {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 

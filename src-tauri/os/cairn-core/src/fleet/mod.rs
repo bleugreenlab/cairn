@@ -635,6 +635,8 @@ struct EnrolledRemoteRecord {
     arch: String,
     link: RemoteLinkState,
     last_attempt: Option<RemoteAttachAttempt>,
+    /// See [`EnrolledRemote::retired`].
+    retired: Vec<String>,
     last_seen_unix_ms: Option<u64>,
     connection_timeline: VecDeque<RemoteConnectionTransition>,
     /// The most recent process telemetry any generation of this machine has
@@ -3128,6 +3130,7 @@ impl Fleet {
                         last_reason: "this runner has not seen it since starting".to_string(),
                     },
                     last_attempt: None,
+                    retired: Vec::new(),
                     last_seen_unix_ms: None,
                     connection_timeline: VecDeque::new(),
                     last_process_report: None,
@@ -3158,6 +3161,31 @@ impl Fleet {
         if changed {
             self.enrollment_gate_changed.notify_waiters();
         }
+    }
+
+    /// Record what retiring a machine's pre-inversion executor found and did,
+    /// without touching its link: the machine is usually attached when the
+    /// runner's start pass retires it.
+    ///
+    /// A later retirement that found nothing does not erase an earlier one that
+    /// found something, so the account of what was retired outlives the runs
+    /// that confirm nothing is left.
+    pub fn record_remote_retirement(&self, executor_id: &str, lines: Vec<String>, found: bool) {
+        if let Some(record) = self.enrolled_remotes.lock().unwrap().get_mut(executor_id) {
+            if found || record.retired.is_empty() {
+                record.retired = lines;
+            }
+        }
+    }
+
+    /// The retirement account recorded for this machine, attached or not.
+    pub fn remote_retirement(&self, executor_id: &str) -> Vec<String> {
+        self.enrolled_remotes
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .map(|record| record.retired.clone())
+            .unwrap_or_default()
     }
 
     pub fn record_remote_attach_attempt(
@@ -3312,6 +3340,7 @@ impl Fleet {
                 link: record.link.clone(),
                 last_attempt: record.last_attempt.clone(),
                 last_seen_unix_ms: record.last_seen_unix_ms,
+                retired: record.retired.clone(),
                 connection_timeline: record.connection_timeline.iter().rev().cloned().collect(),
             })
             .collect();
@@ -23381,6 +23410,7 @@ mod tests {
             last_attempt: None,
             drained: false,
             last_seen_unix_ms: None,
+            retired: Vec::new(),
             connection_timeline: Vec::new(),
         };
         let diagnostic = no_matching_executor_diagnostic(&HashMap::new(), &[absent], &request, &[]);
@@ -23403,6 +23433,7 @@ mod tests {
             last_attempt: None,
             drained: false,
             last_seen_unix_ms: None,
+            retired: Vec::new(),
             connection_timeline: Vec::new(),
         };
         let diagnostic = no_matching_executor_diagnostic(&HashMap::new(), &[linux], &request, &[]);
@@ -23431,6 +23462,7 @@ mod tests {
             last_attempt: None,
             drained: false,
             last_seen_unix_ms: None,
+            retired: Vec::new(),
             connection_timeline: Vec::new(),
         };
         let bystander = EnrolledRemote {
@@ -24790,6 +24822,7 @@ mod tests {
             display_name: "bglab-mac".into(),
             project_ids: vec![],
             bootstrapped_at_unix_ms: None,
+            legacy_retired_at_unix_ms: None,
             legacy_tunnel_port: None,
             extra_ssh_args: vec![],
         }

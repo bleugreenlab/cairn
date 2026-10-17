@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{plist_contents, resolved_unit_dir, ServiceSpec};
+use super::{
+    parse_launchd_plist_json, plist_contents, resolved_unit_dir, LegacyIdentity, RegisteredUnit,
+    ServiceSpec,
+};
 
 fn unit_dir() -> Result<PathBuf, String> {
     resolved_unit_dir(&["Library", "LaunchAgents"])
@@ -39,14 +42,8 @@ pub fn install(spec: &ServiceSpec) -> Result<(), String> {
     let domain = gui_domain();
     // Adoption ordering is load-bearing: stop and remove any pre-rename job
     // before launchd can start the new identity against the same data dir.
-    if let Some(legacy) = spec.legacy.as_ref().and_then(|l| l.label.as_deref()) {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{domain}/{legacy}")])
-            .output();
-        let legacy_path = dir.join(format!("{legacy}.plist"));
-        if legacy_path.exists() {
-            let _ = std::fs::remove_file(&legacy_path);
-        }
+    if let Some(legacy) = spec.legacy.as_ref() {
+        let _ = evict_legacy(legacy);
     }
 
     let path = plist_path(&spec.label)?;
@@ -175,6 +172,83 @@ pub fn runtime(spec: &ServiceSpec) -> Option<super::ServiceRuntime> {
 pub fn recent_log(spec: &ServiceSpec, lines: usize) -> Option<String> {
     let log = std::fs::read(spec.log_path("err")).ok()?;
     Some(super::tail_lines(&String::from_utf8_lossy(&log), lines))
+}
+
+/// The LaunchAgent registered under `identity`'s label: its plist, read through
+/// `plutil` so every plist encoding parses the same way, and launchd's account
+/// of its process.
+pub fn describe_unit(identity: &LegacyIdentity) -> Result<Option<RegisteredUnit>, String> {
+    let Some(label) = identity.label.as_deref() else {
+        return Ok(None);
+    };
+    let path = plist_path(label)?;
+    let target = format!("{}/{label}", gui_domain());
+    let runtime = Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| super::parse_launchctl_print(&String::from_utf8_lossy(&out.stdout)));
+    let present = path.exists();
+    if !present && runtime.is_none() {
+        return Ok(None);
+    }
+    let description = if present {
+        let out = Command::new("plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(&path)
+            .output()
+            .map_err(|error| format!("plutil {}: {error}", path.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "plutil could not read {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        parse_launchd_plist_json(&String::from_utf8_lossy(&out.stdout))?
+    } else {
+        Default::default()
+    };
+    Ok(Some(RegisteredUnit {
+        name: label.to_string(),
+        location: present.then_some(path),
+        description,
+        runtime,
+        command_line: None,
+    }))
+}
+
+/// Boot the job out of the GUI domain, which stops its process, and remove its
+/// plist so nothing bootstraps it again at the next login.
+pub fn evict_legacy(identity: &LegacyIdentity) -> Result<(), String> {
+    let Some(label) = identity.label.as_deref() else {
+        return Ok(());
+    };
+    let target = format!("{}/{label}", gui_domain());
+    let booted_out = Command::new("launchctl")
+        .args(["bootout", &target])
+        .output();
+    // Nothing loaded is an error from launchctl and not one here; a job still
+    // loaded afterwards is, whatever bootout said, because it keeps respawning.
+    let still_loaded = Command::new("launchctl")
+        .args(["print", &target])
+        .output()
+        .is_ok_and(|out| out.status.success());
+    if still_loaded {
+        return Err(match booted_out {
+            Ok(out) => format!(
+                "launchctl bootout {target} left it loaded: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+            Err(error) => format!("launchctl bootout {target}: {error}"),
+        });
+    }
+    let path = plist_path(label)?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

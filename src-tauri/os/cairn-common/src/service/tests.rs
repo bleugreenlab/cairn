@@ -219,3 +219,104 @@ fn systemctl_show_reports_a_unit_waiting_to_restart() {
         }
     );
 }
+
+/// The legacy runner's spec as the pre-rename generator shaped it: the home in
+/// `CAIRN_HOME` on launchd and systemd, in `--data-dir` on Windows.
+fn legacy_runner_spec(windows: bool) -> ServiceSpec {
+    ServiceSpec {
+        label: PRE_RENAME_RUNNER_LABEL.to_string(),
+        unit_name: PRE_RENAME_RUNNER_UNIT.to_string(),
+        run_value: PRE_RENAME_RUNNER_RUN_VALUE.to_string(),
+        exe: PathBuf::from(if windows {
+            r"C:\Users\Dev User\AppData\Local\cairn\cairn-runner.exe"
+        } else {
+            "/usr/bin/cairn-runner"
+        }),
+        args: if windows {
+            vec![
+                "run".into(),
+                "--data-dir".into(),
+                r"C:\Users\Dev User\.cairn-executor".into(),
+            ]
+        } else {
+            vec!["run".into()]
+        },
+        env: vec![
+            ("CAIRN_ENV".into(), "prod".into()),
+            ("CAIRN_HOME".into(), "/home/bleu/.cairn-executor".into()),
+        ],
+        ..spec()
+    }
+}
+
+#[test]
+fn a_generated_systemd_unit_reads_back_its_program_and_home() {
+    let unit = systemd_unit_contents(&legacy_runner_spec(false));
+    assert_eq!(
+        parse_systemd_unit(&unit),
+        UnitDescription {
+            program: Some(PathBuf::from("/usr/bin/cairn-runner")),
+            args: vec!["run".into()],
+            cairn_home: Some(PathBuf::from("/home/bleu/.cairn-executor")),
+        }
+    );
+}
+
+#[test]
+fn a_hand_written_systemd_unit_reads_back_too() {
+    let unit = "[Service]\nExecStart=-\"/opt/cairn runner/bin/cairn-runner\" run --data-dir /srv/cairn\nEnvironment=CAIRN_ENV=prod OTHER=1\n";
+    let description = parse_systemd_unit(unit);
+    assert_eq!(
+        description.program,
+        Some(PathBuf::from("/opt/cairn runner/bin/cairn-runner"))
+    );
+    assert_eq!(description.cairn_home, Some(PathBuf::from("/srv/cairn")));
+}
+
+#[test]
+fn a_launchd_plist_as_plutil_renders_it_reads_back_its_program_and_home() {
+    let json = r#"{"Label":"computer.cairn.runner","ProgramArguments":["/Applications/cairn.app/Contents/MacOS/cairn-runner","run"],"EnvironmentVariables":{"CAIRN_ENV":"prod","CAIRN_HOME":"/Users/dev/.cairn-executor"},"RunAtLoad":true}"#;
+    assert_eq!(
+        parse_launchd_plist_json(json).unwrap(),
+        UnitDescription {
+            program: Some(PathBuf::from(
+                "/Applications/cairn.app/Contents/MacOS/cairn-runner"
+            )),
+            args: vec!["run".into()],
+            cairn_home: Some(PathBuf::from("/Users/dev/.cairn-executor")),
+        }
+    );
+    // A unit that names no home leaves the default to the caller.
+    let bare = r#"{"ProgramArguments":["/usr/local/bin/cairn-runner","run"]}"#;
+    assert_eq!(parse_launchd_plist_json(bare).unwrap().cairn_home, None);
+    assert!(parse_launchd_plist_json("not json").is_err());
+}
+
+#[test]
+fn a_generated_run_value_reads_back_its_program_and_data_dir() {
+    let value = windows_run_command(&legacy_runner_spec(true));
+    assert_eq!(
+        parse_run_value(&value),
+        UnitDescription {
+            program: Some(PathBuf::from(
+                r"C:\Users\Dev User\AppData\Local\cairn\cairn-runner.exe"
+            )),
+            args: vec![
+                "run".into(),
+                "--data-dir".into(),
+                r"C:\Users\Dev User\.cairn-executor".into()
+            ],
+            cairn_home: Some(PathBuf::from(r"C:\Users\Dev User\.cairn-executor")),
+        }
+    );
+}
+
+#[test]
+fn the_runner_identities_are_distinct_on_every_platform() {
+    let current = runner_identity();
+    let legacy = pre_rename_runner_identity();
+    assert_ne!(current.label, legacy.label);
+    assert_ne!(current.unit_name, legacy.unit_name);
+    assert_ne!(current.run_value, legacy.run_value);
+    assert!(legacy.platform_name().is_some());
+}

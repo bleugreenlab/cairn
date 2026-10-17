@@ -5,7 +5,10 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use super::{resolved_unit_dir, systemd_install_steps, systemd_unit_contents, ServiceSpec};
+use super::{
+    parse_systemd_unit, resolved_unit_dir, systemd_install_steps, systemd_unit_contents,
+    LegacyIdentity, RegisteredUnit, ServiceSpec,
+};
 
 fn unit_dir() -> Result<PathBuf, String> {
     resolved_unit_dir(&[".config", "systemd", "user"])
@@ -20,13 +23,8 @@ pub fn install(spec: &ServiceSpec) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
     // Stop the old generation before the new unit can open the same data dir.
-    if let Some(legacy) = spec.legacy.as_ref().and_then(|l| l.unit_name.as_deref()) {
-        let _ = run_systemctl(&["disable", "--now", legacy]);
-        let legacy_path = dir.join(legacy);
-        if legacy_path.exists() {
-            let _ = std::fs::remove_file(&legacy_path);
-        }
-        let _ = run_systemctl(&["daemon-reload"]);
+    if let Some(legacy) = spec.legacy.as_ref() {
+        let _ = evict_legacy(legacy);
     }
 
     let path = unit_path(&spec.unit_name)?;
@@ -122,6 +120,80 @@ pub fn recent_log(spec: &ServiceSpec, lines: usize) -> Option<String> {
         &String::from_utf8_lossy(&out.stdout),
         lines,
     ))
+}
+
+/// The user unit registered under `identity`'s unit name: its file, and the
+/// user manager's account of its main process.
+pub fn describe_unit(identity: &LegacyIdentity) -> Result<Option<RegisteredUnit>, String> {
+    let Some(unit) = identity.unit_name.as_deref() else {
+        return Ok(None);
+    };
+    let path = unit_path(unit)?;
+    let shown = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            &format!(
+                "--property=LoadState,{}",
+                super::SYSTEMCTL_RUNTIME_PROPERTIES
+            ),
+        ])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    let loaded = shown
+        .as_deref()
+        .is_some_and(|shown| shown.lines().any(|line| line.trim() == "LoadState=loaded"));
+    let present = path.exists();
+    if !present && !loaded {
+        return Ok(None);
+    }
+    let description = if present {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        parse_systemd_unit(&text)
+    } else {
+        Default::default()
+    };
+    Ok(Some(RegisteredUnit {
+        name: unit.to_string(),
+        location: present.then_some(path),
+        description,
+        runtime: loaded
+            .then(|| shown.as_deref().map(super::parse_systemctl_show))
+            .flatten(),
+        command_line: None,
+    }))
+}
+
+/// `disable --now` stops the unit, and with it every process in its cgroup,
+/// then the file is removed so the user manager forgets it.
+pub fn evict_legacy(identity: &LegacyIdentity) -> Result<(), String> {
+    let Some(unit) = identity.unit_name.as_deref() else {
+        return Ok(());
+    };
+    // A unit that is not loaded makes `disable` fail; that is nothing to stop.
+    // A unit still active afterwards is a real failure, whatever disable said.
+    let disabled = run_systemctl(&["disable", "--now", unit]);
+    let still_active = Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .status()
+        .is_ok_and(|status| status.success());
+    if still_active {
+        return Err(match disabled {
+            Err(error) => format!("{unit} is still active: {error}"),
+            Ok(()) => format!("{unit} is still active after systemctl disable --now"),
+        });
+    }
+    let path = unit_path(unit)?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("remove {}: {e}", path.display()))?;
+    }
+    let _ = run_systemctl(&["daemon-reload"]);
+    let _ = run_systemctl(&["reset-failed", unit]);
+    Ok(())
 }
 
 fn run_systemctl(args: &[&str]) -> Result<(), String> {

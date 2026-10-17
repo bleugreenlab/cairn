@@ -4204,7 +4204,21 @@ pub struct LearnedResourceEstimate {
 /// a 144 runner sends no bound, so a 145 executor stops nothing for silence,
 /// and a 144 executor ignores the bound and never reports a stop, which is the
 /// behaviour every runner has had until now.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 145;
+///
+/// Version 146 (cairn/5002) gives the storage ladder a rung that deletes trees
+/// the executor never created: the homes of the pre-inversion executor
+/// installation that `cairn-exec service retire-legacy` stopped and recorded in
+/// `retired-executor-homes.json`. The rung runs first on every sweep, under the
+/// same occupancy gate as the quarantine-target rung and only while the home's
+/// own generation lock is free, and a 145 executor never reclaims them. So two
+/// equivalent machines on 145 and 146 report different capacity again, and the
+/// bump is also what carries the rung to attached executors through their
+/// pull-update. Wire additions: [`StorageReclaimRung::RetiredHomes`], which a
+/// 145 runner cannot decode; [`DiskAccounting::retired_homes`] and
+/// [`DiskCategoryAccounting::retired_homes_bytes`], both defaulted, so a 145
+/// executor reports none and its retired homes stay in the unaccounted
+/// remainder exactly as before.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 146;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -8320,6 +8334,60 @@ pub struct DiskAccounting {
     /// that grows without an owner, and a total alone cannot say whose it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub other_top: Vec<DiskPathUsage>,
+    /// Each home a legacy retirement handed to the ladder, until and after it
+    /// is reclaimed: named with its bytes rather than left in the remainder
+    /// outside Cairn's accounting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired_homes: Vec<RetiredHomeAccounting>,
+}
+
+/// One retired executor home as the storage ladder accounts it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RetiredHomeAccounting {
+    /// Absolute: the home lies outside the executor home by definition.
+    pub path: String,
+    /// What it still holds on the volume, as the last accounting walk measured
+    /// it. Zero once reclaimed, and the retained remainder for runner state.
+    pub bytes: u64,
+    pub retired_at_unix_ms: u64,
+    pub state: RetiredHomeState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "state"
+)]
+pub enum RetiredHomeState {
+    /// Recorded and not yet fully reclaimed; the next sweep continues.
+    Reclaiming,
+    /// Left in place this sweep because something uses it: a live holder of
+    /// its generation, or a process the occupancy probe names, or a probe that
+    /// could not tell (`unknown`).
+    Held {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pids: Vec<u32>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        unknown: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Its build slots and managed objects are gone; the rest is a runner's
+    /// database and lock, which are the operator's to remove.
+    RetainedRunnerState {
+        bytes_freed: u64,
+        at_unix_ms: u64,
+    },
+    /// Its record failed validation, so nothing in it was touched.
+    Refused {
+        reason: String,
+    },
+    Reclaimed {
+        bytes_freed: u64,
+        at_unix_ms: u64,
+    },
 }
 
 /// Bytes one executor-home-relative path holds.
@@ -8923,6 +8991,9 @@ pub struct DiskCategoryAccounting {
     pub external_managed_caches_bytes: u64,
     pub quarantines_bytes: u64,
     pub temporary_other_bytes: u64,
+    /// What retired executor homes still hold, counted in `usedBytes`.
+    #[serde(default)]
+    pub retired_homes_bytes: u64,
 }
 
 /// Whether a sweep in the executor's current process has actually retried an
@@ -9128,6 +9199,9 @@ pub enum StoragePressureOutcome {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum StorageReclaimRung {
+    /// Homes of a retired legacy executor installation. Runs on every sweep,
+    /// pressured or not: nothing in them is warm.
+    RetiredHomes,
     /// Discards and quarantines past their forensic window.
     RetiredTrees,
     /// Cairn-managed caches outside the executor home.
@@ -10252,6 +10326,13 @@ pub struct EnrolledRemote {
     pub link: RemoteLinkState,
     /// `None` only while [`RemoteLinkState::Pending`] holds.
     pub last_attempt: Option<RemoteAttachAttempt>,
+    /// What retiring this machine's pre-inversion executor installation found
+    /// and did, one fact per line, from the last retirement that found
+    /// anything. Kept apart from the attach attempt because it is not one: a
+    /// retirement runs on a machine whose link may be up, and the next lost
+    /// link must not erase it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retired: Vec<String>,
     /// Whether the runner is holding this machine drained. Drain is runner-side
     /// state, so it is known for a machine that is not attached — and it is the
     /// state that decides what happens when this one comes back.
@@ -14410,6 +14491,7 @@ mod tests {
                 DiskAccounting {
                     used_bytes: 30,
                     categories: DiskCategoryAccounting {
+                        retired_homes_bytes: 0,
                         managed_objects_bytes: 1,
                         live_cells_bytes: 2,
                         warm_caches_bytes: 3,
@@ -14424,6 +14506,16 @@ mod tests {
                     }],
                     skipped_truncated: 0,
                     vanished_entries: 6,
+                    retired_homes: vec![RetiredHomeAccounting {
+                        path: "/home/bleu/.cairn-executor".into(),
+                        bytes: 224 * 1024 * 1024 * 1024,
+                        retired_at_unix_ms: 1_791_000_000_000,
+                        state: RetiredHomeState::Held {
+                            pids: vec![47471],
+                            unknown: false,
+                            detail: Some("held by cairn_core-0123".into()),
+                        },
+                    }],
                     other_top: vec![DiskPathUsage {
                         path: "scratch".into(),
                         bytes: 5,
@@ -14704,6 +14796,7 @@ mod tests {
                         .with_artifact_fault(Some(RemoteArtifactFault::Unpublished)),
                     ),
                     last_seen_unix_ms: Some(1_785_117_770_000),
+                    retired: Vec::new(),
                     connection_timeline: Vec::new(),
                     drained: false,
                 },
@@ -14721,6 +14814,7 @@ mod tests {
                         "ssh: connect to host bglab-ub port 22: No route to host",
                     )),
                     last_seen_unix_ms: Some(1_785_114_170_000),
+                    retired: Vec::new(),
                     connection_timeline: Vec::new(),
                     // The machine an operator drained while it was unreachable:
                     // the fact travels on the wire whether or not the machine
@@ -14737,6 +14831,7 @@ mod tests {
                     },
                     last_attempt: None,
                     last_seen_unix_ms: None,
+                    retired: Vec::new(),
                     connection_timeline: Vec::new(),
                     drained: false,
                 },
@@ -15414,6 +15509,7 @@ mod tests {
                 },
                 last_attempt: None,
                 last_seen_unix_ms: None,
+                retired: Vec::new(),
                 connection_timeline: Vec::new(),
                 drained: false,
             }],
@@ -15540,6 +15636,7 @@ mod tests {
             }],
             skipped_truncated: 4,
             vanished_entries: 0,
+            retired_homes: Vec::new(),
             other_top: Vec::new(),
         };
         assert!(partial.is_partial());

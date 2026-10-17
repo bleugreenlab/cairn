@@ -4,7 +4,15 @@
 
 use std::path::PathBuf;
 
-use super::ServiceSpec;
+use super::{LegacyIdentity, RegisteredUnit, ServiceSpec};
+
+pub fn describe_unit(_identity: &LegacyIdentity) -> Result<Option<RegisteredUnit>, String> {
+    Ok(None)
+}
+
+pub fn evict_legacy(_identity: &LegacyIdentity) -> Result<(), String> {
+    Ok(())
+}
 
 pub fn install(_spec: &ServiceSpec) -> Result<(), String> {
     Err("service install is unsupported on this platform".to_string())
