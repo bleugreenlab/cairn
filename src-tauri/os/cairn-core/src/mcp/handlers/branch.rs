@@ -500,6 +500,7 @@ async fn resolve_coordinate_repairing_conflicts(
         return Err(cairn_vcs::CoordinateResolutionError::Conflicted {
             coordinate: coordinate.to_string(),
             targets: targets.clone(),
+            refusal: repair_error.refusal().cloned().map(Box::new),
         });
     }
     // Re-resolve rather than trusting the repair's own answer: what has to hold
@@ -536,6 +537,10 @@ pub(crate) enum BranchRefResolutionError {
     Conflicted {
         requested: String,
         versions: Vec<String>,
+        /// Why the store refused to combine them, when a repair ran and said.
+        reason: Option<String>,
+        /// The exact commands a maintainer can run to combine the versions.
+        commands: Vec<String>,
     },
     /// The branch the calling job minted for itself no longer exists, so no
     /// file read, file write, or command on it can be served.
@@ -566,15 +571,36 @@ impl std::fmt::Display for BranchRefResolutionError {
             Self::Conflicted {
                 requested,
                 versions,
-            } => write!(
-                f,
-                "Branch '{requested}' has {} different versions of its history recorded ({}), and \
-                 they could not be combined automatically. You can still read and search files at \
-                 any one of them by using that version's id in place of the branch name. The \
-                 branch itself needs a maintainer before work on it can continue.",
-                versions.len(),
-                versions.join(" and ")
-            ),
+                reason,
+                commands,
+            } => {
+                write!(
+                    f,
+                    "Branch '{requested}' has {} different versions of its history recorded ({}), \
+                     and they could not be combined automatically",
+                    versions.len(),
+                    versions.join(" and ")
+                )?;
+                if let Some(reason) = reason {
+                    write!(f, " because {reason}")?;
+                }
+                write!(
+                    f,
+                    ". You can still read and search files at any one of them by using that \
+                     version's id in place of the branch name. Nothing has been discarded. The \
+                     branch's rebase page (`cairn:~/rebase` on the node that owns it) lists every \
+                     version and what combining them involves."
+                )?;
+                if !commands.is_empty() {
+                    write!(
+                        f,
+                        " A maintainer can combine them with these commands, choosing one \
+                         ordering:\n\n```\n{}\n```",
+                        commands.join("\n")
+                    )?;
+                }
+                Ok(())
+            }
             // Written for a model that would otherwise retry: it names the
             // terminal fact, says the session did not cause it, rules out
             // retrying, and names what still works and what to do next.
@@ -615,12 +641,14 @@ fn map_coordinate_error(
         cairn_vcs::CoordinateResolutionError::Ambiguous(_) => BranchRefResolutionError::Ambiguous {
             requested: requested.to_string(),
         },
-        cairn_vcs::CoordinateResolutionError::Conflicted { targets, .. } => {
-            BranchRefResolutionError::Conflicted {
-                requested: requested.to_string(),
-                versions: targets,
-            }
-        }
+        cairn_vcs::CoordinateResolutionError::Conflicted {
+            targets, refusal, ..
+        } => BranchRefResolutionError::Conflicted {
+            requested: requested.to_string(),
+            versions: targets,
+            reason: refusal.as_ref().map(|refusal| refusal.reason.clone()),
+            commands: refusal.map(|refusal| refusal.commands).unwrap_or_default(),
+        },
         other => BranchRefResolutionError::Unresolvable {
             requested: requested.to_string(),
             diagnostic: other.to_string(),
@@ -1026,26 +1054,45 @@ mod tests {
     }
 
     /// The one refusal in this family that survives automatic repair, so it is
-    /// the one whose text an agent actually has to be able to act on. It has to
-    /// leave a way forward and name it in ordinary words: no talk of bookmarks,
-    /// exports, coordinates, or anything else naming a mechanism the agent has
-    /// no access to.
+    /// the one whose text an agent actually has to be able to act on. Its prose
+    /// has to leave a way forward and name it in ordinary words: no talk of
+    /// bookmarks, exports, coordinates, or anything else naming a mechanism the
+    /// agent has no access to. The maintainer's commands follow in their own
+    /// block, verbatim, because a maintainer needs them exact.
     #[test]
     fn the_conflicted_branch_refusal_offers_a_way_forward_in_plain_language() {
-        let text = BranchRefResolutionError::Conflicted {
+        let commands = vec![
+            "# Keep aaaa1111 as the base and replay bbbb2222's own commits onto it".to_string(),
+            "jj -R '/store' --ignore-working-copy rebase -r 'fork_point(aaaa1111|bbbb2222)..bbbb2222' -d aaaa1111".to_string(),
+            "jj -R '/store' --ignore-working-copy bookmark set 'agent/cairn-1-builder-1' --allow-backwards -r 'aaaa1111:: & change_id(zzzz)'".to_string(),
+        ];
+        let full = BranchRefResolutionError::Conflicted {
             requested: "agent/cairn-1-builder-1".into(),
             versions: vec!["aaaa1111".into(), "bbbb2222".into()],
+            reason: Some("neither version is a rewrite of the commit both moved away from".into()),
+            commands: commands.clone(),
         }
         .to_string();
+
+        // The maintainer's way out is the exact commands, not "needs a maintainer".
+        assert!(!full.contains("needs a maintainer"), "{full}");
+        for command in &commands {
+            assert!(full.contains(command.as_str()), "{full}");
+        }
+        assert!(full.contains("cairn:~/rebase"), "{full}");
+        let (text, _) = full
+            .split_once("```")
+            .expect("the commands sit in their own block");
 
         assert!(text.contains("agent/cairn-1-builder-1"), "{text}");
         assert!(
             text.contains("aaaa1111") && text.contains("bbbb2222"),
             "{text}"
         );
+        assert!(text.contains("neither version is a rewrite"), "{text}");
         // What the agent can still do, stated as an action rather than implied.
         assert!(text.contains("read and search files"), "{text}");
-        crate::system_prompt::assert_no_substrate_vocabulary("conflicted branch refusal", &text);
+        crate::system_prompt::assert_no_substrate_vocabulary("conflicted branch refusal", text);
         for jargon in [
             "bookmark",
             "export",

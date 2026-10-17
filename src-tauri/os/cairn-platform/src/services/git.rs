@@ -65,8 +65,15 @@ pub trait GitClient: Send + Sync {
     /// Get the remote URL for origin.
     fn remote_get_url(&self, repo: &Path) -> Result<String, String>;
 
-    /// Fetch origin into the ordinary Git repository.
-    fn fetch_origin(&self, repo: &Path) -> Result<(), String>;
+    /// Fetch one branch from origin into the ordinary Git repository's
+    /// `refs/remotes/origin/<branch>`, and nothing else.
+    ///
+    /// Deliberately not a whole-remote fetch. Agent branches' tracking refs live
+    /// in the same repository, and a whole-remote fetch rewrites every one of
+    /// them from whatever origin advertises, including an advertisement that
+    /// lags a push this repository already made. That is how a branch was walked
+    /// backwards onto a commit its own store had already moved past.
+    fn fetch_origin_branch(&self, repo: &Path, branch: &str) -> Result<(), String>;
 
     /// Ask `remote` where its `branch` points without fetching anything:
     /// `git ls-remote <remote> refs/heads/<branch>`. `Ok(None)` means the
@@ -466,10 +473,11 @@ impl GitClient for RealGitClient {
         }
     }
 
-    fn fetch_origin(&self, repo: &Path) -> Result<(), String> {
+    fn fetch_origin_branch(&self, repo: &Path, branch: &str) -> Result<(), String> {
+        let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
         let output = crate::process::bounded_command_output(
             self.git_command()
-                .args(["fetch", "origin"])
+                .args(["fetch", "origin", &refspec])
                 .current_dir(repo),
             crate::process::NETWORK_TIMEOUT,
             "git fetch origin",

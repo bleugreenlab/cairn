@@ -386,26 +386,289 @@ pub fn ensure_store_initialized(
 /// ref transaction uses. This is job preparation, so losing the race for the
 /// lock here kills the whole execution being prepared; the import itself is
 /// idempotent, so repeating it costs nothing but time.
+///
+/// # No observation of origin walks a branch backwards
+///
+/// jj treats a tracked remote's move as authoritative and carries it onto the
+/// local bookmark, so a fetch that received an advertisement lagging one of
+/// this store's own pushes would move the branch backwards and hide the commits
+/// it had moved past. That fetch may be Cairn's or the operator's: the backing
+/// repository is the project checkout, and anyone's `git fetch` there writes
+/// the same refs, at any moment, without the store lock.
+///
+/// So the import holds every tracked `<branch>@origin` to the value this store
+/// last recorded for it, wherever origin's ref has moved to a strict ancestor of
+/// that value. It does so twice: before importing, by restoring the git ref,
+/// and after, by judging what the import actually recorded, because a fetch can
+/// write the ref between the two. A regression found after the import is
+/// restored and imported again, which also brings back any commit the first
+/// import hid. Sideways and forward moves pass through untouched; integrating a
+/// foreign rewrite is `converge_managed_branch_after_remote_rewrite`'s job.
+///
+/// Branches declared origin-authoritative (see
+/// [`import_git_with_remote_authority`]) are exempt: origin is the sole
+/// authority there, so a rewind of one is observed, not held off.
 pub fn import_git(jj: &JjEnv, store_dir: &Path) -> Result<(), String> {
     super::with_packed_refs_patience(
         super::PackedRefs::JjStore(store_dir),
         "jj git import",
-        || {
-            jj.run(
-                store_dir,
-                &["git", "import", "--ignore-working-copy"],
-                "jj git import",
-            )
-            .map(|_| ())
-        },
+        || import_holding_tracking_refs(jj, store_dir, None),
     )
 }
 
-/// Fetch a remote into the shared store, advancing its remote-tracking bookmarks
-/// (`<branch>@<remote>`) to the remote's current tips. Used to bring an
-/// externally-advanced default branch into the store independent of the project
-/// checkout's branch, so a sibling can rebase onto `<default>@origin`. Mirrors
-/// `import_git`: a one-liner over the store's backing git.
+/// [`import_git`] for a branch whose authority is origin: `branch`'s tracking
+/// ref is imported wherever it now points, backwards included.
+///
+/// It also DECLARES `branch` origin-authoritative in the store, and every later
+/// import, [`import_git`] included, honours that declaration. Without it, any
+/// ordinary import that ran between a fetch of a legitimate rewind and this
+/// branch's reconcile (job provisioning, say) would restore the old value and
+/// erase the rewind before its reconcile ever saw it.
+///
+/// The exemption is named by the caller, never inferred, for the same reason
+/// `reconcile_tracked_bookmark` must be handed a remote-authoritative branch:
+/// moving a branch backwards is only correct where origin is the sole authority.
+pub fn import_git_with_remote_authority(
+    jj: &JjEnv,
+    store_dir: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    declare_origin_authority(store_dir, branch)?;
+    super::with_packed_refs_patience(
+        super::PackedRefs::JjStore(store_dir),
+        "jj git import",
+        || import_holding_tracking_refs(jj, store_dir, Some(branch)),
+    )
+}
+
+/// Where a store records the branches origin is the sole authority for. Inside
+/// `.jj`, beside jj's own state, because it is a fact about this store and
+/// nothing in Cairn snapshots that directory.
+fn origin_authority_file(store_dir: &Path) -> PathBuf {
+    store_dir
+        .join(".jj")
+        .join("cairn-origin-authoritative-branches")
+}
+
+fn declared_origin_authority(store_dir: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(origin_authority_file(store_dir))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn declare_origin_authority(store_dir: &Path, branch: &str) -> Result<(), String> {
+    if branch.is_empty() || !is_jj_dir(store_dir) {
+        return Ok(());
+    }
+    let mut declared = declared_origin_authority(store_dir);
+    if !declared.insert(branch.to_string()) {
+        return Ok(());
+    }
+    let path = origin_authority_file(store_dir);
+    let staged = path.with_extension("tmp");
+    let body = declared.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+    std::fs::write(&staged, body)
+        .and_then(|()| std::fs::rename(&staged, &path))
+        .map_err(|error| {
+            format!(
+                "declare `{branch}` origin-authoritative in {}: {error}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(test)]
+static BETWEEN_GUARD_AND_IMPORT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    std::sync::Mutex::new(None);
+
+/// Run `write` once, in the next guarded import, after the guard has judged the
+/// tracking refs and before jj reads them: the window a concurrent fetch hits.
+#[cfg(test)]
+pub(crate) fn between_next_guard_and_import(write: impl FnOnce() + Send + 'static) {
+    *BETWEEN_GUARD_AND_IMPORT.lock().unwrap() = Some(Box::new(write));
+}
+
+fn import_holding_tracking_refs(
+    jj: &JjEnv,
+    store_dir: &Path,
+    origin_authoritative: Option<&str>,
+) -> Result<(), String> {
+    let import = || {
+        jj.run(
+            store_dir,
+            &["git", "import", "--ignore-working-copy"],
+            "jj git import",
+        )
+        .map(|_| ())
+    };
+    let checkout = is_jj_dir(store_dir)
+        .then(|| super::export::resolve_backing_checkout(store_dir))
+        .flatten();
+    let Some(checkout) = checkout else {
+        log::debug!(
+            "jj import guard: no backing checkout resolved for {}; importing unguarded",
+            store_dir.display()
+        );
+        return import();
+    };
+    let mut exempt = declared_origin_authority(store_dir);
+    exempt.extend(origin_authoritative.map(ToOwned::to_owned));
+    let recorded = recorded_origin_tracking_targets(jj, store_dir)?
+        .into_iter()
+        .filter(|(branch, _)| !exempt.contains(branch))
+        .collect::<Vec<_>>();
+
+    // Before: restore what the git refs say now, so the common case never
+    // hides anything in the first place.
+    let observed = origin_tracking_refs(&checkout)?;
+    for (branch, recorded) in &recorded {
+        if let Some(observed) = observed.get(branch) {
+            if observed != recorded && git_is_ancestor(&checkout, observed, recorded) {
+                restore_tracking_ref(&checkout, branch, recorded, observed, "before importing")?;
+            }
+        }
+    }
+    #[cfg(test)]
+    if let Some(write) = BETWEEN_GUARD_AND_IMPORT.lock().unwrap().take() {
+        write();
+    }
+    import()?;
+
+    // After: judge what jj actually recorded, since a fetch can write a ref
+    // between the check above and jj reading it. Re-importing a restored ref is
+    // a forward move to jj, which carries the bookmark forward again and makes
+    // the commits the first import hid visible again.
+    for _ in 0..3 {
+        let imported = recorded_origin_tracking_targets(jj, store_dir)?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let regressed = recorded
+            .iter()
+            .filter_map(|(branch, recorded)| {
+                let now = imported.get(branch)?;
+                (now != recorded && git_is_ancestor(&checkout, now, recorded))
+                    .then(|| (branch, recorded, now.clone()))
+            })
+            .collect::<Vec<_>>();
+        if regressed.is_empty() {
+            return Ok(());
+        }
+        for (branch, recorded, now) in regressed {
+            restore_tracking_ref(&checkout, branch, recorded, &now, "after an import took it")?;
+        }
+        import()?;
+    }
+    Err(
+        "jj import guard: origin tracking refs kept regressing while being restored; the last \
+         import may have recorded a stale origin observation"
+            .to_string(),
+    )
+}
+
+/// Put `refs/remotes/origin/<branch>` back from `regressed` to `recorded`.
+///
+/// The recorded value is jj's `<branch>@origin`: what this store last pushed
+/// there or last imported from there. A ref that is a strict ancestor of it is
+/// origin claiming to have gone backwards past something this store already saw
+/// it accept. The restore is a compare-and-swap against the regressed value, so
+/// a concurrent writer is never overwritten; losing that race fails the import
+/// rather than importing a ref nobody has checked.
+fn restore_tracking_ref(
+    checkout: &Path,
+    branch: &str,
+    recorded: &str,
+    regressed: &str,
+    when: &str,
+) -> Result<(), String> {
+    let refname = format!("refs/remotes/origin/{branch}");
+    let output = cairn_platform::env::git()
+        .args(["update-ref", &refname, recorded, regressed])
+        .current_dir(checkout)
+        .output()
+        .map_err(|error| format!("jj import guard: restore {refname}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "jj import guard: {refname} regressed from {recorded} to {regressed} and moved again \
+             before it could be restored: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    log::warn!(
+        "jj import guard: `{branch}`'s origin tracking ref regressed from {recorded} to its \
+         ancestor {regressed} ({when}): a stale origin observation; kept the value this store \
+         last pushed or fetched"
+    );
+    Ok(())
+}
+
+/// Every tracked `<branch>@origin` the store has recorded, with its target.
+fn recorded_origin_tracking_targets(
+    jj: &JjEnv,
+    store_dir: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let out = jj.run(
+        store_dir,
+        &[
+            "bookmark",
+            "list",
+            "--all-remotes",
+            "--ignore-working-copy",
+            "-T",
+            "if(remote == \"origin\" && tracked && normal_target, name ++ \"\\t\" ++ \
+             normal_target.commit_id() ++ \"\\n\", \"\")",
+        ],
+        "jj bookmark list (recorded origin tracking targets)",
+    )?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let (name, commit) = line.trim().split_once('\t')?;
+            Some((name.to_string(), commit.to_string()))
+        })
+        .collect())
+}
+
+/// `refs/remotes/origin/*` in the backing repository, keyed by branch name.
+fn origin_tracking_refs(
+    checkout: &Path,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let output = cairn_platform::env::git()
+        .args([
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/remotes/origin/",
+        ])
+        .current_dir(checkout)
+        .output()
+        .map_err(|error| format!("jj import guard: list origin tracking refs: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "jj import guard: list origin tracking refs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (commit, refname) = line.trim().split_once(' ')?;
+            let branch = refname.strip_prefix("refs/remotes/origin/")?;
+            Some((branch.to_string(), commit.to_string()))
+        })
+        .collect())
+}
+
+fn git_is_ancestor(checkout: &Path, ancestor: &str, descendant: &str) -> bool {
+    cairn_platform::env::git()
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(checkout)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Fetch one branch into the backing Git remote-tracking ref without opening or
 /// mutating jj. Stale-publication recovery calls this outside the per-store lock,
 /// then imports the fetched ref under the lock before changing the graph.
@@ -435,10 +698,34 @@ pub fn fetch_remote_branch_via_git(
     Ok(())
 }
 
-pub fn fetch_remote(jj: &JjEnv, store_dir: &Path, remote: &str) -> Result<(), String> {
+/// Fetch one branch of a remote into the shared store, advancing its
+/// remote-tracking bookmark (`<branch>@<remote>`) to the remote's current tip.
+/// Used to bring an externally-advanced target branch into the store, so a
+/// source can be rebased onto `<branch>@origin` before a fold.
+///
+/// Only the named branch. `jj git fetch` writes the store's view of every
+/// branch it fetches directly, with no import in between to guard it, and it
+/// abandons commits the remote no longer advertises. A whole-remote fetch that
+/// received an advertisement lagging one of this store's own pushes would walk
+/// that agent branch backwards and hide its newest commits.
+pub fn fetch_remote_branch(
+    jj: &JjEnv,
+    store_dir: &Path,
+    remote: &str,
+    branch: &str,
+) -> Result<(), String> {
+    let pattern = format!("exact:{branch:?}");
     jj.run_with_timeout(
         store_dir,
-        &["git", "fetch", "--remote", remote, "--ignore-working-copy"],
+        &[
+            "git",
+            "fetch",
+            "--remote",
+            remote,
+            "--branch",
+            &pattern,
+            "--ignore-working-copy",
+        ],
         "jj git fetch",
         JJ_NETWORK_TIMEOUT,
     )

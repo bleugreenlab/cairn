@@ -930,7 +930,11 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
     let error = error.to_ascii_lowercase();
     if error.contains("immutable") {
         "immutable_commit"
-    } else if error.contains("name") && error.contains("conflicted") {
+    } else if error.contains(crate::jj::CONFLICTED_NAME_REFUSAL)
+        || (error.contains("name `") && error.contains("` is conflicted"))
+    {
+        // The store's own refusal to settle a conflicted name, or jj's
+        // `Name `<branch>` is conflicted` from a verb that met one.
         "conflicted_bookmark"
     } else if error.contains("ambiguous") || error.contains("divergent") {
         "ambiguous_divergence"

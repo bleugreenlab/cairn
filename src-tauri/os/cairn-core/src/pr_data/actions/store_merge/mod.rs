@@ -229,7 +229,7 @@ async fn store_merge_child_inner(
             // taken inside it, never the other way round.
             let fetched =
                 crate::orchestrator::default_branch_sync::with_fetch_lock(orch, &store, || async {
-                    crate::jj::fetch_remote(&jj, &store, "origin")
+                    crate::jj::fetch_remote_branch(&jj, &store, "origin", target_branch)
                 })
                 .await;
             if let Err(e) = fetched {

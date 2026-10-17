@@ -671,8 +671,8 @@ mod tests {
         // A dirty operator checkout is left alone; the store sync still runs.
         git.expect_status()
             .returning(|_| Ok(" M src/lib.rs".into()));
-        git.expect_fetch_origin()
-            .returning(|_| Err("git fetch origin failed: offline".into()));
+        git.expect_fetch_origin_branch()
+            .returning(|_, _| Err("git fetch origin failed: offline".into()));
         let temp = tempfile::tempdir().unwrap().keep();
         let orch = Orchestrator::builder(
             Arc::new(crate::db::DbState::new(

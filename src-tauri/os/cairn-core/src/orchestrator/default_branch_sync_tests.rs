@@ -511,7 +511,7 @@ async fn concurrent_fetches_of_one_repository_never_overlap() {
     {
         let inside = inside.clone();
         let fetches = fetches.clone();
-        git.expect_fetch_origin().returning(move |_| {
+        git.expect_fetch_origin_branch().returning(move |_, _| {
             assert!(
                 !inside.swap(true, Ordering::SeqCst),
                 "two fetches of one repository overlapped"
@@ -525,9 +525,9 @@ async fn concurrent_fetches_of_one_repository_never_overlap() {
     let orch = test_orchestrator(db, Arc::new(git));
     let repo = Path::new("/repo");
     let (a, b, c) = tokio::join!(
-        fetch_origin_serialized(&orch, repo, None),
-        fetch_origin_serialized(&orch, repo, None),
-        fetch_origin_serialized(&orch, repo, None),
+        fetch_origin_serialized(&orch, repo, "main", None),
+        fetch_origin_serialized(&orch, repo, "main", None),
+        fetch_origin_serialized(&orch, repo, "main", None),
     );
     a.unwrap();
     b.unwrap();
@@ -581,19 +581,78 @@ async fn fetch_work_starts_only_once_the_lock_is_held() {
     assert!(started.load(Ordering::SeqCst));
 }
 
+/// A fetch on the default branch's behalf touches the default branch's tracking
+/// ref and nothing else. A whole-remote fetch that received a lagging
+/// advertisement once rewrote two agent branches' tracking refs backwards.
+#[tokio::test]
+async fn a_default_branch_fetch_leaves_agent_branch_tracking_refs_alone() {
+    use crate::jj::tests::{git, git_stdout, init_project};
+
+    let origin = tempfile::tempdir().unwrap();
+    let proj = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "-q", "--bare", "-b", "main"]);
+    init_project(proj.path());
+    let origin_url = origin.path().to_string_lossy().into_owned();
+    git(proj.path(), &["remote", "add", "origin", &origin_url]);
+    git(proj.path(), &["push", "-q", "origin", "main"]);
+    let base = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+
+    // Origin holds an agent branch one commit ahead of base, and main moves on.
+    std::fs::write(proj.path().join("agent.rs"), "agent\n").unwrap();
+    git(proj.path(), &["add", "-A"]);
+    git(proj.path(), &["commit", "-q", "-m", "agent work"]);
+    git(
+        proj.path(),
+        &["push", "-q", "origin", "HEAD:refs/heads/agent/x"],
+    );
+    git(proj.path(), &["checkout", "-q", "--detach", &base]);
+    std::fs::write(proj.path().join("main.rs"), "main\n").unwrap();
+    git(proj.path(), &["add", "-A"]);
+    git(proj.path(), &["commit", "-q", "-m", "main advance"]);
+    let advanced = git_stdout(proj.path(), &["rev-parse", "HEAD"]);
+    git(proj.path(), &["push", "-q", "origin", "HEAD:main"]);
+
+    // The local tracking refs disagree with origin on both branches.
+    git(
+        proj.path(),
+        &["update-ref", "refs/remotes/origin/main", &base],
+    );
+    git(
+        proj.path(),
+        &["update-ref", "refs/remotes/origin/agent/x", &base],
+    );
+
+    let db = crate::storage::migrated_test_db("default-branch-fetch-scope.db").await;
+    let orch = test_orchestrator(db, Arc::new(crate::services::RealGitClient));
+    fetch_origin_serialized(&orch, proj.path(), "main", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", "refs/remotes/origin/main"]),
+        advanced,
+        "the default branch is fetched"
+    );
+    assert_eq!(
+        git_stdout(proj.path(), &["rev-parse", "refs/remotes/origin/agent/x"]),
+        base,
+        "an agent branch's tracking ref is not the default-branch fetch's to write"
+    );
+}
+
 #[tokio::test]
 async fn a_recorded_fetch_failure_is_a_check_error() {
     let db = crate::storage::migrated_test_db("default-branch-fetch-error.db").await;
     let mut git = MockGitClient::new();
-    git.expect_fetch_origin()
-        .returning(|_| Err("git fetch origin failed: offline".into()));
+    git.expect_fetch_origin_branch()
+        .returning(|_, _| Err("git fetch origin failed: offline".into()));
     let orch = test_orchestrator(db, Arc::new(git));
     let error = fetch_origin_serialized(
         &orch,
         Path::new("/repo"),
+        "main",
         Some(FetchRecord {
             project_id: "proj",
-            default_branch: "main",
             source: Source::Fetch,
         }),
     )

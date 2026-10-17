@@ -1679,12 +1679,12 @@ async fn reconcile_jj_downstream(
             let ctx = format!("merged job {}", merged_job.id);
             let record = crate::orchestrator::default_branch_sync::FetchRecord {
                 project_id: &merged_job.project_id,
-                default_branch: base_branch,
                 source: crate::orchestrator::default_branch_sync::Source::Fetch,
             };
             match crate::orchestrator::default_branch_sync::fetch_origin_serialized(
                 orch,
                 repo,
+                base_branch,
                 Some(record),
             )
             .await
@@ -1920,9 +1920,9 @@ pub(crate) async fn reconcile_default_advance(
     crate::orchestrator::default_branch_sync::fetch_origin_serialized(
         orch,
         repo_path_path,
+        default_branch,
         Some(crate::orchestrator::default_branch_sync::FetchRecord {
             project_id,
-            default_branch,
             source: crate::orchestrator::default_branch_sync::Source::Fetch,
         }),
     )
@@ -1937,7 +1937,11 @@ pub(crate) async fn reconcile_default_advance(
             .acquire_jj_store_lock(&store, format!("external import on {default_branch}"))
             .await;
         let _phase = store_guard.phase("git ref import");
-        crate::jj::ensure_project_store(&jj, &store, repo_path_path)
+        // Origin is the authority for the branch just fetched, so its import
+        // observes it wherever it went, backwards included. Every other
+        // tracked branch stays guarded.
+        crate::jj::ensure_store_initialized(&jj, &store, repo_path_path)
+            .and_then(|()| crate::jj::import_git_with_remote_authority(&jj, &store, default_branch))
             .map_err(|error| format!("importing origin into the store failed: {error}"))?;
     }
     // A bookmark that did not move is reported after the downstream work, which
@@ -2042,9 +2046,9 @@ async fn reconcile_startup_remote_default_advance(
     if let Err(error) = crate::orchestrator::default_branch_sync::fetch_origin_serialized(
         orch,
         repo_path,
+        &project.default_branch,
         Some(crate::orchestrator::default_branch_sync::FetchRecord {
             project_id: &project.id,
-            default_branch: &project.default_branch,
             source: crate::orchestrator::default_branch_sync::Source::Startup,
         }),
     )
@@ -3513,6 +3517,37 @@ async fn execute_reconcile_claim(
                     ));
             }
 
+            // A conflicted name fails the rebase below outright, and used to be
+            // retried as `conflicted_bookmark` forever without anything trying
+            // to settle it. Settle it here, under the same guard, so healing
+            // does not wait for someone to read the branch.
+            let name_refusal = match crate::jj::repair_conflicted_branch_name(
+                &jj,
+                &store,
+                branch,
+                crate::jj::BranchAuthority::Store,
+            ) {
+                Ok(Some(settled)) => {
+                    log::info!(
+                        "jj base advance ({label}): settled `{branch}`'s conflicted name on {settled} before replaying it"
+                    );
+                    None
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    log::warn!(
+                        "jj base advance ({label}): `{branch}`'s conflicted name was not settled: {error}"
+                    );
+                    Some(match error.refusal() {
+                        Some(_) => format!(
+                            "{error}. This branch's rebase page (cairn:~/rebase) lists every \
+                             version and the commands that combine them."
+                        ),
+                        None => error.to_string(),
+                    })
+                }
+            };
+
             match crate::jj::collapse_divergent_bookmark(&jj, &store, branch) {
                 Ok(crate::jj::CollapseOutcome::NotDivergent) => {
                     divergence_resolved = true;
@@ -3561,6 +3596,13 @@ async fn execute_reconcile_claim(
             };
             let item_report = if ambiguous_item.is_some() {
                 crate::jj::ReconcileReport::default()
+            } else if let Some(error) = name_refusal {
+                let mut refused = crate::jj::ReconcileReport::default();
+                refused.failed.push(crate::jj::ReconcileFailure {
+                    branch: branch.clone(),
+                    error,
+                });
+                refused
             } else if let Some(carry_plan) = carry_plan {
                 match carry_plan {
                     Ok(plan) => {
@@ -4688,7 +4730,6 @@ where
         let quarantine_note = if crate::jj::reconcile_failure_is_permanent(failure_kind) {
             let guidance = match failure_kind {
                 "immutable_commit" => "jj refused to rewrite some of this branch's commits. The diagnostic above says why when Cairn could tell: if they are already on the default branch, the work landed and the PR and issue can close; if origin holds them under a remote bookmark this store does not track, nothing landed and that copy needs reconciling, so report the diagnostic.",
-                "conflicted_bookmark" => "This branch's name is in a conflicted state and needs a maintainer; report the diagnostic above.",
                 "missing_bookmark" => "This branch no longer exists and needs to be re-created; report the diagnostic above.",
                 _ => "Report the diagnostic above.",
             };
@@ -8373,9 +8414,12 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let mut git = MockGitClient::new();
-        git.expect_fetch_origin()
-            .with(mockall::predicate::eq(PathBuf::from("/repo")))
-            .return_once(move |_| {
+        git.expect_fetch_origin_branch()
+            .with(
+                mockall::predicate::eq(PathBuf::from("/repo")),
+                mockall::predicate::eq("integration".to_string()),
+            )
+            .return_once(move |_, _| {
                 entered_tx.send(()).unwrap();
                 release_rx.lock().unwrap().recv().unwrap();
                 Ok(())
@@ -8450,14 +8494,15 @@ mod tests {
         .unwrap();
 
         let mut git_client = MockGitClient::new();
-        git_client.expect_fetch_origin().returning(|repo| {
-            crate::env::git()
-                .args(["fetch", "-q", "origin"])
-                .current_dir(repo)
-                .status()
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        });
+        git_client
+            .expect_fetch_origin_branch()
+            .returning(|repo, branch| {
+                crate::services::GitClient::fetch_origin_branch(
+                    &crate::services::RealGitClient,
+                    repo,
+                    branch,
+                )
+            });
         let orch = test_orchestrator(db, git_client);
 
         // The store is provisioned and tracking origin, exactly as a live project's is.

@@ -135,6 +135,9 @@ pub enum CoordinateResolutionError {
         /// The competing commits, so a caller can choose among them (or a
         /// diagnostic can name them) without re-querying.
         targets: Vec<String>,
+        /// Why the store's repair left the name conflicted, with a
+        /// maintainer's commands. `None` until a repair has been attempted.
+        refusal: Option<Box<jj::RepairRefusal>>,
     },
     Repository(String),
 }
@@ -535,6 +538,7 @@ impl std::fmt::Display for CoordinateResolutionError {
             Self::Conflicted {
                 coordinate,
                 targets,
+                ..
             } => write!(
                 f,
                 "revision coordinate {coordinate:?} has several competing targets ({})",
@@ -749,6 +753,7 @@ fn conflicted_local_bookmark(
     Some(CoordinateResolutionError::Conflicted {
         coordinate: coordinate.to_string(),
         targets,
+        refusal: None,
     })
 }
 
@@ -1808,6 +1813,7 @@ mod tests {
         let CoordinateResolutionError::Conflicted {
             coordinate,
             targets,
+            ..
         } = &error
         else {
             panic!("expected a conflicted-name outcome, got {error:?}");

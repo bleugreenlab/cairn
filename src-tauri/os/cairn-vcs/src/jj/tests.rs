@@ -6559,14 +6559,752 @@ fn a_genuinely_divergent_branch_is_reported_rather_than_settled() {
     import_git(&fx.jj, &fx.store).unwrap();
     assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
 
+    let before = operation_id(&fx.jj, &fx.store).unwrap();
     let error = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
         .expect_err("divergent targets must not be settled by picking one");
 
-    assert!(error.contains(&store_side), "{error}");
-    assert!(error.contains(&git_side), "{error}");
+    let text = error.to_string();
+    assert!(text.contains(&store_side), "{text}");
+    assert!(text.contains(&git_side), "{text}");
+    assert_eq!(
+        reconcile_failure_kind(&text),
+        "conflicted_bookmark",
+        "{text}"
+    );
     assert!(
         bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap(),
         "a refused repair must leave both sides intact"
+    );
+    assert_eq!(
+        operation_id(&fx.jj, &fx.store).unwrap(),
+        before,
+        "a refusal writes nothing"
+    );
+
+    // The refusal carries a maintainer's way out: inspect, then for each
+    // ordering, keep one version and replay the other's own commits onto it.
+    let refusal = error.refusal().expect("a refusal, not a jj failure");
+    assert!(
+        refusal.reason.contains("neither version is a rewrite"),
+        "{}",
+        refusal.reason
+    );
+    let store = fx.store.to_string_lossy();
+    let commands = refusal.commands.join("\n");
+    assert!(
+        commands.contains(&format!(
+            "jj -R '{store}' --ignore-working-copy log -r 'bookmarks(exact:\"{branch}\") | {exported}'"
+        )),
+        "{commands}"
+    );
+    for (keep, replay) in [(&store_side, &git_side), (&git_side, &store_side)] {
+        assert!(
+            commands.contains(&format!(
+                "jj -R '{store}' --ignore-working-copy rebase -r 'fork_point({keep}|{replay})..{replay}' -d {keep}"
+            )),
+            "{commands}"
+        );
+        assert!(
+            commands.contains(&format!(
+                "jj -R '{store}' --ignore-working-copy bookmark set '{branch}' --allow-backwards -r '{keep}:: & change_id({})'",
+                change_of(&fx, replay)
+            )),
+            "{commands}"
+        );
+    }
+    // Both sides only add files, so either ordering combines cleanly.
+    assert!(
+        commands.contains("expected to replay cleanly"),
+        "{commands}"
+    );
+    // Never a command that keeps one side and drops the other.
+    assert!(
+        !refusal
+            .commands
+            .iter()
+            .any(|line| line.contains("bookmark set") && !line.contains("::")),
+        "{commands}"
+    );
+
+    // The rebase page's read-only view of the same name says the same thing.
+    let (conflict, outlook) = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .unwrap()
+        .expect("the name is conflicted");
+    assert_eq!(conflict, refusal.conflict);
+    assert_eq!(
+        outlook,
+        ConflictedNameOutlook::Refused(Box::new(refusal.clone()))
+    );
+
+    // And the offered repair works as written. `git_side` is origin's `main`,
+    // which jj holds immutable, so the ordering that keeps it is the one a
+    // maintainer can run here.
+    let keep_git_side = refusal
+        .commands
+        .iter()
+        .position(|line| line.contains(" rebase ") && line.ends_with(&format!("-d {git_side}")))
+        .expect("an ordering keeping the git side");
+    for line in &refusal.commands[keep_git_side..keep_git_side + 2] {
+        run_offered_command(&fx, line);
+    }
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    for side in [&store_side, &git_side] {
+        assert!(
+            revset_commit(
+                &fx.jj,
+                &fx.store,
+                &format!("::{branch} & change_id({})", change_of(&fx, side))
+            )
+            .is_some(),
+            "{side} survives the offered repair"
+        );
+    }
+}
+
+/// Run one line of a refusal's commands exactly as a maintainer would, through a
+/// shell, with the store's managed jj environment and binary.
+fn run_offered_command(fx: &TrackedOrigin, line: &str) {
+    let line = line
+        .strip_prefix("jj ")
+        .unwrap_or_else(|| panic!("not a jj command: {line}"));
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' {line}", fx.jj.binary_path()))
+        .envs(fx.jj.shell_env())
+        .status()
+        .unwrap();
+    assert!(status.success(), "offered command failed: jj {line}");
+}
+
+// ---------------------------------------------------------------------------
+// A stale observation of origin must never walk a store-owned branch back.
+//
+// The live specimen (cairn/5019): a whole-remote `git fetch origin` received an
+// advertisement about 80 s behind a push the store had already made, rewrote the
+// agent branch's tracking ref backwards, and the next import moved the bookmark
+// back and hid the branch's newest commit. A base-advance replay then rewrote
+// what the bookmark held, and when the next fetch brought the true tip back the
+// name was left conflicted between the rewrite and the hidden child.
+// ---------------------------------------------------------------------------
+
+/// A commit made with plain git in the project checkout, parented on `parent`.
+/// It moves no branch; the checkout is left detached on it.
+fn git_commit_on(
+    fx: &TrackedOrigin,
+    parent: &str,
+    file: &str,
+    contents: &str,
+    message: &str,
+) -> String {
+    git(fx.proj.path(), &["checkout", "-q", "--detach", parent]);
+    std::fs::write(fx.proj.path().join(file), contents).unwrap();
+    git(fx.proj.path(), &["add", "-A"]);
+    git(fx.proj.path(), &["commit", "-q", "-m", message]);
+    git_stdout(fx.proj.path(), &["rev-parse", "HEAD"])
+}
+
+/// Point `branch` at `commit` from the git side and import, so the store learns
+/// the commit and the bookmark follows it.
+fn point_branch_from_git(fx: &TrackedOrigin, branch: &str, commit: &str) {
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), commit],
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+        Some(commit)
+    );
+}
+
+/// Make git-side commits visible to the store without leaving a bookmark on
+/// them.
+fn import_commits(fx: &TrackedOrigin, commits: &[&str]) {
+    for (n, commit) in commits.iter().enumerate() {
+        git(
+            fx.proj.path(),
+            &["update-ref", &format!("refs/heads/fixture-{n}"), commit],
+        );
+    }
+    import_git(&fx.jj, &fx.store).unwrap();
+    for n in 0..commits.len() {
+        delete_bookmark(&fx.jj, &fx.store, &format!("fixture-{n}")).unwrap();
+    }
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "drop fixture bookmarks").unwrap();
+}
+
+/// The import as it ran before the guard: jj takes every tracking ref at its
+/// word, backwards included.
+fn raw_import(fx: &TrackedOrigin) {
+    fx.jj
+        .run(
+            &fx.store,
+            &["git", "import", "--ignore-working-copy"],
+            "raw jj git import",
+        )
+        .unwrap();
+}
+
+fn tracking_ref(fx: &TrackedOrigin, branch: &str) -> String {
+    git_stdout(
+        fx.proj.path(),
+        &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+    )
+}
+
+fn change_of(fx: &TrackedOrigin, commit: &str) -> String {
+    fx.jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                commit,
+                "--no-graph",
+                "-T",
+                "change_id",
+                "--ignore-working-copy",
+            ],
+            "test change id",
+        )
+        .unwrap()
+}
+
+/// Move the store's default-workspace `@` onto an empty commit off the root, so
+/// it is nobody's descendant. `store_child_of` leaves it on whatever it made.
+fn park_working_copy(fx: &TrackedOrigin) {
+    fx.jj
+        .run(
+            &fx.store,
+            &["new", "root()", "--ignore-working-copy"],
+            "park the store working copy",
+        )
+        .unwrap();
+}
+
+/// An agent branch pushed at `r`, then advanced to `c` (built on `r`) and
+/// pushed again, so origin, its tracking ref, and the store all hold `c`.
+fn push_branch_through_child(
+    fx: &TrackedOrigin,
+    branch: &str,
+    parent: &str,
+    child_file: (&str, &str),
+) -> (String, String) {
+    let r = git_commit_on(fx, parent, "r.txt", "r\n", "agent work R");
+    point_branch_from_git(fx, branch, &r);
+    push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
+    let c = git_commit_on(fx, &r, child_file.0, child_file.1, "agent work C");
+    point_branch_from_git(fx, branch, &c);
+    push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
+    assert_eq!(tracking_ref(fx, branch), c);
+    (r, c)
+}
+
+/// Acceptance #1: the 20:50:48 write — origin's tracking ref for an agent branch
+/// rewritten back to a commit the store had already pushed past — no longer
+/// moves the branch.
+#[test]
+#[serial_test::serial(jj)]
+fn a_stale_origin_observation_cannot_walk_a_managed_branch_back() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping stale_origin_observation_cannot_walk_back: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-4966-builder-0";
+    let (r, c) = push_branch_through_child(&fx, branch, &fx.base, ("c.txt", "c\n"));
+
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/remotes/origin/{branch}"), &r],
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+        Some(c.as_str()),
+        "the branch keeps the commit the store already pushed"
+    );
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("{branch}@origin")).as_deref(),
+        Some(c.as_str())
+    );
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("::visible_heads() & {c}")).as_deref(),
+        Some(c.as_str()),
+        "the newest commit stays visible"
+    );
+    assert_eq!(
+        tracking_ref(&fx, branch),
+        c,
+        "the regressed tracking ref is restored, so no later import can act on it"
+    );
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+}
+
+/// The guard is judged on what the import recorded, not on a snapshot taken
+/// before it: a fetch that writes the stale value after the guard looked, and
+/// before jj reads the refs, is caught, restored, and re-imported, and the
+/// commit the first import hid comes back.
+#[test]
+#[serial_test::serial(jj)]
+fn a_stale_write_between_the_guard_and_the_import_is_still_held() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping stale_write_between_guard_and_import: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-4966-builder-0";
+    let (r, c) = push_branch_through_child(&fx, branch, &fx.base, ("c.txt", "c\n"));
+    park_working_copy(&fx);
+
+    let wrote = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (proj, wrote, r) = (fx.proj.path().to_path_buf(), wrote.clone(), r.clone());
+        super::env::between_next_guard_and_import(move || {
+            for refname in [
+                format!("refs/remotes/origin/{branch}"),
+                format!("refs/heads/{branch}"),
+            ] {
+                git(&proj, &["update-ref", &refname, &r]);
+            }
+            wrote.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+    import_git(&fx.jj, &fx.store).unwrap();
+
+    assert!(
+        wrote.load(std::sync::atomic::Ordering::SeqCst),
+        "the race was staged"
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+        Some(c.as_str()),
+        "the branch is carried forward again"
+    );
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("{branch}@origin")).as_deref(),
+        Some(c.as_str())
+    );
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("::visible_heads() & {c}")).as_deref(),
+        Some(c.as_str()),
+        "the commit the first import hid is visible again"
+    );
+    assert_eq!(tracking_ref(&fx, branch), c);
+}
+
+/// The guard has exactly one named exemption: the default branch's reconcile,
+/// where origin is the sole authority. Origin rewinding `main` still wins there.
+#[test]
+#[serial_test::serial(jj)]
+fn origin_still_rewinds_the_default_branch_through_its_reconcile() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping origin_still_rewinds_the_default_branch: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let advanced = advance_origin_from(&fx, &fx.base, "gh.txt", "advance\n");
+    reconcile_tracked_bookmark(&fx.jj, &fx.store, "main").unwrap();
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(advanced.as_str())
+    );
+
+    // Someone force-pushes main back on origin, and Cairn fetches it.
+    git(
+        fx.proj.path(),
+        &["push", "-q", "-f", "origin", &format!("{}:main", fx.base)],
+    );
+    git(fx.proj.path(), &["fetch", "-q", "origin", "main"]);
+    assert_eq!(tracking_ref(&fx, "main"), fx.base);
+    // An unrelated ordinary import (job provisioning, say) gets there first.
+    // The authority the reconcile declared outlives that reconcile, so this
+    // import observes the rewind instead of holding it off.
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert_eq!(tracking_ref(&fx, "main"), fx.base);
+
+    let outcome = reconcile_tracked_bookmark(&fx.jj, &fx.store, "main").unwrap();
+
+    // The authority import itself carries the rewind onto the tracked bookmark,
+    // so the reconcile may find nothing left to repair. Either way origin won.
+    assert!(
+        matches!(
+            &outcome,
+            BookmarkReconciliation::Repaired { to, .. }
+                | BookmarkReconciliation::Unchanged { commit: to } if to == &fx.base
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, "main").as_deref(),
+        Some(fx.base.as_str())
+    );
+    assert_eq!(proj_ref(&fx, "main"), fx.base);
+    assert_eq!(tracking_ref(&fx, "main"), fx.base);
+}
+
+/// The specimen, driven with the guard bypassed: returns `(r, c, rewrite)` with
+/// the branch's name left conflicted exactly as the live store held it.
+fn drive_the_specimen(
+    fx: &TrackedOrigin,
+    branch: &str,
+    child_file: (&str, &str),
+    advance_file: (&str, &str),
+) -> (String, String, String) {
+    let base = git_commit_on(fx, &fx.base, "shared.txt", "a\nb\nc\n", "shared base");
+    git(
+        fx.proj.path(),
+        &["push", "-q", "origin", &format!("{base}:main")],
+    );
+    git(fx.proj.path(), &["fetch", "-q", "origin", "main"]);
+    import_git(&fx.jj, &fx.store).unwrap();
+
+    // 20:47 to 20:49: the builder's commit `c` reaches origin.
+    let (r, c) = push_branch_through_child(fx, branch, &base, child_file);
+    // The next base advance lands on origin.
+    let advanced = git_commit_on(fx, &base, advance_file.0, advance_file.1, "base advance");
+    git(
+        fx.proj.path(),
+        &["push", "-q", "origin", &format!("{advanced}:main")],
+    );
+    git(fx.proj.path(), &["fetch", "-q", "origin", "main"]);
+    import_git(&fx.jj, &fx.store).unwrap();
+    park_working_copy(fx);
+
+    // 20:50:48: a stale advertisement writes the branch back to `r`, and the
+    // 20:51:05 import, unguarded, follows it and hides `c`.
+    for refname in [
+        format!("refs/remotes/origin/{branch}"),
+        format!("refs/heads/{branch}"),
+    ] {
+        git(fx.proj.path(), &["update-ref", &refname, &r]);
+    }
+    raw_import(fx);
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+        Some(r.as_str()),
+        "without the guard the import walks the branch back"
+    );
+
+    // 20:52:08: the replay correctly rebases what the bookmark now holds.
+    fx.jj
+        .run(
+            &fx.store,
+            &[
+                "rebase",
+                "-b",
+                branch,
+                "-d",
+                "main@origin",
+                "--ignore-working-copy",
+            ],
+            "replay onto the advanced base",
+        )
+        .unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "export the replay").unwrap();
+    let rewrite = bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+
+    // 20:53:33: the next fetch brings origin's true tip back.
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/remotes/origin/{branch}"), &c],
+    );
+    raw_import(fx);
+    (r, c, rewrite)
+}
+
+/// Acceptance #3: the specimen reproduces from its sequence, and the store
+/// settles it by replaying the hidden child onto the rewrite.
+#[test]
+#[serial_test::serial(jj)]
+fn the_specimen_sequence_wedges_and_then_settles() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping the_specimen_sequence_wedges_and_then_settles: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-4966-builder-0";
+    let (r, c, rewrite) = drive_the_specimen(&fx, branch, ("c.txt", "c\n"), ("m.txt", "m\n"));
+
+    // Exactly the live store's state.
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    let conflict = describe_conflicted_bookmark(&fx.jj, &fx.store, branch)
+        .unwrap()
+        .expect("conflicted");
+    assert_eq!(
+        conflict
+            .removed
+            .iter()
+            .map(|t| t.commit.as_str())
+            .collect::<Vec<_>>(),
+        vec![r.as_str()]
+    );
+    let mut added = conflict
+        .added
+        .iter()
+        .map(|t| t.commit.clone())
+        .collect::<Vec<_>>();
+    added.sort();
+    let mut expected = vec![rewrite.clone(), c.clone()];
+    expected.sort();
+    assert_eq!(added, expected);
+    assert_eq!(change_of(&fx, &rewrite), change_of(&fx, &r));
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("{branch}@git")).as_deref(),
+        Some(rewrite.as_str())
+    );
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("{branch}@origin")).as_deref(),
+        Some(c.as_str())
+    );
+    let (_, outlook) = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            &outlook,
+            ConflictedNameOutlook::Settleable { how, commands }
+                if how.contains("replay 1 commit(s)")
+                    && commands.iter().any(|line| line.contains(&format!("'{r}..{c}'")))
+        ),
+        "{outlook:?}"
+    );
+
+    let settled = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .unwrap()
+        .expect("settled");
+
+    assert_eq!(
+        revset_commit(&fx.jj, &fx.store, &format!("{settled}-")).as_deref(),
+        Some(rewrite.as_str()),
+        "the child now sits on the rewrite"
+    );
+    assert_eq!(change_of(&fx, &settled), change_of(&fx, &c));
+    assert_eq!(
+        git_stdout(fx.proj.path(), &["diff", &rewrite, &settled]),
+        git_stdout(fx.proj.path(), &["diff", &r, &c]),
+        "the replayed child carries exactly the child's own change"
+    );
+    assert!(!bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    assert_eq!(proj_ref(&fx, branch), settled);
+
+    // Origin holds `c`, which the store still tracks, so the push is a
+    // sideways move with a correct lease.
+    push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
+    assert_eq!(
+        git_stdout(
+            fx._origin.path(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        settled
+    );
+}
+
+/// Stale-publication recovery meets the same state and settles it through the
+/// shared function, leaving origin's copy tracked for the retried push.
+#[test]
+#[serial_test::serial(jj)]
+fn converge_settles_the_specimen_through_the_shared_settlement() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping converge_settles_the_specimen: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-4966-builder-0";
+    let (_r, c, rewrite) = drive_the_specimen(&fx, branch, ("c.txt", "c\n"), ("m.txt", "m\n"));
+
+    let convergence =
+        converge_managed_branch_after_remote_rewrite(&fx.jj, &fx.store, branch).unwrap();
+
+    let ManagedBranchConvergence::Rebased { from, to, frontier } = convergence else {
+        panic!("expected the settlement to be reported as a rebase, got {convergence:?}");
+    };
+    assert_eq!(from, c);
+    assert_eq!(frontier, rewrite);
+    assert_eq!(change_of(&fx, &to), change_of(&fx, &c));
+    assert_eq!(bookmark_commit(&fx.jj, &fx.store, branch), Some(to.clone()));
+    push_store_bookmark(&fx.jj, &fx.store, branch).unwrap();
+    assert_eq!(
+        git_stdout(
+            fx._origin.path(),
+            &["rev-parse", &format!("refs/heads/{branch}")]
+        ),
+        to
+    );
+}
+
+/// Leave `branch` conflicted in the rewritten-base shape without origin: `r` is
+/// rewritten onto `onto` while `c`, built on `r` and hidden for the rewrite,
+/// comes back through the branch's git ref. Returns the rewrite.
+fn conflict_rewritten_base(
+    fx: &TrackedOrigin,
+    branch: &str,
+    r: &str,
+    c: &str,
+    onto: &str,
+) -> String {
+    create_bookmark_at(&fx.jj, &fx.store, branch, r).unwrap();
+    export_git_preserving_checkout(&fx.jj, &fx.store, true, "export r").unwrap();
+    park_working_copy(fx);
+    fx.jj
+        .run(
+            &fx.store,
+            &["abandon", &format!("{r}..{c}"), "--ignore-working-copy"],
+            "hide the child for the rewrite",
+        )
+        .unwrap();
+    fx.jj
+        .run(
+            &fx.store,
+            &["rebase", "-r", r, "-d", onto, "--ignore-working-copy"],
+            "rewrite r",
+        )
+        .unwrap();
+    let rewrite = bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
+    git(
+        fx.proj.path(),
+        &["update-ref", &format!("refs/heads/{branch}"), c],
+    );
+    import_git(&fx.jj, &fx.store).unwrap();
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+    rewrite
+}
+
+fn assert_refused_without_writing(fx: &TrackedOrigin, branch: &str, reason: &str) {
+    let before = operation_id(&fx.jj, &fx.store).unwrap();
+    let error = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .expect_err("the shape must be refused");
+    let refusal = error
+        .refusal()
+        .unwrap_or_else(|| panic!("not a refusal: {error}"));
+    assert!(refusal.reason.contains(reason), "{}", refusal.reason);
+    assert!(!refusal.commands.is_empty());
+    assert_eq!(operation_id(&fx.jj, &fx.store).unwrap(), before);
+    assert!(bookmark_name_is_conflicted(&fx.jj, &fx.store, branch).unwrap());
+}
+
+/// A suffix that already carries a conflict is never replayed: what it would
+/// produce cannot be told apart from what the replay itself conflicted.
+#[test]
+#[serial_test::serial(jj)]
+fn a_rewritten_base_whose_child_carries_a_conflict_is_refused() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping child_carries_a_conflict_is_refused: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-7-builder-0";
+    let r = git_commit_on(&fx, &fx.base, "r.txt", "r\n", "R");
+    let c1 = git_commit_on(&fx, &r, "new.txt", "one\n", "C1");
+    let k0 = git_commit_on(&fx, &fx.base, "new.txt", "two\n", "K");
+    let onto = git_commit_on(&fx, &fx.base, "onto.txt", "o\n", "onto");
+    import_commits(&fx, &[&r, &c1, &k0, &onto]);
+    fx.jj
+        .run(
+            &fx.store,
+            &["rebase", "-r", &k0, "-d", &c1, "--ignore-working-copy"],
+            "stack a conflicted commit on c1",
+        )
+        .unwrap();
+    let k = revset_commit(&fx.jj, &fx.store, &format!("children({c1})")).unwrap();
+    assert!(revset_has_conflict(&fx.jj, &fx.store, &k).unwrap());
+    conflict_rewritten_base(&fx, branch, &r, &k, &onto);
+
+    assert_refused_without_writing(&fx, branch, "already carry a conflict");
+}
+
+/// Something else built on the child would be re-parented by the replay, so
+/// the shape is refused rather than moving work this branch does not own.
+#[test]
+#[serial_test::serial(jj)]
+fn a_rewritten_base_whose_child_has_other_work_on_it_is_refused() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping child_has_other_work_on_it_is_refused: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-8-builder-0";
+    let r = git_commit_on(&fx, &fx.base, "r.txt", "r\n", "R");
+    let c = git_commit_on(&fx, &r, "c.txt", "c\n", "C");
+    let onto = git_commit_on(&fx, &fx.base, "onto.txt", "o\n", "onto");
+    import_commits(&fx, &[&r, &c, &onto]);
+    conflict_rewritten_base(&fx, branch, &r, &c, &onto);
+    store_child_of(&fx, &c, "a delegated child's work on c");
+
+    assert_refused_without_writing(&fx, branch, "other work is built on");
+}
+
+/// A replay that conflicts is rolled back and refused: resolving it is a
+/// choice, and the store never makes one.
+#[test]
+#[serial_test::serial(jj)]
+fn a_rewritten_base_whose_replay_conflicts_is_rolled_back_and_refused() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping replay_conflicts_is_refused: jj not resolvable");
+        return;
+    };
+    let fx = setup_tracked_origin(&bin);
+    let branch = "agent/cairn-9-builder-0";
+    let base = git_commit_on(&fx, &fx.base, "shared.txt", "a\nb\nc\n", "shared");
+    let r = git_commit_on(&fx, &base, "r.txt", "r\n", "R");
+    let c = git_commit_on(&fx, &r, "shared.txt", "C\nb\nc\n", "C edits line one");
+    let onto = git_commit_on(&fx, &base, "shared.txt", "M\nb\nc\n", "base edits line one");
+    import_commits(&fx, &[&r, &c, &onto]);
+    let rewrite = conflict_rewritten_base(&fx, branch, &r, &c, &onto);
+    let before = describe_conflicted_bookmark(&fx.jj, &fx.store, branch).unwrap();
+
+    let error = repair_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .expect_err("a conflicting replay must be refused");
+
+    let refusal = error
+        .refusal()
+        .unwrap_or_else(|| panic!("not a refusal: {error}"));
+    assert!(refusal.reason.contains("conflicts"), "{}", refusal.reason);
+    assert!(
+        refusal.commands.join("\n").contains("expected to conflict"),
+        "{:?}",
+        refusal.commands
+    );
+    assert_eq!(
+        describe_conflicted_bookmark(&fx.jj, &fx.store, branch).unwrap(),
+        before,
+        "the trial replay is restored"
+    );
+    assert_eq!(
+        revset_commit(
+            &fx.jj,
+            &fx.store,
+            &format!("{rewrite}:: & change_id({})", change_of(&fx, &c))
+        ),
+        None,
+        "no replayed copy of the child survives the rollback"
+    );
+    assert_eq!(proj_ref(&fx, branch), c);
+
+    // The rebase page, read after the refusal, says the same: refused, with
+    // the one combination that keeps both, flagged as expected to conflict.
+    let (_, outlook) = assess_conflicted_bookmark_name(&fx.jj, &fx.store, branch)
+        .unwrap()
+        .expect("still conflicted");
+    let ConflictedNameOutlook::Refused(refusal) = outlook else {
+        panic!("a replay known to conflict must not read as settleable: {outlook:?}");
+    };
+    assert!(
+        refusal.reason.contains("expected to conflict"),
+        "{}",
+        refusal.reason
+    );
+    let commands = refusal.commands.join("\n");
+    assert!(commands.contains("(expected to conflict)"), "{commands}");
+    assert!(
+        commands.contains(&format!("rebase -r '{r}..{c}' -d {rewrite}")),
+        "{commands}"
+    );
+    assert_eq!(
+        commands.matches(" rebase ").count(),
+        1,
+        "replaying the rewrite's ancestry onto the child would drag the base along: {commands}"
     );
 }
 

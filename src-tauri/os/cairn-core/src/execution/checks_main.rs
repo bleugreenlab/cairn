@@ -228,9 +228,9 @@ async fn run(
         crate::orchestrator::default_branch_sync::fetch_origin_serialized(
             orch,
             &repo_root,
+            default_branch,
             Some(crate::orchestrator::default_branch_sync::FetchRecord {
                 project_id,
-                default_branch,
                 source: crate::orchestrator::default_branch_sync::Source::Fetch,
             }),
         )
@@ -241,8 +241,10 @@ async fn run(
             .acquire_jj_store_lock(&store, "main-attestation canonical refresh")
             .await;
         let _phase = guard.phase("main-attestation canonical refresh");
-        crate::jj::ensure_project_store(&jj, &store, &repo_root)
-            .map_err(|error| format!("main-attestation store import failed: {error}"))?;
+        // The reconcile below imports with `default_branch` as origin's to
+        // decide; a guarded import first would hold off a backward move of it.
+        crate::jj::ensure_store_initialized(&jj, &store, &repo_root)
+            .map_err(|error| format!("main-attestation store init failed: {error}"))?;
         crate::jj::reconcile_tracked_bookmark(&jj, &store, default_branch)
             .map_err(|error| format!("main-attestation bookmark reconcile failed: {error}"))?;
     }

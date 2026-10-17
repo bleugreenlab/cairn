@@ -411,18 +411,25 @@ async fn store_lags_remote(
         .map_or(true, |stamp| stamp.contains != Some(true))
 }
 
-/// Which project and branch a serialized fetch should record its result
-/// against. Fetches that do not update the default branch pass `None`.
+/// Which project a serialized fetch of its default branch should record its
+/// result against. Fetches that should not be recorded pass `None`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchRecord<'a> {
     pub project_id: &'a str,
-    pub default_branch: &'a str,
     pub source: Source,
 }
 
-/// Run `fetch` under the repository's fetch lock. Every writer of the
-/// repository's `refs/remotes/origin/*` that Cairn runs goes through this, so
-/// two of them can no longer race on one ref and have the loser give up.
+/// Run `fetch` under the repository's fetch lock. Every FETCH Cairn runs into
+/// the repository's `refs/remotes/origin/*` goes through this, so two of them
+/// can no longer race on one ref and have the loser give up.
+///
+/// Fetches are not the only writers of those refs. The store's own `jj git
+/// push` updates `refs/remotes/origin/<branch>` for the branch it pushed, outside
+/// this lock. That is safe because no two writers share a ref any more: every
+/// fetch here names exactly one branch, an agent branch's tracking ref is only
+/// ever fetched by stale-publication recovery for that same branch, and the
+/// store's import refuses to let any of these refs walk a store-owned branch
+/// backwards (see `cairn_vcs::jj::import_git`).
 ///
 /// `fetch` is a closure so the work is only created once the lock is held: a
 /// `spawn_blocking` handle passed in directly would already be running.
@@ -442,8 +449,14 @@ where
     fetch().await
 }
 
-/// `git fetch origin` under the repository's fetch lock, recording what it
-/// learned about the default branch when `record` names one.
+/// Fetch origin's `branch`, and only that branch, under the repository's fetch
+/// lock, recording what it learned when `record` names the project.
+///
+/// Scoped on purpose. A whole-remote fetch also rewrote every agent branch's
+/// tracking ref from origin's advertisement, and an advertisement that lagged a
+/// push this store had already made walked two agent branches backwards, hiding
+/// their newest commits. Origin does not own an agent branch, so a fetch on the
+/// default branch's behalf has no business touching one.
 ///
 /// A fetch outside Cairn (the operator's own `git fetch`) can still race this
 /// one on a ref lock. Git then reports `cannot lock ref '<ref>': is at <X> but
@@ -452,14 +465,16 @@ where
 pub(crate) async fn fetch_origin_serialized(
     orch: &Orchestrator,
     repo_path: &Path,
+    branch: &str,
     record: Option<FetchRecord<'_>>,
 ) -> Result<(), String> {
     let store = crate::jj::project_store_dir(&orch.config_dir, repo_path);
     let git = orch.services.git.clone();
     let repo = repo_path.to_path_buf();
+    let fetched_branch = branch.to_string();
     let result = with_fetch_lock(orch, &store, || async {
         tokio::task::spawn_blocking(move || {
-            git.fetch_origin(&repo).or_else(|error| {
+            git.fetch_origin_branch(&repo, &fetched_branch).or_else(|error| {
                 if lost_ref_race_is_settled(&repo, &error) {
                     log::debug!("git fetch origin lost a ref-lock race to a fetch that landed the same update: {error}");
                     Ok(())
@@ -477,7 +492,7 @@ pub(crate) async fn fetch_origin_serialized(
         match &result {
             Ok(()) => {
                 let repo = repo_path.to_path_buf();
-                let branch = record.default_branch.to_string();
+                let branch = branch.to_string();
                 let tip = tokio::task::spawn_blocking(move || {
                     read_ref(&repo, &format!("refs/remotes/origin/{branch}"))
                 })

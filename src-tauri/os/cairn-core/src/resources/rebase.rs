@@ -156,9 +156,18 @@ pub(super) async fn read_node_rebase(
         }
         Err(error) => return error,
     };
+    // Read before anything else on the page: while the name is conflicted, no
+    // replay can run, so everything below it describes a branch that cannot
+    // move until this is settled.
+    let name_section = conflicted_name_section(orch, &conn, &job.id, &branch).await;
     let session = match load_active_session(&db, &branch).await {
         Ok(Some(session)) => session,
-        Ok(None) => return render_closed_session(orch, &db, &conn, &job.id, &branch).await,
+        Ok(None) => {
+            return format!(
+                "{name_section}{}",
+                render_closed_session(orch, &db, &conn, &job.id, &branch).await
+            )
+        }
         Err(error) => return error,
     };
 
@@ -179,6 +188,7 @@ pub(super) async fn read_node_rebase(
     if !matches!(request.view, RebaseView::Summary) {
         return rendered;
     }
+    let rendered = format!("{name_section}{rendered}");
     let obligations =
         match crate::mcp::handlers::run_context::project_id_by_key(&orch.db.local, project).await {
             Ok(project_id) => {
@@ -348,27 +358,7 @@ async fn load_base_standing(
     job_id: &str,
     branch: &str,
 ) -> Result<BaseStanding, String> {
-    let mut rows = conn
-        .query(
-            "SELECT p.repo_path
-             FROM jobs j JOIN projects p ON j.project_id = p.id
-             WHERE j.id = ?1 LIMIT 1",
-            (job_id,),
-        )
-        .await
-        .map_err(|error| format!("This node's project row could not be read: {error}"))?;
-    let repo_path = rows
-        .next()
-        .await
-        .map_err(|error| format!("This node's project row could not be read: {error}"))?
-        .and_then(|row| row.opt_text(0).ok().flatten())
-        .filter(|repo_path| !repo_path.is_empty())
-        .ok_or_else(|| {
-            "Cairn holds no repository path for this node's project, so the branch store could \
-             not be asked anything about it."
-                .to_string()
-        })?;
-
+    let repo_path = load_repo_path(conn, job_id).await?;
     let candidates = load_base_candidates(conn, job_id)
         .await
         .map_err(|error| format!("This node's base branch could not be read: {error}"))?;
@@ -384,6 +374,113 @@ async fn load_base_standing(
         superseded: resolved.superseded,
         source: resolved.source,
     })
+}
+
+/// The page's section for a branch whose name the store holds conflicted, or
+/// nothing when it is not. Reads only: the page never settles the name, it
+/// says whether the next replay or branch read will, and when not, why and
+/// with which commands a maintainer can.
+async fn conflicted_name_section(
+    orch: &Orchestrator,
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+    branch: &str,
+) -> String {
+    let Ok(repo_path) = load_repo_path(conn, job_id).await else {
+        return String::new();
+    };
+    let jj = crate::jj::environment(&orch.jj_binary_path, &orch.config_dir);
+    let store = crate::jj::project_store_dir(&orch.config_dir, std::path::Path::new(&repo_path));
+    if !crate::jj::is_jj_dir(&store) {
+        return String::new();
+    }
+    match crate::jj::assess_conflicted_bookmark_name(&jj, &store, branch) {
+        Ok(Some((conflict, outlook))) => render_conflicted_name(&conflict, &outlook),
+        Ok(None) => String::new(),
+        Err(error) => {
+            log::warn!(
+                "rebase page: could not read whether `{branch}`'s name is conflicted: {error}"
+            );
+            String::new()
+        }
+    }
+}
+
+fn render_conflicted_name(
+    conflict: &crate::jj::ConflictedBookmark,
+    outlook: &crate::jj::ConflictedNameOutlook,
+) -> String {
+    let cell = |text: &str| text.replace('|', "\\|");
+    let mut out = format!(
+        "# Branch name is conflicted\n\nThe store records {} versions of `{}`, so no read, write, \
+         or replay can use the name until they are combined. Nothing has been discarded: every \
+         version is still readable by its commit id.\n\n| | commit | change | description |\n|---|---|---|---|\n",
+        conflict.added.len(),
+        conflict.branch,
+    );
+    for (role, targets) in [
+        ("moved away from", &conflict.removed),
+        ("version", &conflict.added),
+    ] {
+        for target in targets {
+            out.push_str(&format!(
+                "| {role} | `{}` | `{}` | {} |\n",
+                target.commit,
+                target.change,
+                cell(&target.description)
+            ));
+        }
+    }
+    match outlook {
+        crate::jj::ConflictedNameOutlook::Settleable { how, commands } => {
+            out.push_str(&format!(
+                "\n**Expected to settle automatically:** the next replay or branch read will try \
+                 to {how}. That has not been attempted yet."
+            ));
+            if commands.is_empty() {
+                out.push_str(" Nothing needs doing by hand.\n\n");
+            } else {
+                out.push_str(&format!(
+                    " If that replay conflicts it is rolled back and refused, and this page will \
+                     say so; a maintainer can then combine the versions with:\n\n```sh\n{}\n```\n\n",
+                    commands.join("\n")
+                ));
+            }
+        }
+        crate::jj::ConflictedNameOutlook::Refused(refusal) => out.push_str(&format!(
+            "\n**Not settleable automatically:** {}. Choosing one version would silently drop \
+             the other's commits, so the store will not. A maintainer can combine them with one \
+             of these orderings, run against the store:\n\n```sh\n{}\n```\n\n",
+            refusal.reason,
+            refusal.commands.join("\n")
+        )),
+    }
+    out
+}
+
+async fn load_repo_path(
+    conn: &cairn_db::turso::Connection,
+    job_id: &str,
+) -> Result<String, String> {
+    let mut rows = conn
+        .query(
+            "SELECT p.repo_path
+             FROM jobs j JOIN projects p ON j.project_id = p.id
+             WHERE j.id = ?1 LIMIT 1",
+            (job_id,),
+        )
+        .await
+        .map_err(|error| format!("This node's project row could not be read: {error}"))?;
+    rows.next()
+        .await
+        .map_err(|error| format!("This node's project row could not be read: {error}"))?
+        .and_then(|row| row.opt_text(0).ok().flatten())
+        .filter(|repo_path| !repo_path.is_empty())
+        .ok_or_else(|| {
+            "Cairn holds no repository path for this node's project, so the branch store could \
+             not be asked anything about it."
+                .to_string()
+        })
 }
 
 /// Where a branch with an open session stands NOW, read live from the store.
@@ -1684,6 +1781,87 @@ mod tests {
 
     /// An unknown key is a typo or a wrong mental model, and either way silently
     /// ignoring it serves a page the caller did not ask for.
+    fn conflicted(added: &[(&str, &str, &str)]) -> crate::jj::ConflictedBookmark {
+        let target =
+            |(commit, change, description): &(&str, &str, &str)| crate::jj::BookmarkTarget {
+                commit: commit.to_string(),
+                change: change.to_string(),
+                description: description.to_string(),
+            };
+        crate::jj::ConflictedBookmark {
+            branch: "agent/cairn-4966-builder-0".into(),
+            removed: vec![target(&("5dc58aff", "uvxqtrvw", "flatten"))],
+            added: added.iter().map(target).collect(),
+        }
+    }
+
+    #[test]
+    fn a_settleable_conflicted_name_says_the_next_replay_settles_it() {
+        let conflict = conflicted(&[
+            ("c4e36dd2", "uvxqtrvw", "flatten"),
+            ("f1c676bc", "sxznpoqz", "docs | protocol"),
+        ]);
+        let page = render_conflicted_name(
+            &conflict,
+            &crate::jj::ConflictedNameOutlook::Settleable {
+                how: "replay 1 commit(s) of `f1c676bc` onto `c4e36dd2`".into(),
+                commands: vec!["jj -R '/store' --ignore-working-copy rebase -r '5dc58aff..f1c676bc' -d c4e36dd2".into()],
+            },
+        );
+
+        assert!(page.starts_with("# Branch name is conflicted"), "{page}");
+        for line in [
+            "| moved away from | `5dc58aff` | `uvxqtrvw` | flatten |",
+            "| version | `c4e36dd2` | `uvxqtrvw` | flatten |",
+            "| version | `f1c676bc` | `sxznpoqz` | docs \\| protocol |",
+        ] {
+            assert!(page.contains(line), "{page}");
+        }
+        // A replay not yet attempted is never promised.
+        assert!(
+            page.contains(
+                "**Expected to settle automatically:** the next replay or branch read will try \
+                 to replay 1 commit(s)"
+            ),
+            "{page}"
+        );
+        assert!(page.contains("has not been attempted yet"), "{page}");
+        assert!(!page.contains("Nothing needs doing"), "{page}");
+        assert!(
+            page.contains(
+                "```sh\njj -R '/store' --ignore-working-copy rebase -r '5dc58aff..f1c676bc' -d c4e36dd2\n```"
+            ),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn a_refused_conflicted_name_shows_the_reason_and_the_commands() {
+        let conflict = conflicted(&[("aaaa1111", "kkkk", "one"), ("bbbb2222", "llll", "two")]);
+        let refusal = crate::jj::RepairRefusal {
+            branch: conflict.branch.clone(),
+            conflict: conflict.clone(),
+            reason: "neither version is a rewrite of the commit both moved away from".into(),
+            commands: vec![
+                "# Keep aaaa1111 as the base and replay bbbb2222's own commits onto it (expected to replay cleanly)".into(),
+                "jj -R '/store' --ignore-working-copy rebase -r 'fork_point(aaaa1111|bbbb2222)..bbbb2222' -d aaaa1111".into(),
+            ],
+        };
+        let page = render_conflicted_name(
+            &conflict,
+            &crate::jj::ConflictedNameOutlook::Refused(Box::new(refusal.clone())),
+        );
+
+        assert!(
+            page.contains("**Not settleable automatically:** neither version is a rewrite"),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!("```sh\n{}\n```", refusal.commands.join("\n"))),
+            "{page}"
+        );
+    }
+
     #[test]
     fn an_unknown_query_key_is_refused_by_name() {
         let typo = params(&[("vue", "base-ours")]);
