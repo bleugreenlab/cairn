@@ -138,10 +138,10 @@ fn native_answers_keep_their_probabilities_and_say_how_they_were_measured() {
         "model": "openai/gpt-6-luna-decisions",
         "answers": [
             {"type": "predicate", "name": "damaged", "probability": 0.95},
-            {"type": "choice", "name": "queue", "choice": "shipping", "confidence": 0.81,
+            {"type": "choice", "name": "queue", "choice": "shipping", "confidence": 0.62,
              "probabilities": [{"value": "billing", "probability": 0.19},
                                {"value": "shipping", "probability": 0.81}]},
-            {"type": "score", "name": "urgency", "score": 1.3, "confidence": 0.62,
+            {"type": "score", "name": "urgency", "score": 1.3, "confidence": 0.31,
              "probabilities": [{"value": 0, "label": "low", "probability": 0.08},
                                {"value": 1, "label": "medium", "probability": 0.54},
                                {"value": 2, "label": "high", "probability": 0.38}]}
@@ -165,11 +165,13 @@ fn native_answers_keep_their_probabilities_and_say_how_they_were_measured() {
         .all(|answer| answer.measured_by() == MeasuredBy::Native));
     assert_eq!(decision.answers[0].pick(), Some("yes"));
     assert_eq!(decision.answers[1].pick(), Some("shipping"));
-    assert_eq!(decision.answers[1].confidence(), Some(0.81));
+    // A reported confidence is the provider's, kept as sent.
+    assert_eq!(decision.answers[1].confidence(), Some(0.62));
     let DecisionAnswer::Score { score, pick, .. } = &decision.answers[2] else {
         panic!("expected a score");
     };
     assert_eq!((*score, pick.as_str()), (1.3, "medium"));
+    assert_eq!(decision.answers[2].confidence(), Some(0.31));
 
     let requests = complete.requests();
     assert_eq!(requests.len(), 1);
@@ -277,8 +279,10 @@ fn logprobs_answers_renormalize_the_label_mass_of_a_vllm_reply() {
     // non-label tokens (`**`, `The`) carry no mass.
     let b = (-0.06122_f64).exp() + (-7.1083_f64).exp();
     let a = (-2.8541_f64).exp() + (-10.002_f64).exp();
-    let expected = b / (a + b);
-    assert!((confidence.unwrap() - expected).abs() < 1e-12);
+    let shipping = b / (a + b);
+    assert!((probabilities[1].probability - shipping).abs() < 1e-12);
+    // Two options: confidence is |2p - 1|, not the pick's probability.
+    assert!((confidence.unwrap() - (2.0 * shipping - 1.0)).abs() < 1e-12);
     assert!((probabilities[0].probability + probabilities[1].probability - 1.0).abs() < 1e-12);
     assert_eq!(probabilities[0].value, "billing");
 
@@ -347,6 +351,116 @@ fn logprobs_measure_predicates_and_scores_one_request_per_question() {
     let c = (-0.1_f64).exp();
     let b = (-2.5_f64).exp();
     assert!((score - (b + 2.0 * c) / (b + c)).abs() < 1e-12);
+}
+
+/// The confidence each route reports for `probabilities` over `question`: the
+/// native route with the provider's `confidence` omitted, and the logprobs
+/// route with one label per nonzero probability. An option with probability 0
+/// is left out of both replies, as a provider or a server may do.
+fn confidence_by_route(question: &DecisionQuestion, probabilities: &[f64]) -> (f64, f64) {
+    let values = question.answer_values();
+    let native_answer = match &question.kind {
+        QuestionKind::Choice { .. } => {
+            let pick = probabilities
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(index, _)| values[index])
+                .unwrap();
+            json!({"type": "choice", "name": question.name, "choice": pick,
+                   "probabilities": values.iter().zip(probabilities)
+                       .filter(|(_, p)| **p > 0.0)
+                       .map(|(value, p)| json!({"value": value, "probability": p}))
+                       .collect::<Vec<_>>()})
+        }
+        QuestionKind::Score { .. } => {
+            json!({"type": "score", "name": question.name,
+                   "score": probabilities.iter().enumerate().map(|(i, p)| i as f64 * p).sum::<f64>(),
+                   "probabilities": probabilities.iter().enumerate()
+                       .filter(|(_, p)| **p > 0.0)
+                       .map(|(i, p)| json!({"value": i, "probability": p}))
+                       .collect::<Vec<_>>()})
+        }
+        QuestionKind::Predicate => unreachable!("a predicate carries no confidence field"),
+    };
+    let complete = Scripted::answering(vec![decisions_reply(json!({"answers": [native_answer]}))]);
+    let route = native_route();
+    let native = decide(&complete, call(&route, std::slice::from_ref(question))).unwrap();
+
+    // The generated token must be the top label, so it leads the list.
+    let mut labelled: Vec<(String, f64)> = probabilities
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| **p > 0.0)
+        .map(|(index, p)| (char::from(b'A' + index as u8).to_string(), p.ln()))
+        .collect();
+    labelled.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let top: Vec<(&str, f64)> = labelled.iter().map(|(t, l)| (t.as_str(), *l)).collect();
+    let complete = Scripted::answering(vec![vllm_reply_with_top(&top)]);
+    let route = logprobs_route();
+    let logprobs = decide(&complete, call(&route, std::slice::from_ref(question))).unwrap();
+
+    (
+        native.answers[0].confidence().expect("native fallback"),
+        logprobs.answers[0].confidence().expect("logprobs"),
+    )
+}
+
+/// Both routes compute confidence by the one shared formula, over the
+/// question's declared options and levels, and land on the providers' own
+/// published values (OpenAI's Decisions guide: 0.93 and 0.55).
+#[test]
+fn both_routes_compute_the_providers_confidence_from_identical_probabilities() {
+    let department = choice("department", &["billing", "technical", "shipping", "other"]);
+    let severity = score("severity", &["cosmetic", "workaround", "blocked"]);
+    for (question, probabilities, published) in [
+        (&department, vec![0.95, 0.02, 0.01, 0.02], Some(0.93)),
+        (&severity, vec![0.1, 0.7, 0.2], Some(0.55)),
+        // Two of four options returned: the even split is still a quarter,
+        // so confidence is (0.6 - 0.25) / 0.75, not the two-option 0.2.
+        (&department, vec![0.6, 0.4, 0.0, 0.0], None),
+        // A level the reply leaves out is 0, still a level away.
+        (&severity, vec![0.5, 0.0, 0.5], None),
+        // A tied peak: both routes pick the first, so both report 0, where
+        // picking the second would report 0.1.
+        (&severity, vec![0.4, 0.4, 0.2], None),
+    ] {
+        let (native, logprobs) = confidence_by_route(question, &probabilities);
+        assert!(
+            (native - logprobs).abs() < 1e-9,
+            "{probabilities:?}: native {native}, logprobs {logprobs}"
+        );
+        if let Some(published) = published {
+            assert_eq!(
+                (native * 100.0).round() / 100.0,
+                published,
+                "{probabilities:?}"
+            );
+        }
+    }
+    let (native, _) = confidence_by_route(&department, &[0.6, 0.4, 0.0, 0.0]);
+    assert!((native - 0.35 / 0.75).abs() < 1e-9, "{native}");
+    let (native, _) = confidence_by_route(&severity, &[0.5, 0.0, 0.5]);
+    assert!(native.abs() < 1e-9, "{native}");
+    let (native, _) = confidence_by_route(&severity, &[0.4, 0.4, 0.2]);
+    assert!(native.abs() < 1e-9, "{native}");
+}
+
+/// A native reply may list levels in any order; the pick and its confidence
+/// come from the declared order, so a tie still breaks to the first level.
+#[test]
+fn a_native_score_breaks_a_tie_by_declared_level_whatever_the_wire_order() {
+    let complete = Scripted::answering(vec![decisions_reply(json!({"answers": [
+        {"type": "score", "name": "severity", "score": 0.8,
+         "probabilities": [{"value": 2, "probability": 0.2},
+                           {"value": 1, "probability": 0.4},
+                           {"value": 0, "probability": 0.4}]}
+    ]}))]);
+    let route = native_route();
+    let questions = [score("severity", &["low", "mid", "high"])];
+    let decision = decide(&complete, call(&route, &questions)).unwrap();
+    assert_eq!(decision.answers[0].pick(), Some("low"));
+    assert!(decision.answers[0].confidence().unwrap().abs() < 1e-9);
 }
 
 /// Never fabricate: a reply without logprobs means the offer cannot decide.

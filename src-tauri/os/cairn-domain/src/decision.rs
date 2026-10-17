@@ -258,7 +258,8 @@ pub enum DecisionAnswer {
         name: String,
         measured_by: MeasuredBy,
         pick: String,
-        /// The pick's probability, when the model reports one.
+        /// [`choice_confidence`]: the provider's when it reports one, else
+        /// computed from `probabilities`. Absent when neither was reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
         /// Every option's probability, in option order, when reported.
@@ -280,6 +281,8 @@ pub enum DecisionAnswer {
         score: f64,
         /// The most probable level's label, else the level nearest `score`.
         pick: String,
+        /// [`score_confidence`]: the provider's when it reports one, else
+        /// computed from `probabilities`. Absent when neither was reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
         /// Every level's probability, lowest level first, when reported.
@@ -328,13 +331,16 @@ impl DecisionAnswer {
         }
     }
 
-    /// The pick's probability, when one was reported.
+    /// How concentrated the answer's distribution is, from 0 (an even
+    /// spread) to 1 (all probability on the pick), when it can be stated.
+    /// See [`choice_confidence`], [`score_confidence`], and
+    /// [`predicate_confidence`].
     pub fn confidence(&self) -> Option<f64> {
         match self {
             Self::Choice { confidence, .. } | Self::Score { confidence, .. } => *confidence,
             Self::Predicate {
                 probability_yes, ..
-            } => Some(probability_yes.max(1.0 - probability_yes)),
+            } => Some(predicate_confidence(*probability_yes)),
             Self::Refusal { .. } => None,
         }
     }
@@ -349,6 +355,85 @@ impl DecisionAnswer {
             _ => None,
         }
     }
+}
+
+// Confidence is the statistic OpenAI's Decisions API and TypeSafe's Jev both
+// return (https://docs.typesafe.ai/confidence#how-confidence-is-calculated),
+// computed here so an answer measured any other way lands on the same scale and
+// a threshold means one thing whatever answered. Unlike the pick's raw
+// probability, it does not drift with the number of options: an even split is
+// 0 whether a choice has two options or ten.
+
+/// The index of the most probable answer in declared order, the first on a
+/// tie (as the providers' reference does). The canonical pick wherever Cairn
+/// picks from a distribution: a score's confidence depends on which tied peak
+/// is the pick, so every route must break ties the same way, over the declared
+/// order rather than the order a reply listed them in.
+pub fn most_probable(probabilities: &[f64]) -> Option<usize> {
+    probabilities
+        .iter()
+        .enumerate()
+        .fold(
+            None,
+            |best: Option<(usize, f64)>, (index, &probability)| match best {
+                Some((_, peak)) if peak.total_cmp(&probability).is_ge() => best,
+                _ => Some((index, probability)),
+            },
+        )
+        .map(|(index, _)| index)
+}
+
+/// A choice's confidence: how far the pick's probability sits above an even
+/// split over the `options` the question declared, rescaled so the even split
+/// is 0 and certainty is 1.
+///
+/// `options` is the declared count, not however many probabilities a route
+/// reported: an option a route left out had probability 0, and still counted
+/// toward the even split.
+pub fn choice_confidence(pick_probability: f64, options: usize) -> f64 {
+    if options <= 1 {
+        return 1.0;
+    }
+    let even = 1.0 / options as f64;
+    ((pick_probability - even) / (1.0 - even)).clamp(0.0, 1.0)
+}
+
+/// A score's confidence: one minus the probability-weighted distance, in
+/// levels, from the picked level, relative to the same distance for an even
+/// spread measured from the middle level; floored at 0.
+///
+/// `level_probabilities` holds every declared level's probability, lowest
+/// first, and `pick` is the picked level's index. Because levels are ordered,
+/// probability on a neighbouring level costs less than the same probability at
+/// the far end.
+pub fn score_confidence(level_probabilities: &[f64], pick: usize) -> f64 {
+    let levels = level_probabilities.len();
+    if levels <= 1 {
+        return 1.0;
+    }
+    let spread: f64 = level_probabilities
+        .iter()
+        .enumerate()
+        .map(|(level, probability)| probability * level.abs_diff(pick) as f64)
+        .sum();
+    (1.0 - spread / even_spread(levels)).clamp(0.0, 1.0)
+}
+
+/// The mean distance from the middle level of an even spread over `levels`
+/// (the formula's MAD_unif).
+fn even_spread(levels: usize) -> f64 {
+    let middle = (levels - 1) as f64 / 2.0;
+    (0..levels)
+        .map(|level| (level as f64 - middle).abs())
+        .sum::<f64>()
+        / levels as f64
+}
+
+/// A predicate's confidence, `|2p - 1|`: the choice formula for two options.
+/// The Decisions APIs return none for a predicate, so this is what puts a
+/// predicate on the scale its siblings use.
+pub fn predicate_confidence(probability_yes: f64) -> f64 {
+    choice_confidence(probability_yes.max(1.0 - probability_yes), 2)
 }
 
 /// What one `decide` call answered: the answers in question order, the model
@@ -572,11 +657,81 @@ mod tests {
             probability_yes: 0.2,
         };
         assert_eq!(answer.pick(), Some("no"));
-        assert_eq!(answer.confidence(), Some(0.8));
+        assert!((answer.confidence().unwrap() - 0.6).abs() < 1e-12);
         assert_eq!(
             serde_json::to_value(&answer).unwrap()["probabilityYes"],
             json!(0.2)
         );
+    }
+
+    fn close(actual: f64, expected: f64) -> bool {
+        (actual - expected).abs() < 1e-9
+    }
+
+    #[test]
+    fn choice_confidence_is_zero_at_an_even_split_and_one_at_certainty() {
+        for options in [2, 3, 4, 10] {
+            let even = 1.0 / options as f64;
+            assert!(close(choice_confidence(even, options), 0.0), "{options}");
+            assert!(close(choice_confidence(1.0, options), 1.0), "{options}");
+        }
+        // The raw top probability called a four-way even split 0.25.
+        assert!(close(choice_confidence(0.25, 4), 0.0));
+        // TypeSafe: (0.6, 0.3, 0.1) and (0.6, 0.2, 0.2) are both 0.4.
+        assert!(close(choice_confidence(0.6, 3), 0.4));
+        // A lone option is certain.
+        assert_eq!(choice_confidence(1.0, 1), 1.0);
+    }
+
+    #[test]
+    fn score_confidence_charges_distance_from_the_picked_level() {
+        // TypeSafe's worked examples: torn between neighbours, then between ends.
+        assert!(close(score_confidence(&[0.0, 0.5, 0.5], 1), 0.25));
+        assert!(close(score_confidence(&[0.5, 0.0, 0.5], 0), 0.0));
+        assert!(close(score_confidence(&[0.0, 0.0, 1.0], 2), 1.0));
+        // An even spread is floored at 0, not driven negative.
+        assert_eq!(score_confidence(&[0.2; 5], 0), 0.0);
+    }
+
+    /// Which tied peak is the pick changes a score's confidence: level 0 of
+    /// (0.4, 0.4, 0.2) gives 0, level 1 gives 0.1. The first, as TypeSafe's
+    /// reference picks it.
+    #[test]
+    fn the_most_probable_answer_is_the_first_of_a_tie() {
+        let tied = [0.4, 0.4, 0.2];
+        assert_eq!(most_probable(&tied), Some(0));
+        assert!(close(score_confidence(&tied, 0), 0.0));
+        assert!(close(score_confidence(&tied, 1), 0.1));
+        assert_eq!(most_probable(&[0.1, 0.2, 0.7]), Some(2));
+        assert_eq!(most_probable(&[]), None);
+    }
+
+    #[test]
+    fn the_even_spread_is_the_mean_distance_from_the_middle_level() {
+        assert!(close(even_spread(5), 1.2));
+        assert!(close(even_spread(3), 2.0 / 3.0));
+        assert!(close(even_spread(2), 0.5));
+    }
+
+    #[test]
+    fn predicate_confidence_is_the_distance_from_a_coin_flip() {
+        assert!(close(predicate_confidence(0.5), 0.0));
+        assert!(close(predicate_confidence(1.0), 1.0));
+        assert!(close(predicate_confidence(0.0), 1.0));
+        for p in [0.1, 0.35, 0.8, 0.97] {
+            assert!(close(predicate_confidence(p), (2.0 * p - 1.0).abs()), "{p}");
+        }
+    }
+
+    /// The published provider examples: OpenAI's guide (a four-option choice
+    /// at 0.95 reporting 0.93; a three-level score reporting 0.55) and
+    /// TypeSafe's (`bug_severity`, reporting about 0.35).
+    #[test]
+    fn the_formulas_reproduce_the_providers_published_values() {
+        let round = |value: f64| (value * 100.0).round() / 100.0;
+        assert_eq!(round(choice_confidence(0.95, 4)), 0.93);
+        assert_eq!(round(score_confidence(&[0.1, 0.7, 0.2], 1)), 0.55);
+        assert!((score_confidence(&[0.0, 0.57, 0.43], 1) - 0.355).abs() < 1e-9);
     }
 
     fn choice(pick: &str, confidence: Option<f64>, measured_by: MeasuredBy) -> DecisionAnswer {

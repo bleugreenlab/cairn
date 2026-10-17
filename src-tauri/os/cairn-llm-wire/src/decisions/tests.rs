@@ -94,7 +94,7 @@ const DOCUMENTED_REPLY: &str = r#"{
       "type": "choice",
       "name": "queue",
       "choice": "shipping",
-      "confidence": 0.81,
+      "confidence": 0.62,
       "probabilities": [
         { "value": "billing", "probability": 0.19 },
         { "value": "shipping", "probability": 0.81 }
@@ -104,7 +104,7 @@ const DOCUMENTED_REPLY: &str = r#"{
       "type": "score",
       "name": "urgency",
       "score": 1.3,
-      "confidence": 0.62,
+      "confidence": 0.31,
       "probabilities": [
         { "value": 0, "label": "low", "probability": 0.08 },
         { "value": 1, "label": "medium", "probability": 0.54 },
@@ -151,7 +151,7 @@ fn the_documented_reply_decodes_answer_for_answer() {
         panic!("expected a choice: {:?}", reply.answers[1]);
     };
     assert_eq!(choice.as_text(), "shipping");
-    assert_eq!(*confidence, Some(0.81));
+    assert_eq!(*confidence, Some(0.62));
     assert_eq!(probabilities.len(), 2);
     let WireAnswer::Score {
         score,

@@ -19,7 +19,8 @@
 //! answering.
 
 use cairn_domain::decision::{
-    DecisionAnswer, DecisionQuestion, MeasuredBy, OptionProbability, QuestionKind,
+    choice_confidence, most_probable, score_confidence, DecisionAnswer, DecisionQuestion,
+    MeasuredBy, OptionProbability, QuestionKind,
 };
 use serde_json::{json, Value};
 
@@ -169,21 +170,20 @@ impl<'a> Ask<'a> {
             // The generated label was missing from its own alternatives.
             return Err(not_answering());
         }
+        // Every declared answer has a slot, so a label absent from the
+        // alternatives is probability 0 and the formulas see the full count.
+        let normalized: Vec<f64> = mass.iter().map(|mass| mass / total).collect();
         let values = self.question.answer_values();
         let probabilities: Vec<OptionProbability> = values
             .iter()
-            .zip(&mass)
-            .map(|(value, mass)| OptionProbability {
+            .zip(&normalized)
+            .map(|(value, probability)| OptionProbability {
                 value: value.to_string(),
-                probability: mass / total,
+                probability: *probability,
             })
             .collect();
-        let (best, best_probability) = probabilities
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (index, entry.probability))
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .expect("a question has at least one answer");
+        let best = most_probable(&normalized).expect("a question has at least one answer");
+        let best_probability = normalized[best];
         Ok(match &self.question.kind {
             QuestionKind::Predicate => DecisionAnswer::Predicate {
                 name,
@@ -194,7 +194,7 @@ impl<'a> Ask<'a> {
                 name,
                 measured_by,
                 pick: probabilities[best].value.clone(),
-                confidence: Some(best_probability),
+                confidence: Some(choice_confidence(best_probability, values.len())),
                 probabilities,
             },
             QuestionKind::Score { .. } => DecisionAnswer::Score {
@@ -206,7 +206,7 @@ impl<'a> Ask<'a> {
                     .map(|(index, entry)| index as f64 * entry.probability)
                     .sum(),
                 pick: probabilities[best].value.clone(),
-                confidence: Some(best_probability),
+                confidence: Some(score_confidence(&normalized, best)),
                 probabilities,
             },
         })

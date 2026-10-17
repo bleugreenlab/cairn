@@ -2,7 +2,8 @@
 //! answers back onto Cairn's answer type.
 
 use cairn_domain::decision::{
-    DecisionAnswer, DecisionQuestion, MeasuredBy, OptionProbability, QuestionKind,
+    choice_confidence, most_probable, score_confidence, DecisionAnswer, DecisionQuestion,
+    MeasuredBy, OptionProbability, QuestionKind,
 };
 
 use crate::interface::complete::CompletionError;
@@ -56,6 +57,10 @@ fn invalid(text: String) -> DecideError {
 /// `name: null`. A refusal stays a refusal. An answer of the wrong kind, or a
 /// pick that is not one of the question's options, is an invalid reply rather
 /// than something to coerce.
+///
+/// A provider's `confidence` is kept as reported, since the Decisions APIs
+/// compute the same statistic Cairn does; it is computed from the
+/// probabilities only when the provider omits it.
 pub(super) fn answers(
     questions: &[DecisionQuestion],
     reply: DecisionsResponse,
@@ -112,7 +117,7 @@ pub(super) fn answers(
                         probabilities
                             .iter()
                             .find(|entry| entry.value == pick)
-                            .map(|entry| entry.probability)
+                            .map(|entry| choice_confidence(entry.probability, options.len()))
                     });
                     Ok(DecisionAnswer::Choice {
                         name,
@@ -137,6 +142,26 @@ pub(super) fn answers(
                             .and_then(|index| levels.get(index))
                             .map(|level| level.label.clone())
                     };
+                    // Each declared level's probability by its index, whatever
+                    // order the wire listed them in; a level it left out is 0.
+                    let mut by_level = vec![0.0_f64; levels.len()];
+                    let mut placed = false;
+                    for entry in &probabilities {
+                        if let Some(slot) = usize::try_from(entry.value)
+                            .ok()
+                            .and_then(|index| by_level.get_mut(index))
+                        {
+                            *slot += entry.probability;
+                            placed = true;
+                        }
+                    }
+                    let peak = if placed {
+                        most_probable(&by_level)
+                    } else {
+                        None
+                    };
+                    let confidence =
+                        confidence.or_else(|| peak.map(|index| score_confidence(&by_level, index)));
                     let probabilities: Vec<OptionProbability> = probabilities
                         .into_iter()
                         .map(|entry| OptionProbability {
@@ -148,18 +173,13 @@ pub(super) fn answers(
                             probability: entry.probability,
                         })
                         .collect();
-                    let most_probable = probabilities
-                        .iter()
-                        .max_by(|a, b| a.probability.total_cmp(&b.probability));
-                    let pick = match most_probable {
-                        Some(entry) => entry.value.clone(),
+                    let pick = match peak {
+                        Some(index) => levels[index].label.clone(),
                         None => {
                             let nearest = score.round().clamp(0.0, (levels.len() - 1) as f64);
                             levels[nearest as usize].label.clone()
                         }
                     };
-                    let confidence =
-                        confidence.or_else(|| most_probable.map(|entry| entry.probability));
                     Ok(DecisionAnswer::Score {
                         name,
                         measured_by,
