@@ -850,3 +850,182 @@ async fn seam_exit_reason(orch: &Orchestrator) -> String {
         .unwrap()
         .unwrap()
 }
+
+/// Golden: what one owned-loop turn writes for each protocol family's usage,
+/// as the event token and cost columns and the stored `raw` payload. Every
+/// writer that takes a usage is driven, so a change to how usage is read can
+/// only land if what is stored stays byte-for-byte the same.
+#[tokio::test]
+async fn each_familys_usage_persists_as_its_golden() {
+    use crate::db::DbState;
+    use crate::orchestrator::OrchestratorBuilder;
+    use crate::services::testing::TestServicesBuilder;
+    use crate::storage::{MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
+    use cairn_db::turso::params;
+    use cairn_models::wire::stream::{StreamSink, StreamSummary};
+
+    let families: Vec<(&str, TurnUsage)> = vec![
+        (
+            "chat",
+            serde_json::from_value(json!({
+                "prompt_tokens": 1200,
+                "completion_tokens": 300,
+                "total_tokens": 1500,
+                "prompt_tokens_details": {"cached_tokens": 1000},
+                "completion_tokens_details": {"reasoning_tokens": 120},
+                "cost": 0.0042,
+                "cost_details": {"upstream_inference_cost": 0.004}
+            }))
+            .unwrap(),
+        ),
+        (
+            "anthropic",
+            TurnUsage::from_anthropic(Some(40), Some(25), Some(128), Some(64), Some(0.0031)),
+        ),
+        (
+            "responses",
+            TurnUsage::from_responses(
+                Some(900),
+                Some(450),
+                None,
+                Some(json!({"cached_tokens": 300})),
+                Some(json!({"reasoning_tokens": 200})),
+                Some(0.012),
+            ),
+        ),
+    ];
+
+    let db_dir = tempfile::tempdir().unwrap();
+    let db = LocalDb::open(db_dir.path().join("usage-golden.db"))
+        .await
+        .unwrap();
+    MigrationRunner::new(TURSO_MIGRATIONS.to_vec())
+        .run(&db)
+        .await
+        .unwrap();
+    let root = tempfile::tempdir().unwrap().keep();
+    let config_dir = root.join("config");
+    std::fs::create_dir_all(config_dir.join("agents")).unwrap();
+    std::fs::create_dir_all(config_dir.join("recipes")).unwrap();
+    let search_index = Arc::new(SearchIndex::open_or_create(root.join("search")).unwrap());
+    let db_state = Arc::new(DbState::new(Arc::new(db), search_index));
+    let services = Arc::new(TestServicesBuilder::new().build());
+    let orch = OrchestratorBuilder::new(db_state, services, config_dir).build();
+
+    let mut golden = Vec::new();
+    for (family, usage) in families {
+        let run_id = format!("run-{family}");
+        let session_id = format!("session-{family}");
+        let now = chrono::Utc::now().timestamp() as i32;
+        let (run, session) = (run_id.clone(), session_id.clone());
+        orch.db
+            .local
+            .write(move |conn| {
+                let (run, session) = (run.clone(), session.clone());
+                Box::pin(async move {
+                    conn.execute(
+                        "INSERT INTO runs(id, status, session_id, created_at, updated_at)
+                             VALUES (?1, 'live', ?2, ?3, ?4)",
+                        params![run.as_str(), session.as_str(), now, now],
+                    )
+                    .await?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+
+        let mut sink = TranscriptSink::new(
+            &orch,
+            orch.db.local.clone(),
+            &run_id,
+            &session_id,
+            None,
+            "golden",
+        );
+        sink.append("streamed answer").unwrap();
+        sink.finalize(StreamSummary {
+            text: "streamed answer".to_string(),
+            thinking: String::new(),
+            reasoning_details: vec![],
+            usage: Some(usage.clone()),
+            generation_id: Some(format!("gen-{family}")),
+            model: Some(format!("model-{family}")),
+        })
+        .unwrap();
+        super::persist::store_assistant_message(
+            &orch,
+            &orch.db.local,
+            &run_id,
+            &session_id,
+            None,
+            "whole answer",
+            Some(&usage),
+            Some(&format!("gen-{family}")),
+            Some(&format!("model-{family}")),
+            usage.cost,
+            "golden",
+        )
+        .unwrap();
+        store_assistant_tool_call(
+            &orch,
+            &orch.db.local,
+            &run_id,
+            &session_id,
+            None,
+            "",
+            &[tool_call("read", r#"{"paths":["file:a"]}"#)],
+            Some(&usage),
+            Some(&format!("gen-{family}")),
+            Some(&format!("model-{family}")),
+            None,
+            "golden",
+        )
+        .unwrap();
+        super::persist::store_success_result(
+            &orch,
+            &orch.db.local,
+            &run_id,
+            &session_id,
+            None,
+            Some(&usage),
+            Some(&format!("gen-{family}")),
+            Some(&format!("model-{family}")),
+            usage.cost,
+            "golden",
+        )
+        .unwrap();
+
+        let delta = crate::runs::queries::list_events_for_session_delta(
+            orch.db.local.clone(),
+            &session_id,
+            None,
+        )
+        .unwrap();
+        let events: Vec<serde_json::Value> = delta
+            .events
+            .iter()
+            .map(|event| {
+                let data: serde_json::Value = serde_json::from_str(&event.data).unwrap();
+                json!({
+                    "eventType": event.event_type,
+                    "inputTokens": event.input_tokens,
+                    "cacheReadTokens": event.cache_read_tokens,
+                    "cacheCreateTokens": event.cache_create_tokens,
+                    "outputTokens": event.output_tokens,
+                    "thinkingTokens": event.thinking_tokens,
+                    "costUsd": event.cost_usd,
+                    "raw": data["raw"],
+                })
+            })
+            .collect();
+        golden.push(json!({"family": family, "events": events}));
+    }
+    crate::backends::assert_golden_file(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/backends/testdata/usage_persisted.json"
+        ),
+        &(serde_json::to_string_pretty(&golden).unwrap() + "\n"),
+    );
+}

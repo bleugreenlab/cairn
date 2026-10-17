@@ -27,7 +27,8 @@ use std::fmt;
 use cairn_credentials::AccountInfo;
 use cairn_domain::decision::MeasuredBy;
 use cairn_models_types::catalog::{
-    DiscoveredModelPricing, ProviderDescriptor, ProviderModelCatalog,
+    DiscoveredModel, Modalities, ModelPricing, ProviderDescriptor, ProviderModelCatalog,
+    ServedVerb, Verb, VerbKind,
 };
 use cairn_models_types::pool::ProviderPoolSnapshot;
 use serde::Serialize;
@@ -75,21 +76,80 @@ pub struct CatalogProvider {
     pub models: Option<ProviderModelCatalog>,
     /// The tiers bound on this provider, in the workspace's tier order.
     pub tiers: Vec<TierBinding>,
-    /// How this provider's offers answer a decision: natively over the
-    /// Decisions wire, from chat logprobs, or (`None`) not at all.
-    pub decision: Option<MeasuredBy>,
-    /// Models on this provider observed unable to answer a decision despite
-    /// its method (a chat server that returned no logprobs, or a model that
-    /// reasons before it answers), each with why. They offer no decision.
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub decision_unsupported: BTreeMap<String, String>,
+    /// What this provider serves for any model it routes, each verb with the
+    /// wire that carries it. A model whose discovery says what it serves
+    /// ([`DiscoveredModel::serves`]) answers for itself; every other model,
+    /// including one a tier is bound to that discovery has not reported,
+    /// serves this.
+    pub serves: Vec<ServedVerb>,
+    /// Verbs models on this provider were observed unable to serve despite
+    /// what they declare (a chat server that returned no logprobs, or a model
+    /// that reasons before it answers), each with why. Those offers do not
+    /// serve that verb.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unable: Vec<Unable>,
+}
+
+/// A model observed unable to serve a verb it declares.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unable {
+    pub model: String,
+    pub verb: VerbKind,
+    /// Why, as a clause that reads after the model's name.
+    pub why: String,
 }
 
 impl CatalogProvider {
-    /// How `model` on this provider answers a decision, or `None`.
-    pub fn decision_for(&self, model: &str) -> Option<MeasuredBy> {
-        self.decision
-            .filter(|_| !self.decision_unsupported.contains_key(model))
+    /// What `model` on this provider serves: its own declaration when
+    /// discovery made one, otherwise the provider's, minus every verb it was
+    /// observed unable to serve.
+    pub fn serves_for(&self, model: &str) -> Vec<ServedVerb> {
+        let declared = self
+            .discovered(model)
+            .and_then(|discovered| discovered.serves.as_deref());
+        self.serves_declared(model, declared)
+    }
+
+    /// Why `model` was observed unable to serve `verb`, when it was.
+    pub fn unable_to(&self, model: &str, verb: VerbKind) -> Option<&str> {
+        self.unable
+            .iter()
+            .find(|unable| unable.model == model && unable.verb == verb)
+            .map(|unable| unable.why.as_str())
+    }
+
+    fn serves_declared(&self, model: &str, declared: Option<&[ServedVerb]>) -> Vec<ServedVerb> {
+        declared
+            .unwrap_or(&self.serves)
+            .iter()
+            .filter(|served| self.unable_to(model, served.verb.kind()).is_none())
+            .cloned()
+            .collect()
+    }
+
+    fn discovered(&self, model: &str) -> Option<&DiscoveredModel> {
+        self.models
+            .as_ref()?
+            .models
+            .iter()
+            .find(|discovered| discovered.model == model || discovered.id == model)
+    }
+
+    /// Whether `account` (when one is asked for) serves `model` here. A model
+    /// that names no serving accounts is served by every account of its
+    /// provider.
+    fn account_serves(&self, model: &str, account: Option<&str>) -> bool {
+        let Some(account) = account else {
+            return true;
+        };
+        self.discovered(model).is_none_or(|discovered| {
+            discovered.serving_account_ids.is_empty()
+                || discovered
+                    .serving_account_ids
+                    .iter()
+                    .any(|id| id == account)
+        })
     }
 }
 
@@ -128,11 +188,168 @@ pub struct CatalogOffer {
     /// The id the provider itself is sent.
     pub model: String,
     pub context_window: Option<i64>,
-    pub pricing: Option<DiscoveredModelPricing>,
-    /// How this offer can answer a decision, or `None`. Whether a given
-    /// answer was measured natively is recorded on the answer itself, since
+    /// What the model takes in and gives out, when its provider said.
+    pub modalities: Option<Modalities>,
+    pub pricing: Option<ModelPricing>,
+    /// What this offer serves, each verb with its wire. Whether a given
+    /// decision was measured natively is recorded on the answer itself, since
     /// tier resolution picks the offer at run time.
-    pub decision: Option<MeasuredBy>,
+    pub serves: Vec<ServedVerb>,
+    /// The accounts that serve this offer. Empty means every account of its
+    /// provider.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub serving_account_ids: Vec<String>,
+}
+
+impl CatalogOffer {
+    /// This offer as the server of `verb`, over its best wire for it, when it
+    /// serves it.
+    pub fn selected(&self, verb: VerbKind) -> Option<SelectedOffer> {
+        Some(SelectedOffer {
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            served: best(&self.serves, verb)?,
+        })
+    }
+}
+
+/// What a caller asks the catalog for: an offer serving `verb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OfferQuery<'a> {
+    pub verb: VerbKind,
+    /// The model or tier an author wrote. Unset, or blank, takes the best
+    /// offer.
+    pub requested: Option<&'a str>,
+    /// Only this provider's offers.
+    pub provider: Option<&'a str>,
+    /// Only offers this account serves. A custom provider's key already is
+    /// its account; this narrows providers whose models are served per
+    /// account (Ollama hosts, Actual targets).
+    pub account: Option<&'a str>,
+}
+
+impl<'a> OfferQuery<'a> {
+    /// Any offer serving `verb`.
+    pub fn new(verb: VerbKind) -> Self {
+        Self {
+            verb,
+            requested: None,
+            provider: None,
+            account: None,
+        }
+    }
+
+    fn admits_provider(&self, key: &str) -> bool {
+        self.provider.is_none_or(|provider| provider == key)
+    }
+
+    fn admits_offer(&self, offer: &CatalogOffer) -> bool {
+        self.admits_provider(&offer.provider)
+            && self.account.is_none_or(|account| {
+                offer.serving_account_ids.is_empty()
+                    || offer.serving_account_ids.iter().any(|id| id == account)
+            })
+    }
+}
+
+/// The offer a verb will be served by, as the catalog chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedOffer {
+    /// The provider's backend key.
+    pub provider: String,
+    /// The id the provider is sent.
+    pub model: String,
+    /// The verb it serves and the wire that carries it.
+    pub served: ServedVerb,
+}
+
+impl SelectedOffer {
+    /// How this offer measures a decision, when what it serves is `decide`.
+    pub fn measured_by(&self) -> Option<MeasuredBy> {
+        match self.served.verb {
+            Verb::Decide => decide::measured_by(self.served.wire),
+            Verb::Complete | Verb::Session => None,
+        }
+    }
+}
+
+/// Nothing in scope serves a verb, or nothing serves it for what was asked.
+/// The text names the fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoOffer {
+    pub verb: VerbKind,
+    /// The model or tier the caller asked for, when it asked for one.
+    pub requested: Option<String>,
+    /// Why the request found nothing, when there is more to say than that
+    /// nothing is configured.
+    pub detail: Option<String>,
+}
+
+impl fmt::Display for NoOffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let capable = capable(self.verb);
+        match &self.requested {
+            Some(requested) => write!(f, "No {capable} model serves '{requested}'")?,
+            None => write!(f, "No {capable} model is configured")?,
+        }
+        if let Some(detail) = &self.detail {
+            write!(f, ": {detail}")?;
+        }
+        write!(f, ". {}", fixes(self.verb))
+    }
+}
+
+impl std::error::Error for NoOffer {}
+
+/// The fixes a completion or session refusal names.
+const CONVERSATION_FIXES: &str =
+    "To fix it, install or configure a provider in Settings → Providers.";
+
+/// The adjective a refusal gives a model that serves `verb`.
+fn capable(verb: VerbKind) -> &'static str {
+    match verb {
+        VerbKind::Complete => "completion-capable",
+        VerbKind::Session => "session-capable",
+        VerbKind::Decide => "decision-capable",
+    }
+}
+
+/// What a refusal says of providers that do not serve `verb`.
+fn cannot(verb: VerbKind) -> &'static str {
+    match verb {
+        VerbKind::Complete => "cannot serve completions",
+        VerbKind::Session => "cannot run sessions",
+        VerbKind::Decide => "cannot answer decisions",
+    }
+}
+
+/// The fixes every refusal of `verb` names.
+pub fn fixes(verb: VerbKind) -> &'static str {
+    match verb {
+        VerbKind::Complete | VerbKind::Session => CONVERSATION_FIXES,
+        VerbKind::Decide => decide::DECISION_FIXES,
+    }
+}
+
+/// How offers serving the same verb rank, lower first. A decision measured
+/// natively comes before one read from logprobs; every other verb ranks
+/// flat, which leaves the workspace's provider order to decide.
+fn preference(served: &ServedVerb) -> u8 {
+    match served.verb {
+        Verb::Decide if decide::measured_by(served.wire) == Some(MeasuredBy::Native) => 0,
+        Verb::Decide => 1,
+        Verb::Complete | Verb::Session => 0,
+    }
+}
+
+/// The best way `serves` serves `verb`, when it does: the first of the best
+/// [`preference`].
+fn best(serves: &[ServedVerb], verb: VerbKind) -> Option<ServedVerb> {
+    serves
+        .iter()
+        .filter(|served| served.verb.kind() == verb)
+        .min_by_key(|served| preference(served))
+        .cloned()
 }
 
 impl Catalog {
@@ -210,8 +427,10 @@ impl Catalog {
                         provider: key.to_string(),
                         model: model.model.clone(),
                         context_window: model.context_window,
+                        modalities: model.modalities.clone(),
                         pricing: model.pricing.clone(),
-                        decision: provider.decision_for(&model.model),
+                        serves: provider.serves_declared(&model.model, model.serves.as_deref()),
+                        serving_account_ids: model.serving_account_ids.clone(),
                     },
                     aliases,
                 );
@@ -230,8 +449,10 @@ impl Catalog {
                         provider: key.to_string(),
                         model: binding.model.clone(),
                         context_window: None,
+                        modalities: None,
                         pricing: None,
-                        decision: provider.decision_for(&binding.model),
+                        serves: provider.serves_declared(&binding.model, None),
+                        serving_account_ids: Vec::new(),
                     },
                     tier_refs(&[binding.model.as_str()]),
                 );
@@ -240,57 +461,52 @@ impl Catalog {
         out
     }
 
-    /// Every offer that can answer a decision: native offers first, then
-    /// logprobs offers, each in the workspace's provider order.
-    pub fn decision_offers(&self) -> Vec<decide::DecisionOffer> {
-        let mut offers: Vec<decide::DecisionOffer> = self
-            .models()
-            .into_iter()
-            .flat_map(|model| model.offers)
-            .filter_map(|offer| {
-                Some(decide::DecisionOffer {
-                    method: offer.decision?,
-                    provider: offer.provider,
-                    model: offer.model,
-                })
-            })
-            .collect();
-        // Stable: provider order survives within each method.
-        offers.sort_by_key(|offer| offer.method != MeasuredBy::Native);
-        offers
+    /// Every offer serving `verb`, best first: by its wire's preference, then
+    /// in the workspace's provider order.
+    pub fn offers_serving(&self, verb: VerbKind) -> Vec<SelectedOffer> {
+        self.candidates(&OfferQuery::new(verb))
     }
 
-    /// The offer a decision asking for `requested` is served by.
+    /// The offer that serves `query.verb` for what was asked.
     ///
-    /// `requested` is what an author wrote. Unset takes the first
-    /// decision-capable offer ([`Self::decision_offers`]). A tier (`sm`, or
-    /// `provider/sm`) takes that tier's binding on a decision-capable
-    /// provider, the tier's default provider first. Anything else is an exact
-    /// model, matched by native id, catalog id, or alias. A selection that
-    /// lands only on providers that cannot decide is refused, never served by
-    /// something that can.
-    pub fn decision_offer(
-        &self,
-        requested: Option<&str>,
-    ) -> Result<decide::DecisionOffer, decide::NoDecisionOffer> {
-        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
-        let refuse = |detail: Option<String>| decide::NoDecisionOffer {
+    /// `requested` is what an author wrote. Unset takes the best offer
+    /// serving the verb ([`Self::offers_serving`]). A tier (`sm`, or
+    /// `provider/sm`) takes that tier's binding on a provider that serves the
+    /// verb, the best wire first and then the tier's default provider.
+    /// Anything else is an exact model, matched by native id, catalog id, or
+    /// alias. A selection that lands only on offers that do not serve the
+    /// verb is refused, never served by something that does. `provider` and
+    /// `account` narrow every branch.
+    pub fn offer_for(&self, query: OfferQuery<'_>) -> Result<SelectedOffer, NoOffer> {
+        let verb = query.verb;
+        let requested = query
+            .requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let refuse = |detail: Option<String>| NoOffer {
+            verb,
             requested: requested.map(str::to_string),
             detail,
         };
         let Some(requested) = requested else {
-            return self.decision_offers().into_iter().next().ok_or_else(|| {
-                // Say why offers that would have decided did not.
+            return self.candidates(&query).into_iter().next().ok_or_else(|| {
+                // Say why offers that would have served it did not.
                 let unable: Vec<String> = self
                     .installed()
-                    .filter(|provider| provider.decision.is_some())
+                    .filter(|provider| query.admits_provider(&provider.descriptor.key))
                     .flat_map(|provider| {
-                        provider
-                            .decision_unsupported
+                        let mut unable: Vec<&Unable> = provider
+                            .unable
                             .iter()
-                            .map(move |(model, why)| {
-                                format!("{model} on {} {why}", provider.descriptor.key)
-                            })
+                            .filter(|unable| unable.verb == verb)
+                            .collect();
+                        unable.sort_by(|a, b| a.model.cmp(&b.model));
+                        unable.into_iter().map(move |unable| {
+                            format!(
+                                "{} on {} {}",
+                                unable.model, provider.descriptor.key, unable.why
+                            )
+                        })
                     })
                     .collect();
                 refuse((!unable.is_empty()).then(|| {
@@ -312,9 +528,12 @@ impl Catalog {
             }
             _ => (None, requested),
         };
-        let mut bindings: Vec<(&CatalogProvider, &TierBinding)> = self
+        let bindings: Vec<(&CatalogProvider, &TierBinding)> = self
             .installed()
-            .filter(|provider| qualifier.is_none_or(|key| provider.descriptor.key.as_ref() == key))
+            .filter(|provider| {
+                let key = provider.descriptor.key.as_ref();
+                query.admits_provider(key) && qualifier.is_none_or(|qualifier| qualifier == key)
+            })
             .flat_map(|provider| {
                 provider
                     .tiers
@@ -324,32 +543,43 @@ impl Catalog {
             })
             .collect();
         if !bindings.is_empty() {
-            bindings.sort_by_key(|(provider, binding)| {
-                (
-                    provider.decision != Some(MeasuredBy::Native),
-                    !binding.is_tier_default,
-                )
-            });
-            return bindings
+            let mut picks: Vec<(SelectedOffer, bool)> = bindings
                 .iter()
-                .find_map(|(provider, binding)| {
-                    Some(decide::DecisionOffer {
+                .filter(|(provider, binding)| {
+                    provider.account_serves(&binding.model, query.account)
+                })
+                .filter_map(|(provider, binding)| {
+                    let offer = SelectedOffer {
                         provider: provider.descriptor.key.to_string(),
                         model: binding.model.clone(),
-                        method: provider.decision_for(&binding.model)?,
-                    })
+                        served: best(&provider.serves_for(&binding.model), verb)?,
+                    };
+                    Some((offer, binding.is_tier_default))
                 })
+                .collect();
+            // Stable: provider order survives within each rank.
+            picks.sort_by_key(|(offer, is_tier_default)| {
+                (preference(&offer.served), !is_tier_default)
+            });
+            return picks
+                .into_iter()
+                .next()
+                .map(|(offer, _)| offer)
                 .ok_or_else(|| {
                     refuse(Some(format!(
-                        "the '{requested}' tier is bound only on {}, which cannot answer decisions{}",
+                        "the '{requested}' tier is bound only on {}, which {}{}",
                         bindings
                             .iter()
                             .map(|(provider, _)| provider.descriptor.key.as_ref())
                             .collect::<Vec<_>>()
                             .join(", "),
-                        self.observed_unable(bindings.iter().map(|(provider, binding)| {
-                            (provider.descriptor.key.as_ref(), binding.model.as_str())
-                        }))
+                        cannot(verb),
+                        self.observed_unable(
+                            verb,
+                            bindings.iter().map(|(provider, binding)| {
+                                (provider.descriptor.key.as_ref(), binding.model.as_str())
+                            })
+                        )
                     )))
                 });
         }
@@ -363,23 +593,18 @@ impl Catalog {
                     || model.offers.iter().any(|offer| offer.model == requested)
             })
             .flat_map(|model| model.offers)
+            .filter(|offer| query.admits_offer(offer))
             .collect();
         if matching.is_empty() {
             return Err(refuse(Some(format!(
                 "no installed provider offers '{requested}'"
             ))));
         }
-        let mut capable: Vec<decide::DecisionOffer> = matching
+        let mut capable: Vec<SelectedOffer> = matching
             .iter()
-            .filter_map(|offer| {
-                Some(decide::DecisionOffer {
-                    provider: offer.provider.clone(),
-                    model: offer.model.clone(),
-                    method: offer.decision?,
-                })
-            })
+            .filter_map(|offer| offer.selected(verb))
             .collect();
-        capable.sort_by_key(|offer| offer.method != MeasuredBy::Native);
+        capable.sort_by_key(|offer| preference(&offer.served));
         capable.into_iter().next().ok_or_else(|| {
             let mut providers: Vec<&str> = matching
                 .iter()
@@ -387,9 +612,11 @@ impl Catalog {
                 .collect();
             providers.dedup();
             refuse(Some(format!(
-                "'{requested}' is offered only by {}, which cannot answer decisions{}",
+                "'{requested}' is offered only by {}, which {}{}",
                 providers.join(", "),
+                cannot(verb),
                 self.observed_unable(
+                    verb,
                     matching
                         .iter()
                         .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
@@ -398,16 +625,34 @@ impl Catalog {
         })
     }
 
-    /// Why the named offers were observed unable to decide, as a clause to
-    /// append to a refusal; empty when none was.
-    fn observed_unable<'a>(&self, offers: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    /// Every offer `query` admits that serves its verb, best first.
+    fn candidates(&self, query: &OfferQuery<'_>) -> Vec<SelectedOffer> {
+        let mut offers: Vec<SelectedOffer> = self
+            .models()
+            .into_iter()
+            .flat_map(|model| model.offers)
+            .filter(|offer| query.admits_offer(offer))
+            .filter_map(|offer| offer.selected(query.verb))
+            .collect();
+        // Stable: provider order survives within each rank.
+        offers.sort_by_key(|offer| preference(&offer.served));
+        offers
+    }
+
+    /// Why the named offers were observed unable to serve `verb`, as a clause
+    /// to append to a refusal; empty when none was.
+    fn observed_unable<'a>(
+        &self,
+        verb: VerbKind,
+        offers: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> String {
         let reasons: Vec<String> = offers
             .filter_map(|(key, model)| {
                 let provider = self
                     .providers
                     .iter()
                     .find(|provider| provider.descriptor.key.as_ref() == key)?;
-                let why = provider.decision_unsupported.get(model)?;
+                let why = provider.unable_to(model, verb)?;
                 Some(format!("{model} on {key} {why}"))
             })
             .collect();
@@ -519,7 +764,7 @@ pub trait Models: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_models_types::catalog::{claude_models, descriptor, DiscoveredModel};
+    use cairn_models_types::catalog::{claude_models, descriptor, DiscoveredModel, Wire};
 
     fn model(id: &str, slug: Option<&str>) -> DiscoveredModel {
         let mut model = claude_models().remove(0);
@@ -556,14 +801,55 @@ mod tests {
                 error: None,
             }),
             tiers,
-            decision: None,
-            decision_unsupported: BTreeMap::new(),
+            serves: Vec::new(),
+            unable: Vec::new(),
+        }
+    }
+
+    fn decision_wire(method: MeasuredBy) -> Wire {
+        match method {
+            MeasuredBy::Native => Wire::OpenAiDecisions,
+            MeasuredBy::Logprobs => Wire::OpenAiChatCompletions,
         }
     }
 
     fn deciding(mut provider: CatalogProvider, method: MeasuredBy) -> CatalogProvider {
-        provider.decision = Some(method);
+        provider.serves = vec![ServedVerb {
+            verb: Verb::Decide,
+            wire: decision_wire(method),
+        }];
         provider
+    }
+
+    fn conversing(mut provider: CatalogProvider) -> CatalogProvider {
+        provider.serves = ServedVerb::conversation(Wire::OpenAiChatCompletions);
+        provider
+    }
+
+    fn decide(catalog: &Catalog, requested: Option<&str>) -> Result<SelectedOffer, NoOffer> {
+        catalog.offer_for(OfferQuery {
+            requested,
+            ..OfferQuery::new(VerbKind::Decide)
+        })
+    }
+
+    fn decision(provider: &str, model: &str, method: MeasuredBy) -> SelectedOffer {
+        SelectedOffer {
+            provider: provider.into(),
+            model: model.into(),
+            served: ServedVerb {
+                verb: Verb::Decide,
+                wire: decision_wire(method),
+            },
+        }
+    }
+
+    fn unable(model: &str, why: &str) -> Unable {
+        Unable {
+            model: model.into(),
+            verb: VerbKind::Decide,
+            why: why.into(),
+        }
     }
 
     fn custom(account: &str, models: &[&str], tiers: Vec<TierBinding>) -> CatalogProvider {
@@ -584,8 +870,8 @@ mod tests {
                 error: None,
             }),
             tiers,
-            decision: None,
-            decision_unsupported: BTreeMap::new(),
+            serves: Vec::new(),
+            unable: Vec::new(),
         }
     }
 
@@ -600,7 +886,7 @@ mod tests {
     }
 
     #[test]
-    fn offers_state_their_providers_decision_method() {
+    fn offers_state_what_their_provider_serves() {
         let catalog = Catalog {
             providers: vec![
                 provider("claude", Some(claude_models()), vec![]),
@@ -611,11 +897,22 @@ mod tests {
             ],
         };
         let models = catalog.models();
-        assert_eq!(find(&models, "claude/opus").offers[0].decision, None);
+        assert_eq!(
+            find(&models, "claude/opus").offers[0].selected(VerbKind::Decide),
+            None
+        );
         let gemma = find(&models, "custom:acc_sparks/gemma4-26b");
-        assert_eq!(gemma.offers[0].decision, Some(MeasuredBy::Logprobs));
+        assert_eq!(
+            gemma.offers[0]
+                .selected(VerbKind::Decide)
+                .and_then(|offer| offer.measured_by()),
+            Some(MeasuredBy::Logprobs)
+        );
         let json = serde_json::to_value(&gemma.offers[0]).unwrap();
-        assert_eq!(json["decision"], "logprobs");
+        assert_eq!(
+            json["serves"],
+            serde_json::json!([{ "verb": "decide", "wire": "openai-chat" }])
+        );
     }
 
     #[test]
@@ -633,22 +930,18 @@ mod tests {
             ],
         };
         assert_eq!(
-            catalog.decision_offer(None).unwrap(),
-            decide::DecisionOffer {
-                provider: "custom:acc_gateway".into(),
-                model: "typesafe-ai/jev".into(),
-                method: MeasuredBy::Native,
-            }
+            decide(&catalog, None).unwrap(),
+            decision("custom:acc_gateway", "typesafe-ai/jev", MeasuredBy::Native)
         );
         assert_eq!(
-            catalog.decision_offer(Some("  ")).unwrap().provider,
+            decide(&catalog, Some("  ")).unwrap().provider,
             "custom:acc_gateway"
         );
     }
 
     #[test]
     fn a_subscription_only_workspace_refuses_naming_the_fixes() {
-        let refusal = subscription_only().decision_offer(None).unwrap_err();
+        let refusal = decide(&subscription_only(), None).unwrap_err();
         let text = refusal.to_string();
         assert!(
             text.starts_with("No decision-capable model is configured."),
@@ -662,7 +955,7 @@ mod tests {
     #[test]
     fn a_tier_resolves_only_on_providers_that_can_decide() {
         let mut catalog = subscription_only();
-        let refusal = catalog.decision_offer(Some("sm")).unwrap_err();
+        let refusal = decide(&catalog, Some("sm")).unwrap_err();
         assert_eq!(
             refusal.detail.as_deref(),
             Some("the 'sm' tier is bound only on claude, which cannot answer decisions")
@@ -673,18 +966,13 @@ mod tests {
             MeasuredBy::Logprobs,
         ));
         assert_eq!(
-            catalog.decision_offer(Some("sm")).unwrap(),
-            decide::DecisionOffer {
-                provider: "custom:acc_sparks".into(),
-                model: "qwen3-4b".into(),
-                method: MeasuredBy::Logprobs,
-            }
+            decide(&catalog, Some("sm")).unwrap(),
+            decision("custom:acc_sparks", "qwen3-4b", MeasuredBy::Logprobs)
         );
         // A qualified tier names its provider and nothing else.
-        assert!(catalog.decision_offer(Some("claude/sm")).is_err());
+        assert!(decide(&catalog, Some("claude/sm")).is_err());
         assert_eq!(
-            catalog
-                .decision_offer(Some("custom:acc_sparks/sm"))
+            decide(&catalog, Some("custom:acc_sparks/sm"))
                 .unwrap()
                 .model,
             "qwen3-4b"
@@ -694,7 +982,7 @@ mod tests {
     #[test]
     fn an_exact_model_is_refused_when_only_non_deciding_providers_offer_it() {
         let mut catalog = subscription_only();
-        let refusal = catalog.decision_offer(Some("opus")).unwrap_err();
+        let refusal = decide(&catalog, Some("opus")).unwrap_err();
         assert_eq!(refusal.requested.as_deref(), Some("opus"));
         assert_eq!(
             refusal.detail.as_deref(),
@@ -704,7 +992,7 @@ mod tests {
             .to_string()
             .starts_with("No decision-capable model serves 'opus': "));
 
-        let unknown = catalog.decision_offer(Some("nothing-like-it")).unwrap_err();
+        let unknown = decide(&catalog, Some("nothing-like-it")).unwrap_err();
         assert_eq!(
             unknown.detail.as_deref(),
             Some("no installed provider offers 'nothing-like-it'")
@@ -715,11 +1003,10 @@ mod tests {
             MeasuredBy::Native,
         ));
         assert_eq!(
-            catalog
-                .decision_offer(Some("typesafe-ai/jev"))
+            decide(&catalog, Some("typesafe-ai/jev"))
                 .unwrap()
-                .method,
-            MeasuredBy::Native
+                .measured_by(),
+            Some(MeasuredBy::Native)
         );
     }
 
@@ -733,37 +1020,149 @@ mod tests {
             ),
             MeasuredBy::Logprobs,
         );
-        sparks
-            .decision_unsupported
-            .insert("qwen3".into(), "returned no logprobs".into());
+        sparks.unable.push(unable("qwen3", "returned no logprobs"));
         let catalog = Catalog {
             providers: vec![sparks],
         };
         // The other model on the same provider still decides.
-        let offers = catalog.decision_offers();
+        let offers = catalog.offers_serving(VerbKind::Decide);
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].model, "gemma4");
-        assert_eq!(catalog.decision_offer(None).unwrap().model, "gemma4");
+        assert_eq!(decide(&catalog, None).unwrap().model, "gemma4");
 
         let mut only_qwen = catalog.clone();
-        only_qwen.providers[0].decision_unsupported.insert(
-            "gemma4".into(),
-            "began 'The' instead of an answer label".into(),
-        );
-        let refusal = only_qwen.decision_offer(None).unwrap_err();
+        only_qwen.providers[0]
+            .unable
+            .push(unable("gemma4", "began 'The' instead of an answer label"));
+        let refusal = decide(&only_qwen, None).unwrap_err();
         assert_eq!(
             refusal.detail.as_deref(),
             Some("every offer that could was seen unable (gemma4 on custom:acc_sparks began 'The' instead of an answer label; qwen3 on custom:acc_sparks returned no logprobs)")
         );
 
         for requested in ["qwen3", "sm"] {
-            let refusal = catalog.decision_offer(Some(requested)).unwrap_err();
+            let refusal = decide(&catalog, Some(requested)).unwrap_err();
             let detail = refusal.detail.unwrap();
             assert!(
                 detail.ends_with("(qwen3 on custom:acc_sparks returned no logprobs)"),
                 "{detail}"
             );
         }
+    }
+
+    #[test]
+    fn a_models_own_declaration_stands_in_for_its_providers() {
+        // An image model that outputs no text serves nothing Cairn has, while
+        // a model discovery made no claim about serves what its provider does.
+        let mut image = model("google/image-only", None);
+        image.serves = Some(Vec::new());
+        let chat = model("openai/gpt", None);
+        let mut responses = model("openai/codex", None);
+        responses.serves = Some(ServedVerb::conversation(Wire::OpenAiResponses));
+        let catalog = Catalog {
+            providers: vec![conversing(provider(
+                "openrouter",
+                Some(vec![image, chat, responses]),
+                vec![],
+            ))],
+        };
+        let offers = catalog.offers_serving(VerbKind::Complete);
+        assert_eq!(
+            offers
+                .iter()
+                .map(|offer| (offer.model.as_str(), offer.served.wire))
+                .collect::<Vec<_>>(),
+            [
+                ("openai/gpt", Wire::OpenAiChatCompletions),
+                ("openai/codex", Wire::OpenAiResponses),
+            ]
+        );
+        let refusal = catalog
+            .offer_for(OfferQuery {
+                requested: Some("google/image-only"),
+                ..OfferQuery::new(VerbKind::Session)
+            })
+            .unwrap_err();
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("'google/image-only' is offered only by openrouter, which cannot run sessions")
+        );
+    }
+
+    #[test]
+    fn provider_and_account_narrow_every_selection() {
+        let mut on_low = model("qwen3", None);
+        on_low.serving_account_ids = vec!["low".into()];
+        let catalog = Catalog {
+            providers: vec![
+                conversing(provider(
+                    "ollama",
+                    Some(vec![on_low]),
+                    vec![binding("sm", "qwen3")],
+                )),
+                conversing(provider(
+                    "openrouter",
+                    Some(vec![model("qwen3", None)]),
+                    vec![],
+                )),
+            ],
+        };
+        let complete = |provider: Option<&'static str>,
+                        account: Option<&'static str>,
+                        requested: Option<&'static str>| {
+            catalog.offer_for(OfferQuery {
+                verb: VerbKind::Complete,
+                requested,
+                provider,
+                account,
+            })
+        };
+        assert_eq!(
+            complete(None, None, Some("qwen3")).unwrap().provider,
+            "ollama"
+        );
+        assert_eq!(
+            complete(Some("openrouter"), None, Some("qwen3"))
+                .unwrap()
+                .provider,
+            "openrouter"
+        );
+        assert_eq!(
+            complete(Some("ollama"), Some("low"), Some("sm"))
+                .unwrap()
+                .model,
+            "qwen3"
+        );
+        assert!(complete(Some("ollama"), Some("high"), Some("qwen3")).is_err());
+        assert!(complete(Some("ollama"), Some("high"), Some("sm")).is_err());
+        // An offer that names no serving account is served by every account.
+        assert_eq!(
+            complete(None, Some("high"), None).unwrap().provider,
+            "openrouter"
+        );
+    }
+
+    #[test]
+    fn a_verb_nothing_serves_refuses_with_its_own_fixes() {
+        let refusal = subscription_only()
+            .offer_for(OfferQuery::new(VerbKind::Session))
+            .unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "No session-capable model is configured. To fix it, install or configure a provider in Settings → Providers."
+        );
+        let refusal = subscription_only()
+            .offer_for(OfferQuery {
+                requested: Some("opus"),
+                ..OfferQuery::new(VerbKind::Complete)
+            })
+            .unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("No completion-capable model serves 'opus': 'opus' is offered only by claude, which cannot serve completions. To fix it"),
+            "{refusal}"
+        );
     }
 
     fn find<'a>(models: &'a [CatalogModel], id: &str) -> &'a CatalogModel {

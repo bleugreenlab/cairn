@@ -7,7 +7,13 @@
 //! Response path (a process per call, a prompt-text journal row) would throw
 //! that away. It shares `complete`'s substrate instead: the same [`Complete`]
 //! carries its POST, and the same [`super::Catalog`] chooses its offer
-//! ([`super::Catalog::decision_offer`]).
+//! ([`super::Catalog::offer_for`] asked for [`VerbKind::Decide`]).
+//!
+//! An offer declares that it serves `decide` over a wire; how its answers are
+//! measured follows from that wire ([`measured_by`]) and is never declared
+//! beside it.
+//!
+//! [`VerbKind::Decide`]: cairn_models_types::catalog::VerbKind::Decide
 //!
 //! Questions and answers are `cairn_domain::decision` types; the facet defines
 //! no mirror of them. What it adds is how an answer is measured: natively over
@@ -21,8 +27,10 @@ use std::fmt;
 use std::time::Duration;
 
 use cairn_domain::decision::{DecisionQuestion, MeasuredBy};
+use cairn_models_types::catalog::Wire;
 
-use super::complete::CompletionError;
+use super::complete::{CompletionError, CompletionWire};
+use super::NoOffer;
 use crate::wire::decisions::http::DecisionsEndpoint;
 use crate::wire::openai_compat::http::Endpoint;
 
@@ -36,11 +44,19 @@ pub enum DecisionRoute {
 }
 
 impl DecisionRoute {
-    pub fn measured_by(&self) -> MeasuredBy {
+    /// The completion route a decision on this deployment is sent over.
+    pub fn completion_wire(&self) -> CompletionWire<'_> {
         match self {
-            Self::Native(_) => MeasuredBy::Native,
-            Self::Logprobs(_) => MeasuredBy::Logprobs,
+            Self::Native(endpoint) => CompletionWire::Decisions(endpoint),
+            Self::Logprobs(endpoint) => CompletionWire::Chat(endpoint),
         }
+    }
+
+    /// How this route measures: by the wire it is sent over, through the one
+    /// wire-to-method mapping ([`measured_by`]).
+    pub fn measured_by(&self) -> MeasuredBy {
+        measured_by(self.completion_wire().wire())
+            .expect("a decision route is sent over a wire that measures decisions")
     }
 
     pub fn backend_key(&self) -> &str {
@@ -58,6 +74,19 @@ impl DecisionRoute {
     }
 }
 
+/// How a decision served over `wire` is measured, or `None` for a wire that
+/// cannot measure one.
+pub fn measured_by(wire: Wire) -> Option<MeasuredBy> {
+    match wire {
+        Wire::OpenAiDecisions => Some(MeasuredBy::Native),
+        Wire::OpenAiChatCompletions => Some(MeasuredBy::Logprobs),
+        Wire::AnthropicMessages
+        | Wire::OpenAiResponses
+        | Wire::ClaudeStreamJson
+        | Wire::CodexAppServer => None,
+    }
+}
+
 /// One decision request.
 pub struct DecisionCall<'a> {
     pub route: &'a DecisionRoute,
@@ -70,28 +99,7 @@ pub struct DecisionCall<'a> {
     pub timeout: Duration,
 }
 
-/// The offer a decision will be served by, as the catalog chose it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecisionOffer {
-    /// The provider's backend key.
-    pub provider: String,
-    /// The id the provider is sent.
-    pub model: String,
-    pub method: MeasuredBy,
-}
-
-/// Nothing in scope can answer a decision, or nothing can answer the one
-/// asked for. The text names the fixes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoDecisionOffer {
-    /// The model or tier the caller asked for, when it asked for one.
-    pub requested: Option<String>,
-    /// Why the request found nothing, when there is more to say than that
-    /// nothing is configured.
-    pub detail: Option<String>,
-}
-
-/// The fixes every no-offer refusal names.
+/// The fixes every no-offer refusal of a decision names.
 pub const DECISION_FIXES: &str =
     "A decision is answered by a decision model or by a local model's \
 logprobs, never by a chat model reporting its own probabilities. To fix it, add a custom provider \
@@ -100,26 +108,11 @@ Vercel AI Gateway at https://ai-gateway.vercel.sh/v1, or TypeSafe Jev) with the 
 Decisions, or an OpenAI-compatible server that returns logprobs (for example vLLM) with the \
 protocol set to OpenAI chat.";
 
-impl fmt::Display for NoDecisionOffer {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.requested {
-            Some(requested) => write!(f, "No decision-capable model serves '{requested}'")?,
-            None => f.write_str("No decision-capable model is configured")?,
-        }
-        if let Some(detail) = &self.detail {
-            write!(f, ": {detail}")?;
-        }
-        write!(f, ". {DECISION_FIXES}")
-    }
-}
-
-impl std::error::Error for NoDecisionOffer {}
-
 /// Why a decision produced no answers. A refused question is not an error:
 /// it is an answer ([`cairn_domain::decision::DecisionAnswer::Refusal`]).
 #[derive(Debug, PartialEq)]
 pub enum DecideError {
-    NoOffer(NoDecisionOffer),
+    NoOffer(NoOffer),
     /// The questions cannot be asked as written.
     InvalidQuestions(Vec<String>),
     /// A logprobs route's endpoint returned no logprobs, so it cannot measure
@@ -190,8 +183,8 @@ impl From<CompletionError> for DecideError {
     }
 }
 
-impl From<NoDecisionOffer> for DecideError {
-    fn from(refusal: NoDecisionOffer) -> Self {
+impl From<NoOffer> for DecideError {
+    fn from(refusal: NoOffer) -> Self {
         Self::NoOffer(refusal)
     }
 }

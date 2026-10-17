@@ -13,7 +13,7 @@ use cairn_domain::decision::{
     question_problems, Decision, DecisionQuestion, MeasuredBy, QuestionKind,
 };
 
-use crate::interface::complete::{Complete, CompletionCall, CompletionWire};
+use crate::interface::complete::{Complete, CompletionCall};
 use crate::interface::decide::{DecideError, DecisionCall, DecisionRoute};
 use crate::wire::decisions::http::build_body;
 
@@ -84,7 +84,7 @@ pub fn decide(complete: &dyn Complete, call: DecisionCall<'_>) -> Result<Decisio
             );
             let reply = complete
                 .complete(CompletionCall::whole(
-                    CompletionWire::Decisions(endpoint),
+                    call.route.completion_wire(),
                     body,
                     call.timeout,
                 ))?
@@ -112,7 +112,7 @@ pub fn decide(complete: &dyn Complete, call: DecisionCall<'_>) -> Result<Decisio
                 let ask = logprobs::Ask::new(call.model, call.input, question)?;
                 let reply = complete
                     .complete(CompletionCall::whole(
-                        CompletionWire::Chat(endpoint),
+                        call.route.completion_wire(),
                         ask.body(),
                         call.timeout,
                     ))?

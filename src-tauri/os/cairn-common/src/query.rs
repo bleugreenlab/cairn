@@ -100,8 +100,10 @@ const KNOWN_QUERY_KEYS: &[&str] = &[
     // Per-kind affordance help projection selector (cairn://help?kind=<slug>):
     // the target of the session-scoped affordance-collapse pointer line.
     "kind",
-    // cairn://models/catalog: add the providers this workspace has not installed.
+    // cairn://models/catalog: add the providers this workspace has not
+    // installed, and narrow to the models that serve one verb.
     "installed",
+    "serves",
     // Fact log reads (cairn://p/{project}/events): filter rows by fact source,
     // and on one row, explain a thread's standing triggers against it.
     "source",

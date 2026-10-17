@@ -5,7 +5,8 @@ use crate::backends::openai_compat::wire::ChatMessage;
 use crate::backends::{AgentBackend, SessionConfig, SessionStart};
 use crate::config::presets::default_presets_config;
 use crate::models::Model;
-use cairn_models::types::catalog::{DiscoveredModel, DiscoveredWireProtocol};
+use cairn_models::types::catalog::{DiscoveredModel, Modality, ServedVerb, Wire};
+use cairn_models::types::usage::{BillingUnit, Charge};
 use serde_json::json;
 
 /// Shapes taken from the live endpoints on 2026-08-15. The subscription catalog
@@ -48,6 +49,7 @@ const METADATA_BODY: &str = r#"{
         "tool_call": true,
         "limit": {"context": 1000000},
         "cost": {"input": 0.3, "output": 1.2},
+        "modalities": {"input": ["text", "image"], "output": ["text"]},
         "provider": {"npm": "@ai-sdk/anthropic"}
       },
       "grok-4.5": {
@@ -132,24 +134,21 @@ fn published_price_per_million_becomes_price_per_token() {
         .expect("a priced model carries pricing");
     // $1.40 per million in, $4.40 out, $0.26 cached read — carried per token, and
     // parseable as a number rather than in scientific notation.
-    let prompt: f64 = pricing
-        .prompt
-        .as_ref()
-        .expect("input price")
-        .parse()
-        .expect("input price parses");
-    let completion: f64 = pricing
-        .completion
-        .as_ref()
-        .expect("output price")
-        .parse()
-        .expect("output price parses");
-    let cache_read: f64 = pricing
-        .input_cache_read
-        .as_ref()
-        .expect("cache read price")
-        .parse()
-        .expect("cache read price parses");
+    let price = |charge| -> f64 {
+        pricing
+            .usd_per(charge, None, BillingUnit::Tokens)
+            .unwrap_or_else(|| panic!("{charge:?} price"))
+            .parse()
+            .expect("price parses")
+    };
+    let prompt = price(Charge::Input);
+    let completion = price(Charge::Output);
+    let cache_read = price(Charge::CacheRead);
+    assert_eq!(
+        pricing.usd_per(Charge::CacheWrite, None, BillingUnit::Tokens),
+        None,
+        "an unpublished price is absent, not zero"
+    );
     assert!((prompt * 1_000_000.0 - 1.4).abs() < 1e-9);
     assert!((completion * 1_000_000.0 - 4.4).abs() < 1e-9);
     assert!((cache_read * 1_000_000.0 - 0.26).abs() < 1e-9);
@@ -164,16 +163,21 @@ fn every_recognized_endpoint_family_is_offered_and_records_how_to_reach_it() {
     let glm = entry(&catalog, "glm-5.2");
     assert!(!glm.hidden);
     assert_eq!(
-        glm.wire_protocol,
-        Some(DiscoveredWireProtocol::OpenAiChatCompletions)
+        glm.serves,
+        Some(ServedVerb::conversation(Wire::OpenAiChatCompletions))
     );
+    // models.dev said nothing about this model's modalities.
+    assert_eq!(glm.modalities, None);
 
     let minimax = entry(&catalog, "minimax-m3");
     assert!(!minimax.hidden, "an Anthropic Messages model is offered");
     assert_eq!(
-        minimax.wire_protocol,
-        Some(DiscoveredWireProtocol::AnthropicMessages)
+        minimax.serves,
+        Some(ServedVerb::conversation(Wire::AnthropicMessages))
     );
+    let modalities = minimax.modalities.as_ref().expect("published modalities");
+    assert_eq!(modalities.input, vec![Modality::Text, Modality::Image]);
+    assert_eq!(modalities.output, vec![Modality::Text]);
     // Its own published description survives, with no leftover apology about an
     // endpoint Cairn could not speak.
     assert_eq!(
@@ -184,8 +188,8 @@ fn every_recognized_endpoint_family_is_offered_and_records_how_to_reach_it() {
     let grok = entry(&catalog, "grok-4.5");
     assert!(!grok.hidden, "an OpenAI Responses model is offered");
     assert_eq!(
-        grok.wire_protocol,
-        Some(DiscoveredWireProtocol::OpenAiResponses)
+        grok.serves,
+        Some(ServedVerb::conversation(Wire::OpenAiResponses))
     );
 }
 
@@ -198,8 +202,8 @@ fn the_protocol_survives_a_catalog_round_trip() {
     let restored: DiscoveredModel = serde_json::from_str(&json).expect("and deserializes");
 
     assert_eq!(
-        restored.wire_protocol,
-        Some(DiscoveredWireProtocol::AnthropicMessages)
+        restored.serves,
+        Some(ServedVerb::conversation(Wire::AnthropicMessages))
     );
     assert_eq!(restored, minimax);
 }
@@ -211,7 +215,8 @@ fn a_catalog_entry_written_before_protocols_existed_claims_none() {
     let legacy = r#"{"id":"x","model":"x","displayName":"X","description":null,
                     "defaultReasoningEffort":null}"#;
     let restored: DiscoveredModel = serde_json::from_str(legacy).expect("legacy entries load");
-    assert_eq!(restored.wire_protocol, None);
+    // No per-model claim, and OpenCode Go declares no provider-wide wire.
+    assert_eq!(restored.serves, None);
 }
 
 #[test]
@@ -224,10 +229,8 @@ fn an_unrecognized_sdk_package_is_not_assumed_compatible() {
     let catalog = build_catalog(&ids, &published);
 
     assert!(catalog[0].hidden);
-    assert_eq!(
-        catalog[0].wire_protocol,
-        Some(DiscoveredWireProtocol::Unknown)
-    );
+    // Discovery says outright that it serves nothing Cairn has.
+    assert_eq!(catalog[0].serves, Some(vec![]));
 }
 
 #[test]
@@ -236,8 +239,8 @@ fn a_subscription_id_with_no_published_metadata_is_accounted_for_not_dropped() {
     let preview = entry(&catalog, "hy3-preview");
     assert!(preview.hidden);
     assert_eq!(preview.context_window, None);
-    // No metadata means no published package, so there is no protocol to claim.
-    assert_eq!(preview.wire_protocol, None);
+    // No metadata means no published package, so there is no wire to claim.
+    assert_eq!(preview.serves, None);
     assert!(preview
         .description
         .as_deref()
@@ -604,4 +607,168 @@ mod golden {
             ],
         );
     }
+}
+
+/// Golden: what the responses journal records (`response_invocations` input,
+/// output, and cost, which `list_response_history` returns as `inputTokens`,
+/// `outputTokens`, and `cost`) for a one-shot completion over each family, and
+/// for a CLI one-shot. These are the completion paths that read a provider's
+/// usage into the journal, so the numbers must survive any change to how usage
+/// is read.
+#[test]
+fn each_familys_one_shot_usage_journals_as_its_golden() {
+    use super::{complete_chat, complete_messages, complete_responses};
+    use crate::backends::openai_responses::wire::{ResponseEnvelope, ResponsesResponse};
+    use crate::backends::{
+        CompletionMessage, CompletionOutcome, CompletionRequest, CompletionRole,
+    };
+    use cairn_models::interface::complete::{
+        Complete, CompletionCall, CompletionError, CompletionReply,
+    };
+    use cairn_models::wire::TurnUsage;
+
+    struct Reply(std::sync::Mutex<Option<CompletionReply>>);
+    impl Complete for Reply {
+        fn complete(&self, _call: CompletionCall<'_>) -> Result<CompletionReply, CompletionError> {
+            Ok(self.0.lock().unwrap().take().expect("one request"))
+        }
+    }
+    fn reply(reply: CompletionReply) -> Reply {
+        Reply(std::sync::Mutex::new(Some(reply)))
+    }
+    fn request(model: &str) -> CompletionRequest {
+        CompletionRequest {
+            system: None,
+            messages: vec![CompletionMessage {
+                role: CompletionRole::User,
+                content: "hi".into(),
+            }],
+            model: model.into(),
+            project_id: None,
+            extras: serde_json::Value::Null,
+            output_schema: None,
+            timeout: std::time::Duration::from_secs(5),
+        }
+    }
+    // Read the outcome the way the responses journal does.
+    fn journal(case: &str, outcome: &CompletionOutcome) -> serde_json::Value {
+        use cairn_models::types::usage::{BillingUnit, Charge};
+        json!({
+            "case": case,
+            "inputTokens": outcome.usage.prompt_tokens(),
+            "outputTokens": outcome.usage.quantity(Charge::Output, BillingUnit::Tokens),
+            "cost": outcome.usage.cost_usd,
+        })
+    }
+    let started = std::time::Instant::now();
+    let chat = |body: serde_json::Value| {
+        complete_chat(
+            &reply(CompletionReply::Chat(serde_json::from_value(body).unwrap())),
+            "key",
+            request("glm-5.2"),
+            started,
+        )
+        .unwrap()
+    };
+
+    let mut golden = vec![
+        journal(
+            "chat with cache, reasoning and cost",
+            &chat(json!({
+                "model": "glm-5.2",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 1200,
+                    "completion_tokens": 300,
+                    "total_tokens": 1500,
+                    "prompt_tokens_details": {"cached_tokens": 1000},
+                    "completion_tokens_details": {"reasoning_tokens": 120},
+                    "cost": 0.0042
+                }
+            })),
+        ),
+        journal(
+            "chat without usage",
+            &chat(json!({
+                "model": "glm-5.2",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}]
+            })),
+        ),
+    ];
+    golden.push(journal(
+        "messages with cache read and creation",
+        &complete_messages(
+            &reply(CompletionReply::Messages(
+                serde_json::from_value(json!({
+                    "model": "minimax-m3",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {
+                        "input_tokens": 40,
+                        "output_tokens": 25,
+                        "cache_read_input_tokens": 128,
+                        "cache_creation_input_tokens": 64
+                    },
+                    "cost": "0.0031"
+                }))
+                .unwrap(),
+            )),
+            "key",
+            request("minimax-m3"),
+            started,
+        )
+        .unwrap(),
+    ));
+    let envelope: ResponseEnvelope = serde_json::from_value(json!({
+        "model": "grok-4.5",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok"}]
+        }],
+        "usage": {
+            "input_tokens": 900,
+            "output_tokens": 450,
+            "total_tokens": 1350,
+            "input_tokens_details": {"cached_tokens": 300},
+            "output_tokens_details": {"reasoning_tokens": 200}
+        },
+        "cost": 0.012
+    }))
+    .unwrap();
+    golden.push(journal(
+        "responses with cache and reasoning",
+        &complete_responses(
+            &reply(CompletionReply::Responses(
+                ResponsesResponse::from_envelope(envelope),
+            )),
+            "key",
+            request("grok-4.5"),
+            started,
+        )
+        .unwrap(),
+    ));
+    // A CLI one-shot: the facet's neutral usage, the Claude CLI's cache reads
+    // and writes folded into the prompt.
+    let cli = TurnUsage::from_anthropic(Some(12), Some(5), Some(900), Some(100), None);
+    let usage = cairn_models::usage::metered(&cli).with_cost(None);
+    golden.push(journal(
+        "cli one-shot",
+        &CompletionOutcome {
+            text: String::new(),
+            parsed: None,
+            model: String::new(),
+            usage,
+            latency_ms: 0,
+            account_id: None,
+        },
+    ));
+
+    crate::backends::assert_golden_file(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/backends/testdata/usage_journaled.json"
+        ),
+        &(serde_json::to_string_pretty(&golden).unwrap() + "\n"),
+    );
 }

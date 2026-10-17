@@ -13,8 +13,8 @@
 //!
 //! That last field decides how Cairn talks to a model. Go fronts three protocol
 //! families behind one base URL, and Cairn speaks all three, so the package is
-//! recorded on the catalog entry as its [`DiscoveredWireProtocol`] and the
-//! backend routes each session and completion by it. A package Cairn has no
+//! recorded on the catalog entry as the [`Wire`] its verbs are served over, and
+//! the backend routes each session and completion by it. A package Cairn has no
 //! mapping for stays unselectable rather than being assumed compatible: that
 //! guess fails in the middle of a session instead of before one starts.
 //!
@@ -24,10 +24,12 @@
 //! behavior that makes this safe to insist on.
 
 use cairn_models::types::catalog::{
-    DiscoveredModel, DiscoveredModelPricing, DiscoveredReasoningEffort, DiscoveredWireProtocol,
+    DiscoveredModel, DiscoveredReasoningEffort, Modalities, Modality, ModelPricing, Price,
+    ServedVerb, Wire,
 };
+use cairn_models::types::usage::{Charge, Meter};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 const SUBSCRIPTION_MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
@@ -77,6 +79,8 @@ pub(crate) struct PublishedModel {
     limit: Option<PublishedLimit>,
     #[serde(default)]
     cost: Option<PublishedCost>,
+    #[serde(default)]
+    modalities: Option<PublishedModalities>,
     /// Per-model override of the provider's default SDK package. Its absence is
     /// meaningful: it means the model uses the provider default, which for
     /// OpenCode Go is the OpenAI-compatible chat/completions package.
@@ -88,6 +92,14 @@ pub(crate) struct PublishedModel {
 struct PublishedProviderOverride {
     #[serde(default)]
     npm: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublishedModalities {
+    #[serde(default)]
+    input: Vec<String>,
+    #[serde(default)]
+    output: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -144,21 +156,17 @@ impl Protocol {
         }
     }
 
-    /// The durable routing fact stored on the catalog entry. This is what makes
-    /// the protocol survive serialization and a catalog refresh, so a session
-    /// started tomorrow reaches the same endpoint as one started today.
-    fn discovered(self) -> DiscoveredWireProtocol {
+    /// The wire this family is, when Cairn has an adapter for it. Recorded on
+    /// the catalog entry's `serves`, which is what makes the routing survive
+    /// serialization and a catalog refresh, so a session started tomorrow
+    /// reaches the same endpoint as one started today.
+    fn wire(self) -> Option<Wire> {
         match self {
-            Protocol::ChatCompletions => DiscoveredWireProtocol::OpenAiChatCompletions,
-            Protocol::AnthropicMessages => DiscoveredWireProtocol::AnthropicMessages,
-            Protocol::OpenAiResponses => DiscoveredWireProtocol::OpenAiResponses,
-            Protocol::Unrecognized => DiscoveredWireProtocol::Unknown,
+            Protocol::ChatCompletions => Some(Wire::OpenAiChatCompletions),
+            Protocol::AnthropicMessages => Some(Wire::AnthropicMessages),
+            Protocol::OpenAiResponses => Some(Wire::OpenAiResponses),
+            Protocol::Unrecognized => None,
         }
-    }
-
-    /// Whether Cairn has an adapter for this family.
-    fn is_served(self) -> bool {
-        !matches!(self, Protocol::Unrecognized)
     }
 }
 
@@ -272,7 +280,23 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
             .as_ref()
             .and_then(|provider| provider.npm.as_deref()),
     );
-    let servable = protocol.is_served();
+    let modalities = metadata.modalities.as_ref().map(|published| Modalities {
+        input: published
+            .input
+            .iter()
+            .map(|m| Modality::from(m.as_str()))
+            .collect(),
+        output: published
+            .output
+            .iter()
+            .map(|m| Modality::from(m.as_str()))
+            .collect(),
+    });
+    let serves = protocol
+        .wire()
+        .map(ServedVerb::conversation)
+        .unwrap_or_default();
+    let servable = !serves.is_empty();
     let description = match servable {
         true => metadata.description.clone(),
         false => Some(unservable_note(metadata.description.as_deref())),
@@ -290,20 +314,27 @@ fn model_from_metadata(id: &str, metadata: &PublishedModel) -> DiscoveredModel {
         context_window: metadata.limit.as_ref().and_then(|limit| limit.context),
         canonical_slug: None,
         serving_account_ids: Vec::new(),
-        pricing: metadata.cost.as_ref().map(|cost| DiscoveredModelPricing {
-            prompt: per_token(cost.input),
-            completion: per_token(cost.output),
-            request: None,
-            image: None,
-            web_search: None,
-            internal_reasoning: None,
-            input_cache_read: per_token(cost.cache_read),
-            input_cache_write: per_token(cost.cache_write),
+        pricing: metadata.cost.as_ref().map(|cost| ModelPricing {
+            prices: [
+                (Charge::Input, cost.input),
+                (Charge::Output, cost.output),
+                (Charge::CacheRead, cost.cache_read),
+                (Charge::CacheWrite, cost.cache_write),
+            ]
+            .into_iter()
+            .filter_map(|(charge, per_million)| {
+                per_token(per_million).map(|usd| Price {
+                    meter: Meter::tokens(charge),
+                    usd,
+                })
+            })
+            .collect(),
+            unplaced: BTreeMap::new(),
         }),
         supported_parameters: supported_parameters(metadata),
         router: false,
-        architecture_modality: None,
-        wire_protocol: Some(protocol.discovered()),
+        modalities,
+        serves: Some(serves),
     }
 }
 
@@ -330,8 +361,8 @@ fn unpublished_model(id: &str) -> DiscoveredModel {
         pricing: None,
         supported_parameters: Vec::new(),
         router: false,
-        architecture_modality: None,
-        wire_protocol: None,
+        modalities: None,
+        serves: None,
     }
 }
 

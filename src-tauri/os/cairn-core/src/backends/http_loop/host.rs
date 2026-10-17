@@ -4,6 +4,7 @@ use super::*;
 use cairn_models::turn::{GenerationMeta, ToolDispatch, TurnEffects};
 use cairn_models::wire::replay::SKIPPED_TOOL_RESULT;
 use cairn_models::wire::stream::StreamSink;
+use serde_json::Value;
 
 pub(super) struct CairnEffects<'a, A: WireAdapter> {
     pub orch: &'a Orchestrator,

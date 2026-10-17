@@ -34,11 +34,10 @@ use crate::backends::{
 use crate::credentials::{
     ApiProvider, CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth,
 };
-use crate::models::decision::MeasuredBy;
 use crate::orchestrator::Orchestrator;
 use cairn_models::interface::decide::DecisionRoute;
-use cairn_models::types::catalog;
 use cairn_models::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::{self, ServedVerb, Verb, Wire};
 use cairn_models::wire::decisions::http::DecisionsEndpoint;
 use cairn_models::wire::openai_compat::http::Endpoint;
 
@@ -150,13 +149,32 @@ impl CustomProviderConfig {
         }
     }
 
-    /// How this provider answers a decision. A chat server is offered as a
-    /// logprobs route; whether it actually returns logprobs is learned from
-    /// its first reply, and one that does not is refused, never guessed at.
-    pub(crate) fn decision_method(&self) -> MeasuredBy {
+    /// What this provider serves, fixed by its protocol. A chat server is
+    /// offered for decisions as a logprobs route; whether it actually returns
+    /// logprobs is learned from its first reply, and one that does not is
+    /// recorded unable, never guessed at.
+    pub(crate) fn serves(&self) -> Vec<ServedVerb> {
+        let wire = self.wire();
+        let decide = ServedVerb {
+            verb: Verb::Decide,
+            wire,
+        };
         match self.protocol {
-            CustomProtocol::OpenAiChatCompletions => MeasuredBy::Logprobs,
-            CustomProtocol::Decisions => MeasuredBy::Native,
+            CustomProtocol::OpenAiChatCompletions => {
+                let mut serves = ServedVerb::conversation(wire);
+                serves.push(decide);
+                serves
+            }
+            CustomProtocol::Decisions => vec![decide],
+        }
+    }
+
+    /// The catalog's name for this provider's protocol: the one place a
+    /// [`CustomProtocol`] becomes a [`Wire`].
+    pub(crate) fn wire(&self) -> Wire {
+        match self.protocol {
+            CustomProtocol::OpenAiChatCompletions => Wire::OpenAiChatCompletions,
+            CustomProtocol::Decisions => Wire::OpenAiDecisions,
         }
     }
 
@@ -229,6 +247,13 @@ impl AgentBackend for CustomBackend {
 
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         Err("a custom provider's models come from its configured endpoint".to_string())
+    }
+
+    /// A provider removed in between serves nothing.
+    fn serves(&self, orch: &Orchestrator, project_id: Option<&str>) -> Vec<ServedVerb> {
+        self.config(orch, project_id)
+            .map(|config| config.serves())
+            .unwrap_or_default()
     }
 
     fn response_completion_availability(

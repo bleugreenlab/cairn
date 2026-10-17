@@ -4,16 +4,14 @@
 //! round trip through the facet: a session opened with no MCP attachment,
 //! awaited with [`cairn_models::session::one_shot::await_one_shot`]. This module
 //! holds the pieces around that call both backends need the same way: the
-//! working directory, the default instructions, the token rule, and the
-//! error mapping.
+//! working directory, the default instructions, and the error mapping.
 
 use std::path::PathBuf;
 
 use cairn_models::interface::session::SessionError;
 use cairn_models::session::one_shot::OneShotError;
-use cairn_models::wire::TurnUsage;
 
-use super::{CompletionError, CompletionRequest, CompletionTokens};
+use super::{CompletionError, CompletionRequest};
 
 /// The least time a CLI one-shot is given. A CLI pays a start before it asks
 /// anything (measured: a Claude Haiku one-shot about 4 to 5 seconds end to
@@ -80,20 +78,6 @@ pub(crate) fn runtime_extras(request: &CompletionRequest) -> crate::models::Runt
     serde_json::from_value(request.extras.clone()).unwrap_or_default()
 }
 
-/// Tokens as the responses journal counts them: the whole prompt in, the way
-/// an HTTP backend's `prompt_tokens` does. The facet's one-shot usage is
-/// already the neutral shape, whose `prompt_tokens` counts the cached parts.
-pub(crate) fn whole_prompt_tokens(usage: Option<&TurnUsage>) -> CompletionTokens {
-    let Some(usage) = usage else {
-        return CompletionTokens::default();
-    };
-    let count = |tokens: Option<i32>| u64::try_from(tokens.unwrap_or(0)).unwrap_or(0);
-    CompletionTokens {
-        input: Some(count(usage.prompt_tokens)),
-        output: Some(count(usage.completion_tokens)),
-    }
-}
-
 pub(crate) fn map_open_error(error: SessionError) -> CompletionError {
     CompletionError::Upstream(error.to_string())
 }
@@ -109,20 +93,6 @@ pub(crate) fn map_one_shot_error(error: OneShotError) -> CompletionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_journal_counts_the_whole_prompt() {
-        // 12 uncached prompt tokens, 900 read from cache, 100 written to it.
-        let usage = TurnUsage::from_anthropic(Some(12), Some(5), Some(900), Some(100), None);
-        assert_eq!(
-            whole_prompt_tokens(Some(&usage)),
-            CompletionTokens {
-                input: Some(1012),
-                output: Some(5)
-            }
-        );
-        assert_eq!(whole_prompt_tokens(None), CompletionTokens::default());
-    }
 
     #[test]
     fn a_cli_one_shot_gets_at_least_the_floor() {

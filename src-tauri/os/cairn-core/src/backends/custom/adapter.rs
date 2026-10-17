@@ -13,7 +13,7 @@ use crate::backends::openai_compat::http::{ChatDialect, ChatReasoning, Endpoint}
 use crate::backends::openai_compat::wire::{ChatContent, ChatMessage};
 use crate::backends::openai_compat::{completion_body, conversation};
 use crate::backends::SessionConfig;
-use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
+use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest};
 use crate::credentials::CustomSampling;
 use crate::orchestrator::Orchestrator;
 use cairn_models::interface::complete::{
@@ -90,18 +90,18 @@ impl CustomAdapter {
             .and_then(ChatContent::as_text)
             .ok_or_else(|| CompletionError::InvalidResponse("missing text choice".to_string()))?
             .to_string();
-        let usage = response.usage.as_ref();
         Ok(CompletionOutcome {
             text,
             parsed: None,
-            model: response.model.unwrap_or(requested_model),
-            tokens: CompletionTokens {
-                input: usage.and_then(|usage| usage.prompt_tokens.map(|value| value as u64)),
-                output: usage.and_then(|usage| usage.completion_tokens.map(|value| value as u64)),
-            },
             // Inference on hardware the operator owns has no per-token price to
             // report. Reporting zero would claim a measurement nobody made.
-            cost: None,
+            usage: response
+                .usage
+                .as_ref()
+                .map(cairn_models::usage::metered)
+                .unwrap_or_default()
+                .with_cost(None),
+            model: response.model.unwrap_or(requested_model),
             latency_ms: started.elapsed().as_millis() as u64,
             account_id: None,
         })

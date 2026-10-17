@@ -1,8 +1,13 @@
+use std::collections::BTreeMap;
+
 use cairn_models::types::catalog::{
-    DiscoveredModel, DiscoveredModelPricing, DiscoveredReasoningEffort,
+    DiscoveredModel, DiscoveredReasoningEffort, Modalities, Modality, ModelPricing, Price,
+    ServedVerb, Wire,
 };
+use cairn_models::types::usage::{BillingUnit, Charge, Meter};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::Deserialize;
+use serde_json::Value;
 
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
@@ -24,7 +29,11 @@ struct OpenRouterModel {
     #[serde(default)]
     top_provider: Option<TopProvider>,
     #[serde(default)]
-    pricing: Option<OpenRouterPricing>,
+    architecture: Option<Architecture>,
+    /// Every price key the provider sent, so a key Cairn cannot place is kept
+    /// rather than dropped by a fixed struct.
+    #[serde(default)]
+    pricing: Option<BTreeMap<String, Value>>,
     #[serde(default)]
     supported_parameters: Vec<String>,
     #[serde(default)]
@@ -40,23 +49,11 @@ struct TopProvider {
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenRouterPricing {
+struct Architecture {
     #[serde(default)]
-    prompt: Option<String>,
+    input_modalities: Option<Vec<String>>,
     #[serde(default)]
-    completion: Option<String>,
-    #[serde(default)]
-    request: Option<String>,
-    #[serde(default)]
-    image: Option<String>,
-    #[serde(default)]
-    web_search: Option<String>,
-    #[serde(default)]
-    internal_reasoning: Option<String>,
-    #[serde(default)]
-    input_cache_read: Option<String>,
-    #[serde(default)]
-    input_cache_write: Option<String>,
+    output_modalities: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +109,7 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
             .and_then(|provider| provider.context_length)
     });
     let reasoning = model.reasoning;
+    let (modalities, serves) = capabilities(model.architecture);
     DiscoveredModel {
         id: model.id.clone(),
         model: model.id.clone(),
@@ -134,26 +132,113 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
         context_window,
         canonical_slug: model.canonical_slug,
         serving_account_ids: Vec::new(),
-        pricing: model.pricing.map(|pricing| DiscoveredModelPricing {
-            prompt: pricing.prompt,
-            completion: pricing.completion,
-            request: pricing.request,
-            image: pricing.image,
-            web_search: pricing.web_search,
-            internal_reasoning: pricing.internal_reasoning,
-            input_cache_read: pricing.input_cache_read,
-            input_cache_write: pricing.input_cache_write,
-        }),
+        pricing: model.pricing.map(pricing),
         supported_parameters: model.supported_parameters,
         router: model.id == "openrouter/auto",
-        architecture_modality: None,
-        wire_protocol: None,
+        modalities,
+        serves,
     }
+}
+
+/// What a model takes and gives, and therefore what it serves. Every model
+/// OpenRouter routes is reached over chat completions, so a model that gives
+/// text serves Complete and Session there. One that gives no text (an image or
+/// embeddings model) serves nothing Cairn has, which is said rather than left
+/// to the provider-wide default.
+fn capabilities(
+    architecture: Option<Architecture>,
+) -> (Option<Modalities>, Option<Vec<ServedVerb>>) {
+    let Some(architecture) = architecture else {
+        return (None, None);
+    };
+    let side = |values: Option<Vec<String>>| -> Option<Vec<Modality>> {
+        values.map(|values| values.into_iter().map(Modality::from).collect())
+    };
+    let input = side(architecture.input_modalities);
+    let output = side(architecture.output_modalities);
+    let serves = output.as_ref().map(|output| {
+        if output.contains(&Modality::Text) {
+            ServedVerb::conversation(Wire::OpenAiChatCompletions)
+        } else {
+            Vec::new()
+        }
+    });
+    let modalities = (input.is_some() || output.is_some()).then(|| Modalities {
+        input: input.unwrap_or_default(),
+        output: output.unwrap_or_default(),
+    });
+    (modalities, serves)
+}
+
+/// The meter each OpenRouter price key is charged on. Every price is USD per
+/// one unit.
+///
+/// The docs name `image` and `audio` only as input costs. The live catalog
+/// settles the unit: every model priced on `image` is a Gemini model whose
+/// `image` price equals its `prompt` price, and `audio` matches Google's and
+/// OpenAI's per-million-token audio rates, so both are per token. `image_output`
+/// is per token the same way (an image model's $30 per million). A key not
+/// listed here is not guessed at.
+fn openrouter_meter(key: &str) -> Option<Meter> {
+    use BillingUnit::{Requests, Tokens};
+    let (charge, modality, unit) = match key {
+        "prompt" => (Charge::Input, None, Tokens),
+        "completion" => (Charge::Output, None, Tokens),
+        "input_cache_read" => (Charge::CacheRead, None, Tokens),
+        "input_cache_write" => (Charge::CacheWrite, None, Tokens),
+        "internal_reasoning" => (Charge::Reasoning, None, Tokens),
+        "request" => (Charge::Request, None, Requests),
+        "web_search" => (Charge::WebSearch, None, Requests),
+        "image" => (Charge::Input, Some(Modality::Image), Tokens),
+        "image_output" => (Charge::Output, Some(Modality::Image), Tokens),
+        "audio" => (Charge::Input, Some(Modality::Audio), Tokens),
+        "audio_output" => (Charge::Output, Some(Modality::Audio), Tokens),
+        _ => return None,
+    };
+    Some(Meter {
+        charge,
+        modality,
+        unit,
+    })
+}
+
+fn pricing(raw: BTreeMap<String, Value>) -> ModelPricing {
+    let mut pricing = ModelPricing::default();
+    for (key, value) in raw {
+        // A non-string value (`overrides`, prices tiered by prompt size) is a
+        // structure rather than a price on one meter.
+        let Value::String(usd) = value else {
+            continue;
+        };
+        match openrouter_meter(&key) {
+            Some(meter) => pricing.prices.push(Price { meter, usd }),
+            None => {
+                pricing.unplaced.insert(key, usd);
+            }
+        }
+    }
+    pricing
 }
 
 #[cfg(test)]
 mod tests {
     use super::decode_models;
+    use cairn_models::types::catalog::{DiscoveredModel, Modality, ServedVerb, VerbKind, Wire};
+    use cairn_models::types::usage::{BillingUnit, Charge};
+
+    /// A slice of the live `/api/v1/models` listing (2026-10-15), descriptions
+    /// trimmed, plus OpenRouter's own documented example entry (`openai/gpt-4`),
+    /// the only place `request` is priced. The pure image and embeddings entries
+    /// come from the `output_modalities=image` and `=embeddings` listings, which
+    /// the default listing Cairn reads leaves out.
+    const LIVE: &str = include_str!("testdata/models.json");
+
+    fn model<'a>(models: &'a [DiscoveredModel], id: &str) -> &'a DiscoveredModel {
+        models
+            .iter()
+            .find(|model| model.id == id)
+            .unwrap_or_else(|| panic!("{id} is in the fixture"))
+    }
 
     #[test]
     fn decodes_openrouter_catalog_fields() {
@@ -177,9 +262,166 @@ mod tests {
         assert_eq!(model.default_reasoning_effort.as_deref(), Some("medium"));
         assert_eq!(model.supported_reasoning_efforts.len(), 3);
         assert_eq!(
-            model.pricing.as_ref().unwrap().prompt.as_deref(),
+            model
+                .pricing
+                .as_ref()
+                .unwrap()
+                .usd_per(Charge::Input, None, BillingUnit::Tokens),
             Some("0.000003")
         );
         assert!(model.supported_parameters.contains(&"tools".to_string()));
+        // No architecture: no claim, so the provider-wide declaration applies.
+        assert_eq!(model.modalities, None);
+        assert_eq!(model.serves, None);
+    }
+
+    #[test]
+    fn modalities_are_typed_and_an_unknown_one_is_kept_verbatim() {
+        let models = decode_models(LIVE).unwrap();
+        let haiku = model(&models, "anthropic/claude-haiku-5.5");
+        let modalities = haiku.modalities.as_ref().unwrap();
+        assert_eq!(
+            modalities.input,
+            vec![Modality::Text, Modality::Image, Modality::File]
+        );
+        assert_eq!(modalities.output, vec![Modality::Text]);
+        let voyage = model(&models, "voyageai/voyage-code-4");
+        assert_eq!(
+            voyage.modalities.as_ref().unwrap().output,
+            vec![Modality::Other("embeddings".into())]
+        );
+    }
+
+    #[test]
+    fn a_model_that_gives_text_serves_conversation_over_chat_and_one_that_does_not_serves_nothing()
+    {
+        let models = decode_models(LIVE).unwrap();
+        let conversation = Some(ServedVerb::conversation(Wire::OpenAiChatCompletions));
+        // An image model that also writes text is a chat model that can draw.
+        let gemini = model(&models, "google/gemini-3-pro-image");
+        assert_eq!(
+            gemini.modalities.as_ref().unwrap().output,
+            vec![Modality::Image, Modality::Text]
+        );
+        assert_eq!(gemini.serves, conversation);
+        assert_eq!(model(&models, "openai/gpt-audio").serves, conversation);
+        // A pure image model and an embeddings model serve no verb Cairn has.
+        for id in [
+            "black-forest-labs/flux-3-image-klein",
+            "voyageai/voyage-code-4",
+        ] {
+            let served = model(&models, id).serves.as_ref().unwrap();
+            assert!(served.is_empty(), "{id} serves {served:?}");
+            assert!(!served.iter().any(|s| s.verb.kind() == VerbKind::Complete));
+        }
+    }
+
+    #[test]
+    fn every_price_key_is_placed_on_its_meter_or_kept_unplaced() {
+        let models = decode_models(LIVE).unwrap();
+        let gemini = model(&models, "google/gemini-3-pro-image")
+            .pricing
+            .as_ref()
+            .unwrap();
+        let tokens = BillingUnit::Tokens;
+        let image = Some(&Modality::Image);
+        let audio = Some(&Modality::Audio);
+        assert_eq!(
+            gemini.usd_per(Charge::Input, None, tokens),
+            Some("0.000002")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::Output, None, tokens),
+            Some("0.000012")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::Input, image, tokens),
+            Some("0.000002")
+        );
+        // Output image priced per token: $120 per million.
+        assert_eq!(
+            gemini.usd_per(Charge::Output, image, tokens),
+            Some("0.00012")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::Input, audio, tokens),
+            Some("0.000002")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::Reasoning, None, tokens),
+            Some("0.000012")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::CacheRead, None, tokens),
+            Some("0.0000002")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::CacheWrite, None, tokens),
+            Some("0.000000375")
+        );
+        assert_eq!(
+            gemini.usd_per(Charge::WebSearch, None, BillingUnit::Requests),
+            Some("0.014")
+        );
+        assert_eq!(
+            gemini.unplaced.get("input_audio_cache").map(String::as_str),
+            Some("0.0000002")
+        );
+
+        let audio_model = model(&models, "openai/gpt-audio").pricing.as_ref().unwrap();
+        assert_eq!(
+            audio_model.usd_per(Charge::Output, audio, tokens),
+            Some("0.000064")
+        );
+
+        let flux = model(&models, "black-forest-labs/flux-3-image-klein")
+            .pricing
+            .as_ref()
+            .unwrap();
+        assert!(flux.unplaced.contains_key("image_token"));
+
+        // `overrides` is a list, not a price, so it is skipped rather than
+        // stringified; the one-hour cache write has no meter.
+        let haiku = model(&models, "anthropic/claude-haiku-5.5")
+            .pricing
+            .as_ref()
+            .unwrap();
+        assert!(!haiku.unplaced.contains_key("overrides"));
+        assert!(haiku.unplaced.contains_key("input_cache_write_1h"));
+
+        let gpt4 = model(&models, "openai/gpt-4").pricing.as_ref().unwrap();
+        assert_eq!(
+            gpt4.usd_per(Charge::Request, None, BillingUnit::Requests),
+            Some("0")
+        );
+    }
+
+    /// Reads the real catalog through discovery. Run it with `--ignored` to
+    /// see what the live listing holds right now.
+    #[test]
+    #[ignore = "reaches openrouter.ai"]
+    fn live_catalog_inventory() {
+        use std::collections::BTreeSet;
+        let models = super::discover_models_blocking(None).unwrap();
+        println!("{} models", models.len());
+        let mut other = BTreeSet::new();
+        let mut unplaced = BTreeSet::new();
+        for model in &models {
+            if let Some(modalities) = &model.modalities {
+                for modality in modalities.input.iter().chain(&modalities.output) {
+                    if let Modality::Other(value) = modality {
+                        other.insert(value.clone());
+                    }
+                }
+                if modalities.outputs(&Modality::Image) {
+                    println!("image output: {} serves {:?}", model.id, model.serves);
+                }
+            }
+            if let Some(pricing) = &model.pricing {
+                unplaced.extend(pricing.unplaced.keys().cloned());
+            }
+        }
+        println!("modalities kept as Other: {other:?}");
+        println!("unplaced price keys: {unplaced:?}");
     }
 }

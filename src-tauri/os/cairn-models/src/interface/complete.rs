@@ -11,6 +11,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cairn_models_types::catalog::Wire;
 use serde_json::Value;
 
 use crate::wire::anthropic_messages::http::MessagesEndpoint;
@@ -51,6 +52,18 @@ impl CompletionWire<'_> {
             Self::Messages(_) => "messages",
             Self::Responses(_) => "responses",
             Self::Decisions(_) => "decisions",
+        }
+    }
+
+    /// The catalog's name for the protocol this route speaks. This is where a
+    /// launch's route meets the wire an offer declares: compare through it,
+    /// never by family string.
+    pub fn wire(&self) -> Wire {
+        match self {
+            Self::Chat(_) => Wire::OpenAiChatCompletions,
+            Self::Messages(_) => Wire::AnthropicMessages,
+            Self::Responses(_) => Wire::OpenAiResponses,
+            Self::Decisions(_) => Wire::OpenAiDecisions,
         }
     }
 }

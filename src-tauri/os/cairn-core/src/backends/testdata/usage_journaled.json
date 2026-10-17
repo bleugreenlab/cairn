@@ -1,0 +1,32 @@
+[
+  {
+    "case": "chat with cache, reasoning and cost",
+    "cost": 0.0042,
+    "inputTokens": 1200,
+    "outputTokens": 300
+  },
+  {
+    "case": "chat without usage",
+    "cost": null,
+    "inputTokens": null,
+    "outputTokens": null
+  },
+  {
+    "case": "messages with cache read and creation",
+    "cost": 0.0031,
+    "inputTokens": 232,
+    "outputTokens": 25
+  },
+  {
+    "case": "responses with cache and reasoning",
+    "cost": 0.012,
+    "inputTokens": 900,
+    "outputTokens": 450
+  },
+  {
+    "case": "cli one-shot",
+    "cost": null,
+    "inputTokens": 1012,
+    "outputTokens": 5
+  }
+]

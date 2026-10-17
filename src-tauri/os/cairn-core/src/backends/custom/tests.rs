@@ -449,10 +449,8 @@ fn discovery_reads_the_openai_model_list_and_its_served_context_length() {
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].model, "qwen3.8-27b");
     assert_eq!(models[0].context_window, Some(131072));
-    assert_eq!(
-        models[0].wire_protocol,
-        Some(cairn_models::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions)
-    );
+    // The provider's configured protocol declares what every model serves.
+    assert_eq!(models[0].serves, None);
 }
 
 #[test]

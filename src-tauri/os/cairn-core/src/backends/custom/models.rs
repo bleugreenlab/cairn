@@ -134,17 +134,10 @@ fn model(
         // what actually answers it.
         supported_parameters: vec![],
         router: false,
-        architecture_modality: None,
-        wire_protocol: Some(match config.protocol {
-            CustomProtocol::OpenAiChatCompletions => {
-                cairn_models::types::catalog::DiscoveredWireProtocol::OpenAiChatCompletions
-            }
-            // No turn family serves it; the catalog's decision method says what
-            // it does serve.
-            CustomProtocol::Decisions => {
-                cairn_models::types::catalog::DiscoveredWireProtocol::Unknown
-            }
-        }),
+        modalities: None,
+        // What a custom provider serves is fixed by its configured protocol, so
+        // the provider declares it once for every model it lists.
+        serves: None,
     }
 }
 

@@ -278,8 +278,8 @@ fn finish_model_discovery(
             pricing: None,
             supported_parameters: Vec::new(),
             router: false,
-            architecture_modality: None,
-            wire_protocol: None,
+            modalities: None,
+            serves: None,
         })
         .collect();
     merge_fallback_models(&mut models);
@@ -361,8 +361,8 @@ fn fallback_model(
         pricing: None,
         supported_parameters: Vec::new(),
         router: false,
-        architecture_modality: None,
-        wire_protocol: None,
+        modalities: None,
+        serves: None,
     }
 }
 

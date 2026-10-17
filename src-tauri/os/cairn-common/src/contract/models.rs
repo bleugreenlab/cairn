@@ -69,11 +69,12 @@ pub(crate) const MODELS_CATALOG_CONTRACT: ResourceContract = ResourceContract {
     kind: ResourceKind::ModelsCatalog,
     uri_template: "cairn://models/catalog",
     name: "Model catalog",
-    description: "Every provider this workspace installed, in the order Settings → Providers lists them: its category, whether an account or host is configured, what model discovery last found (id, name, context window, and pricing where the provider reports it, or the discovery error), and the tiers bound to it. A tier marked default is where an unqualified tier reference such as `lg` resolves; `claude/lg` names the provider outright. The same catalog is what tier resolution and context-window lookup read, so a binding shown here is the binding a launch gets.",
+    description: "Every provider this workspace installed, in the order Settings → Providers lists them: its category, whether an account or host is configured, what model discovery last found (id, name, context window, pricing where the provider reports it with each price in its own unit, what the model takes in and gives out, and the verbs it serves with the wire each rides; or the discovery error), the tiers bound to it, what the provider serves for any model it routes, and any model observed unable to serve a verb it declares, with why. A tier marked default is where an unqualified tier reference such as `lg` resolves; `claude/lg` names the provider outright. The same catalog is what tier resolution and context-window lookup read, so a binding shown here is the binding a launch gets.",
     read_projections: &[
         ProjectionSpec { key: "view", values: "providers (default) | models — each model once under its catalog id (the provider's canonical slug, else provider/model), with every provider offering it and the tier references bound to it" },
         ProjectionSpec { key: "provider", values: "KEY — one provider, e.g. claude, codex, openrouter, custom:<account id>" },
         ProjectionSpec { key: "installed", values: "all — also list the supported providers this workspace has not installed (the Add-provider list)" },
+        ProjectionSpec { key: "serves", values: "complete | session | decide — only the models (in either view) that serve that verb" },
     ],
     related: &[RelatedSpec { label: "accounts behind each provider", kind: ResourceKind::ModelsAccounts, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,

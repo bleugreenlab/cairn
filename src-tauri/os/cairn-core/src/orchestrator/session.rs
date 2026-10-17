@@ -2757,6 +2757,13 @@ mod tests {
         ) -> Result<Vec<cairn_models::types::catalog::DiscoveredModel>, String> {
             Ok(Vec::new())
         }
+        fn serves(
+            &self,
+            _: &crate::orchestrator::Orchestrator,
+            _: Option<&str>,
+        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+            Vec::new()
+        }
         fn resolve_tools(
             &self,
             _tools: &[String],

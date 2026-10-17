@@ -23,7 +23,7 @@ use cairn_models::interface::{
     Catalog, CatalogProvider, ModelScope, Models, SessionState, SessionView, TierBinding,
     LOCAL_HOST,
 };
-use cairn_models::types::catalog::{self, CLAUDE_FAMILY_BACKEND};
+use cairn_models::types::catalog::{self, ServedVerb, CLAUDE_FAMILY_BACKEND};
 use cairn_models::types::pool::ProviderPoolSnapshot;
 use serde_json::Value;
 
@@ -171,6 +171,18 @@ async fn run_facts(dbs: &DbState, run_id: &str) -> Result<RunFacts, String> {
     })
 }
 
+impl Orchestrator {
+    /// What provider `key` serves for any model it routes in `project_id`'s
+    /// scope. A key this build does not ship serves nothing, rather than
+    /// whatever the backend fallback would claim.
+    pub(crate) fn provider_serves(&self, key: &str, project_id: Option<&str>) -> Vec<ServedVerb> {
+        if !catalog::is_supported(key) {
+            return Vec::new();
+        }
+        crate::backends::backend_for_name(Some(key)).serves(self, project_id)
+    }
+}
+
 impl Models for Orchestrator {
     fn catalog(&self, scope: &ModelScope) -> Result<Catalog, String> {
         let presets = self.models_presets(scope)?;
@@ -193,8 +205,8 @@ impl Models for Orchestrator {
                 installed: true,
                 models: discovered.get(key).cloned(),
                 tiers: tier_bindings(key, &presets),
-                decision: self.decision_method(key, scope.project_id.as_deref()),
-                decision_unsupported: self.decision_observations.unsupported(key),
+                serves: self.provider_serves(key, scope.project_id.as_deref()),
+                unable: self.decision_observations.unable(key),
             })
             .collect();
         providers.extend(
@@ -206,8 +218,8 @@ impl Models for Orchestrator {
                     installed: false,
                     models: None,
                     tiers: Vec::new(),
-                    decision: None,
-                    decision_unsupported: Default::default(),
+                    serves: Vec::new(),
+                    unable: Vec::new(),
                 }),
         );
         Ok(Catalog { providers })

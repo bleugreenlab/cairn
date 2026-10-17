@@ -11,13 +11,15 @@ use cairn_models::interface::{
     Catalog, CatalogProvider, ModelScope, Models, SessionState, SessionView, TierBinding,
 };
 use cairn_models::types::catalog::{
-    custom_account_id, DiscoveredModel, DiscoveredModelPricing, ProviderCategory,
+    custom_account_id, DiscoveredModel, Modalities, Modality, ModelPricing, ProviderCategory,
+    ServedVerb, VerbKind, Wire,
 };
 use cairn_models::types::pool::{
     ProviderPoolAccountState, ProviderPoolConstraintReach, ProviderPoolSegmentState,
     ProviderPoolSnapshot,
 };
 use cairn_models::types::usage::ProviderUsageWindow;
+use cairn_models::types::usage::{BillingUnit, Charge};
 use serde_json::Value;
 use std::fmt::Write as _;
 
@@ -89,15 +91,110 @@ fn per_million(price: &str) -> String {
     }
 }
 
-fn pricing(pricing: &DiscoveredModelPricing) -> Option<String> {
+fn charge(charge: Charge) -> &'static str {
+    match charge {
+        Charge::Input => "in",
+        Charge::Output => "out",
+        Charge::CacheRead => "cache read",
+        Charge::CacheWrite => "cache write",
+        Charge::Reasoning => "reasoning",
+        Charge::Request => "request",
+        Charge::WebSearch => "web search",
+    }
+}
+
+/// Input and output tokens first, as `in $X/M, out $Y/M`, then every other
+/// price the provider set, each in its own unit. A price of zero on any other
+/// meter is left out: providers report it for every charge they don't make.
+fn pricing(pricing: &ModelPricing) -> Option<String> {
     let mut parts = Vec::new();
-    if let Some(prompt) = &pricing.prompt {
+    if let Some(prompt) = pricing.usd_per(Charge::Input, None, BillingUnit::Tokens) {
         parts.push(format!("in {}", per_million(prompt)));
     }
-    if let Some(completion) = &pricing.completion {
+    if let Some(completion) = pricing.usd_per(Charge::Output, None, BillingUnit::Tokens) {
         parts.push(format!("out {}", per_million(completion)));
     }
+    for price in &pricing.prices {
+        let meter = &price.meter;
+        let headline = matches!(meter.charge, Charge::Input | Charge::Output)
+            && meter.modality.is_none()
+            && meter.unit == BillingUnit::Tokens;
+        if headline || price.usd.parse::<f64>().is_ok_and(|usd| usd == 0.0) {
+            continue;
+        }
+        let label = match &meter.modality {
+            Some(modality) => format!("{modality} {}", charge(meter.charge)),
+            None => charge(meter.charge).to_string(),
+        };
+        let amount = match meter.unit {
+            BillingUnit::Tokens => per_million(&price.usd),
+            unit => format!("${}/{}", price.usd, unit.noun()),
+        };
+        parts.push(format!("{label} {amount}"));
+    }
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// `text+image → text`, or `None` when the provider said nothing.
+fn modalities(modalities: &Modalities) -> Option<String> {
+    if modalities.input.is_empty() && modalities.output.is_empty() {
+        return None;
+    }
+    let side = |side: &[Modality]| {
+        if side.is_empty() {
+            "?".to_string()
+        } else {
+            side.iter()
+                .map(Modality::as_str)
+                .collect::<Vec<_>>()
+                .join("+")
+        }
+    };
+    Some(format!(
+        "{} → {}",
+        side(&modalities.input),
+        side(&modalities.output)
+    ))
+}
+
+/// The verbs grouped by the wire each rides, `complete, session
+/// (openai-chat)`, or `None` for serving nothing.
+fn served(serves: &[ServedVerb]) -> Option<String> {
+    let mut groups: Vec<(Wire, Vec<&str>)> = Vec::new();
+    for served in serves {
+        let verb = served.verb.kind().as_str();
+        match groups.iter_mut().find(|(wire, _)| *wire == served.wire) {
+            Some((_, verbs)) => verbs.push(verb),
+            None => groups.push((served.wire, vec![verb])),
+        }
+    }
+    (!groups.is_empty()).then(|| {
+        groups
+            .iter()
+            .map(|(wire, verbs)| format!("{} ({wire})", verbs.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
+/// What a model or offer line appends after its context and price: its
+/// modalities when known, and what it serves.
+fn capability(modalities_known: Option<&Modalities>, serves: &[ServedVerb]) -> String {
+    let mut out = String::new();
+    if let Some(text) = modalities_known.and_then(modalities) {
+        let _ = write!(out, " · {text}");
+    }
+    match served(serves) {
+        Some(text) => {
+            let _ = write!(out, " · serves {text}");
+        }
+        None => out.push_str(" · serves nothing Cairn runs"),
+    }
+    out
+}
+
+fn serves_verb(serves: &[ServedVerb], verb: VerbKind) -> bool {
+    serves.iter().any(|served| served.verb.kind() == verb)
 }
 
 fn category(category: ProviderCategory) -> &'static str {
@@ -134,7 +231,7 @@ fn binding_line(binding: &TierBinding) -> String {
     line
 }
 
-fn model_line(model: &DiscoveredModel) -> String {
+fn model_line(provider: &CatalogProvider, model: &DiscoveredModel) -> String {
     let mut line = format!("- `{}`", model.model);
     if model.display_name != model.model {
         let _ = write!(line, " {}", model.display_name);
@@ -155,6 +252,11 @@ fn model_line(model: &DiscoveredModel) -> String {
     if model.hidden {
         let reason = model.description.as_deref().unwrap_or("not servable here");
         let _ = write!(line, " — unavailable: {reason}");
+    } else {
+        line.push_str(&capability(
+            model.modalities.as_ref(),
+            &provider.serves_for(&model.model),
+        ));
     }
     line
 }
@@ -193,9 +295,21 @@ pub(crate) fn render_index() -> String {
 
 pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> String {
     const URI: &str = "cairn://models/catalog";
-    if let Some(error) = unsupported(URI, params, &["view", "provider", "installed"]) {
+    if let Some(error) = unsupported(URI, params, &["view", "provider", "installed", "serves"]) {
         return error;
     }
+    let serving = match find_query_value(params, "serves") {
+        None => None,
+        Some(value) => match VerbKind::parse(value) {
+            Some(verb) => Some(verb),
+            None => {
+                return format!(
+                    "Unknown serves='{value}' for {URI}; expected one of {}.",
+                    VerbKind::ALL.map(VerbKind::as_str).join(", ")
+                )
+            }
+        },
+    };
     let scope = ModelScope::workspace();
     let catalog = match facet.catalog(&scope) {
         Ok(catalog) => catalog,
@@ -227,9 +341,9 @@ pub(crate) fn render_catalog(facet: &dyn Models, params: &[QueryParam]) -> Strin
     match find_query_value(params, "view") {
         None | Some("providers") => {
             let accounts = sorted_accounts(facet, &scope).unwrap_or_default();
-            render_providers(&catalog, &accounts, only, include_uninstalled)
+            render_providers(&catalog, &accounts, only, include_uninstalled, serving)
         }
-        Some("models") => render_models(&catalog, only),
+        Some("models") => render_models(&catalog, only, serving),
         Some(other) => format!("Unknown view '{other}' for {URI}; expected providers or models."),
     }
 }
@@ -239,6 +353,7 @@ fn render_providers(
     accounts: &[Value],
     only: Option<&str>,
     include_uninstalled: bool,
+    serving: Option<VerbKind>,
 ) -> String {
     let installed: Vec<&CatalogProvider> = catalog
         .installed()
@@ -278,6 +393,21 @@ fn render_providers(
             let bindings: Vec<String> = provider.tiers.iter().map(binding_line).collect();
             let _ = writeln!(out, "Tiers: {}", bindings.join(" · "));
         }
+        match served(&provider.serves) {
+            Some(text) => {
+                let _ = writeln!(out, "Serves: {text}");
+            }
+            None => out.push_str(
+                "Serves: nothing by default; each model serves what its discovery declares\n",
+            ),
+        }
+        for unable in &provider.unable {
+            let _ = writeln!(
+                out,
+                "Unable: `{}` cannot {}: it {}",
+                unable.model, unable.verb, unable.why
+            );
+        }
         match &provider.models {
             None => out.push_str("Models: not discovered yet\n"),
             Some(models) => {
@@ -285,12 +415,33 @@ fn render_providers(
                     .refreshed_at
                     .map(|at| format!(", refreshed {}", when(at)))
                     .unwrap_or_default();
-                let _ = writeln!(out, "Models ({}{refreshed}):", models.models.len());
+                let listed: Vec<&DiscoveredModel> = models
+                    .models
+                    .iter()
+                    .filter(|model| {
+                        serving.is_none_or(|verb| {
+                            !model.hidden && serves_verb(&provider.serves_for(&model.model), verb)
+                        })
+                    })
+                    .collect();
+                match serving {
+                    None => {
+                        let _ = writeln!(out, "Models ({}{refreshed}):", models.models.len());
+                    }
+                    Some(verb) => {
+                        let _ = writeln!(
+                            out,
+                            "Models serving {verb} ({} of {}{refreshed}):",
+                            listed.len(),
+                            models.models.len()
+                        );
+                    }
+                }
                 if let Some(error) = &models.error {
                     let _ = writeln!(out, "Discovery error: {error}");
                 }
-                for model in &models.models {
-                    out.push_str(&model_line(model));
+                for model in listed {
+                    out.push_str(&model_line(provider, model));
                     out.push('\n');
                 }
             }
@@ -317,18 +468,29 @@ fn render_providers(
     out
 }
 
-fn render_models(catalog: &Catalog, only: Option<&str>) -> String {
+fn render_models(catalog: &Catalog, only: Option<&str>, serving: Option<VerbKind>) -> String {
     let models: Vec<_> = catalog
         .models()
         .into_iter()
         .filter(|model| only.is_none_or(|key| model.offers.iter().any(|o| o.provider == key)))
+        .filter_map(|mut model| {
+            if let Some(verb) = serving {
+                model
+                    .offers
+                    .retain(|offer| serves_verb(&offer.serves, verb));
+            }
+            (!model.offers.is_empty()).then_some(model)
+        })
         .collect();
     let mut out = String::from("# Model catalog — models\n\n");
     let _ = writeln!(
         out,
-        "{} model{} across the installed providers, each under its catalog id: the provider's canonical slug when it reports one, otherwise `provider/model`. Offers merge only on a shared slug.\n",
+        "{} model{} across the installed providers, each under its catalog id: the provider's canonical slug when it reports one, otherwise `provider/model`. Offers merge only on a shared slug.{}\n",
         models.len(),
-        if models.len() == 1 { "" } else { "s" }
+        if models.len() == 1 { "" } else { "s" },
+        serving
+            .map(|verb| format!(" Only offers that serve {verb} are listed."))
+            .unwrap_or_default()
     );
     for model in models {
         let _ = write!(out, "- `{}`", model.catalog_id);
@@ -348,6 +510,7 @@ fn render_models(catalog: &Catalog, only: Option<&str>) -> String {
             if !facts.is_empty() {
                 let _ = write!(out, " ({})", facts.join(", "));
             }
+            out.push_str(&capability(offer.modalities.as_ref(), &offer.serves));
             out.push('\n');
         }
         if !model.aliases.is_empty() {
@@ -1011,6 +1174,101 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalog_says_what_each_provider_and_offer_serves() {
+        let orch = seeded_orchestrator().await;
+        let catalog = read(&orch, "cairn://models/catalog").await;
+        assert!(
+            catalog.contains("Serves: complete, session (claude-stream-json)"),
+            "{catalog}"
+        );
+        assert!(
+            catalog.contains("Serves: complete, session, decide (openai-chat)"),
+            "the custom chat provider decides from logprobs: {catalog}"
+        );
+        assert!(
+            catalog.contains("`opus` — 1M context")
+                && catalog.contains("· serves complete, session (claude-stream-json)"),
+            "{catalog}"
+        );
+
+        let deciding = read(&orch, "cairn://models/catalog?serves=decide").await;
+        assert!(
+            deciding.contains("Models serving decide (0 of "),
+            "no Claude model decides: {deciding}"
+        );
+        assert!(!deciding.contains("`opus` — 1M context"), "{deciding}");
+
+        let models = read(&orch, "cairn://models/catalog?view=models&serves=session").await;
+        assert!(
+            models.contains("Only offers that serve session"),
+            "{models}"
+        );
+        assert!(
+            models.contains(
+                "claude `opus` (1M context) · serves complete, session (claude-stream-json)"
+            ),
+            "{models}"
+        );
+        let none = read(&orch, "cairn://models/catalog?view=models&serves=decide").await;
+        assert!(!none.contains("`claude/opus`"), "{none}");
+
+        let bad = read(&orch, "cairn://models/catalog?serves=image").await;
+        assert!(
+            bad.starts_with(
+                "Unknown serves='image' for cairn://models/catalog; expected one of complete, session, decide."
+            ),
+            "{bad}"
+        );
+    }
+
+    #[test]
+    fn prices_beyond_tokens_render_in_their_own_unit() {
+        use super::{BillingUnit, Charge, Modality, ModelPricing};
+        use cairn_models::types::catalog::Price;
+        use cairn_models::types::usage::Meter;
+        let price = |meter: Meter, usd: &str| Price {
+            meter,
+            usd: usd.into(),
+        };
+        let pricing = ModelPricing {
+            prices: vec![
+                price(Meter::tokens(Charge::Input), "0.000002"),
+                price(Meter::tokens(Charge::Output), "0.000012"),
+                price(Meter::tokens(Charge::CacheRead), "0.0000002"),
+                price(
+                    Meter {
+                        charge: Charge::Output,
+                        modality: Some(Modality::Image),
+                        unit: BillingUnit::Tokens,
+                    },
+                    "0.00003",
+                ),
+                price(
+                    Meter {
+                        charge: Charge::Input,
+                        modality: Some(Modality::Image),
+                        unit: BillingUnit::Images,
+                    },
+                    "0.04",
+                ),
+                price(
+                    Meter {
+                        charge: Charge::Request,
+                        modality: None,
+                        unit: BillingUnit::Requests,
+                    },
+                    "0",
+                ),
+            ],
+            unplaced: Default::default(),
+        };
+        assert_eq!(
+            super::pricing(&pricing).unwrap(),
+            "in $2/M, out $12/M, cache read $0.2/M, image out $30/M, image in $0.04/image"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn rolled_over_windows_and_past_blocks_read_as_history() {
         use crate::credentials::{ApiProvider, ProviderAuth};
         use cairn_models::types::usage::{ProviderUsageScope, ProviderUsageWindow};
@@ -1071,6 +1329,46 @@ mod tests {
         assert!(current_page.contains("fresh: 0% left"), "{current_page}");
         assert!(current_page.contains("blocked until"), "{current_page}");
         assert!(!current_page.contains("expired"), "{current_page}");
+    }
+
+    /// Golden: the usage page's block for a metered provider with recorded
+    /// per-model cost and credits.
+    #[test]
+    fn a_metered_pool_renders_as_its_golden() {
+        let pool: cairn_models::types::pool::ProviderPoolSnapshot =
+            serde_json::from_value(serde_json::json!({
+                "backend": "openrouter",
+                "accounts": [{
+                    "accountId": "acc_1",
+                    "label": "Main key",
+                    "state": "measured",
+                    "source": "openrouter_generation",
+                    "capturedAt": 1790000000,
+                    "blockedUntil": null,
+                    "error": null,
+                    "errorKind": null
+                }],
+                "families": [],
+                "constraints": [],
+                "credits": {"balance": 12.5, "totalGranted": 20.0, "totalUsed": 7.5, "currency": "USD"},
+                "resetCredits": null,
+                "modelBreakdown": [
+                    {"model": "z-ai/glm-4.6", "costUsd": 0.4213, "tokens": 120000, "runs": 3},
+                    {"model": "openai/gpt-5", "costUsd": 1.0, "tokens": null, "runs": null}
+                ],
+                "unsupportedReason": "OpenRouter meters by credit, not by window",
+                "capturedAt": 1790000000
+            }))
+            .unwrap();
+        let mut out = String::new();
+        super::pool_block(&pool, "OpenRouter (`openrouter`)", &mut out);
+        crate::backends::assert_golden_file(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/resources/testdata/models_usage_pool.md"
+            ),
+            &out,
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

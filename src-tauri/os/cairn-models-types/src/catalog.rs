@@ -27,10 +27,13 @@
 //! cannot leave one surface quietly behind.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
 use crate::provider_id::ApiProvider;
+use crate::usage::{BillingUnit, Charge, Meter};
 
 /// How a provider is paid for and reached, which is what a user is actually
 /// choosing between when installing one.
@@ -394,34 +397,269 @@ pub fn resolved_backend_for_model(model: &str) -> &'static str {
 // orchestrator's window lookup, the settings UI and `cairn://models/catalog` all
 // read these facts from here.
 
+/// What a model takes in or gives out. Values a provider reports that Cairn
+/// doesn't recognise are kept verbatim, never guessed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum Modality {
+    Text,
+    Image,
+    Audio,
+    Video,
+    File,
+    Other(String),
+}
+
+impl Modality {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Text => "text",
+            Self::Image => "image",
+            Self::Audio => "audio",
+            Self::Video => "video",
+            Self::File => "file",
+            Self::Other(value) => value,
+        }
+    }
+}
+
+impl From<&str> for Modality {
+    fn from(value: &str) -> Self {
+        match value {
+            "text" => Self::Text,
+            "image" => Self::Image,
+            "audio" => Self::Audio,
+            "video" => Self::Video,
+            "file" => Self::File,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for Modality {
+    fn from(value: String) -> Self {
+        Self::from(value.as_str())
+    }
+}
+
+impl From<Modality> for String {
+    fn from(value: Modality) -> Self {
+        match value {
+            Modality::Other(value) => value,
+            known => known.as_str().to_string(),
+        }
+    }
+}
+
+impl fmt::Display for Modality {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a model takes in and gives out, as its provider reported them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Modalities {
+    #[serde(default)]
+    pub input: Vec<Modality>,
+    #[serde(default)]
+    pub output: Vec<Modality>,
+}
+
+impl Modalities {
+    pub fn outputs(&self, modality: &Modality) -> bool {
+        self.output.contains(modality)
+    }
+}
+
+impl fmt::Display for Modalities {
+    /// `text+image → text`, the shape a model picker or catalog line shows.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let join = |side: &[Modality]| {
+            if side.is_empty() {
+                "?".to_string()
+            } else {
+                side.iter()
+                    .map(Modality::as_str)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            }
+        };
+        write!(f, "{} → {}", join(&self.input), join(&self.output))
+    }
+}
+
+/// A protocol that carries a verb. This is a name, not the implementation: LLM
+/// families are implemented in cairn-llm-wire, and media wires will get
+/// sibling crates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Wire {
+    /// OpenAI-compatible `chat/completions`.
+    #[serde(rename = "openai-chat")]
+    OpenAiChatCompletions,
+    /// Anthropic-style `messages`.
+    #[serde(rename = "anthropic-messages")]
+    AnthropicMessages,
+    /// OpenAI `responses`.
+    #[serde(rename = "openai-responses")]
+    OpenAiResponses,
+    /// A native decisions endpoint that answers a choice with its own
+    /// probabilities.
+    #[serde(rename = "openai-decisions")]
+    OpenAiDecisions,
+    /// The Claude CLI's stream-json protocol.
+    #[serde(rename = "claude-stream-json")]
+    ClaudeStreamJson,
+    /// The Codex CLI's app-server protocol.
+    #[serde(rename = "codex-app-server")]
+    CodexAppServer,
+}
+
+impl Wire {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "openai-chat",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::OpenAiResponses => "openai-responses",
+            Self::OpenAiDecisions => "openai-decisions",
+            Self::ClaudeStreamJson => "claude-stream-json",
+            Self::CodexAppServer => "codex-app-server",
+        }
+    }
+}
+
+impl fmt::Display for Wire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A facet verb an offer serves. Each variant carries that verb's capability
+/// type, which is where a verb with real capability differences (image sizes,
+/// speech voices) says what it can do. Today's verbs carry none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verb", rename_all = "lowercase")]
+pub enum Verb {
+    Complete,
+    Session,
+    Decide,
+}
+
+impl Verb {
+    pub fn kind(&self) -> VerbKind {
+        match self {
+            Self::Complete => VerbKind::Complete,
+            Self::Session => VerbKind::Session,
+            Self::Decide => VerbKind::Decide,
+        }
+    }
+}
+
+/// Which verb, without its capabilities: what a query asks for and what an
+/// observation records a model as unable to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VerbKind {
+    Complete,
+    Session,
+    Decide,
+}
+
+impl VerbKind {
+    pub const ALL: [VerbKind; 3] = [Self::Complete, Self::Session, Self::Decide];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Session => "session",
+            Self::Decide => "decide",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == value)
+    }
+}
+
+impl fmt::Display for VerbKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One verb an offer serves, and the wire that carries it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServedVerb {
+    #[serde(flatten)]
+    pub verb: Verb,
+    pub wire: Wire,
+}
+
+impl ServedVerb {
+    /// Complete and Session over `wire`: what every conversational model
+    /// serves.
+    pub fn conversation(wire: Wire) -> Vec<ServedVerb> {
+        vec![
+            ServedVerb {
+                verb: Verb::Complete,
+                wire,
+            },
+            ServedVerb {
+                verb: Verb::Session,
+                wire,
+            },
+        ]
+    }
+}
+
+/// The USD price of one unit on one meter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Price {
+    pub meter: Meter,
+    /// USD per one unit, exactly as the provider reported it. Kept as the
+    /// provider's decimal string so no precision is lost before display.
+    pub usd: String,
+}
+
+/// What a model costs, meter by meter.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPricing {
+    #[serde(default)]
+    pub prices: Vec<Price>,
+    /// Provider price keys Cairn can't place on a meter, kept verbatim rather
+    /// than guessed.
+    #[serde(default)]
+    pub unplaced: BTreeMap<String, String>,
+}
+
+impl ModelPricing {
+    /// The price on exactly this meter, if the provider set one.
+    pub fn usd_per(
+        &self,
+        charge: Charge,
+        modality: Option<&Modality>,
+        unit: BillingUnit,
+    ) -> Option<&str> {
+        self.prices
+            .iter()
+            .find(|price| {
+                price.meter.charge == charge
+                    && price.meter.modality.as_ref() == modality
+                    && price.meter.unit == unit
+            })
+            .map(|price| price.usd.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredReasoningEffort {
     pub reasoning_effort: String,
     pub description: Option<String>,
-}
-
-/// The HTTP protocol family a discovered model is served over.
-///
-/// Optional metadata on [`DiscoveredModel`], and deliberately so: a backend that
-/// serves its whole catalog through one hardcoded protocol has no reason to
-/// claim one. What matters is that an ABSENT value never reads as "chat
-/// completions" — that guess is exactly what sends a Messages-only model to an
-/// endpoint which cannot answer it, failing mid-session instead of before one
-/// starts. A backend fronting several families (OpenCode Go) records the family
-/// per model and refuses to route a model whose family it cannot name.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub enum DiscoveredWireProtocol {
-    /// OpenAI-compatible `chat/completions`.
-    OpenAiChatCompletions,
-    /// Anthropic-style `messages`.
-    AnthropicMessages,
-    /// OpenAI `responses`.
-    OpenAiResponses,
-    /// A family Cairn has no adapter for. Recorded as unknown rather than
-    /// guessed, so the catalog can carry the model and say why it is not served.
-    Unknown,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -449,31 +687,25 @@ pub struct DiscoveredModel {
     #[serde(default)]
     pub serving_account_ids: Vec<String>,
     #[serde(default)]
-    pub pricing: Option<DiscoveredModelPricing>,
+    pub pricing: Option<ModelPricing>,
     #[serde(default)]
     pub supported_parameters: Vec<String>,
     #[serde(default)]
     pub router: bool,
+    /// What the model takes in and gives out. `None` means the provider didn't
+    /// say.
     #[serde(default)]
-    pub architecture_modality: Option<String>,
-    /// Which HTTP protocol family serves this model, when the backend fronts
-    /// more than one. `None` means the backend never claimed one — read it as
-    /// "unrouteable here", never as a default family.
+    pub modalities: Option<Modalities>,
+    /// The verbs this model serves and the wire each rides, as discovery found
+    /// them.
+    ///
+    /// `None` means discovery made no per-model claim, so the provider-wide
+    /// declaration applies. `Some(vec![])` means discovery says this model
+    /// serves nothing Cairn has. A backend fronting several wires (OpenCode Go)
+    /// declares no provider-wide default, so for it an absent claim is a
+    /// refusal, never a guess at a family.
     #[serde(default)]
-    pub wire_protocol: Option<DiscoveredWireProtocol>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoveredModelPricing {
-    pub prompt: Option<String>,
-    pub completion: Option<String>,
-    pub request: Option<String>,
-    pub image: Option<String>,
-    pub web_search: Option<String>,
-    pub internal_reasoning: Option<String>,
-    pub input_cache_read: Option<String>,
-    pub input_cache_write: Option<String>,
+    pub serves: Option<Vec<ServedVerb>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -583,8 +815,8 @@ pub fn claude_models() -> Vec<DiscoveredModel> {
         pricing: None,
         supported_parameters: Vec::new(),
         router: false,
-        architecture_modality: None,
-        wire_protocol: None,
+        modalities: None,
+        serves: None,
     })
     .collect()
 }
@@ -622,6 +854,96 @@ pub fn context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_modality_is_its_plain_string_and_an_unknown_one_is_kept_verbatim() {
+        let modalities: Modalities = serde_json::from_value(serde_json::json!({
+            "input": ["text", "image", "hologram"],
+            "output": ["text"]
+        }))
+        .unwrap();
+        assert_eq!(
+            modalities.input,
+            vec![
+                Modality::Text,
+                Modality::Image,
+                Modality::Other("hologram".into())
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&modalities).unwrap(),
+            serde_json::json!({"input": ["text", "image", "hologram"], "output": ["text"]})
+        );
+        assert_eq!(modalities.to_string(), "text+image+hologram → text");
+    }
+
+    #[test]
+    fn a_served_verb_is_one_flat_object_naming_its_verb_and_wire() {
+        let served = ServedVerb::conversation(Wire::AnthropicMessages);
+        let json = serde_json::to_value(&served).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"verb": "complete", "wire": "anthropic-messages"},
+                {"verb": "session", "wire": "anthropic-messages"}
+            ])
+        );
+        assert_eq!(
+            serde_json::from_value::<Vec<ServedVerb>>(json).unwrap(),
+            served
+        );
+        for wire in [
+            Wire::OpenAiChatCompletions,
+            Wire::AnthropicMessages,
+            Wire::OpenAiResponses,
+            Wire::OpenAiDecisions,
+            Wire::ClaudeStreamJson,
+            Wire::CodexAppServer,
+        ] {
+            assert_eq!(serde_json::to_value(wire).unwrap(), wire.as_str());
+        }
+        for kind in VerbKind::ALL {
+            assert_eq!(VerbKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(VerbKind::parse("image"), None);
+    }
+
+    #[test]
+    fn a_price_is_found_on_exactly_its_meter() {
+        let pricing = ModelPricing {
+            prices: vec![
+                Price {
+                    meter: Meter::tokens(Charge::Output),
+                    usd: "0.000012".into(),
+                },
+                Price {
+                    meter: Meter {
+                        charge: Charge::Output,
+                        modality: Some(Modality::Image),
+                        unit: BillingUnit::Tokens,
+                    },
+                    usd: "0.00003".into(),
+                },
+            ],
+            unplaced: BTreeMap::new(),
+        };
+        assert_eq!(
+            pricing.usd_per(Charge::Output, None, BillingUnit::Tokens),
+            Some("0.000012")
+        );
+        assert_eq!(
+            pricing.usd_per(Charge::Output, Some(&Modality::Image), BillingUnit::Tokens),
+            Some("0.00003")
+        );
+        assert_eq!(
+            pricing.usd_per(Charge::Output, Some(&Modality::Image), BillingUnit::Images),
+            None
+        );
+        assert_eq!(
+            pricing.usd_per(Charge::Input, None, BillingUnit::Tokens),
+            None
+        );
+    }
 
     fn provider(account_id: &str, name: &str) -> CustomProvider {
         CustomProvider {

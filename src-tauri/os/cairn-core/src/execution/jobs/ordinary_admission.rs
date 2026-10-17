@@ -1644,6 +1644,13 @@ mod tests {
         fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
             Ok(Vec::new())
         }
+        fn serves(
+            &self,
+            _: &crate::orchestrator::Orchestrator,
+            _: Option<&str>,
+        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+            Vec::new()
+        }
         fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
             ResolvedTools {
                 allowed: Vec::new(),
@@ -1683,6 +1690,13 @@ mod tests {
         }
         fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
             Ok(Vec::new())
+        }
+        fn serves(
+            &self,
+            _: &crate::orchestrator::Orchestrator,
+            _: Option<&str>,
+        ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+            Vec::new()
         }
         fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
             ResolvedTools {

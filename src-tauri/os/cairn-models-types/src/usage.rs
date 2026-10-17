@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::catalog::Modality;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderUsageScope {
@@ -287,9 +289,217 @@ impl ProviderUsageSnapshot {
     }
 }
 
+// ============================================================================
+// Metering: what one call consumed, and what one unit of it costs
+// ============================================================================
+//
+// A price and a usage count are about the same thing, so they share one
+// description of it, the [`Meter`]. A model priced per output image token and a
+// call that consumed output image tokens name the same meter, which is what
+// lets one be multiplied by the other without a per-provider table in between.
+
+/// The unit a quantity is counted, and a price is charged, in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BillingUnit {
+    Tokens,
+    Images,
+    Characters,
+    Seconds,
+    Requests,
+}
+
+impl BillingUnit {
+    /// The singular noun for one unit, as a price is quoted ("$0.04/image").
+    pub fn noun(self) -> &'static str {
+        match self {
+            Self::Tokens => "token",
+            Self::Images => "image",
+            Self::Characters => "character",
+            Self::Seconds => "second",
+            Self::Requests => "request",
+        }
+    }
+}
+
+/// What a quantity is charged as. Input that was served from a cache is its own
+/// charge rather than a kind of input, because providers price it separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Charge {
+    Input,
+    Output,
+    CacheRead,
+    CacheWrite,
+    Reasoning,
+    Request,
+    WebSearch,
+}
+
+/// What one count or price is about: the thing charged, the modality when the
+/// provider distinguishes one (an output image billed per token), and the unit.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Meter {
+    pub charge: Charge,
+    /// `None` when the provider does not distinguish a modality for this
+    /// charge, which for tokens is the ordinary case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<Modality>,
+    pub unit: BillingUnit,
+}
+
+impl Meter {
+    /// A meter counting tokens of any modality.
+    pub fn tokens(charge: Charge) -> Self {
+        Self {
+            charge,
+            modality: None,
+            unit: BillingUnit::Tokens,
+        }
+    }
+}
+
+/// A quantity counted on one meter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Measure {
+    pub meter: Meter,
+    pub quantity: u64,
+}
+
+/// What one call consumed, in the units it was counted in.
+///
+/// Only what the provider actually reported is measured. A meter that is absent
+/// was not reported, which is not the same as having consumed nothing on it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeteredUsage {
+    #[serde(default)]
+    pub measures: Vec<Measure>,
+    /// What the provider said the call cost, when it said.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+}
+
+impl MeteredUsage {
+    /// The total counted as `charge` in `unit`, across every modality, or `None`
+    /// when nothing was measured on it.
+    pub fn quantity(&self, charge: Charge, unit: BillingUnit) -> Option<u64> {
+        self.measures
+            .iter()
+            .filter(|measure| measure.meter.charge == charge && measure.meter.unit == unit)
+            .map(|measure| measure.quantity)
+            .reduce(u64::saturating_add)
+    }
+
+    /// The whole prompt: every token charged on the way in, cached or not.
+    /// This is what a provider means by "prompt tokens", and what the responses
+    /// journal records as a call's input.
+    pub fn prompt_tokens(&self) -> Option<u64> {
+        [Charge::Input, Charge::CacheRead, Charge::CacheWrite]
+            .into_iter()
+            .filter_map(|charge| self.quantity(charge, BillingUnit::Tokens))
+            .reduce(u64::saturating_add)
+    }
+
+    /// This usage with its cost replaced: for a caller that learns the cost
+    /// from somewhere other than the usage body, or knows nobody is charging.
+    pub fn with_cost(self, cost_usd: Option<f64>) -> Self {
+        Self { cost_usd, ..self }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_meter_serializes_its_modality_only_when_it_names_one() {
+        assert_eq!(
+            serde_json::to_value(Meter::tokens(Charge::CacheRead)).unwrap(),
+            serde_json::json!({"charge": "cacheRead", "unit": "tokens"})
+        );
+        let image_out = Meter {
+            charge: Charge::Output,
+            modality: Some(Modality::Image),
+            unit: BillingUnit::Tokens,
+        };
+        let json = serde_json::to_value(&image_out).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"charge": "output", "modality": "image", "unit": "tokens"})
+        );
+        assert_eq!(serde_json::from_value::<Meter>(json).unwrap(), image_out);
+    }
+
+    #[test]
+    fn a_quantity_sums_its_charge_across_modalities_and_is_absent_when_unmeasured() {
+        let usage = MeteredUsage {
+            measures: vec![
+                Measure {
+                    meter: Meter::tokens(Charge::Output),
+                    quantity: 40,
+                },
+                Measure {
+                    meter: Meter {
+                        charge: Charge::Output,
+                        modality: Some(Modality::Image),
+                        unit: BillingUnit::Tokens,
+                    },
+                    quantity: 1290,
+                },
+                Measure {
+                    meter: Meter {
+                        charge: Charge::Output,
+                        modality: Some(Modality::Image),
+                        unit: BillingUnit::Images,
+                    },
+                    quantity: 1,
+                },
+                Measure {
+                    meter: Meter::tokens(Charge::CacheRead),
+                    quantity: 0,
+                },
+            ],
+            cost_usd: None,
+        };
+        assert_eq!(
+            usage.quantity(Charge::Output, BillingUnit::Tokens),
+            Some(1330)
+        );
+        assert_eq!(usage.quantity(Charge::Output, BillingUnit::Images), Some(1));
+        // Reported as zero is a measurement; never reported is not.
+        assert_eq!(
+            usage.quantity(Charge::CacheRead, BillingUnit::Tokens),
+            Some(0)
+        );
+        assert_eq!(usage.quantity(Charge::Input, BillingUnit::Tokens), None);
+        assert_eq!(
+            MeteredUsage::default().quantity(Charge::Output, BillingUnit::Tokens),
+            None
+        );
+    }
+
+    #[test]
+    fn the_prompt_is_every_input_side_token() {
+        let measure = |charge, quantity| Measure {
+            meter: Meter::tokens(charge),
+            quantity,
+        };
+        let usage = MeteredUsage {
+            measures: vec![
+                measure(Charge::Input, 12),
+                measure(Charge::CacheRead, 900),
+                measure(Charge::CacheWrite, 100),
+                measure(Charge::Output, 5),
+            ],
+            cost_usd: Some(0.5),
+        };
+        assert_eq!(usage.prompt_tokens(), Some(1012));
+        assert_eq!(MeteredUsage::default().prompt_tokens(), None);
+        assert_eq!(usage.with_cost(None).cost_usd, None);
+    }
 
     #[test]
     fn unsupported_and_error_snapshots_do_not_claim_a_capture_time() {

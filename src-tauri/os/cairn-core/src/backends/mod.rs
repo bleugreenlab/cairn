@@ -80,7 +80,7 @@ use cairn_models::session::mcp::{McpServer, McpServers};
 pub(crate) fn cairn_servers(server: &McpServer) -> McpServers {
     McpServers::new(vec![server.clone()]).expect("Cairn's own MCP server name is valid")
 }
-use cairn_models::types::catalog::{DiscoveredModel, ProviderOptionDescriptor};
+use cairn_models::types::catalog::{DiscoveredModel, ProviderOptionDescriptor, ServedVerb};
 pub use cairn_session::config::*;
 
 /// Configuration for starting a session (backend-agnostic).
@@ -191,6 +191,13 @@ pub trait AgentBackend: Send + Sync {
 
     /// Discover currently available model options for this backend.
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String>;
+
+    /// What this backend serves for any model it routes in `project_id`'s
+    /// scope, each verb with the wire that carries it. A model whose discovery
+    /// declares what it serves answers for itself ([`DiscoveredModel::serves`]);
+    /// this is what every other model serves, including one a tier is bound to
+    /// that discovery has not reported.
+    fn serves(&self, orch: &Orchestrator, project_id: Option<&str>) -> Vec<ServedVerb>;
 
     /// Whether this backend can execute a response's tool-free, one-shot
     /// completion with the credentials or host configuration currently in
@@ -572,6 +579,9 @@ pub(crate) mod tests {
             fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
                 Ok(Vec::new())
             }
+            fn serves(&self, _: &Orchestrator, _: Option<&str>) -> Vec<ServedVerb> {
+                Vec::new()
+            }
             fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
                 ResolvedTools {
                     allowed: Vec::new(),
@@ -607,6 +617,9 @@ pub(crate) mod tests {
             }
             fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
                 Ok(Vec::new())
+            }
+            fn serves(&self, _: &Orchestrator, _: Option<&str>) -> Vec<ServedVerb> {
+                Vec::new()
             }
             fn resolve_tools(&self, _: &[String], _: &[String]) -> ResolvedTools {
                 ResolvedTools {
@@ -995,6 +1008,25 @@ pub(crate) mod tests {
 }
 
 mod transcript_host;
+
+/// Compare `rendered` with the checked-in golden at `path`, or rewrite the
+/// golden when `CAIRN_UPDATE_GOLDENS=1`. A golden pins observable output across
+/// a refactor, so regenerating one is a claim that the change was intended.
+#[cfg(test)]
+pub(crate) fn assert_golden_file(path: &str, rendered: &str) {
+    if std::env::var("CAIRN_UPDATE_GOLDENS").as_deref() == Ok("1") {
+        let path = std::path::Path::new(path);
+        std::fs::create_dir_all(path.parent().expect("a golden lives in a directory")).unwrap();
+        std::fs::write(path, rendered).unwrap();
+        return;
+    }
+    let golden = std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("golden {path} is unreadable: {error}"));
+    assert!(
+        golden == rendered,
+        "{path} drifted (rerun with CAIRN_UPDATE_GOLDENS=1 only for an intended change)\n--- golden\n{golden}\n--- rendered\n{rendered}"
+    );
+}
 
 pub(crate) use cairn_models::types::catalog::resolved_backend_for_model;
 

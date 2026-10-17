@@ -21,11 +21,12 @@ use cairn_models::interface::session::{
     ServerLaunch, SessionControl, SessionError, SessionEvents, SessionFacts, SessionHost,
     SessionInput, SessionProvider, SessionSpec,
 };
-use cairn_models::interface::Models;
+use cairn_models::interface::{ModelScope, Models};
 use cairn_models::types::catalog::{
-    claude_models, DiscoveredWireProtocol, ProviderModelCatalog, CUSTOM_KEY_PREFIX,
+    claude_models, ProviderModelCatalog, ServedVerb, VerbKind, Wire, CUSTOM_KEY_PREFIX,
     PROVIDER_CATALOG,
 };
+use cairn_models::types::usage::{BillingUnit, Charge};
 use cairn_models::wire::MessageContent;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use serde_json::{json, Value};
@@ -52,6 +53,9 @@ const WAIT: Duration = Duration::from_secs(20);
 #[derive(Default)]
 struct Recorder {
     calls: Mutex<Vec<String>>,
+    /// Every completion's backend key, delivery, and the wire its route
+    /// spoke, so a test can hold it against what the catalog declares.
+    wires: Mutex<Vec<(String, &'static str, Wire)>>,
     released: Mutex<bool>,
     gate: Condvar,
     /// Senders that keep each fake session's output open until the test ends.
@@ -188,6 +192,11 @@ impl Complete for RecordingComplete {
             "complete:{}:{}:{delivery}",
             call.wire.family(),
             call.wire.backend_key()
+        ));
+        self.0.wires.lock().unwrap().push((
+            call.wire.backend_key().to_string(),
+            delivery,
+            call.wire.wire(),
         ));
         if delivery == "stream" {
             self.0.hold();
@@ -531,7 +540,7 @@ async fn orchestrator(recorder: &Arc<Recorder>) -> (Orchestrator, String) {
     glm.id = "glm-coverage".into();
     glm.model = "glm-coverage".into();
     glm.supported_parameters = vec!["tools".into()];
-    glm.wire_protocol = Some(DiscoveredWireProtocol::OpenAiChatCompletions);
+    glm.serves = Some(ServedVerb::conversation(Wire::OpenAiChatCompletions));
     orch.model_catalog.write().unwrap().insert(
         "opencode-go".to_string(),
         ProviderModelCatalog {
@@ -732,6 +741,37 @@ async fn every_catalog_provider_launches_through_the_facet() {
             assert!(outcome.is_err(), "{key}: the recorder refuses every call");
             assert!(recorder.saw(&call), "{key} one-shot did not reach Complete");
         }
+    }
+
+    // Every HTTP launch spoke a wire its catalog entry declares for the verb:
+    // a session streams, a one-shot completes. The declaration is resolved as
+    // an installed provider would resolve it, since not every provider here is
+    // in the workspace's installed list.
+    let catalog = orch.catalog(&ModelScope::default()).unwrap();
+    let discovered = orch.model_catalog.read().unwrap().clone();
+    let wires = recorder.wires.lock().unwrap().clone();
+    assert!(!wires.is_empty(), "no HTTP launch reached Complete");
+    for (key, delivery, wire) in wires {
+        let mut provider = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.descriptor.key == key.as_str())
+            .unwrap_or_else(|| panic!("{key} is not in the catalog"))
+            .clone();
+        provider.models = discovered.get(&key).cloned();
+        provider.serves = orch.provider_serves(&key, None);
+        let verb = if delivery == "stream" {
+            VerbKind::Session
+        } else {
+            VerbKind::Complete
+        };
+        let declared = provider.serves_for(plan(&key).model);
+        assert!(
+            declared
+                .iter()
+                .any(|served| served.verb.kind() == verb && served.wire == wire),
+            "{key} sent a {verb} over {wire}, but its catalog entry declares {declared:?}"
+        );
     }
 
     // The pooled Codex call path starts its server and opens its thread
@@ -935,9 +975,15 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         .unwrap();
     assert_eq!(plain.text, CLAUDE_ANSWER);
     assert_eq!(plain.account_id.as_deref(), Some(profile.id.as_str()));
-    assert_eq!(plain.tokens.input, Some(1012), "the whole prompt");
-    assert_eq!(plain.tokens.output, Some(5));
-    assert_eq!(plain.cost, None, "a subscription's cost is notional");
+    assert_eq!(plain.usage.prompt_tokens(), Some(1012), "the whole prompt");
+    assert_eq!(
+        plain.usage.quantity(Charge::Output, BillingUnit::Tokens),
+        Some(5)
+    );
+    assert_eq!(
+        plain.usage.cost_usd, None,
+        "a subscription's cost is notional"
+    );
     let schema = json!({"type": "object", "properties": {"answer": {"type": "string"}}});
     let structured = complete_on(
         &orch,
@@ -958,8 +1004,11 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
         .unwrap();
     assert_eq!(codex.text, CODEX_ANSWER);
     assert_eq!(codex.account_id.as_deref(), Some(openai.id.as_str()));
-    assert_eq!(codex.tokens.input, Some(60));
-    assert_eq!(codex.tokens.output, Some(10));
+    assert_eq!(codex.usage.prompt_tokens(), Some(60));
+    assert_eq!(
+        codex.usage.quantity(Charge::Output, BillingUnit::Tokens),
+        Some(10)
+    );
     let codex_structured = complete_on(
         &orch,
         "codex",
@@ -1030,6 +1079,7 @@ async fn claude_and_codex_serve_responses_through_the_facet() {
 async fn decisions_launch_only_on_a_decision_capable_offer() {
     use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling};
     use crate::models::decision::{DecisionNode, MeasuredBy};
+    use cairn_models::interface::OfferQuery;
     use cairn_models::subscription::testing::TempHomes;
 
     let recorder = Arc::new(Recorder::default());
@@ -1099,11 +1149,29 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
 
     let offer = orch.decision_offer(None, &decision).unwrap();
     assert_eq!(
-        (offer.provider.as_str(), offer.model.as_str(), offer.method),
-        (jev_key.as_str(), "typesafe-ai/jev", MeasuredBy::Native)
+        (
+            offer.provider.as_str(),
+            offer.model.as_str(),
+            offer.measured_by()
+        ),
+        (
+            jev_key.as_str(),
+            "typesafe-ai/jev",
+            Some(MeasuredBy::Native)
+        )
     );
     let failed = orch.decide(None, &decision, "{}".into()).await.unwrap_err();
     assert!(failed.contains("recorded, not sent"), "{failed}");
+    assert_eq!(
+        recorder
+            .wires
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(_, _, wire)| *wire),
+        Some(offer.served.wire),
+        "the Decisions POST rides the wire the offer declares"
+    );
     assert_eq!(
         *recorder.calls.lock().unwrap(),
         [format!("complete:decisions:{jev_key}:whole")],
@@ -1130,18 +1198,42 @@ async fn decisions_launch_only_on_a_decision_capable_offer() {
         .unwrap();
     let spark_key = cairn_models::types::catalog::custom_key(&spark.id);
     orch.refresh_provider_model_catalog_blocking(&spark_key);
+    // Selection alone: admitting a logprobs offer also probes it, which this
+    // recording completer refuses. The probe is covered in `decide.rs`.
+    let offer = orch
+        .catalog(&ModelScope::default())
+        .unwrap()
+        .offer_for(OfferQuery {
+            requested: Some("gemma4-26b"),
+            ..OfferQuery::new(VerbKind::Decide)
+        })
+        .unwrap();
+    assert_eq!(
+        (offer.provider.as_str(), offer.measured_by()),
+        (spark_key.as_str(), Some(MeasuredBy::Logprobs))
+    );
+    // Admission probes it, and the probe rides the wire the offer declares.
     let pinned = DecisionNode {
         model: Some("gemma4-26b".into()),
         ..decision.clone()
     };
-    let offer = orch.decision_offer(None, &pinned).unwrap();
-    assert_eq!(
-        (offer.provider.as_str(), offer.method),
-        (spark_key.as_str(), MeasuredBy::Logprobs)
+    assert!(
+        orch.decision_offer(None, &pinned).is_err(),
+        "the recorder refuses the probe"
     );
     assert_eq!(
-        orch.decision_offer(None, &decision).unwrap().method,
-        MeasuredBy::Native,
+        recorder
+            .wires
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(_, _, wire)| *wire),
+        Some(offer.served.wire),
+        "the logprobs probe rides the wire the offer declares"
+    );
+    assert_eq!(
+        orch.decision_offer(None, &decision).unwrap().measured_by(),
+        Some(MeasuredBy::Native),
         "unset prefers a native offer over a logprobs one"
     );
     assert_eq!(session_rows(&orch).await, 0);

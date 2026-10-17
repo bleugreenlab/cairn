@@ -233,6 +233,15 @@ impl AgentBackend for ActualBackend {
         Ok(())
     }
 
+    fn serves(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+        use cairn_models::types::catalog::{ServedVerb, Wire};
+        ServedVerb::conversation(Wire::OpenAiChatCompletions)
+    }
+
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         // Inventory is per-target, so it cannot be answered without the
         // configured targets; the orchestrator routes Actual through

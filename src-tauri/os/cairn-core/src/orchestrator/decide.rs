@@ -1,11 +1,12 @@
 //! The orchestrator's side of the cairn-models facet's `decide` verb.
 //!
-//! The facet measures; this module decides where. It reports each provider's
-//! decision method into the catalog, resolves an authored model or tier to a
-//! decision offer through the facet's one selector
-//! ([`cairn_models::interface::Catalog::decision_offer`]), confirms that offer
-//! can measure the node's questions, and runs the facet's blocking `decide`
-//! off the async runtime.
+//! The facet measures; this module decides where. It reports what each
+//! logprobs offer was seen unable to do into the catalog, resolves an authored
+//! model or tier to an offer serving `decide` through the facet's one selector
+//! ([`cairn_models::interface::Catalog::offer_for`]), confirms that offer can
+//! measure the node's questions, and runs the facet's blocking `decide` off the
+//! async runtime. Which providers serve `decide` at all, and over which wire,
+//! is each backend's own declaration (`AgentBackend::serves`).
 //!
 //! Only custom providers can answer a decision today: one speaking the
 //! Decisions protocol natively, one speaking OpenAI chat from its logprobs.
@@ -20,15 +21,15 @@
 //! leaves the catalog's decision offers, so selection moves past it and every
 //! surface stops offering it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::models::decision::{Decision, DecisionNode, MeasuredBy};
 use crate::models::RecipeNode;
-use cairn_models::interface::decide::{DecisionCall, DecisionOffer, DecisionRoute};
-use cairn_models::interface::{ModelScope, Models};
-use cairn_models::types::catalog;
+use cairn_models::interface::decide::{DecisionCall, DecisionRoute};
+use cairn_models::interface::{ModelScope, Models, OfferQuery, SelectedOffer, Unable};
+use cairn_models::types::catalog::{self, VerbKind};
 
 use super::Orchestrator;
 use crate::backends::custom::CustomProviderConfig;
@@ -60,14 +61,14 @@ struct Observation {
 impl DecisionObservations {
     /// What `offer` was last seen to do, while that still stands: `Some(None)`
     /// when it answered, `Some(Some(why))` when it could not.
-    fn get(&self, offer: &DecisionOffer) -> Option<Option<String>> {
+    fn get(&self, offer: &SelectedOffer) -> Option<Option<String>> {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.get(&(offer.provider.clone(), offer.model.clone()))
             .filter(|observation| observation.at.elapsed() < OBSERVATION_TTL)
             .map(|observation| observation.unable.clone())
     }
 
-    fn record(&self, offer: &DecisionOffer, unable: Option<String>) {
+    fn record(&self, offer: &SelectedOffer, unable: Option<String>) {
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
         seen.insert(
             (offer.provider.clone(), offer.model.clone()),
@@ -78,17 +79,25 @@ impl DecisionObservations {
         );
     }
 
-    /// The models on `provider` seen unable to decide, each with why.
-    pub(crate) fn unsupported(&self, provider: &str) -> BTreeMap<String, String> {
+    /// The models on `provider` seen unable to decide, each with why, in
+    /// model order.
+    pub(crate) fn unable(&self, provider: &str) -> Vec<Unable> {
         let seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-        seen.iter()
+        let mut unable: Vec<Unable> = seen
+            .iter()
             .filter(|((key, _), observation)| {
                 key == provider && observation.at.elapsed() < OBSERVATION_TTL
             })
             .filter_map(|((_, model), observation)| {
-                Some((model.clone(), observation.unable.clone()?))
+                Some(Unable {
+                    model: model.clone(),
+                    verb: VerbKind::Decide,
+                    why: observation.unable.clone()?,
+                })
             })
-            .collect()
+            .collect();
+        unable.sort_by(|a, b| a.model.cmp(&b.model));
+        unable
     }
 }
 
@@ -104,34 +113,35 @@ pub struct DecisionDiagnostic {
     pub message: String,
 }
 
-/// Why `offer`'s method cannot ask `decision`'s questions, when it cannot.
-fn unmeasurable_by(offer: &DecisionOffer, decision: &DecisionNode) -> Option<String> {
-    let unmeasurable = cairn_models::decide::unmeasurable(&decision.questions, offer.method);
+/// What a decision node asks the catalog for.
+fn decision_query(decision: &DecisionNode) -> OfferQuery<'_> {
+    OfferQuery {
+        requested: decision.model.as_deref(),
+        ..OfferQuery::new(VerbKind::Decide)
+    }
+}
+
+/// Why `offer` cannot ask `decision`'s questions, when it cannot.
+fn unmeasurable_by(offer: &SelectedOffer, decision: &DecisionNode) -> Option<String> {
+    let Some(method) = offer.measured_by() else {
+        return Some(format!(
+            "{} on {} serves decisions over {}, which measures none",
+            offer.model, offer.provider, offer.served.wire
+        ));
+    };
+    let unmeasurable = cairn_models::decide::unmeasurable(&decision.questions, method);
     (!unmeasurable.is_empty()).then(|| {
         format!(
             "{} on {} measures decisions by {}, which cannot ask this: {}",
             offer.model,
             offer.provider,
-            offer.method,
+            method,
             unmeasurable.join(" ")
         )
     })
 }
 
 impl Orchestrator {
-    /// How the provider `key` answers a decision in `project_id`'s scope, or
-    /// `None` when it cannot.
-    pub(crate) fn decision_method(
-        &self,
-        key: &str,
-        project_id: Option<&str>,
-    ) -> Option<MeasuredBy> {
-        let account_id = catalog::custom_account_id(key)?;
-        CustomProviderConfig::resolve(self, account_id, project_id)
-            .ok()
-            .map(|config| config.decision_method())
-    }
-
     /// The offer `decision` would be answered by in `project_id`'s scope,
     /// confirmed able to measure its questions, or the refusal naming the
     /// fixes.
@@ -143,7 +153,7 @@ impl Orchestrator {
         &self,
         project_id: Option<&str>,
         decision: &DecisionNode,
-    ) -> Result<DecisionOffer, String> {
+    ) -> Result<SelectedOffer, String> {
         let scope = ModelScope {
             project_id: project_id.map(str::to_string),
         };
@@ -153,7 +163,7 @@ impl Orchestrator {
         for _ in 0..32 {
             let offer = self
                 .catalog(&scope)?
-                .decision_offer(decision.model.as_deref())
+                .offer_for(decision_query(decision))
                 .map_err(|refusal| refusal.to_string())?;
             if let Some(refusal) = unmeasurable_by(&offer, decision) {
                 return Err(refusal);
@@ -172,9 +182,9 @@ impl Orchestrator {
     fn confirm_offer(
         &self,
         project_id: Option<&str>,
-        offer: &DecisionOffer,
+        offer: &SelectedOffer,
     ) -> Result<bool, String> {
-        if offer.method == MeasuredBy::Native {
+        if offer.measured_by() == Some(MeasuredBy::Native) {
             return Ok(true);
         }
         if let Some(unable) = self.decision_observations.get(offer) {
@@ -210,7 +220,7 @@ impl Orchestrator {
     fn decision_route(
         &self,
         project_id: Option<&str>,
-        offer: &DecisionOffer,
+        offer: &SelectedOffer,
     ) -> Result<DecisionRoute, String> {
         let account_id = catalog::custom_account_id(&offer.provider)
             .ok_or_else(|| format!("{} cannot answer a decision", offer.provider))?;
@@ -249,14 +259,14 @@ impl Orchestrator {
                         ))
                     }
                 };
-                let offer = match catalog.decision_offer(decision.model.as_deref()) {
+                let offer = match catalog.offer_for(decision_query(decision)) {
                     Ok(offer) => offer,
                     Err(refusal) => return Some(report(true, format!("can't be answered: {refusal}"))),
                 };
                 if let Some(refusal) = unmeasurable_by(&offer, decision) {
                     return Some(report(true, format!("can't be answered: {refusal}")));
                 }
-                (offer.method == MeasuredBy::Logprobs
+                (offer.measured_by() == Some(MeasuredBy::Logprobs)
                     && self.decision_observations.get(&offer).is_none())
                 .then(|| {
                     report(
@@ -346,7 +356,7 @@ impl Orchestrator {
         // What a real decision reveals about the model is kept, so the next
         // save or launch does not admit an offer this one just found unable.
         match &result {
-            Ok(_) if offer.method == MeasuredBy::Logprobs => {
+            Ok(_) if offer.measured_by() == Some(MeasuredBy::Logprobs) => {
                 self.decision_observations.record(&offer, None)
             }
             Err(error) => {
@@ -369,6 +379,7 @@ mod tests {
         Complete, CompletionCall, CompletionError, CompletionReply,
     };
     use cairn_models::interface::{ModelScope, Models};
+    use cairn_models::types::catalog::VerbKind;
     use serde_json::{json, Value};
 
     use crate::credentials::{CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth};
@@ -533,7 +544,7 @@ edges:
 
         // And the catalog stops offering it for decisions.
         let catalog = orch.catalog(&ModelScope::default()).unwrap();
-        assert!(catalog.decision_offers().is_empty());
+        assert!(catalog.offers_serving(VerbKind::Decide).is_empty());
 
         // A read reports it as blocking, naming why, without asking again.
         let [report] = orch

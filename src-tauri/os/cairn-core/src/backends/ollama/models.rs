@@ -1,6 +1,6 @@
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_models::types::catalog::DiscoveredModel;
+use cairn_models::types::catalog::{DiscoveredModel, Modalities, Modality};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -52,6 +52,7 @@ struct MergedModel {
     account_ids: Vec<String>,
     context_window: Option<i64>,
     supports_tools: bool,
+    sees_images: bool,
 }
 #[allow(dead_code)]
 pub(crate) fn discover_models_blocking(
@@ -195,6 +196,7 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
                 // select, while retaining every serving account for failover.
                 entry.context_window = context_length(&show.model_info);
                 entry.supports_tools = show.capabilities.iter().any(|c| c == "tools");
+                entry.sees_images = show.capabilities.iter().any(|c| c == "vision");
             }
         }
     }
@@ -219,8 +221,17 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
                 vec![]
             },
             router: false,
-            architecture_modality: None,
-            wire_protocol: None,
+            // Only `completion` models are listed, so every one reads and
+            // writes text; `vision` is Ollama's word for also reading images.
+            modalities: Some(Modalities {
+                input: if entry.sees_images {
+                    vec![Modality::Text, Modality::Image]
+                } else {
+                    vec![Modality::Text]
+                },
+                output: vec![Modality::Text],
+            }),
+            serves: None,
         })
         .collect()
 }

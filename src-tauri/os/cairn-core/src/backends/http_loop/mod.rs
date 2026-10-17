@@ -47,7 +47,6 @@ use cairn_models::interface::complete::CompletionError;
 use cairn_models::interface::session::SessionInput;
 use cairn_models::turn::{FamilyTurn, ProtocolFamily, TurnExit};
 use cairn_models::wire::MessageContent;
-use serde_json::Value;
 use std::any::Any;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -61,26 +60,7 @@ pub(super) trait HttpUsageExt {
 
 impl HttpUsageExt for TurnUsage {
     fn token_counts(&self) -> TokenCounts {
-        let cache_read = self.prompt_tokens_details.as_ref().and_then(|v| {
-            v.get("cached_tokens")
-                .and_then(Value::as_i64)
-                .map(|n| n as i32)
-        });
-        TokenCounts {
-            input: self
-                .prompt_tokens
-                .map(|input| input.saturating_sub(cache_read.unwrap_or(0))),
-            output: self.completion_tokens,
-            cache_read,
-            cache_create: None,
-            thinking: self.reasoning_tokens.or_else(|| {
-                self.completion_tokens_details.as_ref().and_then(|v| {
-                    v.get("reasoning_tokens")
-                        .and_then(Value::as_i64)
-                        .map(|n| n as i32)
-                })
-            }),
-        }
+        TokenCounts::from(&cairn_models::usage::metered(self))
     }
 }
 

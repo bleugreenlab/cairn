@@ -1,3 +1,4 @@
+use cairn_models::types::usage::{BillingUnit, Charge, MeteredUsage};
 use cairn_models::wire::claude_stream::{
     extract_assistant_content, extract_user_content, parse_event, ClaudeEvent, Usage,
 };
@@ -53,6 +54,24 @@ impl TokenCounts {
 
     pub fn from_optional_usage(usage: Option<&Usage>) -> Self {
         usage.map(Self::from_usage).unwrap_or_default()
+    }
+}
+
+impl From<&MeteredUsage> for TokenCounts {
+    /// A transcript event's token columns: one per token meter.
+    fn from(usage: &MeteredUsage) -> Self {
+        let tokens = |charge| {
+            usage
+                .quantity(charge, BillingUnit::Tokens)
+                .map(|quantity| i32::try_from(quantity).unwrap_or(i32::MAX))
+        };
+        Self {
+            input: tokens(Charge::Input),
+            output: tokens(Charge::Output),
+            cache_read: tokens(Charge::CacheRead),
+            cache_create: tokens(Charge::CacheWrite),
+            thinking: tokens(Charge::Reasoning),
+        }
     }
 }
 

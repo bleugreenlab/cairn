@@ -19,7 +19,7 @@ pub use usage::collect_openrouter_usage_snapshot;
 
 use crate::backends::{
     AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionRole,
-    CompletionShape, CompletionTokens, ResolvedTools, SessionConfig,
+    CompletionShape, ResolvedTools, SessionConfig,
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
@@ -128,16 +128,15 @@ impl AgentBackend for OpenRouterBackend {
             .and_then(|content| content.as_text())
             .ok_or_else(|| CompletionError::InvalidResponse("missing text choice".to_string()))?
             .to_string();
-        let usage = response.usage.as_ref();
         Ok(CompletionOutcome {
             text,
             parsed: None,
+            usage: response
+                .usage
+                .as_ref()
+                .map(cairn_models::usage::metered)
+                .unwrap_or_default(),
             model: response.model.unwrap_or(request.model),
-            tokens: CompletionTokens {
-                input: usage.and_then(|usage| usage.prompt_tokens.map(|value| value as u64)),
-                output: usage.and_then(|usage| usage.completion_tokens.map(|value| value as u64)),
-            },
-            cost: usage.and_then(|usage| usage.cost),
             latency_ms: started.elapsed().as_millis() as u64,
             account_id: None,
         })
@@ -153,6 +152,15 @@ impl AgentBackend for OpenRouterBackend {
         // errors. Keeping this optimistic lets Settings show the provider card and
         // unauthenticated model catalog fallback.
         Ok(())
+    }
+
+    fn serves(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+        use cairn_models::types::catalog::{ServedVerb, Wire};
+        ServedVerb::conversation(Wire::OpenAiChatCompletions)
     }
 
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {

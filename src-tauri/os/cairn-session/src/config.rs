@@ -1,5 +1,6 @@
 //! Resolved session and backend capability values.
 use cairn_domain::Fence;
+use cairn_models::types::usage::MeteredUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
@@ -152,19 +153,13 @@ impl CompletionRequest {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CompletionTokens {
-    pub input: Option<u64>,
-    pub output: Option<u64>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompletionOutcome {
     pub text: String,
     pub parsed: Option<Value>,
     pub model: String,
-    pub tokens: CompletionTokens,
-    pub cost: Option<f64>,
+    /// What the completion consumed and, when the provider said, what it cost.
+    pub usage: MeteredUsage,
     pub latency_ms: u64,
     /// The Cairn account that served the completion, when the backend chose
     /// one. Journaled with the invocation so usage can be attributed to it.

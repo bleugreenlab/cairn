@@ -76,6 +76,15 @@ impl AgentBackend for OllamaBackend {
     fn is_available(&self) -> Result<(), String> {
         Ok(())
     }
+    fn serves(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+        use cairn_models::types::catalog::{ServedVerb, Wire};
+        ServedVerb::conversation(Wire::OpenAiChatCompletions)
+    }
+
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         Err("Ollama discovery requires configured hosts".to_string())
     }

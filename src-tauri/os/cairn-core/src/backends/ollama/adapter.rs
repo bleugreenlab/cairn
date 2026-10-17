@@ -4,7 +4,7 @@ use crate::backends::openai_compat::conversation;
 use crate::backends::openai_compat::http::{ChatDialect, ChatReasoning, Endpoint};
 use crate::backends::openai_compat::wire::{ChatContent, ChatMessage};
 use crate::backends::SessionConfig;
-use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest, CompletionTokens};
+use crate::backends::{CompletionError, CompletionOutcome, CompletionRequest};
 use crate::orchestrator::Orchestrator;
 use cairn_models::interface::complete::{
     Complete, CompletionCall, CompletionReply, CompletionWire,
@@ -63,16 +63,16 @@ impl OllamaAdapter {
             .and_then(ChatContent::as_text)
             .ok_or_else(|| CompletionError::InvalidResponse("missing text choice".to_string()))?
             .to_string();
-        let usage = response.usage.as_ref();
         Ok(CompletionOutcome {
             text,
             parsed: None,
+            usage: response
+                .usage
+                .as_ref()
+                .map(cairn_models::usage::metered)
+                .unwrap_or_default()
+                .with_cost(None),
             model: response.model.unwrap_or(requested_model),
-            tokens: CompletionTokens {
-                input: usage.and_then(|usage| usage.prompt_tokens.map(|value| value as u64)),
-                output: usage.and_then(|usage| usage.completion_tokens.map(|value| value as u64)),
-            },
-            cost: None,
             latency_ms: started.elapsed().as_millis() as u64,
             account_id: None,
         })
@@ -256,9 +256,15 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.text, "done");
         assert_eq!(outcome.model, "qwen:resolved");
-        assert_eq!(outcome.tokens.input, Some(7));
-        assert_eq!(outcome.tokens.output, Some(3));
-        assert_eq!(outcome.cost, None);
+        assert_eq!(outcome.usage.prompt_tokens(), Some(7));
+        assert_eq!(
+            outcome.usage.quantity(
+                cairn_models::types::usage::Charge::Output,
+                cairn_models::types::usage::BillingUnit::Tokens
+            ),
+            Some(3)
+        );
+        assert_eq!(outcome.usage.cost_usd, None);
     }
 
     #[test]

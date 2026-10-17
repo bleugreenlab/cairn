@@ -33,13 +33,13 @@ pub use usage::collect_opencode_usage_snapshot;
 
 use crate::backends::{
     AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionRole,
-    CompletionShape, CompletionTokens, ResolvedTools, SessionConfig,
+    CompletionShape, ResolvedTools, SessionConfig,
 };
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
 use cairn_models::types::catalog::{
-    DiscoveredModel, DiscoveredWireProtocol, OptionChoice, OptionKind, ProviderOptionDescriptor,
-    ProviderOptionKey,
+    DiscoveredModel, OptionChoice, OptionKind, ProviderOptionDescriptor, ProviderOptionKey,
+    VerbKind, Wire,
 };
 
 /// The subscription is what Cairn serves, so the backend is named for it. The
@@ -133,8 +133,8 @@ fn session_blocker(entry: &DiscoveredModel, model: &str) -> Option<String> {
     ))
 }
 
-/// The protocol family that serves a model, resolved from the discovered catalog
-/// BEFORE any network I/O.
+/// The wire that serves `verb` for a model, resolved from the discovered
+/// catalog BEFORE any network I/O.
 ///
 /// Which endpoint a Go model answers on is not guessable from its id, and a
 /// wrong guess is not a graceful failure: a Responses model sent to
@@ -142,24 +142,29 @@ fn session_blocker(entry: &DiscoveredModel, model: &str) -> Option<String> {
 /// silently degrades. So a model Cairn cannot place is refused here, where the
 /// message can say what to do about it, rather than at the first token.
 ///
-/// Absent metadata is a refusal, never a default. Reading "no protocol recorded"
-/// as "chat completions" is exactly the guess this field exists to prevent.
-fn model_protocol(orch: &Orchestrator, model: &str) -> Result<DiscoveredWireProtocol, String> {
+/// Absent metadata is a refusal, never a default. OpenCode Go declares no
+/// provider-wide wire, so reading "no wire recorded" as "chat completions" is
+/// exactly the guess the per-model declaration exists to prevent.
+fn model_wire(orch: &Orchestrator, model: &str, verb: VerbKind) -> Result<Wire, String> {
     let Some(entry) = catalog_entry(orch, model) else {
         return Err(format!(
             "{model} is not in the OpenCode Go model catalog, so Cairn cannot tell which endpoint \
              family serves it. Refresh the catalog in Settings → Providers, or pick a listed model."
         ));
     };
-    match entry.wire_protocol {
-        Some(DiscoveredWireProtocol::Unknown) | None => Err(unservable_reason(&entry, model)
-            .unwrap_or_else(|| {
-                format!(
-                    "{model} does not publish an endpoint family Cairn has a mapping for, so Cairn \
-                     cannot tell how to talk to it."
-                )
-            })),
-        Some(protocol) => Ok(protocol),
+    let served = entry
+        .serves
+        .iter()
+        .flatten()
+        .find(|served| served.verb.kind() == verb);
+    match served {
+        Some(served) => Ok(served.wire),
+        None => Err(unservable_reason(&entry, model).unwrap_or_else(|| {
+            format!(
+                "{model} does not publish an endpoint family Cairn has a mapping for, so Cairn \
+                 cannot tell how to talk to it."
+            )
+        })),
     }
 }
 
@@ -232,16 +237,15 @@ fn complete_chat(
         .and_then(|content| content.as_text())
         .ok_or_else(|| CompletionError::InvalidResponse("missing text choice".to_string()))?
         .to_string();
-    let usage = response.usage.as_ref();
     Ok(CompletionOutcome {
         text,
         parsed: None,
+        usage: response
+            .usage
+            .as_ref()
+            .map(cairn_models::usage::metered)
+            .unwrap_or_default(),
         model: response.model.unwrap_or(request.model),
-        tokens: CompletionTokens {
-            input: usage.and_then(|usage| usage.prompt_tokens.map(|value| value as u64)),
-            output: usage.and_then(|usage| usage.completion_tokens.map(|value| value as u64)),
-        },
-        cost: usage.and_then(|usage| usage.cost),
         latency_ms: started.elapsed().as_millis() as u64,
         account_id: None,
     })
@@ -300,22 +304,16 @@ fn complete_messages(
             "response carried no text content".to_string(),
         ));
     }
-    let usage = response.usage.as_ref();
+    let cost = crate::backends::anthropic_messages::wire::parse_cost(response.cost.as_ref());
     Ok(CompletionOutcome {
         text,
         parsed: None,
+        usage: response
+            .usage
+            .map(|usage| cairn_models::usage::metered(&usage.into_turn_usage(cost)))
+            .unwrap_or_default()
+            .with_cost(cost),
         model: response.model.unwrap_or(request.model),
-        tokens: CompletionTokens {
-            // Anthropic's input components are disjoint, so the whole prompt is
-            // the uncached input plus what was read from and written to cache.
-            input: usage.map(|usage| {
-                (usage.input_tokens.unwrap_or(0)
-                    + usage.cache_read_input_tokens.unwrap_or(0)
-                    + usage.cache_creation_input_tokens.unwrap_or(0)) as u64
-            }),
-            output: usage.and_then(|usage| usage.output_tokens.map(|value| value as u64)),
-        },
-        cost: crate::backends::anthropic_messages::wire::parse_cost(response.cost.as_ref()),
         latency_ms: started.elapsed().as_millis() as u64,
         account_id: None,
     })
@@ -385,16 +383,15 @@ fn complete_responses(
             "response carried no text output".to_string(),
         ));
     }
-    let usage = response.usage.as_ref();
     Ok(CompletionOutcome {
         text,
         parsed: None,
+        usage: response
+            .usage
+            .map(|usage| cairn_models::usage::metered(&usage.into_turn_usage(response.cost)))
+            .unwrap_or_default()
+            .with_cost(response.cost),
         model: response.model.unwrap_or(request.model),
-        tokens: CompletionTokens {
-            input: usage.and_then(|usage| usage.input_tokens.map(|value| value as u64)),
-            output: usage.and_then(|usage| usage.output_tokens.map(|value| value as u64)),
-        },
-        cost: response.cost,
         latency_ms: started.elapsed().as_millis() as u64,
         account_id: None,
     })
@@ -446,21 +443,15 @@ impl AgentBackend for OpenCodeBackend {
         let api_key = opencode_api_key(orch).ok_or(CompletionError::BackendUnavailable)?;
         // A one-shot completion reaches the same three endpoint families a
         // session does, so it routes the same way and for the same reason.
-        let protocol =
-            model_protocol(orch, &request.model).map_err(CompletionError::InvalidRequest)?;
+        let protocol = model_wire(orch, &request.model, VerbKind::Complete)
+            .map_err(CompletionError::InvalidRequest)?;
         let started = std::time::Instant::now();
         let llm = orch.models_runtime().complete.as_ref();
         match protocol {
-            DiscoveredWireProtocol::OpenAiChatCompletions => {
-                complete_chat(llm, &api_key, request, started)
-            }
-            DiscoveredWireProtocol::AnthropicMessages => {
-                complete_messages(llm, &api_key, request, started)
-            }
-            DiscoveredWireProtocol::OpenAiResponses => {
-                complete_responses(llm, &api_key, request, started)
-            }
-            DiscoveredWireProtocol::Unknown => Err(CompletionError::InvalidRequest(format!(
+            Wire::OpenAiChatCompletions => complete_chat(llm, &api_key, request, started),
+            Wire::AnthropicMessages => complete_messages(llm, &api_key, request, started),
+            Wire::OpenAiResponses => complete_responses(llm, &api_key, request, started),
+            _ => Err(CompletionError::InvalidRequest(format!(
                 "{} is served over an endpoint family Cairn has no mapping for.",
                 request.model
             ))),
@@ -477,6 +468,17 @@ impl AgentBackend for OpenCodeBackend {
         // optimistic here lets Settings show the provider card and its catalog
         // before a key is pasted.
         Ok(())
+    }
+
+    /// Go fronts several wires and names none by default, so a model
+    /// discovery made no claim about serves nothing: absent metadata stays a
+    /// refusal, never a guess at a family.
+    fn serves(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+        Vec::new()
     }
 
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
@@ -533,19 +535,19 @@ impl AgentBackend for OpenCodeBackend {
         }
         // Each arm monomorphizes the generic turn loop with its own adapter, so
         // the protocol is settled once here and never re-decided per turn.
-        match model_protocol(orch, &model)? {
-            DiscoveredWireProtocol::OpenAiChatCompletions => {
+        match model_wire(orch, &model, VerbKind::Session)? {
+            Wire::OpenAiChatCompletions => {
                 crate::backends::http_loop::start_session(config, orch, adapter::OpenCodeAdapter)
             }
-            DiscoveredWireProtocol::AnthropicMessages => {
+            Wire::AnthropicMessages => {
                 crate::backends::http_loop::start_session(config, orch, adapter::messages_adapter())
             }
-            DiscoveredWireProtocol::OpenAiResponses => crate::backends::http_loop::start_session(
+            Wire::OpenAiResponses => crate::backends::http_loop::start_session(
                 config,
                 orch,
                 adapter::responses_adapter(),
             ),
-            DiscoveredWireProtocol::Unknown => Err(format!(
+            _ => Err(format!(
                 "{model} is served over an endpoint family Cairn has no mapping for."
             )),
         }

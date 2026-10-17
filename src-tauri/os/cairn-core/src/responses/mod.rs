@@ -742,9 +742,12 @@ async fn complete_definition_with_executor(
                             model: outcome.model,
                             backend: backend_name.clone(),
                             latency_ms: outcome.latency_ms,
-                            cost: outcome.cost,
-                            input_tokens: outcome.tokens.input,
-                            output_tokens: outcome.tokens.output,
+                            cost: outcome.usage.cost_usd,
+                            input_tokens: outcome.usage.prompt_tokens(),
+                            output_tokens: outcome.usage.quantity(
+                                cairn_models::types::usage::Charge::Output,
+                                cairn_models::types::usage::BillingUnit::Tokens,
+                            ),
                             account_id: outcome.account_id,
                         });
                         break;
@@ -1113,7 +1116,7 @@ fn render_value(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backends::{CompletionOutcome, CompletionTokens};
+    use crate::backends::CompletionOutcome;
     use crate::db::DbState;
     use crate::services::testing::TestServicesBuilder;
     use crate::storage::{LocalDb, MigrationRunner, SearchIndex, TURSO_MIGRATIONS};
@@ -1331,8 +1334,7 @@ mod tests {
                     text: r#"{"answer":"done"}"#.into(),
                     parsed: None,
                     model: "test-model".into(),
-                    tokens: CompletionTokens::default(),
-                    cost: None,
+                    usage: Default::default(),
                     latency_ms: 3,
                     account_id: Some("acct-journal".into()),
                 })

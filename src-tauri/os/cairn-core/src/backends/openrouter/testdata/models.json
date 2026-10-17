@@ -1,0 +1,267 @@
+{
+  "data": [
+    {
+      "id": "anthropic/claude-haiku-5.5",
+      "canonical_slug": "anthropic/claude-haiku-5.5-20261007",
+      "name": "Anthropic: Claude Haiku 5.5",
+      "context_length": 1000000,
+      "architecture": {
+        "modality": "text+image+file->text",
+        "input_modalities": [
+          "text",
+          "image",
+          "file"
+        ],
+        "output_modalities": [
+          "text"
+        ],
+        "tokenizer": "Claude",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.0000001",
+        "completion": "0.0000005",
+        "web_search": "0.01",
+        "input_cache_read": "0.00000001",
+        "input_cache_write": "0.000000125",
+        "input_cache_write_1h": "0.0000002",
+        "overrides": [
+          {
+            "min_prompt_tokens": 100000,
+            "prompt": "0.0000005",
+            "completion": "0.0000025",
+            "input_cache_read": "0.00000005",
+            "input_cache_write": "0.000000625",
+            "input_cache_write_1h": "0.000001"
+          }
+        ]
+      },
+      "top_provider": {
+        "context_length": 1000000,
+        "max_completion_tokens": 128000,
+        "is_moderated": true
+      },
+      "supported_parameters": [
+        "include_reasoning",
+        "max_completion_tokens",
+        "max_tokens",
+        "reasoning",
+        "reasoning_effort",
+        "response_format",
+        "stop",
+        "structured_outputs",
+        "tool_choice",
+        "tools",
+        "verbosity"
+      ],
+      "reasoning": {
+        "mandatory": false,
+        "supported_efforts": [
+          "max",
+          "xhigh",
+          "high",
+          "medium",
+          "low",
+          "none"
+        ],
+        "default_effort": "medium"
+      },
+      "description": "Claude Haiku 5.5 is Anthropic's small, fast model for high-volume, cost-sensitiv"
+    },
+    {
+      "id": "google/gemini-3-pro-image",
+      "canonical_slug": "google/gemini-3-pro-image-20260528",
+      "name": "Google: Nano Banana Pro (Gemini 3 Pro Image)",
+      "context_length": 131072,
+      "architecture": {
+        "modality": "text+image->text+image",
+        "input_modalities": [
+          "image",
+          "text"
+        ],
+        "output_modalities": [
+          "image",
+          "text"
+        ],
+        "tokenizer": "Gemini",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.000002",
+        "completion": "0.000012",
+        "image": "0.000002",
+        "image_output": "0.00012",
+        "audio": "0.000002",
+        "input_audio_cache": "0.0000002",
+        "web_search": "0.014",
+        "internal_reasoning": "0.000012",
+        "input_cache_read": "0.0000002",
+        "input_cache_write": "0.000000375"
+      },
+      "top_provider": {
+        "context_length": 65536,
+        "max_completion_tokens": 32768,
+        "is_moderated": false
+      },
+      "supported_parameters": [
+        "include_reasoning",
+        "max_tokens",
+        "reasoning",
+        "response_format",
+        "seed",
+        "stop",
+        "structured_outputs",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_p"
+      ],
+      "reasoning": {
+        "mandatory": true
+      },
+      "description": "Nano Banana Pro is Google\u2019s most advanced image-generation and editing model, bu"
+    },
+    {
+      "id": "openai/gpt-audio",
+      "canonical_slug": "openai/gpt-audio",
+      "name": "OpenAI: GPT Audio",
+      "context_length": 128000,
+      "architecture": {
+        "modality": "text+audio->text+audio",
+        "input_modalities": [
+          "text",
+          "audio"
+        ],
+        "output_modalities": [
+          "text",
+          "audio"
+        ],
+        "tokenizer": "GPT",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.0000025",
+        "completion": "0.00001",
+        "audio": "0.000032",
+        "audio_output": "0.000064"
+      },
+      "top_provider": {
+        "context_length": 128000,
+        "max_completion_tokens": 16384,
+        "is_moderated": true
+      },
+      "supported_parameters": [
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "max_tokens",
+        "presence_penalty",
+        "response_format",
+        "seed",
+        "stop",
+        "structured_outputs",
+        "temperature",
+        "tool_choice",
+        "tools",
+        "top_logprobs",
+        "top_p"
+      ],
+      "description": "The gpt-audio model is OpenAI's first generally available audio model. The new s"
+    },
+    {
+      "id": "black-forest-labs/flux-3-image-klein",
+      "canonical_slug": "black-forest-labs/flux-3-image-klein-20261015",
+      "name": "Black Forest Labs: FLUX 3 Image Klein",
+      "context_length": 46864,
+      "architecture": {
+        "modality": "text+image->image",
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ],
+        "tokenizer": "Other",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0",
+        "completion": "0",
+        "image_token": "0.00000191616766467066",
+        "image_output": "0.00000191616766467066"
+      },
+      "top_provider": {
+        "context_length": 46864,
+        "max_completion_tokens": 42177,
+        "is_moderated": false
+      },
+      "supported_parameters": [
+        "seed"
+      ],
+      "description": "FLUX 3 Image Klein is an open-weights image generation and editing model from Bl"
+    },
+    {
+      "id": "voyageai/voyage-code-4",
+      "canonical_slug": "voyageai/voyage-code-4-20260812",
+      "name": "VoyageAI by MongoDB: voyage-code-4",
+      "context_length": 32000,
+      "architecture": {
+        "modality": "text->embeddings",
+        "input_modalities": [
+          "text"
+        ],
+        "output_modalities": [
+          "embeddings"
+        ],
+        "tokenizer": "Other",
+        "instruct_type": null
+      },
+      "pricing": {
+        "prompt": "0.00000012",
+        "completion": "0"
+      },
+      "top_provider": {
+        "context_length": 32000,
+        "max_completion_tokens": 28800,
+        "is_moderated": false
+      },
+      "supported_parameters": [],
+      "description": "voyage-code-4 is a code embedding model from Voyage AI, a MongoDB company. It is"
+    },
+    {
+      "id": "openai/gpt-4",
+      "canonical_slug": "openai/gpt-4",
+      "name": "GPT-4",
+      "context_length": 8192,
+      "architecture": {
+        "input_modalities": [
+          "text"
+        ],
+        "instruct_type": "chatml",
+        "modality": "text->text",
+        "output_modalities": [
+          "text"
+        ],
+        "tokenizer": "GPT"
+      },
+      "pricing": {
+        "completion": "0.00006",
+        "image": "0",
+        "prompt": "0.00003",
+        "request": "0"
+      },
+      "supported_parameters": [
+        "temperature",
+        "top_p",
+        "max_tokens"
+      ],
+      "top_provider": {
+        "context_length": 8192,
+        "is_moderated": true,
+        "max_completion_tokens": 4096
+      },
+      "description": "GPT-4 is a large multimodal model that can solve difficult problems with greater accuracy."
+    }
+  ]
+}

@@ -118,6 +118,15 @@ impl AgentBackend for CodexBackend {
         crate::env::find_binary("codex").map(|_| ())
     }
 
+    fn serves(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+        use cairn_models::types::catalog::{ServedVerb, Wire};
+        ServedVerb::conversation(Wire::CodexAppServer)
+    }
+
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         let _guard = CODEX_START_LOCK
             .lock()
@@ -450,7 +459,7 @@ impl AgentBackend for CodexBackend {
     ) -> Result<CompletionOutcome, CompletionError> {
         use crate::backends::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
-            response_scratch_dir, runtime_extras, whole_prompt_tokens,
+            response_scratch_dir, runtime_extras,
         };
         use cairn_models::interface::session::ApprovalMode;
         use cairn_models::session::one_shot::await_one_shot;
@@ -538,9 +547,13 @@ impl AgentBackend for CodexBackend {
             text: reply.text,
             parsed,
             model: request.model,
-            tokens: whole_prompt_tokens(reply.usage.as_ref()),
             // Codex reports no price; a subscription's would be notional.
-            cost: None,
+            usage: reply
+                .usage
+                .as_ref()
+                .map(cairn_models::usage::metered)
+                .unwrap_or_default()
+                .with_cost(None),
             latency_ms,
             account_id: selection.account_id,
         })

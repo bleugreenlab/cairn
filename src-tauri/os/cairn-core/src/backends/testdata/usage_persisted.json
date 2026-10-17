@@ -1,0 +1,372 @@
+[
+  {
+    "events": [
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 1000,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 200,
+        "outputTokens": 300,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-chat",
+          "model": "model-chat",
+          "reasoningDetails": [],
+          "streamed": true,
+          "usage": {
+            "completion_tokens": 300,
+            "completion_tokens_details": {
+              "reasoning_tokens": 120
+            },
+            "cost": 0.0042,
+            "cost_details": {
+              "upstream_inference_cost": 0.004
+            },
+            "prompt_tokens": 1200,
+            "prompt_tokens_details": {
+              "cached_tokens": 1000
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 1500
+          }
+        },
+        "thinkingTokens": 120
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 1000,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 200,
+        "outputTokens": 300,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-chat",
+          "model": "model-chat",
+          "totalCost": 0.0042,
+          "usage": {
+            "completion_tokens": 300,
+            "completion_tokens_details": {
+              "reasoning_tokens": 120
+            },
+            "cost": 0.0042,
+            "cost_details": {
+              "upstream_inference_cost": 0.004
+            },
+            "prompt_tokens": 1200,
+            "prompt_tokens_details": {
+              "cached_tokens": 1000
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 1500
+          }
+        },
+        "thinkingTokens": 120
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 1000,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 200,
+        "outputTokens": 300,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-chat",
+          "model": "model-chat",
+          "reasoningDetails": null,
+          "usage": {
+            "completion_tokens": 300,
+            "completion_tokens_details": {
+              "reasoning_tokens": 120
+            },
+            "cost": 0.0042,
+            "cost_details": {
+              "upstream_inference_cost": 0.004
+            },
+            "prompt_tokens": 1200,
+            "prompt_tokens_details": {
+              "cached_tokens": 1000
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 1500
+          }
+        },
+        "thinkingTokens": 120
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 1000,
+        "costUsd": 0.0042,
+        "eventType": "result:success",
+        "inputTokens": 200,
+        "outputTokens": 300,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-chat",
+          "model": "model-chat",
+          "totalCost": 0.0042,
+          "usage": {
+            "completion_tokens": 300,
+            "completion_tokens_details": {
+              "reasoning_tokens": 120
+            },
+            "cost": 0.0042,
+            "cost_details": {
+              "upstream_inference_cost": 0.004
+            },
+            "prompt_tokens": 1200,
+            "prompt_tokens_details": {
+              "cached_tokens": 1000
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 1500
+          }
+        },
+        "thinkingTokens": 120
+      }
+    ],
+    "family": "chat"
+  },
+  {
+    "events": [
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 128,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 104,
+        "outputTokens": 25,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-anthropic",
+          "model": "model-anthropic",
+          "reasoningDetails": [],
+          "streamed": true,
+          "usage": {
+            "completion_tokens": 25,
+            "completion_tokens_details": null,
+            "cost": 0.0031,
+            "cost_details": null,
+            "prompt_tokens": 232,
+            "prompt_tokens_details": {
+              "cache_creation_input_tokens": 64,
+              "cached_tokens": 128
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 257
+          }
+        },
+        "thinkingTokens": null
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 128,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 104,
+        "outputTokens": 25,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-anthropic",
+          "model": "model-anthropic",
+          "totalCost": 0.0031,
+          "usage": {
+            "completion_tokens": 25,
+            "completion_tokens_details": null,
+            "cost": 0.0031,
+            "cost_details": null,
+            "prompt_tokens": 232,
+            "prompt_tokens_details": {
+              "cache_creation_input_tokens": 64,
+              "cached_tokens": 128
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 257
+          }
+        },
+        "thinkingTokens": null
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 128,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 104,
+        "outputTokens": 25,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-anthropic",
+          "model": "model-anthropic",
+          "reasoningDetails": null,
+          "usage": {
+            "completion_tokens": 25,
+            "completion_tokens_details": null,
+            "cost": 0.0031,
+            "cost_details": null,
+            "prompt_tokens": 232,
+            "prompt_tokens_details": {
+              "cache_creation_input_tokens": 64,
+              "cached_tokens": 128
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 257
+          }
+        },
+        "thinkingTokens": null
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 128,
+        "costUsd": 0.0031,
+        "eventType": "result:success",
+        "inputTokens": 104,
+        "outputTokens": 25,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-anthropic",
+          "model": "model-anthropic",
+          "totalCost": 0.0031,
+          "usage": {
+            "completion_tokens": 25,
+            "completion_tokens_details": null,
+            "cost": 0.0031,
+            "cost_details": null,
+            "prompt_tokens": 232,
+            "prompt_tokens_details": {
+              "cache_creation_input_tokens": 64,
+              "cached_tokens": 128
+            },
+            "reasoning_tokens": null,
+            "total_tokens": 257
+          }
+        },
+        "thinkingTokens": null
+      }
+    ],
+    "family": "anthropic"
+  },
+  {
+    "events": [
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 300,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 600,
+        "outputTokens": 450,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-responses",
+          "model": "model-responses",
+          "reasoningDetails": [],
+          "streamed": true,
+          "usage": {
+            "completion_tokens": 450,
+            "completion_tokens_details": {
+              "reasoning_tokens": 200
+            },
+            "cost": 0.012,
+            "cost_details": null,
+            "prompt_tokens": 900,
+            "prompt_tokens_details": {
+              "cached_tokens": 300
+            },
+            "reasoning_tokens": 200,
+            "total_tokens": 1350
+          }
+        },
+        "thinkingTokens": 200
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 300,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 600,
+        "outputTokens": 450,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-responses",
+          "model": "model-responses",
+          "totalCost": 0.012,
+          "usage": {
+            "completion_tokens": 450,
+            "completion_tokens_details": {
+              "reasoning_tokens": 200
+            },
+            "cost": 0.012,
+            "cost_details": null,
+            "prompt_tokens": 900,
+            "prompt_tokens_details": {
+              "cached_tokens": 300
+            },
+            "reasoning_tokens": 200,
+            "total_tokens": 1350
+          }
+        },
+        "thinkingTokens": 200
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 300,
+        "costUsd": null,
+        "eventType": "assistant",
+        "inputTokens": 600,
+        "outputTokens": 450,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-responses",
+          "model": "model-responses",
+          "reasoningDetails": null,
+          "usage": {
+            "completion_tokens": 450,
+            "completion_tokens_details": {
+              "reasoning_tokens": 200
+            },
+            "cost": 0.012,
+            "cost_details": null,
+            "prompt_tokens": 900,
+            "prompt_tokens_details": {
+              "cached_tokens": 300
+            },
+            "reasoning_tokens": 200,
+            "total_tokens": 1350
+          }
+        },
+        "thinkingTokens": 200
+      },
+      {
+        "cacheCreateTokens": null,
+        "cacheReadTokens": 300,
+        "costUsd": 0.012,
+        "eventType": "result:success",
+        "inputTokens": 600,
+        "outputTokens": 450,
+        "raw": {
+          "backend": "golden",
+          "generationId": "gen-responses",
+          "model": "model-responses",
+          "totalCost": 0.012,
+          "usage": {
+            "completion_tokens": 450,
+            "completion_tokens_details": {
+              "reasoning_tokens": 200
+            },
+            "cost": 0.012,
+            "cost_details": null,
+            "prompt_tokens": 900,
+            "prompt_tokens_details": {
+              "cached_tokens": 300
+            },
+            "reasoning_tokens": 200,
+            "total_tokens": 1350
+          }
+        },
+        "thinkingTokens": 200
+      }
+    ],
+    "family": "responses"
+  }
+]

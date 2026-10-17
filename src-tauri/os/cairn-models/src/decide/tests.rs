@@ -454,8 +454,17 @@ fn malformed_questions_are_refused_before_any_request() {
 
 #[test]
 fn the_routes_name_their_method_and_family() {
+    use cairn_models_types::catalog::Wire;
     assert_eq!(native_route().measured_by(), MeasuredBy::Native);
     assert_eq!(logprobs_route().measured_by(), MeasuredBy::Logprobs);
+    assert_eq!(
+        native_route().completion_wire().wire(),
+        Wire::OpenAiDecisions
+    );
+    assert_eq!(
+        logprobs_route().completion_wire().wire(),
+        Wire::OpenAiChatCompletions
+    );
     let route = native_route();
     let DecisionRoute::Native(endpoint) = &route else {
         unreachable!()

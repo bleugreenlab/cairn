@@ -998,6 +998,15 @@ impl AgentBackend for ClaudeBackend {
         crate::env::find_binary("claude").map(|_| ())
     }
 
+    fn serves(
+        &self,
+        _orch: &Orchestrator,
+        _project_id: Option<&str>,
+    ) -> Vec<cairn_models::types::catalog::ServedVerb> {
+        use cairn_models::types::catalog::{ServedVerb, Wire};
+        ServedVerb::conversation(Wire::ClaudeStreamJson)
+    }
+
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
         // Whether Claude's models are usable is a property of the configured
         // accounts, so the orchestrator routes Claude through
@@ -1424,7 +1433,7 @@ impl AgentBackend for ClaudeBackend {
     ) -> Result<CompletionOutcome, CompletionError> {
         use super::one_shot::{
             instructions, map_one_shot_error, map_open_error, one_shot_timeout,
-            response_scratch_dir, runtime_extras, whole_prompt_tokens,
+            response_scratch_dir, runtime_extras,
         };
         use cairn_models::interface::session::{ApprovalMode, PlacedFile, SessionStart};
         use cairn_models::session::one_shot::await_one_shot;
@@ -1509,8 +1518,12 @@ impl AgentBackend for ClaudeBackend {
             text,
             parsed,
             model: request.model,
-            tokens: whole_prompt_tokens(reply.usage.as_ref()),
-            cost: reply.cost_usd.filter(|_| metered),
+            usage: reply
+                .usage
+                .as_ref()
+                .map(cairn_models::usage::metered)
+                .unwrap_or_default()
+                .with_cost(reply.cost_usd.filter(|_| metered)),
             latency_ms,
             account_id: selection.account_id,
         })

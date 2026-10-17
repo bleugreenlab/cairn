@@ -307,7 +307,7 @@ fn merge_targets(
     }
     merged
         .into_iter()
-        // No per-model protocol family is claimed. Actual fronts three request
+        // No per-model wire is claimed. Actual fronts three request
         // families, but they are its own surfaces over whichever weights a
         // device has loaded rather than routes to distinct upstreams, and
         // nothing Cairn can read names a family per model -- the public registry
@@ -330,8 +330,8 @@ fn merge_targets(
             // asserting it here would be a claim the wire never made.
             supported_parameters: vec![],
             router: false,
-            architecture_modality: None,
-            wire_protocol: None,
+            modalities: None,
+            serves: None,
             id,
         })
         .collect()
