@@ -300,10 +300,14 @@ fn format_duration_annotation(duration_ms: u64) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorDisconnectOrigin {
     RunnerInitiated,
     PeerOrIo,
+    /// The executor closed the link itself and said why: it is stopping or
+    /// restarting. Whether its work survived is for its next opening snapshot
+    /// to say, not for the close.
+    ExecutorInitiated(String),
 }
 
 /// What a colocated link's observed silence says about whether it can be left
@@ -2814,12 +2818,15 @@ impl Fleet {
                 // repaired by the runner.
                 record.link = RemoteLinkState::Absent {
                     last_beat_unix_ms: Some(last_seen),
-                    last_reason: match origin {
+                    last_reason: match &origin {
                         ExecutorDisconnectOrigin::RunnerInitiated => {
                             "the runner closed this link".to_string()
                         }
                         ExecutorDisconnectOrigin::PeerOrIo => {
                             "the link went away; the machine reconnects on its own".to_string()
+                        }
+                        ExecutorDisconnectOrigin::ExecutorInitiated(reason) => {
+                            format!("the executor closed this link: {reason}")
                         }
                     },
                 };
@@ -2833,13 +2840,15 @@ impl Fleet {
                 self.disconnect_origins
                     .lock()
                     .unwrap()
-                    .insert((executor_id.to_string(), generation), origin);
+                    .insert((executor_id.to_string(), generation), origin.clone());
             }
             // Who ended the link decides what it says about the work. A runner
             // that closed this connection is recycling the process behind it,
             // so the work really is gone; a link that simply went away says
             // nothing about a machine that is still running and still coming
-            // back.
+            // back. An executor that closed its own link named why, but the
+            // reconciliation against its next opening snapshot is still what
+            // says which of its work survived, so its work is held the same way.
             //
             // Either way, an entry that was only ever OFFERED goes back to the
             // queue: nothing was running behind an offer, so nothing can be run
@@ -2858,14 +2867,18 @@ impl Fleet {
                 ),
                 None => "executor connection closed before returning a result".to_string(),
             };
-            let cause = match (origin, stopped_at) {
+            let cause = match (&origin, stopped_at) {
                 (ExecutorDisconnectOrigin::RunnerInitiated, Some(stopped_at_unix_ms)) => {
                     queue::GenerationEndCause::RunnerStopping { stopped_at_unix_ms }
                 }
                 (ExecutorDisconnectOrigin::RunnerInitiated, None) => {
                     queue::GenerationEndCause::MachineGone
                 }
-                (ExecutorDisconnectOrigin::PeerOrIo, _) => queue::GenerationEndCause::LinkGap,
+                (
+                    ExecutorDisconnectOrigin::PeerOrIo
+                    | ExecutorDisconnectOrigin::ExecutorInitiated(_),
+                    _,
+                ) => queue::GenerationEndCause::LinkGap,
             };
             let sweep = self.queue.end_generation(
                 executor_id,
@@ -2884,7 +2897,8 @@ impl Fleet {
                 ExecutorDisconnectOrigin::RunnerInitiated => {
                     self.fail_calls_for_executor(executor_id, &diagnostic);
                 }
-                ExecutorDisconnectOrigin::PeerOrIo => {
+                ExecutorDisconnectOrigin::PeerOrIo
+                | ExecutorDisconnectOrigin::ExecutorInitiated(_) => {
                     self.hold_executions_across_link_gap(executor_id, sweep.held_claims);
                 }
             }
@@ -20593,6 +20607,37 @@ mod tests {
         updates.changed().await.expect("publication");
         assert_eq!(*updates.borrow_and_update(), Some(advertisement.clone()));
         assert_eq!(fleet.executor_listener(), Some(advertisement));
+    }
+
+    /// A machine that closed its own link said why, and the absent link says
+    /// that rather than reading as a network fault.
+    #[test]
+    fn a_link_the_executor_closed_names_the_executors_reason() {
+        let fleet = Fleet::default();
+        fleet.declare_enrolled_remote("bglab-ub", "bglab-ub", "linux", "x86_64");
+        let (executor_id, entry) = fleet_entry("bglab-ub", "linux", 0, &[]);
+        let generation = entry.generation;
+        fleet.lock_connections().insert(executor_id, entry);
+
+        assert!(fleet.disconnect_advertised_executor_with_origin(
+            "bglab-ub",
+            generation,
+            ExecutorDisconnectOrigin::ExecutorInitiated(
+                "executor stopping: SIGTERM received".into()
+            ),
+        ));
+
+        let unattached = fleet.unattached_enrolled_remotes();
+        assert_eq!(unattached.len(), 1);
+        assert!(
+            matches!(
+                &unattached[0].link,
+                RemoteLinkState::Absent { last_reason, .. }
+                    if last_reason == "the executor closed this link: executor stopping: SIGTERM received"
+            ),
+            "{:?}",
+            unattached[0].link
+        );
     }
 
     /// Removing a machine takes it out of the fleet rather than leaving behind

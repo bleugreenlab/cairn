@@ -4253,6 +4253,15 @@ pub struct LearnedResourceEstimate {
 /// latest-wins. `Hello`'s `executor_build_id` is hashed once at startup rather
 /// than on every connect, which names the running build even after an update
 /// has replaced the file on disk.
+///
+/// Still 147 (cairn/5017): the executor no longer lets its self-update rollback
+/// deadline end a session after `Ready` has committed the update, and when it
+/// ends a live link itself it sends a standard WebSocket close frame (1001)
+/// naming why before letting go. No `ExecutorMessage` changes. A runner talking
+/// to an older executor gets nothing wrong: it sees the bare socket drops it
+/// always saw and records them as a peer or I/O loss, as before. An older
+/// runner talking to a newer executor already accepts a close frame and records
+/// its contents as the disconnect reason.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 147;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
