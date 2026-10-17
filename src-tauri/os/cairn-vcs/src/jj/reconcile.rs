@@ -119,8 +119,8 @@ pub fn branch_description(jj: &JjEnv, store: &Path, branch: &str) -> String {
 /// restore as complete while the backing ref stayed parked on the rejected
 /// flatten — the exact state this function exists to prevent. Returning it cannot
 /// mask the guard failure that got us here: the sole caller is
-/// [`flatten_branch_recovery`]'s `fail`, which logs whatever this returns and
-/// hands back the guard's own reason regardless.
+/// [`flatten_branch_recovery`]'s `fail`, which hands back the guard's own reason
+/// with a [`rollback_incomplete`] line after it.
 pub(crate) fn restore_bookmark(
     jj: &JjEnv,
     store: &Path,
@@ -194,18 +194,22 @@ pub fn operation_id(jj: &JjEnv, store: &Path) -> Result<String, String> {
 /// The caller MUST hold the per-store lock; under it every local-view op since
 /// the snapshot is the caller's own.
 pub fn restore_operation(jj: &JjEnv, store: &Path, op_id: &str) -> Result<(), String> {
-    jj.run(
-        store,
-        &[
-            "op",
-            "restore",
-            "--what",
-            "repo",
-            op_id,
-            "--ignore-working-copy",
-        ],
-        "jj op restore",
-    )?;
+    // Patient, because every rollback depends on it. Restoring to the same
+    // operation twice yields the same view, so a repeat is idempotent.
+    with_packed_refs_patience(PackedRefs::JjStore(store), "jj op restore", || {
+        jj.run(
+            store,
+            &[
+                "op",
+                "restore",
+                "--what",
+                "repo",
+                op_id,
+                "--ignore-working-copy",
+            ],
+            "jj op restore",
+        )
+    })?;
     // The one export with no expectation to name: an op restore rewinds every
     // local bookmark at once, so the set it realigns is not known here and there
     // is no single (branch, commit) invariant to assert. Every other export site
@@ -348,9 +352,6 @@ pub fn flatten_branch_recovery(
         rider_origins.push((rider.clone(), origin));
     }
 
-    // Collapse the branch to one commit on dest whose tree = the clean rebased tip.
-    squash_branch_onto(jj, store, branch, dest_commit, message)?;
-
     // Every bookmark this function has MOVED since the squash, paired with the
     // commit it pointed at beforehand. A refusal must undo all of them.
     //
@@ -362,36 +363,58 @@ pub fn flatten_branch_recovery(
     // below exists to prevent, reached through the path meant to prevent it.
     let moved_bookmarks: RefCell<Vec<(String, String)>> = RefCell::new(Vec::new());
 
-    // From here on the bookmark has ALREADY been rewritten by the squash, so every
-    // post-squash failure path — a footprint mismatch, a transient tree-hash read,
-    // or an unresolved post tip — must first restore the store to its pre-squash
-    // shape, or a refused flatten would leave the visible branch mutated despite
-    // reporting a refusal (the load-bearing safety guarantee). `fail` performs that
-    // restore and returns the reason to hand back as the `Err`.
+    // Installed BEFORE the squash, because the squash itself moves the bookmark
+    // partway through: it repoints the branch at an empty commit on dest and only
+    // then restores the tree into it. Any failure from there on — inside the
+    // squash, a footprint mismatch, a transient tree-hash read, an unresolved
+    // post tip — must restore the pre-squash shape, or a refused flatten would
+    // leave the visible branch mutated (or empty) despite reporting a refusal.
+    // `fail` performs that restore and returns the reason to hand back.
     //
     // `branch` goes back first: it is the head that makes the pre-flatten lineage
-    // visible again, and the riders are restored onto commits within it.
+    // visible again, and the riders are restored onto commits within it. A
+    // branch that never moved is left alone, since then neither has its git ref.
     let fail = |reason: String| -> String {
-        // The guard's own reason still surfaces to the caller; these are the
-        // separate, louder fact that the refusal was not fully undone, so the
-        // store may be left disagreeing with git over the rejected flatten.
-        if let Err(e) = restore_bookmark(jj, store, branch, &pre_tip) {
-            log::error!(
-                "flatten: the post-squash guard refusal for {branch} was not fully undone — it \
-                 could not be proven back at {pre_tip} in both the store and git: {e}"
-            );
+        let mut unrestored = Vec::new();
+        if bookmark_commit(jj, store, branch).as_deref() != Some(pre_tip.as_str()) {
+            if let Err(e) = restore_bookmark(jj, store, branch, &pre_tip) {
+                log::error!(
+                    "flatten: the refusal for {branch} could not put it back at {pre_tip}: {e}"
+                );
+                unrestored.push(format!(
+                    "`{branch}` could not be proven back at {pre_tip}: {e}"
+                ));
+            }
         }
         for (bookmark, origin) in moved_bookmarks.borrow().iter() {
             if let Err(e) = restore_bookmark(jj, store, bookmark, origin) {
                 log::error!(
-                    "flatten: the post-squash guard refusal for {branch} left bookmark \
-                     `{bookmark}` un-restored — it could not be proven back at {origin} in both \
-                     the store and git: {e}"
+                    "flatten: the refusal for {branch} left `{bookmark}` off {origin}: {e}"
                 );
+                unrestored.push(format!(
+                    "`{bookmark}` could not be proven back at {origin}: {e}"
+                ));
             }
         }
-        reason
+        if unrestored.is_empty() {
+            return reason;
+        }
+        // The reason still leads, so a guard refusal stays recognizable; the
+        // marker is the separate, louder fact that the store may now disagree
+        // with git over the refused flatten.
+        format!(
+            "{reason}\n{}",
+            rollback_incomplete(&format!(
+                "the refused flatten was not fully undone: {}",
+                unrestored.join("; ")
+            ))
+        )
     };
+
+    // Collapse the branch to one commit on dest whose tree = the clean rebased tip.
+    if let Err(error) = squash_branch_onto(jj, store, branch, dest_commit, message) {
+        return Err(fail(error));
+    }
 
     let post_tip = match bookmark_commit(jj, store, branch) {
         Some(commit) => commit,
@@ -546,7 +569,9 @@ pub fn flatten_branch_recovery(
                     repointed_bookmarks.push(bookmark.clone());
                 }
             }
-            match jj.run(
+            // One transaction, so a lost lock repeats it safely.
+            match run_store_rewrite(
+                jj,
                 store,
                 &["abandon", &commit, "--ignore-working-copy"],
                 "flatten: abandon orphaned twin",
@@ -668,12 +693,12 @@ pub(crate) fn roll_back_refused_flatten(
         record_failure(
             report,
             branch,
-            format!(
+            rollback_incomplete(&format!(
                 "flatten of the rebased branch was refused ({refusal}), and rolling the rebase \
                  back to operation {} also failed: {error}. The branch may sit on conflict-flagged \
                  history; do not publish it.",
                 rollback.pre_op
-            ),
+            )),
         );
         return;
     }
@@ -687,7 +712,10 @@ pub(crate) fn roll_back_refused_flatten(
         record_failure(
             report,
             branch,
-            format!("flatten refused ({refusal}); rolled back, but the export failed: {error}"),
+            rollback_incomplete(&format!(
+                "flatten refused ({refusal}); the store was rolled back, but exporting the \
+                 restored branch failed, so git may still name the rebased tip: {error}"
+            )),
         );
         return;
     }
@@ -715,6 +743,44 @@ pub(crate) fn roll_back_refused_flatten(
             );
         }
     }
+}
+
+/// Record a flatten refused for a branch that already sat on its dest before
+/// this pass, so there is no rebase of this pass's to roll back.
+///
+/// A guard refusal is a finding about the tree, and the agent is interrupted
+/// rather than the branch silently wedged. Anything else is jj failing to act
+/// — above all a lost `packed-refs.lock` — and is a retried failure, never a
+/// content conflict: there is nothing in the tree for the agent to resolve.
+pub(crate) fn record_unmoved_flatten_refusal(
+    report: &mut ReconcileReport,
+    branch: &str,
+    refusal: String,
+) {
+    if refusal.contains(ROLLBACK_INCOMPLETE) {
+        log::error!("jj reconcile: flatten of {branch} failed and was not fully undone: {refusal}");
+        record_failure(
+            report,
+            branch,
+            format!("the flatten of this branch's conflict-flagged history failed: {refusal}"),
+        );
+        return;
+    }
+    if flatten_refusal_is_guard(&refusal) {
+        log::warn!("jj reconcile: flatten of {branch} refused by guard ({refusal}); classifying conflicted");
+        report.conflicted.push(branch.to_string());
+        return;
+    }
+    log::warn!("jj reconcile: flatten of {branch} could not run ({refusal}); left for retry");
+    record_failure(
+        report,
+        branch,
+        format!(
+            "the branch carries conflict-flagged history that must be flattened, and the flatten \
+             could not run: {refusal}. Nothing was rebased this pass, so the branch is unchanged; \
+             it is retried."
+        ),
+    );
 }
 
 /// Classify one sibling that is already positioned on `dest_commit` (either it was
@@ -819,16 +885,7 @@ fn classify_reconciled_sibling(
                     Some(rollback) => {
                         roll_back_refused_flatten(jj, store, branch, dest, rollback, e, report)
                     }
-                    // The branch already sat on this dest before the pass and was
-                    // not moved by it. Fall back to a conflicted classification so
-                    // the agent is interrupted rather than the branch silently
-                    // wedged.
-                    None => {
-                        log::warn!(
-                            "jj reconcile: flatten of {branch} refused ({e}); classifying conflicted"
-                        );
-                        report.conflicted.push(branch.to_string());
-                    }
+                    None => record_unmoved_flatten_refusal(report, branch, e),
                 },
             }
         }
@@ -851,7 +908,25 @@ pub fn reconcile_failure_is_permanent(kind: &str) -> bool {
     )
 }
 
+///
+/// A lost `packed-refs.lock` is checked first, because the lock error's own
+/// text can carry words the later arms key on. It is infrastructure, never a
+/// finding about the branch: `ref_lock_stale` when patience gave up on an
+/// abandoned lock it could not remove, `ref_lock_contention` otherwise.
+///
+/// One cause outranks even that: a rollback that did not complete. Such an
+/// error often quotes a lost lock as its cause, and filing it under the lock
+/// would tell everyone the branch is unchanged when it may not be.
 pub fn reconcile_failure_kind(error: &str) -> &'static str {
+    if error.contains(ROLLBACK_INCOMPLETE) {
+        return ROLLBACK_FAILED;
+    }
+    if error.contains(STALE_DIAGNOSIS) {
+        return REF_LOCK_STALE;
+    }
+    if error.contains(CONTENTION_DIAGNOSIS) || packed_refs_lock_error(error) {
+        return REF_LOCK_CONTENTION;
+    }
     let error = error.to_ascii_lowercase();
     if error.contains("immutable") {
         "immutable_commit"
@@ -870,6 +945,64 @@ pub fn reconcile_failure_kind(error: &str) -> &'static str {
     } else {
         "transient_process"
     }
+}
+
+pub const REF_LOCK_CONTENTION: &str = "ref_lock_contention";
+pub const REF_LOCK_STALE: &str = "ref_lock_stale";
+/// A failure whose undo did not complete, so the store may not be where the
+/// pass found it. Retried, and — unlike a lost lock — always reported.
+pub const ROLLBACK_FAILED: &str = "rollback_failed";
+
+/// The marker every failure carries when its rollback did not complete. Kept
+/// in one place so no such failure can be mistaken for a clean retry.
+pub const ROLLBACK_INCOMPLETE: &str = "rollback incomplete:";
+
+pub(crate) fn rollback_incomplete(detail: &str) -> String {
+    format!("{ROLLBACK_INCOMPLETE} {detail}")
+}
+
+/// Whether a failure kind is a lost `packed-refs.lock`: retried by the worker,
+/// withheld from the agent, who can act on neither.
+pub fn reconcile_failure_is_ref_lock(kind: &str) -> bool {
+    kind == REF_LOCK_CONTENTION || kind == REF_LOCK_STALE
+}
+
+/// The give-up line of a lost-lock error — who held the lock, or that it was
+/// stale — or `None` when `error` is not a lost lock at all. A bare lock error
+/// that carries no line (a step outside patience) is named as contention.
+pub fn ref_lock_diagnosis(error: &str) -> Option<String> {
+    if !reconcile_failure_is_ref_lock(reconcile_failure_kind(error)) {
+        return None;
+    }
+    Some(
+        error
+            .lines()
+            .find(|line| {
+                line.starts_with(CONTENTION_DIAGNOSIS) || line.starts_with(STALE_DIAGNOSIS)
+            })
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                format!("{CONTENTION_DIAGNOSIS} — lost outside patience, without a diagnosis")
+            }),
+    )
+}
+
+/// The failure to record, without an attempt, for each branch a pass has not
+/// reached yet once `error` showed the ref store locked past patience.
+///
+/// Every rewrite may now wait out the lock while holding the per-store lock,
+/// so one long contention spell would otherwise cost the full wait per branch
+/// — twenty siblings, ten minutes of everyone else queued behind the store.
+/// The remainder is left for the sweep, which retries the whole set shortly.
+/// `None` when `error` is not a lost lock. The deferral carries the same
+/// diagnosis line, so it classifies as the same kind.
+pub fn ref_lock_deferral(error: &str) -> Option<String> {
+    ref_lock_diagnosis(error).map(|diagnosis| {
+        format!(
+            "deferred without an attempt: the ref store stayed locked past patience earlier in \
+             this pass, and is retried automatically.\n{diagnosis}"
+        )
+    })
 }
 
 /// Rebase one sibling onto the reconcile dest, recording the outcome. Returns
@@ -1023,56 +1156,90 @@ fn reconcile_siblings_with_publication(
     // Missing-bookmark siblings are filtered upstream in `reconcile_base_advance`
     // (one store-wide bookmark list before ANY per-sibling jj work), so every
     // sibling reaching this loop has a live bookmark. See `retain_present_siblings`.
+    let mut deferral: Option<String> = None;
     for branch in siblings {
-        let already_on_dest = dest_commit
-            .as_deref()
-            .map(|dest| branch_descends_from(jj, store, branch, dest))
-            .unwrap_or(false);
-        let mut push_clean = !already_on_dest;
-        let mut trivial_fast_forward = false;
-        let mut rollback = None;
-        let carry = resolution
-            .filter(|(resolved, _)| *resolved == branch)
-            .map(|(_, carry)| carry);
-
-        if !already_on_dest {
-            let fast_forward_to = dest_commit
-                .as_deref()
-                .filter(|dest| branch_is_ancestor_of(jj, store, branch, dest));
-            if let Some(dest) = fast_forward_to {
-                if let Err(error) = fast_forward_bookmark(jj, store, branch, dest) {
-                    log::warn!("jj reconcile: fast-forward {branch} to {dest} failed: {error}");
-                    record_failure(&mut report, branch, error);
-                    continue;
-                }
-                push_clean = false;
-                trivial_fast_forward = true;
-            } else {
-                match rebase_sibling(jj, store, branch, integration_branch, carry, &mut report) {
-                    Some(before) => rollback = Some(before),
-                    None => continue,
-                }
-            }
-        }
-
-        if trivial_fast_forward {
-            report.rebased_clean.push(branch.clone());
-            report.silent.push(branch.clone());
+        if let Some(deferred) = deferral.as_ref() {
+            record_failure(&mut report, branch, deferred.clone());
             continue;
         }
-
-        classify_reconciled_sibling(
+        reconcile_one_sibling(
             jj,
             store,
+            integration_branch,
             branch,
             dest_commit.as_deref(),
-            ReconcilePublication {
-                clean: push_clean && publish,
-                flattened: publish,
-            },
-            rollback.as_ref(),
+            publish,
+            resolution,
             &mut report,
         );
+        deferral = report
+            .failed
+            .iter()
+            .find(|failure| failure.branch == *branch)
+            .and_then(|failure| ref_lock_deferral(&failure.error));
     }
     Ok(report)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one sibling's slice of the pass, carrying the pass's pinned coordinates"
+)]
+fn reconcile_one_sibling(
+    jj: &JjEnv,
+    store: &Path,
+    integration_branch: &str,
+    branch: &str,
+    dest_commit: Option<&str>,
+    publish: bool,
+    resolution: Option<(&str, &ResolutionCarry)>,
+    report: &mut ReconcileReport,
+) {
+    let already_on_dest = dest_commit
+        .map(|dest| branch_descends_from(jj, store, branch, dest))
+        .unwrap_or(false);
+    let mut push_clean = !already_on_dest;
+    let mut trivial_fast_forward = false;
+    let mut rollback = None;
+    let carry = resolution
+        .filter(|(resolved, _)| *resolved == branch)
+        .map(|(_, carry)| carry);
+
+    if !already_on_dest {
+        let fast_forward_to =
+            dest_commit.filter(|dest| branch_is_ancestor_of(jj, store, branch, dest));
+        if let Some(dest) = fast_forward_to {
+            if let Err(error) = fast_forward_bookmark(jj, store, branch, dest) {
+                log::warn!("jj reconcile: fast-forward {branch} to {dest} failed: {error}");
+                record_failure(report, branch, error);
+                return;
+            }
+            push_clean = false;
+            trivial_fast_forward = true;
+        } else {
+            match rebase_sibling(jj, store, branch, integration_branch, carry, report) {
+                Some(before) => rollback = Some(before),
+                None => return,
+            }
+        }
+    }
+
+    if trivial_fast_forward {
+        report.rebased_clean.push(branch.to_string());
+        report.silent.push(branch.to_string());
+        return;
+    }
+
+    classify_reconciled_sibling(
+        jj,
+        store,
+        branch,
+        dest_commit,
+        ReconcilePublication {
+            clean: push_clean && publish,
+            flattened: publish,
+        },
+        rollback.as_ref(),
+        report,
+    );
 }

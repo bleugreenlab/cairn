@@ -3266,6 +3266,11 @@ async fn execute_reconcile_claim(
     let mut carry_notes: HashMap<String, String> = HashMap::new();
     let mut report = crate::jj::ReconcileReport::default();
     let mut any_branch_deferred = false;
+    // Set once a branch's rewrite gave up on `packed-refs.lock`. Every rewrite
+    // waits out the lock while holding the store lock, so a long contention
+    // spell must not cost that wait once per branch; the branches after it are
+    // left for the sweep, which retries the set shortly.
+    let mut ref_lock_deferral: Option<String> = None;
 
     for branch in &specs {
         heartbeat_reconcile_intent(db, &claim).await?;
@@ -3339,6 +3344,27 @@ async fn execute_reconcile_claim(
                     continue;
                 }
             }
+        }
+        // After the quarantine and suppression skips, so a parked branch keeps
+        // its parked state rather than being rewritten as owed work.
+        if let Some(deferred) = ref_lock_deferral.as_deref() {
+            persist_reconcile_item(
+                db,
+                ReconcileItemUpdate {
+                    intent_id,
+                    bookmark: branch,
+                    observed_tip: current_tip.as_deref(),
+                    status: "pending",
+                    failure_kind: Some(crate::jj::reconcile_failure_kind(deferred)),
+                    outcome_kind: Some("deferred"),
+                    fingerprint: None,
+                    diagnostic: Some(deferred),
+                },
+            )
+            .await?;
+            log::debug!("jj reconcile ({label}): deferred {branch} behind the ref-store lock");
+            any_branch_deferred = true;
+            continue;
         }
 
         // The open session, if any, is what knows which base the branch's
@@ -3915,6 +3941,17 @@ async fn execute_reconcile_claim(
             },
         )
         .await?;
+        if ref_lock_deferral.is_none() {
+            ref_lock_deferral = reported_failure.and_then(crate::jj::ref_lock_deferral);
+            // The cause once, with the holder the give-up named, rather than
+            // once per deferred branch; each deferred row also carries it.
+            if let Some(diagnosis) = reported_failure.and_then(crate::jj::ref_lock_diagnosis) {
+                log::warn!(
+                    "jj reconcile ({label}): {branch} gave up on the ref-store lock; deferring the \
+                     rest of this pass to the sweep. {diagnosis}"
+                );
+            }
+        }
 
         // A conflicted branch opens (or refreshes) a durable resolution session,
         // then — and only then — markers are projected into its checkout. The
@@ -4616,6 +4653,29 @@ where
                 sibling.id,
                 failure.error
             );
+            continue;
+        }
+        // A lost `packed-refs.lock` is the ref store's state, not the branch's:
+        // the worker retries it and cairn:~/rebase reports it, and "needs
+        // repair" would send an agent after something only the machine can
+        // clear. A stale lock nobody could remove is the operator's to see.
+        if crate::jj::reconcile_failure_is_ref_lock(failure_kind) {
+            if failure_kind == crate::jj::REF_LOCK_STALE {
+                log::error!(
+                    "jj reconcile: {} is blocked by a stale packed-refs lock that patience \
+                     could not remove; retried automatically, withheld from job {}: {}",
+                    failure.branch,
+                    sibling.id,
+                    failure.error
+                );
+            } else {
+                log::info!(
+                    "jj reconcile: packed-refs lock contention on {} withheld from job {}; \
+                     retried automatically",
+                    failure.branch,
+                    sibling.id
+                );
+            }
             continue;
         }
         let Some(run_id) = latest_run_for_job(db, &sibling.id) else {
@@ -7120,6 +7180,85 @@ mod tests {
             "a branch that genuinely cannot move still wakes its agent"
         );
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A lost `packed-refs.lock` is the machine's ref store, not the branch:
+    /// neither contention nor a stale lock may send an agent a "needs repair"
+    /// steer it cannot act on. The worker retries, and cairn:~/rebase says so.
+    #[tokio::test]
+    async fn a_lost_ref_lock_is_withheld_from_the_repair_steer() {
+        let db = migrated_db().await;
+        seed_base_advance_fixture(&db).await;
+        let orch = test_orchestrator(db, MockGitClient::new());
+        let siblings = vec![SiblingJob {
+            id: "job-overlap".to_string(),
+            branch: Some("agent/overlap".to_string()),
+            base_commit: None,
+        }];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let enqueue = |_: &Orchestrator, _: &str, _: &str, _: DeliveryUrgency, _: &str| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(DirectQueueDisposition::QueuedOrPresent)
+        };
+        let lost_locks = [
+            "jj rebase failed: The lock for the packed-ref file could not be obtained\n\
+             packed-refs lock: contention — held by live process 77 (git) after 30s",
+            "jj rebase failed: The lock for the packed-ref file could not be obtained\n\
+             packed-refs lock: stale — older than 30s with no live holder, not removed: lsof \
+             exited 2",
+            "deferred without an attempt: the ref store stayed locked past patience earlier in \
+             this pass, and is retried automatically.\n\
+             packed-refs lock: contention — no lock at give-up; lost the race to a burst of \
+             writers for 30s",
+        ];
+        for (index, error) in lost_locks.iter().enumerate() {
+            let failed = vec![crate::jj::ReconcileFailure {
+                branch: "agent/overlap".to_string(),
+                error: error.to_string(),
+            }];
+            let notified = notify_failed_siblings_with(
+                &orch,
+                &orch.db.local,
+                &siblings,
+                &failed,
+                "test",
+                &format!("intent-lock-{index}"),
+                enqueue,
+            )
+            .unwrap();
+            assert!(notified.is_empty(), "withheld: {error}");
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "nothing may even be enqueued for a lost ref lock"
+        );
+
+        // A lock that caused a failure whose rollback then did not complete is
+        // NOT routine: the branch may not be where the pass found it.
+        let unsafe_rollback = vec![crate::jj::ReconcileFailure {
+            branch: "agent/overlap".to_string(),
+            error: "jj rebase of `agent/overlap` moved the bookmark, and exporting it to git \
+                    failed: The lock for the packed-ref file could not be obtained\n\
+                    packed-refs lock: contention — held by live process 77 (git) after 30s\n\
+                    rollback incomplete: rolling the rebase back to operation op1 also failed"
+                .to_string(),
+        }];
+        let notified = notify_failed_siblings_with(
+            &orch,
+            &orch.db.local,
+            &siblings,
+            &unsafe_rollback,
+            "test",
+            "intent-rollback",
+            enqueue,
+        )
+        .unwrap();
+        assert_eq!(
+            notified,
+            vec!["agent/overlap".to_string()],
+            "an incomplete rollback still reaches the agent"
+        );
     }
 
     #[test]

@@ -116,6 +116,69 @@ pub(crate) fn packed_refs_lock_error(error: &str) -> bool {
         || error.contains("lock for the packed-ref")
 }
 
+/// The leading words of the line a give-up appends to diagnose the lock as it
+/// stood when patience ran out. Stable on purpose: the reconcile classifier
+/// keys its `ref_lock_contention` and `ref_lock_stale` kinds on them.
+pub(crate) const CONTENTION_DIAGNOSIS: &str = "packed-refs lock: contention";
+pub(crate) const STALE_DIAGNOSIS: &str = "packed-refs lock: stale";
+
+/// A live process `lsof` reports holding the lock open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LockHolder {
+    pid: String,
+    command: String,
+}
+
+/// Who holds `lock` open right now, according to `lsof`: `None` when nobody
+/// does. An error means the question could not be answered, which is never
+/// read as "nobody".
+#[cfg(unix)]
+fn lock_holder(lock: &Path) -> Result<Option<LockHolder>, String> {
+    let output = cairn_platform::env::command("lsof")
+        .args(["-F", "pc", "--"])
+        .arg(lock)
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("ask lsof who holds {}: {error}", lock.display()))?;
+    match output.status.code() {
+        Some(0) => Ok(Some(parse_lsof_holder(&String::from_utf8_lossy(
+            &output.stdout,
+        )))),
+        Some(1) => Ok(None),
+        code => Err(format!(
+            "ask lsof who holds {}: unexpected exit {code:?}",
+            lock.display()
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+fn lock_holder(_lock: &Path) -> Result<Option<LockHolder>, String> {
+    Err("no lsof on this platform to prove the lock unheld".to_string())
+}
+
+/// The first process in `lsof -F pc` output: a `p<pid>` line, then `c<command>`.
+fn parse_lsof_holder(output: &str) -> LockHolder {
+    let field = |tag: char| {
+        output
+            .lines()
+            .find_map(|line| line.strip_prefix(tag))
+            .map(str::to_string)
+            .unwrap_or_else(|| "?".to_string())
+    };
+    LockHolder {
+        pid: field('p'),
+        command: field('c'),
+    }
+}
+
+fn lock_age(metadata: &std::fs::Metadata, lock: &Path) -> Result<Duration, String> {
+    metadata
+        .modified()
+        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
+        .map_err(|error| format!("inspect {}: {error}", lock.display()))
+}
+
 /// Prove a lock is abandoned: older than `stale_after` and held by no live
 /// process. Returns the lock's `(dev, ino)` identity, which is what makes the
 /// proof usable — it names the exact file that was proven, not merely the path.
@@ -126,34 +189,58 @@ fn stale_unheld_lock(lock: &Path, stale_after: Duration) -> Result<Option<(u64, 
     let metadata = lock
         .metadata()
         .map_err(|error| format!("inspect {}: {error}", lock.display()))?;
-    let age = metadata
-        .modified()
-        .and_then(|modified| modified.elapsed().map_err(std::io::Error::other))
-        .map_err(|error| format!("inspect {}: {error}", lock.display()))?;
-    if age < stale_after {
+    if lock_age(&metadata, lock)? < stale_after {
         return Ok(None);
     }
-
-    let status = cairn_platform::env::command("lsof")
-        .arg("--")
-        .arg(lock)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| format!("prove {} is unheld with lsof: {error}", lock.display()))?;
-    match status.code() {
-        Some(0) => Ok(None),
-        Some(1) => Ok(Some((metadata.dev(), metadata.ino()))),
-        code => Err(format!(
-            "prove {} is unheld with lsof: unexpected exit {code:?}",
-            lock.display()
-        )),
+    match lock_holder(lock)? {
+        Some(_) => Ok(None),
+        None => Ok(Some((metadata.dev(), metadata.ino()))),
     }
 }
 
 #[cfg(not(unix))]
 fn stale_unheld_lock(_lock: &Path, _stale_after: Duration) -> Result<Option<(u64, u64)>, String> {
     Ok(None)
+}
+
+/// One line saying what the lock looked like when patience gave up, so a
+/// reader can tell a busy ref store from an abandoned lock without gathering
+/// it by hand. `refusal` is why a proven-stale removal did not happen, when it
+/// was attempted and declined.
+fn give_up_diagnosis(scope: PackedRefs<'_>, refusal: Option<&str>) -> String {
+    let waited = LOCK_WAIT.as_secs();
+    let burst = |what: &str| {
+        format!(
+            "{CONTENTION_DIAGNOSIS} — {what} at give-up; lost the race to a burst of writers for \
+             {waited}s"
+        )
+    };
+    let Some(lock) = scope.lock_path() else {
+        return burst("no resolvable lock path");
+    };
+    let Ok(metadata) = lock.metadata() else {
+        return burst("no lock");
+    };
+    let old = lock_age(&metadata, &lock).is_ok_and(|age| age >= LOCK_WAIT);
+    let stale = |reason: &str| {
+        format!(
+            "{STALE_DIAGNOSIS} — older than {waited}s with no live holder, not removed: {reason}"
+        )
+    };
+    match lock_holder(&lock) {
+        Ok(Some(holder)) => format!(
+            "{CONTENTION_DIAGNOSIS} — held by live process {} ({}) after {waited}s",
+            holder.pid, holder.command
+        ),
+        Ok(None) if old => stale(refusal.unwrap_or(
+            "it outlived the wait only after removal was considered; the next attempt removes it",
+        )),
+        Ok(None) => burst("a fresh lock with no live holder"),
+        Err(reason) if old => stale(refusal.unwrap_or(&reason)),
+        Err(reason) => burst(&format!(
+            "a fresh lock whose holder could not be read ({reason})"
+        )),
+    }
 }
 
 #[cfg(unix)]
@@ -266,16 +353,31 @@ impl<'a> Patience<'a> {
         // inside the same call means a live writer is minting them, which is
         // exactly the case where removal must stop rather than escalate.
         if self.healed {
-            return Err(error);
+            return Err(self.give_up(error, None));
         }
         self.healed = true;
         match heal_stale_lock(self.scope, self.ctx, LOCK_WAIT) {
             Ok(true) => Ok(Recovery::RetryNow),
-            Ok(false) => Err(error),
-            Err(proof_error) => Err(format!(
-                "{error}\nStale-lock recovery refused: {proof_error}"
+            Ok(false) => Err(self.give_up(error, None)),
+            Err(proof_error) => Err(self.give_up(
+                format!("{error}\nStale-lock recovery refused: {proof_error}"),
+                Some(&proof_error),
             )),
         }
+    }
+
+    /// The contention error, unchanged, plus one line diagnosing the lock as
+    /// it stands now: a live holder, a burst of writers, or a stale lock that
+    /// could not be removed.
+    fn give_up(&self, error: String, refusal: Option<&str>) -> String {
+        let diagnosis = give_up_diagnosis(self.scope, refusal);
+        log::warn!(
+            "{}: gave up after {} attempts and {:.1}s: {diagnosis}",
+            self.ctx,
+            self.attempts,
+            self.started.elapsed().as_secs_f64()
+        );
+        format!("{error}\n{diagnosis}")
     }
 }
 
@@ -330,6 +432,125 @@ pub async fn with_packed_refs_patience_async<T>(
                 Recovery::RetryNow => {}
             },
         }
+    }
+}
+
+/// Run one repeatable `jj` rewrite against the shared store, patient with
+/// `packed-refs.lock`.
+///
+/// For a single `--ignore-working-copy` command against the store, run under
+/// the per-store lock, and nothing else. A workspace command snapshots its
+/// working copy as an operation of its own, so a repeat is not the same
+/// command; `jj git export` has its own leg with its own verification.
+///
+/// Repeating is safe because a rewrite that loses the lock fails inside its
+/// commit write, before the transaction commits (pinned by
+/// `a_rewrite_that_loses_the_packed_refs_lock_commits_no_operation`). The
+/// guard here does not trust that premise blindly: it compares the operation
+/// head after each lost attempt with the one captured before the first. If it
+/// moved, the attempt committed and then failed, so the store is restored to
+/// the captured operation — exact, because under the per-store lock every
+/// local-view operation since is this call's own — before the command repeats.
+pub(crate) fn run_store_rewrite(
+    jj: &super::JjEnv,
+    store: &Path,
+    args: &[&str],
+    ctx: &str,
+) -> Result<String, String> {
+    let pre_op = super::operation_id(jj, store)?;
+    with_packed_refs_patience(PackedRefs::JjStore(store), ctx, || {
+        let error = match jj.run(store, args, ctx) {
+            Ok(output) => return Ok(output),
+            Err(error) => error,
+        };
+        if !packed_refs_lock_error(&error) {
+            return Err(error);
+        }
+        let now = super::operation_id(jj, store).map_err(|read| {
+            unrepeatable_rewrite(
+                ctx,
+                &format!(
+                    "the operation head could not be re-read to prove the attempt committed \
+                     nothing ({})",
+                    defuse_lock_phrasing(&read)
+                ),
+            )
+        })?;
+        if now == pre_op {
+            return Err(error);
+        }
+        log::warn!(
+            "{ctx}: an attempt that lost the packed-refs lock still committed operation {now}; \
+             restoring {pre_op} before repeating"
+        );
+        super::restore_operation(jj, store, &pre_op).map_err(|restore| {
+            log::error!(
+                "{ctx}: restoring {pre_op} after a committed lost-lock attempt failed: {restore}"
+            );
+            unrepeatable_rewrite(
+                ctx,
+                &format!(
+                    "it committed operation {now} before failing, and restoring {pre_op} also \
+                     failed ({}). The store may hold that partial operation",
+                    defuse_lock_phrasing(&restore)
+                ),
+            )
+        })?;
+        Err(error)
+    })
+}
+
+/// The refusal for a lost-lock attempt that cannot safely be repeated. Its
+/// text must never read as contention, or patience would repeat exactly what
+/// it refuses to repeat and the classifier would file it as routine.
+fn unrepeatable_rewrite(ctx: &str, why: &str) -> String {
+    super::rollback_incomplete(&format!(
+        "{ctx}: lost the ref-store lock and was not repeated, because {why}."
+    ))
+}
+
+#[cfg(test)]
+type StepHook = Box<dyn FnOnce()>;
+
+#[cfg(test)]
+thread_local! {
+    static STEP_HOOKS: std::cell::RefCell<Vec<(&'static str, StepHook)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test-only fault injection: run `hook` the next time this thread reaches
+/// `step`. It is how a test takes the lock at an exact later stage of a
+/// rewrite sequence rather than only before the first command.
+#[cfg(test)]
+pub(crate) fn at_step(step: &'static str, hook: impl FnOnce() + 'static) {
+    STEP_HOOKS.with(|hooks| hooks.borrow_mut().push((step, Box::new(hook))));
+}
+
+/// A named point in a store rewrite sequence. Does nothing outside tests.
+pub(crate) fn reached_step(step: &str) {
+    #[cfg(test)]
+    {
+        let hook = STEP_HOOKS.with(|hooks| {
+            let mut hooks = hooks.borrow_mut();
+            let index = hooks.iter().position(|(name, _)| *name == step)?;
+            Some(hooks.remove(index).1)
+        });
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    #[cfg(not(test))]
+    let _ = step;
+}
+
+/// Quote an error inside [`unrepeatable_rewrite`] without carrying the lock
+/// phrasing [`packed_refs_lock_error`] keys on. The verbatim text goes to the
+/// log at the call site.
+fn defuse_lock_phrasing(error: &str) -> String {
+    if packed_refs_lock_error(error) {
+        "it too lost the ref-store lock; the full error is in the log".to_string()
+    } else {
+        error.to_string()
     }
 }
 
@@ -479,6 +700,98 @@ mod tests {
         })
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    /// A rewrite that committed and then could not be put back must stop, and
+    /// say so in words that neither patience nor the reconcile classifier read
+    /// as routine contention — even when the restore's own failure was a lock.
+    #[test]
+    fn an_unrepeatable_rewrite_never_reads_as_contention() {
+        let restore = "jj op restore failed: The lock for the packed-ref file could not be \
+                       obtained. The lockfile at '/r/.git/packed-refs.lock' might need manual \
+                       deletion.";
+        let refusal = unrepeatable_rewrite(
+            "jj rebase",
+            &format!(
+                "restoring op1 also failed ({})",
+                defuse_lock_phrasing(restore)
+            ),
+        );
+        assert!(!packed_refs_lock_error(&refusal), "{refusal}");
+        assert!(!refusal.contains(CONTENTION_DIAGNOSIS), "{refusal}");
+        assert_eq!(
+            super::super::reconcile_failure_kind(&refusal),
+            super::super::ROLLBACK_FAILED,
+            "a store that may hold a partial operation is reported, not quietly retried"
+        );
+        assert!(refusal.contains("was not repeated"), "{refusal}");
+        assert_eq!(
+            defuse_lock_phrasing("Revision x does not exist"),
+            "Revision x does not exist",
+            "an unrelated error is quoted verbatim"
+        );
+    }
+
+    #[test]
+    fn lsof_field_output_names_the_first_holder() {
+        assert_eq!(
+            parse_lsof_holder("p4242\ncgit\nf3\np99\ncjj\n"),
+            LockHolder {
+                pid: "4242".to_string(),
+                command: "git".to_string()
+            }
+        );
+        assert_eq!(parse_lsof_holder("").pid, "?");
+    }
+
+    fn checkout_with_lock() -> (TempDir, PathBuf, PathBuf) {
+        let temp = TempDir::new().unwrap();
+        let checkout = temp.path().join("repo");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        let lock = checkout.join(".git").join("packed-refs.lock");
+        (temp, checkout, lock)
+    }
+
+    /// The give-up line separates the three situations an operator must tell
+    /// apart: a burst of writers that left nothing behind, a live holder, and
+    /// an abandoned lock nothing removed.
+    #[test]
+    fn the_give_up_line_says_burst_holder_or_stale() {
+        let (_temp, checkout, lock) = checkout_with_lock();
+        let scope = PackedRefs::Checkout(&checkout);
+
+        let burst = give_up_diagnosis(scope, None);
+        assert!(burst.starts_with(CONTENTION_DIAGNOSIS), "{burst}");
+        assert!(burst.contains("no lock at give-up"), "{burst}");
+
+        std::fs::write(&lock, "fresh\n").unwrap();
+        let fresh = give_up_diagnosis(scope, None);
+        assert!(fresh.starts_with(CONTENTION_DIAGNOSIS), "{fresh}");
+
+        let old = std::time::SystemTime::now() - Duration::from_secs(120);
+        std::fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let held = std::fs::File::open(&lock).unwrap();
+            let live = give_up_diagnosis(scope, None);
+            assert!(live.starts_with(CONTENTION_DIAGNOSIS), "{live}");
+            assert!(
+                live.contains(&format!("held by live process {}", std::process::id())),
+                "names the holder: {live}"
+            );
+            drop(held);
+        }
+        let stale = give_up_diagnosis(scope, Some("the lock was replaced after proof"));
+        assert!(stale.starts_with(STALE_DIAGNOSIS), "{stale}");
+        assert!(
+            stale.contains("not removed: the lock was replaced after proof"),
+            "{stale}"
+        );
     }
 
     #[tokio::test]

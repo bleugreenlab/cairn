@@ -44,12 +44,43 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
         "fn recreate_keep_refs(",
     ),
+    // Every jj rewrite writes a `refs/jj/keep/<commit>` ref per commit it
+    // mints, so the store replay and flatten contend for the lock too.
+    (
+        "store replay rebase",
+        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
+        "pub(crate) fn rebase_branch_onto_with_resolution(",
+    ),
+    (
+        "resolution carry",
+        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
+        "fn apply_resolution_carry(",
+    ),
+    (
+        "flatten squash",
+        include_str!("../../../cairn-vcs/src/jj/merge.rs"),
+        "pub fn squash_branch_onto(",
+    ),
+    (
+        "flatten twin cleanup",
+        include_str!("../../../cairn-vcs/src/jj/reconcile.rs"),
+        "pub fn flatten_branch_recovery(",
+    ),
+    (
+        "operation restore",
+        include_str!("../../../cairn-vcs/src/jj/reconcile.rs"),
+        "pub fn restore_operation(",
+    ),
     (
         "held delta ref",
         include_str!("../mcp/handlers/run/held.rs"),
         "fn held_ref_transaction(",
     ),
 ];
+
+/// The one sanctioned shortcut: a repeatable store rewrite routed through
+/// `run_store_rewrite`, which is itself patience plus an operation-head guard.
+const PATIENT_ROUTES: &[&str] = &["with_packed_refs_patience", "run_store_rewrite("];
 
 /// The body of a free function, from its signature to the closing brace
 /// rustfmt puts in column zero.
@@ -66,9 +97,18 @@ fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
 
 #[test]
 fn every_ref_writing_site_routes_through_the_shared_wrapper() {
+    assert!(
+        body_of(
+            include_str!("../../../cairn-vcs/src/jj/packed_refs.rs"),
+            "pub(crate) fn run_store_rewrite("
+        )
+        .contains("with_packed_refs_patience("),
+        "run_store_rewrite is only a sanctioned route while it runs through the shared wrapper"
+    );
     for (name, source, signature) in REF_WRITERS {
+        let body = body_of(source, signature);
         assert!(
-            body_of(source, signature).contains("with_packed_refs_patience"),
+            PATIENT_ROUTES.iter().any(|route| body.contains(route)),
             "{name} writes a ref without packed-refs patience. Every ref transaction in the \
              project repository contends for one packed-refs.lock, and an impatient one \
              rolls back work that already succeeded. Wrap it in \

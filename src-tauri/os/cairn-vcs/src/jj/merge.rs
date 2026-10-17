@@ -251,7 +251,11 @@ pub fn squash_branch_onto(
     // `@`. `jj new` emits no machine-readable id, so address the new commit by
     // the set difference of `base_rev`'s children before and after.
     let before = base_children(jj, store, base_rev)?;
-    jj.run(
+    // One transaction, so a lost lock repeats it safely and adds no child: the
+    // before/after difference below stays exact. A give-up leaves nothing
+    // moved, only an orphan empty commit at worst.
+    run_store_rewrite(
+        jj,
         store,
         &[
             "new",
@@ -292,8 +296,13 @@ pub fn squash_branch_onto(
         ],
         "jj bookmark set (squash)",
     )?;
+    reached_step("squash: bookmark repointed");
     let branch_rev = format!("bookmarks(exact:{branch:?})");
-    jj.run(
+    // One transaction. The bookmark already names the EMPTY squash commit here,
+    // so a give-up must be undone: `flatten_branch_recovery` installs its
+    // refusal path before calling this, and it puts the bookmark back.
+    run_store_rewrite(
+        jj,
         store,
         &[
             "restore",
@@ -787,7 +796,9 @@ fn apply_resolution_carry(
             "--",
         ];
         args.extend_from_slice(paths);
-        jj.run(store, &args, label).map(|_| ())
+        // Each restore is one transaction, so a lost lock repeats it safely. A
+        // give-up partway is undone whole by the caller's `restore_operation`.
+        run_store_rewrite(jj, store, &args, label).map(|_| ())
     };
 
     let from_tip: Vec<&str> = carry
@@ -824,6 +835,10 @@ fn apply_resolution_carry(
             std::fs::write(&target, text)
                 .map_err(|error| format!("write carried `{path}`: {error}"))?;
         }
+        // Deliberately not patient: a workspace seal snapshots the working copy
+        // as an operation of its own, so repeating it is not repeating the same
+        // command. A lock lost here takes the caller's whole-replay rollback,
+        // and the reconcile worker retries the replay.
         seal_paths(
             jj,
             workspace,
@@ -839,7 +854,8 @@ fn apply_resolution_carry(
         &text_paths,
         "jj restore (carried conflict resolution)",
     )?;
-    jj.run(
+    run_store_rewrite(
+        jj,
         store,
         &["abandon", &scratch, "--ignore-working-copy"],
         "jj abandon (carried resolution scratch commit)",
@@ -890,6 +906,44 @@ fn explain_immutable_rebase_refusal(
     format!("{error}\n{cause}")
 }
 
+/// Undo a rebase that landed in the store but whose follow-through failed, and
+/// say truthfully which of the two outcomes the store is now in.
+///
+/// Only a proven rollback earns "unchanged": the store back at `pre_op` AND
+/// the backing git ref verified back with it. Anything less is written as
+/// [`rollback_incomplete`], which the reconcile classifier ranks above every
+/// other cause — a lost lock nested inside it included — so the branch is
+/// reported as needing repair rather than quietly retried.
+fn roll_back_rebase(
+    jj: &JjEnv,
+    store: &Path,
+    branch: &str,
+    pre_op: &str,
+    failure: String,
+) -> String {
+    let undone = restore_operation(jj, store, pre_op).and_then(|()| {
+        export_bookmark_advance(
+            jj,
+            store,
+            true,
+            branch,
+            "jj git export (failed rebase rolled back)",
+        )
+    });
+    match undone {
+        Ok(()) => format!(
+            "{failure}\nThe rebase was rolled back to operation {pre_op}, so the branch is unchanged."
+        ),
+        Err(rollback) => format!(
+            "{failure}\n{}",
+            rollback_incomplete(&format!(
+                "rolling the rebase back to operation {pre_op} also failed: {rollback}. The branch \
+                 may sit on the rebased tip in the store and not in git; do not publish it."
+            ))
+        ),
+    }
+}
+
 /// Rebase a branch while honoring an explicitly identified committed resolution.
 ///
 /// `resolution` is supplied only by the explicit durable conflict-session
@@ -933,7 +987,12 @@ pub(crate) fn rebase_branch_onto_with_resolution(
     let pre_op = operation_id(jj, store)?;
     let pre_tip = bookmark_commit(jj, store, branch);
 
-    if let Err(error) = jj.run(
+    // One transaction: a rebase that loses `packed-refs.lock` commits nothing,
+    // and `run_store_rewrite` checks the operation head before repeating it.
+    // The `expected_pre_tip` check above runs once, before any waiting, and
+    // stays valid throughout: the bookmark cannot move under the store lock.
+    if let Err(error) = run_store_rewrite(
+        jj,
         store,
         &["rebase", "-b", branch, "-o", dest, "--ignore-working-copy"],
         "jj rebase",
@@ -951,23 +1010,26 @@ pub(crate) fn rebase_branch_onto_with_resolution(
             .as_deref()
             .ok_or_else(|| format!("resolved rebase: branch `{branch}` had no pre-rebase tip"))?;
         if let Err(error) = apply_resolution_carry(jj, store, branch, resolution, carry) {
-            restore_operation(jj, store, &pre_op).map_err(|rollback| {
-                format!(
-                    "resolved rebase of `{branch}` failed while applying the committed tip ({error}), and rollback to {pre_op} also failed: {rollback}"
-                )
-            })?;
-            export_bookmark_advance(
+            return Err(roll_back_rebase(
                 jj,
                 store,
-                true,
                 branch,
-                "jj git export (failed resolved rebase rolled back)",
-            )?;
-            return Err(format!(
-                "resolved rebase of `{branch}` failed while applying the committed tip and was rolled back: {error}"
+                &pre_op,
+                format!(
+                    "resolved rebase of `{branch}` failed while applying the committed tip: {error}"
+                ),
             ));
         }
-        if !branch_has_conflict(jj, store, branch)? {
+        let conflicted = branch_has_conflict(jj, store, branch).map_err(|error| {
+            roll_back_rebase(
+                jj,
+                store,
+                branch,
+                &pre_op,
+                format!("resolved rebase of `{branch}`: {error}"),
+            )
+        })?;
+        if !conflicted {
             log::info!(
                 "jj rebase: carried committed resolution for `{branch}` on {} path(s)",
                 carry.paths.len()
@@ -975,7 +1037,18 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         }
     }
 
-    if branch_has_conflict(jj, store, branch)? {
+    let conflicted = branch_has_conflict(jj, store, branch).map_err(|error| {
+        roll_back_rebase(
+            jj,
+            store,
+            branch,
+            &pre_op,
+            format!(
+                "jj rebase of `{branch}` onto `{dest}` landed, and reading it back failed: {error}"
+            ),
+        )
+    })?;
+    if conflicted {
         // Everything the rollback is about to erase is read HERE, in the only
         // window where it exists. Afterwards the branch is clean again, so a
         // later probe reports no conflict, no conflicting paths, and no
@@ -984,23 +1057,27 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         let paths = branch_conflicted_paths(jj, store, branch);
         let diagnostic =
             capture_conflict_diagnostic(jj, store, branch, dest, pre_tip.as_deref(), paths.clone());
-        restore_operation(jj, store, &pre_op).map_err(|error| {
-            format!(
-                "jj rebase of `{branch}` onto `{dest}` recorded a conflict, and the store could \
-                 not be rolled back to its pre-rebase operation {pre_op}: {error}. The branch may \
-                 be sitting on a conflict-flagged commit; do NOT export or publish it."
-            )
-        })?;
-        // The bookmark is back where it started, so this export asserts the
-        // pre-rebase commit rather than publishing anything new. It is what
-        // proves the git ref was never dragged onto the conflict.
-        export_bookmark_advance(
-            jj,
-            store,
-            true,
-            branch,
-            "jj git export (conflicting rebase rolled back)",
-        )?;
+        // The bookmark is back where it started after the restore, so the
+        // export asserts the pre-rebase commit rather than publishing anything
+        // new. It is what proves the git ref was never dragged onto the conflict.
+        restore_operation(jj, store, &pre_op)
+            .and_then(|()| {
+                export_bookmark_advance(
+                    jj,
+                    store,
+                    true,
+                    branch,
+                    "jj git export (conflicting rebase rolled back)",
+                )
+            })
+            .map_err(|error| {
+                rollback_incomplete(&format!(
+                    "jj rebase of `{branch}` onto `{dest}` recorded a conflict, and the store \
+                     could not be proven rolled back to its pre-rebase operation {pre_op}: \
+                     {error}. The branch may be sitting on a conflict-flagged commit; do NOT \
+                     export or publish it."
+                ))
+            })?;
         log::info!(
             "jj rebase: `{branch}` onto `{dest}` recorded a {} and was rolled back to {} — nothing \
              conflict-flagged was exported. Conflicting file(s): {}. Incoming change also carries \
@@ -1017,7 +1094,19 @@ pub(crate) fn rebase_branch_onto_with_resolution(
         return Ok(RebaseOutcome::Conflicted { diagnostic });
     }
 
-    export_bookmark_advance(jj, store, true, branch, "jj git export (rebase)")?;
+    reached_step("rebase: before export");
+    if let Err(error) = export_bookmark_advance(jj, store, true, branch, "jj git export (rebase)") {
+        return Err(roll_back_rebase(
+            jj,
+            store,
+            branch,
+            &pre_op,
+            format!(
+                "jj rebase of `{branch}` onto `{dest}` moved the bookmark, and exporting it to \
+                 git failed: {error}"
+            ),
+        ));
+    }
 
     // A clean TIP is not a clean branch. Enumerate the whole rebased range: a
     // conflict-flagged ancestor is invisible to `branch_has_conflict` and would
@@ -1158,7 +1247,7 @@ pub fn merge_side_patch(
 
 /// Assemble the complete conflict diagnostic while the conflict still exists.
 ///
-/// Called from inside [`rebase_branch_onto`] between the recorded conflict and
+/// Called from inside [`rebase_branch_onto_with_resolution`] between the recorded conflict and
 /// the rollback, under the per-store lock every caller holds. Every step is
 /// advisory in the sense that it degrades to a missing field rather than failing
 /// the rebase: an instrument must never be able to break the machinery it

@@ -52,7 +52,11 @@ pub use worktree::*;
 // jj API.
 pub(crate) use env::quote_fileset;
 pub(crate) use errors::LOST_SEAL_MSG;
-pub(crate) use packed_refs::packed_refs_lock_error;
+#[cfg(test)]
+pub(crate) use packed_refs::at_step;
+pub(crate) use packed_refs::{
+    packed_refs_lock_error, reached_step, run_store_rewrite, CONTENTION_DIAGNOSIS, STALE_DIAGNOSIS,
+};
 
 // Referenced only by the jj test suite (unused in non-test builds).
 #[cfg(test)]

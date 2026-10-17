@@ -164,6 +164,22 @@ pub(crate) struct ConflictSession {
     /// The destination that request was actually queued onto, which can be
     /// newer than `destination_commit`.
     pub(crate) replay_requested_destination: Option<String>,
+    /// The reconcile item that processes an outstanding request: the one under
+    /// the intent for `replay_requested_destination`, which is often not the
+    /// row this session was recorded on. `None` when no request is outstanding
+    /// or no such row exists yet.
+    pub(crate) replay_pass: Option<ReplayPass>,
+}
+
+/// What the reconcile row that processes a replay request last recorded.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ReplayPass {
+    pub(crate) item_status: Option<String>,
+    pub(crate) intent_status: Option<String>,
+    pub(crate) outcome_kind: Option<String>,
+    pub(crate) failure_kind: Option<String>,
+    pub(crate) diagnostic: Option<String>,
+    pub(crate) updated_at: i64,
 }
 
 /// The merge base and incoming side one path was resolved against.
@@ -260,20 +276,20 @@ impl ConflictSession {
     /// Where an outstanding replay request has got to, if there is one.
     ///
     /// Composed from what is already stored rather than modelled again: the
-    /// intent's lifecycle says whether the worker has picked the work up, and
-    /// the request timestamp says an agent asked at all. Only the second was
-    /// missing, which is why this is a surfacing problem and not a data one.
+    /// request timestamp says an agent asked, and the row that processes the
+    /// request says what its last pass did. That row is keyed by the request's
+    /// destination, not by where this session was recorded — reading the
+    /// session's own row is what once left a failed request reading QUEUED
+    /// forever.
     pub(crate) fn replay_progress(&self) -> Option<ReplayProgress> {
         let requested_at = self.replay_requested_at?;
-        let state = if self.intent_status.as_deref() == Some("superseded") {
-            ReplayState::Superseded
-        } else if self.intent_status.as_deref() == Some("running")
-            || self.item_status.as_deref() == Some("graph_moved")
-        {
-            ReplayState::Running
-        } else {
-            ReplayState::Queued
+        let own = ReplayPass {
+            item_status: self.item_status.clone(),
+            intent_status: self.intent_status.clone(),
+            updated_at: self.updated_at,
+            ..ReplayPass::default()
         };
+        let state = replay_state(self.replay_pass.as_ref().unwrap_or(&own), requested_at);
         Some(ReplayProgress {
             requested_at,
             state,
@@ -361,16 +377,88 @@ pub(crate) struct ReplayProgress {
     pub(crate) destination: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReplayState {
-    /// Waiting for the reconcile worker.
+    /// Waiting for the reconcile worker, which has not yet processed it.
     Queued,
     /// The reconcile worker has claimed the intent and is acting on it.
     Running,
-    /// The intent this session was recorded under was replaced by one at a
-    /// newer destination. Its own status no longer describes the request, so
-    /// it is not reported as queued.
+    /// The intent carrying the request was replaced by one at a newer
+    /// destination. Its own status no longer describes the request, so it is
+    /// not reported as queued.
     Superseded,
+    /// The last pass lost the ref store's `packed-refs.lock`. Infrastructure,
+    /// not the branch; the worker retries it. `diagnosis` is the give-up line.
+    Retrying { diagnosis: String, at: i64 },
+    /// The last pass failed for another reason.
+    Failed {
+        kind: String,
+        diagnostic: Option<String>,
+        at: i64,
+    },
+    /// The last pass finished with this outcome (`conflicted`, `rebased_clean`, …).
+    Processed { outcome: String, at: i64 },
+    /// Nothing has processed the request and nothing is queued to: its intent
+    /// finished without it. Never reported as queued.
+    NotProcessed { intent_status: String },
+}
+
+/// The request's state from the row that processes it. Pure, so each state is
+/// provable without a database.
+///
+/// `Queued` is only ever a positive fact — the intent is pending and its row
+/// has recorded nothing since the request — and anything that matches no arm
+/// says so rather than falling through to it.
+fn replay_state(pass: &ReplayPass, requested_at: i64) -> ReplayState {
+    let intent = pass.intent_status.as_deref();
+    if intent == Some("superseded") {
+        return ReplayState::Superseded;
+    }
+    if intent == Some("running") {
+        return ReplayState::Running;
+    }
+    let at = pass.updated_at;
+    if at >= requested_at {
+        let ref_lock = pass
+            .failure_kind
+            .as_deref()
+            .is_some_and(crate::jj::reconcile_failure_is_ref_lock);
+        if ref_lock && intent == Some("pending") {
+            let diagnosis = pass
+                .diagnostic
+                .as_deref()
+                .and_then(crate::jj::ref_lock_diagnosis)
+                .unwrap_or_else(|| "the ref store's packed-refs lock was held".to_string());
+            return ReplayState::Retrying { diagnosis, at };
+        }
+        match pass.outcome_kind.as_deref() {
+            Some("failed") => {
+                return ReplayState::Failed {
+                    kind: pass
+                        .failure_kind
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    diagnostic: pass.diagnostic.clone(),
+                    at,
+                }
+            }
+            // A deferral attempted nothing, so it says no more than the
+            // intent's own lifecycle below.
+            Some("deferred") | None => {}
+            Some(outcome) => {
+                return ReplayState::Processed {
+                    outcome: outcome.to_string(),
+                    at,
+                }
+            }
+        }
+    }
+    if intent == Some("pending") {
+        return ReplayState::Queued;
+    }
+    ReplayState::NotProcessed {
+        intent_status: intent.unwrap_or("missing").to_string(),
+    }
 }
 
 /// What the branch's LIVE tip means for this session.
@@ -998,6 +1086,7 @@ async fn load_session(
                     resolution_basis: decode_basis(row.opt_text(22)?.as_deref()),
                     replay_requested_tip: row.opt_text(23)?,
                     replay_requested_destination: row.opt_text(24)?,
+                    replay_pass: None,
                 }))
             })
         })
@@ -1006,8 +1095,65 @@ async fn load_session(
 
     if let Some(session) = session.as_mut() {
         session.files = load_session_files(db, &session.intent_id, &session.bookmark).await?;
+        if session.replay_requested_at.is_some() {
+            let destination = session
+                .replay_requested_destination
+                .clone()
+                .unwrap_or_else(|| session.destination_commit.clone());
+            session.replay_pass =
+                load_replay_pass(db, &session.bookmark, &session.store_path, &destination).await?;
+        }
     }
     Ok(session)
+}
+
+/// The reconcile row that processes a replay request onto `destination`.
+///
+/// `request_replay` reopens and runs the intent at the request's destination,
+/// so that row — not the one the session was recorded on — carries what the
+/// last pass did. Keyed by store and destination commit rather than base
+/// name, because the request may have re-resolved the base to a new name.
+async fn load_replay_pass(
+    db: &LocalDb,
+    bookmark: &str,
+    store_path: &str,
+    destination: &str,
+) -> Result<Option<ReplayPass>, String> {
+    let (bookmark, store_path, destination) = (
+        bookmark.to_string(),
+        store_path.to_string(),
+        destination.to_string(),
+    );
+    db.read(move |conn| {
+        let (bookmark, store_path, destination) =
+            (bookmark.clone(), store_path.clone(), destination.clone());
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT i.status, n.status, i.outcome_kind, i.failure_kind, i.last_diagnostic,
+                            i.updated_at
+                     FROM jj_reconcile_items i
+                     JOIN jj_reconcile_intents n ON n.id = i.intent_id
+                     WHERE i.bookmark = ?1 AND n.store_path = ?2 AND n.destination_commit = ?3
+                     ORDER BY i.updated_at DESC LIMIT 1",
+                    params![bookmark, store_path, destination],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                return Ok(None);
+            };
+            Ok(Some(ReplayPass {
+                item_status: row.opt_text(0)?,
+                intent_status: row.opt_text(1)?,
+                outcome_kind: row.opt_text(2)?,
+                failure_kind: row.opt_text(3)?,
+                diagnostic: row.opt_text(4)?,
+                updated_at: row.opt_i64(5)?.unwrap_or(0),
+            }))
+        })
+    })
+    .await
+    .map_err(|error| format!("load replay pass: {error}"))
 }
 
 /// The incoming change's complete file inventory for one session, path-ordered.
@@ -1349,6 +1495,7 @@ mod tests {
             resolution_basis: ResolutionBasis::new(),
             replay_requested_tip: None,
             replay_requested_destination: None,
+            replay_pass: None,
         }
     }
 
@@ -1451,6 +1598,109 @@ mod tests {
         assert_eq!(asked.replay_progress().unwrap().state, ReplayState::Queued);
         asked.replay_requested_destination = None;
         assert_eq!(asked.replay_progress().unwrap().destination, "d1");
+    }
+
+    fn pass(intent: &str, outcome: Option<&str>, kind: Option<&str>, at: i64) -> ReplayPass {
+        ReplayPass {
+            item_status: Some("pending".to_string()),
+            intent_status: Some(intent.to_string()),
+            outcome_kind: outcome.map(str::to_string),
+            failure_kind: kind.map(str::to_string),
+            diagnostic: kind.map(|_| {
+                "jj rebase failed: The lock for the packed-ref file could not be obtained\n\
+                 packed-refs lock: contention — held by live process 77 (git) after 30s"
+                    .to_string()
+            }),
+            updated_at: at,
+        }
+    }
+
+    /// cairn/5002's shape: the request is stamped, the intent that carried it
+    /// finished, and its row recorded nothing since. Nothing will process it,
+    /// so it must never read as queued.
+    #[test]
+    fn a_request_no_pass_processed_is_never_reported_as_queued() {
+        let finished = pass("completed", Some("conflicted"), None, 50);
+        assert_eq!(
+            replay_state(&finished, 100),
+            ReplayState::NotProcessed {
+                intent_status: "completed".to_string()
+            }
+        );
+        assert_eq!(
+            replay_state(&pass("pending", None, None, 50), 100),
+            ReplayState::Queued,
+            "queued is the positive fact of a pending intent with nothing recorded since"
+        );
+    }
+
+    #[test]
+    fn a_pass_that_lost_the_ref_lock_reads_as_retrying_with_its_diagnosis() {
+        let locked = pass(
+            "pending",
+            Some("failed"),
+            Some(crate::jj::REF_LOCK_CONTENTION),
+            120,
+        );
+        assert_eq!(
+            replay_state(&locked, 100),
+            ReplayState::Retrying {
+                diagnosis: "packed-refs lock: contention — held by live process 77 (git) after 30s"
+                    .to_string(),
+                at: 120
+            }
+        );
+        // A deferral behind another branch's lock carries the same kind.
+        let deferred = pass(
+            "pending",
+            Some("deferred"),
+            Some(crate::jj::REF_LOCK_STALE),
+            120,
+        );
+        assert!(matches!(
+            replay_state(&deferred, 100),
+            ReplayState::Retrying { .. }
+        ));
+    }
+
+    #[test]
+    fn every_processed_outcome_is_reported_as_what_it_was() {
+        let mut failed = pass("pending", Some("failed"), None, 120);
+        failed.failure_kind = Some("transient_process".to_string());
+        failed.diagnostic = Some("jj exited 1".to_string());
+        assert_eq!(
+            replay_state(&failed, 100),
+            ReplayState::Failed {
+                kind: "transient_process".to_string(),
+                diagnostic: Some("jj exited 1".to_string()),
+                at: 120
+            }
+        );
+        assert_eq!(
+            replay_state(&pass("completed", Some("conflicted"), None, 100), 100),
+            ReplayState::Processed {
+                outcome: "conflicted".to_string(),
+                at: 100
+            },
+            "a pass in the request's own second counts as processing it"
+        );
+        assert_eq!(
+            replay_state(&pass("running", Some("failed"), None, 120), 100),
+            ReplayState::Running,
+            "a running intent outranks what its last pass recorded"
+        );
+    }
+
+    /// The request's own row, not the session's, decides: a session recorded
+    /// under a superseded intent whose request is queued at a newer
+    /// destination is queued.
+    #[test]
+    fn the_request_row_outranks_the_session_row() {
+        let mut asked = session("resolved", "d1", &["list.txt"]);
+        asked.replay_requested_at = Some(100);
+        asked.intent_status = Some("superseded".to_string());
+        asked.replay_pass = Some(pass("pending", None, None, 10));
+        assert_eq!(asked.replay_progress().unwrap().state, ReplayState::Queued);
     }
 
     /// A stated reason is not a licence to skip the check: a proof that already

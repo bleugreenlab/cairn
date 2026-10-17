@@ -3729,13 +3729,139 @@ fn a_refused_flatten_rolls_the_rebase_back_and_says_why() {
             assert!(report.conflicted.is_empty(), "a lock is not a conflict");
             assert_eq!(report.failed.len(), 1);
             assert!(report.failed[0].error.contains("packed-ref"));
-            assert_eq!(
-                reconcile_failure_kind(&report.failed[0].error),
-                "transient_process",
+            let kind = reconcile_failure_kind(&report.failed[0].error);
+            assert_eq!(kind, REF_LOCK_CONTENTION);
+            assert!(
+                !reconcile_failure_is_permanent(kind),
                 "so the durable worker retries it"
             );
         }
     }
+}
+
+/// The other arm of the same specimen: a branch that already sat on its dest,
+/// so this pass rebased nothing and there is nothing to roll back. A lost lock
+/// there used to be filed as a content conflict and steer the agent to
+/// resolve markers that did not exist.
+#[test]
+fn an_unmoved_branch_whose_flatten_cannot_run_is_a_retried_failure_not_a_conflict() {
+    let branch = "agent/cairn-4994-builder-0";
+    let mut lock = ReconcileReport::default();
+    record_unmoved_flatten_refusal(
+        &mut lock,
+        branch,
+        "jj new (squash base) failed: The lock for the packed-ref file could not be obtained\n\
+         packed-refs lock: contention — held by live process 77 (git) after 30s"
+            .to_string(),
+    );
+    assert!(lock.conflicted.is_empty(), "a lock is not a conflict");
+    assert_eq!(lock.failed.len(), 1);
+    assert_eq!(
+        reconcile_failure_kind(&lock.failed[0].error),
+        REF_LOCK_CONTENTION
+    );
+
+    let mut guard = ReconcileReport::default();
+    record_unmoved_flatten_refusal(
+        &mut guard,
+        branch,
+        "flatten footprint guard: would delete base file(s)".to_string(),
+    );
+    assert_eq!(
+        guard.conflicted,
+        vec![branch.to_string()],
+        "a guard refusal is still a finding about the tree"
+    );
+    assert!(guard.failed.is_empty());
+}
+
+/// A rollback that did not complete outranks the lock that caused it. Such an
+/// error quotes the lock, and filing it as routine contention would tell the
+/// agent and the page that nothing moved when the store may disagree with git.
+#[test]
+fn an_incomplete_rollback_outranks_a_nested_lost_lock() {
+    let compound = format!(
+        "jj rebase of `b` onto `main` moved the bookmark, and exporting it to git failed: The \
+         lock for the packed-ref file could not be obtained\n\
+         packed-refs lock: contention — held by live process 77 (git) after 30s\n{}",
+        rollback_incomplete(
+            "rolling the rebase back to operation op1 also failed: The lock for \
+                             the packed-ref file could not be obtained"
+        )
+    );
+    assert_eq!(reconcile_failure_kind(&compound), ROLLBACK_FAILED);
+    assert!(!reconcile_failure_is_ref_lock(ROLLBACK_FAILED));
+    assert!(!reconcile_failure_is_permanent(ROLLBACK_FAILED));
+    assert_eq!(
+        ref_lock_deferral(&compound),
+        None,
+        "it does not defer the pass either"
+    );
+
+    // An unmoved branch whose flatten failed and could not be undone is a
+    // reported failure — even when the failure was a guard refusal.
+    let branch = "agent/cairn-4994-builder-0";
+    let mut report = ReconcileReport::default();
+    record_unmoved_flatten_refusal(
+        &mut report,
+        branch,
+        format!(
+            "flatten footprint guard: would delete base file(s)\n{}",
+            rollback_incomplete(
+                "the refused flatten was not fully undone: `b` could not be \
+                                 proven back at abc"
+            )
+        ),
+    );
+    assert!(report.conflicted.is_empty(), "{report:?}");
+    assert_eq!(report.failed.len(), 1);
+    assert_eq!(
+        reconcile_failure_kind(&report.failed[0].error),
+        ROLLBACK_FAILED
+    );
+    assert!(
+        !report.failed[0].error.contains("unchanged"),
+        "it claims nothing about the branch: {}",
+        report.failed[0].error
+    );
+}
+
+#[test]
+fn lost_packed_refs_locks_classify_as_infrastructure_never_permanent() {
+    let contention = "jj rebase failed: Internal error: Unexpected error from backend\n\
+                      The lockfile at '/r/.git/packed-refs.lock' might need manual deletion.\n\
+                      packed-refs lock: contention — held by live process 77 (git) after 30s";
+    let stale = "jj rebase failed: The lock for the packed-ref file could not be obtained\n\
+                 packed-refs lock: stale — older than 30s with no live holder, not removed: \
+                 the lock was replaced after stale-lock proof";
+    let bare = "seal failed: The lock for the packed-ref file could not be obtained";
+    assert_eq!(reconcile_failure_kind(contention), REF_LOCK_CONTENTION);
+    assert_eq!(reconcile_failure_kind(stale), REF_LOCK_STALE);
+    assert_eq!(
+        reconcile_failure_kind(bare),
+        REF_LOCK_CONTENTION,
+        "a lock lost outside patience carries no line and is still contention"
+    );
+    for kind in [REF_LOCK_CONTENTION, REF_LOCK_STALE] {
+        assert!(!reconcile_failure_is_permanent(kind));
+        assert!(reconcile_failure_is_ref_lock(kind));
+    }
+    assert!(!reconcile_failure_is_ref_lock("transient_process"));
+
+    assert_eq!(
+        ref_lock_diagnosis(contention).as_deref(),
+        Some("packed-refs lock: contention — held by live process 77 (git) after 30s")
+    );
+    assert!(ref_lock_diagnosis(bare)
+        .unwrap()
+        .starts_with(CONTENTION_DIAGNOSIS));
+    assert_eq!(ref_lock_diagnosis("Revision main does not exist"), None);
+    let deferral = ref_lock_deferral(stale).unwrap();
+    assert_eq!(
+        reconcile_failure_kind(&deferral),
+        REF_LOCK_STALE,
+        "a deferral classifies as the lock that caused it"
+    );
 }
 
 #[test]
@@ -8895,5 +9021,485 @@ fn an_immutable_rebase_refusal_names_an_untracked_holder_not_a_landing() {
     assert_eq!(
         bookmark_commit(&jj, &store, branch).as_deref(),
         Some(tip.as_str())
+    );
+}
+
+/// A branch one commit ahead of a `main` that has since advanced, with
+/// `packed-refs` present so gix consults (and locks) it on every ref write.
+/// The store replay's lock tests share it.
+struct ReplayLockFixture {
+    _home: TempDir,
+    proj: TempDir,
+    _wts: TempDir,
+    jj: JjEnv,
+    store: PathBuf,
+    branch: &'static str,
+    lock: PathBuf,
+}
+
+fn replay_lock_fixture(bin: &str) -> ReplayLockFixture {
+    let home = TempDir::new().unwrap();
+    let proj = TempDir::new().unwrap();
+    let wts = TempDir::new().unwrap();
+    init_project(proj.path());
+    let jj = JjEnv::resolve(bin, home.path());
+    let store = home.path().join("jj-stores").join("proj");
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    let branch = "agent/cairn-4994-builder-0";
+    let ws = wts.path().join("job");
+    add_workspace(&jj, &store, &ws, branch, "main", None).unwrap();
+    std::fs::write(ws.join("agent.rs"), "agent work\n").unwrap();
+    seal(&jj, &ws, "agent work", None).unwrap();
+    advance_project(proj.path());
+    ensure_project_store(&jj, &store, proj.path()).unwrap();
+    git(proj.path(), &["pack-refs", "--all"]);
+    let lock = proj.path().join(".git").join("packed-refs.lock");
+    ReplayLockFixture {
+        _home: home,
+        proj,
+        _wts: wts,
+        jj,
+        store,
+        branch,
+        lock,
+    }
+}
+
+/// The premise every patient store rewrite rests on, pinned against the
+/// bundled jj: a rewrite that loses `packed-refs.lock` fails BEFORE its
+/// transaction commits. jj-lib writes `refs/jj/keep/<id>` inside the commit
+/// write, ahead of `Transaction::commit`, so the operation head and every
+/// bookmark stay put and repeating the identical command is safe. A jj upgrade
+/// that moved the keep-ref write after the commit would make the repeat
+/// double-apply, and this is where that would show.
+#[test]
+#[serial_test::serial(jj)]
+fn a_rewrite_that_loses_the_packed_refs_lock_commits_no_operation() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping lost-lock rewrite premise test: jj not resolvable");
+        return;
+    };
+    let fx = replay_lock_fixture(&bin);
+    let pre_op = operation_id(&fx.jj, &fx.store).unwrap();
+    let pre_tip = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+
+    std::fs::write(&fx.lock, "held by a live writer\n").unwrap();
+    let held = std::fs::File::open(&fx.lock).unwrap();
+    let result = fx.jj.run(
+        &fx.store,
+        &[
+            "rebase",
+            "-b",
+            fx.branch,
+            "-o",
+            "main",
+            "--ignore-working-copy",
+        ],
+        "bare jj rebase under a held lock",
+    );
+    drop(held);
+    std::fs::remove_file(&fx.lock).unwrap();
+
+    let error = result.expect_err("a rebase cannot write its commits while the lock is held");
+    assert!(
+        packed_refs_lock_error(&error),
+        "the failure is recognizable as lock contention: {error}"
+    );
+    assert_eq!(
+        operation_id(&fx.jj, &fx.store).unwrap(),
+        pre_op,
+        "the failed rewrite committed no operation"
+    );
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, fx.branch).as_deref(),
+        Some(pre_tip.as_str()),
+        "and moved no bookmark"
+    );
+}
+
+fn replay_range_commits(fx: &ReplayLockFixture, range: &str) -> usize {
+    count_commits(&fx.jj, &fx.store, range)
+}
+
+/// The replay itself is patient now. A routine writer holding
+/// `packed-refs.lock` for two seconds used to fail the rebase after gix's
+/// one-second wait; the replay now waits it out and applies exactly once.
+#[test]
+#[serial_test::serial(jj)]
+fn a_replay_waits_out_a_lock_held_for_two_seconds() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping replay packed-refs wait test: jj not resolvable");
+        return;
+    };
+    let fx = replay_lock_fixture(&bin);
+    let range = format!("main..{}", fx.branch);
+    let commits_before = replay_range_commits(&fx, &range);
+
+    std::fs::write(&fx.lock, "held by test\n").unwrap();
+    let release = fx.lock.clone();
+    let holder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+        std::fs::remove_file(release).unwrap();
+    });
+    let started = std::time::Instant::now();
+    let report =
+        reconcile_siblings_without_publication(&fx.jj, &fx.store, "main", &[fx.branch.to_string()])
+            .unwrap();
+    holder.join().unwrap();
+
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(1),
+        "the fixture must actually have made the replay wait"
+    );
+    assert_eq!(
+        report.rebased_clean,
+        vec![fx.branch.to_string()],
+        "{report:?}"
+    );
+    assert_eq!(
+        replay_range_commits(&fx, &range),
+        commits_before,
+        "the rebase applied once: the branch carries its own commits and no more"
+    );
+    let main = bookmark_commit(&fx.jj, &fx.store, "main").unwrap();
+    let parent = fx
+        .jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                &format!("bookmarks(exact:{:?})-", fx.branch),
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "rebased parent",
+        )
+        .unwrap();
+    assert_eq!(
+        parent.trim(),
+        main,
+        "the branch now sits on the advanced main"
+    );
+}
+
+/// Patience is bounded, and a replay that runs out of it moves nothing and
+/// says what it met. The lock held by a live process is never removed, the
+/// failure is infrastructure rather than a conflict, and the next branch in
+/// the pass is deferred without an attempt rather than waiting out the same
+/// lock again.
+#[test]
+#[serial_test::serial(jj)]
+fn a_replay_refused_past_patience_moves_nothing_and_defers_the_rest() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping replay packed-refs exhaustion test: jj not resolvable");
+        return;
+    };
+    let fx = replay_lock_fixture(&bin);
+    let second = "agent/cairn-4994-builder-1";
+    let wts = TempDir::new().unwrap();
+    let ws = wts.path().join("second");
+    let base = fx
+        .jj
+        .run(
+            &fx.store,
+            &[
+                "log",
+                "-r",
+                "main-",
+                "--no-graph",
+                "-T",
+                "commit_id",
+                "--ignore-working-copy",
+            ],
+            "pre-advance main",
+        )
+        .unwrap();
+    add_workspace(&fx.jj, &fx.store, &ws, second, base.trim(), None).unwrap();
+    std::fs::write(ws.join("second.rs"), "second\n").unwrap();
+    seal(&fx.jj, &ws, "second work", None).unwrap();
+    git(fx.proj.path(), &["pack-refs", "--all"]);
+
+    let pre_op = operation_id(&fx.jj, &fx.store).unwrap();
+    let tips: Vec<String> = [fx.branch, second]
+        .iter()
+        .map(|branch| bookmark_commit(&fx.jj, &fx.store, branch).unwrap())
+        .collect();
+    let git_ref = git_stdout(
+        fx.proj.path(),
+        &["rev-parse", &format!("refs/heads/{}", fx.branch)],
+    );
+
+    std::fs::write(&fx.lock, "held by a live writer\n").unwrap();
+    let held = std::fs::File::open(&fx.lock).unwrap();
+    let report = reconcile_siblings_without_publication(
+        &fx.jj,
+        &fx.store,
+        "main",
+        &[fx.branch.to_string(), second.to_string()],
+    )
+    .unwrap();
+    assert!(fx.lock.exists(), "a live writer's lock is never removed");
+    drop(held);
+    std::fs::remove_file(&fx.lock).unwrap();
+
+    assert!(
+        report.conflicted.is_empty(),
+        "a lock is not a conflict: {report:?}"
+    );
+    assert!(report.rebased_clean.is_empty(), "{report:?}");
+    assert_eq!(report.failed.len(), 2, "{report:?}");
+    let first = &report.failed[0];
+    assert_eq!(first.branch, fx.branch);
+    assert_eq!(
+        reconcile_failure_kind(&first.error),
+        REF_LOCK_CONTENTION,
+        "{}",
+        first.error
+    );
+    assert!(
+        first
+            .error
+            .contains(&format!("held by live process {}", std::process::id())),
+        "the give-up names the live holder: {}",
+        first.error
+    );
+    let deferred = &report.failed[1];
+    assert_eq!(deferred.branch, second);
+    assert!(
+        deferred.error.starts_with("deferred without an attempt"),
+        "{}",
+        deferred.error
+    );
+    assert_eq!(reconcile_failure_kind(&deferred.error), REF_LOCK_CONTENTION);
+
+    assert_eq!(
+        operation_id(&fx.jj, &fx.store).unwrap(),
+        pre_op,
+        "no operation was committed"
+    );
+    for (branch, tip) in [fx.branch, second].iter().zip(&tips) {
+        assert_eq!(
+            bookmark_commit(&fx.jj, &fx.store, branch).as_deref(),
+            Some(tip.as_str()),
+            "{branch} did not move"
+        );
+    }
+    assert_eq!(
+        git_stdout(
+            fx.proj.path(),
+            &["rev-parse", &format!("refs/heads/{}", fx.branch)]
+        ),
+        git_ref,
+        "the backing git ref did not move"
+    );
+}
+
+/// A lock abandoned by a crashed writer is proven stale — old, and held by no
+/// process — removed once, and the replay goes through.
+#[test]
+#[serial_test::serial(jj)]
+fn a_stale_lock_is_healed_and_the_replay_proceeds() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping replay stale-lock test: jj not resolvable");
+        return;
+    };
+    let fx = replay_lock_fixture(&bin);
+    std::fs::write(&fx.lock, "abandoned by a crashed writer\n").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&fx.lock)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+
+    let report =
+        reconcile_siblings_without_publication(&fx.jj, &fx.store, "main", &[fx.branch.to_string()])
+            .unwrap();
+    assert_eq!(
+        report.rebased_clean,
+        vec![fx.branch.to_string()],
+        "{report:?}"
+    );
+    assert!(!fx.lock.exists(), "the proven-stale lock was removed");
+}
+
+type HeldLock = std::sync::Arc<std::sync::Mutex<Option<std::thread::JoinHandle<()>>>>;
+
+/// Take `lock` the moment this thread's store rewrite reaches `step`, hold it
+/// open (so `lsof` sees a live writer) for `held`, then release it. Long
+/// enough to exhaust the step's patience, short enough for the rollback that
+/// follows to win the lock back.
+fn hold_lock_at_step(step: &'static str, lock: PathBuf, held: std::time::Duration) -> HeldLock {
+    let slot: HeldLock = Default::default();
+    let handle_slot = slot.clone();
+    at_step(step, move || {
+        std::fs::write(&lock, "held by a live writer\n").unwrap();
+        let file = std::fs::File::open(&lock).unwrap();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(held);
+            drop(file);
+            std::fs::remove_file(&lock).unwrap();
+        });
+        *handle_slot.lock().unwrap() = Some(handle);
+    });
+    slot
+}
+
+fn release(held: HeldLock) {
+    if let Some(handle) = held.lock().unwrap().take() {
+        handle.join().unwrap();
+    }
+}
+
+/// The squash repoints the branch at an EMPTY commit on dest before it
+/// restores the tree into it. A lock taken in exactly that window used to leave
+/// the branch on the empty commit while the pass reported it unchanged and
+/// retried quietly. The refusal now puts the branch, its tree, and its git ref
+/// back, and the next pass flattens it properly.
+#[test]
+#[serial_test::serial(jj)]
+fn a_squash_that_loses_the_lock_after_repointing_is_undone_and_retried() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping squash mid-sequence lock test: jj not resolvable");
+        return;
+    };
+    let fx = setup_divergence_fixture(&bin);
+    let dest = make_intermediate_only(&fx);
+    let proj = fx._proj.path();
+    git(proj, &["pack-refs", "--all"]);
+    let lock = proj.join(".git").join("packed-refs.lock");
+    let pre_tip = bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).unwrap();
+    let git_ref = git_stdout(proj, &["rev-parse", &format!("refs/heads/{DIV_SIBLING}")]);
+
+    let held = hold_lock_at_step(
+        "squash: bookmark repointed",
+        lock.clone(),
+        std::time::Duration::from_secs(36),
+    );
+    let report = reconcile_siblings_without_publication(
+        &fx.jj,
+        &fx.store,
+        DIV_INT,
+        &[DIV_SIBLING.to_string()],
+    )
+    .unwrap();
+    release(held);
+
+    assert!(
+        report.conflicted.is_empty(),
+        "a lock is not a conflict: {report:?}"
+    );
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    let error = &report.failed[0].error;
+    assert_eq!(
+        reconcile_failure_kind(error),
+        REF_LOCK_CONTENTION,
+        "{error}"
+    );
+    assert!(!error.contains(ROLLBACK_INCOMPLETE), "{error}");
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, DIV_SIBLING).as_deref(),
+        Some(pre_tip.as_str()),
+        "the branch is off the empty squash commit and back where it was"
+    );
+    assert_eq!(
+        git_stdout(proj, &["rev-parse", &format!("refs/heads/{DIV_SIBLING}")]),
+        git_ref,
+        "and so is its git ref"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&file_show(&fx.jj, &fx.store, DIV_SIBLING, "shared.rs").unwrap()),
+        "resolved\n",
+        "the source tree survived"
+    );
+
+    let retried = reconcile_siblings_without_publication(
+        &fx.jj,
+        &fx.store,
+        DIV_INT,
+        &[DIV_SIBLING.to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        retried.rebased_clean,
+        vec![DIV_SIBLING.to_string()],
+        "{retried:?}"
+    );
+    assert_eq!(
+        count_commits(
+            &fx.jj,
+            &fx.store,
+            &format!("{dest}..bookmarks(exact:{DIV_SIBLING:?})")
+        ),
+        1,
+        "the retry flattened it to one commit"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&file_show(&fx.jj, &fx.store, DIV_SIBLING, "shared.rs").unwrap()),
+        "resolved\n",
+        "carrying the same tree"
+    );
+}
+
+/// A rebase that lands in the store and then cannot export is rolled back, so
+/// "the branch is unchanged" is true when the failure is classified as a lost
+/// lock, and the next pass performs the whole rebase again.
+#[test]
+#[serial_test::serial(jj)]
+fn a_rebase_whose_export_loses_the_lock_is_rolled_back_and_retried() {
+    let Some(bin) = jj_bin() else {
+        eprintln!("skipping rebase export lock test: jj not resolvable");
+        return;
+    };
+    let fx = replay_lock_fixture(&bin);
+    let pre_tip = bookmark_commit(&fx.jj, &fx.store, fx.branch).unwrap();
+    let git_ref = git_stdout(
+        fx.proj.path(),
+        &["rev-parse", &format!("refs/heads/{}", fx.branch)],
+    );
+
+    let held = hold_lock_at_step(
+        "rebase: before export",
+        fx.lock.clone(),
+        std::time::Duration::from_secs(36),
+    );
+    let report =
+        reconcile_siblings_without_publication(&fx.jj, &fx.store, "main", &[fx.branch.to_string()])
+            .unwrap();
+    release(held);
+
+    assert!(report.conflicted.is_empty(), "{report:?}");
+    assert_eq!(report.failed.len(), 1, "{report:?}");
+    let error = &report.failed[0].error;
+    assert_eq!(
+        reconcile_failure_kind(error),
+        REF_LOCK_CONTENTION,
+        "{error}"
+    );
+    assert!(error.contains("rolled back"), "{error}");
+    assert_eq!(
+        bookmark_commit(&fx.jj, &fx.store, fx.branch).as_deref(),
+        Some(pre_tip.as_str()),
+        "the landed rebase was undone in the store"
+    );
+    assert_eq!(
+        git_stdout(
+            fx.proj.path(),
+            &["rev-parse", &format!("refs/heads/{}", fx.branch)]
+        ),
+        git_ref,
+        "and git agrees"
+    );
+
+    let retried =
+        reconcile_siblings_without_publication(&fx.jj, &fx.store, "main", &[fx.branch.to_string()])
+            .unwrap();
+    assert_eq!(
+        retried.rebased_clean,
+        vec![fx.branch.to_string()],
+        "{retried:?}"
     );
 }

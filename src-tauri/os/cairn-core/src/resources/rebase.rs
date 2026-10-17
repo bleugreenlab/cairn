@@ -1226,7 +1226,59 @@ fn status_line(session: &ConflictSession) -> String {
         .map(|stamp| format!(", requested {stamp}"))
         .unwrap_or_default();
     let destination = progress.destination.as_str();
+    let when = |at: i64| {
+        crate::clock::stamp(at)
+            .map(|stamp| format!(" at {stamp}"))
+            .unwrap_or_default()
+    };
     match progress.state {
+        ReplayState::Retrying { diagnosis, at } => format!(
+            "\n**Status:** replay onto `{destination}`{requested} is RETRYING. Its last \
+             attempt{} could not take the ref store's lock: {diagnosis}. That is the machine's \
+             shared Git ref store, not your branch — nothing needs repair, and the reconcile \
+             worker retries it automatically. Re-requesting does not make it sooner.\n",
+            when(at)
+        ),
+        // A failure says nothing about where the branch now stands: a clean
+        // rebase may have landed before its publication failed. Only the
+        // diagnostic does, so it is quoted rather than summarized.
+        ReplayState::Failed {
+            kind,
+            diagnostic,
+            at,
+        } => {
+            let quoted = diagnostic
+                .as_deref()
+                .map(|text| format!("\n\n```\n{}\n```\n", text.trim()))
+                .unwrap_or_default();
+            if kind == crate::jj::ROLLBACK_FAILED {
+                format!(
+                    "\n**Status:** replay onto `{destination}`{requested} FAILED{} and its \
+                     rollback did NOT complete, so the store may not be where the pass found it. \
+                     Do not publish or force-push this branch; report the diagnostic below.{quoted}",
+                    when(at)
+                )
+            } else {
+                format!(
+                    "\n**Status:** replay onto `{destination}`{requested} was attempted{} and \
+                     FAILED ({kind}); the diagnostic below says what the pass changed.{quoted} A \
+                     transient failure is retried automatically; one that needs you also arrives \
+                     as a message.\n",
+                    when(at)
+                )
+            }
+        }
+        ReplayState::Processed { outcome, at } => format!(
+            "\n**Status:** replay onto `{destination}`{requested} was processed: {} {}. If this \
+             page has not caught up with that pass, re-read it.\n",
+            outcome.replace('_', " "),
+            when(at).trim_start()
+        ),
+        ReplayState::NotProcessed { intent_status } => format!(
+            "\n**Status:** a replay was requested onto `{destination}`{requested}, but no pass \
+             has processed it and none is queued to (its reconcile work is {intent_status}). \
+             Request the replay again.\n"
+        ),
         ReplayState::Running => format!(
             "\n**Status:** replay IN PROGRESS onto `{destination}`{requested}. It runs under the \
              store lock; nothing runs in your slot.\n"
@@ -1490,6 +1542,7 @@ mod tests {
             resolution_basis: Default::default(),
             replay_requested_tip: None,
             replay_requested_destination: None,
+            replay_pass: None,
         }
     }
 
@@ -1525,6 +1578,97 @@ mod tests {
         assert!(
             current.contains("rewritten since this session was recorded"),
             "{current}"
+        );
+    }
+
+    /// A replay whose last pass lost the ref-store lock says so, names the
+    /// lock's state, and tells the agent there is nothing to repair; one no
+    /// pass will process says to ask again instead of claiming to be queued.
+    #[test]
+    fn the_status_line_reports_the_last_pass_instead_of_queued() {
+        let mut session = recorded_session();
+        session.replay_requested_at = Some(100);
+        session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
+            item_status: Some("pending".to_string()),
+            intent_status: Some("pending".to_string()),
+            outcome_kind: Some("failed".to_string()),
+            failure_kind: Some(crate::jj::REF_LOCK_CONTENTION.to_string()),
+            diagnostic: Some(
+                "jj rebase failed: The lock for the packed-ref file could not be obtained\n\
+                 packed-refs lock: contention — held by live process 77 (git) after 30s"
+                    .to_string(),
+            ),
+            updated_at: 130,
+        });
+        let line = status_line(&session);
+        assert!(line.contains("RETRYING"), "{line}");
+        assert!(
+            line.contains("held by live process 77 (git)"),
+            "names the lock's state: {line}"
+        );
+        assert!(line.contains("nothing needs repair"), "{line}");
+        assert!(!line.contains("QUEUED"), "{line}");
+
+        session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
+            intent_status: Some("completed".to_string()),
+            updated_at: 50,
+            ..Default::default()
+        });
+        let line = status_line(&session);
+        assert!(line.contains("no pass has processed it"), "{line}");
+        assert!(line.contains("Request the replay again"), "{line}");
+        assert!(!line.contains("QUEUED"), "{line}");
+    }
+
+    /// A failure never promises an unchanged branch: a publication can fail
+    /// after its rebase landed. And a failure whose rollback did not complete
+    /// — even one caused by a lost lock — is a warning, never a quiet retry.
+    #[test]
+    fn a_failed_pass_claims_nothing_about_the_branch_and_an_incomplete_rollback_warns() {
+        let failed = |kind: &str, diagnostic: &str| {
+            let mut session = recorded_session();
+            session.replay_requested_at = Some(100);
+            session.replay_pass = Some(crate::orchestrator::conflict_session::ReplayPass {
+                item_status: Some("pending".to_string()),
+                intent_status: Some("pending".to_string()),
+                outcome_kind: Some("failed".to_string()),
+                failure_kind: Some(kind.to_string()),
+                diagnostic: Some(diagnostic.to_string()),
+                updated_at: 130,
+            });
+            status_line(&session)
+        };
+        let push = failed(
+            "transient_process",
+            "origin push failed: connection reset. GitHub still holds the previous branch head",
+        );
+        assert!(push.contains("FAILED (transient_process)"), "{push}");
+        assert!(
+            !push.contains("unchanged"),
+            "a published rebase may have landed: {push}"
+        );
+        assert!(
+            push.contains("origin push failed"),
+            "the diagnostic is quoted: {push}"
+        );
+
+        let unsafe_rollback = failed(
+            crate::jj::ROLLBACK_FAILED,
+            "jj rebase moved the bookmark, and exporting it failed: The lock for the packed-ref \
+             file could not be obtained\nrollback incomplete: rolling the rebase back also failed",
+        );
+        assert!(
+            unsafe_rollback.contains("rollback did NOT complete"),
+            "{unsafe_rollback}"
+        );
+        assert!(
+            unsafe_rollback.contains("Do not publish"),
+            "{unsafe_rollback}"
+        );
+        assert!(!unsafe_rollback.contains("RETRYING"), "{unsafe_rollback}");
+        assert!(
+            !unsafe_rollback.contains("nothing needs repair"),
+            "{unsafe_rollback}"
         );
     }
 
