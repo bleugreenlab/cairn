@@ -99,6 +99,8 @@ mod reseed_fallback_tests;
 /// `transition_to_warm_state`, and that path had dropped both, leaving batch
 /// parents hung forever.
 #[cfg(test)]
+mod thread_task_completion_tests;
+#[cfg(test)]
 mod warm_completion_tests;
 
 /// CAIRN-1882: the work-turn idle edge is the single creator of a review push.

@@ -59,6 +59,20 @@ pub fn recompute_execution_jobs(orch: &Orchestrator, execution_id: &str) -> Resu
     )
 }
 
+/// Boot repair: sweep `execution_id` once, settling the stranded jobs in
+/// `settle_job_ids` quietly, and return the status changes the sweep wrote.
+pub fn settle_stranded_jobs(
+    orch: &Orchestrator,
+    execution_id: &str,
+    settle_job_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<JobStatusChange>, String> {
+    cairn_workflow::advancement::recompute::settle_stranded_jobs(
+        &crate::workflow_host::runtime(orch),
+        execution_id,
+        settle_job_ids,
+    )
+}
+
 #[cfg(test)]
 mod artifact_present_tests {
     use super::{

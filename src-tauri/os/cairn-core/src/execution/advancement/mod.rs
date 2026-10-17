@@ -24,5 +24,5 @@ pub use cairn_workflow::advancement::{
 };
 pub use recompute::{
     heal_stuck_delegated_children, recompute_execution_jobs, recompute_job,
-    reduce_delegated_child_job,
+    reduce_delegated_child_job, settle_stranded_jobs,
 };

@@ -241,6 +241,81 @@ fn delegated_result_text(
     Ok("Task completed.".to_string())
 }
 
+/// How a settled task reaches its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeMode {
+    /// The task's own turn just ended: the ordinary completion path.
+    Live,
+    /// A boot repair settled a task whose completion a defective release never
+    /// delivered. Only a parent still parked on the exact anchor is woken, and
+    /// each result says plainly that it is late.
+    Repair,
+}
+
+/// When a task's work ended: its latest work turn's end, the memory review
+/// excluded. `None` when the task never ran a turn.
+async fn task_finished_at(db: &LocalDb, job_id: &str) -> Result<Option<i64>, String> {
+    let job_id = job_id.to_string();
+    db.read(move |conn| {
+        let job_id = job_id.clone();
+        Box::pin(async move {
+            let mut rows = conn
+                .query(
+                    "SELECT ended_at FROM turns
+                     WHERE job_id = ?1 AND start_reason != 'memory_review'
+                     ORDER BY created_at DESC, sequence DESC LIMIT 1",
+                    (job_id.as_str(),),
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => row.opt_i64(0),
+                None => Ok(None),
+            }
+        })
+    })
+    .await
+    .map_err(|e| format!("Failed to load task completion time: {e}"))
+}
+
+/// The notice a repaired delivery leads with, so the parent reads a long-held
+/// result as history rather than as fresh news.
+fn delayed_delivery_notice(finished_at: Option<i64>) -> String {
+    let when = finished_at
+        .and_then(|secs| chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0))
+        .map(|at| format!("at {}", at.format("%Y-%m-%d %H:%M UTC")))
+        .unwrap_or_else(|| "long before this delivery".to_string());
+    format!(
+        "Delayed delivery: this task finished {when}. A defect (fixed in cairn/5058) kept \
+         this thread from being woken when it finished; read this result as history, not \
+         as fresh news."
+    )
+}
+
+/// Each packet's result text as its parent receives it. A repaired delivery
+/// prefixes every result with its delayed-delivery notice, which reaches both
+/// the combined resume message and the per-call Task `tool_result`s built from
+/// these same strings.
+async fn render_delegated_results(
+    db: &std::sync::Arc<LocalDb>,
+    packets: Vec<crate::models::DelegatedWorkPacket>,
+    mode: ResumeMode,
+) -> Result<Vec<(crate::models::DelegatedWorkPacket, String)>, String> {
+    let mut rendered = Vec::with_capacity(packets.len());
+    for packet in packets {
+        let result = delegated_result_text(db.clone(), &packet)?;
+        let result = match (mode, packet.result_artifact_job_id.as_deref()) {
+            (ResumeMode::Repair, Some(job_id)) => format!(
+                "{}\n\n{}",
+                delayed_delivery_notice(task_finished_at(db, job_id).await?),
+                result
+            ),
+            _ => result,
+        };
+        rendered.push((packet, result));
+    }
+    Ok(rendered)
+}
+
 fn format_delegated_resume_message(
     packets: &[(crate::models::DelegatedWorkPacket, String)],
 ) -> String {
@@ -607,6 +682,32 @@ pub fn resume_suspended_parent_after_task_completion(
     orch: &Orchestrator,
     child_job_id: &str,
 ) -> Result<(), String> {
+    resume_parent_after_task_settled(orch, child_job_id, ResumeMode::Live)
+}
+
+/// Deliver a task that a boot repair just settled to the parent that spawned it,
+/// if and only if that parent is still parked on the task's exact anchor turn.
+///
+/// This is the live completion path with two differences. A background packet
+/// pushes nothing: the spawner was never parked on it, so a late wake would
+/// interrupt whatever it is doing now with news it stopped waiting for. And each
+/// delivered result leads with a delayed-delivery notice naming when the task
+/// actually finished. A blocking packet still has to clear the same gates —
+/// every sibling terminal, then the exact-anchor `dependency_unblock` claim — so
+/// a parent whose head moved on is left alone, and a batch repaired together
+/// wakes its parent exactly once.
+pub fn resume_parked_parent_after_repair(
+    orch: &Orchestrator,
+    child_job_id: &str,
+) -> Result<(), String> {
+    resume_parent_after_task_settled(orch, child_job_id, ResumeMode::Repair)
+}
+
+fn resume_parent_after_task_settled(
+    orch: &Orchestrator,
+    child_job_id: &str,
+    mode: ResumeMode,
+) -> Result<(), String> {
     let db = {
         let dbs = orch.db.clone();
         let cjid = child_job_id.to_string();
@@ -668,8 +769,11 @@ pub fn resume_suspended_parent_after_task_completion(
 
             // Background spawns never prepared a successor turn, so the blocking
             // successor/resume path below does not apply: notify the spawner via
-            // a push instead.
+            // a push instead. A repair pushes nothing: nobody is parked on it.
             if refreshed_packet.background {
+                if mode == ResumeMode::Repair {
+                    return Ok(None);
+                }
                 return notify_spawner_after_background_task_completion(
                     &db,
                     &execution_id,
@@ -719,11 +823,7 @@ pub fn resume_suspended_parent_after_task_completion(
             }
 
             grouped_packets.sort_by_key(|packet| (packet.task_index, packet.created_at));
-            let mut rendered_packets = Vec::with_capacity(grouped_packets.len());
-            for packet in grouped_packets {
-                let result = delegated_result_text(db.clone(), &packet)?;
-                rendered_packets.push((packet, result));
-            }
+            let rendered_packets = render_delegated_results(&db, grouped_packets, mode).await?;
 
             let full_combined = format_delegated_resume_message(&rendered_packets);
             let session_id = select_optional_text(
@@ -840,6 +940,78 @@ pub fn resume_suspended_parent_after_task_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delayed_delivery_notice_names_when_the_task_finished() {
+        let notice = delayed_delivery_notice(Some(1_757_000_000));
+        assert!(notice.starts_with("Delayed delivery:"), "{notice}");
+        assert!(notice.contains("at 2025-09-04 15:33 UTC"), "{notice}");
+        assert!(notice.contains("as history, not as fresh news"), "{notice}");
+        assert!(delayed_delivery_notice(None).contains("long before this delivery"));
+    }
+
+    /// A repaired delivery prefixes every packet's result with its own notice and
+    /// finish time; the live path renders the bare result. Both the combined
+    /// resume message and the Task `tool_result`s are built from these strings.
+    #[tokio::test]
+    async fn repaired_results_lead_with_their_delayed_delivery_notice() {
+        let db = LocalDb::open(tempfile::tempdir().unwrap().keep().join("render.db"))
+            .await
+            .unwrap();
+        crate::storage::MigrationRunner::new(crate::storage::TURSO_MIGRATIONS.to_vec())
+            .run(&db)
+            .await
+            .unwrap();
+        db.execute_script(
+            "INSERT INTO workspaces (id, name, created_at, updated_at) VALUES ('w','W',1,1);
+             INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p','w','P','prj','/tmp/prj',1,1);
+             INSERT INTO jobs (id, project_id, status, created_at, updated_at)
+               VALUES ('j-a','p','complete',1,1), ('j-b','p','complete',1,1);
+             INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at)
+               VALUES ('t-a','s-a','j-a',1,'complete','initial',1,1757000000,1),
+                      ('t-b','s-b','j-b',1,'complete','initial',1,1757003600,1),
+                      ('t-b-review','s-b','j-b',2,'complete','memory_review',2,1800000000,2);
+             INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name, created_at, updated_at)
+               VALUES ('a-a','j-a','return',0,'{\"summary\":\"quic ok\"}',1,'return',1,1),
+                      ('a-b','j-b','return',0,'{\"summary\":\"tar ok\"}',1,'return',1,1);",
+        )
+        .await
+        .unwrap();
+        let db = std::sync::Arc::new(db);
+        let packets = || {
+            ["j-a", "j-b"]
+                .into_iter()
+                .map(|job| {
+                    let mut p = packet(job, "parent", Some("anchor"));
+                    p.result_artifact_job_id = Some(job.to_string());
+                    p
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let repaired = render_delegated_results(&db, packets(), ResumeMode::Repair)
+            .await
+            .unwrap();
+        assert!(repaired[0]
+            .1
+            .starts_with("Delayed delivery: this task finished at 2025-09-04 15:33 UTC"));
+        assert!(repaired[0].1.contains("quic ok"));
+        // The memory-review turn is not the task's finish.
+        assert!(repaired[1]
+            .1
+            .starts_with("Delayed delivery: this task finished at 2025-09-04 16:33 UTC"));
+        assert!(repaired[1].1.contains("tar ok"));
+        let message = format_delegated_resume_message(&repaired);
+        assert_eq!(message.matches("Delayed delivery:").count(), 2);
+
+        let live = render_delegated_results(&db, packets(), ResumeMode::Live)
+            .await
+            .unwrap();
+        assert!(live
+            .iter()
+            .all(|(_, text)| !text.contains("Delayed delivery")));
+    }
 
     fn packet(
         id: &str,

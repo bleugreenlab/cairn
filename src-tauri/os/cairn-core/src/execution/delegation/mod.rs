@@ -7,8 +7,9 @@ pub mod runtime;
 
 pub(crate) use runtime::lookup_caller_job_id;
 pub(crate) use runtime::{
-    is_call_child, resume_suspended_parent_after_task_completion, spawn_call_packets,
-    spawn_task_packets, spawn_workflow_packets,
+    is_call_child, resume_parked_parent_after_repair,
+    resume_suspended_parent_after_task_completion, spawn_call_packets, spawn_task_packets,
+    spawn_workflow_packets,
 };
 
 use cairn_common::ids;

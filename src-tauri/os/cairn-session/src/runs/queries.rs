@@ -220,6 +220,10 @@ pub struct ReconcileResult {
     /// once the sweep's writes have landed. Re-derivation is idempotent, so a
     /// job that is genuinely live is simply written Running again.
     pub reproject_job_ids: Vec<String>,
+    /// Thread tasks a release that projected every thread-owned job by liveness
+    /// alone left cached `idle` after their work ended. The caller settles them
+    /// rather than re-deriving them; see the query that selects them.
+    pub stranded_thread_task_ids: Vec<String>,
     /// Stale runs whose surviving process this sweep actually stopped, as
     /// opposed to ones merely assumed dead.
     reaped_count: usize,
@@ -1461,12 +1465,108 @@ async fn reconcile_stale_runs_db(
                 }
             }
 
+            // Upgrade repair: a release that projected every job carrying a
+            // `thread_id` by liveness alone — the session's rule — left the
+            // tasks a thread spawned cached `idle` once their work ended, never
+            // Complete, so no parent was ever told. The forward fix limits that
+            // rule to the session job; these are the residue.
+            //
+            // Only `idle` is selected, so the selection empties once repaired.
+            // Under the fixed projection a delegated task cannot derive Idle: its
+            // packet always carries an output contract, so it requires output and
+            // is not long-running. A task cached `running` by a host crash is
+            // deliberately not selected: it keeps the ordinary crash semantics
+            // (interrupted, then Pending, then relaunched) through the repairs
+            // above.
+            //
+            // `idle` alone does not mean finished, though. Under the defect a task
+            // legitimately parked mid-work also read `idle`: one waiting on its
+            // own question, permission, durable wait, or sub-task. The caller
+            // SETTLES these (anything without a recorded outcome becomes
+            // Cancelled, which is sticky), so settling a parked task would cancel
+            // live work and tell its parent it was over. A candidate must
+            // therefore have stopped, and own nothing still waiting:
+            //
+            // - its latest work turn (memory review excluded) is terminal —
+            //   complete, failed, interrupted or cancelled, never yielded,
+            //   pending or running. A yielded turn is a wait in progress,
+            //   including a wait on the task's own sub-tasks;
+            // - no prompt it raised is unanswered and not withdrawn;
+            // - no permission it requested is pending;
+            // - no `agent_waits` row of its own is pending or resolving.
+            //
+            // The one exception to the turn rule is a node-less task with no
+            // turn and no run at all (a Thread-agent task created and never
+            // launched). A node-less job has no DAG node to claim it, and every
+            // node-less launch path starts a run as it creates the job, so one
+            // that has neither can never start: settling it Cancelled records
+            // what already happened. A node-backed task without a turn is NOT
+            // excepted, since its next sweep derives Pending and the DAG may still
+            // launch it.
+            //
+            // Single-table shape, as above: every other table is reached from
+            // `j` inside a correlated EXISTS or scalar subquery.
+            let mut rows = conn
+                .query(
+                    &format!(
+                        "SELECT j.id
+                         FROM jobs j
+                         WHERE j.status = 'idle'
+                           AND j.thread_id IS NOT NULL
+                           AND j.execution_id IS NOT NULL
+                           AND NOT (CASE WHEN {} THEN 1 ELSE 0 END)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM runs r
+                               WHERE r.job_id = j.id
+                                 AND r.status IN ('starting', 'live')
+                           )
+                           AND (
+                               (
+                                   SELECT latest.state FROM turns latest
+                                   WHERE latest.job_id = j.id
+                                     AND latest.start_reason != 'memory_review'
+                                   ORDER BY latest.created_at DESC, latest.sequence DESC
+                                   LIMIT 1
+                               ) IN ('complete', 'failed', 'interrupted', 'cancelled')
+                               OR (
+                                   j.recipe_node_id IS NULL
+                                   AND NOT EXISTS (SELECT 1 FROM turns t WHERE t.job_id = j.id)
+                                   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.job_id = j.id)
+                               )
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM prompts p JOIN runs r ON p.run_id = r.id
+                               WHERE r.job_id = j.id
+                                 AND p.response IS NULL AND p.withdrawn_at IS NULL
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM permission_requests pr JOIN runs r ON pr.run_id = r.id
+                               WHERE r.job_id = j.id AND pr.status = 'pending'
+                           )
+                           AND NOT EXISTS (
+                               SELECT 1 FROM agent_waits w
+                               WHERE w.job_id = j.id AND w.state IN ('pending', 'resolving')
+                           )",
+                        cairn_db::lineage::SESSION_JOB_SHAPE
+                    ),
+                    (),
+                )
+                .await?;
+            let mut stranded_thread_task_ids = Vec::new();
+            while let Some(row) = rows.next().await? {
+                let job_id = row.text(0)?;
+                if !claimed_job_ids.contains(&job_id) {
+                    stranded_thread_task_ids.push(job_id);
+                }
+            }
+
             Ok(ReconcileResult {
                 stale_run_count,
                 turn_count,
                 reaped_count,
                 orphaned_pending_count,
                 reproject_job_ids: reproject_job_ids.into_iter().collect(),
+                stranded_thread_task_ids,
             })
         })
     })

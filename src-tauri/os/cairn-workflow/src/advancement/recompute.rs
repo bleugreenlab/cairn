@@ -36,6 +36,11 @@ pub enum ChangeCause {
     /// announcing it would replay completions on long-finished issues, and
     /// advancing a resolved issue's DAG would launch work nobody can use.
     IssueResolved,
+    /// A boot repair settled a projection that a defective release left stale.
+    /// The work ended long ago, so the change is published as a db-change only:
+    /// announcing it would replay a completion nobody is waiting on, and
+    /// advancing on it would launch work the repair was never asked to start.
+    Repaired,
 }
 
 /// A job whose derived status differs from its cached status.
@@ -125,11 +130,11 @@ impl JobStatusChange {
     /// a blocked job as settled, so excluding it here contradicted the gate the
     /// evaluator itself applies.
     ///
-    /// `Cancelled` is a stopped status too, and is absent on purpose. Its one
-    /// derived edge is the settlement of a job onto a merged or closed issue
-    /// ([`ChangeCause::IssueResolved`]), and those changes are never announced
-    /// (see [`Self::is_announced`]): the resolution itself already evaluated
-    /// whatever there was to evaluate. Archiving, the other way to Cancelled, is
+    /// `Cancelled` is a stopped status too, and is absent on purpose. Its derived
+    /// edges are settlements — of a job onto a merged or closed issue
+    /// ([`ChangeCause::IssueResolved`]) or of stranded work by a boot repair
+    /// ([`ChangeCause::Repaired`]) — and those changes are never announced (see
+    /// [`Self::is_announced`]): nothing new happened to the work. Archiving, the other way to Cancelled, is
     /// an explicit sticky override written by `cancel_job_conn`, and the sweep
     /// skips cancelled jobs before deriving anything.
     ///
@@ -155,7 +160,23 @@ struct SweepJob {
     issue_id: Option<String>,
     project_id: String,
     parent_tool_use_id: Option<String>,
-    thread_id: Option<String>,
+    /// Whether this is a thread's session job (see [`thread_session_sql`]).
+    thread_session: bool,
+}
+
+/// SQL for "this row is a thread's session job", over a `jobs j` alias.
+///
+/// A thread's session is the one job whose status is liveness-only: it is a
+/// standing conversation, not work that completes. Tasks the thread spawns carry
+/// its `thread_id` too, but they are ordinary jobs and complete like any other,
+/// so ownership alone must not select this projection. The shape is
+/// [`cairn_db::lineage::SESSION_JOB_SHAPE`], the canonical session identity; the
+/// `CASE` folds its NULL (`uri_segment IS NULL`) into a plain 0.
+fn thread_session_sql() -> String {
+    format!(
+        "CASE WHEN j.thread_id IS NOT NULL AND {} THEN 1 ELSE 0 END",
+        cairn_db::lineage::SESSION_JOB_SHAPE
+    )
 }
 
 /// The checkpoint gate for a node. A standalone checkpoint node runs a command
@@ -881,9 +902,13 @@ async fn load_sweep_jobs(
 ) -> DbResult<Vec<SweepJob>> {
     let mut rows = conn
         .query(
-            "SELECT id, recipe_node_id, parent_job_id, status, issue_id, project_id,
-                    completed_at, parent_tool_use_id, thread_id
-             FROM jobs WHERE execution_id = ?1",
+            &format!(
+                "SELECT j.id, j.recipe_node_id, j.parent_job_id, j.status, j.issue_id,
+                        j.project_id, j.completed_at, j.parent_tool_use_id,
+                        {} AS thread_session
+                 FROM jobs j WHERE j.execution_id = ?1",
+                thread_session_sql()
+            ),
             (execution_id,),
         )
         .await?;
@@ -901,7 +926,7 @@ async fn load_sweep_jobs(
             issue_id: row.opt_text(4)?,
             project_id: row.text(5)?,
             parent_tool_use_id: row.opt_text(7)?,
-            thread_id: row.opt_text(8)?,
+            thread_session: row.i64(8)? != 0,
         });
     }
     Ok(jobs)
@@ -1012,9 +1037,12 @@ pub async fn recompute_job_status_conn(
     let jobs_one = {
         let mut rows = conn
             .query(
-                "SELECT execution_id, recipe_node_id, status, parent_job_id, agent_config_id,
-                        thread_id, issue_id
-                 FROM jobs WHERE id = ?1",
+                &format!(
+                    "SELECT j.execution_id, j.recipe_node_id, j.status, j.parent_job_id,
+                            j.agent_config_id, {} AS thread_session, j.issue_id
+                     FROM jobs j WHERE j.id = ?1",
+                    thread_session_sql()
+                ),
                 (job_id,),
             )
             .await?;
@@ -1027,7 +1055,7 @@ pub async fn recompute_job_status_conn(
                     row.text(2)?,
                     row.opt_text(3)?,
                     row.opt_text(4)?,
-                    row.opt_text(5)?,
+                    row.i64(5)? != 0,
                     row.opt_text(6)?,
                 ))
             })
@@ -1039,7 +1067,7 @@ pub async fn recompute_job_status_conn(
         current_status,
         parent_job_id,
         agent_config_id,
-        thread_id,
+        thread_session,
         issue_id,
     )) = jobs_one
     else {
@@ -1073,10 +1101,10 @@ pub async fn recompute_job_status_conn(
         return Ok(current_status);
     }
 
-    // A closed thread's terminal outcome is durable. Thread ownership changes
-    // how a resumable session rests, but it must not erase Complete or Failed
-    // merely because no process is currently live.
-    if thread_id.is_some() && current_status.is_terminal() {
+    // A closed thread's terminal outcome is durable. Being a thread's session
+    // changes how a resumable session rests, but it must not erase Complete or
+    // Failed merely because no process is currently live.
+    if thread_session && current_status.is_terminal() {
         return Ok(current_status);
     }
 
@@ -1090,9 +1118,10 @@ pub async fn recompute_job_status_conn(
     // A merged or closed issue takes no more work: every job on it settles to
     // the outcome it recorded, or to Cancelled. This precedes the delegated
     // child and workflow early return below, so node-less children settle too
-    // rather than keeping whatever status they held at resolution. Thread-owned
-    // jobs are excluded: dormancy governs them.
-    if thread_id.is_none() {
+    // rather than keeping whatever status they held at resolution. A thread's
+    // session job is excluded: dormancy governs it. Its tasks are ordinary jobs
+    // and settle like any other.
+    if !thread_session {
         if let Some(issue_id) = issue_id.as_deref() {
             if issue_is_terminal_conn(conn, issue_id).await? {
                 return derive_terminal_issue_status_conn(
@@ -1119,10 +1148,11 @@ pub async fn recompute_job_status_conn(
     let turn = turn_facts(conn, job_id).await?;
     let active_run = has_active_run_conn(conn, job_id).await?;
 
-    // A thread remains the owner after it acquires a passive host execution.
-    // Its status is liveness-only in both shapes: live work runs, otherwise the
-    // warm session rests Idle.
-    if thread_id.is_some() {
+    // A thread's session job remains a session after it acquires a passive host
+    // execution. Its status is liveness-only in both shapes: live work runs,
+    // otherwise the warm session rests Idle. The thread's tasks carry its
+    // `thread_id` too, but they are ordinary jobs and derive from their facts.
+    if thread_session {
         return Ok(if turn.work_live(active_run) {
             JobStatus::Running
         } else {
@@ -1199,14 +1229,34 @@ pub struct RecomputeOutcome {
 /// edges for effect emission.
 ///
 /// On a merged or closed issue the sweep settles instead of deriving: every
-/// non-thread, non-cancelled job — node-backed or not — takes the status
-/// [`derive_terminal_issue_status_conn`] would give it, with no DAG claim guard
-/// (no launch on a resolved issue is real work), and each change carries
-/// [`ChangeCause::IssueResolved`] so it is published quietly.
+/// non-cancelled job other than a thread's session — node-backed or not —
+/// takes the status [`derive_terminal_issue_status_conn`] would give it, with no
+/// DAG claim guard (no launch on a resolved issue is real work), and each change
+/// carries [`ChangeCause::IssueResolved`] so it is published quietly.
 pub async fn recompute_execution_jobs_conn(
     conn: &cairn_db::turso::Connection,
     execution_id: &str,
     claimed_launch_job_ids: &HashSet<String>,
+) -> DbResult<RecomputeOutcome> {
+    sweep_execution_jobs_conn(conn, execution_id, claimed_launch_job_ids, &HashSet::new()).await
+}
+
+/// [`recompute_execution_jobs_conn`] with a set of jobs to settle rather than
+/// derive, as a resolved issue settles all of its jobs.
+///
+/// A job in `settle_job_ids` is stranded work a defective release left cached
+/// non-terminal. It takes the settled status — its recorded Complete or Failed
+/// outcome, otherwise Cancelled — and its change carries
+/// [`ChangeCause::Repaired`]. Settling rather than re-deriving is what keeps a
+/// stranded job whose last turn was interrupted from deriving Pending and being
+/// relaunched by the next advance of its execution. A thread's session job and
+/// a cancelled job are never settled. Every other job in the execution derives
+/// exactly as [`recompute_execution_jobs_conn`] derives it.
+pub async fn sweep_execution_jobs_conn(
+    conn: &cairn_db::turso::Connection,
+    execution_id: &str,
+    claimed_launch_job_ids: &HashSet<String>,
+    settle_job_ids: &HashSet<String>,
 ) -> DbResult<RecomputeOutcome> {
     let snapshot = load_execution_snapshot_conn(conn, execution_id).await?;
     let all_nodes_db = snapshot_nodes_to_db(&snapshot);
@@ -1254,12 +1304,13 @@ pub async fn recompute_execution_jobs_conn(
 
     let mut changes = Vec::new();
 
-    // A thread's execution is passive machinery, not a workflow that must
+    // A thread's host execution is passive machinery, not a workflow that must
     // complete. Thread session jobs are intentionally node-less in the modern
-    // empty-host recipe, so project every thread-owned job independently of the
+    // empty-host recipe, so project every session job independently of the
     // recipe's node order. This also covers historical hosts that did retain a
-    // recipe node id.
-    for j in jobs.iter().filter(|job| job.thread_id.is_some()) {
+    // recipe node id. The tasks a thread spawns live in the same execution but
+    // are ordinary delegated jobs: they derive through the DAG walk below.
+    for j in jobs.iter().filter(|job| job.thread_session) {
         if j.status.is_terminal() {
             continue;
         }
@@ -1296,9 +1347,10 @@ pub async fn recompute_execution_jobs_conn(
         for i in idxs {
             visited.insert(i);
             let j = &jobs[i];
-            // Thread hosts were projected above because modern hosts have no
-            // recipe node at all and ownership, not DAG position, defines them.
-            if j.thread_id.is_some() {
+            // Thread sessions were projected above because modern hosts have no
+            // recipe node at all and session identity, not DAG position,
+            // defines them.
+            if j.thread_session {
                 continue;
             }
             // Cancelled jobs are archived (node removed or restarted, or the
@@ -1341,10 +1393,14 @@ pub async fn recompute_execution_jobs_conn(
                 .cloned()
                 .unwrap_or_else(|| j.status.clone());
 
-            let (derived, cause) = if issue_terminal {
+            let (derived, cause) = if issue_terminal || settle_job_ids.contains(&j.id) {
                 (
                     settle_for_terminal_issue(derive_job_status(&gathered.at_terminal_issue())),
-                    ChangeCause::IssueResolved,
+                    if issue_terminal {
+                        ChangeCause::IssueResolved
+                    } else {
+                        ChangeCause::Repaired
+                    },
                 )
             } else {
                 let derived = derive_job_status(&gathered.facts);
@@ -1398,13 +1454,19 @@ pub async fn recompute_execution_jobs_conn(
 
     // The DAG walk above reaches only jobs whose node is in the snapshot. On a
     // resolved issue every other job settles too — node-less delegated children,
-    // and nodes no longer in the snapshot — from its turn outcome alone.
-    if issue_terminal {
+    // and nodes no longer in the snapshot — from its turn outcome alone, and so
+    // does any such job a repair asked to settle.
+    if issue_terminal || !settle_job_ids.is_empty() {
         for (i, j) in jobs.iter().enumerate() {
-            if visited.contains(&i) || j.thread_id.is_some() {
+            if visited.contains(&i) || j.thread_session {
                 continue;
             }
-            if j.status == JobStatus::Cancelled && !is_resolution_cancel_conn(conn, &j.id).await? {
+            if !issue_terminal && !settle_job_ids.contains(&j.id) {
+                continue;
+            }
+            if j.status == JobStatus::Cancelled
+                && !(issue_terminal && is_resolution_cancel_conn(conn, &j.id).await?)
+            {
                 continue;
             }
             let current = status
@@ -1420,7 +1482,11 @@ pub async fn recompute_execution_jobs_conn(
                     j,
                     current,
                     derived,
-                    ChangeCause::IssueResolved,
+                    if issue_terminal {
+                        ChangeCause::IssueResolved
+                    } else {
+                        ChangeCause::Repaired
+                    },
                     None,
                 ));
             }
@@ -1838,6 +1904,29 @@ pub fn recompute_execution_jobs(
     runtime: &WorkflowRuntime,
     execution_id: &str,
 ) -> Result<(), String> {
+    sweep_execution_jobs(runtime, execution_id, HashSet::new()).map(|_| ())
+}
+
+/// Boot repair for stranded work: sweep `execution_id` once, settling the jobs
+/// in `settle_job_ids` (see [`sweep_execution_jobs_conn`]) while every other job
+/// derives as usual, and return the status changes so the caller can wake any
+/// parent still parked on the settled jobs. Settled changes carry
+/// [`ChangeCause::Repaired`] and are published as db-changes only.
+pub fn settle_stranded_jobs(
+    runtime: &WorkflowRuntime,
+    execution_id: &str,
+    settle_job_ids: &HashSet<String>,
+) -> Result<Vec<JobStatusChange>, String> {
+    sweep_execution_jobs(runtime, execution_id, settle_job_ids.clone())
+}
+
+/// The one effect path for an execution sweep: write the projection in a
+/// transaction, publish it, and advance the DAG on an announced completion.
+fn sweep_execution_jobs(
+    runtime: &WorkflowRuntime,
+    execution_id: &str,
+    settle_job_ids: HashSet<String>,
+) -> Result<Vec<JobStatusChange>, String> {
     let execution_id_owned = execution_id.to_string();
     let claimed_launch_job_ids = runtime.host.claimed_launch_job_ids();
     let db = runtime.database(WorkflowOwner::Execution(&execution_id_owned))?;
@@ -1845,8 +1934,15 @@ pub fn recompute_execution_jobs(
         db.write(|conn| {
             let execution_id = execution_id_owned.clone();
             let claimed_launch_job_ids = claimed_launch_job_ids.clone();
+            let settle_job_ids = settle_job_ids.clone();
             Box::pin(async move {
-                recompute_execution_jobs_conn(conn, &execution_id, &claimed_launch_job_ids).await
+                sweep_execution_jobs_conn(
+                    conn,
+                    &execution_id,
+                    &claimed_launch_job_ids,
+                    &settle_job_ids,
+                )
+                .await
             })
         })
         .await
@@ -1854,7 +1950,7 @@ pub fn recompute_execution_jobs(
     })?;
 
     if outcome.changes.is_empty() && outcome.newly_terminal_issue_ids.is_empty() {
-        return Ok(());
+        return Ok(outcome.changes);
     }
 
     runtime.host.projection_changed(execution_id, &outcome);
@@ -1877,7 +1973,7 @@ pub fn recompute_execution_jobs(
         }
     }
 
-    Ok(())
+    Ok(outcome.changes)
 }
 
 #[cfg(any(test, feature = "test-utils"))]

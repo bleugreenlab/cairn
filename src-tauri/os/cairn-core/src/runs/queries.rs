@@ -73,18 +73,9 @@ pub fn reconcile_stale_runs(
         // candidates cluster by execution (a resolved issue contributes every
         // job it left unsettled), so sweep each execution once.
         let mut swept = std::collections::HashSet::new();
+        settle_stranded_thread_tasks(orch, result.stranded_thread_task_ids, &mut swept);
         for job_id in result.reproject_job_ids {
-            let execution_id = crate::storage::run_db_blocking({
-                let db = orch.db.local.clone();
-                let job_id = job_id.clone();
-                move || async move {
-                    db.query_opt_text("SELECT execution_id FROM jobs WHERE id = ?1", (job_id,))
-                        .await
-                        .map_err(|error| error.to_string())
-                }
-            })
-            .ok()
-            .flatten();
+            let execution_id = execution_id_of(orch, &job_id);
             let outcome = match execution_id {
                 Some(execution_id) if !swept.insert(execution_id.clone()) => continue,
                 Some(execution_id) => {
@@ -94,6 +85,74 @@ pub fn reconcile_stale_runs(
             };
             if let Err(error) = outcome {
                 log::warn!("Failed to re-derive job status for {job_id}: {error}");
+            }
+        }
+    }
+}
+
+fn execution_id_of(orch: &crate::orchestrator::Orchestrator, job_id: &str) -> Option<String> {
+    crate::storage::run_db_blocking({
+        let db = orch.db.local.clone();
+        let job_id = job_id.to_string();
+        move || async move {
+            db.query_opt_text("SELECT execution_id FROM jobs WHERE id = ?1", (job_id,))
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// Settle the thread tasks a liveness-only release stranded `idle`, then deliver
+/// each one to a parent that is still parked waiting for it.
+///
+/// Each execution is swept once, settling all of its stranded tasks together, so
+/// a blocking batch has every sibling terminal before the first delivery runs and
+/// its parent wakes exactly once. The settlement is quiet (see
+/// `ChangeCause::Repaired`); the only thing a parent can receive is the repair
+/// resume, which wakes nothing whose head has moved on and pushes nothing for a
+/// background task. Executions swept here are recorded in `swept` so the
+/// reprojection that follows does not sweep them a second time.
+fn settle_stranded_thread_tasks(
+    orch: &crate::orchestrator::Orchestrator,
+    stranded: Vec<String>,
+    swept: &mut std::collections::HashSet<String>,
+) {
+    let mut by_execution: std::collections::BTreeMap<String, std::collections::HashSet<String>> =
+        std::collections::BTreeMap::new();
+    for job_id in stranded {
+        if let Some(execution_id) = execution_id_of(orch, &job_id) {
+            by_execution.entry(execution_id).or_default().insert(job_id);
+        }
+    }
+    for (execution_id, settle) in by_execution {
+        swept.insert(execution_id.clone());
+        let changes =
+            match crate::execution::advancement::settle_stranded_jobs(orch, &execution_id, &settle)
+            {
+                Ok(changes) => changes,
+                Err(error) => {
+                    log::warn!("Failed to settle stranded thread tasks in {execution_id}: {error}");
+                    continue;
+                }
+            };
+        let settled: Vec<&str> = changes
+            .iter()
+            .filter(|change| settle.contains(&change.job_id) && change.to.is_terminal())
+            .map(|change| change.job_id.as_str())
+            .collect();
+        if !settled.is_empty() {
+            log::info!(
+                "Settled {} stranded thread task(s) in execution {execution_id}",
+                settled.len()
+            );
+        }
+        for job_id in settled {
+            if let Err(error) =
+                crate::execution::delegation::resume_parked_parent_after_repair(orch, job_id)
+            {
+                log::warn!("Repair delivery for stranded thread task {job_id} failed: {error}");
             }
         }
     }

@@ -2335,3 +2335,248 @@ async fn reconcile_stale_runs_leaves_a_durably_queued_launch_for_recovery() {
         "the queued launch stays for startup recovery to relaunch"
     );
 }
+
+/// The operator-visible half of the cairn/5058 boot repair, end to end. A thread
+/// session parked on a blocking batch of three tasks that a liveness-only release
+/// stranded `idle`, holding an operator message that arrived while it was parked
+/// (a self-suspended head holds pushes until its wait resolves). One boot settles
+/// the batch, claims the unblock once, and resumes the session on its live
+/// process: each Task result arrives with its delayed-delivery notice, and the
+/// held message is delivered with the unblock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconcile_stale_runs_delivers_a_repaired_batch_and_the_held_message_once() {
+    let (_temp, orch) = common::test_orchestrator().await;
+    let db = &orch.db.local;
+    let project_id = common::create_project(db, "held").await;
+    let tasks = [
+        ("j-quic", "pkt-quic", 1_757_000_000_i64),
+        ("j-tar", "pkt-tar", 1_757_000_600),
+        ("j-jwt", "pkt-jwt", 1_757_001_200),
+    ];
+
+    let mut nodes = Vec::new();
+    let mut packets = Vec::new();
+    for (index, (job, packet_id, _)) in tasks.iter().enumerate() {
+        let agent = format!("delegated-{packet_id}-agent");
+        let packet = serde_json::json!({
+            "id": packet_id, "parentJobId": "job-1", "parentTurnId": "anchor",
+            "parentToolUseId": "tool-1", "origin": "task_tool", "title": packet_id,
+            "problemStatement": "x", "agentConfigId": "Explore", "ownership": {"cwd": "/tmp"},
+            "outputContract": {"schemaType": "return"}, "status": "materialized",
+            "materializedNodeIds": [agent], "resultArtifactJobId": job,
+            "taskIndex": index, "createdAt": 0
+        });
+        let node = cairn_workflow::effects::dag::delegation::delegated_agent_node_for_test(
+            agent,
+            &serde_json::from_value(packet.clone()).unwrap(),
+        );
+        nodes.push(serde_json::to_value(node).unwrap());
+        packets.push(packet);
+    }
+    let snapshot = serde_json::json!({
+        "recipe": {"id": "host-thread", "name": "Session Host", "description": null,
+                   "trigger": "manual", "nodes": nodes, "edges": []},
+        "agents": {}, "skills": {},
+        "triggerContext": {"issueId": null, "projectId": project_id, "triggerType": "manual"},
+        "delegatedPackets": packets, "createdAt": 1
+    })
+    .to_string();
+
+    db.execute(
+        "INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+         VALUES ('thread-sec', ?1, 'security', 'active', 'none', 1, 1)",
+        params![project_id.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO executions (id, recipe_id, project_id, status, started_at, snapshot, triggered_by)
+         VALUES ('execution-sec', 'host-thread', ?1, 'running', 1, ?2, 'manual')",
+        params![project_id.as_str(), snapshot],
+    )
+    .await
+    .unwrap();
+    // The session job. `register_recording_process` serves `job-1`.
+    db.execute(
+        "INSERT INTO jobs (id, execution_id, thread_id, project_id, status, node_name, uri_segment,
+                           created_at, updated_at)
+         VALUES ('job-1', 'execution-sec', 'thread-sec', ?1, 'running', 'thread', 'thread', 1, 1)",
+        params![project_id.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO sessions (id, job_id, status, backend_id, created_at, updated_at)
+         VALUES ('session-1', 'job-1', 'open', 'handle-1', 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    // Postdates STALE_BOOT_AT: the parked session's warm process survives boot.
+    db.execute(
+        "INSERT INTO runs (id, project_id, job_id, status, session_id, created_at, updated_at, start_mode)
+         VALUES ('run-1', ?1, 'job-1', 'live', 'session-1', 2000000, 2000000, 'resume')",
+        params![project_id.as_str()],
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO turns (id, session_id, run_id, job_id, sequence, state, yield_reason, start_reason,
+                            created_at, ended_at, updated_at)
+         VALUES ('anchor', 'session-1', 'run-1', 'job-1', 1, 'yielded', 'dependency_wait', 'initial',
+                 1, 1, 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "UPDATE jobs SET current_session_id = 'session-1', current_turn_id = 'anchor' WHERE id = 'job-1'",
+        (),
+    )
+    .await
+    .unwrap();
+    for (job, packet_id, finished_at) in tasks {
+        db.execute(
+            "INSERT INTO jobs (id, execution_id, recipe_node_id, parent_job_id, thread_id, project_id,
+                               status, node_name, uri_segment, parent_tool_use_id, agent_config_id,
+                               created_at, updated_at)
+             VALUES (?1, 'execution-sec', ?2, 'job-1', 'thread-sec', ?3, 'idle', ?4, ?4, 'tool-1',
+                     'Explore', 1, 1)",
+            params![
+                job,
+                format!("delegated-{packet_id}-agent"),
+                project_id.as_str(),
+                packet_id
+            ],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, end_reason,
+                                created_at, ended_at, updated_at)
+             VALUES ('turn-' || ?1, 's-' || ?1, ?1, 1, 'complete', 'initial', 'artifact_handoff',
+                     ?2, ?2, ?2)",
+            params![job, finished_at],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO artifacts (id, job_id, artifact_type, confirmed, data, version, output_name,
+                                    created_at, updated_at)
+             VALUES ('artifact-' || ?1, ?1, 'return', 0, ?2, 1, 'return', 1, 1)",
+            params![job, format!("{{\"summary\":\"{packet_id} finding\"}}")],
+        )
+        .await
+        .unwrap();
+    }
+    // The operator message held while the session was parked on its batch.
+    db.execute(
+        "INSERT INTO messages (id, channel_type, sender_name, recipient_run_id, content, created_at, urgency)
+         VALUES ('msg-held', 'direct', 'cairn://p/held/llm', 'run-1', 'Held operator note for security',
+                 1, 'steer')",
+        (),
+    )
+    .await
+    .unwrap();
+    db.execute(
+        "INSERT INTO attention_pushes (id, recipient, content_ref, wake, boundary, key, created_at)
+         VALUES ('push-held', 'job-1', 'cairn://p/held/security', 'wake', 'event', 'direct:msg-held', 1)",
+        (),
+    )
+    .await
+    .unwrap();
+    let delivered = common::register_recording_process(&orch, "run-1", "session-1");
+
+    let boot = orch.clone();
+    std::thread::spawn(move || queries::reconcile_stale_runs(&boot, &NoopEmitter, STALE_BOOT_AT))
+        .join()
+        .unwrap();
+
+    for (job, _, _) in tasks {
+        assert_eq!(
+            common::scalar_text_by_id(db, "SELECT status FROM jobs WHERE id = ?1", job)
+                .await
+                .as_deref(),
+            Some("complete"),
+            "{job}"
+        );
+    }
+    assert_eq!(anchor_unblock_count(db).await, 1);
+
+    let tool_results: Vec<String> = {
+        let mut rows = db
+            .read(|conn| {
+                Box::pin(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT data FROM events WHERE run_id = 'run-1' AND event_type = 'tool_result'",
+                            (),
+                        )
+                        .await?;
+                    let mut out = Vec::new();
+                    while let Some(row) = rows.next().await? {
+                        out.push(row.get::<String>(0)?);
+                    }
+                    Ok::<_, cairn_core::internal::storage::DbError>(out)
+                })
+            })
+            .await
+            .unwrap();
+        rows.sort();
+        rows
+    };
+    let delivered_result = tool_results.join("\n");
+    assert_eq!(
+        delivered_result.matches("Delayed delivery:").count(),
+        3,
+        "each task's result leads with its notice: {delivered_result}"
+    );
+    for when in [
+        "2025-09-04 15:33 UTC",
+        "2025-09-04 15:43 UTC",
+        "2025-09-04 15:53 UTC",
+    ] {
+        assert!(
+            delivered_result.contains(when),
+            "missing {when}: {delivered_result}"
+        );
+    }
+    assert!(delivered_result.contains("pkt-quic finding"));
+
+    assert!(
+        db.query_opt_text(
+            "SELECT delivered_event_id FROM attention_pushes WHERE id = 'push-held'",
+            ()
+        )
+        .await
+        .unwrap()
+        .is_some(),
+        "the held operator message is delivered with the unblock"
+    );
+    let stdin = String::from_utf8_lossy(&delivered.lock().unwrap()).to_string();
+    assert!(
+        stdin.contains("Held operator note for security"),
+        "the resumed session receives the held message: {stdin}"
+    );
+
+    let again = orch.clone();
+    std::thread::spawn(move || queries::reconcile_stale_runs(&again, &NoopEmitter, STALE_BOOT_AT))
+        .join()
+        .unwrap();
+    assert_eq!(
+        anchor_unblock_count(db).await,
+        1,
+        "a second boot delivers nothing again"
+    );
+}
+
+async fn anchor_unblock_count(db: &LocalDb) -> i64 {
+    db.query_one(
+        "SELECT COUNT(*) FROM turns WHERE predecessor_id = 'anchor'
+         AND start_reason = 'dependency_unblock'",
+        (),
+        |row| Ok(row.get::<i64>(0)?),
+    )
+    .await
+    .unwrap()
+}
