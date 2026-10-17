@@ -1512,13 +1512,16 @@ pub async fn settle_stale_run(
     if updated == 0 {
         return Ok(None);
     }
-    cairn_db::storage::withdraw_queued_ordinary_admission(
+    if let Some(withdrawn) = cairn_db::storage::withdraw_queued_ordinary_admission(
         conn,
         run_id,
         &format!("run settled as stale ({exit_reason})"),
         now,
     )
-    .await?;
+    .await?
+    {
+        cairn_attention::push::return_withdrawn_delivery_conn(conn, &withdrawn).await;
+    }
 
     let mut turn_rows = conn
         .query(

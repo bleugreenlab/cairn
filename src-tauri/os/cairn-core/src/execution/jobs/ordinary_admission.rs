@@ -1,5 +1,6 @@
 use super::{run_db, start_ordinary_session, PreparedJob};
 use crate::models::{AgentConfig, Model, OutputSchemaInfo};
+use crate::orchestrator::attention_push::TurnDelivery;
 use crate::orchestrator::Orchestrator;
 use crate::runtime_admission::RuntimeAdmissionClient;
 use crate::storage::RowExt;
@@ -132,6 +133,12 @@ fn resume_warm_race(
     })?
     .ok_or_else(|| "prepared ordinary warm continuation is no longer durable".to_string())?;
     if run_status != "starting" || turn_state != "pending" {
+        return_undelivered_attention(
+            orch,
+            &snapshot.run_id,
+            &snapshot.turn_id,
+            TurnDelivery::Unknown,
+        );
         finish(
             orch,
             lease,
@@ -153,7 +160,10 @@ fn resume_warm_race(
         "cancelled",
         Some("warm process won queued cold launch race"),
     )?;
-    super::lifecycle::deliver_prepared_warm_continuation(
+    // Delivery binds the turn to the already-live warm run before it sends, so
+    // that run's `started_at` proves nothing about this prompt. A failed handoff
+    // is known here and nowhere else, so the wake is returned here.
+    if let Err(error) = super::lifecycle::deliver_prepared_warm_continuation(
         orch,
         &owning,
         warm_run_id,
@@ -161,7 +171,15 @@ fn resume_warm_race(
         &snapshot.turn_id,
         &project_id,
         prompt,
-    )?;
+    ) {
+        return_undelivered_attention(
+            orch,
+            &snapshot.run_id,
+            &snapshot.turn_id,
+            TurnDelivery::NeverSent,
+        );
+        return Err(error);
+    }
     let db = owning;
     let cold_run_id = snapshot.run_id.clone();
     run_db(async move {
@@ -850,6 +868,7 @@ fn start_leased(
     let turn_id = snapshot.turn_id.clone();
     let result = start_leased_inner(orch, &lease, snapshot);
     if let Err(error) = &result {
+        return_undelivered_attention(orch, &run_id, &turn_id, TurnDelivery::Unknown);
         // Enqueue already returned success to the launch source, so nothing
         // upstream will see this error. Terminalize the run and job exactly as a
         // direct start failure would, or the job stays `running` forever.
@@ -937,6 +956,12 @@ fn start_leased_inner(
         .find_process_by_session(&snapshot.session_id)
         .is_some()
     {
+        return_undelivered_attention(
+            orch,
+            &snapshot.run_id,
+            &snapshot.turn_id,
+            TurnDelivery::Unknown,
+        );
         finish(
             orch,
             lease,
@@ -953,6 +978,12 @@ fn start_leased_inner(
         .claimed_launch_run(&snapshot.job_id)
         .is_some_and(|claimed| claimed != snapshot.run_id)
     {
+        return_undelivered_attention(
+            orch,
+            &snapshot.run_id,
+            &snapshot.turn_id,
+            TurnDelivery::Unknown,
+        );
         finish(
             orch,
             lease,
@@ -985,6 +1016,12 @@ fn start_leased_inner(
         }
     })?;
     let Some((run_status, turn_state, project_id)) = launch_state else {
+        return_undelivered_attention(
+            orch,
+            &snapshot.run_id,
+            &snapshot.turn_id,
+            TurnDelivery::Unknown,
+        );
         finish(
             orch,
             lease,
@@ -994,6 +1031,12 @@ fn start_leased_inner(
         return Ok(false);
     };
     if run_status != "starting" || turn_state != "pending" {
+        return_undelivered_attention(
+            orch,
+            &snapshot.run_id,
+            &snapshot.turn_id,
+            TurnDelivery::Unknown,
+        );
         finish(
             orch,
             lease,
@@ -1137,6 +1180,58 @@ fn start_leased_inner(
             Ok(true)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Return the attention delivery a queued launch's turn carried, because the
+/// launch is ending without a process.
+///
+/// A queued launch's briefing stays stamped while it waits, so a concurrent
+/// resume cannot drain the same pushes twice. Admission owns it from then on,
+/// and every exit that ends the launch short of a process returns it here.
+///
+/// This never fails its caller. A revert that errors costs one wake, but if the
+/// error also skipped the caller's own bookkeeping (failing the job, closing the
+/// lease), the job would read as running with no process behind it.
+pub(super) fn return_undelivered_attention(
+    orch: &Orchestrator,
+    run_id: &str,
+    turn_id: &str,
+    delivery: TurnDelivery,
+) {
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
+    let turn_id = turn_id.to_string();
+    let _ = run_db(async move {
+        return_undelivered_attention_in(&dbs, &run_id, &turn_id, delivery).await;
+        Ok::<(), String>(())
+    });
+}
+
+/// [`return_undelivered_attention`] for a caller already inside async code.
+pub(super) async fn return_undelivered_attention_in(
+    dbs: &crate::db::DbState,
+    run_id: &str,
+    turn_id: &str,
+    delivery: TurnDelivery,
+) {
+    let reverted = async {
+        let db = crate::execution::routing::owning_db_for_run(dbs, run_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        crate::orchestrator::attention_push::revert_turn_deliveries(&db, turn_id, delivery)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    .await;
+    match reverted {
+        Ok(0) => {}
+        Ok(restored) => log::info!(
+            "ordinary launch of run {run_id} ended without a process; returned {restored} push(es) from turn {turn_id} to the pending queue"
+        ),
+        Err(error) => log::warn!(
+            "ordinary launch of run {run_id} ended without a process, and returning turn {turn_id}'s attention delivery failed ({error}); that wake will not be redelivered"
+        ),
     }
 }
 
@@ -2003,6 +2098,262 @@ mod tests {
             !crate::messages::delivery::head_turn_active_sync(&orch.db.local, "j"),
             "a stopped queued launch must not leave the job reading as mid-turn"
         );
+    }
+
+    /// Deliver one push to `recipient` through a briefing on `turn`, the way a
+    /// cold continuation does before it hands its launch to admission.
+    async fn brief(orch: &Orchestrator, run: &str, turn: &str, recipient: &str) -> String {
+        use crate::orchestrator::attention_push as attention;
+        orch.db.local.execute_script(&format!(
+            "INSERT INTO events(id,run_id,turn_id,sequence,event_type,data,timestamp,created_at) VALUES('brief-{turn}','{run}','{turn}',2,'attention:briefing','{{}}',1,1);"
+        )).await.unwrap();
+        let (id, _) = attention::push(
+            &orch.db.local,
+            recipient,
+            "cairn://p/P/1",
+            attention::Wake::Wake,
+            attention::Boundary::Event,
+            &format!("direct:{turn}"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            attention::stamp_delivered(
+                &orch.db.local,
+                std::slice::from_ref(&id),
+                &format!("brief-{turn}")
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        id
+    }
+
+    /// Whether the push is pending again and its briefing gone: the state a
+    /// delivery that never happened must leave.
+    async fn delivery_returned(orch: &Orchestrator, recipient: &str, turn: &str) -> bool {
+        let pending = crate::orchestrator::attention_push::list_pending(&orch.db.local, recipient)
+            .await
+            .unwrap()
+            .len();
+        let briefings = text(
+            orch,
+            &format!("SELECT CAST(COUNT(*) AS TEXT) FROM events WHERE id='brief-{turn}'"),
+        )
+        .await;
+        match (pending, briefings.as_str()) {
+            (1, "0") => true,
+            (0, "1") => false,
+            other => panic!("a delivery is undone whole or not at all, got {other:?}"),
+        }
+    }
+
+    /// A leased launch the promoter cancels never reached a process, so the
+    /// wake its turn carried goes back to the queue rather than being spent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_launch_returns_its_turns_attention_delivery() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-cancel-returns-wake.db").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET state='released' WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        queue_launch(&orch, &snapshot, 2, "crashed").await;
+        brief(&orch, "r2", "t2", "j2").await;
+        assert!(!delivery_returned(&orch, "j2", "t2").await);
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+
+        assert_eq!(
+            request_state(&orch, "req2").await,
+            (
+                "cancelled".to_string(),
+                Some("run or turn is no longer launchable".to_string())
+            ),
+            "the launch was attempted and cancelled at promotion"
+        );
+        assert!(delivery_returned(&orch, "j2", "t2").await);
+    }
+
+    /// The same cancellation after the launch's run already went live (a lease
+    /// requeued after its process ran) keeps the delivery: a process received
+    /// that prompt, so returning the push would deliver it twice.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_launch_keeps_a_delivery_its_run_already_carried() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-cancel-keeps-delivery.db").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET state='released' WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        queue_launch(&orch, &snapshot, 2, "crashed").await;
+        orch.db
+            .local
+            .execute("UPDATE runs SET started_at=1 WHERE id='r2'", ())
+            .await
+            .unwrap();
+        brief(&orch, "r2", "t2", "j2").await;
+
+        super::promote_private_lane_blocking(&orch, "lane").unwrap();
+
+        assert_eq!(request_state(&orch, "req2").await.0, "cancelled");
+        assert!(!delivery_returned(&orch, "j2", "t2").await);
+    }
+
+    /// Boot recovery withdraws a queued row whose run settled while the runner
+    /// was down, and returns the wake with it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn recovery_withdrawal_returns_the_launchs_attention_delivery() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-recover-returns-wake.db").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET state='released' WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        queue_launch(&orch, &snapshot, 2, "crashed").await;
+        brief(&orch, "r2", "t2", "j2").await;
+
+        super::recover_on_startup(&orch).await;
+
+        assert_eq!(
+            request_state(&orch, "req2").await,
+            (
+                "cancelled".to_string(),
+                Some("run settled before admission".to_string())
+            )
+        );
+        assert!(delivery_returned(&orch, "j2", "t2").await);
+    }
+
+    /// The orphan sweep cancels a queued private row and returns its wake in one
+    /// write, so an interruption cannot leave a cancelled row (which no sweep
+    /// revisits) beside a stamped wake. With the cancellation forced to fail,
+    /// nothing moves; the next sweep then does both.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_interrupted_orphan_withdrawal_leaves_row_and_wake_together() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-orphan-atomic.db").await;
+        orch.db
+            .local
+            .execute(
+                "UPDATE runtime_admission_requests SET state='released' WHERE request_id='req'",
+                (),
+            )
+            .await
+            .unwrap();
+        queue_launch(&orch, &snapshot, 2, "crashed").await;
+        brief(&orch, "r2", "t2", "j2").await;
+        exclusive_ddl(
+            &orch,
+            "CREATE TRIGGER interrupt_withdrawal BEFORE UPDATE OF state ON runtime_admission_requests
+             WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'interrupted withdrawal'); END;",
+        )
+        .await;
+        let sweep = |orch: Orchestrator| {
+            tokio::task::spawn_blocking(move || {
+                crate::execution::jobs::withdraw_orphaned_ordinary_admissions(&orch)
+            })
+        };
+
+        assert_eq!(sweep(orch.clone()).await.unwrap(), 0);
+        assert_eq!(request_state(&orch, "req2").await.0, "queued");
+        assert!(
+            !delivery_returned(&orch, "j2", "t2").await,
+            "the failed write took the revert with it"
+        );
+
+        exclusive_ddl(&orch, "DROP TRIGGER interrupt_withdrawal").await;
+        assert_eq!(sweep(orch.clone()).await.unwrap(), 1);
+        assert_eq!(request_state(&orch, "req2").await.0, "cancelled");
+        assert!(delivery_returned(&orch, "j2", "t2").await);
+    }
+
+    /// A warm process that won the launch race is handed the queued prompt.
+    /// Delivery binds the turn to that already-live run before it sends, so if
+    /// the send fails the run's `started_at` proves nothing: the wake must still
+    /// come back. The successful send is the witness that the same setup
+    /// otherwise delivers and keeps the stamp.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_warm_race_handoff_returns_the_wake_and_a_sent_one_keeps_it() {
+        for sends in [false, true] {
+            let (orch, request, snapshot) =
+                lifecycle_fixture(&format!("ordinary-warm-race-wake-{sends}.db")).await;
+            orch.db.local.execute("INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,started_at,created_at,updated_at) VALUES('warm','p','i','j','s','live',1,1,1)", ()).await.unwrap();
+            brief(&orch, "cold", "t", "j").await;
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let stdin = Arc::new(Mutex::new(sends.then(|| {
+                cairn_models::session::claude::ClaudeControl::boxed(Box::new(CapturingWriter(
+                    bytes.clone(),
+                )))
+            })));
+            let handle = crate::agent_process::process::RunHandle::new(
+                Arc::new(Mutex::new(None)),
+                stdin,
+                Some("s".into()),
+                Some("j".into()),
+            );
+            orch.process_state
+                .register_process("warm".into(), handle)
+                .unwrap();
+            orch.process_state.transition_to_warm("warm");
+            let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            crate::orchestrator::session::install_test_session_backend(Box::new(CountingBackend(
+                starts.clone(),
+            )));
+
+            let result =
+                super::start_leased(&orch, super::OrdinaryLease::Private(request), snapshot);
+
+            assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(
+                text(&orch, "SELECT run_id FROM turns WHERE id='t'").await,
+                "warm",
+                "the turn was bound to the live warm run before the send"
+            );
+            if sends {
+                assert!(result.is_ok(), "{result:?}");
+                assert!(String::from_utf8(bytes.lock().unwrap().clone())
+                    .unwrap()
+                    .contains("queued hello"));
+                assert!(!delivery_returned(&orch, "j", "t").await);
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a warm process with no stdin cannot take the prompt"
+                );
+                assert!(delivery_returned(&orch, "j", "t").await);
+            }
+        }
+    }
+
+    /// Stopping a job whose launch is still queued settles the run and withdraws
+    /// the row in one write, and that same write returns the wake, so the next
+    /// resume redelivers it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_a_queued_launch_returns_its_attention_delivery() {
+        let (orch, _, snapshot) = lifecycle_fixture("ordinary-stop-returns-wake.db").await;
+        orch.db.local.execute(
+            "UPDATE runtime_admission_requests SET state='queued', lease_owner=NULL, lease_expires_at=NULL WHERE request_id='req'",
+            (),
+        ).await.unwrap();
+        crate::storage::persist_prepared_ordinary_launch(&orch.db.local, snapshot)
+            .await
+            .unwrap();
+        brief(&orch, "cold", "t", "j").await;
+
+        crate::orchestrator::lifecycle::stop_job(&orch, "j").unwrap();
+
+        assert_eq!(request_state(&orch, "req").await.0, "cancelled");
+        assert!(delivery_returned(&orch, "j", "t").await);
     }
 
     #[tokio::test(flavor = "current_thread")]

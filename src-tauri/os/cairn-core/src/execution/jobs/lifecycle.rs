@@ -1701,6 +1701,7 @@ pub(crate) fn continue_job_launch_locked_for_operator_compact<'a>(
         },
         Some(launch_guard),
     )
+    .map(|launch| launch.run)
 }
 
 pub fn resume_job_from_digest(
@@ -2168,6 +2169,7 @@ fn continue_job_impl_with_intent(
         },
         Some(_launch_guard),
     )
+    .map(|launch| launch.run)
 }
 
 /// The launch already in flight for this job, if there is one. Called only under
@@ -2258,7 +2260,11 @@ pub(crate) fn continue_job_launch_locked_for_watchdog<'a>(
     prompt_resume: Option<ResumeContext>,
     launch_guard: std::sync::MutexGuard<'a, ()>,
 ) -> Result<WatchdogContinuation, String> {
-    let run = continue_job_launch_locked(
+    let ContinuationLaunch {
+        run,
+        turn_id,
+        started,
+    } = continue_job_launch_locked(
         orch,
         job_id,
         None,
@@ -2271,24 +2277,6 @@ pub(crate) fn continue_job_launch_locked_for_watchdog<'a>(
         },
         Some(launch_guard),
     )?;
-    let turn_id = run_db({
-        let dbs = orch.db.clone();
-        let run_id = run.id.clone();
-        async move {
-            let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
-                .await
-                .map_err(|error| error.to_string())?;
-            db.query_opt_text(
-                "SELECT turn_id FROM events WHERE run_id=?1 AND turn_id IS NOT NULL ORDER BY created_at DESC,id DESC LIMIT 1",
-                (run_id,),
-            )
-            .await
-            .map_err(|error| error.to_string())
-        }
-    })?
-    .ok_or_else(|| format!("watchdog successor run {} has no current turn", run.id))?;
-    let started = orch.process_state.has_process(&run.id) == Some(true)
-        && orch.process_state.get_current_turn_id(&run.id).as_deref() == Some(turn_id.as_str());
     Ok(if started {
         WatchdogContinuation::Started { run, turn_id }
     } else {
@@ -2300,6 +2288,18 @@ pub(crate) fn continue_job_launch_locked_for_watchdog<'a>(
 pub(crate) enum WatchdogContinuation {
     Started { run: Run, turn_id: String },
     Queued { run: Run, turn_id: String },
+}
+
+/// What a continuation launched: the run, the turn it opened, and whether a
+/// process already holds that turn's prompt. The launch is the only thing that
+/// knows which branch it took, so it says so rather than leaving a caller to
+/// reconstruct the turn from the events it happened to write. A passive wake
+/// writes none.
+struct ContinuationLaunch {
+    run: Run,
+    turn_id: String,
+    /// `false` while durable admission still holds the launch queued.
+    started: bool,
 }
 
 /// One resume's timing identity: the id every `ResumeTimingEvent` on this path
@@ -2322,7 +2322,7 @@ fn continue_job_launch_locked(
     continuation_intent: ContinuationIntent,
     trace: ResumeTrace<'_>,
     mut launch_guard: Option<std::sync::MutexGuard<'_, ()>>,
-) -> Result<Run, String> {
+) -> Result<ContinuationLaunch, String> {
     let ResumeTrace {
         id: resume_id,
         started: resume_started,
@@ -3470,7 +3470,7 @@ fn continue_job_launch_locked(
     }
 
     // ---- Warm process or new session ------------------------------------
-    if is_process_reuse {
+    let started = if is_process_reuse {
         // Establish the turn FULLY before waking the agent (CAIRN-2123). A warm
         // agent commonly fires a tool call the instant it resumes; if the wake
         // (`send_user_message`) preceded turn establishment, that call could
@@ -3596,6 +3596,7 @@ fn continue_job_launch_locked(
         stdin_event.emit();
         // The warm agent now holds the prompt these pushes rode in on.
         stamped_pushes.delivered();
+        true
     } else {
         let launch_event_id = run_db({
             let db = owning_db.clone();
@@ -3614,7 +3615,7 @@ fn continue_job_launch_locked(
         // Durable admission is now the launch owner. It may remain queued, and
         // promotion reacquires this same lock before its final state recheck.
         drop(launch_guard.take());
-        super::start_prepared_job_session(
+        let started = super::start_prepared_job_session(
             orch,
             PreparedJob {
                 job_id: job_id.to_string(),
@@ -3634,12 +3635,17 @@ fn continue_job_launch_locked(
             },
             identity_override,
         )?;
-        // Durable admission now owns the exact prompt and turn. Returning while
-        // queued must not roll either back; promotion establishes the turn once
-        // the process exists.
+        // Durable admission now owns the exact prompt and turn, including the
+        // attention delivery stamped for it. Returning while queued must not
+        // roll any of them back: the stamp keeps a concurrent resume from
+        // draining the same pushes twice, and promotion establishes the turn
+        // once the process exists. This guard hands its delivery to admission,
+        // which returns it at every exit that ends the launch without a process
+        // (`ordinary_admission::return_undelivered_attention`).
         stamped_pushes.delivered();
         pending_launch_turn.adopted();
-    }
+        started
+    };
 
     // ---- Return run -----------------------------------------------------
     let run = run_db(load_run(
@@ -3647,7 +3653,11 @@ fn continue_job_launch_locked(
         run_id.clone(),
         "Run not found after creation",
     ))?;
-    Ok(run)
+    Ok(ContinuationLaunch {
+        run,
+        turn_id,
+        started,
+    })
 }
 
 /// An attention delivery written by a launch that has not yet reached a process,
@@ -3664,6 +3674,11 @@ fn continue_job_launch_locked(
 /// A guard rather than an error branch because the window is long and every step
 /// in it can fail; `Drop` covers each one without asking a future edit to
 /// remember.
+///
+/// A cold launch disarms it once durable admission holds the launch, because the
+/// window outlives this call there. From then on admission owns the delivery and
+/// returns it by turn at every exit that ends the launch without a process
+/// (`ordinary_admission::return_undelivered_attention`).
 struct UndeliveredPushes {
     db: Arc<LocalDb>,
     carrying_event_id: Option<String>,
@@ -6522,9 +6537,14 @@ mod tests {
     /// that a recovery successor lands on the session it was recovering rather
     /// than a replacement, which is what `needs_fresh_session` used to guarantee
     /// it would not (CAIRN-4618).
+    ///
+    /// A passive wake on a warm process writes no event for its turn, so the
+    /// launch has to report the turn it opened. The positive witness below is that
+    /// it did, and that the warm process is serving exactly that turn; without it
+    /// the session assertions would also pass for a wake that never landed.
     #[tokio::test(flavor = "current_thread")]
     async fn a_passive_wake_launch_leaves_the_session_alone() {
-        use super::{continue_job_launch_locked_for_watchdog, ResumeContext};
+        use super::{continue_job_launch_locked_for_watchdog, ResumeContext, WatchdogContinuation};
 
         let (orch, db) = standing_node("standing-node-wake").await;
         let before = session_state(&db).await;
@@ -6533,7 +6553,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        continue_job_launch_locked_for_watchdog(
+        let launch = continue_job_launch_locked_for_watchdog(
             &orch,
             "j",
             Some(ResumeContext {
@@ -6548,6 +6568,15 @@ mod tests {
         assert_eq!(session_state(&db).await, before);
         assert_eq!(before.1.as_deref(), Some("s1"));
         assert_eq!(before.2.as_deref(), Some("native-thread-1"));
+        let WatchdogContinuation::Started { run, turn_id } = launch else {
+            panic!("a wake on a warm process starts there, got {launch:?}");
+        };
+        assert_eq!(run.id, "r1", "the wake lands on the warm process's run");
+        assert_eq!(
+            orch.process_state.get_occupancy("r1"),
+            Some(RunOccupancy::ServingTurn(turn_id)),
+            "the warm process must be serving the turn the launch reported"
+        );
     }
 
     /// The standing-thread canary (CAIRN-4618).

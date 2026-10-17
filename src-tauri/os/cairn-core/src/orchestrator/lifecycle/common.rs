@@ -339,14 +339,22 @@ pub(super) fn transition_run(
                             // A run that ends while its launch is still queued
                             // (stopped, killed, or failed to start) withdraws that
                             // queue entry in the same write, so the promoter never
-                            // leases a dead launch.
-                            crate::storage::withdraw_queued_ordinary_admission(
-                                conn,
-                                &run_id,
-                                &format!("run {to} before admission"),
-                                now,
-                            )
-                            .await?;
+                            // leases a dead launch, and returns the attention the
+                            // launch's turn was to carry.
+                            if let Some(withdrawn) =
+                                crate::storage::withdraw_queued_ordinary_admission(
+                                    conn,
+                                    &run_id,
+                                    &format!("run {to} before admission"),
+                                    now,
+                                )
+                                .await?
+                            {
+                                crate::orchestrator::attention_push::return_withdrawn_delivery_conn(
+                                    conn, &withdrawn,
+                                )
+                                .await;
+                            }
                         }
                         RunStatus::Starting => {
                             conn.execute(

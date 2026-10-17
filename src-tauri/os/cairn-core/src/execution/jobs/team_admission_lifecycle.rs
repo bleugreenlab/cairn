@@ -3,7 +3,7 @@ use crate::orchestrator::Orchestrator;
 use crate::runtime_admission::{
     AdmissionTerminalAction, FinishAdmissionRequest, RuntimeAdmissionClient, TeamAdmissionClient,
 };
-use crate::storage::{LocalDb, TeamOrdinaryAuthority};
+use crate::storage::{LocalDb, RowExt, TeamOrdinaryAuthority};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,10 +192,19 @@ pub(super) enum TeamWithdrawal {
 /// until the authority answers. Retiring it first would strand a queued request
 /// in Postgres that blocks younger work behind it, with nothing left locally to
 /// retry from.
+///
+/// Once Postgres has let go, the wake the launch's turn was to carry goes back to
+/// the queue *before* the mirror is retired, because the run and its turn live in
+/// the team replica and cannot share the mirror's write. Retiring first would let
+/// a restart in between leave a cancelled mirror nothing revisits beside a wake
+/// stamped to a turn no agent ran. Returning first means an interruption leaves
+/// the mirror queued, and the retry's revert finds nothing left to undo.
+/// `owning` is where runs resolve; `None` skips the return (no replica to reach).
 pub(super) async fn withdraw_settled_team_request_with(
     db: &LocalDb,
     client: &dyn RuntimeAdmissionClient,
     request_id: &str,
+    owning: Option<&crate::db::DbState>,
 ) -> Result<TeamWithdrawal, String> {
     use crate::runtime_admission::AdmissionClientError;
     let cancelled = tokio::time::timeout(
@@ -227,6 +236,29 @@ pub(super) async fn withdraw_settled_team_request_with(
     if !gone {
         return Ok(TeamWithdrawal::Pending);
     }
+    if let Some(dbs) = owning {
+        // A snapshot read that fails leaves the mirror queued, so the return is
+        // retried; only the revert itself is warn-and-continue.
+        // Only the two ids are read: a snapshot that no longer decodes must not
+        // hold its withdrawal open forever.
+        let launch = db
+            .query_opt(
+                "SELECT run_id, turn_id FROM prepared_ordinary_launches WHERE request_id = ?1",
+                (request_id.to_string(),),
+                |row| Ok((row.text(0)?, row.text(1)?)),
+            )
+            .await
+            .map_err(|error| format!("read prepared launch of {request_id}: {error}"))?;
+        if let Some((run_id, turn_id)) = launch {
+            super::ordinary_admission::return_undelivered_attention_in(
+                dbs,
+                &run_id,
+                &turn_id,
+                crate::orchestrator::attention_push::TurnDelivery::Unknown,
+            )
+            .await;
+        }
+    }
     // From any phase before registration: a lease that was journaled but never
     // started is as finished as a queued request once Postgres has let it go.
     crate::storage::retire_team_mirror(
@@ -245,10 +277,11 @@ pub(super) fn withdraw_settled_team_request(
     request_id: &str,
 ) -> Result<TeamWithdrawal, String> {
     let client = team_client(orch)?;
-    let db = orch.db.local.clone();
+    let dbs = orch.db.clone();
     let request_id = request_id.to_string();
     super::run_db(async move {
-        withdraw_settled_team_request_with(&db, client.as_ref(), &request_id).await
+        withdraw_settled_team_request_with(&dbs.local, client.as_ref(), &request_id, Some(&dbs))
+            .await
     })
 }
 
@@ -478,7 +511,7 @@ mod tests {
         client.unavailable.store(true, Ordering::SeqCst);
 
         assert!(
-            withdraw_settled_team_request_with(&db, &client, "request-1")
+            withdraw_settled_team_request_with(&db, &client, "request-1", None)
                 .await
                 .is_err()
         );
@@ -492,7 +525,7 @@ mod tests {
         // The next sweep, or startup recovery after a restart, retries it.
         client.unavailable.store(false, Ordering::SeqCst);
         assert_eq!(
-            withdraw_settled_team_request_with(&db, &client, "request-1").await,
+            withdraw_settled_team_request_with(&db, &client, "request-1", None).await,
             Ok(TeamWithdrawal::Withdrawn)
         );
         assert_eq!(local_state(&db).await, "cancelled");
@@ -512,17 +545,119 @@ mod tests {
         let client = FakeClient::default();
         *client.remote_state.lock().unwrap() = "leased".into();
         assert_eq!(
-            withdraw_settled_team_request_with(&db, &client, "request-1").await,
+            withdraw_settled_team_request_with(&db, &client, "request-1", None).await,
             Ok(TeamWithdrawal::Pending)
         );
         assert_eq!(local_state(&db).await, "queued");
 
         *client.remote_state.lock().unwrap() = "released".into();
         assert_eq!(
-            withdraw_settled_team_request_with(&db, &client, "request-1").await,
+            withdraw_settled_team_request_with(&db, &client, "request-1", None).await,
             Ok(TeamWithdrawal::Withdrawn)
         );
         assert_eq!(local_state(&db).await, "cancelled");
+    }
+
+    /// The window between Postgres letting go and the mirror retiring is where a
+    /// restart used to strand a wake: the mirror retired first, and nothing
+    /// revisits a cancelled mirror. Here retirement itself is interrupted. The
+    /// wake must already be back on the queue, and the mirror must still be
+    /// queued so the next sweep finishes the withdrawal without undoing anything
+    /// twice.
+    #[tokio::test]
+    async fn an_interrupted_team_withdrawal_has_already_returned_the_wake() {
+        use crate::orchestrator::attention_push as attention;
+        let db = queued_team_mirror("team-withdraw-returns-wake.db").await;
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO jobs(id,project_id,status,current_session_id,created_at,updated_at) VALUES('job-1','p','running','session-1',1,1);
+             INSERT INTO sessions(id,job_id,backend,status,created_at,updated_at) VALUES('session-1','job-1','codex','open',1,1);
+             INSERT INTO runs(id,project_id,job_id,session_id,status,created_at,updated_at) VALUES('run-1','p','job-1','session-1','crashed',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at) VALUES('turn-1','session-1','run-1','job-1',1,'pending','follow_up',1,1);
+             INSERT INTO events(id,run_id,session_id,turn_id,sequence,timestamp,event_type,data,created_at) VALUES('brief','run-1','session-1','turn-1',1,1,'attention:briefing','{}',1);
+             INSERT INTO prepared_ordinary_launches(request_id,job_id,run_id,session_id,turn_id,execution_id,launch_event_id,prompt,reason,session_start_json,model,agent_config_json,runtime_capability_json,created_at) VALUES('request-1','job-1','run-1','session-1','turn-1','','brief','hello','initial','{}','','null','{}',1);",
+        )
+        .await
+        .unwrap();
+        let (push_id, _) = attention::push(
+            &db,
+            "job-1",
+            "cairn://p/p/1",
+            attention::Wake::Wake,
+            attention::Boundary::Event,
+            "direct:team-withdraw",
+        )
+        .await
+        .unwrap();
+        attention::stamp_delivered(&db, std::slice::from_ref(&push_id), "brief")
+            .await
+            .unwrap();
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute(
+                    "CREATE TRIGGER interrupt_mirror_retire BEFORE UPDATE OF state ON runtime_admission_requests
+                     WHEN NEW.state = 'cancelled' BEGIN SELECT RAISE(ABORT, 'interrupted before retirement'); END;",
+                    (),
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let db = Arc::new(db);
+        let root = tempfile::tempdir().unwrap();
+        let dbs = crate::db::DbState::new(
+            db.clone(),
+            Arc::new(
+                crate::storage::SearchIndex::open_or_create(root.path().join("search")).unwrap(),
+            ),
+        );
+        let client = FakeClient::default();
+        *client.remote_state.lock().unwrap() = "queued".into();
+
+        let interrupted =
+            withdraw_settled_team_request_with(&db, &client, "request-1", Some(&dbs)).await;
+        assert!(
+            interrupted
+                .as_ref()
+                .is_err_and(|error| error.contains("interrupted before retirement")),
+            "only retirement may fail here, got {interrupted:?}"
+        );
+        assert_eq!(*client.remote_state.lock().unwrap(), "cancelled");
+        assert_eq!(local_state(&db).await, "queued", "the obligation survives");
+        assert_eq!(
+            attention::list_pending(&db, "job-1").await.unwrap().len(),
+            1,
+            "the wake was returned before the mirror could retire"
+        );
+        assert_eq!(
+            db.query_opt_text("SELECT id FROM events WHERE id='brief'", ())
+                .await
+                .unwrap(),
+            None
+        );
+
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("DROP TRIGGER interrupt_mirror_retire", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            withdraw_settled_team_request_with(&db, &client, "request-1", Some(&dbs)).await,
+            Ok(TeamWithdrawal::Withdrawn),
+            "the next sweep finishes the withdrawal Postgres already acknowledged"
+        );
+        assert_eq!(local_state(&db).await, "cancelled");
+        assert_eq!(
+            attention::list_pending(&db, "job-1").await.unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]

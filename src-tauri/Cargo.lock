@@ -1283,6 +1283,7 @@ name = "cairn-session"
 version = "0.12.34"
 dependencies = [
  "cairn-analytics",
+ "cairn-attention",
  "cairn-common",
  "cairn-db",
  "cairn-domain",
@@ -1355,6 +1356,7 @@ name = "cairn-workflow"
 version = "0.12.34"
 dependencies = [
  "async-trait",
+ "cairn-attention",
  "cairn-common",
  "cairn-config",
  "cairn-db",

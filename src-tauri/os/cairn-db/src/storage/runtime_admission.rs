@@ -1145,10 +1145,16 @@ pub struct WithdrawnAdmission {
     pub request_id: String,
     pub workspace_key: String,
     pub resource_lane: String,
+    /// The turn the withdrawn launch would have served. Its attention delivery
+    /// was stamped when the launch queued and is now owed back to the pending
+    /// queue (`cairn_attention::push::return_withdrawn_delivery_conn`).
+    pub turn_id: Option<String>,
 }
 
 /// Cancel the still-`queued` ordinary request of `run_id` inside the caller's
 /// write, so settling a run and withdrawing its queue entry are one fact.
+/// Callers return the withdrawn turn's attention delivery in the same write:
+/// a launch withdrawn before admission never reached a process.
 ///
 /// Only `queued` rows are touched and no lease fence applies, because a queued
 /// row has no owner. A `leased`/`starting` row belongs to its promoter, which
@@ -1174,7 +1180,7 @@ pub async fn withdraw_queued_ordinary_admission(
     let launch_key = format!("ordinary:{run_id}");
     let mut rows = conn
         .query(
-            "SELECT request_id,workspace_key,resource_lane FROM runtime_admission_requests WHERE launch_key=?1 AND state='queued'",
+            "SELECT r.request_id,r.workspace_key,r.resource_lane,p.turn_id FROM runtime_admission_requests r LEFT JOIN prepared_ordinary_launches p ON p.request_id=r.request_id WHERE r.launch_key=?1 AND r.state='queued'",
             params![launch_key.clone()],
         )
         .await?;
@@ -1185,6 +1191,7 @@ pub async fn withdraw_queued_ordinary_admission(
         request_id: row.text(0)?,
         workspace_key: row.text(1)?,
         resource_lane: row.text(2)?,
+        turn_id: row.opt_text(3)?,
     };
     drop(rows);
     let changed = conn
@@ -1202,6 +1209,7 @@ pub struct QueuedOrdinaryLaunch {
     pub request_id: String,
     pub workspace_key: String,
     pub run_id: String,
+    pub turn_id: String,
 }
 
 /// Queued launches not yet leased: private rows in `queued`, and team mirrors
@@ -1209,13 +1217,14 @@ pub struct QueuedOrdinaryLaunch {
 /// fenced terminal path, never to a queued cancellation.
 pub async fn list_queued_ordinary_launches(db: &LocalDb) -> DbResult<Vec<QueuedOrdinaryLaunch>> {
     db.query_all(
-        "SELECT r.request_id,r.workspace_key,p.run_id FROM runtime_admission_requests r JOIN prepared_ordinary_launches p ON p.request_id=r.request_id WHERE r.state='queued' AND NOT EXISTS (SELECT 1 FROM team_ordinary_admission_authority a WHERE a.request_id=r.request_id) ORDER BY r.enqueue_seq",
+        "SELECT r.request_id,r.workspace_key,p.run_id,p.turn_id FROM runtime_admission_requests r JOIN prepared_ordinary_launches p ON p.request_id=r.request_id WHERE r.state='queued' AND NOT EXISTS (SELECT 1 FROM team_ordinary_admission_authority a WHERE a.request_id=r.request_id) ORDER BY r.enqueue_seq",
         (),
         |row| {
             Ok(QueuedOrdinaryLaunch {
                 request_id: row.text(0)?,
                 workspace_key: row.text(1)?,
                 run_id: row.text(2)?,
+                turn_id: row.text(3)?,
             })
         },
     )
@@ -2332,6 +2341,9 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            if let Some(withdrawn) = &withdrawn {
+                assert_eq!(withdrawn.turn_id.as_deref(), Some("t-run-queued"));
+            }
             assert_eq!(withdrawn.map(|withdrawn| withdrawn.request_id), expected);
         }
         assert_eq!(state_of(&db, "req-run-queued").await, "cancelled");

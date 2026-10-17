@@ -380,6 +380,40 @@ async fn push_rows(db: &LocalDb, key: &str) -> Vec<(String, String, Option<Strin
     .unwrap()
 }
 
+/// Wait (bounded) for the recorder to see `n` spawns. A cold resume is admitted
+/// durably and promoted on its own thread, so the spawn trails the call that
+/// queued it. Returns without failing; the caller's assertion reports a miss.
+async fn await_spawn_count(recorder: &RecordingProcessSpawner, n: usize) {
+    for _ in 0..100 {
+        if recorder.spawn_count() >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// Wait (bounded) for the admission request of `run_id`'s launch to reach a
+/// terminal state, and return that state.
+async fn await_admission_settled(db: &LocalDb, run_id: &str) -> String {
+    let launch_key = format!("ordinary:{run_id}");
+    for _ in 0..100 {
+        let state = db
+            .query_opt_text(
+                "SELECT state FROM runtime_admission_requests WHERE launch_key=?1",
+                (launch_key.clone(),),
+            )
+            .await
+            .unwrap();
+        if let Some(state) =
+            state.filter(|state| matches!(state.as_str(), "failed" | "cancelled" | "released"))
+        {
+            return state;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the admission request for {launch_key} never settled within the wait window");
+}
+
 async fn attention_event_count(db: &LocalDb) -> i64 {
     db.query_one(
         "SELECT COUNT(*) FROM events WHERE event_type='attention:briefing'",
@@ -417,6 +451,7 @@ async fn settled_child_review_wakes_idle_coordinator_while_checks_are_running() 
 
     assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
     evaluate_review_readiness(&orch, "child").await;
+    await_spawn_count(&recorder, 1).await;
 
     let rows = push_rows(&db, &format!("review:{CHILD_URI}")).await;
     let resumed_run = cairn_core::messages::delivery::latest_run_for_job(&db, "coordinator")
@@ -500,12 +535,7 @@ async fn child_plan_gate_wakes_idle_coordinator() {
 
     // The nudge trails push creation inside the same detached evaluation, so give
     // it the same bounded window the push itself got.
-    for _ in 0..100 {
-        if recorder.spawn_count() > 0 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+    await_spawn_count(&recorder, 1).await;
     assert_eq!(
         recorder.spawn_count(),
         1,
@@ -530,6 +560,10 @@ async fn child_plan_gate_wakes_idle_coordinator() {
 /// for the same fact, and every surface built from durable events — the
 /// transcript, a reseed digest, the wake card — shows the child update twice, one
 /// of them attributed to a turn no agent ever ran.
+///
+/// The resume queues its launch behind durable admission and returns, so the
+/// refusal arrives later, when promotion tries to start the process. The
+/// queued launch owns the delivery until then and returns the wake there.
 #[tokio::test(flavor = "current_thread")]
 async fn a_refused_launch_returns_the_childs_wake_to_the_queue() {
     let (temp, db) = common::migrated_db().await;
@@ -539,6 +573,17 @@ async fn a_refused_launch_returns_the_childs_wake_to_the_queue() {
 
     assert!(orch.try_begin_turn_end_checks("child-builder").is_some());
     evaluate_review_readiness(&orch, "child").await;
+
+    // Positive witness first: the coordinator's successor launch was attempted
+    // and refused, not merely still waiting to be promoted.
+    let resumed_run = cairn_core::messages::delivery::latest_run_for_job(&db, "coordinator")
+        .expect("the wake must still reach a launch attempt");
+    assert_ne!(resumed_run, "coord-run");
+    assert_eq!(
+        await_admission_settled(&db, &resumed_run).await,
+        "failed",
+        "promotion must have tried the launch and refused it"
+    );
 
     let rows = push_rows(&db, &format!("review:{CHILD_URI}")).await;
     assert_eq!(rows.len(), 1, "the review wake is still minted");

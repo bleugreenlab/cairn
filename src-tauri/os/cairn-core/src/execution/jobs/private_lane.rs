@@ -441,16 +441,36 @@ pub(crate) fn withdraw_orphaned_ordinary_admissions(orch: &Orchestrator) -> usiz
                 }
             }
         } else {
+            // A private run lives in the local database beside its admission
+            // row, so withdrawing the row and returning the wake its turn was
+            // to carry are one write: the cancelled row is the last trace this
+            // sweep would ever look at, so nothing could retry a revert left
+            // for later.
             matches!(
                 run_db_borrowed(async {
-                    crate::storage::cancel_queued_admission(
-                        &orch.db.local,
-                        &launch.request_id,
-                        Some("run settled before admission"),
-                        chrono::Utc::now().timestamp(),
-                    )
-                    .await
-                    .map_err(|error| error.to_string())
+                    orch.db
+                        .local
+                        .write(|conn| {
+                            let run_id = launch.run_id.clone();
+                            Box::pin(async move {
+                                let withdrawn = crate::storage::withdraw_queued_ordinary_admission(
+                                    conn,
+                                    &run_id,
+                                    "run settled before admission",
+                                    chrono::Utc::now().timestamp(),
+                                )
+                                .await?;
+                                if let Some(withdrawn) = &withdrawn {
+                                    crate::orchestrator::attention_push::return_withdrawn_delivery_conn(
+                                        conn, withdrawn,
+                                    )
+                                    .await;
+                                }
+                                Ok(withdrawn.is_some())
+                            })
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
                 }),
                 Ok(true)
             )

@@ -321,12 +321,15 @@ pub fn start_ordinary_session(
     )
 }
 
+/// Start a prepared ordinary session, or queue it behind durable admission.
+/// Returns `true` when a process already holds the prompt and `false` while the
+/// launch waits in admission's queue.
 pub fn start_prepared_job_session(
     orch: &Orchestrator,
     mut prepared: PreparedJob,
     identity_override: Option<crate::identity::UserIdentity>,
-) -> Result<(), String> {
-    ordinary_admission::enqueue_or_start(orch, &mut prepared, identity_override).map(|_| ())
+) -> Result<bool, String> {
+    ordinary_admission::enqueue_or_start(orch, &mut prepared, identity_override)
 }
 
 fn start_ordinary_session_now(

@@ -57,14 +57,19 @@ pub async fn transition_run(
                     .await?;
                     // A run that ends while its launch is still queued (stopped,
                     // killed, or failed to start) withdraws that queue entry in
-                    // the same write, so the promoter never leases a dead launch.
-                    cairn_db::storage::withdraw_queued_ordinary_admission(
+                    // the same write, so the promoter never leases a dead launch,
+                    // and returns the attention the launch's turn was to carry.
+                    if let Some(withdrawn) = cairn_db::storage::withdraw_queued_ordinary_admission(
                         conn,
                         &run_id,
                         &format!("run {to} before admission"),
                         now,
                     )
-                    .await?;
+                    .await?
+                    {
+                        cairn_attention::push::return_withdrawn_delivery_conn(conn, &withdrawn)
+                            .await;
+                    }
                 }
                 _ => {
                     conn.execute(

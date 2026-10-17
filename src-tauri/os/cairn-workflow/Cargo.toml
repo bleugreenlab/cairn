@@ -9,6 +9,7 @@ description = "Durable recipe advancement, effect processing, and workflow persi
 evalexpr = "11"
 async-trait = "0.1"
 tracing = "0.1"
+cairn-attention = { path = "../cairn-attention" }
 cairn-common = { path = "../cairn-common" }
 cairn-config = { path = "../cairn-config" }
 cairn-db = { path = "../cairn-db" }

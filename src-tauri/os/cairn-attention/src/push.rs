@@ -1004,7 +1004,9 @@ pub async fn stamp_delivered_conn(
 /// between injection and commit.
 ///
 /// Keyed on the carrying event rather than on push ids, so it can only ever
-/// revert the delivery this launch itself wrote.
+/// revert the delivery this launch itself wrote. A launch that hands its turn to
+/// durable admission no longer holds that event in memory, so it is reverted by
+/// turn instead ([`revert_turn_deliveries`]).
 pub async fn revert_delivery(db: &LocalDb, carrying_event_id: &str) -> DbResult<usize> {
     let event_id = carrying_event_id.to_string();
     db.write(|conn| {
@@ -1021,6 +1023,117 @@ pub async fn revert_delivery(db: &LocalDb, carrying_event_id: &str) -> DbResult<
                 .await?;
             Ok(restored)
         })
+    })
+    .await
+}
+
+/// What the caller knows about whether a process received a turn's prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnDelivery {
+    /// The caller saw this turn's handoff fail before any process held the
+    /// prompt, such as a warm delivery whose send errored after the turn was
+    /// already bound to that warm run. Nothing else proves otherwise, so the
+    /// delivery is reverted unconditionally.
+    NeverSent,
+    /// The caller cannot rule out that an earlier generation of the same launch
+    /// delivered it, so a turn whose run went live keeps its delivery.
+    Unknown,
+}
+
+/// [`revert_delivery`] for a launch that queued: undo every attention delivery
+/// carried by `turn_id`, provided that turn never reached a process.
+///
+/// A queued launch commits its briefing before admission decides whether a
+/// process will ever carry it, and that decision lands later, on another thread,
+/// after the launching resume has returned. So the in-memory guard that covers a
+/// direct launch cannot cover it. Admission instead owns the delivery while the
+/// launch is queued and returns it at every exit that ends the launch without a
+/// process: a refused start, a cancelled lease, a withdrawal because the run
+/// settled first. Keying on the turn needs nothing held in memory and survives a
+/// restart, because the carrying event already records the turn.
+///
+/// With [`TurnDelivery::Unknown`] the revert is a no-op once the turn's run has
+/// gone live. A run's `started_at` is written right after its process spawns,
+/// carrying the prompt the briefing rode in, so for a cold launch it is the
+/// durable proof that the delivery happened. A launch whose lease was requeued
+/// after its process ran still points at that live run and keeps its delivery.
+/// That guard is what makes it safe to call this from every non-start exit,
+/// without each caller first proving that no earlier generation of the same
+/// launch reached a process. It proves nothing for a turn bound to an
+/// already-live warm run before the send: that caller knows the outcome and
+/// says so with [`TurnDelivery::NeverSent`]. Returns the number of pushes put
+/// back on the pending queue.
+pub async fn revert_turn_deliveries_conn(
+    conn: &cairn_db::turso::Connection,
+    turn_id: &str,
+    delivery: TurnDelivery,
+) -> DbResult<usize> {
+    if delivery == TurnDelivery::Unknown && turn_run_went_live(conn, turn_id).await? {
+        return Ok(0);
+    }
+    let restored = conn
+        .execute(
+            "UPDATE attention_pushes SET delivered_event_id = NULL
+             WHERE delivered_event_id IN (
+               SELECT id FROM events WHERE turn_id = ?1 AND event_type = 'attention:briefing'
+             )",
+            params![turn_id],
+        )
+        .await? as usize;
+    conn.execute(
+        "DELETE FROM events WHERE turn_id = ?1 AND event_type = 'attention:briefing'",
+        params![turn_id],
+    )
+    .await?;
+    Ok(restored)
+}
+
+async fn turn_run_went_live(conn: &cairn_db::turso::Connection, turn_id: &str) -> DbResult<bool> {
+    let mut reached_process = conn
+        .query(
+            "SELECT 1 FROM turns t JOIN runs r ON r.id = t.run_id
+             WHERE t.id = ?1 AND r.started_at IS NOT NULL",
+            params![turn_id],
+        )
+        .await?;
+    Ok(reached_process.next().await?.is_some())
+}
+
+/// Return the delivery of a launch withdrawn inside the caller's write, the way
+/// settling a run withdraws a launch that was still queued.
+///
+/// This never fails the enclosing write. The revert is owed, but losing it costs
+/// one wake, while failing the write would leave the run unsettled.
+pub async fn return_withdrawn_delivery_conn(
+    conn: &cairn_db::turso::Connection,
+    withdrawn: &cairn_db::storage::WithdrawnAdmission,
+) {
+    let Some(turn_id) = withdrawn.turn_id.as_deref() else {
+        return;
+    };
+    match revert_turn_deliveries_conn(conn, turn_id, TurnDelivery::Unknown).await {
+        Ok(0) => {}
+        Ok(restored) => log::info!(
+            "withdrawn launch {} returned {restored} push(es) from turn {turn_id} to the pending queue",
+            withdrawn.request_id
+        ),
+        Err(error) => log::warn!(
+            "withdrawn launch {} could not return turn {turn_id}'s attention delivery ({error}); that wake will not be redelivered",
+            withdrawn.request_id
+        ),
+    }
+}
+
+/// [`revert_turn_deliveries_conn`] in its own write.
+pub async fn revert_turn_deliveries(
+    db: &LocalDb,
+    turn_id: &str,
+    delivery: TurnDelivery,
+) -> DbResult<usize> {
+    let turn_id = turn_id.to_string();
+    db.write(|conn| {
+        let turn_id = turn_id.clone();
+        Box::pin(async move { revert_turn_deliveries_conn(conn, &turn_id, delivery).await })
     })
     .await
 }
@@ -2905,6 +3018,113 @@ mod tests {
             pending.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
             vec!["early", "late"]
         );
+    }
+
+    /// Seed a pending turn bound to `run-1` and deliver one push on it through
+    /// a briefing event, the way a queued launch does before admission decides.
+    async fn deliver_on_queued_turn(db: &LocalDb) -> String {
+        db.execute_script(
+            "
+            INSERT INTO sessions(id, job_id, backend, status, created_at, updated_at)
+              VALUES('sess2','child-job','claude','open',1,1);
+            INSERT INTO turns(id, session_id, run_id, job_id, sequence, state, start_reason, created_at, updated_at)
+              VALUES('turn-q','sess2','run-1','child-job',1,'pending','follow_up',1,1);
+            INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp, event_type, data, created_at)
+              VALUES('brief-q','run-1','sess2','turn-q',1,1,'attention:briefing','{}',1);
+            INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp, event_type, data, created_at)
+              VALUES('prompt-q','run-1','sess2','turn-q',2,1,'user','{}',1);
+            ",
+        )
+        .await
+        .unwrap();
+        let id = tell(db, "watcher").await;
+        assert_eq!(
+            stamp_delivered(db, std::slice::from_ref(&id), "brief-q")
+                .await
+                .unwrap(),
+            1
+        );
+        id
+    }
+
+    async fn event_exists(db: &LocalDb, id: &str) -> bool {
+        db.query_opt_text("SELECT id FROM events WHERE id=?1", (id.to_string(),))
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// A launch that never reached a process returns its wake whole: the push
+    /// is pending again and the briefing for a turn no agent ran is gone, while
+    /// the turn's other events are untouched.
+    #[tokio::test]
+    async fn a_turn_that_never_reached_a_process_returns_its_delivery() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        let id = deliver_on_queued_turn(&db).await;
+
+        assert_eq!(
+            revert_turn_deliveries(&db, "turn-q", TurnDelivery::Unknown)
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(delivered_event(&db, &id).await, None);
+        assert_eq!(list_pending(&db, "watcher").await.unwrap().len(), 1);
+        assert!(!event_exists(&db, "brief-q").await);
+        assert!(
+            event_exists(&db, "prompt-q").await,
+            "only the briefing is a delivery; the turn's own events stay"
+        );
+    }
+
+    /// Once the turn's run has gone live a process holds the prompt the push
+    /// rode in, so the delivery happened and nothing is reverted, which is what
+    /// lets every non-start exit call this without proving no earlier
+    /// generation of the same launch ran.
+    #[tokio::test]
+    async fn a_turn_whose_run_went_live_keeps_its_delivery() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        let id = deliver_on_queued_turn(&db).await;
+        db.execute("UPDATE runs SET started_at=5 WHERE id='run-1'", ())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            revert_turn_deliveries(&db, "turn-q", TurnDelivery::Unknown)
+                .await
+                .unwrap(),
+            0
+        );
+
+        assert_eq!(delivered_event(&db, &id).await.as_deref(), Some("brief-q"));
+        assert!(list_pending(&db, "watcher").await.unwrap().is_empty());
+        assert!(event_exists(&db, "brief-q").await);
+    }
+
+    /// A live run proves nothing for a turn bound to it before a send that
+    /// then failed. The caller that saw the failure says so, and the delivery
+    /// is returned anyway.
+    #[tokio::test]
+    async fn a_known_failed_handoff_returns_its_delivery_even_on_a_live_run() {
+        let db = migrated_db().await;
+        seed(&db).await;
+        let id = deliver_on_queued_turn(&db).await;
+        db.execute("UPDATE runs SET started_at=5 WHERE id='run-1'", ())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            revert_turn_deliveries(&db, "turn-q", TurnDelivery::NeverSent)
+                .await
+                .unwrap(),
+            1
+        );
+
+        assert_eq!(delivered_event(&db, &id).await, None);
+        assert!(!event_exists(&db, "brief-q").await);
     }
 
     #[tokio::test]
