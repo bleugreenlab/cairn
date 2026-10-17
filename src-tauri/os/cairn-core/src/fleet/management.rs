@@ -494,7 +494,6 @@ pub fn occupancy(orch: &Orchestrator, executor_id: &str) -> OccupancyReading {
         return OccupancyReading::default();
     };
     let snapshot = &inspection.occupancy;
-    let heartbeat_age_ms = inspection.health.heartbeat_age_ms;
     OccupancyReading {
         occupancy: ExecutorOccupancy {
             running: snapshot.executing_requests.len(),
@@ -513,9 +512,7 @@ pub fn occupancy(orch: &Orchestrator, executor_id: &str) -> OccupancyReading {
         // The same liveness bound placement applies. A machine placement has
         // already stopped considering is not one whose counts a removal should
         // treat as live.
-        silence_ms: (heartbeat_age_ms
-            > cairn_common::executor_protocol::EXECUTOR_PROGRESS_FRESHNESS_MS)
-            .then_some(heartbeat_age_ms),
+        silence_ms: orch.fleet.peer_silence_ms(executor_id, now),
     }
 }
 

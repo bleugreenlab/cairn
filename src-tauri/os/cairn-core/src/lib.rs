@@ -90,6 +90,7 @@ mod dev_instances;
 mod durable_content;
 mod duration;
 pub(crate) mod fleet;
+mod repeat_report;
 pub use cairn_db::db_records;
 mod effects;
 mod embeddings;

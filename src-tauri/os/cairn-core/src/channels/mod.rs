@@ -122,13 +122,6 @@ impl SessionContinuity {
     }
 }
 
-#[derive(Default)]
-struct AdmissionFailureReporter {
-    last_error: Option<String>,
-    last_reported_at: Option<Instant>,
-    suppressed: u64,
-}
-
 pub fn wake_discord_surfaces() {
     DISCORD_SURFACE_WAKE
         .get_or_init(tokio::sync::Notify::new)
@@ -643,29 +636,6 @@ pub(super) fn set_router_blocker(provider: &'static str, error: Option<String>) 
     }
 }
 
-impl AdmissionFailureReporter {
-    fn record(&mut self, now: Instant, error: &str) -> Option<String> {
-        let changed = self.last_error.as_deref() != Some(error);
-        let report_due = self
-            .last_reported_at
-            .is_none_or(|last| now.duration_since(last) >= ADMISSION_REPORT_INTERVAL);
-        if changed || report_due {
-            let suffix = if changed || self.suppressed == 0 {
-                String::new()
-            } else {
-                format!(" ({} identical attempts suppressed)", self.suppressed)
-            };
-            self.last_error = Some(error.to_string());
-            self.last_reported_at = Some(now);
-            self.suppressed = 0;
-            Some(format!("{error}{suffix}"))
-        } else {
-            self.suppressed = self.suppressed.saturating_add(1);
-            None
-        }
-    }
-}
-
 async fn supervise_admission<L, C, F, Fut, R, W, WFut>(
     mut load: L,
     mut run: F,
@@ -679,7 +649,7 @@ async fn supervise_admission<L, C, F, Fut, R, W, WFut>(
     W: FnMut() -> WFut,
     WFut: std::future::Future<Output = ()>,
 {
-    let mut failures = AdmissionFailureReporter::default();
+    let mut failures = crate::repeat_report::RepeatReporter::new(ADMISSION_REPORT_INTERVAL);
     loop {
         let Some(config) = load() else {
             return;
@@ -687,7 +657,7 @@ async fn supervise_admission<L, C, F, Fut, R, W, WFut>(
         match run(config).await {
             Ok(()) => return,
             Err(error) => {
-                if let Some(message) = failures.record(Instant::now(), &error) {
+                if let Some(message) = failures.record(Instant::now(), &error, &error) {
                     report(message);
                 }
                 wait_to_retry().await;
@@ -1686,30 +1656,6 @@ mod tests {
         .await;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn admission_failure_report_summarizes_suppressed_attempts_periodically() {
-        let start = Instant::now();
-        let mut reporter = AdmissionFailureReporter::default();
-        assert_eq!(
-            reporter.record(start, "executor disconnected").as_deref(),
-            Some("executor disconnected")
-        );
-        assert_eq!(
-            reporter.record(start + Duration::from_secs(2), "executor disconnected"),
-            None
-        );
-        assert_eq!(
-            reporter.record(start + Duration::from_secs(4), "executor disconnected"),
-            None
-        );
-        assert_eq!(
-            reporter
-                .record(start + ADMISSION_REPORT_INTERVAL, "executor disconnected")
-                .as_deref(),
-            Some("executor disconnected (2 identical attempts suppressed)")
-        );
     }
 
     #[test]

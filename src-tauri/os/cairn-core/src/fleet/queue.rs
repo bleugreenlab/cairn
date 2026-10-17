@@ -50,7 +50,22 @@ use cairn_common::executor_protocol::{
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use super::decline_condition::PostedCondition;
 use super::RequestIdentity;
+
+/// The first wait before a machine that declined an entry may be offered it
+/// again, whatever it posts in the meantime.
+const REOFFER_BACKOFF_INITIAL_MS: u64 = 1_000;
+/// The longest that wait grows to while the machine keeps giving the same
+/// reason. Short against any horizon, long against a posting cadence.
+const REOFFER_BACKOFF_MAX_MS: u64 = 30_000;
+/// How long a decline whose posted condition still holds stands before the
+/// machine is asked again anyway. Posted state is the rule; this is the floor
+/// under it, because the runner reads the machine's condition from what the
+/// machine posts and a refusal can rest on something it does not post (a
+/// residency footprint, a memory hold). Long against any posting cadence,
+/// short against a horizon.
+const DECLINE_RECHECK_MS: u64 = 120_000;
 
 /// A queue entry's own identity, minted fresh per entry.
 ///
@@ -163,11 +178,13 @@ pub(crate) struct QueueEntry {
     /// The latest answer each machine that declined gave, keyed by executor id.
     ///
     /// A decline stops this entry being offered to that machine until the
-    /// machine posts new state, because new posted state is the only thing that
-    /// makes reconsidering it meaningful. An ordering, deliberately, rather than
-    /// a timer: a retry clock would re-ask a machine whose situation had not
-    /// changed. Posting state supersedes the decline rather than erasing it, so
-    /// a request that reaches its horizon can still say who refused it and why.
+    /// posted condition behind the reason it gave changes (see
+    /// [`super::decline_condition`]), and never sooner than its re-offer
+    /// backoff. Posted state is what makes reconsidering a machine meaningful;
+    /// the backoff is only a ceiling on how often, so a condition that flaps
+    /// cannot turn into an offer-and-decline loop. A superseded decline is
+    /// kept rather than erased, so a request that reaches its horizon can still
+    /// say who refused it and why.
     pub(crate) declined: HashMap<String, EntryDecline>,
     /// Offer, claim, decline, in order, for the placement record.
     pub(crate) chain: Vec<BindingEvent>,
@@ -241,15 +258,20 @@ impl QueueEntry {
 
     /// Whether this machine may be offered this entry right now.
     ///
-    /// A machine that declined is out until it posts new state. `generation` is
-    /// the machine's current one: a decline recorded against an older link says
-    /// nothing about this one, because the process behind it may have been
-    /// replaced entirely.
-    pub(crate) fn may_offer_to(&self, executor_id: &str, generation: u64) -> bool {
+    /// A machine that declined is out until its decline is superseded and its
+    /// backoff has run. `generation` is the machine's current one: a decline
+    /// recorded against an older link says nothing about this one, because the
+    /// process behind it may have been replaced entirely.
+    pub(crate) fn may_offer_to(
+        &self,
+        executor_id: &str,
+        generation: u64,
+        now_unix_ms: u64,
+    ) -> bool {
         !self
             .declined
             .get(executor_id)
-            .is_some_and(|decline| decline.stands_on(generation))
+            .is_some_and(|decline| decline.stands_on(generation, now_unix_ms))
     }
 
     fn answer(&mut self, outcome: CellOutcome) {
@@ -285,17 +307,37 @@ pub(crate) struct EntryDecline {
     /// relieve it.
     pub(crate) disk: Option<DiskDecline>,
     pub(crate) at_unix_ms: u64,
-    /// The machine has posted state since. A superseded decline no longer keeps
-    /// the machine from being offered this entry, but it is still the last
-    /// thing that machine said about it.
+    /// What the machine had posted, when it declined, that explains `reason`.
+    /// `None` when nothing it posts does; then any new post supersedes this.
+    pub(crate) condition: Option<PostedCondition>,
+    /// How long this machine waits before being offered the entry again. It
+    /// doubles while the machine keeps giving the same reason and starts over
+    /// when the reason changes or the machine claims.
+    pub(crate) backoff_ms: u64,
+    /// `at_unix_ms + backoff_ms`: no offer to this machine before it.
+    pub(crate) retry_after_unix_ms: u64,
+    /// The posted condition behind the reason has changed since. A superseded
+    /// decline no longer keeps the machine from being offered this entry once
+    /// its backoff has run, but it is still the last thing that machine said
+    /// about it.
     pub(crate) superseded: bool,
 }
 
 impl EntryDecline {
     /// Whether this decline still keeps the machine, on `generation`, from
-    /// being offered the entry.
-    pub(crate) fn stands_on(&self, generation: u64) -> bool {
-        !self.superseded && self.generation == generation
+    /// being offered the entry at `now_unix_ms`.
+    ///
+    /// Until its backoff has run once superseded, and otherwise until
+    /// [`DECLINE_RECHECK_MS`] has passed.
+    pub(crate) fn stands_on(&self, generation: u64, now_unix_ms: u64) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        if self.superseded {
+            now_unix_ms < self.retry_after_unix_ms
+        } else {
+            now_unix_ms < self.at_unix_ms.saturating_add(DECLINE_RECHECK_MS)
+        }
     }
 }
 
@@ -553,7 +595,7 @@ impl ExecutionQueue {
         // candidate filter to have applied it. A machine's own refusal is
         // better evidence than anything ranking can compute about it, and an
         // offer that ignores one would be answered the same way twice.
-        if !entry.may_offer_to(executor_id, generation) {
+        if !entry.may_offer_to(executor_id, generation, now_unix_ms) {
             return false;
         }
         let reasks_last_decliner = matches!(
@@ -619,6 +661,12 @@ impl ExecutionQueue {
             generation,
             at_unix_ms: now_unix_ms,
         };
+        // The machine took the work, so whatever it refused before is history:
+        // a later refusal starts its backoff over.
+        if let Some(decline) = entry.declined.get_mut(executor_id) {
+            decline.backoff_ms = 0;
+            decline.retry_after_unix_ms = 0;
+        }
         entry.chain.push(BindingEvent::Claimed {
             executor_id: executor_id.to_string(),
             generation,
@@ -647,7 +695,11 @@ impl ExecutionQueue {
     /// A machine that is re-asked after posting state and gives the same reason
     /// again is one continuing refusal, not a new step: its decline is
     /// refreshed in place (newest detail, newest time) and nothing is appended
-    /// to the chain or the journal.
+    /// to the chain or the journal. Its re-offer backoff doubles.
+    ///
+    /// `condition` is the machine's posted condition behind `reason` at the
+    /// moment of the decline, which is what [`Self::supersede_declines_for`]
+    /// compares later posts against.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn decline(
         &self,
@@ -657,6 +709,7 @@ impl ExecutionQueue {
         reason: DeclineReason,
         detail: Option<String>,
         disk: Option<DiskDecline>,
+        condition: Option<PostedCondition>,
         now_unix_ms: u64,
     ) -> DeclineRecord {
         let mut state = self.entries.lock().unwrap();
@@ -676,6 +729,19 @@ impl ExecutionQueue {
             )
         });
         entry.state = EntryState::Queued;
+        let backoff_ms = match entry.declined.get(executor_id) {
+            Some(previous)
+                if previous.generation == generation
+                    && previous.reason == reason
+                    && previous.backoff_ms > 0 =>
+            {
+                previous
+                    .backoff_ms
+                    .saturating_mul(2)
+                    .min(REOFFER_BACKOFF_MAX_MS)
+            }
+            _ => REOFFER_BACKOFF_INITIAL_MS,
+        };
         entry.declined.insert(
             executor_id.to_string(),
             EntryDecline {
@@ -684,6 +750,9 @@ impl ExecutionQueue {
                 detail: detail.clone(),
                 disk,
                 at_unix_ms: now_unix_ms,
+                condition,
+                backoff_ms,
+                retry_after_unix_ms: now_unix_ms.saturating_add(backoff_ms),
                 superseded: false,
             },
         );
@@ -746,26 +815,36 @@ impl ExecutionQueue {
         DeclineRecord::Recorded { repeat }
     }
 
-    /// Supersede this machine's declines, because it has posted new state.
+    /// Supersede this machine's declines whose reason its new posted state no
+    /// longer bears out.
     ///
-    /// New posted state is the only thing that makes reconsidering a machine
-    /// meaningful, so it is the only thing that clears a decline. The decline's
-    /// facts stay on the entry as that machine's last answer. Returns whether
-    /// anything became offerable again, which is worth a placement wake.
-    pub(crate) fn clear_declines_for(&self, executor_id: &str) -> bool {
+    /// `still_posted` answers, for one entry's request and the decline the
+    /// machine gave it, whether the machine's current posted condition for
+    /// that reason is the one recorded with the decline. A decline it answers
+    /// `false` for is superseded; the rest stand. The decline's facts stay on
+    /// the entry as that machine's last answer either way. Returns whether
+    /// anything was superseded, which is worth a placement wake.
+    pub(crate) fn supersede_declines_for(
+        &self,
+        executor_id: &str,
+        still_posted: impl Fn(&CellRequest, &EntryDecline) -> bool,
+    ) -> bool {
         let mut state = self.entries.lock().unwrap();
-        let mut cleared = false;
+        let mut superseded = false;
         for entry in state.entries.values_mut() {
+            let request = &entry.request;
             if let Some(decline) = entry
                 .declined
                 .get_mut(executor_id)
                 .filter(|decline| !decline.superseded)
             {
-                decline.superseded = true;
-                cleared = true;
+                if !still_posted(request, decline) {
+                    decline.superseded = true;
+                    superseded = true;
+                }
             }
         }
-        cleared
+        superseded
     }
 }
 
@@ -957,6 +1036,9 @@ impl ExecutionQueue {
                             )),
                             disk: None,
                             at_unix_ms: now_unix_ms,
+                            condition: None,
+                            backoff_ms: 0,
+                            retry_after_unix_ms: 0,
                             superseded: false,
                         },
                     );
@@ -1479,7 +1561,7 @@ impl super::Fleet {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::storage::RowExt;
     use cairn_common::executor_protocol::{
@@ -1618,7 +1700,7 @@ mod tests {
         });
     }
 
-    fn request(request_id: &str, mobility: PlacementMobility) -> CellRequest {
+    pub(crate) fn request(request_id: &str, mobility: PlacementMobility) -> CellRequest {
         CellRequest {
             request_id: request_id.into(),
             attempt_id: "attempt".into(),
@@ -1768,16 +1850,25 @@ mod tests {
         assert!(queue.offer(&entry, "first", "first", 1, 2));
 
         assert!(queue
-            .decline(&entry, "first", 1, DeclineReason::Pressure, None, None, 3)
+            .decline(
+                &entry,
+                "first",
+                1,
+                DeclineReason::Pressure,
+                None,
+                None,
+                None,
+                3
+            )
             .applied());
 
         assert_eq!(queue.state_of(&entry), Some(EntryState::Queued));
         assert!(!queue
-            .with_entry(&entry, |held| held.may_offer_to("first", 1))
+            .with_entry(&entry, |held| held.may_offer_to("first", 1, 4))
             .unwrap());
         // Another machine is free to take it immediately.
         assert!(queue
-            .with_entry(&entry, |held| held.may_offer_to("second", 1))
+            .with_entry(&entry, |held| held.may_offer_to("second", 1, 4))
             .unwrap());
         assert!(queue.offer(&entry, "second", "second", 1, 4));
     }
@@ -1791,16 +1882,27 @@ mod tests {
         let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
         assert!(queue.offer(&entry, "machine", "machine", 1, 2));
         assert!(queue
-            .decline(&entry, "machine", 1, DeclineReason::Capacity, None, None, 3)
+            .decline(
+                &entry,
+                "machine",
+                1,
+                DeclineReason::Capacity,
+                None,
+                None,
+                None,
+                3
+            )
             .applied());
         // Asserted through `offer` rather than through the predicate behind it:
         // the queue enforcing its own rule is the behaviour that matters, and a
         // caller whose candidate filter forgot the rule must still be refused.
         assert!(!queue.offer(&entry, "machine", "machine", 1, 4));
 
-        assert!(queue.clear_declines_for("machine"));
+        assert!(supersede_all(&queue, "machine"));
+        // Superseded, but the re-offer backoff still holds the machine back.
+        assert!(!queue.offer(&entry, "machine", "machine", 1, 5));
 
-        assert!(queue.offer(&entry, "machine", "machine", 1, 5));
+        assert!(queue.offer(&entry, "machine", "machine", 1, 1_003));
     }
 
     /// A claim that arrives after its entry moved on is answered rather than
@@ -1946,6 +2048,7 @@ mod tests {
                 DeclineReason::Pressure,
                 Some("needs 2147483648 bytes of memory, has 943718400".into()),
                 None,
+                None,
                 3,
             )
             .applied());
@@ -1980,6 +2083,7 @@ mod tests {
                 1,
                 DeclineReason::Pressure,
                 Some("needs 2 GiB, has 900 MiB".into()),
+                None,
                 None,
                 3
             )
@@ -2018,6 +2122,7 @@ mod tests {
                 DeclineReason::ProjectProvisioning,
                 Some("project p is provisioning for request other".into()),
                 None,
+                None,
                 3,
             )
             .applied());
@@ -2035,12 +2140,12 @@ mod tests {
             Some("project p is provisioning for request other")
         );
         assert_eq!(standing.at_unix_ms, 3);
-        assert!(standing.stands_on(1));
+        assert!(standing.stands_on(1, 4));
 
-        assert!(queue.clear_declines_for("machine"));
-        assert!(!queue.clear_declines_for("machine"), "already superseded");
+        assert!(supersede_all(&queue, "machine"));
+        assert!(!supersede_all(&queue, "machine"), "already superseded");
         let superseded = recorded(&queue);
-        assert!(!superseded.stands_on(1));
+        assert!(!superseded.stands_on(1, 1_003));
         assert_eq!(superseded.detail, standing.detail);
         assert_eq!(superseded.at_unix_ms, 3);
     }
@@ -2073,6 +2178,7 @@ mod tests {
                 DeclineReason::Pressure,
                 Some("cpu 99%".into()),
                 None,
+                None,
                 3
             ),
             DeclineRecord::Recorded { repeat: false }
@@ -2082,8 +2188,8 @@ mod tests {
             vec!["queued", "offered", "queued"]
         );
 
-        for at in [10, 20, 30] {
-            assert!(queue.clear_declines_for("machine"));
+        for at in [10_000, 20_000, 30_000] {
+            assert!(supersede_all(&queue, "machine"));
             assert!(queue.offer(&entry, "machine", "machine", 1, at));
             assert_eq!(
                 queue.decline(
@@ -2092,6 +2198,7 @@ mod tests {
                     1,
                     DeclineReason::Pressure,
                     Some(format!("cpu at {at}")),
+                    None,
                     None,
                     at + 1
                 ),
@@ -2106,13 +2213,13 @@ mod tests {
         assert_eq!(chain.len(), 2, "{chain:?}");
         assert!(matches!(
             &chain[1],
-            BindingEvent::Declined { detail: Some(detail), at_unix_ms: 31, .. } if detail == "cpu at 30"
+            BindingEvent::Declined { detail: Some(detail), at_unix_ms: 30_001, .. } if detail == "cpu at 30000"
         ));
 
         // A different answer is a new step, and the re-offer that produced it
         // is journaled ahead of it.
-        assert!(queue.clear_declines_for("machine"));
-        assert!(queue.offer(&entry, "machine", "machine", 1, 40));
+        assert!(supersede_all(&queue, "machine"));
+        assert!(queue.offer(&entry, "machine", "machine", 1, 40_000));
         assert_eq!(
             queue.decline(
                 &entry,
@@ -2121,7 +2228,8 @@ mod tests {
                 DeclineReason::ProjectProvisioning,
                 None,
                 None,
-                41
+                None,
+                40_001
             ),
             DeclineRecord::Recorded { repeat: false }
         );
@@ -2132,9 +2240,155 @@ mod tests {
         );
 
         // And a re-offer that is finally claimed is journaled before the claim.
-        assert!(queue.clear_declines_for("machine"));
-        assert!(queue.offer(&entry, "machine", "machine", 1, 50));
-        assert_eq!(queue.claim(&entry, "machine", 1, 51), ClaimVerdict::Granted);
+        assert!(supersede_all(&queue, "machine"));
+        assert!(queue.offer(&entry, "machine", "machine", 1, 50_000));
+        assert_eq!(
+            queue.claim(&entry, "machine", 1, 50_001),
+            ClaimVerdict::Granted
+        );
         assert_eq!(journaled_states(&mut journal), vec!["offered", "claimed"]);
+    }
+
+    /// Every post reads as a change: the rule the queue had before it knew
+    /// what a decline's reason depends on, and still the rule for a reason
+    /// nothing posted explains.
+    fn supersede_all(queue: &ExecutionQueue, executor_id: &str) -> bool {
+        queue.supersede_declines_for(executor_id, |_, _| false)
+    }
+
+    fn cpu_pressured() -> PostedCondition {
+        PostedCondition::Pressure {
+            cpu_pressured: true,
+            memory_short: false,
+        }
+    }
+
+    /// A machine that declined for a reason its posts still bear out is not
+    /// asked again, however often it posts; the condition changing is what
+    /// makes it worth asking.
+    #[test]
+    fn a_decline_stands_while_the_posted_condition_behind_its_reason_holds() {
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        assert!(queue.offer(&entry, "machine", "machine", 1, 2));
+        assert!(queue
+            .decline(
+                &entry,
+                "machine",
+                1,
+                DeclineReason::Pressure,
+                Some("cpu 100%".into()),
+                None,
+                Some(cpu_pressured()),
+                3,
+            )
+            .applied());
+
+        let posted = std::cell::RefCell::new(cpu_pressured());
+        let still_posted = |_: &CellRequest, decline: &EntryDecline| {
+            decline.condition.as_ref() == Some(&*posted.borrow())
+        };
+        for _ in 0..1_000 {
+            assert!(!queue.supersede_declines_for("machine", still_posted));
+        }
+        assert!(
+            !queue.offer(&entry, "machine", "machine", 1, 100_000),
+            "an unchanged condition keeps the decline standing long past its backoff"
+        );
+
+        *posted.borrow_mut() = PostedCondition::Pressure {
+            cpu_pressured: false,
+            memory_short: false,
+        };
+        assert!(queue.supersede_declines_for("machine", still_posted));
+        assert!(queue.offer(&entry, "machine", "machine", 1, 100_001));
+    }
+
+    /// A condition the runner reads as unchanged is still re-asked after two
+    /// minutes, because what the runner reads is only what the machine posts.
+    #[test]
+    fn a_decline_whose_condition_never_changes_is_rechecked() {
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        assert!(queue.offer(&entry, "machine", "machine", 1, 2));
+        queue.decline(
+            &entry,
+            "machine",
+            1,
+            DeclineReason::Pressure,
+            None,
+            None,
+            Some(cpu_pressured()),
+            3,
+        );
+        assert!(!queue.offer(&entry, "machine", "machine", 1, 3 + DECLINE_RECHECK_MS - 1));
+        assert!(queue.offer(&entry, "machine", "machine", 1, 3 + DECLINE_RECHECK_MS));
+    }
+
+    /// The ceiling regardless of reason. A machine that declines instantly
+    /// while posting state every 30 ms, each post reading as a change, is
+    /// offered the entry a handful of times a minute rather than the
+    /// thousands of times a request was declined on 10-16.
+    #[test]
+    fn the_reoffer_backoff_bounds_an_instant_decliner_that_posts_constantly() {
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        let mut offers = 0;
+        let mut now = 1;
+        while now < 60_000 {
+            if queue.offer(&entry, "machine", "machine", 1, now) {
+                offers += 1;
+                queue.decline(
+                    &entry,
+                    "machine",
+                    1,
+                    DeclineReason::Disk,
+                    Some("waiting here will not help".into()),
+                    None,
+                    None,
+                    now,
+                );
+            }
+            supersede_all(&queue, "machine");
+            now += 30;
+        }
+        assert!((2..10).contains(&offers), "{offers} offers in a minute");
+        let backoff = queue
+            .with_entry(&entry, |held| held.declined["machine"].backoff_ms)
+            .unwrap();
+        assert_eq!(backoff, REOFFER_BACKOFF_MAX_MS);
+    }
+
+    /// The backoff measures one continuing refusal. A different reason is a
+    /// new refusal, and a claim ends the refusal altogether.
+    #[test]
+    fn the_reoffer_backoff_starts_over_on_a_new_reason_or_a_claim() {
+        let queue = ExecutionQueue::default();
+        let (entry, _waiter) = enqueue(&queue, "r", PlacementMobility::SpillEligible);
+        let backoff = |queue: &ExecutionQueue| {
+            queue
+                .with_entry(&entry, |held| held.declined["machine"].backoff_ms)
+                .unwrap()
+        };
+        let mut now = 0;
+        for (reason, expected) in [
+            (DeclineReason::Pressure, 1_000),
+            (DeclineReason::Pressure, 2_000),
+            (DeclineReason::Pressure, 4_000),
+            (DeclineReason::Capacity, 1_000),
+        ] {
+            now += 100_000;
+            supersede_all(&queue, "machine");
+            assert!(queue.offer(&entry, "machine", "machine", 1, now));
+            queue.decline(&entry, "machine", 1, reason, None, None, None, now);
+            assert_eq!(backoff(&queue), expected);
+        }
+        supersede_all(&queue, "machine");
+        assert!(queue.offer(&entry, "machine", "machine", 1, now + 100_000));
+        assert_eq!(
+            queue.claim(&entry, "machine", 1, now + 100_000),
+            ClaimVerdict::Granted
+        );
+        assert_eq!(backoff(&queue), 0);
     }
 }

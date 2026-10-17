@@ -550,11 +550,22 @@ pub(crate) async fn publish_sealed_commit_pack(
         .filter(|repository_id| !repository_id.is_empty())
         .ok_or_else(|| "project has no durable repository identity".to_string())?;
 
-    let tip = git_stdout(
-        repository,
-        &["rev-parse", &format!("{sealed_commit}^{{commit}}")],
-    )?;
-    let parent = git_stdout(repository, &["rev-parse", &format!("{tip}^")]).ok();
+    // Two git subprocesses, so off the runtime: a worker waiting on them in
+    // `output()` is a worker the Runner cannot schedule anything else on.
+    let (tip, parent) = {
+        let repository = repository.to_path_buf();
+        let sealed_commit = sealed_commit.to_string();
+        tokio::task::spawn_blocking(move || {
+            let tip = git_stdout(
+                &repository,
+                &["rev-parse", &format!("{sealed_commit}^{{commit}}")],
+            )?;
+            let parent = git_stdout(&repository, &["rev-parse", &format!("{tip}^")]).ok();
+            Ok::<_, String>((tip, parent))
+        })
+        .await
+        .map_err(|error| format!("resolve sealed commit: {error}"))??
+    };
     let covered_parent = match parent.as_deref() {
         Some(parent) => {
             db.query_opt_i64(

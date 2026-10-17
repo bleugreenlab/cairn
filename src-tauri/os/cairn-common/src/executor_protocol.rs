@@ -2972,6 +2972,17 @@ pub const CPU_ADMISSION_SAMPLE_INTERVAL_MS: u64 = 5_000;
 /// far shorter than the minutes a genuinely starved sampler goes quiet for.
 pub const CPU_ADMISSION_BLIND_AFTER_MS: u64 = 3 * CPU_ADMISSION_SAMPLE_INTERVAL_MS;
 
+/// Available memory a non-interactive admission must leave the machine beyond
+/// what the arriving request asks for, and beyond the memory the executor is
+/// already holding for resident work it has never measured. Room for the
+/// operating system, the executor, and the request's own error in estimating
+/// itself.
+///
+/// Shared because the runner reads the same line: a `Pressure` decline stands
+/// while the machine's posted memory is still below it, and the two ends must
+/// agree on where that line is.
+pub const ADMISSION_MEMORY_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// How old an executor's machine reading may be before a reader must treat it
 /// as history rather than as the machine's current state.
 ///
@@ -4275,6 +4286,34 @@ pub struct LearnedResourceEstimate {
 /// for. Mixed versions fail safe in both directions: a 147 executor ignores the
 /// field and keeps gating, and a 147 runner omits it, so a 148 executor gates
 /// that offer as fresh work, exactly as before.
+///
+/// cairn/5027 changes when the runner re-offers an entry to a machine that
+/// declined it, without a bump. A decline used to be superseded by any snapshot
+/// or heartbeat the machine posted; it now stands until the posted condition
+/// behind its reason changes (the CPU admission verdict and memory against
+/// [`ADMISSION_MEMORY_FLOOR_BYTES`] for `Pressure`; for `Disk` the disk
+/// verdict, sweep, last pass, and headroom over the watermark and reserved
+/// growth, where any growth of headroom is relief; the posted commitment for
+/// `Capacity`; the project's [`ProvisioningHold`] for `ProjectProvisioning`),
+/// in every case no sooner than a per-machine backoff of one to thirty
+/// seconds and no later than a two-minute recheck. Every input is a field executors already post, and nothing is
+/// added to the wire; the memory floor moved here from the executor so both
+/// ends read the same line, at the same value. The capacity question the
+/// executor-semantic-capacity ruling asks is unchanged: an executor of any
+/// version answers an offer from its own admission exactly as before, so
+/// mixed versions agree about what a machine can take. A condition an older
+/// executor does not post reads as unexplained, which falls back to the old
+/// rule (any post supersedes), bounded by the same backoff, so a runner
+/// talking to an older executor re-offers at most as often as before and never
+/// parks a request on a condition that cannot change. It also adds
+/// [`PlacementRejectionReason::RunnerNotListening`], which only the runner
+/// produces and only runner surfaces render: no executor decodes a placement
+/// rejection, so an executor of any version is unaffected. On the executor
+/// side, a colocated executor now lowers every child it spawns rather than
+/// compile classes only, and on macOS starts it under a utility QoS clamp with
+/// throttled disk I/O. That is how the executor schedules its own children,
+/// not anything it posts or admits: an older colocated executor lowers less,
+/// which is exactly what every runner has had until now.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 148;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -11311,6 +11350,16 @@ pub enum PlacementRejectionReason {
         silence_ms: u64,
         stale_after_ms: u64,
     },
+    /// The runner's own reader for this link has not run for
+    /// `reader_silence_ms`, so it cannot have heard the machine and charges it
+    /// with nothing. `ingest_phase` is what the link's ingest was doing, for
+    /// `ingest_age_ms`, which is usually why. A fact about the runner, not the
+    /// machine.
+    RunnerNotListening {
+        reader_silence_ms: u64,
+        ingest_phase: String,
+        ingest_age_ms: u64,
+    },
     /// The caller asked for something this machine is not.
     SelectorMismatch { requested: String },
     /// The work already lives on another machine.
@@ -11435,6 +11484,13 @@ impl PlacementRejectionReason {
                 stale_after_ms,
             } => format!(
                 "connection published no progress for {silence_ms}ms, past the {stale_after_ms}ms liveness bound"
+            ),
+            Self::RunnerNotListening {
+                reader_silence_ms,
+                ingest_phase,
+                ingest_age_ms,
+            } => format!(
+                "the runner's reader for this link has not run for {reader_silence_ms}ms (its ingest was in {ingest_phase} for {ingest_age_ms}ms), so it has not heard this machine either way"
             ),
             Self::SelectorMismatch { requested } => format!("does not match {requested}"),
             Self::PinMismatch { pinned_executor_id } => {

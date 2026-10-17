@@ -39,6 +39,10 @@ pub mod account {
     pub use crate::account::*;
 }
 
+pub mod repeat_report {
+    pub use crate::repeat_report::*;
+}
+
 pub mod transcripts {
     pub use crate::transcripts::*;
 }
