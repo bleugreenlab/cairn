@@ -48,31 +48,13 @@ pub trait ClaudeHost: Send + Sync {
     fn initialized(&self);
     fn capture_output(&self, output: serde_json::Value);
     fn rate_limit(&self, snapshot: ProviderUsageSnapshot, info: Option<&RateLimitInfo>) -> bool;
-    /// The turn ended because its account is depleted. Called at most once per
-    /// turn and BEFORE that turn's completion is applied, so account health and
-    /// any replacement pin are durable before completion can dispatch queued
-    /// work. `block_recorded` is true when this turn's blocking
-    /// `rate_limit_event` already persisted the provider's own block, which a
-    /// reset-less terminal quarantine must not overwrite. Returns whether the
-    /// host persisted the account's health.
-    fn provider_depleted(
-        &self,
-        depletion: ProviderDepletion,
-        snapshot: ProviderUsageSnapshot,
-        block_recorded: bool,
-    ) -> bool;
-    /// Consume an actual terminal HTTP 429 without completing its unfinished turn.
-    /// `depletion` is the turn's classification (credit exhaustion, reported by an
-    /// earlier structured error, wins over a bare rolling-window 429), and
-    /// `block_recorded` is as for [`ClaudeHost::provider_depleted`].
-    fn provider_limit_result(
-        &self,
-        data: &serde_json::Value,
-        depletion: ProviderDepletion,
-        block_recorded: bool,
-        blocking_reset: Option<i64>,
-        now: i64,
-    ) -> bool;
+    /// Hold a turn the provider refused for a structured usage limit, without
+    /// completing it: a terminal HTTP 429, or a terminal error result after the
+    /// CLI's synthetic credits message. Called before any completion of that
+    /// turn, so account health and any replacement pin are durable before
+    /// queued work can dispatch. Returns whether the account's health was
+    /// persisted.
+    fn provider_limit_result(&self, report: ProviderLimitReport<'_>) -> bool;
     fn context_snapshot(&self, snapshot: ContextTokenState);
     fn complete(&self, outcome: ClaudeTurnOutcome, context: ClaudeTurnContext);
     fn artifact_handoff(&self);
@@ -91,15 +73,40 @@ pub trait ClaudeHost: Send + Sync {
     fn eof(&self, report: ClaudeEof);
 }
 
+/// What the reader observed about a turn the provider refused for a usage limit.
+#[derive(Debug, Clone, Copy)]
+pub struct ProviderLimitReport<'a> {
+    /// The terminal result's text, the only place the CLI states a reset clock.
+    pub result_text: Option<&'a str>,
+    /// The turn's classification: credit exhaustion, reported by an earlier
+    /// structured error, wins over a bare rolling-window 429.
+    pub depletion: ProviderDepletion,
+    /// This turn's blocking `rate_limit_event` already persisted the provider's
+    /// own block, which a reset-less re-probe quarantine must not overwrite.
+    pub block_recorded: bool,
+    /// The reset that blocking event declared.
+    pub blocking_reset: Option<i64>,
+    /// A tool call was issued and its result never reached the stream before the
+    /// refusal. The CLI may already have run it, so resuming without an operator
+    /// could run it again.
+    pub tool_in_flight: bool,
+    pub now: i64,
+}
+
 pub struct ClaudeEof {
     pub evidence: StreamEvidence,
     pub persisted_rate_limit_quarantine: bool,
     /// The depletion classified during the last turn, if any.
     pub pending_depletion: Option<ProviderDepletion>,
-    /// Whether [`ClaudeHost::provider_depleted`] already handled that turn.
+    /// Whether a terminal result already handed that turn to
+    /// [`ClaudeHost::provider_limit_result`].
     pub depletion_handled: bool,
     /// Whether the last turn's blocking `rate_limit_event` persisted a block.
     pub turn_block_recorded: bool,
+    /// The reset that blocking event declared.
+    pub blocking_reset: Option<i64>,
+    /// As [`ProviderLimitReport::tool_in_flight`], at the moment stdout closed.
+    pub tool_in_flight: bool,
     pub terminal_tool_called: bool,
     pub backend_failure: Option<BackendFailure>,
 }
@@ -278,27 +285,6 @@ pub fn update_claude_watchdog_lease(
             .map_err(|error| error.to_string())
     }) {
         log::error!("Failed to update durable Claude watchdog lease: {error}");
-    }
-}
-
-pub(crate) fn terminal_rate_limit_snapshot() -> ProviderUsageSnapshot {
-    let captured_at = chrono::Utc::now().timestamp();
-    ProviderUsageSnapshot {
-        backend: "claude".to_string(),
-        source: "claude_terminal_429".to_string(),
-        captured_at,
-        windows: vec![ProviderUsageWindow {
-            id: "claude".to_string(),
-            label: "Rate limit (HTTP 429)".to_string(),
-            scope: ProviderUsageScope::RollingWindow,
-            scope_target: None,
-            used_percent: 100.0,
-            remaining_percent: 0.0,
-            resets_at: Some(captured_at + TERMINAL_429_REPROBE_AFTER.as_secs() as i64),
-            reset_at_text: None,
-            window_duration_mins: None,
-        }],
-        ..Default::default()
     }
 }
 
@@ -689,10 +675,11 @@ pub fn emit_streaming_delta(
 #[derive(Default)]
 pub struct ClaudeResultContext {
     pub pending_depletion: Option<ProviderDepletion>,
-    pub depletion_handled: bool,
     pub block_recorded: bool,
     pub terminal_interrupt_ack_pending: bool,
     pub blocking_reset: Option<i64>,
+    /// Some tool_use of this stream has no tool_result yet.
+    pub tool_in_flight: bool,
 }
 
 /// The production Result decision boundary. The clock is supplied so recorded
@@ -704,36 +691,27 @@ pub fn dispatch_claude_result(
     context: ClaudeResultContext,
     now: i64,
 ) -> bool {
-    if is_error && result_is_rate_limited(data) {
-        let depletion = terminal_provider_depletion(is_error, data, context.pending_depletion)
-            .unwrap_or(ProviderDepletion::RollingWindow { resets_at: None });
-        return host.provider_limit_result(
-            data,
+    // Every structured depletion holds: a terminal 429, and a terminal error
+    // after the CLI's synthetic credits message, whose result text is generic.
+    if let Some(depletion) = terminal_provider_depletion(is_error, data, context.pending_depletion)
+    {
+        return host.provider_limit_result(ProviderLimitReport {
+            result_text: data.get("result").and_then(serde_json::Value::as_str),
             depletion,
-            context.block_recorded,
-            context.blocking_reset,
+            block_recorded: context.block_recorded,
+            blocking_reset: context.blocking_reset,
+            tool_in_flight: context.tool_in_flight,
             now,
-        );
-    }
-    let depletion = terminal_provider_depletion(is_error, data, context.pending_depletion);
-    let quarantined = depletion
-        .filter(|_| !context.depletion_handled)
-        .is_some_and(|depletion| {
-            host.provider_depleted(
-                depletion,
-                terminal_rate_limit_snapshot(),
-                context.block_recorded,
-            )
         });
+    }
     host.complete(
         claude_result_outcome(is_error, data),
         ClaudeTurnContext {
             terminal_tool_completed: false,
             terminal_interrupt_ack_pending: context.terminal_interrupt_ack_pending,
-            rate_limited: depletion.is_some(),
         },
     );
-    quarantined
+    false
 }
 
 pub(crate) fn claude_result_outcome(is_error: bool, data: &serde_json::Value) -> ClaudeTurnOutcome {
@@ -1942,7 +1920,6 @@ impl ClaudeRuntime {
                                 ClaudeTurnContext {
                                     terminal_tool_completed: true,
                                     terminal_interrupt_ack_pending,
-                                    rate_limited: false,
                                 },
                             );
                         }
@@ -2211,10 +2188,10 @@ impl ClaudeRuntime {
                             data,
                             ClaudeResultContext {
                                 pending_depletion,
-                                depletion_handled,
                                 block_recorded: turn_block_recorded,
                                 terminal_interrupt_ack_pending: ack_pending,
                                 blocking_reset,
+                                tool_in_flight: !pending_tool_ids.is_empty(),
                             },
                             chrono::Utc::now().timestamp(),
                         ) {
@@ -2286,6 +2263,8 @@ impl ClaudeRuntime {
             pending_depletion,
             depletion_handled,
             turn_block_recorded,
+            blocking_reset,
+            tool_in_flight: !pending_tool_ids.is_empty(),
             terminal_tool_called: terminal_tool_flag.load(Ordering::Acquire),
             backend_failure: stderr_watch.and_then(StderrWatch::settle),
         });
@@ -2364,19 +2343,6 @@ mod tests {
             panic!("is_error must override the success subtype in the host report");
         };
         assert!(message.contains("HTTP 429"));
-    }
-    #[test]
-    fn terminal_429_quarantine_has_a_bounded_reprobe_time() {
-        let snapshot = terminal_rate_limit_snapshot();
-        let window = snapshot.windows.first().expect("terminal 429 window");
-        assert_eq!(
-            window.resets_at,
-            Some(snapshot.captured_at + TERMINAL_429_REPROBE_AFTER.as_secs() as i64)
-        );
-        assert!(
-            window.resets_at.is_some(),
-            "a terminal 429 cannot persist forever"
-        );
     }
     #[test]
     fn terminal_api_error_without_429_is_not_called_a_rate_limit() {
@@ -2641,31 +2607,26 @@ mod depletion_order_tests {
             self.record(format!("rate_limit:{blocking}"));
             blocking
         }
-        fn provider_depleted(
-            &self,
-            depletion: ProviderDepletion,
-            _snapshot: ProviderUsageSnapshot,
-            block_recorded: bool,
-        ) -> bool {
-            self.record(format!("depleted:{depletion:?}:{block_recorded}"));
-            true
-        }
-        fn provider_limit_result(
-            &self,
-            _data: &serde_json::Value,
-            depletion: ProviderDepletion,
-            block_recorded: bool,
-            blocking_reset: Option<i64>,
-            _now: i64,
-        ) -> bool {
+        fn provider_limit_result(&self, report: ProviderLimitReport<'_>) -> bool {
+            let ProviderLimitReport {
+                depletion,
+                block_recorded,
+                blocking_reset,
+                tool_in_flight,
+                ..
+            } = report;
             self.record(format!(
                 "provider_limit:{depletion:?}:{block_recorded}:{blocking_reset:?}"
             ));
+            if tool_in_flight {
+                self.record("tool_in_flight".to_string());
+            }
             true
         }
         fn context_snapshot(&self, _snapshot: ContextTokenState) {}
         fn complete(&self, _outcome: ClaudeTurnOutcome, context: ClaudeTurnContext) {
-            self.record(format!("complete:{}", context.rate_limited));
+            let _ = context;
+            self.record("complete".to_string());
         }
         fn artifact_handoff(&self) {}
         fn interrupt(&self) -> Result<(), String> {
@@ -2679,7 +2640,10 @@ mod depletion_order_tests {
             Ok(())
         }
         fn eof(&self, report: ClaudeEof) {
-            self.record(format!("eof:handled={}", report.depletion_handled));
+            self.record(format!(
+                "eof:handled={}:blocking={}",
+                report.depletion_handled, report.evidence.saw_blocking_rate_limit
+            ));
         }
     }
 
@@ -2710,8 +2674,11 @@ mod depletion_order_tests {
         calls
     }
 
+    // The credits shape: a structured synthetic error, then a generic error
+    // result with no 429 status. It holds like any other limit and never
+    // completes the turn.
     #[tokio::test]
-    async fn credit_depletion_is_reported_before_the_turn_completes() {
+    async fn a_credits_message_before_a_generic_error_result_holds() {
         let calls = run_script(&[
             r#"{"type":"assistant","uuid":"a1","session_id":"s1","is_api_error_message":true,"api_error_status":429,"error_details":"credits_required","message":{"role":"assistant","content":[{"type":"text","text":"Manage credits with /usage-credits"}]}}"#,
             r#"{"type":"result","subtype":"success","session_id":"s1","is_error":true,"result":"You're out of usage credits."}"#,
@@ -2720,10 +2687,23 @@ mod depletion_order_tests {
         assert_eq!(
             calls,
             [
-                "depleted:Credits:false",
-                "complete:true",
-                "eof:handled=true"
+                "provider_limit:Credits:false:None",
+                "eof:handled=true:blocking=true"
             ]
+        );
+    }
+
+    // A blocking limit event and then the process exits with no result: the
+    // reader reports it at EOF, unhandled, for the host to hold.
+    #[tokio::test]
+    async fn a_blocking_exit_without_a_result_reaches_eof_unhandled() {
+        let calls = run_script(&[
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}"#,
+        ])
+        .await;
+        assert_eq!(
+            calls,
+            ["rate_limit:true", "eof:handled=false:blocking=true"]
         );
     }
 
@@ -2738,7 +2718,39 @@ mod depletion_order_tests {
             [
                 "rate_limit:false",
                 "provider_limit:RollingWindow { resets_at: None }:false:None",
-                "eof:handled=true"
+                "eof:handled=true:blocking=true"
+            ]
+        );
+    }
+
+    // Recorded 2026-09-03 (run ef12efb6): the CLI ran a tool and sent its
+    // follow-up request (`num_turns: 2`), which was refused, yet no tool_result
+    // reached the stream first. Automatic resume could repeat that tool call.
+    #[tokio::test]
+    async fn a_limit_with_an_unanswered_tool_call_reports_the_tool_in_flight() {
+        let fixture = include_str!("../../tests/fixtures/claude_limit_tool_in_flight.jsonl");
+        let calls = run_script(&fixture.lines().collect::<Vec<_>>()).await;
+        assert_eq!(
+            calls,
+            [
+                "provider_limit:RollingWindow { resets_at: None }:false:None",
+                "tool_in_flight",
+                "eof:handled=true:blocking=true",
+            ]
+        );
+    }
+
+    // The clean ordering seen in 83 of the 86 recorded mid-turn limits: the
+    // tool's result is on the stream before the refused request.
+    #[tokio::test]
+    async fn a_limit_after_the_tool_result_does_not_report_a_tool_in_flight() {
+        let fixture = include_str!("../../tests/fixtures/claude_limit_tool_answered.jsonl");
+        let calls = run_script(&fixture.lines().collect::<Vec<_>>()).await;
+        assert_eq!(
+            calls,
+            [
+                "provider_limit:RollingWindow { resets_at: None }:false:None",
+                "eof:handled=true:blocking=true",
             ]
         );
     }
@@ -2756,10 +2768,7 @@ mod depletion_order_tests {
                 1788545269,
             );
         }
-        assert_eq!(
-            *host.calls.lock().unwrap(),
-            ["complete:false", "complete:false"]
-        );
+        assert_eq!(*host.calls.lock().unwrap(), ["complete", "complete"]);
     }
 
     #[tokio::test]
@@ -2774,7 +2783,7 @@ mod depletion_order_tests {
             [
                 "rate_limit:true",
                 "provider_limit:RollingWindow { resets_at: None }:true:Some(4102444800)",
-                "eof:handled=true",
+                "eof:handled=true:blocking=true",
             ]
         );
     }

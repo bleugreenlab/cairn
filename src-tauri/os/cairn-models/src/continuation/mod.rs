@@ -53,6 +53,15 @@
 //! the same per-token rate, and the only thing separating them is how many tokens
 //! each sends ([`prefix_cache_state`], [`cold_reseed_pays`]).
 //!
+//! The cache is also per organization. Anthropic isolates prompt caches by
+//! organization, and separate subscriptions are separate organizations, so a
+//! session whose next launch authenticates as a different account than its last
+//! request reads cold however recent that request was ([`prefix_cache_reading`]).
+//! That is still a cost reading, never a viability one: the conversation resumes
+//! on the new account either way, and the same savings guard decides whether a
+//! rebuild is worth it. An account Cairn cannot attribute on either side changes
+//! nothing, because unknown is not cold.
+//!
 //! The second question may never answer the first. A cold prefix does not replace
 //! a conversation on its own — it earns the right to be priced, and the savings
 //! guard refuses the rebuild unless it materially lowers the bill. The
@@ -180,6 +189,64 @@ pub fn prefix_cache_state(
     }
 }
 
+/// Why a prefix reads cold, carried onto the boundary of the continuation it
+/// priced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdCause {
+    /// The provider's horizon has passed since the last request.
+    HorizonElapsed,
+    /// The next launch authenticates as a different account than the last
+    /// request ran on, and the cache does not cross organizations.
+    AccountChanged,
+}
+
+impl ColdCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ColdCause::HorizonElapsed => "horizon_elapsed",
+            ColdCause::AccountChanged => "account_changed",
+        }
+    }
+}
+
+/// A prefix cache reading together with why it is cold, when it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefixReading {
+    pub state: PrefixCacheState,
+    pub cold_cause: Option<ColdCause>,
+}
+
+/// Read the prefix's cache state from the clock and from the accounts on both
+/// sides of the continuation: the one the last provider request ran on, and the
+/// one the next launch will authenticate as.
+///
+/// Two known, different accounts read cold whatever the clock says. Anything
+/// else is [`prefix_cache_state`]'s reading unchanged, so an account Cairn could
+/// not attribute on either side never makes a prefix cold.
+pub fn prefix_cache_reading(
+    backend: ResumeBackend,
+    last_provider_request_at: Option<i64>,
+    last_request_account: Option<&str>,
+    launch_account: Option<&str>,
+    now: i64,
+) -> PrefixReading {
+    if last_provider_request_at.is_some() {
+        if let (Some(last), Some(launch)) = (last_request_account, launch_account) {
+            if last != launch {
+                return PrefixReading {
+                    state: PrefixCacheState::Cold,
+                    cold_cause: Some(ColdCause::AccountChanged),
+                };
+            }
+        }
+    }
+    let state = prefix_cache_state(backend, last_provider_request_at, now);
+    PrefixReading {
+        state,
+        cold_cause: (state == PrefixCacheState::Cold).then_some(ColdCause::HorizonElapsed),
+    }
+}
+
 /// A cold rebuild must at least halve what the next request sends. Below that,
 /// native resume costs about the same money and keeps the conversation, so
 /// rebuilding is a pure loss.
@@ -268,6 +335,8 @@ pub struct CacheDecision {
     pub candidate_seed_bytes: Option<i64>,
     /// The ratio the refusal was measured against.
     pub threshold: Option<f64>,
+    /// Why the prefix read cold.
+    pub cold_cause: Option<ColdCause>,
 }
 
 impl CacheDecision {
@@ -288,7 +357,15 @@ impl CacheDecision {
             prefix_bytes: None,
             candidate_seed_bytes: None,
             threshold: None,
+            cold_cause: None,
         }
+    }
+
+    /// Name why the prefix read cold. Applied by the host that took the
+    /// reading, so the pricing functions stay ignorant of where it came from.
+    pub fn with_cold_cause(mut self, cause: Option<ColdCause>) -> Self {
+        self.cold_cause = cause;
+        self
     }
 
     /// A cold prefix that was priced and kept. Both measurements ride along,
@@ -301,6 +378,7 @@ impl CacheDecision {
             prefix_bytes: Some(prefix_bytes),
             candidate_seed_bytes: Some(candidate_seed_bytes),
             threshold: Some(COLD_RESEED_MIN_SAVINGS_RATIO),
+            cold_cause: None,
         }
     }
 
@@ -315,6 +393,7 @@ impl CacheDecision {
             prefix_bytes: None,
             candidate_seed_bytes: None,
             threshold: None,
+            cold_cause: None,
         }
     }
 }
@@ -554,6 +633,52 @@ mod tests {
             prefix_cache_state(ResumeBackend::Claude, None, 10 * 24 * 60 * 60),
             PrefixCacheState::Unknown
         );
+    }
+
+    /// Seconds after the last request, a launch on another account reads cold:
+    /// the new organization holds no cache for this prefix. Removing the account
+    /// comparison makes this read warm.
+    #[test]
+    fn an_account_change_reads_the_prefix_cold_inside_the_horizon() {
+        let reading = prefix_cache_reading(ResumeBackend::Claude, Some(0), Some("a"), Some("b"), 5);
+        assert_eq!(reading.state, PrefixCacheState::Cold);
+        assert_eq!(reading.cold_cause, Some(ColdCause::AccountChanged));
+        assert_eq!(
+            decide_continue_action("claude", Some("sess"), Some("claude"), reading.state, false),
+            ContinueAction::MaybeReseed
+        );
+        // Codex too: the cold reading outranks its native-resume preference.
+        let codex = prefix_cache_reading(ResumeBackend::Codex, Some(0), Some("a"), Some("b"), 5);
+        assert_eq!(codex.state, PrefixCacheState::Cold);
+        // And past the horizon an account change still names itself.
+        let late =
+            prefix_cache_reading(ResumeBackend::Claude, Some(0), Some("a"), Some("b"), 7_200);
+        assert_eq!(late.cold_cause, Some(ColdCause::AccountChanged));
+    }
+
+    #[test]
+    fn the_same_or_an_unknown_account_keeps_todays_reading() {
+        for (last, launch) in [
+            (Some("a"), Some("a")),
+            (None, Some("b")),
+            (Some("a"), None),
+            (None, None),
+        ] {
+            for now in [5, 3_599, 3_600, 7_200] {
+                let reading =
+                    prefix_cache_reading(ResumeBackend::Claude, Some(0), last, launch, now);
+                let today = prefix_cache_state(ResumeBackend::Claude, Some(0), now);
+                assert_eq!(reading.state, today, "{last:?} -> {launch:?} at {now}");
+                assert_eq!(
+                    reading.cold_cause,
+                    (today == PrefixCacheState::Cold).then_some(ColdCause::HorizonElapsed)
+                );
+            }
+        }
+        // No request on record: there is no prefix to have moved.
+        let none = prefix_cache_reading(ResumeBackend::Claude, None, Some("a"), Some("b"), 5);
+        assert_eq!(none.state, PrefixCacheState::Unknown);
+        assert_eq!(none.cold_cause, None);
     }
 
     /// A cold Codex prefix must reach the pricing decision at all. Warm, it

@@ -426,6 +426,14 @@ async fn run_scheduler_loop(orch: Orchestrator) {
                 });
         let mut provider_holds = Vec::new();
         for db in orch.db.all_dbs().await {
+            if let Err(error) = crate::orchestrator::wakes::supersede_orphaned_provider_limit_holds(
+                &db,
+                Utc::now().timestamp(),
+            )
+            .await
+            {
+                log::error!("Failed to retire orphaned provider limit holds: {error}");
+            }
             match crate::orchestrator::wakes::load_active_provider_limit_holds(&db).await {
                 Ok(holds) => provider_holds.extend(holds),
                 Err(error) => log::error!("Failed to load provider limit holds: {error}"),

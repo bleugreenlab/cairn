@@ -645,6 +645,11 @@ pub struct ProviderAccountHealth {
     pub windows: Vec<cairn_models_types::usage::ProviderUsageWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_until: Option<i64>,
+    /// Whether `blocked_until` is a reset the provider declared, rather than
+    /// Cairn's own re-probe guess. Absent reads as a guess, so a block recorded
+    /// before provenance existed never acquires a timer anyone can wait on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub blocked_until_declared: bool,
     /// Credit exhaustion cannot be inferred to have healed with time. Only an
     /// explicit operator retry clears this marker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -652,7 +657,70 @@ pub struct ProviderAccountHealth {
     pub captured_at: i64,
 }
 
+/// Until when a blocked account cannot serve, and on whose word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountBlock {
+    /// A reset the provider declared.
+    Declared(i64),
+    /// Cairn's bounded re-probe after a refusal that declared no reset.
+    Reprobe(i64),
+}
+
+impl AccountBlock {
+    pub fn until(self) -> i64 {
+        match self {
+            AccountBlock::Declared(at) | AccountBlock::Reprobe(at) => at,
+        }
+    }
+
+    pub fn is_declared(self) -> bool {
+        matches!(self, AccountBlock::Declared(_))
+    }
+}
+
+/// When the accounts a routing policy may select can next serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutedAvailability {
+    /// This account can serve now.
+    Now(String),
+    /// None can serve now; this account is the first whose declared resets
+    /// have all passed at this instant.
+    At(i64, String),
+    /// Every candidate is blocked with no declared end: credits, a re-probe
+    /// guess, or an exhausted window with no reset.
+    Unknown,
+    /// The policy selects no routed account at all.
+    NoCandidates,
+}
+
 impl ProviderAccountHealth {
+    /// When this account can serve `requested_model` again, judged only on
+    /// what the provider declared: `Some(now)` when nothing blocks it, the
+    /// latest declared end of everything that does, or `None` when something
+    /// blocking it has no declared end.
+    fn available_at(&self, requested_model: Option<&str>, now: i64) -> Option<i64> {
+        if self.depleted.is_some() {
+            return None;
+        }
+        let mut at = now;
+        if let Some(until) = self.blocked_until.filter(|until| *until > now) {
+            if !self.blocked_until_declared {
+                return None;
+            }
+            at = at.max(until);
+        }
+        for window in self
+            .windows
+            .iter()
+            .filter(|window| window.is_live_at(self.captured_at, now))
+            .filter(|window| window.matches_model(requested_model))
+            .filter(|window| window.remaining_percent <= 0.0)
+        {
+            at = at.max(window.resets_at?);
+        }
+        Some(at)
+    }
+
     /// Whether the provider has told Cairn this account cannot run yet.
     fn is_blocked(&self, now: i64) -> bool {
         self.depleted.is_some() || self.blocked_until.is_some_and(|until| until > now)
@@ -1283,13 +1351,8 @@ impl CredentialStore {
             });
         }
 
-        accounts
-            .into_iter()
-            .filter(|account| {
-                excluded_id != Some(account.id.as_str())
-                    && provider.routes(&account.auth)
-                    && account.serves_backend(backend)
-            })
+        self.routed_candidates(provider, project_id)
+            .filter(|account| excluded_id != Some(account.id.as_str()))
             .filter_map(|account| {
                 let (headroom, since) = match account.health.as_ref() {
                     Some(health) => {
@@ -1322,6 +1385,58 @@ impl CredentialStore {
                 },
             )
             .map(|(account, _, _)| account)
+    }
+
+    /// The subscription accounts Automatic routing chooses among.
+    fn routed_candidates<'a>(
+        &'a self,
+        provider: RoutedProvider,
+        project_id: Option<&str>,
+    ) -> impl Iterator<Item = &'a ProviderAccount> + 'a {
+        let backend = provider.backend();
+        self.accounts_for_provider(provider.api_provider(), project_id)
+            .into_iter()
+            .filter(move |account| {
+                provider.routes(&account.auth) && account.serves_backend(backend)
+            })
+    }
+
+    /// When the accounts a routing policy may select can next serve: the
+    /// explicit account alone, or every Automatic candidate. Each account is
+    /// available once the latest of its declared blocks has passed; across
+    /// accounts the earliest wins. Credit exhaustion and re-probe guesses
+    /// declare nothing, so they never supply a time.
+    pub fn routed_availability(
+        &self,
+        provider: RoutedProvider,
+        project_id: Option<&str>,
+        explicit_account: Option<&str>,
+        requested_model: Option<&str>,
+        now: i64,
+    ) -> RoutedAvailability {
+        let mut candidates = 0usize;
+        let earliest = self
+            .routed_candidates(provider, project_id)
+            .filter(|account| explicit_account.is_none_or(|id| account.id == id))
+            .inspect(|_| candidates += 1)
+            .filter_map(|account| {
+                let at = match account.health.as_ref() {
+                    Some(health) => health.available_at(requested_model, now)?,
+                    None => now,
+                };
+                Some((at, account))
+            })
+            .min_by(|(left_at, left), (right_at, right)| {
+                left_at
+                    .cmp(right_at)
+                    .then_with(|| left.sort_order.cmp(&right.sort_order))
+            });
+        match earliest {
+            Some((at, account)) if at <= now => RoutedAvailability::Now(account.id.clone()),
+            Some((at, account)) => RoutedAvailability::At(at, account.id.clone()),
+            None if candidates == 0 => RoutedAvailability::NoCandidates,
+            None => RoutedAvailability::Unknown,
+        }
     }
 
     /// The overrides that pin one named account of a backend, or `None` when no
@@ -1703,6 +1818,7 @@ mod account_operation_tests {
         store.accounts[0].health = Some(ProviderAccountHealth {
             windows: Vec::new(),
             blocked_until: Some(99),
+            blocked_until_declared: false,
             depleted: None,
             captured_at: 1,
         });
@@ -1847,10 +1963,110 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            blocked_until_declared: false,
             depleted: None,
             captured_at,
         });
         account
+    }
+
+    /// `id` with its five-hour window exhausted until `window_reset` and, when
+    /// given, a block until `block.0`, declared by the provider when `block.1`.
+    fn limited(id: &str, window_reset: Option<i64>, block: Option<(i64, bool)>) -> ProviderAccount {
+        let mut account = healthy_claude_account(id, 0.0, 100);
+        let health = account.health.as_mut().unwrap();
+        health.windows[0].resets_at = window_reset;
+        if let Some((until, declared)) = block {
+            health.blocked_until = Some(until);
+            health.blocked_until_declared = declared;
+        }
+        account
+    }
+
+    fn availability(
+        store: &CredentialStore,
+        explicit: Option<&str>,
+        model: Option<&str>,
+    ) -> RoutedAvailability {
+        store.routed_availability(RoutedProvider::Claude, None, explicit, model, 200)
+    }
+
+    #[test]
+    fn earliest_availability_takes_the_min_across_accounts_of_each_accounts_max() {
+        let mut store = test_store();
+        // A is declared blocked until 7_400; its exhausted window resets
+        // sooner, so A serves at 7_400. B's block ends at 3_800 but its window
+        // stays exhausted until 5_000, so B serves at 5_000.
+        store.accounts = vec![
+            limited("a", Some(300), Some((7_400, true))),
+            limited("b", Some(5_000), Some((3_800, true))),
+        ];
+        assert_eq!(
+            availability(&store, None, None),
+            RoutedAvailability::At(5_000, "b".to_string())
+        );
+        // An explicit policy waits on its own account alone.
+        assert_eq!(
+            availability(&store, Some("a"), None),
+            RoutedAvailability::At(7_400, "a".to_string())
+        );
+        // Any account that can serve now wins outright.
+        store.accounts.push(healthy_claude_account("c", 50.0, 100));
+        assert_eq!(
+            availability(&store, None, None),
+            RoutedAvailability::Now("c".to_string())
+        );
+    }
+
+    #[test]
+    fn credits_and_reprobe_guesses_have_no_availability() {
+        let mut store = test_store();
+        assert_eq!(
+            availability(&store, None, None),
+            RoutedAvailability::NoCandidates
+        );
+
+        let mut credits = limited("credits", Some(300), None);
+        credits.health.as_mut().unwrap().depleted = Some(AccountDepletion {
+            since: 150,
+            detail: "credits_required".to_string(),
+        });
+        let guess = limited("guess", Some(300), Some((500, false)));
+        let no_reset = limited("no-reset", None, None);
+        store.accounts = vec![credits, guess, no_reset];
+        assert_eq!(
+            availability(&store, None, None),
+            RoutedAvailability::Unknown
+        );
+
+        // A block persisted before provenance existed reads as a guess.
+        let legacy: ProviderAccountHealth = serde_json::from_value(serde_json::json!({
+            "windows": [], "blockedUntil": 500, "capturedAt": 100
+        }))
+        .unwrap();
+        assert!(!legacy.blocked_until_declared);
+        assert_eq!(legacy.available_at(None, 200), None);
+    }
+
+    #[test]
+    fn a_model_scoped_exhausted_window_counts_only_for_its_model() {
+        let mut store = test_store();
+        let mut account = healthy_claude_account("a", 80.0, 100);
+        let mut fable = account.health.as_ref().unwrap().windows[0].clone();
+        fable.id = "weekly_scoped-fable".to_string();
+        fable.scope_target = Some("Fable".to_string());
+        fable.remaining_percent = 0.0;
+        fable.resets_at = Some(9_000);
+        account.health.as_mut().unwrap().windows.push(fable);
+        store.accounts = vec![account];
+        assert_eq!(
+            availability(&store, None, Some("claude-fable-5-1")),
+            RoutedAvailability::At(9_000, "a".to_string())
+        );
+        assert_eq!(
+            availability(&store, None, Some("claude-opus-4-1")),
+            RoutedAvailability::Now("a".to_string())
+        );
     }
 
     #[test]
@@ -2411,6 +2627,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            blocked_until_declared: false,
             depleted: None,
             captured_at,
         });

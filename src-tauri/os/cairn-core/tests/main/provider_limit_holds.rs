@@ -14,7 +14,8 @@ use cairn_core::internal::execution::jobs::{
 };
 use cairn_core::internal::orchestrator::lifecycle::{finalize_run, stop_job};
 use cairn_core::internal::orchestrator::wakes::{
-    load_active_provider_limit_holds, resolve_provider_limit_hold, ProviderLimitHold,
+    load_active_provider_limit_holds, resolve_provider_limit_hold,
+    supersede_orphaned_provider_limit_holds, ProviderLimitHold,
 };
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::services::testing::{
@@ -540,12 +541,8 @@ async fn resolution_claims_and_launches_exactly_one_successor() {
     assert_eq!(recorder.spawn_count(), 1);
 }
 
-// A limit on one account is a reason to wait only when no other account can take
-// the work. With an eligible replacement, the session is repinned and the hold is
-// due immediately rather than at the exhausted account's reset.
-#[tokio::test]
-async fn a_limit_with_an_eligible_replacement_switches_accounts_and_resumes_now() {
-    let (_temp, db, orch, _recorder) = fixture().await;
+/// Two managed Claude accounts, with the session pinned to the first.
+async fn two_accounts(orch: &Orchestrator, db: &LocalDb) -> (String, String) {
     let [exhausted, replacement] = ["Work Max", "Personal Max"].map(|label| {
         orch.add_account(
             cairn_core::credentials::ApiProvider::Anthropic,
@@ -562,6 +559,261 @@ async fn a_limit_with_an_eligible_replacement_switches_accounts_and_resumes_now(
     )
     .await
     .unwrap();
+    (exhausted, replacement)
+}
+
+/// Stream a recorded Claude stdout through the production reader and host.
+fn read_stream(orch: &Orchestrator, db: &Arc<LocalDb>, stdout: &'static str) {
+    let runtime = claude_runtime(
+        orch,
+        &orch.services.emitter,
+        "run",
+        Some("session".into()),
+        db.clone(),
+    );
+    let db = db.clone();
+    std::thread::spawn(move || {
+        cairn_session::backends::claude::ClaudeRuntime::reader_thread(
+            &runtime,
+            "run",
+            Some("session".into()),
+            false,
+            Box::new(std::io::Cursor::new(stdout.as_bytes())),
+            None,
+            db,
+        )
+    })
+    .join()
+    .expect("reader thread");
+}
+
+const TOOL_IN_FLIGHT: &str =
+    include_str!("../../../cairn-session/tests/fixtures/claude_limit_tool_in_flight.jsonl");
+const TOOL_ANSWERED: &str =
+    include_str!("../../../cairn-session/tests/fixtures/claude_limit_tool_answered.jsonl");
+
+async fn only_hold(db: &LocalDb) -> ProviderLimitHold {
+    let holds = load_active_provider_limit_holds(db).await.unwrap();
+    assert_eq!(holds.len(), 1, "the refusal must arm one durable hold");
+    holds.into_iter().next().unwrap()
+}
+
+// Recorded 2026-09-03: a tool_use whose result never reached the stream before
+// the 429. The account still fails over, but the work waits for an operator,
+// because the CLI may already have run the tool.
+#[tokio::test]
+async fn a_tool_in_flight_holds_without_a_timer() {
+    let (_temp, db, orch, recorder) = fixture().await;
+    let (exhausted, replacement) = two_accounts(&orch, &db).await;
+    read_stream(&orch, &db, TOOL_IN_FLIGHT);
+
+    let hold = only_hold(&db).await;
+    assert_eq!(hold.resume_gate.as_deref(), Some("tool_in_flight"));
+    assert_eq!(hold.boundary_source, "account_switch");
+    assert_eq!(hold.account_id.as_deref(), Some(exhausted.as_str()));
+    assert_eq!(
+        text(
+            &db,
+            "SELECT account_id FROM sessions WHERE id=?1",
+            "session"
+        )
+        .await,
+        replacement,
+        "failover bookkeeping still runs"
+    );
+    assert_held(&db).await;
+    assert_eq!(hold.next_due_at(), None);
+    for now in [OBSERVED_AT, RESET_AT, i64::MAX] {
+        assert!(!resolve_provider_limit_hold(&orch, &hold, now)
+            .await
+            .unwrap());
+    }
+    assert_eq!(turns(&db).await, 1);
+    assert_eq!(recorder.spawn_count(), 0);
+    let note = text(
+        &db,
+        "SELECT data FROM events WHERE run_id=?1 AND data LIKE '%provider_limit_hold%'",
+        "run",
+    )
+    .await;
+    assert!(note.contains("did not resume automatically"), "{note}");
+    assert!(note.contains("tool_in_flight"), "{note}");
+
+    // One explicit continue is authoritative over the gated hold, which then has
+    // no head left to own.
+    continue_job_impl(&orch, "a", None, None, None).unwrap();
+    assert_eq!(turns(&db).await, 2);
+    assert!(!resolve_provider_limit_hold(&orch, &hold, i64::MAX)
+        .await
+        .unwrap());
+    assert_eq!(
+        supersede_orphaned_provider_limit_holds(&db, RESET_AT)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM provider_limit_holds WHERE id=?1",
+            &hold.id
+        )
+        .await,
+        "superseded"
+    );
+}
+
+/// A live process mid-turn on `account`, so stdout EOF reads as the process
+/// exiting under the turn rather than as a host-initiated stop.
+fn register_live_process(orch: &Orchestrator, account: &str) {
+    let mut handle = cairn_core::internal::agent_process::process::RunHandle::test_handle(
+        Some("session"),
+        Some("a"),
+    );
+    handle.account_id = Some(account.to_string());
+    orch.process_state
+        .processes
+        .lock()
+        .unwrap()
+        .register("run".to_string(), handle);
+    orch.process_state.begin_turn("run", "turn");
+}
+
+// Acceptance 3. The CLI reports a blocking limit and exits before any terminal
+// result. That is the same refusal a terminal 429 is: the account fails over and
+// the work resumes on the replacement through the same hold, with no crash and
+// no operator input.
+#[tokio::test]
+async fn a_blocking_rate_limit_exit_without_a_result_holds_and_fails_over() {
+    let (_temp, db, orch, _recorder) = fixture().await;
+    let (exhausted, replacement) = two_accounts(&orch, &db).await;
+    register_live_process(&orch, &exhausted);
+    read_stream(
+        &orch,
+        &db,
+        r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":4102444800}}"#,
+    );
+
+    let hold = only_hold(&db).await;
+    assert_eq!(hold.boundary_source, "account_switch");
+    assert_eq!(hold.resume_gate, None);
+    assert_eq!(hold.account_id.as_deref(), Some(exhausted.as_str()));
+    assert_held(&db).await;
+    assert_eq!(
+        text(
+            &db,
+            "SELECT account_id FROM sessions WHERE id=?1",
+            "session"
+        )
+        .await,
+        replacement
+    );
+    assert_eq!(
+        text(&db, "SELECT status FROM runs WHERE id=?1", "run").await,
+        "exited",
+        "a held exit is not a crash"
+    );
+    assert_eq!(
+        common::scalar_i64_by_id(
+            &db,
+            "SELECT COUNT(*) FROM runs WHERE id=?1 AND exit_reason IS NOT NULL",
+            "run"
+        )
+        .await,
+        0
+    );
+    let now = chrono::Utc::now().timestamp();
+    assert!(resolve_provider_limit_hold(&orch, &hold, now)
+        .await
+        .unwrap());
+    assert_eq!(common::scalar_i64_by_id(&db, "SELECT COUNT(*) FROM turns WHERE job_id=?1 AND start_reason='wait_resolved' AND predecessor_id='turn'", "a").await, 1);
+}
+
+// The credits shape: the CLI's synthetic credits message, then a generic error
+// result with no 429 status. It fails over through the hold like any limit.
+#[tokio::test]
+async fn a_credits_message_before_a_generic_error_holds() {
+    let (_temp, db, orch, _recorder) = fixture().await;
+    let (exhausted, replacement) = two_accounts(&orch, &db).await;
+    register_live_process(&orch, &exhausted);
+    read_stream(
+        &orch,
+        &db,
+        concat!(
+            r#"{"type":"assistant","uuid":"a1","session_id":"s1","is_api_error_message":true,"api_error_status":429,"error_details":"credits_required","message":{"role":"assistant","model":"<synthetic>","content":[{"type":"text","text":"Manage credits with /usage-credits"}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","session_id":"s1","is_error":true,"result":"You're out of usage credits."}"#,
+        ),
+    );
+
+    let hold = only_hold(&db).await;
+    assert_eq!(hold.boundary_source, "account_switch");
+    assert_held(&db).await;
+    assert_eq!(
+        text(
+            &db,
+            "SELECT account_id FROM sessions WHERE id=?1",
+            "session"
+        )
+        .await,
+        replacement
+    );
+    let note = text(
+        &db,
+        "SELECT data FROM events WHERE run_id=?1 AND data LIKE '%provider_limit_hold%'",
+        "run",
+    )
+    .await;
+    assert!(
+        note.replace('\\', "")
+            .contains(r#""depletionKind":"credits""#),
+        "{note}"
+    );
+    assert!(note.contains(exhausted.as_str()), "{note}");
+}
+
+// The sweep retires only holds that lost their head: a live hold is untouched.
+#[tokio::test]
+async fn a_hold_that_still_owns_its_head_is_not_retired() {
+    let (_temp, db, orch, _recorder) = fixture().await;
+    let hold = hold(&orch, &db, "Usage limit reached").await;
+    assert_eq!(
+        supersede_orphaned_provider_limit_holds(&db, RESET_AT)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        text(
+            &db,
+            "SELECT state FROM provider_limit_holds WHERE id=?1",
+            &hold.id
+        )
+        .await,
+        "active"
+    );
+}
+
+#[tokio::test]
+async fn an_answered_tool_call_fails_over_and_resumes_on_its_own() {
+    let (_temp, db, orch, _recorder) = fixture().await;
+    two_accounts(&orch, &db).await;
+    read_stream(&orch, &db, TOOL_ANSWERED);
+
+    let hold = only_hold(&db).await;
+    assert_eq!(hold.resume_gate, None);
+    assert_eq!(hold.boundary_source, "account_switch");
+    assert!(hold.next_due_at().is_some());
+    assert_held(&db).await;
+}
+
+// A limit on one account is a reason to wait only when no other account can take
+// the work. With an eligible replacement, the session is repinned and the hold is
+// due immediately rather than at the exhausted account's reset.
+#[tokio::test]
+async fn a_limit_with_an_eligible_replacement_switches_accounts_and_resumes_now() {
+    let (_temp, db, orch, _recorder) = fixture().await;
+    let (exhausted, replacement) = two_accounts(&orch, &db).await;
 
     let hold = hold(&orch, &db, LIMIT).await;
     assert_eq!(hold.boundary_source, "account_switch");

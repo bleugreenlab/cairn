@@ -2938,6 +2938,7 @@ pub(crate) async fn continue_into_permission_successor(
             },
         )),
         preclaimed_successor_turn_id: Some(successor_turn_id.to_string()),
+        answers_open_tool_call: true,
         unwind_preclaimed_start_as: Some(TurnEndReason::PermissionResumeRefused),
         ..Default::default()
     };

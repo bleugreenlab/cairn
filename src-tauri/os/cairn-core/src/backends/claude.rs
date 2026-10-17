@@ -16,11 +16,11 @@ use cairn_models::interface::session::{
 use cairn_models::wire::claude_stream::{ProviderDepletion, RateLimitInfo, StreamEvidence};
 
 use super::run_state::{
-    is_task_spawned_run, resolve_run_db, run_backend_db, run_job_id, run_status,
-    transition_run_to_live,
+    is_task_spawned_run, record_run_account, resolve_run_db, run_backend_db, run_job_id,
+    run_status, transition_run_to_live,
 };
 
-use crate::credentials::RoutedProvider;
+use crate::credentials::{AccountBlock, RoutedProvider};
 use crate::models::{ContextTokenState, RunStatus, TurnEndReason};
 use crate::orchestrator::session::{
     assemble_prompt_segments, flatten_prompt_segments, get_claude_path, insert_error_event,
@@ -323,16 +323,25 @@ fn next_reset_in_zone<T: chrono::TimeZone>(
     None
 }
 
+/// Fail the account over when policy allows, then yield the refused turn and arm
+/// the hold that owns it. Returns whether the account's health was persisted.
+/// On `Err` neither the yield nor the hold landed, and the caller settles the
+/// turn as the refusal it observed.
 fn hold_claude_provider_limit(
     host: &ClaudeReaderHost,
-    data: &serde_json::Value,
-    depletion: ProviderDepletion,
-    block_recorded: bool,
-    blocking_reset: Option<i64>,
-    now: i64,
+    report: ProviderLimitReport<'_>,
 ) -> Result<bool, String> {
-    use crate::orchestrator::wakes::{yield_and_arm_provider_limit_hold, ProviderLimitObservation};
-    let text = data.get("result").and_then(serde_json::Value::as_str);
+    use crate::orchestrator::wakes::{
+        yield_and_arm_provider_limit_hold, ProviderLimitObservation, RESUME_GATE_TOOL_IN_FLIGHT,
+    };
+    let ProviderLimitReport {
+        result_text: text,
+        depletion,
+        block_recorded,
+        blocking_reset,
+        tool_in_flight,
+        now,
+    } = report;
     let parsed = text.and_then(|text| parse_claude_reset_boundary(text, now));
     let (reset, source) = if let Some(reset) = blocking_reset {
         (Some(reset), "rate_limit_event")
@@ -364,7 +373,7 @@ fn hold_claude_provider_limit(
     let explicitly_pinned = rotation
         .as_ref()
         .is_some_and(|rotation| rotation.explicitly_pinned);
-    let (reset, source) = if switched_to.is_some() {
+    let (mut reset, source) = if switched_to.is_some() {
         (Some(now), "account_switch")
     } else if credits {
         // Credits do not refill on a clock Cairn can see.
@@ -372,6 +381,31 @@ fn hold_claude_provider_limit(
     } else {
         (reset, source)
     };
+    // No account can take the work now. Under Automatic policy the wait ends
+    // when the first account it may select can serve again, which is this
+    // account's own reset only when no other comes sooner. An explicit pin
+    // waits on its own account.
+    let mut boundary_account: Option<(String, String)> = None;
+    if let Some(rotation) = rotation
+        .as_ref()
+        .filter(|rotation| rotation.replacement.is_none() && !rotation.explicitly_pinned)
+    {
+        if let crate::credentials::RoutedAvailability::At(at, account) =
+            host.orch.routed_availability(
+                RoutedProvider::Claude,
+                rotation.target.project_id.as_deref(),
+                rotation.explicit_policy.as_deref(),
+                rotation.target.model.as_deref(),
+                now,
+            )
+        {
+            if account != rotation.target.account_id {
+                reset = Some(at);
+                let label = account_label(&rotation.accounts, &account);
+                boundary_account = Some((account, label));
+            }
+        }
+    }
     let db = host.run_db.clone();
     let run = host.run_id.clone();
     let (job_id, turn_id, pinned_account) = run_backend_db(CLAUDE_BACKEND_NAME, async move {
@@ -413,6 +447,8 @@ fn hold_claude_provider_limit(
         retry_not_before: reset,
         boundary_source: source.to_string(),
         observed_text: text.map(str::to_string),
+        resume_gate: tool_in_flight.then_some(RESUME_GATE_TOOL_IN_FLIGHT),
+        boundary_account_id: boundary_account.as_ref().map(|(id, _)| id.clone()),
         now,
     };
     let db = host.run_db.clone();
@@ -424,19 +460,7 @@ fn hold_claude_provider_limit(
         let _ = emitter.emit("db-change", change);
         Ok::<_, String>(hold)
     });
-    let hold = match armed {
-        Ok(hold) => hold,
-        Err(error) => {
-            // Neither the yield nor its hold landed. Settle the turn the way an
-            // exhausted account does: unfinished and resumable on an explicit
-            // continuation, never a completion and never an unowned yield.
-            crate::orchestrator::lifecycle::interrupt_run_for_provider_depletion(
-                &host.orch,
-                &host.run_id,
-            );
-            return Err(error);
-        }
-    };
+    let hold = armed?;
     crate::orchestrator::lifecycle::warm_provider_held_run(&host.orch, &host.run_id);
     // The warm process carries the exhausted account's credentials; the resumed
     // turn must cold-start on the replacement pin.
@@ -454,7 +478,28 @@ fn hold_claude_provider_limit(
             .map(|rotation| rotation.old_label.clone())
             .unwrap_or_else(|| "Claude".to_string());
         let stamp = |at: i64| crate::clock::stamp(at).unwrap_or_else(|| at.to_string());
-        let content = if let Some((_, to)) = &switched_to {
+        let content = if tool_in_flight {
+            // Account bookkeeping and the repin above still happened; only the
+            // automatic resume is withheld.
+            let why = if credits {
+                "has no usage credits left"
+            } else {
+                "reached its usage limit"
+            };
+            let resume = match (&switched_to, reset) {
+                (Some((_, to)), _) => {
+                    format!("Switched this session to {to}; continue once to resume on it.")
+                }
+                (None, Some(at)) => format!(
+                    "Continue once to resume after the provider reset at {}.",
+                    stamp(at)
+                ),
+                (None, None) => {
+                    "Continue once to resume when the account is available again.".to_string()
+                }
+            };
+            format!("{account} {why} while a tool call was still waiting for its result, so Cairn did not resume automatically: resuming could run that tool call again. {resume}")
+        } else if let Some((_, to)) = &switched_to {
             format!("{account} reached its usage limit. Switched this session to {to}; the unfinished work will continue on it automatically.")
         } else if explicitly_pinned {
             let why = if credits {
@@ -472,7 +517,16 @@ fn hold_claude_provider_limit(
             } else {
                 ""
             };
+            let why = if credits {
+                "has no usage credits left"
+            } else {
+                "reached its usage limit"
+            };
             match reset {
+                Some(at) if boundary_account.is_some() => {
+                    let (_, first) = boundary_account.as_ref().expect("checked above");
+                    format!("{account} {why}{none_left}. Work is held until {first} resets at {}, then account selection runs again and the work continues automatically.", stamp(at))
+                }
                 _ if credits => format!("{account} has no usage credits left{none_left}. Work remains held until an operator continues it."),
                 Some(at) => format!("{account} reached its usage limit{none_left}. Work is held until the provider reset at {}, then will continue automatically.", stamp(at)),
                 None => format!("{account} reached its usage limit{none_left}, without a readable reset time. Work remains held until an operator continues it."),
@@ -491,7 +545,9 @@ fn hold_claude_provider_limit(
                 "fromAccountId":account_id,
                 "fromAccountLabel":rotation.as_ref().map(|rotation| rotation.old_label.clone()),
                 "toAccountId":to_id,"toAccountLabel":to_label,
-                "explicitlyPinned":explicitly_pinned}),
+                "explicitlyPinned":explicitly_pinned,
+                "boundaryAccountId":boundary_account.as_ref().map(|(id, _)| id.clone()),
+                "resumeGate":tool_in_flight.then_some(RESUME_GATE_TOOL_IN_FLIGHT)}),
         )?;
     }
     Ok(quarantined)
@@ -617,6 +673,330 @@ mod reset_boundary_tests {
     }
 }
 
+#[cfg(test)]
+mod account_reach_tests {
+    //! A hold with no account to fail over to waits for the first account its
+    //! policy may select, and re-arms rather than launching into a refusal.
+    use super::*;
+    use crate::credentials::{AccountBlock, ApiProvider, ProviderAuth};
+    use crate::orchestrator::wakes::{
+        load_active_provider_limit_holds, resolve_provider_limit_hold, ProviderLimitHold,
+    };
+
+    struct Fixture {
+        orch: Orchestrator,
+        db: Arc<LocalDb>,
+        refused: String,
+        other: String,
+        now: i64,
+    }
+
+    async fn fixture(name: &str) -> Fixture {
+        fixture_with(name, None).await
+    }
+
+    /// [`fixture`], with an Anthropic API key configured beside the two
+    /// subscription accounts when `api_key` is given.
+    async fn fixture_with(name: &str, api_key: Option<&str>) -> Fixture {
+        use crate::identity::CredentialStoreExt;
+        let db = Arc::new(crate::storage::migrated_test_db(name).await);
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+               VALUES('a','p','i','running','builder','builder','session','opus',1,1);
+             INSERT INTO sessions(id,job_id,backend,backend_id,status,sequence,created_at,updated_at)
+               VALUES('session','a','claude','native','open',1,1,1);
+             INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,start_mode,created_at,updated_at)
+               VALUES('run','p','i','a','session','live','resume',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,start_reason,created_at,updated_at)
+               VALUES('turn','session','run','a',1,'running','initial',1,1);
+             UPDATE jobs SET current_turn_id='turn' WHERE id='a';",
+        )
+        .await
+        .unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        let state = Arc::new(crate::db::DbState::new(
+            db.clone(),
+            Arc::new(crate::storage::SearchIndex::open_or_create(root.join("search.db")).unwrap()),
+        ));
+        let store = crate::credentials::CredentialStore::from_user_identity(
+            &crate::identity::UserIdentity {
+                user_id: "u".to_string(),
+                email: "u@example.com".to_string(),
+                name: "U".to_string(),
+                claude_auth: api_key
+                    .map(|key| crate::credentials::ClaudeAuth::ApiKey(key.to_string())),
+                codex_auth: None,
+                github_token: None,
+            },
+        );
+        let orch = Orchestrator::builder(
+            state,
+            Arc::new(crate::services::testing::TestServicesBuilder::new().build()),
+            root,
+        )
+        .credential_store(Some(store))
+        .build();
+        let [refused, other] = ["Work Max", "Personal Max"].map(|label| {
+            orch.add_account(
+                ApiProvider::Anthropic,
+                label.to_string(),
+                ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap()
+            .id
+        });
+        db.execute(
+            "UPDATE sessions SET account_id=?1 WHERE id='session'",
+            params![refused.as_str()],
+        )
+        .await
+        .unwrap();
+        Fixture {
+            orch,
+            db,
+            refused,
+            other,
+            now: chrono::Utc::now().timestamp(),
+        }
+    }
+
+    const HOUR: i64 = 60 * 60;
+
+    /// The refused account resets at T+2h; the other is already limited until
+    /// T+1h. A 429 arrives on the refused one, declaring its reset.
+    async fn limit_both(f: &Fixture) -> ProviderLimitHold {
+        f.orch
+            .record_account_health(
+                &f.other,
+                Vec::new(),
+                Some(AccountBlock::Declared(f.now + HOUR)),
+            )
+            .unwrap();
+        let runtime = claude_runtime(
+            &f.orch,
+            &f.orch.services.emitter,
+            "run",
+            Some("session".into()),
+            f.db.clone(),
+        );
+        dispatch_claude_result(
+            runtime.host.as_ref(),
+            true,
+            &serde_json::json!({"type":"result","is_error":true,"api_error_status":429,
+                                "result":"You've hit your session limit"}),
+            ClaudeResultContext {
+                blocking_reset: Some(f.now + 2 * HOUR),
+                ..Default::default()
+            },
+            f.now,
+        );
+        let mut holds = load_active_provider_limit_holds(&f.db).await.unwrap();
+        assert_eq!(holds.len(), 1, "the refusal arms one hold");
+        holds.remove(0)
+    }
+
+    fn blocked_until(f: &Fixture, account: &str) -> Option<i64> {
+        f.orch
+            .get_credential_store()
+            .unwrap()
+            .accounts
+            .into_iter()
+            .find(|candidate| candidate.id == account)
+            .and_then(|candidate| candidate.health)
+            .and_then(|health| health.blocked_until)
+    }
+
+    async fn pinned(f: &Fixture) -> Option<String> {
+        crate::sessions::queries::get(&f.db, "session")
+            .await
+            .unwrap()
+            .account_id
+    }
+
+    // Acceptance 4. Due at the other account's T+1h, not the refused one's
+    // T+2h; at resolution selection runs again and picks the other account,
+    // while each account keeps its own reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn all_accounts_limited_waits_for_the_earliest_reset_and_reselects() {
+        let f = fixture("earliest-reset").await;
+        let hold = limit_both(&f).await;
+        assert_eq!(hold.retry_not_before, Some(f.now + HOUR));
+        assert_eq!(hold.boundary_account_id.as_deref(), Some(f.other.as_str()));
+        assert_eq!(hold.boundary_source, "rate_limit_event");
+        assert_eq!(hold.account_id.as_deref(), Some(f.refused.as_str()));
+        let due = hold.next_due_at().unwrap();
+        assert!((f.now + HOUR..=f.now + HOUR + 120).contains(&due), "{due}");
+        assert_eq!(blocked_until(&f, &f.refused), Some(f.now + 2 * HOUR));
+        assert_eq!(pinned(&f).await.as_deref(), Some(f.refused.as_str()));
+
+        // The other account's reset passes.
+        f.orch
+            .record_account_health(&f.other, Vec::new(), None)
+            .unwrap();
+        // Test builds cannot spawn a managed profile, so the launch itself may
+        // be refused after the claim; selection has run by then.
+        let _ = resolve_provider_limit_hold(&f.orch, &hold, due).await;
+        assert_eq!(
+            f.db.query_opt_i64(
+                "SELECT COUNT(*) FROM turns WHERE predecessor_id='turn' AND start_reason='wait_resolved'",
+                (),
+            )
+            .await
+            .unwrap(),
+            Some(1),
+            "the due hold claimed its successor"
+        );
+        assert_eq!(pinned(&f).await.as_deref(), Some(f.other.as_str()));
+        assert_eq!(
+            blocked_until(&f, &f.refused),
+            Some(f.now + 2 * HOUR),
+            "the refused account keeps its own reset"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_pin_waits_on_its_own_reset() {
+        let f = fixture("explicit-own-reset").await;
+        f.orch
+            .set_project_overrides(
+                "p",
+                Some(crate::credentials::AccountOverrides {
+                    anthropic_account_id: Some(f.refused.clone()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let hold = limit_both(&f).await;
+        assert_eq!(hold.retry_not_before, Some(f.now + 2 * HOUR));
+        assert_eq!(hold.boundary_account_id, None);
+    }
+
+    async fn successors(f: &Fixture) -> Option<i64> {
+        f.db.query_opt_i64(
+            "SELECT COUNT(*) FROM turns WHERE predecessor_id='turn' AND start_reason='wait_resolved'",
+            (),
+        )
+        .await
+        .unwrap()
+    }
+
+    // The gate asks launch routing, which keeps a healthy pin before it consults
+    // policy. A policy changed to an account that cannot serve does not hold
+    // back a session whose own account has recovered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_healthy_pin_launches_though_the_policy_names_an_unavailable_account() {
+        let f = fixture("healthy-pin-launches").await;
+        let hold = limit_both(&f).await;
+        f.orch
+            .set_project_overrides(
+                "p",
+                Some(crate::credentials::AccountOverrides {
+                    anthropic_account_id: Some(f.other.clone()),
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        f.orch
+            .record_account_health(
+                &f.other,
+                Vec::new(),
+                Some(AccountBlock::Declared(f.now + 3 * HOUR)),
+            )
+            .unwrap();
+        f.orch
+            .record_account_health(&f.refused, Vec::new(), None)
+            .unwrap();
+
+        let _ = resolve_provider_limit_hold(&f.orch, &hold, hold.next_due_at().unwrap()).await;
+        assert_eq!(successors(&f).await, Some(1), "the healthy pin launches");
+        assert_eq!(pinned(&f).await.as_deref(), Some(f.refused.as_str()));
+    }
+
+    // Under Automatic, routing falls back to a configured API key when no
+    // subscription can serve, so the hold launches rather than waiting on one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_api_key_fallback_launches_under_automatic() {
+        let f = fixture_with("api-key-fallback-launches", Some("test-key")).await;
+        let hold = limit_both(&f).await;
+        f.orch
+            .record_account_health(
+                &f.other,
+                Vec::new(),
+                Some(AccountBlock::Declared(f.now + 3 * HOUR)),
+            )
+            .unwrap();
+
+        let _ = resolve_provider_limit_hold(&f.orch, &hold, hold.next_due_at().unwrap()).await;
+        assert_eq!(
+            successors(&f).await,
+            Some(1),
+            "the API-key fallback launches"
+        );
+    }
+
+    // The boundary named an account that was limited again before it came due.
+    // Launching would only burn an attempt on a refusal, so the hold re-arms to
+    // the next account that can serve, here the refused one's own reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_boundary_rearms_instead_of_burning_launch_attempts() {
+        let f = fixture("stale-boundary").await;
+        let hold = limit_both(&f).await;
+        f.orch
+            .record_account_health(
+                &f.other,
+                Vec::new(),
+                Some(AccountBlock::Declared(f.now + 3 * HOUR)),
+            )
+            .unwrap();
+        let due = hold.next_due_at().unwrap();
+        assert!(!resolve_provider_limit_hold(&f.orch, &hold, due)
+            .await
+            .unwrap());
+
+        let rearmed = load_active_provider_limit_holds(&f.db)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(rearmed.id, hold.id);
+        assert_eq!(rearmed.retry_not_before, Some(f.now + 2 * HOUR));
+        assert_eq!(rearmed.boundary_account_id, None);
+        assert_eq!(rearmed.launch_attempts, 0);
+        assert_eq!(
+            f.db.query_opt_i64("SELECT COUNT(*) FROM turns WHERE job_id='a'", ())
+                .await
+                .unwrap(),
+            Some(1),
+            "nothing was claimed"
+        );
+
+        // With every account blocked on a guess, there is no time to wait for.
+        for account in [&f.refused, &f.other] {
+            f.orch
+                .record_account_health(
+                    account,
+                    Vec::new(),
+                    Some(AccountBlock::Reprobe(f.now + 4 * HOUR)),
+                )
+                .unwrap();
+        }
+        let due = rearmed.next_due_at().unwrap();
+        assert!(!resolve_provider_limit_hold(&f.orch, &rearmed, due)
+            .await
+            .unwrap());
+        let timerless = load_active_provider_limit_holds(&f.db)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(timerless.retry_not_before, None);
+        assert_eq!(timerless.next_due_at(), None);
+        assert_eq!(timerless.launch_attempts, 0);
+    }
+}
+
 /// Whether a stored `runs.status` names a run that still owns its process.
 /// Parsed through [`RunStatus`] so legacy spellings map to their canonical
 /// state and no status literal is compared here.
@@ -643,8 +1023,8 @@ enum EofVerdict {
     /// Exited mid-run without a terminal Result while still running. Finalize
     /// Crashed, which *interrupts* the running turn rather than failing it —
     /// leaving the job resumable (Pending), not completed-and-advanced and not
-    /// cascade-failed. A blocking rate-limit exit lands here too; the rate-limit
-    /// signal refines the diagnostic/error message, not the verdict.
+    /// cascade-failed. A blocking rate-limit exit lands here too, and is held
+    /// rather than crashed when its hold can be armed.
     Crashed,
     /// Already terminal before EOF; nothing to finalize.
     AlreadyTerminal,
@@ -690,19 +1070,19 @@ fn classify_eof(
 #[derive(Debug)]
 struct RateLimitRetryTarget {
     session_id: String,
-    turn_id: String,
     project_id: Option<String>,
     account_id: String,
     model: Option<String>,
 }
 
-/// The session, turn, and account a run's provider outcome belongs to.
+/// The session and account a run's provider outcome belongs to.
 ///
 /// Bound to the run itself, never to the job head: by the time a depletion is
-/// handled the job may already point at a successor session or turn. The
+/// handled the job may already point at a successor session. The
 /// account is the one whose credentials were frozen into this run's process at
-/// launch, falling back to the run session's durable pin when the process is
-/// no longer registered.
+/// launch: the registered process's, else the run's recorded launch account.
+/// The session pin is the last resort, because a failover is exactly what moves
+/// it away from the account that was refused.
 fn rate_limit_retry_target(
     orch: &Orchestrator,
     db: &Arc<LocalDb>,
@@ -713,47 +1093,47 @@ fn rate_limit_retry_target(
     let run = run_id.to_string();
     let session = session_id.map(str::to_string);
     let row = run_backend_db(CLAUDE_BACKEND_NAME, async move {
-        db.read(|conn| Box::pin(async move {
-            let mut rows = conn.query(
-                "SELECT s.id, j.current_turn_id, COALESCE(r.project_id, i.project_id), s.account_id, j.model
+        db.read(|conn| {
+            Box::pin(async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT s.id, COALESCE(r.project_id, i.project_id),
+                        COALESCE(r.account_id, s.account_id), j.model
                    FROM runs r
                    JOIN jobs j ON j.id = r.job_id
                    LEFT JOIN issues i ON i.id = r.issue_id
                    JOIN sessions s ON s.id = COALESCE(?2, j.current_session_id)
                   WHERE r.id = ?1
                   LIMIT 1",
-                (run.as_str(), session.as_deref()),
-            ).await?;
-            let Some(row) = rows.next().await? else { return Ok(None); };
-            Ok(Some((
-                row.text(0)?,
-                row.opt_text(1)?,
-                row.opt_text(2)?,
-                row.opt_text(3)?,
-                row.opt_text(4)?,
-            )))
-        })).await.map_err(|error| error.to_string())
+                        (run.as_str(), session.as_deref()),
+                    )
+                    .await?;
+                let Some(row) = rows.next().await? else {
+                    return Ok(None);
+                };
+                Ok(Some((
+                    row.text(0)?,
+                    row.opt_text(1)?,
+                    row.opt_text(2)?,
+                    row.opt_text(3)?,
+                )))
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())
     })?;
-    let Some((session_id, head_turn_id, project_id, pinned_account_id, model)) = row else {
+    let Some((session_id, project_id, launch_account_id, model)) = row else {
         return Ok(None);
     };
     let Some(account_id) = orch
         .process_state
         .get_account_id(run_id)
-        .or(pinned_account_id)
-    else {
-        return Ok(None);
-    };
-    let Some(turn_id) = orch
-        .process_state
-        .get_current_turn_id(run_id)
-        .or(head_turn_id)
+        .or(launch_account_id)
     else {
         return Ok(None);
     };
     Ok(Some(RateLimitRetryTarget {
         session_id,
-        turn_id,
         project_id,
         account_id,
         model,
@@ -790,6 +1170,9 @@ struct AccountRotation {
     /// `(account id, label)` the session is now pinned to.
     replacement: Option<(String, String)>,
     explicitly_pinned: bool,
+    /// The account the routing policy names, if it names one.
+    explicit_policy: Option<String>,
+    accounts: Vec<crate::credentials::AccountInfo>,
 }
 
 /// Record a depleted account's health, then repin the session away from it.
@@ -816,11 +1199,12 @@ fn rotate_depleted_account(
             .record_account_health(
                 &target.account_id,
                 Vec::new(),
-                resets_at.or_else(|| {
-                    Some(
+                Some(match resets_at {
+                    Some(at) => AccountBlock::Declared(at),
+                    None => AccountBlock::Reprobe(
                         chrono::Utc::now().timestamp()
                             + TERMINAL_429_REPROBE_AFTER.as_secs() as i64,
-                    )
+                    ),
                 }),
             )
             .map(|_| ()),
@@ -896,57 +1280,15 @@ fn rotate_depleted_account(
     } else {
         None
     };
+    let explicit_policy = explicit_policy.map(str::to_string);
     Some(AccountRotation {
         target,
         old_label,
         replacement,
         explicitly_pinned,
+        explicit_policy,
+        accounts,
     })
-}
-
-fn handle_provider_depletion(
-    orch: &Orchestrator,
-    run_db: &Arc<LocalDb>,
-    run_id: &str,
-    session_id: Option<&str>,
-    depletion: ProviderDepletion,
-    health_recorded: bool,
-) -> bool {
-    let Some(AccountRotation {
-        target,
-        old_label,
-        replacement,
-        explicitly_pinned,
-    }) = rotate_depleted_account(orch, run_db, run_id, session_id, depletion, health_recorded)
-    else {
-        return false;
-    };
-    let (replacement_id, replacement_label) = replacement.unzip();
-
-    let kind = match depletion {
-        ProviderDepletion::Credits => "credits",
-        ProviderDepletion::RollingWindow { .. } => "rolling_window",
-    };
-    let message = match replacement_label.as_ref() {
-        Some(new_label) => format!("{old_label} is unavailable. Switched this provider session to {new_label}; continue once to resume safely. The interrupted turn was not replayed."),
-        None if explicitly_pinned => format!("The Claude account chosen for this execution, {old_label}, is unavailable. Choose another account or Automatic, then continue once. The interrupted turn was not replayed."),
-        None => format!("{old_label} is unavailable and no eligible Claude account remains. The interrupted turn was not replayed."),
-    };
-    let _ = crate::messages::transcript::insert_system_message_sync(
-        orch,
-        run_id,
-        session_id,
-        Some(&target.turn_id),
-        &message,
-        serde_json::json!({"provider":"claude","kind":"provider_account_depleted","depletionKind":kind,"fromAccountId":target.account_id,"fromAccountLabel":old_label,"toAccountId":replacement_id,"toAccountLabel":replacement_label,"needsExplicitContinuation":true}),
-    );
-    if matches!(
-        orch.process_state.get_occupancy(run_id),
-        Some(crate::agent_process::process::RunOccupancy::Idle)
-    ) {
-        crate::orchestrator::lifecycle::release_and_stop_process(orch, run_id);
-    }
-    true
 }
 
 /// Look up `(job_id, execution_id)` for a run, for the crash diagnostic.
@@ -1311,6 +1653,12 @@ impl AgentBackend for ClaudeBackend {
             );
             active_process.model = effective_model.clone();
             active_process.account_id = config.account_id.clone();
+            record_run_account(
+                CLAUDE_BACKEND_NAME,
+                &run_db,
+                &config.run_id,
+                config.account_id.as_deref(),
+            );
             let fed_account = launched.facts.account_id.clone();
             active_process.facts = Some(launched.facts);
             // Only a process with a live stdin can take a renewed credential;
@@ -2722,9 +3070,12 @@ impl ClaudeHost for ClaudeReaderHost {
             return false;
         };
         let provider_reset = info.and_then(|info| info.resets_at.or(info.overage_resets_at));
-        let blocked_until = provider_reset.or(Some(
-            snapshot.captured_at + TERMINAL_429_REPROBE_AFTER.as_secs() as i64,
-        ));
+        let blocked_until = Some(match provider_reset {
+            Some(at) => AccountBlock::Declared(at),
+            None => AccountBlock::Reprobe(
+                snapshot.captured_at + TERMINAL_429_REPROBE_AFTER.as_secs() as i64,
+            ),
+        });
         let health_windows = if provider_reset.is_some() {
             snapshot.windows
         } else {
@@ -2741,39 +3092,24 @@ impl ClaudeHost for ClaudeReaderHost {
             }
         }
     }
-    fn provider_depleted(
-        &self,
-        depletion: ProviderDepletion,
-        snapshot: ProviderUsageSnapshot,
-        block_recorded: bool,
-    ) -> bool {
-        self.orch.store_provider_usage_snapshot(snapshot);
-        handle_provider_depletion(
-            &self.orch,
-            &self.run_db,
-            &self.run_id,
-            self.session_id.as_deref(),
-            depletion,
-            block_recorded,
-        )
-    }
-    fn provider_limit_result(
-        &self,
-        data: &serde_json::Value,
-        depletion: ProviderDepletion,
-        block_recorded: bool,
-        blocking_reset: Option<i64>,
-        now: i64,
-    ) -> bool {
-        let result =
-            hold_claude_provider_limit(self, data, depletion, block_recorded, blocking_reset, now);
-        if let Err(error) = &result {
-            // A failed durable write must never fall through to successful completion.
-            self.error(&format!(
-                "Could not persist the provider limit hold: {error}. Work remains unfinished."
-            ));
+    fn provider_limit_result(&self, report: ProviderLimitReport<'_>) -> bool {
+        match hold_claude_provider_limit(self, report) {
+            Ok(quarantined) => quarantined,
+            Err(error) => {
+                // Neither the yield nor its hold landed. Settle the turn the
+                // way an exhausted account does: unfinished and resumable on an
+                // explicit continuation, never a completion and never an
+                // unowned yield.
+                crate::orchestrator::lifecycle::interrupt_run_for_provider_depletion(
+                    &self.orch,
+                    &self.run_id,
+                );
+                self.error(&format!(
+                    "Could not persist the provider limit hold: {error}. Work remains unfinished."
+                ));
+                false
+            }
         }
-        result.unwrap_or(false)
     }
     fn context_snapshot(&self, snapshot: ContextTokenState) {
         self.orch.store_context_token_snapshot(snapshot);
@@ -2821,10 +3157,12 @@ impl ClaudeHost for ClaudeReaderHost {
     fn eof(&self, report: ClaudeEof) {
         let ClaudeEof {
             evidence,
-            mut persisted_rate_limit_quarantine,
+            persisted_rate_limit_quarantine,
             pending_depletion,
             depletion_handled,
             turn_block_recorded,
+            blocking_reset,
+            tool_in_flight,
             terminal_tool_called,
             backend_failure,
         } = report;
@@ -2890,18 +3228,42 @@ impl ClaudeHost for ClaudeReaderHost {
                      saw_blocking_rate_limit={saw_blocking_rate_limit} run_status={run_status_val:?}"
                 );
 
-                // A blocking exit whose turn never reached a terminal result
-                // has not been handled by `provider_depleted` yet.
+                // A blocking limit whose turn never reached a terminal result is
+                // the same refusal a terminal 429 is, and holds the same way.
+                // The process is gone, so the held run settles as an exit: the
+                // provider-yielded turn stays owned by its hold.
+                let mut persisted_rate_limit_quarantine = persisted_rate_limit_quarantine;
                 if saw_blocking_rate_limit && !depletion_handled {
-                    persisted_rate_limit_quarantine = handle_provider_depletion(
-                        orch,
-                        &run_db,
-                        run_id,
-                        session_id.as_deref(),
-                        pending_depletion
-                            .unwrap_or(ProviderDepletion::RollingWindow { resets_at: None }),
-                        turn_block_recorded,
-                    ) || turn_block_recorded;
+                    let held = hold_claude_provider_limit(
+                        self,
+                        ProviderLimitReport {
+                            result_text: None,
+                            depletion: pending_depletion
+                                .unwrap_or(ProviderDepletion::RollingWindow { resets_at: None }),
+                            block_recorded: turn_block_recorded,
+                            blocking_reset,
+                            tool_in_flight,
+                            now: chrono::Utc::now().timestamp(),
+                        },
+                    );
+                    match held {
+                        Ok(_) => {
+                            log::info!(
+                                "Claude process {} exited at a provider limit; the turn is held",
+                                &run_id[..run_id.len().min(8)]
+                            );
+                            crate::orchestrator::lifecycle::finalize_run(
+                                orch,
+                                run_id,
+                                RunStatus::Exited,
+                            );
+                            return;
+                        }
+                        Err(error) => {
+                            log::warn!("Could not hold the provider-limited run {run_id}: {error}");
+                            persisted_rate_limit_quarantine |= turn_block_recorded;
+                        }
+                    }
                 }
 
                 let error_message = if saw_blocking_rate_limit && persisted_rate_limit_quarantine {

@@ -975,6 +975,7 @@ pub(crate) async fn resolve(
                         Some(ResumeContext {
                             suppress_user_event: true,
                             preclaimed_successor_turn_id: Some(turn_id),
+                            answers_open_tool_call: true,
                             goal_reactivation: goal_owner.map(
                                 crate::execution::jobs::GoalReactivation::OwnedConditionResolved,
                             ),

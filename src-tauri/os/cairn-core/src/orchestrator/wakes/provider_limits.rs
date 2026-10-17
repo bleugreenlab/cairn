@@ -26,14 +26,23 @@ pub struct ProviderLimitHold {
     pub created_at: i64,
     pub updated_at: i64,
     pub resolved_at: Option<i64>,
+    /// Why automatic resolution is withheld whatever the boundary says.
+    pub resume_gate: Option<String>,
+    /// The account whose reset the boundary is, when not this hold's own.
+    pub boundary_account_id: Option<String>,
 }
+
+/// The limit landed while a tool call had no recorded result. Resuming could run
+/// that call a second time, so only an explicit continue resumes the work.
+pub const RESUME_GATE_TOOL_IN_FLIGHT: &str = "tool_in_flight";
 
 impl ProviderLimitHold {
     /// Stable FNV-1a jitter, independent of process hash seeds and restarts.
     /// The jitter spreads jobs released by one shared reset; a switch to another
-    /// account has no shared instant to spread, so it is due as declared.
+    /// account has no shared instant to spread, so it is due as declared. A gated
+    /// hold keeps its boundary for the record but is never due.
     pub fn next_due_at(&self) -> Option<i64> {
-        if self.state != "active" {
+        if self.state != "active" || self.resume_gate.is_some() {
             return None;
         }
         if self.boundary_source == "account_switch" {
@@ -60,10 +69,16 @@ pub struct ProviderLimitObservation {
     pub retry_not_before: Option<i64>,
     pub boundary_source: String,
     pub observed_text: Option<String>,
+    /// [`RESUME_GATE_TOOL_IN_FLIGHT`] when a tool call had no recorded result.
+    pub resume_gate: Option<&'static str>,
+    /// The account whose reset `retry_not_before` is, when it is not this
+    /// hold's own: the earliest any account the policy may select can serve.
+    /// `boundary_source` then still says how this hold's own limit was seen.
+    pub boundary_account_id: Option<String>,
     pub now: i64,
 }
 
-const COLUMNS: &str = "id, job_id, run_id, turn_id, backend, account_id, retry_not_before, boundary_source, observed_text, observed_count, launch_attempts, state, created_at, updated_at, resolved_at";
+const COLUMNS: &str = "id, job_id, run_id, turn_id, backend, account_id, retry_not_before, boundary_source, observed_text, observed_count, launch_attempts, state, created_at, updated_at, resolved_at, resume_gate, boundary_account_id";
 
 fn from_row(row: &Row) -> DbResult<ProviderLimitHold> {
     Ok(ProviderLimitHold {
@@ -82,6 +97,8 @@ fn from_row(row: &Row) -> DbResult<ProviderLimitHold> {
         created_at: row.i64(12)?,
         updated_at: row.i64(13)?,
         resolved_at: row.opt_i64(14)?,
+        resume_gate: row.opt_text(15)?,
+        boundary_account_id: row.opt_text(16)?,
     })
 }
 
@@ -111,9 +128,17 @@ pub async fn yield_and_arm_provider_limit_hold(
     if !matches!(
         observation.boundary_source.as_str(),
         "rate_limit_event" | "result_text" | "account_switch" | "credits_depleted" | "unknown"
-    ) || (observation.retry_not_before.is_none() != timerless)
+    ) || (observation.boundary_account_id.is_none()
+        && observation.retry_not_before.is_none() != timerless)
+        || (observation.boundary_account_id.is_some() && observation.retry_not_before.is_none())
     {
         return Err("provider limit boundary and source disagree".into());
+    }
+    if observation
+        .resume_gate
+        .is_some_and(|gate| gate != RESUME_GATE_TOOL_IN_FLIGHT)
+    {
+        return Err("unknown provider limit resume gate".into());
     }
     db.write(move |conn| {
         let observation = observation.clone();
@@ -151,30 +176,55 @@ pub async fn yield_and_arm_provider_limit_hold(
             let existing = rows.next().await?.map(|row| row.text(0)).transpose()?;
             drop(rows);
             let id = if let Some(id) = existing {
-                // NULL observations do not erase a previously declared boundary.
+                // NULL observations do not erase a previously declared boundary,
+                // and no later observation lifts a resume gate.
+                let later = "?1 IS NOT NULL AND (retry_not_before IS NULL OR ?1 > retry_not_before)";
                 conn.execute(
-                    "UPDATE provider_limit_holds SET
-                       boundary_source=CASE WHEN ?1 IS NOT NULL AND (retry_not_before IS NULL OR ?1 > retry_not_before) THEN ?2 ELSE boundary_source END,
+                    &format!("UPDATE provider_limit_holds SET
+                       boundary_source=CASE WHEN {later} THEN ?2 ELSE boundary_source END,
+                       boundary_account_id=CASE WHEN {later} THEN ?7 ELSE boundary_account_id END,
                        retry_not_before=CASE WHEN retry_not_before IS NULL THEN ?1 WHEN ?1 IS NULL THEN retry_not_before ELSE MAX(retry_not_before, ?1) END,
+                       resume_gate=COALESCE(resume_gate, ?6),
                        observed_text=?3, observed_count=observed_count+1, updated_at=?4
-                     WHERE id=?5 AND state='active'",
-                    params![o.retry_not_before, o.boundary_source, o.observed_text, o.now, id.as_str()],
+                     WHERE id=?5 AND state='active'"),
+                    params![o.retry_not_before, o.boundary_source, o.observed_text, o.now, id.as_str(), o.resume_gate, o.boundary_account_id],
                 ).await?;
                 id
             } else {
                 let id = ids::mint_child(&o.job_id);
                 conn.execute(
                     "INSERT INTO provider_limit_holds
-                     (id,job_id,run_id,turn_id,backend,account_id,retry_not_before,boundary_source,observed_text,created_at,updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
+                     (id,job_id,run_id,turn_id,backend,account_id,retry_not_before,boundary_source,observed_text,created_at,updated_at,resume_gate,boundary_account_id)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10,?11,?12)",
                     params![id.as_str(), o.job_id, o.run_id, o.turn_id, o.backend, o.account_id,
-                        o.retry_not_before, o.boundary_source, o.observed_text, o.now],
+                        o.retry_not_before, o.boundary_source, o.observed_text, o.now, o.resume_gate,
+                        o.boundary_account_id],
                 ).await?;
                 id
             };
             load_conn(conn, &id).await?.ok_or_else(|| DbError::internal("armed hold disappeared".to_string()))
         })
     }).await.map_err(|error| error.to_string())
+}
+
+/// Retire every active hold whose provider-yielded turn is no longer its job's
+/// head. A hold exists to own that head; once an operator continues past it, the
+/// hold has nothing left to resolve. A timed hold would learn this at its claim,
+/// but a hold with no timer, or with automatic resume withheld, is never claimed.
+pub async fn supersede_orphaned_provider_limit_holds(
+    db: &LocalDb,
+    now: i64,
+) -> Result<u64, String> {
+    db.execute(
+        "UPDATE provider_limit_holds SET state='superseded', updated_at=?1
+         WHERE state='active' AND NOT EXISTS (
+           SELECT 1 FROM jobs j JOIN turns t ON t.id=j.current_turn_id
+           WHERE j.id=provider_limit_holds.job_id AND t.id=provider_limit_holds.turn_id
+             AND t.state='yielded' AND t.yield_reason='provider_limit')",
+        params![now],
+    )
+    .await
+    .map_err(|error| error.to_string())
 }
 
 pub async fn load_active_provider_limit_holds(
@@ -345,6 +395,91 @@ pub(crate) async fn restore_provider_hold_after_admission_failure(
     Ok(true)
 }
 
+/// Whether a due hold's work has an account to run on. A boundary is a reading
+/// taken when the hold was armed; by the time it comes due, the account it
+/// named may have been limited again. Launching anyway would only spend one of
+/// the hold's launch attempts on a refusal, so a hold whose launch routing would
+/// refuse re-arms to when a subscription the policy may select next can serve,
+/// or to no timer when none declares a time, and launches nothing. Whether the
+/// launch would be refused is asked of launch routing itself, so a healthy pin
+/// or an allowed API-key fallback launches exactly as a continue would.
+async fn hold_can_launch(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    hold: &ProviderLimitHold,
+    now: i64,
+) -> Result<bool, String> {
+    use crate::credentials::{RoutedAvailability, RoutedProvider};
+    let Some(provider) = RoutedProvider::for_backend(&hold.backend) else {
+        return Ok(true);
+    };
+    let job = hold.job_id.clone();
+    let Some((project_id, model, pinned)) = db
+        .query_opt(
+            "SELECT COALESCE(j.project_id, i.project_id), j.model, s.account_id FROM jobs j
+               LEFT JOIN issues i ON i.id = j.issue_id
+               LEFT JOIN sessions s ON s.id = j.current_session_id
+              WHERE j.id = ?1",
+            (job,),
+            |row| Ok((row.opt_text(0)?, row.opt_text(1)?, row.opt_text(2)?)),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(true);
+    };
+    let snapshot =
+        crate::orchestrator::session::snapshot_account_override_for_job(orch, &hold.job_id)?;
+    if crate::orchestrator::session::routed_session_can_launch(
+        orch,
+        provider,
+        pinned.as_deref(),
+        project_id.as_deref(),
+        model.as_deref(),
+        snapshot.as_deref(),
+    ) {
+        return Ok(true);
+    }
+    let explicit = snapshot.or_else(|| {
+        crate::orchestrator::session::routed_project_override(orch, provider, project_id.as_deref())
+    });
+    let (at, account) = match orch.routed_availability(
+        provider,
+        project_id.as_deref(),
+        explicit.as_deref(),
+        model.as_deref(),
+        now,
+    ) {
+        RoutedAvailability::Now(_) | RoutedAvailability::NoCandidates => return Ok(true),
+        RoutedAvailability::At(at, _) if at <= now => return Ok(true),
+        RoutedAvailability::At(at, account) => (Some(at), Some(account)),
+        RoutedAvailability::Unknown => (None, None),
+    };
+    let account = account.filter(|account| hold.account_id.as_deref() != Some(account.as_str()));
+    log::info!(
+        "Provider hold {} came due with no account able to serve; re-armed to {at:?}",
+        hold.id
+    );
+    let id = hold.id.clone();
+    db.write(move |conn| {
+        let id = id.clone();
+        let account = account.clone();
+        Box::pin(async move {
+            conn.execute(
+                "UPDATE provider_limit_holds SET retry_not_before=?1, boundary_account_id=?2,
+                   updated_at=?3
+                 WHERE id=?4 AND state='active'",
+                params![at, account, now, id.as_str()],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(false)
+}
+
 /// Resolve through owned-wait admission, never through an attention push or the
 /// model-capacity retry path (both would mint a competing successor).
 pub async fn resolve_provider_limit_hold(
@@ -366,6 +501,9 @@ pub async fn resolve_provider_limit_hold(
         })
         .await
         .map_err(|error| error.to_string())?;
+        return Ok(false);
+    }
+    if !hold_can_launch(orch, &db, hold, now).await? {
         return Ok(false);
     }
     let Some((hold, successor, session)) = claim(&db, &hold.id, now).await? else {
@@ -432,6 +570,8 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             resolved_at: None,
+            resume_gate: None,
+            boundary_account_id: None,
         };
         let due = hold.next_due_at().unwrap();
         assert!((1000..=1120).contains(&due));
@@ -446,6 +586,12 @@ mod tests {
             hold.next_due_at(),
             Some(1000),
             "an account switch is not jittered"
+        );
+        hold.resume_gate = Some(RESUME_GATE_TOOL_IN_FLIGHT.into());
+        assert_eq!(
+            hold.due_at(i64::MAX),
+            None,
+            "a gated hold is never due, whatever its boundary"
         );
     }
 }

@@ -3,9 +3,7 @@
 use crate::agent_process::completion::ClaudeTurnOutcome;
 use crate::backends::is_task_spawned_run;
 use crate::models::{RunStatus, TurnEndReason};
-use crate::orchestrator::lifecycle::{
-    finalize_run, interrupt_run_for_provider_depletion, transition_to_warm_state,
-};
+use crate::orchestrator::lifecycle::{finalize_run, transition_to_warm_state};
 use crate::orchestrator::session::insert_error_event;
 use crate::orchestrator::Orchestrator;
 use crate::services::EventEmitter;
@@ -34,22 +32,16 @@ pub(crate) fn apply_claude_turn_completion(
                     log::info!("Swallowed terminal-tool interrupt ack for run {} (work turn already warmed)", &run_id[..run_id.len().min(8)]);
                     return;
                 }
-                if !context.rate_limited {
-                    if was_host_interrupted(orch, run_id) {
-                        warm_and_emit(orch, emitter, run_id, None);
-                    } else {
-                        insert_error_event(orch, run_id, session_id, &message);
-                        // Claude's existing failure contract leaves the turn
-                        // resumable; Codex/HTTP task-aware failure is different.
-                        finalize_run(orch, run_id, RunStatus::Crashed);
-                    }
-                    return;
+                // A provider depletion never reaches here: the reader hands it
+                // to the usage-limit hold instead of completing the turn.
+                if was_host_interrupted(orch, run_id) {
+                    warm_and_emit(orch, emitter, run_id, None);
+                } else {
+                    insert_error_event(orch, run_id, session_id, &message);
+                    // Claude's existing failure contract leaves the turn
+                    // resumable; Codex/HTTP task-aware failure is different.
+                    finalize_run(orch, run_id, RunStatus::Crashed);
                 }
-                // The reader already persisted the account's health and any
-                // replacement pin. A depleted turn is resumable work, not a
-                // completed turn, so it never takes the warm path.
-                insert_error_event(orch, run_id, session_id, &message);
-                interrupt_run_for_provider_depletion(orch, run_id);
                 return;
             }
             ClaudeTurnOutcome::Completed => {}

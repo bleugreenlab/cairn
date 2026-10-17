@@ -166,6 +166,29 @@ impl Orchestrator {
         })
     }
 
+    /// When the accounts a routing policy may select can next serve, from the
+    /// stored health of each. See [`crate::credentials::CredentialStore::routed_availability`].
+    pub(crate) fn routed_availability(
+        &self,
+        provider: RoutedProvider,
+        project_id: Option<&str>,
+        explicit_account: Option<&str>,
+        requested_model: Option<&str>,
+        now: i64,
+    ) -> crate::credentials::RoutedAvailability {
+        self.get_credential_store()
+            .map(|store| {
+                store.routed_availability(
+                    provider,
+                    project_id,
+                    explicit_account,
+                    requested_model,
+                    now,
+                )
+            })
+            .unwrap_or(crate::credentials::RoutedAvailability::NoCandidates)
+    }
+
     /// Select a subscription account for a provider by remaining usage and
     /// resolve the runtime identity to it.
     pub(crate) fn select_routed_identity(
@@ -433,7 +456,7 @@ impl Orchestrator {
         &self,
         id: &str,
         windows: Vec<cairn_models::types::usage::ProviderUsageWindow>,
-        blocked_until: Option<i64>,
+        block: Option<crate::credentials::AccountBlock>,
     ) -> Result<String, String> {
         let mut guard = self
             .credential_store
@@ -447,7 +470,9 @@ impl Orchestrator {
             .ok_or_else(|| format!("Account not found: {id}"))?;
         account.health = Some(crate::credentials::ProviderAccountHealth {
             windows,
-            blocked_until,
+            blocked_until: block.map(crate::credentials::AccountBlock::until),
+            blocked_until_declared: block
+                .is_some_and(crate::credentials::AccountBlock::is_declared),
             depleted: account
                 .health
                 .as_ref()
@@ -623,6 +648,7 @@ impl Orchestrator {
             account.health = Some(crate::credentials::ProviderAccountHealth {
                 windows: snapshot.windows.clone(),
                 blocked_until: None,
+                blocked_until_declared: false,
                 depleted: account
                     .health
                     .as_ref()
@@ -1724,7 +1750,7 @@ fi
                 reset_at_text: None,
                 window_duration_mins: None,
             }],
-            Some(i64::MAX),
+            Some(crate::credentials::AccountBlock::Declared(i64::MAX)),
         )
         .expect("old health recorded");
         orch.store_provider_account_usage_snapshot(

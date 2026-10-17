@@ -1294,8 +1294,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        orch.record_account_health(&stale.id, vec![window("rolled", 0.0, 1_000)], Some(1_000))
-            .unwrap();
+        orch.record_account_health(
+            &stale.id,
+            vec![window("rolled", 0.0, 1_000)],
+            Some(crate::credentials::AccountBlock::Declared(1_000)),
+        )
+        .unwrap();
         // Still blocked, still measured.
         let current = orch
             .add_account(
@@ -1308,7 +1312,7 @@ mod tests {
         orch.record_account_health(
             &current.id,
             vec![window("fresh", 0.0, far_future)],
-            Some(far_future),
+            Some(crate::credentials::AccountBlock::Declared(far_future)),
         )
         .unwrap();
 

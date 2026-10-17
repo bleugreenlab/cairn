@@ -4,10 +4,13 @@ use crate::sessions::queries::RotationReason;
 use crate::threads::compaction::CompactionTrigger;
 use crate::threads::ThreadCompaction;
 use cairn_models::continuation::{
-    decide_continue_action, prefix_cache_state, price_cold_rebuild, reseed_step,
+    decide_continue_action, prefix_cache_reading, price_cold_rebuild, reseed_step,
     window_pressure_reached, CacheDecision, ColdRebuild, ContinueAction, PrefixCacheState,
-    ReseedStep, ResumeBackend, COLD_RESEED_MIN_SAVINGS_RATIO,
+    PrefixReading, ReseedStep, ResumeBackend, COLD_RESEED_MIN_SAVINGS_RATIO,
 };
+
+/// Log target for the continuation's cache-reading diagnostics.
+pub(crate) const CONTINUATION_LOG_TARGET: &str = "cairn::continuation";
 
 // ============================================================================
 // on_job_complete_impl
@@ -263,6 +266,9 @@ impl SessionBoundary {
             }
             if let Some(threshold) = cache.threshold {
                 object.insert("savingsThreshold".to_string(), threshold.into());
+            }
+            if let Some(cause) = cache.cold_cause {
+                object.insert("coldCause".to_string(), cause.as_str().into());
             }
         }
         raw
@@ -1965,6 +1971,12 @@ pub struct ResumeContext {
     /// `running` for the caller. Under the lock, a `running` preclaimed
     /// successor then always means some launch delivered it.
     pub(crate) unwind_preclaimed_start_as: Option<crate::models::TurnEndReason>,
+    /// The resume delivers a result into a tool call the native conversation is
+    /// still waiting on (a durable-suspend resolution, a permission answer). Only
+    /// that conversation can receive it, so such a resume never rotates onto a
+    /// rebuilt session. A provider-limit resolution delivers nothing and leaves
+    /// this false.
+    pub(crate) answers_open_tool_call: bool,
 }
 
 /// Validate a pre-created successor turn (owned-wait `WaitResolved` or
@@ -2043,6 +2055,7 @@ pub(crate) fn continue_automatic_retry(
             goal_reactivation: None,
             preclaimed_successor_turn_id: None,
             unwind_preclaimed_start_as: None,
+            answers_open_tool_call: false,
         }),
     )
 }
@@ -2396,6 +2409,9 @@ fn continue_job_launch_locked(
     // hands it here to reuse; that changes reconcile, reseed, and turn-selection
     // below (CAIRN-2970).
     let resuming_owned_wait = preclaimed_successor_turn_id.is_some();
+    let answers_open_tool_call = prompt_resume
+        .as_ref()
+        .is_some_and(|context| context.answers_open_tool_call);
     if let Some(retry_turn_id) = preclaimed_retry_turn_id.as_deref() {
         if job.parent_job_id.is_some()
             || job.recipe_node_id.is_some()
@@ -2680,24 +2696,62 @@ fn continue_job_launch_locked(
                     // horizon still pays cache creation on its full prefix on the
                     // next turn — which needs a warm-process teardown story
                     // before it can be closed safely (CAIRN-4757).
-                    let prefix_cache = if orch
+                    //
+                    // A warm process on a different account than this launch will
+                    // authenticate as is no exception: it is restarted on the new
+                    // account below, and that restart is a cold launch.
+                    let launch_account = launch_account_for_continuation(
+                        orch,
+                        &owning_db,
+                        &job,
+                        &project_id,
+                        &session,
+                        identity_override.is_some(),
+                    );
+                    let warm_process_serves_launch = orch
                         .process_state
                         .find_process_by_session(&session.id)
-                        .is_some()
-                    {
-                        PrefixCacheState::Warm
+                        .is_some_and(|run| {
+                            match (
+                                orch.process_state.get_account_id(&run),
+                                launch_account.as_deref(),
+                            ) {
+                                (Some(process), Some(launch)) => process == launch,
+                                _ => true,
+                            }
+                        });
+                    let prefix_reading = if warm_process_serves_launch {
+                        PrefixReading {
+                            state: PrefixCacheState::Warm,
+                            cold_cause: None,
+                        }
                     } else {
-                        prefix_cache_state(
+                        // The lookup prices the continuation and must never gate
+                        // it: a failure reads the way an absent request does.
+                        let last = match run_db(load_last_provider_request_for_session(
+                            owning_db.clone(),
+                            session.id.clone(),
+                        )) {
+                            Ok(last) => last,
+                            Err(error) => {
+                                log::warn!(
+                                    target: CONTINUATION_LOG_TARGET,
+                                    "Could not read the last provider request of session {}; \
+                                     continuing without a cache reading: {error}",
+                                    &session.id[..session.id.len().min(8)]
+                                );
+                                None
+                            }
+                        };
+                        prefix_cache_reading(
                             ResumeBackend::from_key(&session.backend),
-                            run_db(load_last_provider_request_for_session(
-                                owning_db.clone(),
-                                session.id.clone(),
-                            ))
-                            .ok()
-                            .flatten(),
+                            last.as_ref().map(|last| last.at),
+                            last.as_ref().and_then(|last| last.account_id.as_deref()),
+                            launch_account.as_deref(),
                             orch.services.clock.now(),
                         )
                     };
+                    let prefix_cache = prefix_reading.state;
                     let unconfirmed_spawned_launch =
                         session_has_unconfirmed_spawned_launch(&owning_db, &session);
                     match decide_continue_action(
@@ -2833,12 +2887,13 @@ fn continue_job_launch_locked(
                             // failure in the attempt falls open to native resume with
                             // session state untouched.
                             //
-                            // An owned-wait resume is the exception: it reuses a
-                            // successor turn already bound to this session, so a
-                            // reseed rotation would strand that turn. Take native
-                            // resume instead (CAIRN-2970).
+                            // A resume that answers an open tool call is the
+                            // exception: the result it carries can only be
+                            // delivered into the native conversation that issued
+                            // the call, so it never rotates. Any other owned-wait
+                            // successor is adopted onto a rebuilt session below.
                             let now_secs = orch.services.clock.now();
-                            let reseed = if resuming_owned_wait {
+                            let reseed = if answers_open_tool_call {
                                 ReseedDecision::NativeResume(None)
                             } else {
                                 attempt_session_reseed(
@@ -2859,15 +2914,18 @@ fn continue_job_launch_locked(
                                     let run_start_mode = run_start_mode(&session_start).to_string();
                                     let new_id = outcome.new_session_id.clone();
                                     reseed_outcome = Some(outcome);
-                                    session_boundary = Some(
-                                        SessionBoundary::digest_reseed(
-                                            session.backend.clone(),
-                                            reseed_outcome
-                                                .as_ref()
-                                                .map_or(0, |value| value.seed_content.len()),
-                                        )
-                                        .with_cache(decision),
-                                    );
+                                    session_boundary =
+                                        Some(
+                                            SessionBoundary::digest_reseed(
+                                                session.backend.clone(),
+                                                reseed_outcome
+                                                    .as_ref()
+                                                    .map_or(0, |value| value.seed_content.len()),
+                                            )
+                                            .with_cache(decision.map(|decision| {
+                                                decision.with_cold_cause(prefix_reading.cold_cause)
+                                            })),
+                                        );
                                     (new_id, session_start, run_start_mode)
                                 }
                                 ReseedDecision::NativeResume(decision) => {
@@ -2876,7 +2934,9 @@ fn continue_job_launch_locked(
                                     // reading forward rather than the conclusion is
                                     // what keeps its label and its detail set by
                                     // this same branch.
-                                    cache_decision = decision;
+                                    cache_decision = decision.map(|decision| {
+                                        decision.with_cold_cause(prefix_reading.cold_cause)
+                                    });
                                     let session_start = resolve_continue_session_start(&session)?;
                                     let run_start_mode = run_start_mode(&session_start).to_string();
                                     (session.id.clone(), session_start, run_start_mode)
@@ -4042,6 +4102,57 @@ enum ReseedDecision {
 ///
 /// The digest is rendered from the prior history *before* any rotation or new
 /// event, so it can never contain itself.
+/// The account this continuation's launch will authenticate as, resolved before
+/// the cache reading so the reading prices the launch that actually happens.
+///
+/// Admission resolves the same identity later and would repin there; doing it
+/// here first means admission finds an available pin and returns early, so
+/// selection still runs once. A healthy pinned session is untouched: the
+/// resolution returns at its pin without writing or selecting anything.
+/// Resolution failure is logged and leaves the stored pin as the answer;
+/// admission keeps its own refusal.
+fn launch_account_for_continuation(
+    orch: &Orchestrator,
+    owning_db: &Arc<LocalDb>,
+    job: &DbJob,
+    project_id: &str,
+    session: &Session,
+    identity_overridden: bool,
+) -> Option<String> {
+    let provider =
+        crate::credentials::RoutedProvider::for_backend(&session.backend.to_ascii_lowercase());
+    let (Some(provider), false) = (provider, identity_overridden) else {
+        return session.account_id.clone();
+    };
+    let resolved = crate::orchestrator::session::snapshot_account_override_for_job(orch, &job.id)
+        .and_then(|snapshot_account| {
+            crate::orchestrator::session::resolve_routed_session_identity(
+                orch,
+                provider,
+                &session.id,
+                Some(project_id),
+                job.model.as_deref(),
+                snapshot_account.as_deref(),
+            )
+        });
+    if let Err(error) = resolved {
+        log::warn!(
+            "Could not resolve the launch account of session {} before pricing its continuation: {error}",
+            &session.id[..session.id.len().min(8)]
+        );
+        return session.account_id.clone();
+    }
+    let db = owning_db.clone();
+    let session_id = session.id.clone();
+    run_db(async move {
+        crate::sessions::queries::get(&db, &session_id)
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .map(|session| session.account_id)
+    .unwrap_or_else(|_| session.account_id.clone())
+}
+
 fn attempt_session_reseed(
     orch: &Orchestrator,
     owning_db: &Arc<LocalDb>,
@@ -6171,7 +6282,8 @@ mod tests {
             ResumeBackend::from_key("claude"),
             super::load_last_provider_request_for_session(db.clone(), "s1".to_string())
                 .await
-                .unwrap(),
+                .unwrap()
+                .map(|last| last.at),
             now,
         )
     }
@@ -6704,7 +6816,8 @@ mod tests {
                 ResumeBackend::from_key(&session.backend),
                 super::load_last_provider_request_for_session(db.clone(), "s1".to_string())
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .map(|last| last.at),
                 now,
             );
             assert_eq!(
@@ -7149,7 +7262,8 @@ mod tests {
         let (_orch, db) = node_with_a_provider_request("cache-horizon-unknown-backend").await;
         let last = super::load_last_provider_request_for_session(db.clone(), "s1".to_string())
             .await
-            .unwrap();
+            .unwrap()
+            .map(|last| last.at);
         let ten_days = 10 * 24 * 60 * 60;
         assert_eq!(
             prefix_cache_state(ResumeBackend::from_key("openrouter"), last, ten_days),
@@ -7166,6 +7280,335 @@ mod tests {
             ContinueAction::MaybeReseed,
             "an unpriced backend must reach the same arm it reaches today"
         );
+    }
+
+    /// A job held at a provider limit and failed over: the session is now pinned
+    /// to `acct-b`, while its last provider request, seconds ago, ran on
+    /// `acct-a`. The held turn issued a tool call whose result is on record; a
+    /// `heavy` transcript carries enough tool output for a digest to pay.
+    async fn failed_over_node(
+        name: &str,
+        heavy: bool,
+    ) -> (Orchestrator, Arc<crate::storage::LocalDb>) {
+        let orch = test_orchestrator(migrated_test_db(name).await);
+        let db = orch.db.local.clone();
+        let now = orch.services.clock.now();
+        db.execute_script(
+            "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
+             INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','w','P','p','/tmp/p',1,1);
+             INSERT INTO issues(id,project_id,number,title,status,created_at,updated_at) VALUES('i','p',1,'I','active',1,1);
+             INSERT INTO jobs(id,project_id,issue_id,status,node_name,uri_segment,current_session_id,model,created_at,updated_at)
+               VALUES('j','p','i','running','builder','builder','s1','opus',1,1);
+             INSERT INTO sessions(id,job_id,backend,backend_id,account_id,status,sequence,created_at,updated_at)
+               VALUES('s1','j','claude','native-thread-1','acct-b','open',1,1,1);
+             INSERT INTO runs(id,job_id,session_id,account_id,status,start_mode,created_at,updated_at)
+               VALUES('r1','j','s1','acct-a','exited','resume',1,1);
+             INSERT INTO turns(id,session_id,run_id,job_id,sequence,state,yield_reason,start_reason,created_at,updated_at)
+               VALUES('held','s1','r1','j',1,'yielded','provider_limit','initial',1,1);
+             INSERT INTO turns(id,session_id,job_id,sequence,predecessor_id,state,start_reason,created_at,updated_at)
+               VALUES('successor','s1','j',2,'held','pending','wait_resolved',1,1);
+             UPDATE jobs SET current_turn_id='successor' WHERE id='j';",
+        )
+        .await
+        .unwrap();
+        let at = now - 5;
+        let call = serde_json::json!({
+            "content": "Reading the failing check first.",
+            "toolUses": [{"id": "tu-held", "name": "run", "input": {"command": "bun run check:held-turn-marker"}}],
+        });
+        let body = if heavy {
+            "held-turn tool output a resumed conversation would re-send\n".repeat(400)
+        } else {
+            "held-turn tool output\n".to_string()
+        } + "Exit code: 0";
+        let result =
+            serde_json::json!({"toolResult": body, "toolName": "run", "toolUseId": "tu-held"});
+        let rows = [
+            (
+                "e-user",
+                "user",
+                serde_json::json!({"content": "fix the failing check"}),
+                None,
+            ),
+            ("e-call", "assistant", call, Some(1200)),
+            ("e-result", "tool_result", result.clone(), None),
+        ];
+        for (sequence, (id, kind, data, tokens)) in rows.into_iter().enumerate() {
+            db.execute(
+                "INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp, event_type, data,
+                                    parent_tool_use_id, created_at, input_tokens, output_tokens)
+                 VALUES(?1, 'r1', 's1', 'held', ?2, ?3, ?4, ?5, NULL, ?3, ?6, ?6)",
+                params![id, sequence as i64, at, kind, data.to_string(), tokens],
+            )
+            .await
+            .unwrap();
+        }
+        if heavy {
+            for index in 0..8i64 {
+                db.execute(
+                    "INSERT INTO events(id, run_id, session_id, turn_id, sequence, timestamp, event_type, data,
+                                        parent_tool_use_id, created_at)
+                     VALUES(?1, 'r1', 's1', 'held', ?2, ?3, 'tool_result', ?4, NULL, ?3)",
+                    params![format!("e-bulk-{index}"), index + 10, at, result.to_string()],
+                )
+                .await
+                .unwrap();
+            }
+        }
+        (orch, db)
+    }
+
+    fn hold_resolution(answers_open_tool_call: bool) -> super::ResumeContext {
+        super::ResumeContext {
+            preclaimed_successor_turn_id: Some("successor".to_string()),
+            suppress_user_event: true,
+            suppress_self_suspend_note: true,
+            answers_open_tool_call,
+            ..Default::default()
+        }
+    }
+
+    async fn session_boundaries(db: &crate::storage::LocalDb) -> Vec<serde_json::Value> {
+        db.query_all(
+            "SELECT data FROM events WHERE event_type = 'system:session_boundary' ORDER BY created_at, sequence",
+            (),
+            |row| crate::storage::RowExt::text(row, 0),
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap()["raw"].clone())
+        .collect()
+    }
+
+    async fn current_session(db: &crate::storage::LocalDb) -> String {
+        db.query_opt_text("SELECT current_session_id FROM jobs WHERE id = 'j'", ())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Acceptance 1. The account moved seconds after the last request, so the
+    /// prefix reads cold on the new organization, the resolution of the hold
+    /// takes the digest, and exactly one boundary names why. With the account
+    /// comparison removed, or with the blanket owned-wait guard restored, this
+    /// resumes natively instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failover_resume_reseeds_from_the_digest_when_it_pays() {
+        let (orch, db) = failed_over_node("failover-reseeds", true).await;
+        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
+            .expect("the hold's resolution launches");
+
+        let successor_session = current_session(&db).await;
+        assert_ne!(successor_session, "s1", "the failover resumed natively");
+        let boundaries = session_boundaries(&db).await;
+        assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+        assert_eq!(boundaries[0]["kind"], "digest_reseed");
+        assert_eq!(boundaries[0]["cacheState"], "cold");
+        assert_eq!(boundaries[0]["coldCause"], "account_changed");
+        // The preclaimed successor moved onto the rebuilt session with the job.
+        assert_eq!(
+            db.query_opt_text("SELECT session_id FROM turns WHERE id = 'successor'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(successor_session.as_str())
+        );
+        // The seed carries the held turn's tool call paired with its result, so
+        // the yielded work is not lost to the rebuild. Result bodies are elided
+        // as in every digest; the pairing shows as the result's figure, where an
+        // unpaired call would read `[pending]`.
+        let seed = db
+            .query_opt_text(
+                "SELECT data FROM events WHERE session_id = ?1 AND event_type = 'user:seed'",
+                params![successor_session.clone()],
+            )
+            .await
+            .unwrap()
+            .expect("the rebuilt session is seeded");
+        assert!(seed.contains("check:held-turn-marker"), "{seed}");
+        assert!(seed.contains("[exit 0]"), "{seed}");
+        assert!(!seed.contains("[pending]"), "{seed}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failover_resume_keeps_native_when_the_seed_would_not_pay() {
+        let (orch, db) = failed_over_node("failover-keeps-native", false).await;
+        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
+            .expect("the hold's resolution launches");
+
+        assert_eq!(current_session(&db).await, "s1");
+        let boundaries = session_boundaries(&db).await;
+        assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+        assert_eq!(boundaries[0]["decision"], "native_resume");
+        assert_eq!(boundaries[0]["reseedSkipped"], "insufficient_savings");
+        assert_eq!(boundaries[0]["coldCause"], "account_changed");
+    }
+
+    /// A durable-suspend or permission answer is delivered into the tool call
+    /// the native conversation is waiting on, so it never rotates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answering_an_open_tool_call_never_reseeds() {
+        let (orch, db) = failed_over_node("answer-keeps-native", true).await;
+        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(true)))
+            .expect("the answer launches");
+
+        assert_eq!(current_session(&db).await, "s1");
+        for boundary in session_boundaries(&db).await {
+            assert_ne!(boundary["kind"], "digest_reseed", "{boundary}");
+        }
+    }
+
+    /// An idle process still holding the refused account's credential is no
+    /// warm cache for a launch on another account: it is restarted, and the
+    /// restart is priced as the cold launch it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_process_on_the_old_account_does_not_read_warm() {
+        let (orch, db) = failed_over_node("idle-old-account", false).await;
+        {
+            let mut processes = orch.process_state.processes.lock().unwrap();
+            let mut handle = RunHandle::new(
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(Some(
+                    cairn_models::session::claude::ClaudeControl::boxed(Box::new(Vec::<u8>::new())),
+                ))),
+                Some("s1".to_string()),
+                Some("j".to_string()),
+            );
+            handle.transition_to_warm();
+            handle.model = Some("opus".to_string());
+            handle.backend = Some("claude".to_string());
+            handle.account_id = Some("acct-a".to_string());
+            processes.register("r1".to_string(), handle);
+        }
+        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
+            .expect("the hold's resolution launches");
+
+        let boundaries = session_boundaries(&db).await;
+        assert_eq!(boundaries.len(), 1, "{boundaries:?}");
+        assert_eq!(boundaries[0]["cacheState"], "cold", "{boundaries:?}");
+        assert_eq!(boundaries[0]["coldCause"], "account_changed");
+    }
+
+    /// Acceptance 6. The last-request lookup prices the launch and may never
+    /// gate it: with the lookup failing, the continuation launches on today's
+    /// reading and says why in the log.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_last_request_lookup_still_launches_and_warns() {
+        crate::test_support::capture_log(super::CONTINUATION_LOG_TARGET);
+        let (orch, db) = failed_over_node("failed-last-request", true).await;
+        // The lookup attributes the request through this column; without it the
+        // query itself fails.
+        db.exclusive(|conn| {
+            Box::pin(async move {
+                conn.execute("ALTER TABLE runs DROP COLUMN account_id", ())
+                    .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        super::continue_job_impl(&orch, "j", None, None, Some(hold_resolution(false)))
+            .expect("a failed lookup never refuses the launch");
+
+        assert_eq!(current_session(&db).await, "s1", "unknown is not cold");
+        assert!(
+            crate::test_support::captured_log(super::CONTINUATION_LOG_TARGET)
+                .iter()
+                .any(|line| line.contains("Could not read the last provider request of session s1")),
+            "the failure was not reported"
+        );
+    }
+
+    /// The pin the cache reading compares against is the one the launch will
+    /// use: an unavailable pin is repinned before the reading, and a healthy pin
+    /// is left exactly as it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_launch_account_is_resolved_before_the_cache_reading() {
+        let (orch, db) = failed_over_node("launch-account-preresolved", false).await;
+        let orch = {
+            use crate::identity::CredentialStoreExt;
+            let store = crate::credentials::CredentialStore::from_user_identity(
+                &crate::identity::UserIdentity {
+                    user_id: "u".to_string(),
+                    email: "u@example.com".to_string(),
+                    name: "U".to_string(),
+                    claude_auth: None,
+                    codex_auth: None,
+                    github_token: None,
+                },
+            );
+            Orchestrator::builder(
+                orch.db.clone(),
+                orch.services.clone(),
+                orch.config_dir.clone(),
+            )
+            .credential_store(Some(store))
+            .build()
+        };
+        let [refused, replacement] = ["Work Max", "Personal Max"].map(|label| {
+            orch.add_account(
+                crate::credentials::ApiProvider::Anthropic,
+                label.to_string(),
+                crate::credentials::ProviderAuth::ClaudeProfile { oauth: None },
+                None,
+            )
+            .unwrap()
+            .id
+        });
+        db.execute(
+            "UPDATE runs SET account_id = ?1 WHERE id = 'r1'",
+            params![refused.clone()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE sessions SET account_id = ?1 WHERE id = 's1'",
+            params![refused.clone()],
+        )
+        .await
+        .unwrap();
+        let job = super::load_job(db.clone(), "j".to_string(), "launch account")
+            .await
+            .unwrap();
+        let session = || async { crate::sessions::queries::get(&db, "s1").await.unwrap() };
+
+        // A healthy pin: resolution returns at the pin and writes nothing.
+        let before = session().await;
+        assert_eq!(
+            super::launch_account_for_continuation(&orch, &db, &job, "p", &before, false)
+                .as_deref(),
+            Some(refused.as_str())
+        );
+        let after = session().await;
+        assert_eq!(after.account_id, before.account_id);
+        assert_eq!(
+            after.updated_at, before.updated_at,
+            "a healthy pin was rewritten"
+        );
+
+        // The refused account is blocked: the launch moves to the replacement
+        // before the reading, and the reading sees the move.
+        orch.record_account_health(
+            &refused,
+            Vec::new(),
+            Some(crate::credentials::AccountBlock::Declared(i64::MAX)),
+        )
+        .unwrap();
+        let launch = super::launch_account_for_continuation(&orch, &db, &job, "p", &after, false);
+        assert_eq!(launch.as_deref(), Some(replacement.as_str()));
+        assert_eq!(
+            session().await.account_id.as_deref(),
+            Some(replacement.as_str())
+        );
+        let reading = cairn_models::continuation::prefix_cache_reading(
+            ResumeBackend::Claude,
+            Some(orch.services.clock.now() - 5),
+            Some(refused.as_str()),
+            launch.as_deref(),
+            orch.services.clock.now(),
+        );
+        assert_eq!(reading.state, PrefixCacheState::Cold);
     }
 
     #[test]

@@ -383,33 +383,50 @@ pub(super) async fn load_last_event_time_for_session(
 /// Unlike that reader this one keeps `result:*` events: a result row reports the
 /// usage of a request that genuinely happened, and freshness asks when, not how
 /// much.
+///
+/// The account is the launch account of the run that made the request. The
+/// session pin is deliberately not consulted: a failover is exactly what moves
+/// it, so it would name the account the request did not run on.
 pub(super) async fn load_last_provider_request_for_session(
     db: Arc<LocalDb>,
     session_id: String,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<LastProviderRequest>, String> {
     db.read(|conn| {
         let session_id = session_id.clone();
         Box::pin(async move {
             let mut rows = conn
                 .query(
-                    "SELECT MAX(created_at) FROM events
-                      WHERE session_id = ?1
-                        AND parent_tool_use_id IS NULL
-                        AND (input_tokens IS NOT NULL
-                          OR output_tokens IS NOT NULL
-                          OR cache_read_tokens IS NOT NULL
-                          OR cache_create_tokens IS NOT NULL)",
+                    "SELECT e.created_at, r.account_id FROM events e
+                       LEFT JOIN runs r ON r.id = e.run_id
+                      WHERE e.session_id = ?1
+                        AND e.parent_tool_use_id IS NULL
+                        AND (e.input_tokens IS NOT NULL
+                          OR e.output_tokens IS NOT NULL
+                          OR e.cache_read_tokens IS NOT NULL
+                          OR e.cache_create_tokens IS NOT NULL)
+                      ORDER BY e.created_at DESC LIMIT 1",
                     params![session_id.as_str()],
                 )
                 .await?;
             match rows.next().await? {
-                Some(row) => Ok(row.opt_i64(0)?),
+                Some(row) => Ok(Some(LastProviderRequest {
+                    at: row.i64(0)?,
+                    account_id: row.opt_text(1)?,
+                })),
                 None => Ok(None),
             }
         })
     })
     .await
     .map_err(|e| db_error("Failed to load last provider request time", e))
+}
+
+/// The most recent request a session's own conversation made to its provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct LastProviderRequest {
+    pub(super) at: i64,
+    /// The account the request ran on, when its run recorded one.
+    pub(super) account_id: Option<String>,
 }
 
 pub(super) async fn insert_session_conn(

@@ -224,6 +224,83 @@ pub(crate) fn select_routed_serving_identity(
         .ok_or_else(|| no_credential.to_string())
 }
 
+/// How a session's next launch would authenticate.
+enum SessionRoute {
+    /// Its durable pin can still serve.
+    Pinned(crate::identity::UserIdentity),
+    /// Policy chose for it: a subscription account, or the API-key fallback.
+    Selected(RoutedSelection),
+    /// No credential of any kind is configured.
+    NoCredential,
+}
+
+/// The one answer to which account a session's launch runs on, asked by the
+/// launch itself (which then pins it) and by anything that must predict the
+/// launch without changing it. `Err` is routing's refusal: the policy names
+/// accounts and none can serve.
+fn route_session(
+    orch: &Orchestrator,
+    provider: crate::credentials::RoutedProvider,
+    pinned_account: Option<&str>,
+    project_id: Option<&str>,
+    requested_model: Option<&str>,
+    snapshot_account_id: Option<&str>,
+    mode: SelectionMode,
+) -> Result<SessionRoute, String> {
+    // An existing session authenticates as its pin while that account can still
+    // serve: its conversation and prompt cache live there. Account policy — the
+    // snapshot's, then the project's — chooses only for sessions with no usable
+    // pin: new and successor sessions, or one whose account became unavailable.
+    // Editing either policy therefore never moves a healthy session, and a warm
+    // process and a cold resume of the same session always agree, because warm
+    // reuse likewise compares only the stored pin.
+    if let Some(identity) = pinned_account.and_then(|account_id| {
+        orch.resolve_available_routed_account(provider, project_id, account_id, requested_model)
+    }) {
+        return Ok(SessionRoute::Pinned(identity));
+    }
+    // The execution snapshot's explicit account is the most specific policy,
+    // then the project's.
+    let project_override = routed_project_override(orch, provider, project_id);
+    let explicit_account = snapshot_account_id.or(project_override.as_deref());
+    Ok(
+        match route(
+            orch,
+            provider,
+            project_id,
+            explicit_account,
+            requested_model,
+            mode,
+        )? {
+            Some(selection) => SessionRoute::Selected(selection),
+            None => SessionRoute::NoCredential,
+        },
+    )
+}
+
+/// Whether a session's next launch would find an account to run on, without
+/// pinning or selecting anything. Only routing's refusal answers no: a missing
+/// credential is the launch's own error to report, not a reason to wait.
+pub(crate) fn routed_session_can_launch(
+    orch: &Orchestrator,
+    provider: crate::credentials::RoutedProvider,
+    pinned_account: Option<&str>,
+    project_id: Option<&str>,
+    requested_model: Option<&str>,
+    snapshot_account_id: Option<&str>,
+) -> bool {
+    route_session(
+        orch,
+        provider,
+        pinned_account,
+        project_id,
+        requested_model,
+        snapshot_account_id,
+        SelectionMode::Probe,
+    )
+    .is_ok()
+}
+
 pub(crate) fn resolve_routed_session_identity(
     orch: &Orchestrator,
     provider: crate::credentials::RoutedProvider,
@@ -237,32 +314,18 @@ pub(crate) fn resolve_routed_session_identity(
         let session_id = session_id.to_string();
         move || async move { crate::sessions::queries::get(&db, &session_id).await }
     })?;
-    let project_override = routed_project_override(orch, provider, project_id);
-    // An existing session authenticates as its pin while that account can still
-    // serve: its conversation and prompt cache live there. Account policy — the
-    // snapshot's, then the project's — chooses only for sessions with no usable
-    // pin: new and successor sessions, or one whose account became unavailable.
-    // Editing either policy therefore never moves a healthy session, and a warm
-    // process and a cold resume of the same session always agree, because warm
-    // reuse likewise compares only the stored pin.
-    if let Some(identity) = session.account_id.as_deref().and_then(|account_id| {
-        orch.resolve_available_routed_account(provider, project_id, account_id, requested_model)
-    }) {
-        return Ok(Some(identity));
-    }
-    // The execution snapshot's explicit account is the most specific policy,
-    // then the project's.
-    let explicit_account = snapshot_account_id.or(project_override.as_deref());
-    let Some(selection) = route(
+    let selection = match route_session(
         orch,
         provider,
+        session.account_id.as_deref(),
         project_id,
-        explicit_account,
         requested_model,
+        snapshot_account_id,
         SelectionMode::Serve,
-    )?
-    else {
-        return Ok(None);
+    )? {
+        SessionRoute::Pinned(identity) => return Ok(Some(identity)),
+        SessionRoute::NoCredential => return Ok(None),
+        SessionRoute::Selected(selection) => selection,
     };
     let Some(account_id) = selection
         .account_id
@@ -407,19 +470,50 @@ pub(crate) fn snapshot_account_override(
             )
             .await
             .map_err(|e| e.to_string())?;
-        let Some((Some(snapshot), Some(agent_id))) = row else {
-            return Ok(None);
-        };
-        let value: serde_json::Value =
-            serde_json::from_str(&snapshot).map_err(|e| e.to_string())?;
-        Ok(value
-            .get("agents")
-            .and_then(|agents| agents.get(&agent_id))
-            .and_then(|agent| agent.get("providerAccount"))
-            .and_then(|policy| policy.get("account"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string))
+        snapshot_policy_account(row)
     })
+}
+
+/// [`snapshot_account_override`] for a job, before any run of its next launch
+/// exists.
+pub(crate) fn snapshot_account_override_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let dbs = orch.db.clone();
+    let job_id = job_id.to_string();
+    run_db_blocking(move || async move {
+        let db = crate::execution::routing::owning_db_for_job(&dbs, &job_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let row = db
+            .query_opt(
+                "SELECT e.snapshot, j.agent_config_id FROM jobs j LEFT JOIN executions e ON e.id = j.execution_id WHERE j.id = ?1",
+                (job_id,),
+                |row| Ok((row.opt_text(0)?, row.opt_text(1)?)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        snapshot_policy_account(row)
+    })
+}
+
+/// The account an execution snapshot's agent policy names, from its
+/// `(snapshot, agent id)` row.
+fn snapshot_policy_account(
+    row: Option<(Option<String>, Option<String>)>,
+) -> Result<Option<String>, String> {
+    let Some((Some(snapshot), Some(agent_id))) = row else {
+        return Ok(None);
+    };
+    let value: serde_json::Value = serde_json::from_str(&snapshot).map_err(|e| e.to_string())?;
+    Ok(value
+        .get("agents")
+        .and_then(|agents| agents.get(&agent_id))
+        .and_then(|agent| agent.get("providerAccount"))
+        .and_then(|policy| policy.get("account"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
 }
 
 /// Resolve the non-subscription outcome after routed account selection fails.
@@ -3576,41 +3670,13 @@ mod tests {
         ));
     }
 
-    static ACCOUNT_SELECTION_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-    /// Records the account-selection log target for the whole test binary; a
-    /// test reads back only the lines naming its own run.
-    struct AccountSelectionLog;
-
-    impl log::Log for AccountSelectionLog {
-        fn enabled(&self, metadata: &log::Metadata) -> bool {
-            metadata.target() == ACCOUNT_SELECTION_LOG_TARGET
-                && metadata.level() <= log::Level::Info
-        }
-        fn log(&self, record: &log::Record) {
-            if self.enabled(record.metadata()) {
-                ACCOUNT_SELECTION_LOG
-                    .lock()
-                    .unwrap()
-                    .push(record.args().to_string());
-            }
-        }
-        fn flush(&self) {}
-    }
-
+    /// A test reads back only the selection lines naming its own run.
     fn capture_account_selection_log() {
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            log::set_logger(&AccountSelectionLog)
-                .expect("the cairn-core test binary installs no other logger");
-            log::set_max_level(log::LevelFilter::Info);
-        });
+        crate::test_support::capture_log(ACCOUNT_SELECTION_LOG_TARGET);
     }
 
     fn logged_account_selection(run_id: &str) -> Option<serde_json::Value> {
-        ACCOUNT_SELECTION_LOG
-            .lock()
-            .unwrap()
+        crate::test_support::captured_log(ACCOUNT_SELECTION_LOG_TARGET)
             .iter()
             .filter_map(|line| line.strip_prefix(ACCOUNT_SELECTION_LOG_PREFIX))
             .filter_map(|json| serde_json::from_str::<serde_json::Value>(json).ok())
@@ -3740,6 +3806,7 @@ mod tests {
             health: Some(crate::credentials::ProviderAccountHealth {
                 windows: Vec::new(),
                 blocked_until: Some(chrono::Utc::now().timestamp() + 300),
+                blocked_until_declared: false,
                 depleted: None,
                 captured_at: chrono::Utc::now().timestamp(),
             }),

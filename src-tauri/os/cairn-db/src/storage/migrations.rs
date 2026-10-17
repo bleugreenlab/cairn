@@ -153,6 +153,15 @@ macro_rules! shared_tail_provider_limit_holds {
     };
 }
 
+/// cairn/4959: `runs.account_id` records the account a run launched on, and a
+/// hold may withhold automatic resume or wait on another account's reset. Both
+/// tables are shared project state, so the columns reach both lineages.
+macro_rules! shared_tail_provider_limit_failover {
+    () => {
+        migration!("0260_provider_limit_failover")
+    };
+}
+
 /// cairn/4936: an answered permission whose job could not be continued records
 /// why on the request row, so the refusal is visible where the answer is.
 /// `permission_requests` is project-scoped shared state carried by both
@@ -180,15 +189,6 @@ macro_rules! shared_tail_execution_after_gates {
 macro_rules! shared_tail_retire_issue_dependencies {
     () => {
         migration!("0257_retire_issue_dependencies")
-    };
-}
-
-/// cairn/4977: a terminal settled because its process was proven gone records
-/// why, since its exit code cannot. `job_terminals` is carried by both lineages,
-/// so the column is written once and composed into both.
-macro_rules! shared_tail_terminal_exit_reason {
-    () => {
-        migration!("0252_terminal_exit_reason")
     };
 }
 
@@ -1372,6 +1372,7 @@ macro_rules! team_lineage {
             shared_tail_execution_after_gates!(),
             shared_tail_retire_issue_dependencies!(),
             shared_tail_reconcile_resolution_basis!(),
+            shared_tail_provider_limit_failover!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1635,6 +1636,7 @@ macro_rules! private_lineage {
             shared_tail_retire_issue_dependencies!(),
             shared_tail_reconcile_resolution_basis!(),
             private_held_publications!(),
+            shared_tail_provider_limit_failover!(),
         ]
     };
 }
@@ -3313,6 +3315,7 @@ mod tests {
                 "retire_issue_dependencies",
                 "reconcile_resolution_basis",
                 "held_publications",
+                "provider_limit_failover",
             ]
         );
         assert_eq!(
@@ -6583,6 +6586,7 @@ mod tests {
                 "retire_issue_dependencies",
                 // cairn/4987: a conflict session's resolution basis, in both.
                 "reconcile_resolution_basis",
+                "provider_limit_failover",
             ]
         );
         assert_eq!(

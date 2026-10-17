@@ -30,6 +30,33 @@ pub(in crate::backends) fn resolve_run_db(
     })
 }
 
+/// Record the account whose credential this run's process was launched with, so
+/// a later reader can attribute the run's provider requests after the session
+/// pin has moved. Best-effort: an unrecorded account reads as unknown, never as a
+/// reason to refuse the spawn.
+pub(in crate::backends) fn record_run_account(
+    backend_name: &str,
+    db: &Arc<LocalDb>,
+    run_id: &str,
+    account_id: Option<&str>,
+) {
+    let Some(account_id) = account_id.map(str::to_string) else {
+        return;
+    };
+    let db = db.clone();
+    let run = run_id.to_string();
+    if let Err(error) = run_backend_db(backend_name, async move {
+        db.execute(
+            "UPDATE runs SET account_id = ?1 WHERE id = ?2",
+            params![account_id.as_str(), run.as_str()],
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }) {
+        log::warn!("Failed to record the launch account of run {run_id}: {error}");
+    }
+}
+
 pub(in crate::backends) fn transition_run_to_live(
     backend_name: &str,
     orch: &Orchestrator,

@@ -1,5 +1,57 @@
 use crate::storage::{LocalDb, RowExt};
 
+/// Log targets some test has asked to record, and the lines recorded for them.
+static CAPTURED_TARGETS: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
+static CAPTURED_LINES: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The one logger of the cairn-core test binary. `log` admits a single logger
+/// per process, so every test that asserts on a log line records it here and
+/// reads back only the lines it can attribute to itself.
+struct CapturedLog;
+
+impl log::Log for CapturedLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+            && CAPTURED_TARGETS
+                .lock()
+                .unwrap()
+                .contains(&metadata.target())
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            CAPTURED_LINES
+                .lock()
+                .unwrap()
+                .push((record.target().to_string(), record.args().to_string()));
+        }
+    }
+    fn flush(&self) {}
+}
+
+/// Record every Info-or-louder line logged to `target` from now on.
+pub(crate) fn capture_log(target: &'static str) {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        log::set_logger(&CapturedLog).expect("the cairn-core test binary installs no other logger");
+        log::set_max_level(log::LevelFilter::Info);
+    });
+    let mut targets = CAPTURED_TARGETS.lock().unwrap();
+    if !targets.contains(&target) {
+        targets.push(target);
+    }
+}
+
+/// The lines recorded for `target`, across the whole test binary.
+pub(crate) fn captured_log(target: &str) -> Vec<String> {
+    CAPTURED_LINES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(recorded, _)| recorded == target)
+        .map(|(_, line)| line.clone())
+        .collect()
+}
+
 pub(crate) struct ThreadFixture {
     pub project_id: &'static str,
     pub thread_id: &'static str,

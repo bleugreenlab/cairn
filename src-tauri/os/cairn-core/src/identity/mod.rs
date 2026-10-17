@@ -336,6 +336,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            blocked_until_declared: false,
             depleted: None,
             captured_at,
         });
@@ -436,6 +437,7 @@ mod tests {
                 window_duration_mins: Some(300),
             }],
             blocked_until: None,
+            blocked_until_declared: false,
             depleted: None,
             captured_at,
         });

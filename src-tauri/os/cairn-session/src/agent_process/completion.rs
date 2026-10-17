@@ -63,7 +63,6 @@ impl From<TurnExit> for OwnedTurnOutcome {
 pub struct ClaudeTurnContext {
     pub terminal_tool_completed: bool,
     pub terminal_interrupt_ack_pending: bool,
-    pub rate_limited: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

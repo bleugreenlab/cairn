@@ -602,7 +602,8 @@ impl CodexHost for CodexReaderHost {
                 .iter()
                 .filter(|window| window.remaining_percent <= 0.0)
                 .filter_map(|window| window.resets_at)
-                .max();
+                .max()
+                .map(crate::credentials::AccountBlock::Declared);
             if let Err(error) =
                 orch.record_account_health(account_id, snapshot.windows.clone(), blocked_until)
             {
