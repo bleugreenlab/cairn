@@ -4243,6 +4243,16 @@ pub struct LearnedResourceEstimate {
 /// before any alignment, claim-time switch, or recovery reset that would leave
 /// behind a commit its destination does not carry, and refuse the move when the
 /// ref cannot be written; that half sends nothing new.
+///
+/// cairn/5024 moves the executor's blocking work off its runtime workers
+/// without a bump. No frame, field, or meaning changes: heartbeats, snapshots,
+/// residency answers, and `Hello` carry what they carried, and a runner talking
+/// to an executor of either side of the change reads the same wire. What moves
+/// is which thread does the work. Snapshot publications from async paths
+/// coalesce, which the runner already tolerates because the snapshot slot is
+/// latest-wins. `Hello`'s `executor_build_id` is hashed once at startup rather
+/// than on every connect, which names the running build even after an update
+/// has replaced the file on disk.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 147;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
