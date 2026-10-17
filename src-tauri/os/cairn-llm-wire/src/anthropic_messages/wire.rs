@@ -183,17 +183,43 @@ pub struct MessagesUsage {
     pub cache_creation_input_tokens: Option<i32>,
     #[serde(default)]
     pub cache_read_input_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// How a turn's cache writes split by lifetime. Anthropic prices a one-hour
+/// write at twice the input rate and a five-minute write at 1.25x, but no meter
+/// distinguishes a write's lifetime, so the split is kept in the stored usage
+/// (`prompt_tokens_details.cache_creation`) rather than metered.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<i32>,
 }
 
 impl MessagesUsage {
     pub fn into_turn_usage(self, cost: Option<f64>) -> TurnUsage {
-        TurnUsage::from_anthropic(
+        let mut usage = TurnUsage::from_anthropic(
             self.input_tokens,
             self.output_tokens,
             self.cache_read_input_tokens,
             self.cache_creation_input_tokens,
             cost,
-        )
+        );
+        if let Some(split) = self
+            .cache_creation
+            .and_then(|split| serde_json::to_value(split).ok())
+        {
+            if let Value::Object(details) = usage
+                .prompt_tokens_details
+                .get_or_insert_with(|| Value::Object(serde_json::Map::new()))
+            {
+                details.insert("cache_creation".to_string(), split);
+            }
+        }
+        usage
     }
 
     /// Fold a later usage report over an earlier one.
@@ -213,6 +239,9 @@ impl MessagesUsage {
         }
         if other.cache_creation_input_tokens.is_some() {
             self.cache_creation_input_tokens = other.cache_creation_input_tokens;
+        }
+        if other.cache_creation.is_some() {
+            self.cache_creation = other.cache_creation.clone();
         }
     }
 }

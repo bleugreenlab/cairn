@@ -126,12 +126,12 @@ impl TurnUsage {
     ///
     /// Anthropic reports DISJOINT input components: `input_tokens` counts only
     /// the uncached prompt, with cache reads and cache writes alongside it. The
-    /// neutral shape is OpenAI's, where `prompt_tokens` is the WHOLE prompt and
-    /// `prompt_tokens_details.cached_tokens` names the cached subset of it. So
-    /// the components are summed here rather than passed through: without this,
-    /// a 128-token cache read against a 40-token prompt would render as negative
-    /// input in the context dial (`prompt_tokens - cached_tokens`) and under-
-    /// report occupancy by the entire cached prefix.
+    /// neutral shape is OpenRouter's, where `prompt_tokens` is the WHOLE prompt
+    /// and `prompt_tokens_details` names the parts of it read from cache
+    /// (`cached_tokens`) and written to it (`cache_write_tokens`). So the
+    /// components are summed here rather than passed through: without this, a
+    /// 128-token cache read against a 40-token prompt would read as negative
+    /// uncached input and under-report the prompt by the entire cached prefix.
     pub fn from_anthropic(
         input_tokens: Option<i32>,
         output_tokens: Option<i32>,
@@ -144,9 +144,6 @@ impl TurnUsage {
                 .saturating_add(cache_read.unwrap_or(0))
                 .saturating_add(cache_creation.unwrap_or(0))
         });
-        // Preserve both cache figures: `cached_tokens` is the key the neutral
-        // `token_counts` and the frontend rollup read, and the creation count is
-        // kept beside it so nothing observed is silently dropped.
         let prompt_tokens_details = (cache_read.is_some() || cache_creation.is_some()).then(|| {
             let mut details = serde_json::Map::new();
             if let Some(cache_read) = cache_read {
@@ -154,7 +151,7 @@ impl TurnUsage {
             }
             if let Some(cache_creation) = cache_creation {
                 details.insert(
-                    "cache_creation_input_tokens".to_string(),
+                    "cache_write_tokens".to_string(),
                     Value::from(cache_creation),
                 );
             }

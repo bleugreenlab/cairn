@@ -1029,3 +1029,24 @@ async fn each_familys_usage_persists_as_its_golden() {
         &(serde_json::to_string_pretty(&golden).unwrap() + "\n"),
     );
 }
+
+#[test]
+fn live_context_occupancy_counts_every_prompt_part() {
+    // 40 uncached, 128 read from cache, 64 written to it, 25 out. The writes are
+    // part of the prompt the model saw, so the dial must count them.
+    let usage = TurnUsage::from_anthropic(Some(40), Some(25), Some(128), Some(64), None);
+    let state = super::context_state(
+        "run",
+        "session",
+        "golden",
+        "model",
+        Some(200_000),
+        &usage,
+        7,
+    );
+    assert_eq!(state.used_tokens, 40 + 128 + 64 + 25);
+    assert_eq!(state.last_output_tokens, Some(25));
+    assert_eq!(state.context_window, Some(200_000));
+    assert_eq!(state.session_id.as_deref(), Some("session"));
+    assert_eq!(state.captured_at, 7);
+}

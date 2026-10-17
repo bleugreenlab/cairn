@@ -12,8 +12,8 @@ use super::conversation::{
 use super::generation::into_generation;
 use super::http::{build_body, MessagesEndpoint, TERMINAL_EVENTS};
 use super::wire::{
-    ContentBlock, MessagesMessage, MessagesResponse, StreamEvent, StreamingMessage, ASSISTANT_ROLE,
-    USER_ROLE,
+    ContentBlock, MessagesMessage, MessagesResponse, MessagesUsage, StreamEvent, StreamingMessage,
+    ASSISTANT_ROLE, USER_ROLE,
 };
 use crate::replay::MessageContent;
 use crate::replay::{ReplayEvent, ToolUseInfo};
@@ -459,8 +459,30 @@ fn disjoint_anthropic_token_components_are_summed_into_the_neutral_prompt_total(
         json!(128)
     );
     assert_eq!(
-        serialized["prompt_tokens_details"]["cache_creation_input_tokens"],
+        serialized["prompt_tokens_details"]["cache_write_tokens"],
         json!(12)
+    );
+}
+
+#[test]
+fn the_cache_write_lifetime_split_is_kept_in_the_prompt_details() {
+    let usage: MessagesUsage = serde_json::from_value(json!({
+        "input_tokens": 40,
+        "output_tokens": 25,
+        "cache_read_input_tokens": 128,
+        "cache_creation_input_tokens": 64,
+        "cache_creation": {"ephemeral_5m_input_tokens": 16, "ephemeral_1h_input_tokens": 48}
+    }))
+    .expect("usage parses");
+    let details = usage
+        .into_turn_usage(None)
+        .prompt_tokens_details
+        .expect("cache figures were reported");
+    assert_eq!(details["cached_tokens"], json!(128));
+    assert_eq!(details["cache_write_tokens"], json!(64));
+    assert_eq!(
+        details["cache_creation"],
+        json!({"ephemeral_5m_input_tokens": 16, "ephemeral_1h_input_tokens": 48})
     );
 }
 

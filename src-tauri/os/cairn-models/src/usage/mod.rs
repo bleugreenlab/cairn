@@ -13,14 +13,12 @@ use serde_json::Value;
 /// reports through. This is the one interpretation of [`TurnUsage`]: transcript
 /// event columns and the responses journal both read usage through it.
 ///
-/// `prompt_tokens` is the whole prompt with `cached_tokens` inside it, so
-/// Input is the uncached remainder and CacheRead the cached part. Reasoning is
-/// the share of Output spent reasoning, counted inside Output the way providers
-/// report it. A meter is measured only when its source field is present.
-///
-/// No CacheWrite is measured. The Anthropic mapping folds cache-creation tokens
-/// into `prompt_tokens`, so they land in Input; separating them would change
-/// what every stored HTTP turn has been accounted as.
+/// `prompt_tokens` is the whole prompt, with the tokens read from cache
+/// (`cached_tokens`) and the tokens written to it (`cache_write_tokens`) inside
+/// it, so Input is the uncached remainder, CacheRead and CacheWrite the cached
+/// parts. Reasoning is the share of Output spent reasoning, counted inside
+/// Output the way providers report it. A meter is measured only when its source
+/// field is present.
 pub fn metered(usage: &TurnUsage) -> MeteredUsage {
     let count = |value: i64| u64::try_from(value).unwrap_or(0);
     let detail = |details: &Option<Value>, key: &str| {
@@ -31,9 +29,12 @@ pub fn metered(usage: &TurnUsage) -> MeteredUsage {
             .map(count)
     };
     let cache_read = detail(&usage.prompt_tokens_details, "cached_tokens");
-    let input = usage
-        .prompt_tokens
-        .map(|prompt| count(prompt.into()).saturating_sub(cache_read.unwrap_or(0)));
+    let cache_write = detail(&usage.prompt_tokens_details, "cache_write_tokens");
+    let input = usage.prompt_tokens.map(|prompt| {
+        count(prompt.into())
+            .saturating_sub(cache_read.unwrap_or(0))
+            .saturating_sub(cache_write.unwrap_or(0))
+    });
     let output = usage.completion_tokens.map(|tokens| count(tokens.into()));
     let reasoning = usage
         .reasoning_tokens
@@ -42,6 +43,7 @@ pub fn metered(usage: &TurnUsage) -> MeteredUsage {
     let measures = [
         (Charge::Input, input),
         (Charge::CacheRead, cache_read),
+        (Charge::CacheWrite, cache_write),
         (Charge::Output, output),
         (Charge::Reasoning, reasoning),
     ]
@@ -100,16 +102,36 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_cache_creation_is_accounted_as_input() {
-        // Pins today's accounting, not a preference: `from_anthropic` folds the
-        // 64 cache-creation tokens into the prompt, so they read as Input and no
-        // CacheWrite is measured. The whole prompt is still exact.
+    fn anthropic_cache_writes_are_their_own_charge_not_input() {
+        // Anthropic reports 40 uncached, 128 read from cache and 64 written to
+        // it. Cache writes are priced above input (1.25x for five minutes, 2x
+        // for an hour), so counting them as Input understates the call's cost.
         let usage = TurnUsage::from_anthropic(Some(40), Some(25), Some(128), Some(64), None);
         let metered = metered(&usage);
-        assert_eq!(tokens(&metered, Charge::Input), Some(104));
+        assert_eq!(tokens(&metered, Charge::Input), Some(40));
         assert_eq!(tokens(&metered, Charge::CacheRead), Some(128));
-        assert_eq!(tokens(&metered, Charge::CacheWrite), None);
+        assert_eq!(tokens(&metered, Charge::CacheWrite), Some(64));
+        assert_eq!(tokens(&metered, Charge::Output), Some(25));
+        // The whole prompt is unchanged by the split.
+        assert_eq!(usage.prompt_tokens, Some(232));
         assert_eq!(metered.prompt_tokens(), Some(232));
+    }
+
+    #[test]
+    fn openrouter_chat_cache_writes_are_their_own_charge_not_input() {
+        // OpenRouter's chat usage names cache writes inside the prompt the same
+        // way, for models with explicit caching.
+        let usage: TurnUsage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 194,
+            "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 100}
+        }))
+        .unwrap();
+        let metered = metered(&usage);
+        assert_eq!(tokens(&metered, Charge::Input), Some(94));
+        assert_eq!(tokens(&metered, Charge::CacheRead), Some(0));
+        assert_eq!(tokens(&metered, Charge::CacheWrite), Some(100));
+        assert_eq!(metered.prompt_tokens(), Some(194));
     }
 
     #[test]

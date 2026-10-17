@@ -132,11 +132,11 @@
   {
     "events": [
       {
-        "cacheCreateTokens": null,
+        "cacheCreateTokens": 64,
         "cacheReadTokens": 128,
         "costUsd": null,
         "eventType": "assistant",
-        "inputTokens": 104,
+        "inputTokens": 40,
         "outputTokens": 25,
         "raw": {
           "backend": "golden",
@@ -151,7 +151,7 @@
             "cost_details": null,
             "prompt_tokens": 232,
             "prompt_tokens_details": {
-              "cache_creation_input_tokens": 64,
+              "cache_write_tokens": 64,
               "cached_tokens": 128
             },
             "reasoning_tokens": null,
@@ -161,11 +161,11 @@
         "thinkingTokens": null
       },
       {
-        "cacheCreateTokens": null,
+        "cacheCreateTokens": 64,
         "cacheReadTokens": 128,
         "costUsd": null,
         "eventType": "assistant",
-        "inputTokens": 104,
+        "inputTokens": 40,
         "outputTokens": 25,
         "raw": {
           "backend": "golden",
@@ -179,7 +179,7 @@
             "cost_details": null,
             "prompt_tokens": 232,
             "prompt_tokens_details": {
-              "cache_creation_input_tokens": 64,
+              "cache_write_tokens": 64,
               "cached_tokens": 128
             },
             "reasoning_tokens": null,
@@ -189,11 +189,11 @@
         "thinkingTokens": null
       },
       {
-        "cacheCreateTokens": null,
+        "cacheCreateTokens": 64,
         "cacheReadTokens": 128,
         "costUsd": null,
         "eventType": "assistant",
-        "inputTokens": 104,
+        "inputTokens": 40,
         "outputTokens": 25,
         "raw": {
           "backend": "golden",
@@ -207,7 +207,7 @@
             "cost_details": null,
             "prompt_tokens": 232,
             "prompt_tokens_details": {
-              "cache_creation_input_tokens": 64,
+              "cache_write_tokens": 64,
               "cached_tokens": 128
             },
             "reasoning_tokens": null,
@@ -217,11 +217,11 @@
         "thinkingTokens": null
       },
       {
-        "cacheCreateTokens": null,
+        "cacheCreateTokens": 64,
         "cacheReadTokens": 128,
         "costUsd": 0.0031,
         "eventType": "result:success",
-        "inputTokens": 104,
+        "inputTokens": 40,
         "outputTokens": 25,
         "raw": {
           "backend": "golden",
@@ -235,7 +235,7 @@
             "cost_details": null,
             "prompt_tokens": 232,
             "prompt_tokens_details": {
-              "cache_creation_input_tokens": 64,
+              "cache_write_tokens": 64,
               "cached_tokens": 128
             },
             "reasoning_tokens": null,

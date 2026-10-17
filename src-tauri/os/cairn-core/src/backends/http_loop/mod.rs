@@ -35,7 +35,7 @@ use crate::backends::run_state::{
 };
 use crate::backends::{SessionConfig, SessionStart};
 use crate::dispatch::DispatchOutput;
-use crate::models::ContextTokenState;
+use crate::models::{ContextTokenEventSnapshot, ContextTokenState};
 use crate::orchestrator::lifecycle::apply_owned_turn_outcome;
 use crate::orchestrator::session::{
     assemble_prompt_segments, flatten_prompt_segments, insert_error_event,
@@ -402,21 +402,41 @@ fn emit_context_snapshot(
     context_window: Option<i64>,
     usage: &TurnUsage,
 ) {
+    orch.store_context_token_snapshot(context_state(
+        run_id,
+        session_id,
+        backend_key,
+        model,
+        context_window,
+        usage,
+        chrono::Utc::now().timestamp(),
+    ));
+}
+
+/// One generation's occupancy, read from the same event columns a transcript
+/// stores and through the same calculation the persisted dial uses, so the live
+/// and reloaded dials cannot disagree.
+fn context_state(
+    run_id: &str,
+    session_id: &str,
+    backend_key: &str,
+    model: &str,
+    context_window: Option<i64>,
+    usage: &TurnUsage,
+    captured_at: i64,
+) -> ContextTokenState {
     let counts = usage.token_counts();
-    let input = counts.input.unwrap_or(0) as i64;
-    let output = counts.output.unwrap_or(0) as i64;
-    orch.store_context_token_snapshot(ContextTokenState {
+    ContextTokenEventSnapshot {
         run_id: run_id.to_string(),
-        session_id: Some(session_id.to_string()),
+        session_id: session_id.to_string(),
         backend: backend_key.to_string(),
         model: Some(model.to_string()),
-        // Persisted usage components are disjoint, so occupancy is the complete
-        // input prompt (uncached + cached) plus the response output.
-        used_tokens: input + counts.cache_read.unwrap_or(0) as i64 + output,
-        context_window,
-        auto_compact_limit: None,
-        reasoning_tokens: counts.thinking.map(|thinking| thinking as i64),
-        last_output_tokens: counts.output.map(|output| output as i64),
-        captured_at: chrono::Utc::now().timestamp(),
-    });
+        input_tokens: counts.input.map(i64::from),
+        cache_read_tokens: counts.cache_read.map(i64::from),
+        cache_create_tokens: counts.cache_create.map(i64::from),
+        output_tokens: counts.output.map(i64::from),
+        thinking_tokens: counts.thinking.map(i64::from),
+        captured_at,
+    }
+    .into_state(context_window)
 }
