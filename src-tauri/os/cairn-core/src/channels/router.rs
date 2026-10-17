@@ -5921,11 +5921,22 @@ mod tests {
             .await
             .unwrap();
 
+        // The shipped route is core-pack content; no pack sync runs here, so the
+        // test installs the real shipped file the way the sync would.
+        let config = temp.path().join("config");
+        std::fs::create_dir_all(config.join("routes")).unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../packs/core/routes/followed-thread-stream.yaml"),
+            config.join("routes/followed-thread-stream.yaml"),
+        )
+        .expect("the core pack ships the followed-thread-stream route");
+
         let search = Arc::new(SearchIndex::open_or_create(temp.path().join("search")).unwrap());
         let orch = Orchestrator::builder(
             Arc::new(DbState::new(db.clone(), search)),
             Arc::new(TestServicesBuilder::new().build()),
-            temp.path().join("config"),
+            config,
         )
         .boot_at(0)
         .build();
