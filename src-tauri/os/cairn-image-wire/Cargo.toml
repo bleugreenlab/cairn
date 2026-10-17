@@ -1,0 +1,17 @@
+[package]
+name = "cairn-image-wire"
+version.workspace = true
+edition = "2021"
+description = "Cairn image wires: OpenRouter's Image API and the OpenAI Images API (generations and multipart edits), with image sniffing"
+license = "BUSL-1.1"
+
+# A leaf, like cairn-llm-wire: its own DTOs and error, no workspace crate. The
+# cairn-models facet maps them onto the catalog and usage vocabulary.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+base64 = "0.22"
+imagesize = "0.15"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "blocking", "charset", "http2", "macos-system-configuration", "multipart", "rustls-tls-native-roots"] }

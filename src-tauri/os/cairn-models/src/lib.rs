@@ -4,6 +4,8 @@
 //! re-exported whole:
 //!
 //! - [`wire`]: the three HTTP protocol families (`cairn-llm-wire`).
+//! - [`image_wire`]: OpenRouter's Image API and the OpenAI Images API
+//!   (`cairn-image-wire`).
 //! - [`types`]: provider ids, the shipped catalog, usage windows and
 //!   snapshots, pooled capacity (`cairn-models-types`).
 //! - [`accounts`]: the credential store, account routing, and leases
@@ -11,8 +13,10 @@
 //!
 //! [`interface`] is what the facet answers: the [`interface::Models`] trait the
 //! `cairn://models/*` resources render, and the launch side every backend adapts
-//! to, [`interface::complete::Complete`] and [`interface::session`].
-//! [`complete`] and [`session`] are the implementations that reach providers.
+//! to, [`interface::complete::Complete`] and [`interface::session`], and the
+//! image verb, [`interface::image`].
+//! [`complete`], [`session`], and [`image`] are the implementations that reach
+//! providers.
 //! [`turn`] is the provider-neutral HTTP agent turn: the loop of generation
 //! and host-dispatched tool calls that every HTTP backend runs.
 //! [`continuation`] decides whether a session resumes natively or is rebuilt,
@@ -24,6 +28,7 @@
 //! subscription usage probes) are not public; they live in the private
 //! `cairn-models-subscriptions` crate outside `os/`.
 pub use cairn_credentials as accounts;
+pub use cairn_image_wire as image_wire;
 pub use cairn_llm_wire as wire;
 pub use cairn_models_types as types;
 
@@ -33,7 +38,9 @@ pub mod codex;
 pub mod complete;
 pub mod continuation;
 pub mod decide;
+pub mod image;
 pub mod interface;
+pub mod openrouter;
 pub mod session;
 pub mod sign_in;
 pub mod subscription;

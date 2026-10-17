@@ -15,6 +15,7 @@ mod usage;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use models::discover_catalog_blocking;
 pub use usage::collect_openrouter_usage_snapshot;
 
 use crate::backends::{
@@ -109,7 +110,7 @@ impl AgentBackend for OpenRouterBackend {
             provider_name: OPENROUTER_BACKEND_NAME.to_string(),
             backend_key: OPENROUTER_BACKEND_KEY.to_string(),
             chat_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
-            headers: http::openrouter_headers(&api_key).map_err(CompletionError::InvalidRequest)?,
+            headers: http::openrouter_headers(&api_key),
         };
         let started = Instant::now();
         let response = orch
@@ -163,8 +164,14 @@ impl AgentBackend for OpenRouterBackend {
         ServedVerb::conversation(Wire::OpenAiChatCompletions)
     }
 
+    /// The chat listing with the image listing merged in. The catalog refresh
+    /// reads [`discover_catalog_blocking`] directly, so a failed image listing
+    /// is reported beside chat models that did load.
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
-        models::discover_models_blocking(None)
+        match models::discover_catalog_blocking() {
+            (models, Some(error)) if models.is_empty() => Err(error),
+            (models, _) => Ok(models),
+        }
     }
 
     fn option_descriptors(&self) -> Vec<ProviderOptionDescriptor> {

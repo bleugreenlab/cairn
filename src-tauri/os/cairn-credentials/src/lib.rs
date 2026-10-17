@@ -10,6 +10,7 @@ pub mod store;
 pub use cairn_models_types::ApiProvider;
 pub use handle::CredentialStoreHandle;
 
+use cairn_models_types::image::ImageCapabilities;
 use serde::{Deserialize, Serialize};
 
 /// Authentication selected for the provider runtimes in a session.
@@ -251,6 +252,12 @@ pub enum ProviderAuth {
         /// Maximum tokens the endpoint may generate for one agent-loop turn.
         #[serde(default = "default_custom_max_output_tokens")]
         max_output_tokens: i64,
+        /// What an OpenAI Images endpoint can draw, as its operator or host
+        /// declared it. Absent means [`ImageCapabilities::openai_images_minimal`].
+        /// Set through [`ProviderAuth::with_image_capabilities`]. Boxed: it is
+        /// the largest field any account carries, and most accounts have none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Box<ImageCapabilities>>,
     },
 }
 
@@ -292,6 +299,7 @@ impl std::fmt::Debug for ProviderAuth {
                 models,
                 sampling,
                 max_output_tokens,
+                images,
             } => f
                 .debug_struct("CustomEndpoint")
                 .field("base_url", base_url)
@@ -304,6 +312,7 @@ impl std::fmt::Debug for ProviderAuth {
                 .field("models", models)
                 .field("sampling", sampling)
                 .field("max_output_tokens", max_output_tokens)
+                .field("images", images)
                 .finish(),
         }
     }
@@ -333,6 +342,11 @@ pub enum CustomProtocol {
     /// else, so it never serves an agent turn or a response.
     #[serde(rename = "openai-decisions")]
     Decisions,
+    /// The OpenAI Images API (`{base}/images/generations` and
+    /// `{base}/images/edits`): OpenAI itself, or an OpenAI-compatible image
+    /// server. It draws images and nothing else.
+    #[serde(rename = "openai-images")]
+    OpenAiImages,
 }
 
 impl CustomProtocol {
@@ -340,6 +354,7 @@ impl CustomProtocol {
         match self {
             CustomProtocol::OpenAiChatCompletions => "openai-chat",
             CustomProtocol::Decisions => "openai-decisions",
+            CustomProtocol::OpenAiImages => "openai-images",
         }
     }
 
@@ -347,6 +362,7 @@ impl CustomProtocol {
         match value {
             "openai-chat" => Some(Self::OpenAiChatCompletions),
             "openai-decisions" => Some(Self::Decisions),
+            "openai-images" => Some(Self::OpenAiImages),
             _ => None,
         }
     }
@@ -490,6 +506,15 @@ impl ProviderAuth {
                     .to_string(),
             );
         }
+        if protocol == CustomProtocol::OpenAiImages && matches!(models, CustomModelPolicy::Discover)
+        {
+            // An Images server's `/models`, where it has one, does not say
+            // which models draw (OpenAI's lists every model it serves).
+            return Err(
+                "list the image model ids for an OpenAI Images provider (for example gpt-image-2); its model listing does not say which models draw images"
+                    .to_string(),
+            );
+        }
         let raw = base_url.trim();
         let parsed = url::Url::parse(raw)
             .map_err(|error| format!("invalid endpoint URL '{raw}': {error}"))?;
@@ -599,7 +624,37 @@ impl ProviderAuth {
             models,
             sampling,
             max_output_tokens,
+            images: None,
         })
+    }
+
+    /// This custom endpoint, declaring what its images can do. A host that
+    /// knows its image server (OpenAI's GPT Image models, a local front)
+    /// declares it here; anything but a custom endpoint is returned unchanged.
+    pub fn with_image_capabilities(mut self, capabilities: ImageCapabilities) -> Self {
+        if let Self::CustomEndpoint { images, .. } = &mut self {
+            *images = Some(Box::new(capabilities));
+        }
+        self
+    }
+
+    /// What an OpenAI Images endpoint can draw: its declaration, or the
+    /// minimal default when it made none. `None` for anything that is not an
+    /// OpenAI Images endpoint.
+    pub fn image_capabilities(&self) -> Option<ImageCapabilities> {
+        match self {
+            Self::CustomEndpoint {
+                protocol: CustomProtocol::OpenAiImages,
+                images,
+                ..
+            } => Some(
+                images
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or_else(ImageCapabilities::openai_images_minimal),
+            ),
+            _ => None,
+        }
     }
 
     /// Get the raw credential value, if any.
@@ -2867,6 +2922,48 @@ mod tests {
             CustomSampling::default(),
             DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
         )
+    }
+
+    #[test]
+    fn an_image_provider_lists_its_models_and_defaults_its_capabilities() {
+        let images = |models| {
+            ProviderAuth::custom_endpoint(
+                "http://spark:8080",
+                CustomProtocol::OpenAiImages,
+                None,
+                &[],
+                models,
+                CustomSampling::default(),
+                DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
+            )
+        };
+        let refused = images(CustomModelPolicy::Discover).unwrap_err();
+        assert!(refused.contains("list the image model ids"), "{refused}");
+        let auth = images(CustomModelPolicy::Explicit {
+            ids: vec!["qwen-image".into()],
+        })
+        .unwrap();
+        assert_eq!(
+            auth.image_capabilities(),
+            Some(ImageCapabilities::openai_images_minimal())
+        );
+        let declared = auth.with_image_capabilities(ImageCapabilities::openai_gpt_image());
+        assert_eq!(
+            declared.image_capabilities(),
+            Some(ImageCapabilities::openai_gpt_image())
+        );
+        assert_eq!(
+            CustomProtocol::parse("openai-images"),
+            Some(CustomProtocol::OpenAiImages)
+        );
+        assert_eq!(CustomProtocol::OpenAiImages.as_str(), "openai-images");
+        // A chat endpoint draws nothing, declared or not.
+        let chat = custom("http://host:8000", None, &[], CustomModelPolicy::Discover).unwrap();
+        assert_eq!(
+            chat.with_image_capabilities(ImageCapabilities::openai_gpt_image())
+                .image_capabilities(),
+            None
+        );
     }
 
     fn base_url_of(auth: &ProviderAuth) -> &str {

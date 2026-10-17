@@ -240,7 +240,49 @@ fn config(name: &str, base_url: &str, models: CustomModelPolicy) -> CustomProvid
         models,
         sampling: CustomSampling::default(),
         max_output_tokens: 32_768,
+        images: None,
     }
+}
+
+#[test]
+fn an_images_provider_draws_and_does_nothing_else() {
+    use cairn_models::interface::decide::measured_by;
+    use cairn_models::types::catalog::{VerbKind, Wire};
+    use cairn_models::types::image::ImageCapabilities;
+
+    let mut images = config(
+        "sparks",
+        "http://spark:8080/v1",
+        CustomModelPolicy::Explicit {
+            ids: vec!["qwen-image".into()],
+        },
+    );
+    images.protocol = CustomProtocol::OpenAiImages;
+    let serves = images.serves();
+    assert_eq!(serves.len(), 1);
+    assert_eq!(serves[0].wire, Wire::OpenAiImages);
+    assert_eq!(serves[0].verb.kind(), VerbKind::Image);
+    // Declared nothing: the minimal Images contract.
+    assert_eq!(
+        serves[0].verb.image(),
+        Some(&ImageCapabilities::openai_images_minimal())
+    );
+    images.images = Some(ImageCapabilities::openai_gpt_image());
+    assert_eq!(
+        images.serves()[0].verb.image(),
+        Some(&ImageCapabilities::openai_gpt_image())
+    );
+    assert!(images
+        .require_turns()
+        .unwrap_err()
+        .contains("draws images only"));
+    assert!(images
+        .decision_route()
+        .unwrap_err()
+        .contains("cannot answer a decision"));
+    assert_eq!(measured_by(Wire::OpenAiImages), None);
+    assert_eq!(measured_by(Wire::OpenRouterImages), None);
+    assert!(discover_blocking(&images).1.is_none());
 }
 
 fn account(id: &str, label: &str, auth: ProviderAuth) -> ProviderAccount {

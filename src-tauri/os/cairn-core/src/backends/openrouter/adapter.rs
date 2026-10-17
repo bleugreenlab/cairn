@@ -63,7 +63,7 @@ impl WireAdapter for OpenRouterAdapter {
                 provider_name: OPENROUTER_BACKEND_NAME.to_string(),
                 backend_key: OPENROUTER_BACKEND_KEY.to_string(),
                 chat_url: CHAT_URL.to_string(),
-                headers: openrouter_headers(api_key)?,
+                headers: openrouter_headers(api_key),
             },
             dialect: ChatDialect {
                 include_usage: false,

@@ -11,6 +11,79 @@ use serde_json::Value;
 
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
+/// Bounds each request of the image discovery pass.
+const IMAGE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Every model OpenRouter serves: the chat listing, with the image listing
+/// merged in, and what went wrong with either.
+///
+/// The two listings are read side by side. A failed image listing keeps the
+/// chat models and says `image models unavailable: ...`; it is never silent.
+pub(crate) fn discover_catalog_blocking() -> (Vec<DiscoveredModel>, Option<String>) {
+    let (chat, images) = std::thread::scope(|scope| {
+        let images =
+            scope.spawn(|| cairn_models::image::openrouter::discover(IMAGE_DISCOVERY_TIMEOUT));
+        let chat = discover_models_blocking(None);
+        let images = images
+            .join()
+            .unwrap_or_else(|_| Err("image discovery panicked".to_string()));
+        (chat, images)
+    });
+    let mut errors = Vec::new();
+    let mut models = chat.unwrap_or_else(|error| {
+        errors.push(error);
+        Vec::new()
+    });
+    match images {
+        Ok(found) => {
+            if let Some(first) = found.failures.first() {
+                errors.push(format!(
+                    "image models unavailable: {} endpoint records could not be read (first, {first}); those models serve nothing until the next refresh",
+                    found.failures.len()
+                ));
+            }
+            merge_image_models(&mut models, found.models);
+        }
+        Err(error) => errors.push(format!("image models unavailable: {error}")),
+    }
+    (models, (!errors.is_empty()).then(|| errors.join("; ")))
+}
+
+/// Merge the image listing into the chat listing by id. A model in both
+/// (Gemini's image models) keeps what it serves in chat and gains `image`;
+/// an image-only model is added as discovery found it.
+pub(crate) fn merge_image_models(models: &mut Vec<DiscoveredModel>, images: Vec<DiscoveredModel>) {
+    for image in images {
+        let Some(model) = models.iter_mut().find(|model| model.id == image.id) else {
+            models.push(image);
+            continue;
+        };
+        // No claim from chat discovery meant OpenRouter's provider-wide
+        // declaration, which is conversation over chat completions.
+        let mut serves = model
+            .serves
+            .take()
+            .unwrap_or_else(|| ServedVerb::conversation(Wire::OpenAiChatCompletions));
+        serves.extend(image.serves.unwrap_or_default());
+        model.serves = Some(serves);
+        if let Some(image_pricing) = image.pricing {
+            let pricing = model.pricing.get_or_insert_with(ModelPricing::default);
+            for price in image_pricing.prices {
+                if !pricing
+                    .prices
+                    .iter()
+                    .any(|known| known.meter == price.meter)
+                {
+                    pricing.prices.push(price);
+                }
+            }
+            for (key, usd) in image_pricing.unplaced {
+                pricing.unplaced.entry(key).or_insert(usd);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     #[serde(default)]
@@ -394,6 +467,85 @@ mod tests {
             gpt4.usd_per(Charge::Request, None, BillingUnit::Requests),
             Some("0")
         );
+    }
+
+    const IMAGE_MODELS: &str =
+        include_str!("../../../../cairn-image-wire/testdata/openrouter/image_models.json");
+    const IMAGE_ENDPOINTS: &str =
+        include_str!("../../../../cairn-image-wire/testdata/openrouter/endpoints.json");
+
+    /// The image listing fixture as discovery maps it.
+    fn image_models() -> Vec<DiscoveredModel> {
+        use cairn_models::image_wire::openrouter::discovery::{
+            read_image_models, read_model_endpoints,
+        };
+        let endpoints: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(IMAGE_ENDPOINTS).unwrap();
+        read_image_models(IMAGE_MODELS)
+            .unwrap()
+            .data
+            .iter()
+            .map(|listed| {
+                let record = read_model_endpoints(&endpoints[&listed.id].to_string()).unwrap();
+                cairn_models::image::openrouter::discovered_model(listed, Ok(&record))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dual_listed_model_keeps_its_chat_verbs_and_an_image_only_model_serves_image() {
+        let mut models = decode_models(LIVE).unwrap();
+        let chat_count = models.len();
+        let mut images = image_models();
+        // The chat fixture's pure image model, as the image listing reports it.
+        let mut klein = images
+            .iter()
+            .find(|model| model.id == "black-forest-labs/flux.2-klein-4b")
+            .unwrap()
+            .clone();
+        klein.id = "black-forest-labs/flux-3-image-klein".into();
+        klein.model = klein.id.clone();
+        images.push(klein);
+        let image_only = images
+            .iter()
+            .filter(|image| !models.iter().any(|model| model.id == image.id))
+            .count();
+        super::merge_image_models(&mut models, images);
+        assert_eq!(models.len(), chat_count + image_only);
+
+        let kinds = |id: &str| -> Vec<VerbKind> {
+            model(&models, id)
+                .serves
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|served| served.verb.kind())
+                .collect()
+        };
+        assert_eq!(
+            kinds("google/gemini-3-pro-image"),
+            vec![VerbKind::Complete, VerbKind::Session, VerbKind::Image]
+        );
+        let gemini = model(&models, "google/gemini-3-pro-image");
+        let image_verb = gemini.serves.as_ref().unwrap().last().unwrap();
+        assert_eq!(image_verb.wire, Wire::OpenRouterImages);
+        // Its chat price stays; nothing the image listing adds displaces it.
+        assert_eq!(
+            gemini.pricing.as_ref().unwrap().usd_per(
+                Charge::Output,
+                Some(&Modality::Image),
+                BillingUnit::Tokens
+            ),
+            Some("0.00012")
+        );
+        // The pure image model that served nothing in chat serves image.
+        assert_eq!(
+            kinds("black-forest-labs/flux-3-image-klein"),
+            vec![VerbKind::Image]
+        );
+        assert_eq!(kinds("black-forest-labs/flux.2-pro"), vec![VerbKind::Image]);
+        // Embeddings still serve nothing.
+        assert!(kinds("voyageai/voyage-code-4").is_empty());
     }
 
     /// Reads the real catalog through discovery. Run it with `--ignored` to

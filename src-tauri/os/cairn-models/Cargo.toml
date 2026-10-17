@@ -9,6 +9,7 @@ license = "BUSL-1.1"
 # member crates exist for dependency weight (see docs/backends.md).
 [dependencies]
 cairn-llm-wire = { path = "../cairn-llm-wire" }
+cairn-image-wire = { path = "../cairn-image-wire" }
 cairn-models-types = { path = "../cairn-models-types" }
 cairn-credentials = { path = "../cairn-credentials" }
 cairn-domain = { path = "../cairn-domain" }

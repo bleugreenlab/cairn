@@ -1,7 +1,7 @@
 //! The cairn-models facet's dependency boundary, checked against the Cargo graph.
 //!
 //! One implementation, included by `#[path]` from each crate that runs it: the
-//! four public facet members, the two `os/` crates most likely to grow a
+//! five public facet members, the two `os/` crates most likely to grow a
 //! forbidden edge (`cairn-core`, `cairn-session`), the private
 //! `cairn-models-subscriptions`, and the external host in `examples/llm-host`. A
 //! manifest-only change to any of them therefore runs the check under the
@@ -21,12 +21,13 @@ use std::path::{Path, PathBuf};
 pub const PUBLIC_ROOTS: &[&str] = &[
     "cairn-models",
     "cairn-llm-wire",
+    "cairn-image-wire",
     "cairn-models-types",
     "cairn-credentials",
 ];
 
 /// Public members that must reach no workspace crate at all.
-pub const LEAF_ROOTS: &[&str] = &["cairn-llm-wire", "cairn-models-types"];
+pub const LEAF_ROOTS: &[&str] = &["cairn-llm-wire", "cairn-image-wire", "cairn-models-types"];
 
 /// The runtime, the work layer, heavy configuration, and the private crate.
 pub const PUBLIC_FORBIDDEN: &[&str] = &[

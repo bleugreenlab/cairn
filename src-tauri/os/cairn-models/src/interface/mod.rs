@@ -8,8 +8,8 @@
 //! onto the same trait.
 //!
 //! The launch side is [`complete`] (an HTTP completion over one of the three
-//! protocol families) and [`session`] (a CLI session opened on a host and
-//! driven through its control).
+//! protocol families), [`session`] (a CLI session opened on a host and
+//! driven through its control), [`decide`], and [`image`].
 //!
 //! Every answer reuses the facet's existing vocabulary: accounts are
 //! [`AccountInfo`], usage is [`ProviderPoolSnapshot`], providers are
@@ -19,6 +19,7 @@
 
 pub mod complete;
 pub mod decide;
+pub mod image;
 pub mod session;
 
 use std::collections::BTreeMap;
@@ -268,7 +269,7 @@ impl SelectedOffer {
     pub fn measured_by(&self) -> Option<MeasuredBy> {
         match self.served.verb {
             Verb::Decide => decide::measured_by(self.served.wire),
-            Verb::Complete | Verb::Session => None,
+            Verb::Complete | Verb::Session | Verb::Image(_) => None,
         }
     }
 }
@@ -288,9 +289,11 @@ pub struct NoOffer {
 impl fmt::Display for NoOffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let capable = capable(self.verb);
-        match &self.requested {
-            Some(requested) => write!(f, "No {capable} model serves '{requested}'")?,
-            None => write!(f, "No {capable} model is configured")?,
+        match (&self.requested, &self.detail) {
+            (Some(requested), _) => write!(f, "No {capable} model serves '{requested}'")?,
+            // Offers exist, but none of them could take this request.
+            (None, Some(_)) => write!(f, "No {capable} model is available")?,
+            (None, None) => write!(f, "No {capable} model is configured")?,
         }
         if let Some(detail) = &self.detail {
             write!(f, ": {detail}")?;
@@ -311,6 +314,7 @@ fn capable(verb: VerbKind) -> &'static str {
         VerbKind::Complete => "completion-capable",
         VerbKind::Session => "session-capable",
         VerbKind::Decide => "decision-capable",
+        VerbKind::Image => "image-capable",
     }
 }
 
@@ -320,6 +324,7 @@ fn cannot(verb: VerbKind) -> &'static str {
         VerbKind::Complete => "cannot serve completions",
         VerbKind::Session => "cannot run sessions",
         VerbKind::Decide => "cannot answer decisions",
+        VerbKind::Image => "cannot generate images",
     }
 }
 
@@ -328,6 +333,7 @@ pub fn fixes(verb: VerbKind) -> &'static str {
     match verb {
         VerbKind::Complete | VerbKind::Session => CONVERSATION_FIXES,
         VerbKind::Decide => decide::DECISION_FIXES,
+        VerbKind::Image => image::IMAGE_FIXES,
     }
 }
 
@@ -338,7 +344,7 @@ fn preference(served: &ServedVerb) -> u8 {
     match served.verb {
         Verb::Decide if decide::measured_by(served.wire) == Some(MeasuredBy::Native) => 0,
         Verb::Decide => 1,
-        Verb::Complete | Verb::Session => 0,
+        Verb::Complete | Verb::Session | Verb::Image(_) => 0,
     }
 }
 
@@ -478,6 +484,70 @@ impl Catalog {
     /// verb is refused, never served by something that does. `provider` and
     /// `account` narrow every branch.
     pub fn offer_for(&self, query: OfferQuery<'_>) -> Result<SelectedOffer, NoOffer> {
+        self.ranked(&query).map(|mut offers| offers.remove(0))
+    }
+
+    /// The best offer for `query` that `admit` accepts, with what `admit`
+    /// returned for it: the request-aware walk a verb with per-request
+    /// capabilities (an image's mask, a voice's streaming) selects with.
+    ///
+    /// It walks the same ranked offers [`Self::offer_for`] would pick from. A
+    /// refusal names, three at most, each offer that declined and why; when a
+    /// model or tier was asked for, it also names up to three offers of the
+    /// verb that would admit the request.
+    pub fn admitting_offer<A, E: fmt::Display>(
+        &self,
+        query: OfferQuery<'_>,
+        admit: impl Fn(&SelectedOffer) -> Result<A, E>,
+    ) -> Result<(SelectedOffer, A), NoOffer> {
+        let ranked = self.ranked(&query)?;
+        let mut declined = Vec::new();
+        for offer in ranked {
+            match admit(&offer) {
+                Ok(admitted) => return Ok((offer, admitted)),
+                Err(why) => declined.push(format!("{} on {}: {why}", offer.model, offer.provider)),
+            }
+        }
+        let mut detail = declined
+            .iter()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if declined.len() > 3 {
+            detail.push_str(&format!("; and {} more", declined.len() - 3));
+        }
+        let requested = query
+            .requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if requested.is_some() {
+            let would: Vec<String> = self
+                .candidates(&OfferQuery {
+                    requested: None,
+                    ..query
+                })
+                .into_iter()
+                .filter(|offer| admit(offer).is_ok())
+                .take(3)
+                .map(|offer| format!("{}/{}", offer.provider, offer.model))
+                .collect();
+            if !would.is_empty() {
+                detail.push_str(&format!("; offers that would: {}", would.join(", ")));
+            }
+        }
+        Err(NoOffer {
+            verb: query.verb,
+            requested: requested.map(str::to_string),
+            detail: Some(detail),
+        })
+    }
+
+    /// Every offer that serves `query.verb` for what was asked, best first;
+    /// never empty. This is [`Self::offer_for`]'s selection, kept whole so a
+    /// request-aware walk can move past an offer that cannot take it.
+    fn ranked(&self, query: &OfferQuery<'_>) -> Result<Vec<SelectedOffer>, NoOffer> {
+        let query = *query;
         let verb = query.verb;
         let requested = query
             .requested
@@ -489,33 +559,35 @@ impl Catalog {
             detail,
         };
         let Some(requested) = requested else {
-            return self.candidates(&query).into_iter().next().ok_or_else(|| {
-                // Say why offers that would have served it did not.
-                let unable: Vec<String> = self
-                    .installed()
-                    .filter(|provider| query.admits_provider(&provider.descriptor.key))
-                    .flat_map(|provider| {
-                        let mut unable: Vec<&Unable> = provider
-                            .unable
-                            .iter()
-                            .filter(|unable| unable.verb == verb)
-                            .collect();
-                        unable.sort_by(|a, b| a.model.cmp(&b.model));
-                        unable.into_iter().map(move |unable| {
-                            format!(
-                                "{} on {} {}",
-                                unable.model, provider.descriptor.key, unable.why
-                            )
+            return Some(self.candidates(&query))
+                .filter(|candidates| !candidates.is_empty())
+                .ok_or_else(|| {
+                    // Say why offers that would have served it did not.
+                    let unable: Vec<String> = self
+                        .installed()
+                        .filter(|provider| query.admits_provider(&provider.descriptor.key))
+                        .flat_map(|provider| {
+                            let mut unable: Vec<&Unable> = provider
+                                .unable
+                                .iter()
+                                .filter(|unable| unable.verb == verb)
+                                .collect();
+                            unable.sort_by(|a, b| a.model.cmp(&b.model));
+                            unable.into_iter().map(move |unable| {
+                                format!(
+                                    "{} on {} {}",
+                                    unable.model, provider.descriptor.key, unable.why
+                                )
+                            })
                         })
-                    })
-                    .collect();
-                refuse((!unable.is_empty()).then(|| {
-                    format!(
-                        "every offer that could was seen unable ({})",
-                        unable.join("; ")
-                    )
-                }))
-            });
+                        .collect();
+                    refuse((!unable.is_empty()).then(|| {
+                        format!(
+                            "every offer that could was seen unable ({})",
+                            unable.join("; ")
+                        )
+                    }))
+                });
         };
 
         let (qualifier, tier) = match requested.split_once('/') {
@@ -561,27 +633,30 @@ impl Catalog {
             picks.sort_by_key(|(offer, is_tier_default)| {
                 (preference(&offer.served), !is_tier_default)
             });
-            return picks
-                .into_iter()
-                .next()
-                .map(|(offer, _)| offer)
-                .ok_or_else(|| {
-                    refuse(Some(format!(
-                        "the '{requested}' tier is bound only on {}, which {}{}",
-                        bindings
-                            .iter()
-                            .map(|(provider, _)| provider.descriptor.key.as_ref())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        cannot(verb),
-                        self.observed_unable(
-                            verb,
-                            bindings.iter().map(|(provider, binding)| {
-                                (provider.descriptor.key.as_ref(), binding.model.as_str())
-                            })
-                        )
-                    )))
-                });
+            return Some(
+                picks
+                    .into_iter()
+                    .map(|(offer, _)| offer)
+                    .collect::<Vec<_>>(),
+            )
+            .filter(|picks| !picks.is_empty())
+            .ok_or_else(|| {
+                refuse(Some(format!(
+                    "the '{requested}' tier is bound only on {}, which {}{}",
+                    bindings
+                        .iter()
+                        .map(|(provider, _)| provider.descriptor.key.as_ref())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    cannot(verb),
+                    self.observed_unable(
+                        verb,
+                        bindings.iter().map(|(provider, binding)| {
+                            (provider.descriptor.key.as_ref(), binding.model.as_str())
+                        })
+                    )
+                )))
+            });
         }
 
         let matching: Vec<CatalogOffer> = self
@@ -605,24 +680,26 @@ impl Catalog {
             .filter_map(|offer| offer.selected(verb))
             .collect();
         capable.sort_by_key(|offer| preference(&offer.served));
-        capable.into_iter().next().ok_or_else(|| {
-            let mut providers: Vec<&str> = matching
-                .iter()
-                .map(|offer| offer.provider.as_str())
-                .collect();
-            providers.dedup();
-            refuse(Some(format!(
-                "'{requested}' is offered only by {}, which {}{}",
-                providers.join(", "),
-                cannot(verb),
-                self.observed_unable(
-                    verb,
-                    matching
-                        .iter()
-                        .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
-                )
-            )))
-        })
+        Some(capable)
+            .filter(|capable| !capable.is_empty())
+            .ok_or_else(|| {
+                let mut providers: Vec<&str> = matching
+                    .iter()
+                    .map(|offer| offer.provider.as_str())
+                    .collect();
+                providers.dedup();
+                refuse(Some(format!(
+                    "'{requested}' is offered only by {}, which {}{}",
+                    providers.join(", "),
+                    cannot(verb),
+                    self.observed_unable(
+                        verb,
+                        matching
+                            .iter()
+                            .map(|offer| (offer.provider.as_str(), offer.model.as_str()))
+                    )
+                )))
+            })
     }
 
     /// Every offer `query` admits that serves its verb, best first.
@@ -1140,6 +1217,63 @@ mod tests {
             complete(None, Some("high"), None).unwrap().provider,
             "openrouter"
         );
+    }
+
+    #[test]
+    fn the_request_aware_walk_moves_past_offers_that_decline_and_names_them() {
+        let catalog = Catalog {
+            providers: vec![conversing(provider(
+                "openrouter",
+                Some(vec![model("a", None), model("b", None), model("c", None)]),
+                vec![],
+            ))],
+        };
+        let query = OfferQuery::new(VerbKind::Complete);
+        let (offer, admitted) = catalog
+            .admitting_offer(query, |offer| {
+                if offer.model == "b" {
+                    Ok(7)
+                } else {
+                    Err("too small")
+                }
+            })
+            .unwrap();
+        assert_eq!((offer.model.as_str(), admitted), ("b", 7));
+
+        let refusal = catalog
+            .admitting_offer(query, |_| Err::<(), _>("too small"))
+            .unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "No completion-capable model is available: a on openrouter: too small; b on openrouter: too small; c on openrouter: too small. To fix it, install or configure a provider in Settings → Providers."
+        );
+
+        let pinned = catalog
+            .admitting_offer(
+                OfferQuery {
+                    requested: Some("a"),
+                    ..query
+                },
+                |offer| if offer.model == "a" { Err("too small") } else { Ok(()) },
+            )
+            .unwrap_err();
+        assert_eq!(
+            pinned.detail.as_deref(),
+            Some("a on openrouter: too small; offers that would: openrouter/b, openrouter/c")
+        );
+        // An unknown model is refused as it always was.
+        assert!(catalog
+            .admitting_offer(
+                OfferQuery {
+                    requested: Some("zzz"),
+                    ..query
+                },
+                |_| Ok::<_, &str>(())
+            )
+            .unwrap_err()
+            .detail
+            .unwrap()
+            .contains("no installed provider offers 'zzz'"));
     }
 
     #[test]

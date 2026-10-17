@@ -74,7 +74,7 @@ pub(crate) const MODELS_CATALOG_CONTRACT: ResourceContract = ResourceContract {
         ProjectionSpec { key: "view", values: "providers (default) | models — each model once under its catalog id (the provider's canonical slug, else provider/model), with every provider offering it and the tier references bound to it" },
         ProjectionSpec { key: "provider", values: "KEY — one provider, e.g. claude, codex, openrouter, custom:<account id>" },
         ProjectionSpec { key: "installed", values: "all — also list the supported providers this workspace has not installed (the Add-provider list)" },
-        ProjectionSpec { key: "serves", values: "complete | session | decide — only the models (in either view) that serve that verb" },
+        ProjectionSpec { key: "serves", values: "complete | session | decide | image — only the models (in either view) that serve that verb; an image offer also says what it can draw (count, references, aspect ratios or sizes, mask)" },
     ],
     related: &[RelatedSpec { label: "accounts behind each provider", kind: ResourceKind::ModelsAccounts, actions: false }],
     cross_actions: NO_CROSS_ACTIONS,

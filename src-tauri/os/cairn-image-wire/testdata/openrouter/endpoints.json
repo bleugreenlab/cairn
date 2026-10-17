@@ -1,0 +1,825 @@
+{
+  "openai/gpt-image-2": {
+    "id": "openai/gpt-image-2",
+    "endpoints": [
+      {
+        "provider_name": "OpenAI",
+        "provider_slug": "openai",
+        "provider_tag": "openai",
+        "supported_parameters": {
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "3:2",
+              "2:3",
+              "4:3",
+              "3:4",
+              "16:9",
+              "9:16",
+              "21:9",
+              "auto"
+            ]
+          },
+          "quality": {
+            "type": "enum",
+            "values": [
+              "auto",
+              "low",
+              "medium",
+              "high"
+            ]
+          },
+          "background": {
+            "type": "enum",
+            "values": [
+              "auto",
+              "opaque"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 10
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 16
+          },
+          "output_compression": {
+            "type": "range",
+            "min": 0,
+            "max": 100
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "moderation"
+        ],
+        "supports_streaming": true,
+        "pricing": [
+          {
+            "billable": "input_image",
+            "unit": "token",
+            "cost_usd": 8e-06
+          },
+          {
+            "billable": "input_text",
+            "unit": "token",
+            "cost_usd": 5e-06
+          },
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 3e-05
+          }
+        ]
+      }
+    ]
+  },
+  "black-forest-labs/flux.2-pro": {
+    "id": "black-forest-labs/flux.2-pro",
+    "endpoints": [
+      {
+        "provider_name": "Black Forest Labs",
+        "provider_slug": "black-forest-labs",
+        "provider_tag": "black-forest-labs",
+        "supported_parameters": {
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "4:3",
+              "3:4",
+              "3:2",
+              "2:3",
+              "16:9",
+              "9:16",
+              "21:9",
+              "auto"
+            ]
+          },
+          "output_format": {
+            "type": "enum",
+            "values": [
+              "png",
+              "jpeg"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 8
+          },
+          "seed": {
+            "type": "boolean"
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "steps",
+          "guidance",
+          "safety_tolerance"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "megapixel",
+            "cost_usd": 0.03
+          }
+        ]
+      }
+    ]
+  },
+  "black-forest-labs/flux.2-klein-4b": {
+    "id": "black-forest-labs/flux.2-klein-4b",
+    "endpoints": [
+      {
+        "provider_name": "Black Forest Labs",
+        "provider_slug": "black-forest-labs",
+        "provider_tag": "black-forest-labs",
+        "supported_parameters": {
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "4:3",
+              "3:4",
+              "3:2",
+              "2:3",
+              "16:9",
+              "9:16",
+              "21:9",
+              "auto"
+            ]
+          },
+          "output_format": {
+            "type": "enum",
+            "values": [
+              "png",
+              "jpeg"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 4
+          },
+          "seed": {
+            "type": "boolean"
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "steps",
+          "guidance",
+          "safety_tolerance"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "megapixel",
+            "cost_usd": 0.014
+          }
+        ]
+      }
+    ]
+  },
+  "black-forest-labs/flux.2-flex": {
+    "id": "black-forest-labs/flux.2-flex",
+    "endpoints": [
+      {
+        "provider_name": "Black Forest Labs",
+        "provider_slug": "black-forest-labs/us-3",
+        "provider_tag": "black-forest-labs/us-3",
+        "supported_parameters": {
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "4:3",
+              "3:4",
+              "3:2",
+              "2:3",
+              "16:9",
+              "9:16",
+              "21:9",
+              "auto"
+            ]
+          },
+          "output_format": {
+            "type": "enum",
+            "values": [
+              "png",
+              "jpeg"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 8
+          },
+          "seed": {
+            "type": "boolean"
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "steps",
+          "guidance",
+          "safety_tolerance"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "input_image",
+            "unit": "megapixel",
+            "cost_usd": 0.06
+          },
+          {
+            "billable": "output_image",
+            "unit": "megapixel",
+            "cost_usd": 0.06
+          }
+        ]
+      }
+    ]
+  },
+  "qwen/qwen-image-2.1-turbo": {
+    "id": "qwen/qwen-image-2.1-turbo",
+    "endpoints": [
+      {
+        "provider_name": "Alibaba Cloud Int.",
+        "provider_slug": "alibaba",
+        "provider_tag": "alibaba",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "1K",
+              "2K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "1:2",
+              "1:4",
+              "2:1",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:1",
+              "4:3",
+              "4:5",
+              "5:4",
+              "9:16",
+              "16:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 6
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 4
+          },
+          "seed": {
+            "type": "boolean"
+          }
+        },
+        "allowed_passthrough_parameters": [],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "input_image",
+            "unit": "image",
+            "cost_usd": 0
+          },
+          {
+            "billable": "output_image",
+            "unit": "image",
+            "cost_usd": 0.0184,
+            "variant": "1k"
+          },
+          {
+            "billable": "output_image",
+            "unit": "image",
+            "cost_usd": 0.0184,
+            "variant": "2k"
+          }
+        ]
+      }
+    ]
+  },
+  "google/gemini-3.1-flash-image": {
+    "id": "google/gemini-3.1-flash-image",
+    "endpoints": [
+      {
+        "provider_name": "Google Vertex",
+        "provider_slug": "google-vertex/us",
+        "provider_tag": "google-vertex/us",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "512",
+              "1K",
+              "2K",
+              "4K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "1:4",
+              "1:8",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:1",
+              "4:3",
+              "4:5",
+              "5:4",
+              "8:1",
+              "9:16",
+              "16:9",
+              "21:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 14
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "cachedContent"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 6.6e-05
+          }
+        ]
+      },
+      {
+        "provider_name": "Google AI Studio",
+        "provider_slug": "google-ai-studio",
+        "provider_tag": "google-ai-studio",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "512",
+              "1K",
+              "2K",
+              "4K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "1:4",
+              "1:8",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:1",
+              "4:3",
+              "4:5",
+              "5:4",
+              "8:1",
+              "9:16",
+              "16:9",
+              "21:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 14
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "cachedContent"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 6e-05
+          }
+        ]
+      },
+      {
+        "provider_name": "Google Vertex",
+        "provider_slug": "google-vertex/global",
+        "provider_tag": "google-vertex/global",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "512",
+              "1K",
+              "2K",
+              "4K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "1:4",
+              "1:8",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:1",
+              "4:3",
+              "4:5",
+              "5:4",
+              "8:1",
+              "9:16",
+              "16:9",
+              "21:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 14
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "cachedContent"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 6e-05
+          }
+        ]
+      }
+    ]
+  },
+  "google/gemini-3-pro-image": {
+    "id": "google/gemini-3-pro-image",
+    "endpoints": [
+      {
+        "provider_name": "Google AI Studio",
+        "provider_slug": "google-ai-studio/global",
+        "provider_tag": "google-ai-studio/global",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "1K",
+              "2K",
+              "4K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:3",
+              "4:5",
+              "5:4",
+              "9:16",
+              "16:9",
+              "21:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 14
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "cachedContent"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "input_image",
+            "unit": "token",
+            "cost_usd": 2e-06
+          },
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 0.00012
+          }
+        ]
+      },
+      {
+        "provider_name": "Google Vertex",
+        "provider_slug": "google-vertex/global",
+        "provider_tag": "google-vertex/global",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "1K",
+              "2K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:3",
+              "4:5",
+              "5:4",
+              "9:16",
+              "16:9",
+              "21:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 14
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "cachedContent"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "input_image",
+            "unit": "token",
+            "cost_usd": 2e-06
+          },
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 0.00012
+          }
+        ]
+      }
+    ]
+  },
+  "tencent/hy-image-v3.5-preview": {
+    "id": "tencent/hy-image-v3.5-preview",
+    "endpoints": [
+      {
+        "provider_name": "Tencent Cloud",
+        "provider_slug": "tencent",
+        "provider_tag": "tencent",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "1K",
+              "1.5K",
+              "2K",
+              "4K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "1:2",
+              "1:4",
+              "2:1",
+              "2:3",
+              "3:2",
+              "3:4",
+              "4:1",
+              "4:3",
+              "4:5",
+              "5:4",
+              "9:16",
+              "16:9"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 20
+          },
+          "seed": {
+            "type": "boolean"
+          },
+          "size": {
+            "type": "boolean"
+          }
+        },
+        "allowed_passthrough_parameters": [],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "token",
+            "cost_usd": 1.6e-06
+          }
+        ]
+      }
+    ]
+  },
+  "meta/muse-image": {
+    "id": "meta/muse-image",
+    "endpoints": []
+  },
+  "recraft/recraft-v4-styles-vector": {
+    "id": "recraft/recraft-v4-styles-vector",
+    "endpoints": [
+      {
+        "provider_name": "Recraft",
+        "provider_slug": "recraft",
+        "provider_tag": "recraft",
+        "supported_parameters": {
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "2:1",
+              "1:2",
+              "3:2",
+              "2:3",
+              "4:3",
+              "3:4",
+              "5:4",
+              "4:5",
+              "16:9",
+              "9:16",
+              "auto"
+            ]
+          },
+          "output_format": {
+            "type": "enum",
+            "values": [
+              "svg"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 6
+          },
+          "input_references": {
+            "type": "range",
+            "min": 1,
+            "max": 10
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "style_id",
+          "style_match",
+          "controls",
+          "random_seed"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "image",
+            "cost_usd": 0.05
+          },
+          {
+            "billable": "input_reference",
+            "unit": "request",
+            "cost_usd": 0.005
+          }
+        ]
+      }
+    ]
+  },
+  "sourceful/riverflow-v2-fast": {
+    "id": "sourceful/riverflow-v2-fast",
+    "endpoints": [
+      {
+        "provider_name": "Sourceful",
+        "provider_slug": "sourceful",
+        "provider_tag": "sourceful",
+        "supported_parameters": {
+          "resolution": {
+            "type": "enum",
+            "values": [
+              "1K",
+              "2K",
+              "4K"
+            ]
+          },
+          "aspect_ratio": {
+            "type": "enum",
+            "values": [
+              "1:1",
+              "4:3",
+              "3:4",
+              "3:2",
+              "2:3",
+              "16:9",
+              "9:16",
+              "21:9",
+              "auto"
+            ]
+          },
+          "n": {
+            "type": "range",
+            "min": 1,
+            "max": 1
+          },
+          "input_references": {
+            "type": "range",
+            "min": 0,
+            "max": 4
+          }
+        },
+        "allowed_passthrough_parameters": [
+          "font_inputs"
+        ],
+        "supports_streaming": false,
+        "pricing": [
+          {
+            "billable": "output_image",
+            "unit": "image",
+            "cost_usd": 0.02
+          },
+          {
+            "billable": "output_image",
+            "unit": "image",
+            "cost_usd": 0.04,
+            "variant": "2k"
+          },
+          {
+            "billable": "input_font",
+            "unit": "image",
+            "cost_usd": 0.03
+          },
+          {
+            "billable": "input_reference",
+            "unit": "image",
+            "cost_usd": 0.2
+          }
+        ]
+      }
+    ]
+  }
+}

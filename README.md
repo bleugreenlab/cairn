@@ -38,6 +38,7 @@ the dependency versions Cairn ships.
 |---|---|
 | `cairn-models` | HTTP protocols, provider vocabulary, accounts and routing, and usage as data |
 | `cairn-llm-wire` | Model wires: HTTP protocol families with generation assembly and replay, and the Claude and Codex CLI streams |
+| `cairn-image-wire` | Image wires: OpenRouter's Image API and the OpenAI Images API, with image sniffing |
 | `cairn-models-types` | Facet vocabulary: provider ids, the provider catalog, usage windows and snapshots, pooled capacity |
 | `cairn-credentials` | Provider accounts, credential storage, leases, and selection |
 

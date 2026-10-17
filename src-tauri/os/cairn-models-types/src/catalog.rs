@@ -32,6 +32,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::image::ImageCapabilities;
 use crate::provider_id::ApiProvider;
 use crate::usage::{BillingUnit, Charge, Meter};
 
@@ -491,8 +492,8 @@ impl fmt::Display for Modalities {
 }
 
 /// A protocol that carries a verb. This is a name, not the implementation: LLM
-/// families are implemented in cairn-llm-wire, and media wires will get
-/// sibling crates.
+/// families are implemented in cairn-llm-wire, and image wires in its sibling
+/// cairn-image-wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Wire {
     /// OpenAI-compatible `chat/completions`.
@@ -514,6 +515,14 @@ pub enum Wire {
     /// The Codex CLI's app-server protocol.
     #[serde(rename = "codex-app-server")]
     CodexAppServer,
+    /// OpenRouter's Image API: `POST /api/v1/images`, JSON in and out.
+    #[serde(rename = "openrouter-images")]
+    OpenRouterImages,
+    /// The OpenAI Images API: `/images/generations` (JSON) and
+    /// `/images/edits` (multipart), as OpenAI and every OpenAI-compatible
+    /// image server answers it.
+    #[serde(rename = "openai-images")]
+    OpenAiImages,
 }
 
 impl Wire {
@@ -525,6 +534,8 @@ impl Wire {
             Self::OpenAiDecisions => "openai-decisions",
             Self::ClaudeStreamJson => "claude-stream-json",
             Self::CodexAppServer => "codex-app-server",
+            Self::OpenRouterImages => "openrouter-images",
+            Self::OpenAiImages => "openai-images",
         }
     }
 }
@@ -537,13 +548,16 @@ impl fmt::Display for Wire {
 
 /// A facet verb an offer serves. Each variant carries that verb's capability
 /// type, which is where a verb with real capability differences (image sizes,
-/// speech voices) says what it can do. Today's verbs carry none.
+/// speech voices) says what it can do. The conversational verbs and `decide`
+/// carry none; `image` carries what the offer can draw, flattened beside the
+/// tag (`{"verb": "image", "maxCount": 4, ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "lowercase")]
 pub enum Verb {
     Complete,
     Session,
     Decide,
+    Image(ImageCapabilities),
 }
 
 impl Verb {
@@ -552,6 +566,15 @@ impl Verb {
             Self::Complete => VerbKind::Complete,
             Self::Session => VerbKind::Session,
             Self::Decide => VerbKind::Decide,
+            Self::Image(_) => VerbKind::Image,
+        }
+    }
+
+    /// What this verb can draw, when it is `image`.
+    pub fn image(&self) -> Option<&ImageCapabilities> {
+        match self {
+            Self::Image(capabilities) => Some(capabilities),
+            _ => None,
         }
     }
 }
@@ -564,16 +587,18 @@ pub enum VerbKind {
     Complete,
     Session,
     Decide,
+    Image,
 }
 
 impl VerbKind {
-    pub const ALL: [VerbKind; 3] = [Self::Complete, Self::Session, Self::Decide];
+    pub const ALL: [VerbKind; 4] = [Self::Complete, Self::Session, Self::Decide, Self::Image];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Complete => "complete",
             Self::Session => "session",
             Self::Decide => "decide",
+            Self::Image => "image",
         }
     }
 
@@ -899,13 +924,35 @@ mod tests {
             Wire::OpenAiDecisions,
             Wire::ClaudeStreamJson,
             Wire::CodexAppServer,
+            Wire::OpenRouterImages,
+            Wire::OpenAiImages,
         ] {
             assert_eq!(serde_json::to_value(wire).unwrap(), wire.as_str());
         }
         for kind in VerbKind::ALL {
             assert_eq!(VerbKind::parse(kind.as_str()), Some(kind));
         }
-        assert_eq!(VerbKind::parse("image"), None);
+        assert_eq!(VerbKind::parse("speech"), None);
+    }
+
+    #[test]
+    fn an_image_verb_flattens_its_capabilities_beside_its_tag_and_wire() {
+        let served = ServedVerb {
+            verb: Verb::Image(ImageCapabilities::openai_images_minimal()),
+            wire: Wire::OpenAiImages,
+        };
+        let json = serde_json::to_value(&served).unwrap();
+        assert_eq!(json["verb"], "image");
+        assert_eq!(json["wire"], "openai-images");
+        assert_eq!(json["maxCount"], 1);
+        assert_eq!(json["shape"]["auto"], true);
+        assert_eq!(serde_json::from_value::<ServedVerb>(json).unwrap(), served);
+        assert_eq!(served.verb.kind(), VerbKind::Image);
+        assert_eq!(
+            served.verb.image(),
+            Some(&ImageCapabilities::openai_images_minimal())
+        );
+        assert_eq!(Verb::Decide.image(), None);
     }
 
     #[test]

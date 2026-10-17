@@ -304,6 +304,8 @@ impl ProviderUsageSnapshot {
 pub enum BillingUnit {
     Tokens,
     Images,
+    /// Output area, as an image model priced by size is (FLUX on OpenRouter).
+    Megapixels,
     Characters,
     Seconds,
     Requests,
@@ -315,6 +317,7 @@ impl BillingUnit {
         match self {
             Self::Tokens => "token",
             Self::Images => "image",
+            Self::Megapixels => "megapixel",
             Self::Characters => "character",
             Self::Seconds => "second",
             Self::Requests => "request",

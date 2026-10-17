@@ -182,6 +182,9 @@ enum AuthFile {
         sampling: CustomSampling,
         #[serde(default = "default_custom_max_output_tokens")]
         max_output_tokens: i64,
+        /// Not secret: what an image server can draw.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        images: Option<Box<cairn_models_types::image::ImageCapabilities>>,
     },
     #[serde(rename = "local_cli")]
     LocalCli,
@@ -581,6 +584,7 @@ fn store_from_v2_file(
                 models,
                 sampling,
                 max_output_tokens,
+                images,
             } => {
                 let values: Vec<String> = match &encrypted_header_values {
                     Some(sealed) => serde_json::from_str(&decrypt_credential(sealed, machine_id)?)
@@ -608,6 +612,7 @@ fn store_from_v2_file(
                     models,
                     sampling,
                     max_output_tokens,
+                    images,
                 }
             }
             AuthFile::ClaudeProfile { encrypted_oauth } => ProviderAuth::ClaudeProfile {
@@ -702,6 +707,7 @@ fn store_to_v2_file(
                 models,
                 sampling,
                 max_output_tokens,
+                images,
             } => AuthFile::CustomEndpoint {
                 base_url: base_url.clone(),
                 protocol: *protocol,
@@ -725,6 +731,7 @@ fn store_to_v2_file(
                 models: models.clone(),
                 sampling: sampling.clone(),
                 max_output_tokens: *max_output_tokens,
+                images: images.clone(),
             },
             ProviderAuth::ClaudeProfile { oauth } => AuthFile::ClaudeProfile {
                 encrypted_oauth: oauth
@@ -1361,6 +1368,47 @@ accounts:
     }
 
     #[test]
+    fn an_image_endpoint_keeps_its_declared_capabilities_on_disk() {
+        let declared = cairn_models_types::image::ImageCapabilities::openai_gpt_image();
+        let auth = ProviderAuth::custom_endpoint(
+            "https://api.openai.com/v1",
+            CustomProtocol::OpenAiImages,
+            Some("sk-secret-value"),
+            &[],
+            CustomModelPolicy::Explicit {
+                ids: vec!["gpt-image-2".into()],
+            },
+            CustomSampling::default(),
+            crate::DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
+        )
+        .unwrap()
+        .with_image_capabilities(declared.clone());
+        let store = CredentialStore {
+            user_id: "local-1".to_string(),
+            accounts: vec![configured_account(
+                "acc_openai",
+                "OpenAI Images",
+                ApiProvider::Custom,
+                auth,
+                0,
+                0,
+                None,
+            )],
+            git_identities: vec![],
+            project_overrides: Default::default(),
+            retired_logins: vec![],
+            config_dir: std::path::PathBuf::new(),
+        };
+        let yaml = serde_yaml::to_string(&store_to_v2_file(&store, "m").unwrap()).unwrap();
+        assert!(yaml.contains("openai-images"), "{yaml}");
+        let (restored, _) = store_from_v2_file(serde_yaml::from_str(&yaml).unwrap(), "m").unwrap();
+        assert_eq!(
+            restored.accounts[0].auth.image_capabilities(),
+            Some(declared)
+        );
+    }
+
+    #[test]
     fn a_custom_endpoint_round_trips_with_its_secrets_sealed() {
         let machine = "test-machine";
         let auth = ProviderAuth::custom_endpoint(
@@ -1422,10 +1470,12 @@ accounts:
             models,
             sampling,
             max_output_tokens,
+            images,
         } = &restored.auth
         else {
             panic!("expected a custom endpoint");
         };
+        assert_eq!(*images, None);
         assert_eq!(base_url, "http://10.10.10.83:8000/v1");
         assert_eq!(*protocol, CustomProtocol::OpenAiChatCompletions);
         assert_eq!(api_key.as_deref(), Some("sk-secret-value"));

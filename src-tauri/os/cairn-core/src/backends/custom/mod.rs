@@ -38,6 +38,7 @@ use crate::orchestrator::Orchestrator;
 use cairn_models::interface::decide::DecisionRoute;
 use cairn_models::types::catalog::DiscoveredModel;
 use cairn_models::types::catalog::{self, ServedVerb, Verb, Wire};
+use cairn_models::types::image::ImageCapabilities;
 use cairn_models::wire::decisions::http::DecisionsEndpoint;
 use cairn_models::wire::openai_compat::http::Endpoint;
 
@@ -60,6 +61,9 @@ pub(crate) struct CustomProviderConfig {
     pub(crate) models: CustomModelPolicy,
     pub(crate) sampling: CustomSampling,
     pub(crate) max_output_tokens: i64,
+    /// What an OpenAI Images provider can draw; `None` for every other
+    /// protocol.
+    pub(crate) images: Option<ImageCapabilities>,
 }
 
 impl CustomProviderConfig {
@@ -93,6 +97,7 @@ impl CustomProviderConfig {
             models,
             sampling,
             max_output_tokens,
+            ..
         } = &account.auth
         else {
             return Err(format!("account {account_id} is not a custom endpoint"));
@@ -116,6 +121,7 @@ impl CustomProviderConfig {
             models: models.clone(),
             sampling: sampling.clone(),
             max_output_tokens: *max_output_tokens,
+            images: account.auth.image_capabilities(),
         })
     }
 
@@ -137,13 +143,17 @@ impl CustomProviderConfig {
         format!("{}/decisions", self.base_url)
     }
 
-    /// Refuse what a Decisions provider cannot do: it answers decisions, and
-    /// has no agent turn or text completion to offer.
+    /// Refuse what a Decisions or Images provider cannot do: each serves its
+    /// one verb, and has no agent turn or text completion to offer.
     pub(crate) fn require_turns(&self) -> Result<(), String> {
         match self.protocol {
             CustomProtocol::OpenAiChatCompletions => Ok(()),
             CustomProtocol::Decisions => Err(format!(
                 "{} speaks the Decisions protocol, which answers decisions only; it cannot run an agent or a response. Choose a chat provider for this.",
+                self.display_name
+            )),
+            CustomProtocol::OpenAiImages => Err(format!(
+                "{} speaks the OpenAI Images protocol, which draws images only; it cannot run an agent or a response. Choose a chat provider for this.",
                 self.display_name
             )),
         }
@@ -166,6 +176,14 @@ impl CustomProviderConfig {
                 serves
             }
             CustomProtocol::Decisions => vec![decide],
+            CustomProtocol::OpenAiImages => vec![ServedVerb {
+                verb: Verb::Image(
+                    self.images
+                        .clone()
+                        .unwrap_or_else(ImageCapabilities::openai_images_minimal),
+                ),
+                wire,
+            }],
         }
     }
 
@@ -175,27 +193,32 @@ impl CustomProviderConfig {
         match self.protocol {
             CustomProtocol::OpenAiChatCompletions => Wire::OpenAiChatCompletions,
             CustomProtocol::Decisions => Wire::OpenAiDecisions,
+            CustomProtocol::OpenAiImages => Wire::OpenAiImages,
         }
     }
 
     /// The deployment that measures this provider's decisions.
-    pub(crate) fn decision_route(&self) -> DecisionRoute {
+    pub(crate) fn decision_route(&self) -> Result<DecisionRoute, String> {
         let provider_name = self.display_name.clone();
         let backend_key = self.backend_key();
         let headers = self.headers.clone();
         match self.protocol {
-            CustomProtocol::OpenAiChatCompletions => DecisionRoute::Logprobs(Endpoint {
+            CustomProtocol::OpenAiChatCompletions => Ok(DecisionRoute::Logprobs(Endpoint {
                 provider_name,
                 backend_key,
                 chat_url: self.chat_url(),
                 headers,
-            }),
-            CustomProtocol::Decisions => DecisionRoute::Native(DecisionsEndpoint {
+            })),
+            CustomProtocol::Decisions => Ok(DecisionRoute::Native(DecisionsEndpoint {
                 provider_name,
                 backend_key,
                 url: self.decisions_url(),
                 headers,
-            }),
+            })),
+            CustomProtocol::OpenAiImages => Err(format!(
+                "{} speaks the OpenAI Images protocol, which cannot answer a decision",
+                self.display_name
+            )),
         }
     }
 }

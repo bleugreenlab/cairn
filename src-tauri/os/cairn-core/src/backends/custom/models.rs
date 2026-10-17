@@ -72,6 +72,9 @@ fn fetch(config: &CustomProviderConfig) -> Result<Vec<ModelEntry>, String> {
         CustomProtocol::Decisions => {
             return Err("a Decisions provider lists its models explicitly".to_string())
         }
+        CustomProtocol::OpenAiImages => {
+            return Err("an OpenAI Images provider lists its models explicitly".to_string())
+        }
     }
     let client = reqwest::blocking::Client::builder()
         .connect_timeout(DISCOVERY_TIMEOUT)

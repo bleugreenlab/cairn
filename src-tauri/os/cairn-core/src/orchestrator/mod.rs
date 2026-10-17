@@ -3381,6 +3381,10 @@ impl Orchestrator {
             crate::backends::claude::discover_catalog_blocking(self)
         } else if backend_name == "ollama" {
             crate::backends::ollama::models::discover_catalog_blocking(self)
+        } else if backend_name == crate::backends::openrouter::OPENROUTER_BACKEND_KEY {
+            // Chat and image models come from two listings; one failing must
+            // neither hide the other nor go unsaid.
+            crate::backends::openrouter::discover_catalog_blocking()
         } else if backend_name == crate::backends::actual::ACTUAL_BACKEND_KEY {
             // Inventory is per target, so discovery needs the configured
             // accounts rather than a vendor-wide list.

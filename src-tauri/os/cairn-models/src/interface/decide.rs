@@ -83,7 +83,9 @@ pub fn measured_by(wire: Wire) -> Option<MeasuredBy> {
         Wire::AnthropicMessages
         | Wire::OpenAiResponses
         | Wire::ClaudeStreamJson
-        | Wire::CodexAppServer => None,
+        | Wire::CodexAppServer
+        | Wire::OpenRouterImages
+        | Wire::OpenAiImages => None,
     }
 }
 

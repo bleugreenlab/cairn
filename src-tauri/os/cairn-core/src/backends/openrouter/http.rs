@@ -1,5 +1,6 @@
-//! OpenRouter's endpoint, headers, and provider-routing object, and the
-//! structured-output constraint its one-shot completions carry.
+//! OpenRouter's endpoint and provider-routing object, and the
+//! structured-output constraint its one-shot completions carry. Its headers
+//! are the facet's (`cairn_models::openrouter`), shared with the image verb.
 
 use crate::models::{OpenRouterRouting, OpenRouterSort};
 use serde_json::{json, Value};
@@ -52,16 +53,10 @@ pub(super) fn apply_output_schema(body: &mut Value, schema: Option<&Value>) {
     }
 }
 
-pub(super) fn openrouter_headers(api_key: &str) -> Result<Vec<(String, String)>, String> {
-    Ok(vec![
-        ("authorization".to_string(), format!("Bearer {api_key}")),
-        ("content-type".to_string(), "application/json".to_string()),
-        (
-            "http-referer".to_string(),
-            "https://cairn.computer".to_string(),
-        ),
-        ("x-openrouter-title".to_string(), "Cairn".to_string()),
-    ])
+/// The headers Cairn's OpenRouter requests carry: the facet's, attributed to
+/// Cairn.
+pub(super) fn openrouter_headers(api_key: &str) -> Vec<(String, String)> {
+    cairn_models::openrouter::headers(api_key, &cairn_models::openrouter::Attribution::cairn())
 }
 
 #[cfg(test)]

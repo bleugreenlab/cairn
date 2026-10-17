@@ -224,7 +224,7 @@ impl Orchestrator {
     ) -> Result<DecisionRoute, String> {
         let account_id = catalog::custom_account_id(&offer.provider)
             .ok_or_else(|| format!("{} cannot answer a decision", offer.provider))?;
-        Ok(CustomProviderConfig::resolve(self, account_id, project_id)?.decision_route())
+        CustomProviderConfig::resolve(self, account_id, project_id)?.decision_route()
     }
 
     /// Where each decision node in `nodes` stands in `project_id`'s scope,

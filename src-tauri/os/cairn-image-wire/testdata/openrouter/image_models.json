@@ -1,0 +1,578 @@
+{
+  "data": [
+    {
+      "id": "openai/gpt-image-2",
+      "name": "OpenAI: GPT Image 2",
+      "description": "OpenAI's latest image generation model. Supports high-fidelity image generation and editin...",
+      "created": 1782264714,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "3:2",
+            "2:3",
+            "4:3",
+            "3:4",
+            "16:9",
+            "9:16",
+            "21:9",
+            "auto"
+          ]
+        },
+        "quality": {
+          "type": "enum",
+          "values": [
+            "auto",
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "background": {
+          "type": "enum",
+          "values": [
+            "auto",
+            "opaque"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 10
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 16
+        },
+        "output_compression": {
+          "type": "range",
+          "min": 0,
+          "max": 100
+        }
+      },
+      "supports_streaming": true,
+      "endpoints": "/api/v1/images/models/openai/gpt-image-2/endpoints"
+    },
+    {
+      "id": "black-forest-labs/flux.2-pro",
+      "name": "Black Forest Labs: FLUX.2 Pro",
+      "description": "A high-end image generation and editing model focused on frontier-level visual quality and...",
+      "created": 1764030274,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "4:3",
+            "3:4",
+            "3:2",
+            "2:3",
+            "16:9",
+            "9:16",
+            "21:9",
+            "auto"
+          ]
+        },
+        "output_format": {
+          "type": "enum",
+          "values": [
+            "png",
+            "jpeg"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 8
+        },
+        "seed": {
+          "type": "boolean"
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/black-forest-labs/flux.2-pro/endpoints"
+    },
+    {
+      "id": "black-forest-labs/flux.2-klein-4b",
+      "name": "Black Forest Labs: FLUX.2 Klein 4B",
+      "description": "FLUX.2 [klein] 4B is the fastest and most cost-effective model in the FLUX.2 family, optim...",
+      "created": 1768429228,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "4:3",
+            "3:4",
+            "3:2",
+            "2:3",
+            "16:9",
+            "9:16",
+            "21:9",
+            "auto"
+          ]
+        },
+        "output_format": {
+          "type": "enum",
+          "values": [
+            "png",
+            "jpeg"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 4
+        },
+        "seed": {
+          "type": "boolean"
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/black-forest-labs/flux.2-klein-4b/endpoints"
+    },
+    {
+      "id": "black-forest-labs/flux.2-flex",
+      "name": "Black Forest Labs: FLUX.2 Flex",
+      "description": "FLUX.2 [flex] excels at rendering complex text, typography, and fine details, and supports...",
+      "created": 1764045987,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "4:3",
+            "3:4",
+            "3:2",
+            "2:3",
+            "16:9",
+            "9:16",
+            "21:9",
+            "auto"
+          ]
+        },
+        "output_format": {
+          "type": "enum",
+          "values": [
+            "png",
+            "jpeg"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 8
+        },
+        "seed": {
+          "type": "boolean"
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/black-forest-labs/flux.2-flex/endpoints"
+    },
+    {
+      "id": "qwen/qwen-image-2.1-turbo",
+      "name": "Qwen: Qwen Image 2.1 Turbo",
+      "description": "Qwen Image 2.1 Turbo is the fast, lower-cost tier of the Qwen Image 2.1 series from Qwen, ...",
+      "created": 1792194104,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "1K",
+            "2K"
+          ]
+        },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "1:2",
+            "1:4",
+            "2:1",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:1",
+            "4:3",
+            "4:5",
+            "5:4",
+            "9:16",
+            "16:9"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 6
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 4
+        },
+        "seed": {
+          "type": "boolean"
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/qwen/qwen-image-2.1-turbo/endpoints"
+    },
+    {
+      "id": "google/gemini-3.1-flash-image",
+      "name": "Google: Nano Banana 2 (Gemini 3.1 Flash Image)",
+      "description": "Gemini 3.1 Flash Image, a.k.a. \"Nano Banana 2,\" is Google\u2019s latest state of the art image ...",
+      "created": 1781754065,
+      "architecture": {
+        "input_modalities": [
+          "image",
+          "text"
+        ],
+        "output_modalities": [
+          "image",
+          "text"
+        ]
+      },
+      "supported_parameters": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "512",
+            "1K",
+            "2K",
+            "4K"
+          ]
+        },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "1:4",
+            "1:8",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:1",
+            "4:3",
+            "4:5",
+            "5:4",
+            "8:1",
+            "9:16",
+            "16:9",
+            "21:9"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 14
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/google/gemini-3.1-flash-image/endpoints"
+    },
+    {
+      "id": "google/gemini-3-pro-image",
+      "name": "Google: Nano Banana Pro (Gemini 3 Pro Image)",
+      "description": "Nano Banana Pro is Google\u2019s most advanced image-generation and editing model, built on Gem...",
+      "created": 1781754054,
+      "architecture": {
+        "input_modalities": [
+          "image",
+          "text"
+        ],
+        "output_modalities": [
+          "image",
+          "text"
+        ]
+      },
+      "supported_parameters": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "1K",
+            "2K",
+            "4K"
+          ]
+        },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:3",
+            "4:5",
+            "5:4",
+            "9:16",
+            "16:9",
+            "21:9"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 14
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/google/gemini-3-pro-image/endpoints"
+    },
+    {
+      "id": "tencent/hy-image-v3.5-preview",
+      "name": "Tencent: Hy Image 3.5 Preview",
+      "description": "Hy Image 3.5 Preview is a unified image generation and editing model from Tencent. It hand...",
+      "created": 1791232017,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "1K",
+            "1.5K",
+            "2K",
+            "4K"
+          ]
+        },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "1:2",
+            "1:4",
+            "2:1",
+            "2:3",
+            "3:2",
+            "3:4",
+            "4:1",
+            "4:3",
+            "4:5",
+            "5:4",
+            "9:16",
+            "16:9"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 20
+        },
+        "seed": {
+          "type": "boolean"
+        },
+        "size": {
+          "type": "boolean"
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/tencent/hy-image-v3.5-preview/endpoints"
+    },
+    {
+      "id": "meta/muse-image",
+      "name": "Meta: Muse Image",
+      "description": "Muse Image is an agentic image generation model from Meta that generates and edits images ...",
+      "created": 1787764532,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {},
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/meta/muse-image/endpoints"
+    },
+    {
+      "id": "recraft/recraft-v4-styles-vector",
+      "name": "Recraft: Recraft V4 Styles Vector",
+      "description": "Recraft V4 Styles Vector is a style-consistent image generation model from Recraft. Every ...",
+      "created": 1787742635,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "2:1",
+            "1:2",
+            "3:2",
+            "2:3",
+            "4:3",
+            "3:4",
+            "5:4",
+            "4:5",
+            "16:9",
+            "9:16",
+            "auto"
+          ]
+        },
+        "output_format": {
+          "type": "enum",
+          "values": [
+            "svg"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 6
+        },
+        "input_references": {
+          "type": "range",
+          "min": 1,
+          "max": 10
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/recraft/recraft-v4-styles-vector/endpoints"
+    },
+    {
+      "id": "sourceful/riverflow-v2-fast",
+      "name": "Sourceful: Riverflow V2 Fast",
+      "description": "Riverflow V2 Fast is the fastest variant of Sourceful's Riverflow 2.0 lineup, best for pro...",
+      "created": 1770051423,
+      "architecture": {
+        "input_modalities": [
+          "text",
+          "image"
+        ],
+        "output_modalities": [
+          "image"
+        ]
+      },
+      "supported_parameters": {
+        "resolution": {
+          "type": "enum",
+          "values": [
+            "1K",
+            "2K",
+            "4K"
+          ]
+        },
+        "aspect_ratio": {
+          "type": "enum",
+          "values": [
+            "1:1",
+            "4:3",
+            "3:4",
+            "3:2",
+            "2:3",
+            "16:9",
+            "9:16",
+            "21:9",
+            "auto"
+          ]
+        },
+        "n": {
+          "type": "range",
+          "min": 1,
+          "max": 1
+        },
+        "input_references": {
+          "type": "range",
+          "min": 0,
+          "max": 4
+        }
+      },
+      "supports_streaming": false,
+      "endpoints": "/api/v1/images/models/sourceful/riverflow-v2-fast/endpoints"
+    }
+  ]
+}

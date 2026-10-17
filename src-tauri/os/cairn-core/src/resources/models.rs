@@ -158,20 +158,34 @@ fn modalities(modalities: &Modalities) -> Option<String> {
 }
 
 /// The verbs grouped by the wire each rides, `complete, session
-/// (openai-chat)`, or `None` for serving nothing.
+/// (openai-chat)`, or `None` for serving nothing. An image verb says what it
+/// can draw beside its wire: `image (openrouter-images: ≤4 · refs ≤16 · no
+/// mask)`.
 fn served(serves: &[ServedVerb]) -> Option<String> {
-    let mut groups: Vec<(Wire, Vec<&str>)> = Vec::new();
+    let mut groups: Vec<(Wire, Vec<&str>, Option<String>)> = Vec::new();
     for served in serves {
         let verb = served.verb.kind().as_str();
-        match groups.iter_mut().find(|(wire, _)| *wire == served.wire) {
-            Some((_, verbs)) => verbs.push(verb),
-            None => groups.push((served.wire, vec![verb])),
+        let detail = served
+            .verb
+            .image()
+            .map(|capabilities| capabilities.summary());
+        match groups.iter_mut().find(|(wire, _, _)| *wire == served.wire) {
+            Some((_, verbs, summary)) => {
+                verbs.push(verb);
+                if summary.is_none() {
+                    *summary = detail;
+                }
+            }
+            None => groups.push((served.wire, vec![verb], detail)),
         }
     }
     (!groups.is_empty()).then(|| {
         groups
             .iter()
-            .map(|(wire, verbs)| format!("{} ({wire})", verbs.join(", ")))
+            .map(|(wire, verbs, summary)| match summary {
+                Some(summary) => format!("{} ({wire}: {summary})", verbs.join(", ")),
+                None => format!("{} ({wire})", verbs.join(", ")),
+            })
             .collect::<Vec<_>>()
             .join("; ")
     })
@@ -1212,12 +1226,42 @@ mod tests {
         let none = read(&orch, "cairn://models/catalog?view=models&serves=decide").await;
         assert!(!none.contains("`claude/opus`"), "{none}");
 
-        let bad = read(&orch, "cairn://models/catalog?serves=image").await;
+        let drawing = read(&orch, "cairn://models/catalog?serves=image").await;
+        assert!(
+            drawing.contains("Models serving image (0 of "),
+            "no seeded model draws: {drawing}"
+        );
+
+        let bad = read(&orch, "cairn://models/catalog?serves=speech").await;
         assert!(
             bad.starts_with(
-                "Unknown serves='image' for cairn://models/catalog; expected one of complete, session, decide."
+                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, image."
             ),
             "{bad}"
+        );
+    }
+
+    #[test]
+    fn an_image_offer_says_what_it_can_draw_beside_its_wire() {
+        use super::{ServedVerb, Wire};
+        use cairn_models::types::catalog::Verb;
+        use cairn_models::types::image::ImageCapabilities;
+        let image = ServedVerb {
+            verb: Verb::Image(ImageCapabilities::openai_gpt_image()),
+            wire: Wire::OpenAiImages,
+        };
+        assert_eq!(
+            super::served(std::slice::from_ref(&image)).as_deref(),
+            Some("image (openai-images: ≤10 · refs ≤16 · size any ×16 ≤3840 ≤3:1 · mask)")
+        );
+        let mut both = ServedVerb::conversation(Wire::OpenAiChatCompletions);
+        both.push(ServedVerb {
+            verb: Verb::Image(ImageCapabilities::openai_images_minimal()),
+            wire: Wire::OpenRouterImages,
+        });
+        assert_eq!(
+            super::served(&both).as_deref(),
+            Some("complete, session (openai-chat); image (openrouter-images: ≤1 · size 1024x1024|1024x1536|1536x1024 · no edit)")
         );
     }
 
