@@ -161,6 +161,75 @@ pub fn tree_entries(jj: &JjEnv, ws: &Path, treeish: &str) -> Result<Vec<(String,
     Ok(parse_ls_tree(&String::from_utf8_lossy(&out.stdout)))
 }
 
+/// One line of a commit's tree that a [`grep_fixed_at`] needle matched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepHit {
+    pub path: String,
+    /// One-based.
+    pub line: u32,
+    pub text: String,
+}
+
+/// The lines of `commit`'s tree, limited to `pathspecs`, that contain any of
+/// `needles` as a fixed string — one `git grep` over the backing object
+/// database, so no checkout of `commit` is needed. Binary files are skipped.
+pub fn grep_fixed_at(
+    jj: &JjEnv,
+    ws: &Path,
+    commit: &str,
+    needles: &[String],
+    pathspecs: &[String],
+) -> Result<Vec<GrepHit>, String> {
+    if needles.is_empty() {
+        return Ok(Vec::new());
+    }
+    let git_dir = git_backend_root(jj, ws)?;
+    let mut command = cairn_platform::env::git();
+    command.args([
+        "--git-dir",
+        &git_dir,
+        "grep",
+        "-n",
+        "-z",
+        "-I",
+        "-F",
+        "--no-color",
+    ]);
+    for needle in needles {
+        command.args(["-e", needle]);
+    }
+    command.arg(commit).arg("--").args(pathspecs);
+    let out = bounded_command_output(&mut command, JJ_DEFAULT_TIMEOUT, "git grep at revision")?;
+    match out.status.code() {
+        Some(0) => Ok(parse_grep_z(&String::from_utf8_lossy(&out.stdout), commit)),
+        // git grep's "nothing matched".
+        Some(1) => Ok(Vec::new()),
+        _ => Err(format!(
+            "git grep at {commit} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+/// Parse `git grep -n -z <commit>` output. Each record is
+/// `<commit>:<path> NUL <line> NUL <text> LF`; `-z` leaves the path unquoted, and
+/// a matched line cannot itself hold a newline, so the record split is exact.
+pub(crate) fn parse_grep_z(output: &str, commit: &str) -> Vec<GrepHit> {
+    let prefix = format!("{commit}:");
+    output
+        .split('\n')
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, '\0');
+            let (path, line, text) = (fields.next()?, fields.next()?, fields.next()?);
+            Some(GrepHit {
+                path: path.strip_prefix(&prefix).unwrap_or(path).to_string(),
+                line: line.parse().ok()?,
+                text: text.to_string(),
+            })
+        })
+        .collect()
+}
+
 /// Blob CONTENT for a set of object ids, in ONE `git cat-file --batch`.
 ///
 /// [`tree_entries`] gives paths and object ids; check-input derivation needs the

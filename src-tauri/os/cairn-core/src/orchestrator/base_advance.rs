@@ -577,6 +577,22 @@ fn plan_post_rebase_resolution(
         if assignments.is_empty() {
             continue;
         }
+        // Best-effort: a missed site costs the agent a warning, not correctness,
+        // so a failed search must not refuse an otherwise sound resolution.
+        let literal_hits = crate::jj::grep_fixed_at(
+            jj,
+            store,
+            rebased_tip,
+            &contended::bare_version_needles(&assignments),
+            &contended::bare_version_pathspecs(lineage),
+        )
+        .unwrap_or_else(|error| {
+            log::warn!(
+                "[{}] bare version literal search at `{rebased_tip}` failed: {error}",
+                lineage.label
+            );
+            Vec::new()
+        });
         for (from, to) in &assignments {
             plan.edits.push(contended::FileEdit::Rename {
                 from: format!("{}/{}.sql", lineage.dir, from),
@@ -586,6 +602,7 @@ fn plan_post_rebase_resolution(
                 lineage: lineage.label.to_string(),
                 from: from.clone(),
                 to: to.clone(),
+                bare_literals: contended::bare_literal_sites(from, &literal_hits),
             });
         }
         registry_rewrites.insert(
@@ -8605,6 +8622,13 @@ mod real_store_collision_tests {
         add_migration(&destination_ws, "0228_destination");
         crate::jj::seal(&fx.jj, &destination_ws, "destination migration", None).unwrap();
         add_migration(&branch_ws, "0228_branch");
+        // A test naming the migration by number keeps pointing at 0228 after
+        // the renumber, which is now the destination's migration.
+        std::fs::write(
+            branch_ws.join("src-tauri/os/cairn-db/src/storage/ordering_tests.rs"),
+            "// header\nassert_eq!(applied, \"0228\");\nlet unrelated = \"0229\";\n",
+        )
+        .unwrap();
         crate::jj::seal(&fx.jj, &branch_ws, "branch migration", None).unwrap();
         let pre_tip = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();
         let destination =
@@ -8648,8 +8672,11 @@ mod real_store_collision_tests {
         .unwrap();
         assert!(plan.movements.iter().any(|movement| matches!(
             movement,
-            Movement::Renumbered { from, to, .. } if from == "0228_branch" && to == "0230_branch"
-        )));
+            Movement::Renumbered { from, to, bare_literals, .. }
+                if from == "0228_branch"
+                    && to == "0230_branch"
+                    && bare_literals == &["src-tauri/os/cairn-db/src/storage/ordering_tests.rs:2"]
+        )), "{:?}", plan.movements);
         apply_resolution_plan(&fx.jj, &fx.store, branch, &union_tip, &plan).unwrap();
 
         let resolved = crate::jj::bookmark_commit(&fx.jj, &fx.store, branch).unwrap();

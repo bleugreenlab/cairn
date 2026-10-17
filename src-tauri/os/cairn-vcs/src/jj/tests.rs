@@ -1372,6 +1372,29 @@ fn parse_ls_tree_extracts_sorted_path_blob_pairs() {
     );
 }
 
+/// `parse_grep_z` strips the `<commit>:` prefix git grep puts on every path when
+/// searching a tree, keeps the matched text verbatim even when it holds colons,
+/// and drops the empty record after the final newline. Pure.
+#[test]
+fn parse_grep_z_reads_path_line_and_text() {
+    let out = "abc:src/a.rs\x0012\x00assert_eq!(v, \"0256\"); // a: b\nabc:scripts/b.ts\x003\x00x('0256')\n";
+    assert_eq!(
+        super::parse_grep_z(out, "abc"),
+        vec![
+            super::GrepHit {
+                path: "src/a.rs".into(),
+                line: 12,
+                text: "assert_eq!(v, \"0256\"); // a: b".into(),
+            },
+            super::GrepHit {
+                path: "scripts/b.ts".into(),
+                line: 3,
+                text: "x('0256')".into(),
+            },
+        ]
+    );
+}
+
 /// `parse_cat_file_batch` reads the length-delimited `--batch` wire format:
 /// content is taken by the declared byte count (never scanned for line
 /// structure, so a manifest containing a blank line or a `\n<sha> blob` lookalike

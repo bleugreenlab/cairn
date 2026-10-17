@@ -313,6 +313,11 @@ pub(crate) enum Movement {
         lineage: String,
         from: String,
         to: String,
+        /// `path:line` sites outside the lineage and its registry that still
+        /// spell `from`'s version as a bare quoted literal. They are reported,
+        /// never rewritten: a number reference does not follow a renumber, and
+        /// only the author knows which migration it meant.
+        bare_literals: Vec<String>,
     },
     /// A monotonic constant carried its branch's delta onto the new base value.
     Advanced {
@@ -395,8 +400,22 @@ impl ResolutionPlan {
         self.movements
             .iter()
             .map(|movement| match movement {
-                Movement::Renumbered { lineage, from, to } => {
-                    format!("- [{lineage}] `{from}` → `{to}`")
+                Movement::Renumbered {
+                    lineage,
+                    from,
+                    to,
+                    bare_literals,
+                } => {
+                    let moved = format!("- [{lineage}] `{from}` → `{to}`");
+                    match (bare_literals.is_empty(), from.get(..VERSION_DIGITS)) {
+                        (false, Some(version)) => format!(
+                            "{moved}. `{version}` still appears as a bare literal at {}; number \
+                             references do not follow a renumber — reference the migration by \
+                             name.",
+                            bare_literals.join(", ")
+                        ),
+                        _ => moved,
+                    }
                 }
                 Movement::Advanced {
                     identifier,
@@ -745,12 +764,26 @@ fn registrations(text: &str, macro_name: &str) -> Vec<(usize, String)> {
 /// numbers, so nothing is ever moved: only the four digits inside an existing
 /// literal change.
 ///
-/// Renumbering is minimal by construction: when two of this branch's own
-/// additions claim a number that is otherwise free, one of them keeps it. The
-/// lineage's versions have to stay gapless — `scripts/check-migrations.ts`
-/// requires `NNNN` to equal the file's one-based position — so moving both
-/// would mint a hole and red the migrations lane on a branch this pass had just
-/// resolved.
+/// The pass acts only when a collision exists — an addition whose number the
+/// base holds, or that an earlier-registered addition of this branch already
+/// claimed. When it acts, the branch's additions are numbered consecutively
+/// above the base in registry order, and only those whose number changes move.
+/// For a branch whose additions continued its fork in order, that reads as: the
+/// additions before the first collision keep their numbers, and every addition
+/// from the first collision onward moves, not just the colliding ones. Moving
+/// only the colliding stem to the top would leave a dependent pair reading
+/// `0255_a`, `0254_b`: gapless as a set, so no lane objects and apply order
+/// (the registry) is unaffected, but a human reads the inversion as a defect
+/// and renumbers by hand — exactly the error-prone multi-site edit this pass
+/// exists to remove. The postcondition is therefore that the branch's
+/// additions strictly increase in registry order, and that the lineage is
+/// gapless whenever the base is.
+///
+/// It stays minimal where it matters: when two of this branch's own additions
+/// claim a number that is otherwise free, the first registered keeps it.
+/// Moving both would mint a hole, and `scripts/check-migrations.ts` requires
+/// the sorted versions to run `0001..N`, so that would red the migrations lane
+/// on a branch this pass had just resolved.
 pub(crate) fn plan_lineage_renumber(
     lineage: &SequentialFileLineage,
     base_stems: &BTreeSet<String>,
@@ -777,16 +810,12 @@ pub(crate) fn plan_lineage_renumber(
         .collect();
     mine.sort_by_key(|stem| positions.get(stem.as_str()).copied().unwrap_or(usize::MAX));
 
-    let mut taken: BTreeSet<u32> = BTreeSet::new();
-    let mut highest = 0u32;
-    for stem in base_stems {
-        if let Some(version) = version_of(stem) {
-            taken.insert(version);
-            highest = highest.max(version);
-        }
-    }
+    let taken: BTreeSet<u32> = base_stems
+        .iter()
+        .filter_map(|stem| version_of(stem))
+        .collect();
 
-    let mut mine_versions: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut mine_versions: Vec<u32> = Vec::with_capacity(mine.len());
     for stem in &mine {
         let Some(version) = version_of(stem) else {
             return Err(Refusal::new(format!(
@@ -794,25 +823,18 @@ pub(crate) fn plan_lineage_renumber(
                 lineage.label
             )));
         };
-        mine_versions.insert(stem.as_str(), version);
-        highest = highest.max(version);
+        mine_versions.push(version);
     }
 
     // A stem collides when its number is already claimed on the base, or when
     // an earlier-registered addition of this branch's own already claimed it.
     // The second happens when two sibling branches merged into this one at
-    // different times, and there the first registration keeps the number: only
-    // the ones that follow it have to move.
-    let mut seen_within_mine: BTreeMap<u32, &str> = BTreeMap::new();
-    let mut colliding: Vec<&str> = Vec::new();
-    for stem in &mine {
-        let version = mine_versions[stem.as_str()];
-        let duplicate_within_mine = seen_within_mine.insert(version, stem.as_str()).is_some();
-        if taken.contains(&version) || duplicate_within_mine {
-            colliding.push(stem.as_str());
-        }
-    }
-    if colliding.is_empty() {
+    // different times.
+    let mut seen_within_mine: BTreeSet<u32> = BTreeSet::new();
+    let collides = mine_versions
+        .iter()
+        .any(|version| taken.contains(version) || !seen_within_mine.insert(*version));
+    if !collides {
         return Ok(Vec::new());
     }
 
@@ -825,23 +847,24 @@ pub(crate) fn plan_lineage_renumber(
         )));
     }
 
-    for stem in &colliding {
-        if !positions.contains_key(*stem) {
+    // `mine` already follows the registry. An addition that sits on the next
+    // number keeps it, which is every addition before the first collision when
+    // the branch continued its fork in order; from the first that does not, the
+    // rest follow consecutively.
+    let mut next = taken.last().copied().unwrap_or(0);
+    let mut assignments = Vec::new();
+    for (stem, version) in mine.iter().zip(mine_versions) {
+        next += 1;
+        if version == next {
+            continue;
+        }
+        if !positions.contains_key(stem.as_str()) {
             return Err(Refusal::new(format!(
                 "[{}] `{stem}` has no `{}!(\"{stem}\")` registration in `{}`, so renumbering it \
                  would orphan the file",
                 lineage.label, lineage.macro_name, lineage.registry_file
             )));
         }
-    }
-
-    // `colliding` already follows the registry, and the movers take the numbers
-    // immediately above the highest one in play — so a lineage that was gapless
-    // apart from the contended numbers stays gapless.
-    let mut next = highest;
-    let mut assignments = Vec::new();
-    for stem in colliding {
-        next += 1;
         let renumbered = restem(stem, next);
         if renumbered.len() != stem.len() {
             return Err(Refusal::new(format!(
@@ -853,6 +876,46 @@ pub(crate) fn plan_lineage_renumber(
         assignments.push((stem.to_string(), renumbered));
     }
     Ok(assignments)
+}
+
+/// The quoted spellings of each renumbered stem's old version, as fixed-string
+/// needles for one search over the tree.
+pub(crate) fn bare_version_needles(assignments: &[(String, String)]) -> Vec<String> {
+    assignments
+        .iter()
+        .filter_map(|(from, _)| from.get(..VERSION_DIGITS))
+        .flat_map(|version| [format!("\"{version}\""), format!("'{version}'")])
+        .collect()
+}
+
+/// Where a test or script could name a migration by its bare number: Rust and
+/// TypeScript under `src-tauri/` and `scripts/`, minus the lineage directory
+/// and the registry, whose stems the pass rewrites itself.
+pub(crate) fn bare_version_pathspecs(lineage: &SequentialFileLineage) -> Vec<String> {
+    let mut pathspecs: Vec<String> = ["src-tauri", "scripts"]
+        .iter()
+        .flat_map(|root| ["rs", "ts"].map(|extension| format!(":(glob){root}/**/*.{extension}")))
+        .collect();
+    pathspecs.push(format!(":(exclude){}", lineage.dir));
+    pathspecs.push(format!(":(exclude){}", lineage.registry_file));
+    pathspecs
+}
+
+/// The `path:line` sites among `hits` that spell `stem`'s version as a bare
+/// quoted literal.
+pub(crate) fn bare_literal_sites(stem: &str, hits: &[crate::jj::GrepHit]) -> Vec<String> {
+    let Some(version) = stem.get(..VERSION_DIGITS) else {
+        return Vec::new();
+    };
+    let quoted = [format!("\"{version}\""), format!("'{version}'")];
+    hits.iter()
+        .filter(|hit| {
+            quoted
+                .iter()
+                .any(|needle| hit.text.contains(needle.as_str()))
+        })
+        .map(|hit| format!("{}:{}", hit.path, hit.line))
+        .collect()
 }
 
 /// Rewrite each reassigned stem literal in place, leaving every other byte —
@@ -1488,6 +1551,194 @@ mod tests {
             ]
         );
         assert_resolved_lineage_is_gapless(&branch, &assignments);
+    }
+
+    #[test]
+    fn a_base_collision_moves_every_later_addition_so_a_dependent_pair_stays_in_order() {
+        // `b` depends on `a` and registers after it. Moving only the colliding
+        // `a` to the top would read 0253_x, 0255_a, 0254_b: gapless as a set,
+        // and an inversion a human renumbers by hand.
+        let registry = "migration!(\"0253_x\"),\nmigration!(\"0253_a\"),\nmigration!(\"0254_b\"),\n";
+        let branch = ["0252_base", "0253_x", "0253_a", "0254_b"];
+        let assignments = plan_lineage_renumber(
+            &SEQUENTIAL_FILE_LINEAGES[0],
+            &stems(&["0252_base", "0253_x"]),
+            &stems(&branch),
+            registry,
+        )
+        .expect("planned");
+        assert_eq!(
+            assignments,
+            vec![
+                ("0253_a".to_string(), "0254_a".to_string()),
+                ("0254_b".to_string(), "0255_b".to_string()),
+            ]
+        );
+        assert_resolved_lineage_is_gapless(&branch, &assignments);
+    }
+
+    #[test]
+    fn a_collision_in_the_middle_keeps_what_precedes_it_and_moves_what_follows() {
+        // A sibling merged in `0251_b` beside this branch's `0251_a`, and `c`
+        // was added after both. `a` keeps 0251; `b` and `c` take 0252 and
+        // 0253 in registry order rather than `b` jumping over `c`.
+        let registry =
+            "migration!(\"0251_a\"),\nmigration!(\"0251_b\"),\nmigration!(\"0252_c\"),\n";
+        let branch = ["0250_base", "0251_a", "0251_b", "0252_c"];
+        let assignments = plan_lineage_renumber(
+            &SEQUENTIAL_FILE_LINEAGES[0],
+            &stems(&["0250_base"]),
+            &stems(&branch),
+            registry,
+        )
+        .expect("planned");
+        assert_eq!(
+            assignments,
+            vec![
+                ("0251_b".to_string(), "0252_b".to_string()),
+                ("0252_c".to_string(), "0253_c".to_string()),
+            ]
+        );
+        assert_resolved_lineage_is_gapless(&branch, &assignments);
+    }
+
+    /// Every branch over a small gapless base: when the pass acts, the base is
+    /// untouched, the branch's additions strictly increase in registry order,
+    /// and the lineage is gapless. Where the additions before the first
+    /// collision continue the base in order — any branch that was gapless and
+    /// ordered before the base advanced — the plan is exactly "keep everything
+    /// before the first collision, number the rest consecutively from the top".
+    #[test]
+    fn renumbering_postconditions_hold_for_every_small_lineage() {
+        fn sequences(length: usize, values: u32) -> Vec<Vec<u32>> {
+            if length == 0 {
+                return vec![Vec::new()];
+            }
+            sequences(length - 1, values)
+                .into_iter()
+                .flat_map(|prefix| {
+                    (1..=values).map(move |value| {
+                        let mut next = prefix.clone();
+                        next.push(value);
+                        next
+                    })
+                })
+                .collect()
+        }
+
+        let mut acted = 0usize;
+        for base_len in 1..=3u32 {
+            let base: Vec<String> = (1..=base_len).map(|v| format!("{v:04}_base")).collect();
+            for length in 1..=4 {
+                for versions in sequences(length, base_len + 4) {
+                    let mine: Vec<String> = versions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, v)| format!("{v:04}_m{index}"))
+                        .collect();
+                    let registry: String = base
+                        .iter()
+                        .chain(&mine)
+                        .map(|stem| format!("migration!(\"{stem}\"),\n"))
+                        .collect();
+                    let base_set: BTreeSet<String> = base.iter().cloned().collect();
+                    let branch_set: BTreeSet<String> = base.iter().chain(&mine).cloned().collect();
+                    let assignments = plan_lineage_renumber(
+                        &SEQUENTIAL_FILE_LINEAGES[0],
+                        &base_set,
+                        &branch_set,
+                        &registry,
+                    )
+                    .expect("planned");
+
+                    let mut seen = BTreeSet::new();
+                    let first_collision = versions
+                        .iter()
+                        .position(|v| *v <= base_len || !seen.insert(*v));
+                    let Some(first_collision) = first_collision else {
+                        assert!(assignments.is_empty(), "{versions:?} {assignments:?}");
+                        continue;
+                    };
+                    acted += 1;
+
+                    let renamed: BTreeMap<&str, &str> = assignments
+                        .iter()
+                        .map(|(from, to)| (from.as_str(), to.as_str()))
+                        .collect();
+                    assert!(
+                        renamed.keys().all(|from| !base_set.contains(*from)),
+                        "a base stem moved: {assignments:?}"
+                    );
+                    let landed: Vec<u32> = mine
+                        .iter()
+                        .map(|stem| renamed.get(stem.as_str()).copied().unwrap_or(stem))
+                        .map(|stem| version_of(stem).unwrap())
+                        .collect();
+                    assert!(
+                        landed.windows(2).all(|pair| pair[0] < pair[1]),
+                        "additions not increasing: {versions:?} -> {landed:?}"
+                    );
+                    let all: Vec<&str> = base.iter().chain(&mine).map(String::as_str).collect();
+                    assert_resolved_lineage_is_gapless(&all, &assignments);
+
+                    let kept = &versions[..first_collision];
+                    if kept.iter().copied().eq(base_len + 1..=base_len + kept.len() as u32) {
+                        let start = base_len + kept.len() as u32 + 1;
+                        let expected: Vec<(String, String)> = mine[first_collision..]
+                            .iter()
+                            .zip(start..)
+                            .filter(|(stem, to)| version_of(stem) != Some(*to))
+                            .map(|(stem, to)| (stem.clone(), restem(stem, to)))
+                            .collect();
+                        assert_eq!(assignments, expected, "{versions:?}");
+                    }
+                }
+            }
+        }
+        assert!(acted > 1000, "the enumeration exercised only {acted} plans");
+    }
+
+    #[test]
+    fn a_bare_literal_of_the_old_version_is_named_in_the_note() {
+        let hits = [
+            crate::jj::GrepHit {
+                path: "src-tauri/a_test.rs".into(),
+                line: 7,
+                text: "assert_eq!(v, \"0256\");".into(),
+            },
+            crate::jj::GrepHit {
+                path: "scripts/b.test.ts".into(),
+                line: 2,
+                text: "expect(x).toBe('0256')".into(),
+            },
+            crate::jj::GrepHit {
+                path: "src-tauri/c.rs".into(),
+                line: 1,
+                text: "let other = \"0257\";".into(),
+            },
+        ];
+        let assignments = [("0256_a".to_string(), "0258_a".to_string())];
+        assert_eq!(
+            bare_version_needles(&assignments),
+            vec!["\"0256\"".to_string(), "'0256'".to_string()]
+        );
+        let sites = bare_literal_sites("0256_a", &hits);
+        assert_eq!(sites, vec!["src-tauri/a_test.rs:7", "scripts/b.test.ts:2"]);
+        let plan = ResolutionPlan {
+            movements: vec![Movement::Renumbered {
+                lineage: "private".into(),
+                from: "0256_a".into(),
+                to: "0258_a".into(),
+                bare_literals: sites,
+            }],
+            ..ResolutionPlan::default()
+        };
+        assert_eq!(
+            plan.describe(),
+            "- [private] `0256_a` → `0258_a`. `0256` still appears as a bare literal at \
+             src-tauri/a_test.rs:7, scripts/b.test.ts:2; number references do not follow a \
+             renumber — reference the migration by name."
+        );
     }
 
     #[test]
