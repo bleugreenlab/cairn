@@ -115,7 +115,7 @@ lsp-types = "0.97"
 # inspired pure-Rust converter; only `text/html` responses are converted, JSON
 # and text/markdown pass through unchanged.
 htmd = "0.5"
-pdf-extract = "0.7"
+pdf-extract = "0.12"
 matfile = "0.5"
 
 # OS keychain access for MCP server secrets. Backend is selected per target so a

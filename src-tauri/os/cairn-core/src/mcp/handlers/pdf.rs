@@ -87,4 +87,40 @@ mod tests {
         assert!(!is_pdf_target("https://example.com/page", false));
         assert!(!is_pdf_target("https://example.com/notpdf.html", false));
     }
+
+    /// A small, well-formed PDF whose only object is `depth` nested arrays. The
+    /// xref offsets are exact so the parser reaches the object body rather than
+    /// bailing on a broken cross-reference table.
+    fn deeply_nested_array_pdf(depth: usize) -> Vec<u8> {
+        let mut pdf = b"%PDF-1.7\n".to_vec();
+        let object_offset = pdf.len();
+        pdf.extend_from_slice(b"1 0 obj\n");
+        pdf.extend(std::iter::repeat_n(b'[', depth));
+        pdf.extend(std::iter::repeat_n(b']', depth));
+        pdf.extend_from_slice(b"\nendobj\n");
+        let xref_offset = pdf.len();
+        pdf.extend_from_slice(
+            format!(
+                "xref\n0 2\n0000000000 65535 f \n{object_offset:010} 00000 n \n\
+                 trailer\n<< /Size 2 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+            )
+            .as_bytes(),
+        );
+        pdf
+    }
+
+    /// GHSA-6fj4-rcr3-r7rr / RUSTSEC-2026-0187: lopdf <= 0.41 recursed without
+    /// bound on nested arrays, so a ~40 KB input like this one overflowed the
+    /// stack and aborted the whole process (uncatchable by `catch_unwind`).
+    /// Extraction runs in the orchestrator process, so reaching the assertion at
+    /// all — with either verdict — is the property under test.
+    #[test]
+    fn deeply_nested_pdf_returns_instead_of_overflowing_the_stack() {
+        let bytes = deeply_nested_array_pdf(20_000);
+        // A PDF with no page tree may be rejected or read as empty; either is
+        // fine, but it must not yield text.
+        if let Ok(text) = pdf_extract::extract_text_from_mem(&bytes) {
+            assert!(text.trim().is_empty(), "unexpected text: {text:?}");
+        }
+    }
 }
