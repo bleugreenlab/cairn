@@ -1558,7 +1558,8 @@ mod tests {
         // `b` depends on `a` and registers after it. Moving only the colliding
         // `a` to the top would read 0253_x, 0255_a, 0254_b: gapless as a set,
         // and an inversion a human renumbers by hand.
-        let registry = "migration!(\"0253_x\"),\nmigration!(\"0253_a\"),\nmigration!(\"0254_b\"),\n";
+        let registry =
+            "migration!(\"0253_x\"),\nmigration!(\"0253_a\"),\nmigration!(\"0254_b\"),\n";
         let branch = ["0252_base", "0253_x", "0253_a", "0254_b"];
         let assignments = plan_lineage_renumber(
             &SEQUENTIAL_FILE_LINEAGES[0],
@@ -1682,7 +1683,11 @@ mod tests {
                     assert_resolved_lineage_is_gapless(&all, &assignments);
 
                     let kept = &versions[..first_collision];
-                    if kept.iter().copied().eq(base_len + 1..=base_len + kept.len() as u32) {
+                    if kept
+                        .iter()
+                        .copied()
+                        .eq(base_len + 1..=base_len + kept.len() as u32)
+                    {
                         let start = base_len + kept.len() as u32 + 1;
                         let expected: Vec<(String, String)> = mine[first_collision..]
                             .iter()
