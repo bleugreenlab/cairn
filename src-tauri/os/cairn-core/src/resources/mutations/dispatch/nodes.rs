@@ -172,14 +172,19 @@ pub(super) async fn dispatch(
                         if dry_run {
                             format!("Would refresh PR for {node_id}")
                         } else {
+                            let barrier =
+                                crate::mcp::handlers::run::held::job_commit_barrier(orch, &owner_id)
+                                    .await;
                             let cache =
                                 crate::pr_data::actions::refresh_pr_for_job(orch, &owner_id)
                                     .await
-                                    .map_err(|error| build_failure(index, item, error))?;
-                            format!(
+                                    .map_err(|error| {
+                                        build_failure(index, item, barrier.prefix(error))
+                                    })?;
+                            barrier.prefix(format!(
                                 "Refreshed {} for {node_id}",
                                 crate::pr_data::publication::refreshed_summary(&cache)
-                            )
+                            ))
                         }
                     }
                     "publish" => {

@@ -663,6 +663,7 @@ pub(super) async fn preview_change(
             target_hashes,
             replayed: None,
             post_seal: None,
+            held_publications: Vec::new(),
             blocking: None,
         })
         .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"));
@@ -682,6 +683,7 @@ pub(super) async fn preview_change(
         // A preview applies nothing, so it is never a replay to suppress.
         replayed: None,
         post_seal: None,
+        held_publications: Vec::new(),
         blocking: None,
     })
     .unwrap_or_else(|e| format!("Failed to serialize change report: {e}"))

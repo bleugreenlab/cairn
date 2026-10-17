@@ -202,6 +202,15 @@ macro_rules! shared_tail_reconcile_resolution_basis {
     };
 }
 
+/// cairn/4986: routed batch deltas that reached this machine's project store
+/// but not their branch, held for republication at the next commit barrier.
+/// Private: each row names store paths on this machine.
+macro_rules! private_held_publications {
+    () => {
+        migration!("0259_held_publications")
+    };
+}
+
 /// How each execution bound to a machine. Runner-transient state keyed by a
 /// runner incarnation, like the workflow journal, so it never syncs to a team
 /// replica.
@@ -1625,6 +1634,7 @@ macro_rules! private_lineage {
             shared_tail_execution_after_gates!(),
             shared_tail_retire_issue_dependencies!(),
             shared_tail_reconcile_resolution_basis!(),
+            private_held_publications!(),
         ]
     };
 }
@@ -2134,6 +2144,12 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     // this installation's own fleet.
     (
         "executor_preparation_refusals",
+        TableScope::Private(PrivateReason::RunnerTransient),
+    ),
+    // A routed batch's commit awaiting republication onto its branch. Names
+    // store paths on this machine, so it means nothing on another.
+    (
+        "held_publications",
         TableScope::Private(PrivateReason::RunnerTransient),
     ),
     (
@@ -3296,6 +3312,7 @@ mod tests {
                 "execution_after_gates",
                 "retire_issue_dependencies",
                 "reconcile_resolution_basis",
+                "held_publications",
             ]
         );
         assert_eq!(

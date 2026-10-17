@@ -44,6 +44,11 @@ const REF_WRITERS: &[(&str, &str, &str)] = &[
         include_str!("../../../cairn-vcs/src/jj/maintenance.rs"),
         "fn recreate_keep_refs(",
     ),
+    (
+        "held delta ref",
+        include_str!("../mcp/handlers/run/held.rs"),
+        "fn held_ref_transaction(",
+    ),
 ];
 
 /// The body of a free function, from its signature to the closing brace

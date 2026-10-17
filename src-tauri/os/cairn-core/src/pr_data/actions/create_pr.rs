@@ -223,7 +223,21 @@ fn publish_outcome_message(
 /// Refused without pushing unless the pull request is bound and open, both as
 /// recorded and as GitHub reports it live: publishing the branch of a merged or
 /// closed pull request could recreate a remote branch removed on purpose.
+///
+/// A commit barrier first: commits earlier batches sealed on the branch but
+/// could not publish are republished, so the push carries them.
 pub(crate) async fn publish_pr_branch_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+) -> Result<String, String> {
+    let barrier = crate::mcp::handlers::run::held::job_commit_barrier(orch, job_id).await;
+    publish_pr_branch_past_barrier(orch, job_id)
+        .await
+        .map(|reply| barrier.prefix(reply))
+        .map_err(|error| barrier.prefix(error))
+}
+
+async fn publish_pr_branch_past_barrier(
     orch: &Orchestrator,
     job_id: &str,
 ) -> Result<String, String> {

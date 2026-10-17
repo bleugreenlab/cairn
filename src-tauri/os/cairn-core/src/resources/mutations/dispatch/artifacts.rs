@@ -145,13 +145,18 @@ pub(super) async fn dispatch(
                         if dry_run {
                             format!("Would refresh PR for {node_id}/{artifact_label}")
                         } else {
+                            let barrier =
+                                crate::mcp::handlers::run::held::job_commit_barrier(orch, &job_id)
+                                    .await;
                             let cache = crate::pr_data::actions::refresh_pr_for_job(orch, &job_id)
                                 .await
-                                .map_err(|error| build_failure(index, item, error))?;
-                            format!(
+                                .map_err(|error| {
+                                    build_failure(index, item, barrier.prefix(error))
+                                })?;
+                            barrier.prefix(format!(
                                 "Refreshed {} for {node_id}/{artifact_label}",
                                 crate::pr_data::publication::refreshed_summary(&cache)
-                            )
+                            ))
                         }
                     }
                     "publish" => {
@@ -224,7 +229,30 @@ pub(super) async fn dispatch(
                     mode_name(mode)
                 )
             } else {
-                comments_artifacts::write_artifact_change(
+                // Saving the PR artifact is a commit barrier on the branch it
+                // presents: a commit an earlier batch sealed but could not
+                // publish lands before the PR is opened or re-synced from it.
+                let barrier = if artifact_label == "create-pr" {
+                    match crate::resources::resolve_node_or_task_job_id(
+                        &orch.db.local,
+                        project,
+                        *number,
+                        *exec_seq,
+                        node_id,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(job_id) => Some(
+                            crate::mcp::handlers::run::held::job_commit_barrier(orch, &job_id)
+                                .await,
+                        ),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                let summary = comments_artifacts::write_artifact_change(
                     orch,
                     request,
                     project,
@@ -237,7 +265,11 @@ pub(super) async fn dispatch(
                     matches!(mode, ChangeMode::Patch),
                 )
                 .await
-                .map_err(|error| build_failure(index, item, error))?
+                .map_err(|error| build_failure(index, item, error))?;
+                match barrier {
+                    Some(barrier) => barrier.prefix(barrier.warn_if_held(summary)),
+                    None => summary,
+                }
             }
         }
         (

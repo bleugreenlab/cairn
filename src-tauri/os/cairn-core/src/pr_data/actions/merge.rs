@@ -663,7 +663,35 @@ async fn merge_remote_pr_via_github(
 /// Merge a PR, mark the issue merged, and run post-merge reconciliation (file
 /// capture, optional main-repo pull, active-worktree fast-forward, teardown, PR
 /// refresh) in the background via `reconcile_after_merge`.
+///
+/// A merge is a commit barrier on the PR's source branch: commits earlier
+/// batches sealed there but could not publish are republished first, and the
+/// merge is refused while any is still held, because the pull request would
+/// ship without work its author was told is committed.
 pub async fn merge_pr_for_job(
+    orch: &Orchestrator,
+    job_id: &str,
+    merge_method: Option<String>,
+    attribution: Option<super::PrResolutionAttribution>,
+) -> Result<String, String> {
+    let db = crate::execution::routing::owning_db_for_job(&orch.db, job_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let merge_context = resolve_merge_mr_context_for_job(&db, job_id).await?;
+    let barrier = crate::mcp::handlers::run::held::pr_commit_barrier(
+        orch,
+        &merge_context.project_id,
+        &merge_context.source_branch,
+    )
+    .await;
+    barrier.refuse_merge()?;
+    merge_pr_for_job_past_barrier(orch, job_id, merge_method, attribution)
+        .await
+        .map(|reply| barrier.prefix(reply))
+        .map_err(|error| barrier.prefix(error))
+}
+
+async fn merge_pr_for_job_past_barrier(
     orch: &Orchestrator,
     job_id: &str,
     merge_method: Option<String>,

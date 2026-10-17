@@ -42,6 +42,11 @@ pub(super) struct ChangeReport {
         rename = "_post_seal"
     )]
     pub(super) post_seal: Option<MintedPostSealState>,
+    /// What this write's commit barrier did with commits earlier batches on
+    /// the branch sealed but could not publish. They are republished ahead of
+    /// this write's own changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) held_publications: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +193,7 @@ pub(super) fn empty_change_report(
         target_hashes: Vec::new(),
         replayed: None,
         post_seal: None,
+        held_publications: Vec::new(),
     }
 }
 

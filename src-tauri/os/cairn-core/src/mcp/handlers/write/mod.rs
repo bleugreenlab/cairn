@@ -422,6 +422,38 @@ fn apply_snapshot_mutations(
 }
 
 pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> String {
+    let mut drained = Vec::new();
+    let report = handle_write_under_barrier(orch, request, &mut drained).await;
+    if drained.is_empty() {
+        return report;
+    }
+    // The store lock was released when the write returned, so the held
+    // commits' remaining rungs (the origin push among them) can run now.
+    attach_held_notes(
+        report,
+        super::run::held::settle_drained(orch, drained).await,
+    )
+}
+
+/// Carry what the write's commit barrier republished in its change report.
+fn attach_held_notes(report: String, notes: Vec<String>) -> String {
+    match serde_json::from_str::<self::types::ChangeReport>(&report) {
+        Ok(mut parsed) => {
+            parsed.held_publications = notes;
+            serde_json::to_string(&parsed).unwrap_or(report)
+        }
+        Err(_) => format!("{}\n\n{report}", notes.join("\n")),
+    }
+}
+
+/// The write itself. A file write is a commit barrier on its branch: the
+/// branch's held deltas are republished into `drained` under the same store
+/// lock, before the head this write builds on is read.
+async fn handle_write_under_barrier(
+    orch: &Orchestrator,
+    request: &McpCallbackRequest,
+    drained: &mut Vec<super::run::held::Drained>,
+) -> String {
     // Authoritative validation gate, shared with cairn-cmd's pre-flight check so
     // the contract and error text are identical everywhere. Collects every
     // blocking problem (structural shape, target/mode, and the commit_msg
@@ -1028,7 +1060,7 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     let mut destination_job_id = None;
     let mut minted_branch: Option<super::branch::MintedThreadBranch> = None;
     let mut minted_pr_url: Option<String> = None;
-    let logical_resolution = if has_file_targets {
+    let mut logical_resolution = if has_file_targets {
         let resolved = if let Some(index) = mint_index {
             let title = payload.changes[index]
                 .payload
@@ -1094,6 +1126,53 @@ pub async fn handle_write(orch: &Orchestrator, request: &McpCallbackRequest) -> 
     } else {
         None
     };
+    // A freshly minted branch has nothing held on it yet.
+    if minted_branch.is_none() {
+        if let Some(resolution) = logical_resolution.as_mut() {
+            *drained = super::run::held::drain_held_publications(
+                orch,
+                &resolution.project_id,
+                &resolution.rev,
+            )
+            .await;
+            // The write's expected-head check must see the head the drain
+            // left, or it would refuse its own branch as moved.
+            if super::run::held::any_landed(drained) {
+                match cairn_vcs::resolve_coordinate(&resolution.repository_path, &resolution.rev)
+                    .await
+                {
+                    Ok(head) => resolution.commit_id = head,
+                    Err(error) => {
+                        return serde_json::to_string(&empty_change_report(
+                            Vec::new(),
+                            vec![ChangeFailure {
+                                index: 0,
+                                target: payload
+                                    .changes
+                                    .first()
+                                    .map(|change| change.target.clone())
+                                    .unwrap_or_default(),
+                                mode: payload
+                                    .changes
+                                    .first()
+                                    .map(|change| mode_name(change.mode))
+                                    .unwrap_or("patch")
+                                    .to_string(),
+                                kind: "file".to_string(),
+                                error: format!(
+                                    "Re-resolve the logical head after publishing held commits: {error}"
+                                ),
+                            }],
+                            None,
+                            payload.atomic.unwrap_or(false),
+                            false,
+                        ))
+                        .unwrap_or_else(|serialize_error| serialize_error.to_string());
+                    }
+                }
+            }
+        }
+    }
     let mut logical_snapshot = std::collections::HashMap::new();
     if revert_commit.is_none() {
         if let Some(resolution) = logical_resolution.as_ref() {

@@ -1189,6 +1189,16 @@ pub async fn render_live_pr_section(
         out.push_str(&divergence.note(src));
         out.push('\n');
     }
+    if let (Some(project_id), Some((src, _))) = (mr_context.project_id.as_deref(), &source_branches)
+    {
+        if let Some(warning) =
+            crate::mcp::handlers::run::held::held_warning(orch, project_id, src).await
+        {
+            out.push('\n');
+            out.push_str(&warning);
+            out.push('\n');
+        }
+    }
     if source_conflict.as_ref().is_some_and(|r| r.tip_conflicted) {
         // A conflicted TIP inflates the diff GitHub reports; flag it so the
         // number can't read as a clean, mergeable change.

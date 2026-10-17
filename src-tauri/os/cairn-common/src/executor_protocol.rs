@@ -4227,7 +4227,23 @@ pub struct LearnedResourceEstimate {
 /// `Cancel`, `Lost`, and `Shutdown`, at the moments a dropped caller and a
 /// runner-initiated close already sent them. A runner talking to an executor
 /// of any version therefore gets nothing wrong.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 146;
+///
+/// Version 147 (cairn/4986) changes the ancestry of a [`MutationDelta`]. A
+/// batch that opens on a commit ahead of its routed base (an earlier batch's
+/// delta the runner has not published, which the execution home carries
+/// forward) is now sealed with that commit as its parent rather than the base,
+/// so the delta's own diff is the batch's work alone. The runner merges such a
+/// delta against its parent once the branch carries that parent, and holds it
+/// behind the parent while the parent is itself held for republication. A 146
+/// executor and a 147 runner would disagree about what a delta's parent means,
+/// the class of disagreement v86 and v87 were minted for. A 146 runner
+/// proposes the delta as a child of the base it declared and the logical-head
+/// transaction refuses the parent mismatch, so the two must not meet. The same
+/// change makes the executor park a cell's HEAD under `refs/cairn/rescued/`
+/// before any alignment, claim-time switch, or recovery reset that would leave
+/// behind a commit its destination does not carry, and refuse the move when the
+/// ref cannot be written; that half sends nothing new.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 147;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //

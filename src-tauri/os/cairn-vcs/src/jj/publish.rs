@@ -326,6 +326,35 @@ pub fn integrate_delta_onto_head(
     Ok(Integration::Commit(commit))
 }
 
+/// Re-root a delta's tree onto `head` as a new commit.
+///
+/// For a delta whose own parent is a commit the branch never held (one its
+/// batch's execution home carried forward unpublished) when that commit is to
+/// be published together with the delta. The tree is the delta's whole claim.
+pub fn reparent_delta_onto_head(
+    repository: &Path,
+    delta_commit: &str,
+    head: &str,
+) -> Result<String, String> {
+    let tree = git_capture(
+        repository,
+        &["rev-parse", &format!("{delta_commit}^{{tree}}")],
+        "read the delta tree to re-root",
+    )?;
+    git_capture_with_identity(
+        repository,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            head,
+            "-m",
+            INTEGRATION_DESCRIPTION,
+        ],
+        "re-root the delta onto the logical head",
+    )
+}
+
 fn git_capture(repository: &Path, args: &[&str], context: &str) -> Result<String, String> {
     capture(
         cairn_platform::env::git()
