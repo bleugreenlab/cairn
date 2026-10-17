@@ -101,6 +101,8 @@ resource_samples! {
     ProjectThreads { project: project() } => Parser,
     ProjectMessages { project: project() } => Parser,
     ProjectPosts { project: project() } => Parser,
+    ProjectTenets { project: project() } => Parser,
+    ProjectTenet { project: project(), key: "3".to_string() } => Parser,
     ProjectCodemap { project: project() } => Parser,
     ProjectMap { project: project() } => Parser,
     ProjectHome { project: project() } => Parser,

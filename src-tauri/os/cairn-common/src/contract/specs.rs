@@ -230,7 +230,19 @@ pub(crate) const TITLE: KeySpec = KeySpec::new("title", KeyType::Str, "");
 pub(crate) const EXECUTION: KeySpec = KeySpec::new(
     "execution",
     KeyType::Object,
-    "{recipe, backend?, overrides?, after?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied",
+    "{recipe, backend?, overrides?, after?, proposal?, tenet?} to also start an execution once the issue is created (recipe required); omit to create only. `overrides` takes the same launch deltas the executions collection does, so a child can be created with review already off in one call. `after` takes the same gate clauses the executions collection does: the execution is filed HELD and starts only once every gate is satisfied. `proposal`/`tenet` are the executions collection's commissioning-gate keys: a thread filing a tenet-gated recipe sends exactly one, and the filing is refused before the issue is created when it sends neither",
+);
+/// The commissioning gate's two keys, shared verbatim by the executions-collection
+/// append and the issue-create `execution` block.
+pub(crate) const TENET_PROPOSAL: KeySpec = KeySpec::new(
+    "proposal",
+    KeyType::Object,
+    "{question, options:[...]} (1-5 options, option 1 your recommendation): a thread filing a tenet-gated recipe (planbuild, coordinator, PlanCoord by default) proposes this tenet to the operator and the execution is filed HELD on its verdict. Send exactly one of proposal or tenet on such a filing; `build` stays ungated for repair",
+);
+pub(crate) const TENET_NUMBER: KeySpec = KeySpec::new(
+    "tenet",
+    KeyType::Int,
+    "number of one of your thread's proposed or approved tenets to hold this filing on instead of proposing one; one approval can release every filing of a plan, and an already-approved tenet starts the filing at once",
 );
 /// `after:` gates, shared verbatim by the executions-collection append, the
 /// issue-create `execution` block, and the execution patch — one grammar,
@@ -238,7 +250,7 @@ pub(crate) const EXECUTION: KeySpec = KeySpec::new(
 pub(crate) const AFTER_GATES: KeySpec = KeySpec::new(
     "after",
     KeyType::Array,
-    "gate clause OBJECTS (never prose); the execution is filed HELD — no jobs, no slot — and starts by itself, exactly once, when every clause is satisfied. Facts: {fact:\"issue_resolution\",issue:URI,resolution?:\"merged\"|\"closed\"} · {fact:\"pr_state\",issue:URI,state?:\"open\"|\"merged\"|\"closed\"} · {fact:\"artifact_confirmed\",issue:URI,artifact?:TYPE} · {fact:\"check_verdict\",check:NAME,issue:URI,verdict?:\"passed\"|\"failed\"} · {fact:\"clock\",notBefore:RFC3339}. An omitted field means any; an array means any of. A clause that can never come true leaves the execution held and wakes its filer; a wait cycle across issues is refused",
+    "gate clause OBJECTS (never prose); the execution is filed HELD — no jobs, no slot — and starts by itself, exactly once, when every clause is satisfied. Facts: {fact:\"issue_resolution\",issue:URI,resolution?:\"merged\"|\"closed\"} · {fact:\"pr_state\",issue:URI,state?:\"open\"|\"merged\"|\"closed\"} · {fact:\"artifact_confirmed\",issue:URI,artifact?:TYPE} · {fact:\"check_verdict\",check:NAME,issue:URI,verdict?:\"passed\"|\"failed\"} · {fact:\"clock\",notBefore:RFC3339} · {fact:\"tenet_verdict\",tenet:\"cairn://p/PROJECT/tenets/N\",outcome:\"answered\"|\"ratified\"} (the operator's verdict; a thread's gated filing gets this from `proposal`/`tenet`). An omitted field means any; an array means any of. A clause that can never come true leaves the execution held and wakes its filer; a wait cycle across issues is refused",
 );
 /// Ad-hoc launch deltas, shared verbatim by the executions-collection append and
 /// the issue-create `execution` block — one grammar, described once.

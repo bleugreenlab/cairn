@@ -215,6 +215,7 @@ impl Default for GateVocabulary {
                 Arc::new(ArtifactConfirmedFact),
                 Arc::new(CheckVerdictFact),
                 Arc::new(ClockFact),
+                Arc::new(TenetVerdictFact),
             ],
         }
     }
@@ -918,6 +919,164 @@ fn not_before(clause: &TriggerClause) -> Result<i64, String> {
         .map_err(|error| format!("notBefore '{raw}' is not an RFC 3339 timestamp: {error}"))
 }
 
+// ---------------------------------------------------------------------------
+// tenet_verdict
+// ---------------------------------------------------------------------------
+
+/// What a tenet gate can wait for: the release policies a project can hold
+/// (`crate::tenets::TenetRelease`).
+pub(crate) const GATE_TENET_OUTCOMES: &[&str] = &["answered", "ratified"];
+
+/// `{fact: "tenet_verdict", tenet: "cairn://p/CAIRN/tenets/12", outcome: "answered"}`
+///
+/// The operator's verdict on a tenet. The commissioning gate stamps this on a
+/// thread's gated filing with `outcome` set to the project's release policy at
+/// filing time, so the gate says what it waits for instead of reading a policy
+/// that may have changed since.
+///
+/// `answered` is satisfied by an approval, including one later superseded:
+/// the approval was given, and the filing it released was released on it.
+/// `ratified` is never satisfied today. No verified authenticator path
+/// exists, so the policy setter refuses it and no filing is stamped with it;
+/// a clause written by hand with it simply waits.
+#[derive(Debug, Clone, Copy)]
+pub struct TenetVerdictFact;
+
+const TENET_VERDICT_FIELDS: &[(&str, FieldKind)] =
+    &[("tenet", FieldKind::Scalar), ("outcome", FieldKind::Scalar)];
+
+#[async_trait]
+impl GateFact for TenetVerdictFact {
+    fn fact(&self) -> &'static str {
+        crate::tenets::TENET_GATE_FACT
+    }
+
+    fn fields(&self) -> &'static [(&'static str, FieldKind)] {
+        TENET_VERDICT_FIELDS
+    }
+
+    fn example(&self) -> TriggerClause {
+        BTreeMap::from([
+            ("fact".into(), Value::String(self.fact().into())),
+            (
+                "tenet".into(),
+                Value::String("cairn://p/CAIRN/tenets/12".into()),
+            ),
+            ("outcome".into(), Value::String("answered".into())),
+        ])
+    }
+
+    fn validate(&self, clause: &TriggerClause) -> Result<(), String> {
+        tenet_address(clause)?;
+        if clause.get("outcome").is_none() {
+            return Err(
+                "a tenet gate needs an 'outcome' naming what releases it: answered or ratified"
+                    .into(),
+            );
+        }
+        validate_enum(clause, "outcome", GATE_TENET_OUTCOMES)
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &GateContext<'_>,
+        clause: &TriggerClause,
+    ) -> DbResult<GateOutcome> {
+        use crate::tenets::{TenetLookup, TenetStatus};
+        let TenetLookup::Found(tenet) = tenet_lookup(ctx, clause).await? else {
+            return Ok(GateOutcome::NoEvidence);
+        };
+        let answered = field_matches(clause, "outcome", "answered").unwrap_or(false);
+        Ok(match tenet.status {
+            TenetStatus::Approved | TenetStatus::Superseded if answered => GateOutcome::Satisfied,
+            TenetStatus::Declined => GateOutcome::Refuted,
+            _ => GateOutcome::NoEvidence,
+        })
+    }
+
+    async fn foreclosed(
+        &self,
+        ctx: &GateContext<'_>,
+        clause: &TriggerClause,
+    ) -> DbResult<Option<String>> {
+        use crate::tenets::{TenetLookup, TenetStatus};
+        let (_, number) = tenet_address(clause).map_err(DbError::Row)?;
+        Ok(match tenet_lookup(ctx, clause).await? {
+            // A verdict is given once, so a declined tenet is never approved.
+            TenetLookup::Found(tenet) if tenet.status == TenetStatus::Declined => {
+                Some(match tenet.comment.as_deref() {
+                    Some(comment) => format!("tenet #{number} declined: {comment}"),
+                    None => format!("tenet #{number} declined, with no comment"),
+                })
+            }
+            TenetLookup::Found(tenet) if tenet.status == TenetStatus::Withdrawn => Some(format!(
+                "tenet #{number} was withdrawn by the thread that proposed it"
+            )),
+            TenetLookup::Missing => Some(format!("tenet #{number} no longer exists")),
+            TenetLookup::Found(_) | TenetLookup::Unreachable => None,
+        })
+    }
+
+    fn render(&self, clause: &TriggerClause) -> String {
+        let tenet = match tenet_address(clause) {
+            Ok((_, number)) => format!("tenet #{number}"),
+            Err(_) => "tenet ?".to_string(),
+        };
+        match clause_str(clause, "outcome") {
+            Some("ratified") => format!("{tenet} ratified (verified authenticator)"),
+            _ => format!("{tenet} answered (unverified desktop answer)"),
+        }
+    }
+}
+
+/// The project key and number a tenet URI names. A gate names a tenet by its
+/// canonical number, never by a migrated ruling's slug alias.
+pub(crate) fn parse_tenet_uri(raw: &str) -> Result<(String, i64), String> {
+    match cairn_common::uri::parse_uri(raw.trim()) {
+        Some(cairn_common::uri::CairnResource::ProjectTenet { project, key }) => key
+            .parse::<i64>()
+            .ok()
+            .filter(|number| *number > 0)
+            .map(|number| (project, number))
+            .ok_or_else(|| {
+                format!("tenet '{raw}' must name a tenet by number, like cairn://p/CAIRN/tenets/12")
+            }),
+        _ => Err(format!(
+            "tenet '{raw}' is not a tenet URI like cairn://p/CAIRN/tenets/12"
+        )),
+    }
+}
+
+/// A tenet URI in its canonical stored form, so a gate row matches the tenet's
+/// own address by string.
+pub(crate) fn canonicalize_tenet_uri(raw: &str) -> Result<String, String> {
+    let (project, number) = parse_tenet_uri(raw)?;
+    Ok(crate::tenets::tenet_uri(&project, number))
+}
+
+fn tenet_address(clause: &TriggerClause) -> Result<(String, i64), String> {
+    let raw = clause_str(clause, "tenet")
+        .ok_or_else(|| "a tenet gate needs a 'tenet' field naming the tenet's URI".to_string())?;
+    parse_tenet_uri(raw)
+}
+
+/// Read the tenet a clause names from the database that owns its project.
+async fn tenet_lookup(
+    ctx: &GateContext<'_>,
+    clause: &TriggerClause,
+) -> DbResult<crate::tenets::TenetLookup> {
+    let (project, number) = tenet_address(clause).map_err(DbError::Row)?;
+    ctx.orch()
+        .db
+        .for_project(&project)
+        .await
+        .read(move |conn| {
+            let project = project.clone();
+            Box::pin(async move { crate::tenets::lookup_conn(conn, &project, number).await })
+        })
+        .await
+}
+
 fn validate_enum(clause: &TriggerClause, key: &str, allowed: &[&str]) -> Result<(), String> {
     let values: Vec<&Value> = match clause.get(key) {
         None => return Ok(()),
@@ -1458,7 +1617,7 @@ mod tests {
         assert_eq!(
             error,
             "unknown gate fact 'decision' \u{2014} known: issue_resolution, pr_state, \
-             artifact_confirmed, check_verdict, clock"
+             artifact_confirmed, check_verdict, clock, tenet_verdict"
         );
     }
 
@@ -1544,6 +1703,11 @@ mod tests {
             clause(&[
                 ("fact", text("clock")),
                 ("notBefore", text("2026-09-05T12:00:00Z")),
+            ]),
+            clause(&[
+                ("fact", text("tenet_verdict")),
+                ("tenet", text("cairn://p/CAIRN/tenets/12")),
+                ("outcome", text("answered")),
             ]),
         ] {
             vocabulary

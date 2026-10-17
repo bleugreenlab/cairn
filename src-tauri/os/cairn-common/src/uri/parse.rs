@@ -401,6 +401,15 @@ pub fn parse_uri(uri: &str) -> Option<CairnResource> {
         [PROJECT_SCOPE, project, "posts"] => Some(CairnResource::ProjectPosts {
             project: canonical_project(project),
         }),
+        [PROJECT_SCOPE, project, "tenets"] => Some(CairnResource::ProjectTenets {
+            project: canonical_project(project),
+        }),
+        [PROJECT_SCOPE, project, "tenets", key] if !key.is_empty() => {
+            Some(CairnResource::ProjectTenet {
+                project: canonical_project(project),
+                key: (*key).to_string(),
+            })
+        }
         // Must precede the thread arm below: a literal `codemap` segment names
         // this projection, not a thread of that name.
         [PROJECT_SCOPE, project, "codemap"] => Some(CairnResource::ProjectCodemap {

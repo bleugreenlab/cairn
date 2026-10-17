@@ -786,6 +786,17 @@ pub(super) async fn read_project(orch: &Orchestrator, project_key: &str) -> Stri
         issue_stats.closed
     ));
 
+    if let Ok(pending) = crate::tenets::pending_count(db, &project_id).await {
+        let inbox = format!(
+            "{}?status=pending",
+            cairn_common::uri::build_project_tenets_uri(&canonical_key)
+        );
+        output.push_str(&format!(
+            "{}: [{inbox}]({inbox})\n\n",
+            super::tenets::awaiting(pending)
+        ));
+    }
+
     output.push_str(&render_held_executions(&conn, &canonical_key, &project_id).await);
 
     output.push_str(&render_main_attestation(orch, &project_id));

@@ -358,56 +358,68 @@ pub async fn update(db: &LocalDb, input: UpdateThread) -> Result<ThreadUpdate, C
 
 /// Delete the direct thread-owned rows explicitly because Turso does not execute
 /// runtime ON DELETE cascades.
-pub async fn delete(db: &LocalDb, id: &str) -> Result<(), CairnError> {
+///
+/// `emitter` announces the tenets the deletion removed; the caller announces
+/// the thread itself.
+pub async fn delete(
+    db: &LocalDb,
+    emitter: &dyn crate::services::EventEmitter,
+    id: &str,
+) -> Result<(), CairnError> {
     let id = id.to_string();
     let store_id = id.clone();
-    db.write(|conn| {
-        let id = id.clone();
-        Box::pin(async move {
-            conn.execute(
-                "UPDATE issues SET parent_thread_id = NULL WHERE parent_thread_id = ?1",
-                params![id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM comments WHERE thread_id = ?1",
-                params![id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM messages WHERE channel_type = 'thread' AND channel_id = ?1",
-                params![id.as_str()],
-            )
-            .await?;
-
-            crate::jobs::cleanup::delete_owned_jobs(
-                conn,
-                crate::jobs::cleanup::JobOwner::Thread,
-                &id,
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM wake_conditions WHERE home_kind = 'thread' AND home_id = ?1",
-                params![id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM wake_schedules WHERE home_kind = 'thread' AND home_id = ?1",
-                params![id.as_str()],
-            )
-            .await?;
-            conn.execute(
-                "DELETE FROM thread_automations WHERE thread_id = ?1",
-                params![id.as_str()],
-            )
-            .await?;
-            conn.execute("DELETE FROM threads WHERE id = ?1", params![id.as_str()])
+    let released_tenets = db
+        .write(|conn| {
+            let id = id.clone();
+            Box::pin(async move {
+                // First, so a thread whose tenets carry verdicts is refused before
+                // anything else it owns is touched.
+                let released_tenets = crate::tenets::release_deleted_thread_conn(conn, &id).await?;
+                conn.execute(
+                    "UPDATE issues SET parent_thread_id = NULL WHERE parent_thread_id = ?1",
+                    params![id.as_str()],
+                )
                 .await?;
-            Ok(())
+                conn.execute(
+                    "DELETE FROM comments WHERE thread_id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "DELETE FROM messages WHERE channel_type = 'thread' AND channel_id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+
+                crate::jobs::cleanup::delete_owned_jobs(
+                    conn,
+                    crate::jobs::cleanup::JobOwner::Thread,
+                    &id,
+                )
+                .await?;
+                conn.execute(
+                    "DELETE FROM wake_conditions WHERE home_kind = 'thread' AND home_id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "DELETE FROM wake_schedules WHERE home_kind = 'thread' AND home_id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+                conn.execute(
+                    "DELETE FROM thread_automations WHERE thread_id = ?1",
+                    params![id.as_str()],
+                )
+                .await?;
+                conn.execute("DELETE FROM threads WHERE id = ?1", params![id.as_str()])
+                    .await?;
+                Ok(released_tenets)
+            })
         })
-    })
-    .await
-    .map_err(CairnError::from)?;
+        .await
+        .map_err(CairnError::from)?;
+    released_tenets.announce(emitter);
     if let Err(error) = super::db_store::remove(&store_id).await {
         tracing::error!(thread_id = %store_id, %error, "failed to remove deleted thread database");
     }
@@ -470,15 +482,16 @@ mod tests {
         let shape = store
             .query_one(
                 "SELECT
-                   (SELECT COUNT(*) FROM _cairn_rulings),
+                   (SELECT COUNT(*) FROM sqlite_schema WHERE name = '_cairn_rulings'),
                    (SELECT COUNT(*) FROM _cairn_open_questions),
-                   (SELECT COUNT(*) FROM cairn_schema_migrations WHERE version = '0001')",
+                   (SELECT COUNT(*) FROM cairn_schema_migrations WHERE version IN ('0001', '0002'))",
                 (),
                 |row| Ok((row.i64(0)?, row.i64(1)?, row.i64(2)?)),
             )
             .await
             .unwrap();
-        assert_eq!(shape, (0, 0, 1));
+        // A fresh store passes the import guard: 0002 runs on an empty table.
+        assert_eq!(shape, (0, 0, 2));
     }
 
     /// An absent name is the server's cue to allocate, and allocation counts
@@ -573,7 +586,13 @@ mod tests {
 
         let deleted = create(&db, unnamed("project-a")).await.unwrap();
         assert_eq!(deleted.name, "thread-3");
-        delete(&db, &deleted.id).await.unwrap();
+        delete(
+            &db,
+            &crate::services::testing::CapturingEmitter::new(),
+            &deleted.id,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             create(&db, unnamed("project-a")).await.unwrap().name,
             "thread-4",
@@ -969,7 +988,13 @@ mod tests {
         .await
         .unwrap();
 
-        delete(&db, &thread.id).await.unwrap();
+        delete(
+            &db,
+            &crate::services::testing::CapturingEmitter::new(),
+            &thread.id,
+        )
+        .await
+        .unwrap();
         for table in [
             "comments",
             "messages",

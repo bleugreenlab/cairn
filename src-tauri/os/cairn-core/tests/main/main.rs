@@ -73,6 +73,7 @@ mod stale_run_reaper;
 mod synthetic_continuation_event;
 mod team_connect;
 mod team_sync_loop;
+mod tenet_ruling_import;
 mod terminal_exit_wakes;
 mod thread_arc_lifecycle;
 mod thread_db_resources;

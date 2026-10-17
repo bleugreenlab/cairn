@@ -45,7 +45,7 @@ use std::sync::Mutex;
 
 use cairn_common::executor_protocol::{
     BindingEvent, CellAdmissionKind, CellOutcome, CellRequest, DeclineReason, DiskDecline,
-    DiskReliefOutlook, OfferSummary,
+    DiskReliefOutlook, OfferSummary, ResidencyFence,
 };
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -207,10 +207,15 @@ impl QueueEntry {
     /// grant names; the two must be the same request or the claim admits one
     /// reservation (the submitted default, or an unclamped whole-machine
     /// declaration) while the work consumes another.
+    ///
+    /// `execution_residency` is the fence of the batch the grant will carry,
+    /// when that batch runs inside an existing residency. The machine checks it
+    /// against its own cells to decide whether the work provisions anything.
     pub(crate) fn summary(
         &self,
         attempt: &CellRequest,
         predicted_cost_ms: Option<u64>,
+        execution_residency: Option<&ResidencyFence>,
     ) -> OfferSummary {
         debug_assert_eq!(
             (&attempt.request_id, &attempt.attempt_id),
@@ -230,6 +235,7 @@ impl QueueEntry {
             waiting_since_unix_ms: attempt.waiting_since_unix_ms,
             wait_horizon_unix_ms: attempt.wait_horizon_unix_ms,
             predicted_cost_ms,
+            execution_residency: execution_residency.cloned(),
         }
     }
 

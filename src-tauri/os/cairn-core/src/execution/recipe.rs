@@ -1392,6 +1392,35 @@ fn insert_execution(db: Arc<LocalDb>, execution: NewExecution) -> Result<(), Str
     })
 }
 
+/// The recipe id a filing names, as its launch will resolve it.
+///
+/// The id of the file [`crate::config::recipes::get_recipe`] loads for it in
+/// this project, which is what the launch snapshots: `Memory-Triage` comes
+/// back as the file's own `memory-triage`. A path, a file name, or anything
+/// else that is not a recipe id is refused here, naming the canonical id when
+/// one resolves. A plain id no file answers to comes back as named, and the
+/// launch then refuses it as not found. A filing's policy checks (the tenet
+/// gate) read this id and its launch is handed this same id, so the two can
+/// never disagree about which recipe is filed.
+pub(crate) async fn resolve_filed_recipe_id(
+    config_dir: &Path,
+    db: &LocalDb,
+    project_id: &str,
+    recipe: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(recipe) = recipe.map(str::trim).filter(|recipe| !recipe.is_empty()) else {
+        return Ok(None);
+    };
+    let project_path = project_repo_path(db, project_id)
+        .await?
+        .map(std::path::PathBuf::from);
+    let resolved = crate::config::recipes::get_recipe(config_dir, recipe, project_path.as_deref())?;
+    Ok(Some(resolved.map_or_else(
+        || recipe.to_string(),
+        |file_recipe| file_recipe.recipe.id,
+    )))
+}
+
 async fn project_repo_path(db: &LocalDb, project_id: &str) -> Result<Option<String>, String> {
     let project_id = project_id.to_string();
     db.query_text(

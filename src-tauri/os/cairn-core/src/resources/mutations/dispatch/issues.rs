@@ -419,7 +419,7 @@ fn parse_create_execution_spec(
         build_failure(
             index,
             item,
-            "payload.execution must be an object {recipe?, backend?, overrides?, after?}",
+            "payload.execution must be an object {recipe, backend?, overrides?, after?, proposal?, tenet?}",
         )
     })?;
     let str_field = |key: &str| -> ResourceMutationResult<Option<String>> {
@@ -453,6 +453,13 @@ fn parse_create_execution_spec(
             obj.get("after"),
             "payload.execution.after",
         )?,
+        tenet: crate::tenets::filing::TenetFiling::from_payload(
+            None,
+            Some(obj),
+            "payload.execution",
+        )
+        .map_err(|error| build_failure(index, item, error))?
+        .claim,
     }))
 }
 

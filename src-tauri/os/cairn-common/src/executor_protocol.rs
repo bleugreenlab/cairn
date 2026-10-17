@@ -4262,7 +4262,20 @@ pub struct LearnedResourceEstimate {
 /// always saw and records them as a peer or I/O loss, as before. An older
 /// runner talking to a newer executor already accepts a close frame and records
 /// its contents as the disconnect reason.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 147;
+///
+/// Version 148 (cairn/5026) changes which work a project's provisioning hold
+/// gates. [`OfferSummary::execution_residency`] names the residency a command
+/// runs inside. An executor that finds that residency active among its own
+/// cells admits the work without taking or waiting on the hold, unless the work
+/// prepares managed objects (preparation is part of what the hold serializes);
+/// an offer against an existing checkout is admitted the same way. A 147
+/// executor gates and holds every admission for its project, so equivalent
+/// machines on the two versions admit different work under the same hold and
+/// report different usable capacity, which is what v114 and v144 were minted
+/// for. Mixed versions fail safe in both directions: a 147 executor ignores the
+/// field and keeps gating, and a 147 runner omits it, so a 148 executor gates
+/// that offer as fresh work, exactly as before.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 148;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -5766,6 +5779,13 @@ pub struct OfferSummary {
     /// Carried and recorded today; consulting it is a later change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predicted_cost_ms: Option<u64>,
+    /// The residency this command runs inside, when it does: the
+    /// [`ProcessBatch::execution_residency`] of the batch the grant will carry.
+    /// The machine verifies it against its own cells before treating the work
+    /// as needing no provisioning, so a stale or foreign fence is gated like
+    /// fresh work rather than trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_residency: Option<ResidencyFence>,
 }
 
 /// Why a machine would not take work it was offered.
@@ -5797,8 +5817,11 @@ pub enum DeclineReason {
     Constraint,
     /// The refusal is real and its cause did not classify.
     Unknown,
-    /// This project is already provisioning a cell here, and a project
-    /// provisions one cell at a time. A transient serialisation rather than a
+    /// This project is already provisioning a cell here, a project provisions
+    /// one cell at a time, and this work would provision one too. Work that
+    /// runs in a cell that already exists and prepares nothing (an existing
+    /// checkout, or a live residency on a path that needs no managed objects)
+    /// is never declined for this. A transient serialisation rather than a
     /// shortage: it routes exactly like [`Self::Capacity`] (not here, not now),
     /// and the detail names the request that holds the project and for how
     /// long. Kept apart from `Capacity` because a hold that never clears is a
@@ -13136,6 +13159,11 @@ mod tests {
                     waiting_since_unix_ms: request.waiting_since_unix_ms,
                     wait_horizon_unix_ms: request.wait_horizon_unix_ms,
                     predicted_cost_ms: Some(4_000),
+                    execution_residency: Some(ResidencyFence {
+                        holder: sample_holder(),
+                        incarnation_id: "incarnation".into(),
+                        cell_epoch: 3,
+                    }),
                 },
             },
             ExecutorMessage::Claim {
@@ -13567,6 +13595,58 @@ mod tests {
                 .unwrap()
                 .waiting_since_unix_ms,
             0
+        );
+    }
+
+    /// An offer names the residency its work runs inside, and omits the key
+    /// when there is none, so an offer from a runner that predates the field
+    /// decodes as fresh work: gated by the project's provisioning hold, exactly
+    /// as every executor treated it before.
+    #[test]
+    fn an_offer_names_its_execution_residency_and_an_older_offer_decodes_without_one() {
+        let request = sample_request();
+        let fresh = OfferSummary {
+            request_id: request.request_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            project_id: request.project_id.clone(),
+            repository: request.repository.clone(),
+            base_commit: request.base_commit.clone(),
+            reservation: request.resource_reservation.clone(),
+            admission_kind: CellAdmissionKind::Command,
+            interactive: true,
+            priority: request.priority,
+            waiting_since_unix_ms: request.waiting_since_unix_ms,
+            wait_horizon_unix_ms: request.wait_horizon_unix_ms,
+            predicted_cost_ms: None,
+            execution_residency: None,
+        };
+        let json = serde_json::to_value(&fresh).unwrap();
+        assert!(json.get("executionResidency").is_none());
+        assert_eq!(serde_json::from_value::<OfferSummary>(json).unwrap(), fresh);
+
+        let resident = OfferSummary {
+            execution_residency: Some(ResidencyFence {
+                holder: sample_holder(),
+                incarnation_id: "incarnation".into(),
+                cell_epoch: 9,
+            }),
+            ..fresh.clone()
+        };
+        let json = serde_json::to_value(&resident).unwrap();
+        assert_eq!(json["executionResidency"]["cellEpoch"], 9);
+        assert_eq!(
+            serde_json::from_value::<OfferSummary>(json.clone()).unwrap(),
+            resident
+        );
+
+        let mut previous = json;
+        previous
+            .as_object_mut()
+            .unwrap()
+            .remove("executionResidency");
+        assert_eq!(
+            serde_json::from_value::<OfferSummary>(previous).unwrap(),
+            fresh
         );
     }
 

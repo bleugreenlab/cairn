@@ -211,6 +211,36 @@ macro_rules! private_held_publications {
     };
 }
 
+/// cairn/5028: tenets, the human checkpoint for threads, plus the per-project
+/// numbering counter and operator-only release policy columns on `projects`.
+/// Tenets are ProjectScoped and `projects` is shared, so the whole change lands
+/// in both lineages.
+macro_rules! shared_tail_tenets {
+    () => {
+        migration!("0261_tenets")
+    };
+}
+
+/// cairn/5030: the per-thread ledger of the boot-time import that turned each
+/// thread's rulings into migrated tenets. It shares a database with `tenets`
+/// so a thread's ledger row commits atomically with the tenets it describes,
+/// which puts it in both lineages.
+macro_rules! shared_tail_tenet_ruling_imports {
+    () => {
+        migration!("0262_tenet_ruling_imports")
+    };
+}
+
+/// cairn/5032: tenet evidence. Concluded work (an issue resolution, a thread
+/// era) becomes an evaluation event, and the judged verdicts become evidence
+/// rows on the tenets they bear on. Evidence references `tenets`, so both
+/// tables are ProjectScoped and land in both lineages.
+macro_rules! shared_tail_tenet_evidence {
+    () => {
+        migration!("0263_tenet_evidence")
+    };
+}
+
 /// How each execution bound to a machine. Runner-transient state keyed by a
 /// runner incarnation, like the workflow journal, so it never syncs to a team
 /// replica.
@@ -1373,6 +1403,9 @@ macro_rules! team_lineage {
             shared_tail_retire_issue_dependencies!(),
             shared_tail_reconcile_resolution_basis!(),
             shared_tail_provider_limit_failover!(),
+            shared_tail_tenets!(),
+            shared_tail_tenet_ruling_imports!(),
+            shared_tail_tenet_evidence!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1637,6 +1670,9 @@ macro_rules! private_lineage {
             shared_tail_reconcile_resolution_basis!(),
             private_held_publications!(),
             shared_tail_provider_limit_failover!(),
+            shared_tail_tenets!(),
+            shared_tail_tenet_ruling_imports!(),
+            shared_tail_tenet_evidence!(),
         ]
     };
 }
@@ -2062,6 +2098,10 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
         "thread_read_positions",
         TableScope::Private(PrivateReason::IdentityCredential),
     ),
+    ("tenet_evidence", TableScope::ProjectScoped),
+    ("tenet_evidence_events", TableScope::ProjectScoped),
+    ("tenet_ruling_imports", TableScope::ProjectScoped),
+    ("tenets", TableScope::ProjectScoped),
     ("thread_branches", TableScope::ProjectScoped),
     ("threads", TableScope::ProjectScoped),
     ("todos", TableScope::ProjectScoped),
@@ -2769,6 +2809,22 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
         id_columns: &["id", "subscription_id", "job_id"],
     },
     RekeyTableManifest {
+        table: "tenet_evidence",
+        id_columns: &["id", "project_id", "tenet_id", "event_id"],
+    },
+    RekeyTableManifest {
+        table: "tenet_evidence_events",
+        id_columns: &["id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "tenet_ruling_imports",
+        id_columns: &["thread_id", "project_id"],
+    },
+    RekeyTableManifest {
+        table: "tenets",
+        id_columns: &["id", "project_id", "proposing_thread_id"],
+    },
+    RekeyTableManifest {
         table: "thread_branches",
         id_columns: &["id", "thread_id", "job_id"],
     },
@@ -3316,6 +3372,9 @@ mod tests {
                 "reconcile_resolution_basis",
                 "held_publications",
                 "provider_limit_failover",
+                "tenets",
+                "tenet_ruling_imports",
+                "tenet_evidence",
             ]
         );
         assert_eq!(
@@ -6587,6 +6646,11 @@ mod tests {
                 // cairn/4987: a conflict session's resolution basis, in both.
                 "reconcile_resolution_basis",
                 "provider_limit_failover",
+                // cairn/5028: tenets are ProjectScoped and their counter and
+                // policy columns land on the shared `projects` row.
+                "tenets",
+                "tenet_ruling_imports",
+                "tenet_evidence",
             ]
         );
         assert_eq!(

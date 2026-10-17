@@ -28,6 +28,11 @@ use crate::storage::{DbError, DbResult};
 /// fact whose evidence that issue's own work produces (its resolution, its pull
 /// request, an artifact its jobs confirm, a check verdict on its branch). Each
 /// is a wait edge, so each can close a cycle.
+///
+/// `tenet_verdict` is deliberately absent here and from
+/// [`SELF_PRODUCIBLE_FACTS`]: only the operator answers a tenet, so no
+/// execution can produce that fact, its clause waits on no issue, and it can
+/// close no wait cycle.
 const ISSUE_EDGE_FACTS: &[&str] = &[
     "issue_resolution",
     "pr_state",
@@ -105,8 +110,9 @@ fn example_clause() -> String {
 /// Validate every clause and return each one's canonical stored form, in
 /// authored order with exact duplicates dropped.
 ///
-/// Canonical means: the `issue` URI canonicalized (so `cairn://p/CAIRN/12` and
-/// `cairn://p/cairn/12` are one predicate, and cycle detection and gate patching
+/// Canonical means: the `issue` and `tenet` URIs canonicalized (so
+/// `cairn://p/CAIRN/12` and `cairn://p/cairn/12` are one predicate, and cycle
+/// detection, gate patching, and a tenet's lookup of the gates naming it
 /// compare like with like) and keys in sorted order, which a `BTreeMap`
 /// serializes to by construction.
 pub fn canonical_predicates(clauses: &[TriggerClause], key: &str) -> Result<Vec<String>, String> {
@@ -122,6 +128,11 @@ pub fn canonical_predicates(clauses: &[TriggerClause], key: &str) -> Result<Vec<
             let issue = canonicalize_issue_uri(issue)
                 .map_err(|error| format!("{key}[{index}].issue: {error}"))?;
             canonical.insert("issue".into(), Value::String(issue));
+        }
+        if let Some(Value::String(tenet)) = clause.get("tenet") {
+            let tenet = super::vocabulary::canonicalize_tenet_uri(tenet)
+                .map_err(|error| format!("{key}[{index}].tenet: {error}"))?;
+            canonical.insert("tenet".into(), Value::String(tenet));
         }
         let json = serde_json::to_string(&canonical)
             .map_err(|error| format!("{key}[{index}] is not serializable: {error}"))?;

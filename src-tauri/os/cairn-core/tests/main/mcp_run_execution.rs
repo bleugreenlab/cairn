@@ -894,6 +894,7 @@ async fn a_batch_declined_while_its_project_provisions_runs_when_the_hold_clears
                 waiting_since_unix_ms: 0,
                 wait_horizon_unix_ms: u64::MAX,
                 predicted_cost_ms: None,
+                execution_residency: None,
             },
         )
         .expect("an idle machine takes the project's provisioning ticket");
@@ -930,6 +931,118 @@ async fn a_batch_declined_while_its_project_provisions_runs_when_the_hold_clears
     let text = run_text(&result);
     assert!(text.contains("after-the-hold"), "{text}");
     assert!(!text.contains(REACHED_PLACEMENT), "{text}");
+    kill_all_sessions(&orch);
+}
+
+/// A batch in an environment that already exists provisions nothing, so
+/// another request provisioning the same project does not hold it (cairn/5026).
+///
+/// The first batch stands up the job's execution environment. Then another
+/// request takes the project's provisioning ticket, and the agent's next batch,
+/// bound to that live environment, runs to completion while the ticket is still
+/// held. Before this change it was declined `ProjectProvisioning` and waited,
+/// because every admission for the project was gated by the hold and took it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_in_an_existing_environment_runs_while_another_request_provisions() {
+    use cairn_common::executor_protocol::{
+        CellAdmissionKind, CellPriority, OfferSummary, RepositoryLocator,
+    };
+    if common::skip_if_fenced(
+        "a_batch_in_an_existing_environment_runs_while_another_request_provisions",
+    ) {
+        return;
+    }
+    let (temp, db) = common::migrated_db().await;
+    let project_repo = temp.path().join("project");
+    init_git_repo(&project_repo);
+    let db = Arc::new(db);
+    let project_id = common::insert_project_with_repo(&db, "rer", &project_repo).await;
+    let worktree = temp.path().join("worktree");
+    let branch = "agent/RER-1-builder-0";
+    let base_commit = common::head_sha(&project_repo);
+    seed_run(
+        &db,
+        &project_id,
+        &worktree,
+        branch,
+        &base_commit,
+        "run-resident",
+    )
+    .await;
+    let orch = orchestrator_without_executor(&temp, db.clone());
+    let machine = common::attach_test_executor_pool(&orch);
+    common::provision_jj_workspace(
+        &temp.path().join("config"),
+        &project_repo,
+        &worktree,
+        branch,
+    );
+    let cwd = worktree.display().to_string();
+
+    let first = handle_run(
+        &orch,
+        &request(
+            &cwd,
+            Some("run-resident"),
+            json!({ "commands": [{ "command": "echo environment-ready" }] }),
+        ),
+    )
+    .await;
+    let first = run_text(&first);
+    assert!(first.contains("environment-ready"), "{first}");
+
+    // Another request is provisioning a cell for this project.
+    machine
+        .try_claim(
+            "provisioning-elsewhere",
+            &OfferSummary {
+                request_id: "provisioning-elsewhere".into(),
+                attempt_id: "attempt".into(),
+                project_id: project_id.clone(),
+                repository: RepositoryLocator::ScratchOnly {
+                    owner_id: project_id.clone(),
+                },
+                base_commit: String::new(),
+                reservation: Default::default(),
+                admission_kind: CellAdmissionKind::Command,
+                interactive: true,
+                priority: CellPriority::AgentInteractive,
+                waiting_since_unix_ms: 0,
+                wait_horizon_unix_ms: u64::MAX,
+                predicted_cost_ms: None,
+                execution_residency: None,
+            },
+        )
+        .expect("an idle project's ticket is taken");
+    let held_by_elsewhere = || {
+        machine.snapshot().provisioning_holds.iter().any(|hold| {
+            hold.project_id == project_id && hold.owner_request_id == "provisioning-elsewhere"
+        })
+    };
+    assert!(held_by_elsewhere());
+
+    let during = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle_run(
+            &orch,
+            &request(
+                &cwd,
+                Some("run-resident"),
+                json!({ "commands": [{ "command": "echo during-the-hold" }] }),
+            ),
+        ),
+    )
+    .await
+    .expect("a batch in its existing environment is not held by another request's provisioning");
+    let during = run_text(&during);
+    assert!(during.contains("during-the-hold"), "{during}");
+    assert!(!during.contains(DURABLE_SUSPEND), "{during}");
+    assert!(
+        held_by_elsewhere(),
+        "the batch ran while the other request still held the project, and took nothing from it"
+    );
+
+    assert!(machine.release_claim("provisioning-elsewhere").is_some());
     kill_all_sessions(&orch);
 }
 

@@ -694,9 +694,13 @@ pub(super) async fn dispatch(
                     if dry_run {
                         format!("Would delete thread {project}/{name}")
                     } else {
-                        crate::threads::crud::delete(&db, &thread.id)
-                            .await
-                            .map_err(|e| build_failure(index, item, e.to_string()))?;
+                        crate::threads::crud::delete(
+                            &db,
+                            orch.services.emitter.as_ref(),
+                            &thread.id,
+                        )
+                        .await
+                        .map_err(|e| build_failure(index, item, e.to_string()))?;
                         let _ = orch.services.emitter.emit(
                             "db-change",
                             crate::notify::thread_db_change(&thread, "delete"),

@@ -68,6 +68,12 @@ pub(super) async fn dispatch(
                 item.payload.as_ref().and_then(|p| p.get("after")),
                 "payload.after",
             )?;
+            let tenet = crate::tenets::filing::TenetFiling::from_payload(
+                request.run_id.clone(),
+                item.payload.as_ref().and_then(|p| p.as_object()),
+                "payload",
+            )
+            .map_err(|error| build_failure(index, item, error))?;
             // CAIRN-4665: the default is the issue's next ATTEMPT, which
             // supersedes whichever execution owns the issue now. A caller that
             // wants a second opinion running beside the canonical one must
@@ -112,6 +118,7 @@ pub(super) async fn dispatch(
                     overrides,
                     intent,
                     after,
+                    tenet,
                 )
                 .await
                 .map_err(|error| build_failure(index, item, error))?

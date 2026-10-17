@@ -15,9 +15,9 @@ use crate::storage::{DbError, DbResult, LocalDb, RowExt};
 // ============================================================================
 
 /// Optional create+start request parsed from the issue-create payload's
-/// `execution` key. Both fields default like an executions-collection append:
-/// `recipe` to the project (then workspace) default manual recipe, `backend` to
-/// the recipe/agent default.
+/// `execution` key, taking the same keys an executions-collection append does.
+/// `recipe` is required by the launch (there is no default recipe); `backend`
+/// defaults to the recipe/agent default.
 #[derive(Debug, Default, Clone)]
 pub struct CreateExecutionSpec {
     pub(crate) recipe: Option<String>,
@@ -31,6 +31,9 @@ pub struct CreateExecutionSpec {
     /// once every gate is satisfied. "Create the issue and a held execution on
     /// it" in one call.
     pub(crate) after: Vec<crate::routes::TriggerClause>,
+    /// `proposal` or `tenet`: the commissioning gate's tenet, which a thread's
+    /// filing of a gated recipe must carry (`crate::tenets::filing`).
+    pub(crate) tenet: Option<crate::tenets::filing::TenetClaim>,
 }
 
 /// Persist a new issue and emit the standard side effects (embed, sync,
@@ -178,6 +181,35 @@ pub async fn create_issue_in_project(
 ) -> Result<CreatedIssueOutcome, String> {
     let owning_db = orch.db.for_project(project_key).await;
     let ctx = lookup_project_by_key(&owning_db, project_key).await?;
+    let tenet = execution
+        .as_ref()
+        .map(|spec| crate::tenets::filing::TenetFiling {
+            caller_run_id: caller_run_id.clone(),
+            claim: spec.tenet.clone(),
+            key_prefix: "payload.execution",
+        })
+        .unwrap_or_default();
+    // A filing the commissioning gate refuses, or that names its recipe by
+    // anything but a recipe id, is refused before the issue exists, so the
+    // refusal leaves no orphan issue behind it.
+    if let Some(spec) = &execution {
+        let recipe = crate::execution::recipe::resolve_filed_recipe_id(
+            &orch.config_dir,
+            &owning_db,
+            &ctx.project_id,
+            spec.recipe.as_deref(),
+        )
+        .await?;
+        crate::tenets::filing::plan(
+            &orch.db,
+            &owning_db,
+            &ctx.project_key,
+            &ctx.project_id,
+            recipe.as_deref(),
+            &tenet,
+        )
+        .await?;
+    }
     let issue = insert_issue_with_context(
         orch,
         &owning_db,
@@ -217,6 +249,7 @@ pub async fn create_issue_in_project(
             // attempt yet.
             crate::execution::recipe::LaunchIntent::NewAttempt,
             spec.after,
+            tenet,
         )
         .await
         {
@@ -445,6 +478,36 @@ async fn owning_thread_for_run(
         .await?;
     match rows.next().await? {
         Some(row) => row.opt_text(0),
+        None => Ok(None),
+    }
+}
+
+/// The thread a run acts for and that thread's project, wherever the thread
+/// lives: [`owning_thread_for_run`] without the project scope.
+///
+/// That scope is right for inferring a parent edge, where a cross-project
+/// answer must be dropped, and wrong for deciding whether a caller IS a
+/// thread, where dropping it would let a thread pass as a person. Read on the
+/// run's own database.
+pub(crate) async fn acting_thread_for_run(
+    conn: &cairn_db::turso::Connection,
+    run_id: &str,
+) -> DbResult<Option<(String, String)>> {
+    let Some(job_id) = owning_node_job_for_run(conn, run_id).await? else {
+        return Ok(None);
+    };
+    let mut rows = conn
+        .query(
+            "SELECT t.id, t.project_id
+             FROM jobs j
+             JOIN threads t ON t.id = j.thread_id
+             WHERE j.id = ?1
+             LIMIT 1",
+            params![job_id.as_str()],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some((row.text(0)?, row.text(1)?))),
         None => Ok(None),
     }
 }

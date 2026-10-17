@@ -145,6 +145,18 @@ pub enum CairnResource {
     ProjectPosts {
         project: String,
     },
+    /// A project's tenets: the questions its threads put to the operator and
+    /// the verdicts given.
+    ProjectTenets {
+        project: String,
+    },
+    /// One tenet, addressed by its number or, for a tenet migrated from a
+    /// thread's rulings, by its slug. A slug is an alias: the tenet's
+    /// canonical address is its number.
+    ProjectTenet {
+        project: String,
+        key: String,
+    },
     /// One project's code map: the base tree's source inventory, the import
     /// graph over it, and per-file churn.
     ProjectCodemap {
@@ -929,6 +941,8 @@ impl CairnResource {
             Self::Post { .. } => ResourceKind::Post,
             Self::PostComment { .. } => ResourceKind::PostComment,
             Self::ProjectPosts { .. } => ResourceKind::ProjectPosts,
+            Self::ProjectTenets { .. } => ResourceKind::ProjectTenets,
+            Self::ProjectTenet { .. } => ResourceKind::ProjectTenet,
             Self::ProjectCodemap { .. } => ResourceKind::ProjectCodemap,
             Self::ProjectMap { .. } => ResourceKind::ProjectMap,
             Self::ProjectHome { .. } => ResourceKind::ProjectHome,

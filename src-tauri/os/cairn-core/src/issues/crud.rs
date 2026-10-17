@@ -649,20 +649,34 @@ async fn set_dismissed(
     .map_err(CairnError::from)
 }
 
-pub async fn complete(db: &LocalDb, clock: &dyn Clock, id: &str) -> Result<(), CairnError> {
-    resolve(db, clock, id, Resolution::Merged).await.map(|_| ())
+/// Mark an issue merged. `device_id` is this machine's stable id, which owns
+/// the tenet evidence event the resolution snapshots.
+pub async fn complete(
+    db: &LocalDb,
+    clock: &dyn Clock,
+    id: &str,
+    device_id: &str,
+) -> Result<(), CairnError> {
+    resolve(db, clock, id, Resolution::Merged, device_id)
+        .await
+        .map(|_| ())
 }
 
+/// Record an issue's terminal resolution, and in the same write snapshot it as
+/// a tenet evidence event owned by `device_id` (this machine's stable id).
 pub async fn resolve(
     db: &LocalDb,
     clock: &dyn Clock,
     id: &str,
     resolution: Resolution,
+    device_id: &str,
 ) -> Result<Vec<String>, CairnError> {
+    let device_id = device_id.to_string();
     let id = id.to_string();
     let now = clock.now();
     db.write(|conn| {
         let id = id.clone();
+        let device_id = device_id.clone();
         Box::pin(async move {
             let reason = match resolution {
                 Resolution::Merged => {
@@ -712,6 +726,13 @@ pub async fn resolve(
                 )
                 .await?;
             }
+
+            // Every terminal resolution passes through here, including the
+            // `complete_issue` command that never reaches `resolve_terminal`.
+            crate::tenets::evidence::events::insert_issue_event_conn(
+                conn, &id, resolution, &device_id, now,
+            )
+            .await?;
 
             close_sessions_for_issue_conn(conn, &id, reason, now).await
         })

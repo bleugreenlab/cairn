@@ -60,28 +60,125 @@ pub fn list_recipes(
     Ok(results)
 }
 
+/// What a recipe id is, for refusals that name the rule.
+const RECIPE_ID_SHAPE: &str = "a recipe id is a plain name of letters, digits, `-` and `_` (the recipe file's name without its extension), never a path or a file name";
+
+/// Whether `id` is a recipe id: a plain name of letters, digits, `-` and `_`.
+///
+/// A recipe's identity is the stem of its file, and policy that names a
+/// recipe (the tenet-gated list, contextual-package selection) compares ids,
+/// so an id must not be able to reach a file by another spelling: no path
+/// separators, no `.` (so no `..`, no extension, no hidden name).
+pub fn is_recipe_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The refusal for a string that is not a recipe id, naming the recipe it
+/// most plausibly meant when one resolves (`./planbuild` and
+/// `recipes/planbuild.yaml` both suggest `planbuild`).
+fn recipe_id_refusal(config_dir: &Path, id: &str, project_path: Option<&Path>) -> String {
+    let last = id.rsplit(['/', '\\']).next().unwrap_or(id).trim();
+    let stem = last
+        .strip_suffix(".yaml")
+        .or_else(|| last.strip_suffix(".yml"))
+        .unwrap_or(last)
+        .trim_start_matches('.');
+    let canonical = is_recipe_id(stem)
+        .then(|| {
+            find_recipe_file(config_dir, stem, project_path)
+                .ok()
+                .flatten()
+        })
+        .flatten()
+        .and_then(|(path, _)| id_from_path(&path));
+    match canonical {
+        Some(canonical) => {
+            format!("`{id}` is not a recipe id: {RECIPE_ID_SHAPE}. Use `{canonical}`.")
+        }
+        None => format!("`{id}` is not a recipe id: {RECIPE_ID_SHAPE}, like `build`."),
+    }
+}
+
+/// The file recipe `id` names, and whether it is project-scoped.
+///
+/// Project scope shadows workspace scope. Within a directory the file whose
+/// stem is exactly `id` wins, else the one whose stem matches it ignoring
+/// ASCII case, `.yaml` before `.yml`. Matching is done here against the
+/// directory's entries rather than by joining `id` into a path, so the
+/// filesystem's own case folding never decides which file an id names, and
+/// the resolved file's stem is the recipe's canonical id on every platform.
+fn find_recipe_file(
+    config_dir: &Path,
+    id: &str,
+    project_path: Option<&Path>,
+) -> Result<Option<(PathBuf, bool)>, String> {
+    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "recipes")
+    {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // (exact, extension rank, stem, path): sorting puts the best first.
+        let mut candidates: Vec<(bool, u8, String, PathBuf)> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some((stem, ext)) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.rsplit_once('.'))
+            else {
+                continue;
+            };
+            let rank = match ext {
+                "yaml" => 0,
+                "yml" => 1,
+                _ => continue,
+            };
+            if !stem.eq_ignore_ascii_case(id) || path.is_dir() {
+                continue;
+            }
+            candidates.push((stem != id, rank, stem.to_string(), path));
+        }
+        candidates.sort();
+        let Some((inexact, _, stem, path)) = candidates.first() else {
+            continue;
+        };
+        if *inexact {
+            if let Some((_, _, other, _)) = candidates.iter().find(|c| &c.2 != stem) {
+                return Err(format!(
+                    "recipe id `{id}` matches both `{stem}` and `{other}` in {}; name one exactly",
+                    dir.display()
+                ));
+            }
+        }
+        return Ok(Some((path.clone(), is_project_scoped)));
+    }
+    Ok(None)
+}
+
 /// Get a specific recipe by ID (filename without extension)
 ///
 /// Checks project-scoped first (if project_path provided), then workspace-scoped.
+/// The loaded recipe's id is its file's stem, which may differ from `id` in
+/// ASCII case only. A string that is not a recipe id ([`is_recipe_id`]) is
+/// refused rather than looked up.
 pub fn get_recipe(
     config_dir: &Path,
     id: &str,
     project_path: Option<&Path>,
 ) -> Result<Option<FileRecipe>, String> {
-    for (dir, is_project_scoped) in super::config_root_subdirs(config_dir, project_path, "recipes")
-    {
-        for ext in ["yaml", "yml"] {
-            let path = dir.join(format!("{}.{}", id, ext));
-            if path.exists() {
-                return match load_recipe_file(&path, is_project_scoped) {
-                    ConfigResult::Ok(recipe) => Ok(Some(recipe)),
-                    ConfigResult::Err { error, .. } => Err(error),
-                };
-            }
-        }
+    if !is_recipe_id(id) {
+        return Err(recipe_id_refusal(config_dir, id, project_path));
     }
-
-    Ok(None)
+    match find_recipe_file(config_dir, id, project_path)? {
+        Some((path, is_project_scoped)) => match load_recipe_file(&path, is_project_scoped) {
+            ConfigResult::Ok(recipe) => Ok(Some(recipe)),
+            ConfigResult::Err { error, .. } => Err(error),
+        },
+        None => Ok(None),
+    }
 }
 
 /// Save a recipe to a file
@@ -93,6 +190,12 @@ pub fn save_recipe(
     // Determine target path
     let path = if file_recipe.file_path.as_os_str().is_empty() {
         // No existing path - determine from scope
+        if !is_recipe_id(&file_recipe.recipe.id) {
+            return Err(format!(
+                "cannot save recipe `{}`: {RECIPE_ID_SHAPE}",
+                file_recipe.recipe.id
+            ));
+        }
         let filename = format!("{}.yaml", file_recipe.recipe.id);
         if file_recipe.is_project_scoped {
             let proj_path =
@@ -127,39 +230,24 @@ pub fn save_recipe(
     Ok(path)
 }
 
-/// Delete a recipe file
+/// Delete the recipe file `id` names, the same file [`get_recipe`] loads for
+/// it. Deleting a recipe that does not exist is not an error.
 pub fn delete_recipe(
     config_dir: &Path,
     id: &str,
     project_path: Option<&Path>,
 ) -> Result<(), String> {
-    // Try project-scoped first if project specified
-    if let Some(proj_path) = project_path {
-        for ext in ["yaml", "yml"] {
-            let path = proj_path
-                .join(".cairn")
-                .join("recipes")
-                .join(format!("{}.{}", id, ext));
-            if path.exists() {
-                std::fs::remove_file(&path)
-                    .map_err(|e| format!("Failed to delete recipe file: {}", e))?;
-                return Ok(());
-            }
-        }
+    if !is_recipe_id(id) {
+        return Err(recipe_id_refusal(config_dir, id, project_path));
     }
-
-    // Try workspace-scoped
-    let ws_dir = config_dir.join("recipes");
-    for ext in ["yaml", "yml"] {
-        let path = ws_dir.join(format!("{}.{}", id, ext));
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| format!("Failed to delete recipe file: {}", e))?;
-            super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Recipe, id);
-            return Ok(());
-        }
+    let Some((path, is_project_scoped)) = find_recipe_file(config_dir, id, project_path)? else {
+        return Ok(());
+    };
+    std::fs::remove_file(&path).map_err(|e| format!("Failed to delete recipe file: {}", e))?;
+    if !is_project_scoped {
+        let canonical = id_from_path(&path).unwrap_or_else(|| id.to_string());
+        super::pack::note_removed_item(config_dir, super::pack::PackItemKind::Recipe, &canonical);
     }
-
     Ok(())
 }
 
@@ -174,6 +262,14 @@ fn load_recipe_file(path: &Path, is_project_scoped: bool) -> ConfigResult<FileRe
             }
         }
     };
+    if !is_recipe_id(&id) {
+        return ConfigResult::Err {
+            path: path.to_path_buf(),
+            error: format!(
+                "the recipe file name `{id}` is not a recipe id: {RECIPE_ID_SHAPE}. Rename the file."
+            ),
+        };
+    }
 
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -433,6 +529,115 @@ edges: []
             .expect("should find workspace recipe");
         assert_eq!(loaded_ws.recipe.name, "Workspace Version");
         assert!(!loaded_ws.is_project_scoped);
+    }
+
+    /// A path, a file name, or a dotted name is not a recipe id: every caller
+    /// is refused, with the canonical id named when one resolves, and no file
+    /// outside a recipes directory is ever loaded, saved, or deleted.
+    #[test]
+    fn noncanonical_recipe_ids_are_refused_for_every_operation() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        save_recipe(
+            &config_dir,
+            &FileRecipe {
+                recipe: minimal_recipe("planbuild", "Plan Build"),
+                bundles: Vec::new(),
+                is_project_scoped: false,
+                file_path: PathBuf::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let absolute = config_dir.join("recipes/planbuild").display().to_string();
+        for spelling in [
+            "./planbuild",
+            "planbuild.yaml",
+            "planbuild.yml",
+            ".planbuild",
+            "../recipes/planbuild",
+            "recipes\\planbuild",
+            " planbuild",
+            absolute.as_str(),
+        ] {
+            let refusal = get_recipe(&config_dir, spelling, None).unwrap_err();
+            assert!(
+                refusal.contains("is not a recipe id") && refusal.ends_with("Use `planbuild`."),
+                "{spelling}: {refusal}"
+            );
+            assert!(delete_recipe(&config_dir, spelling, None).is_err());
+        }
+        let unknown = get_recipe(&config_dir, "../nowhere", None).unwrap_err();
+        assert!(unknown.ends_with("like `build`."), "{unknown}");
+        assert!(get_recipe(&config_dir, "", None).is_err());
+
+        let escaping = FileRecipe {
+            recipe: minimal_recipe("../escaped", "Escaped"),
+            bundles: Vec::new(),
+            is_project_scoped: false,
+            file_path: PathBuf::new(),
+        };
+        assert!(save_recipe(&config_dir, &escaping, None).is_err());
+        assert!(!config_dir.join("escaped.yaml").exists());
+        assert!(config_dir.join("recipes/planbuild.yaml").exists());
+    }
+
+    /// An id resolves to its file ignoring ASCII case on every platform, and
+    /// the loaded recipe carries the file's own stem as its id; an exact match
+    /// wins over a case variant.
+    #[test]
+    fn a_case_variant_resolves_to_the_files_own_id() {
+        let temp = tempdir().unwrap();
+        let config_dir = temp.path().join("config");
+        let save = |id: &str| {
+            save_recipe(
+                &config_dir,
+                &FileRecipe {
+                    recipe: minimal_recipe(id, id),
+                    bundles: Vec::new(),
+                    is_project_scoped: false,
+                    file_path: PathBuf::new(),
+                },
+                None,
+            )
+            .unwrap()
+        };
+        save("PlanCoord");
+        let loaded = get_recipe(&config_dir, "plancoord", None)
+            .unwrap()
+            .expect("a case variant resolves");
+        assert_eq!(loaded.recipe.id, "PlanCoord");
+        assert_eq!(
+            get_recipe(&config_dir, "PlanCoord", None)
+                .unwrap()
+                .unwrap()
+                .recipe
+                .id,
+            "PlanCoord"
+        );
+        delete_recipe(&config_dir, "PLANCOORD", None).unwrap();
+        assert!(get_recipe(&config_dir, "PlanCoord", None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A file whose name is not a recipe id lists as an error naming the fix,
+    /// rather than as a recipe no id can reach.
+    #[test]
+    fn a_recipe_file_with_a_noncanonical_name_lists_as_an_error() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("v1.2.yaml");
+        std::fs::write(
+            &path,
+            "cairnVersion: 1\nname: Dotted\ntrigger: manual\nnodes: []\nedges: []\n",
+        )
+        .unwrap();
+        match load_recipe_file(&path, false) {
+            ConfigResult::Err { error, .. } => {
+                assert!(error.contains("Rename the file"), "{error}")
+            }
+            ConfigResult::Ok(_) => panic!("a dotted file name is not a recipe id"),
+        }
     }
 
     /// A `system: true` recipe file loads with is_system set; the picker filter

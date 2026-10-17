@@ -119,6 +119,29 @@ pub async fn get_resource_embedding_async(
     .await
 }
 
+/// Every resource vector under a URI prefix for one model and width, as
+/// `(uri, vector)`. The prefix is compared exactly, not as a LIKE pattern, so
+/// a `_` in a project key matches only itself.
+pub async fn resource_embeddings_with_prefix_async(
+    db: &LocalDb,
+    prefix: &str,
+    model: &str,
+    dims: i32,
+) -> DbResult<Vec<(String, Vec<f32>)>> {
+    db.query_all(
+        "SELECT uri, embedding FROM resource_embeddings
+         WHERE substr(uri, 1, length(?1)) = ?1 AND model = ?2 AND dims = ?3",
+        params![prefix, model, dims],
+        |row| {
+            Ok((
+                row.text(0)?,
+                crate::embeddings::vector::from_bytes(&row.blob(1)?),
+            ))
+        },
+    )
+    .await
+}
+
 pub async fn delete_resource_embedding_async(db: &LocalDb, uri: &str) -> DbResult<()> {
     let uri = uri.to_string();
     db.execute(

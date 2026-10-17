@@ -578,6 +578,11 @@ async fn produce_thread_db_resource(
         }
         Err(error) => return RenderedResource::line(error, affordance, None, None),
     };
+    if let Some(sql) = find_query_value(params, "sql") {
+        if let Err(refusal) = super::sql_policy::refuse_retired_rulings(sql) {
+            return RenderedResource::line(refusal, affordance, None, None);
+        }
+    }
     let db = match crate::threads::db_store::open_existing(&thread_id).await {
         Ok(Some(db)) => db,
         Ok(None) => {
@@ -2124,6 +2129,12 @@ async fn render_resource_body(
                 &params,
             )
             .await
+        }
+        CairnResource::ProjectTenets { project } => {
+            super::tenets::read_collection(db, &project, &params).await
+        }
+        CairnResource::ProjectTenet { project, key } => {
+            super::tenets::read_entity(db, &project, &key, &params).await
         }
         CairnResource::ProjectCodemap { project } => {
             super::codemap::read_codemap(orch, db, &project, &params).await
@@ -3985,14 +3996,12 @@ line2', X'0001020AFF', 2.5),
         assert!(arc.content.contains("The canonical arc — café"));
         assert_ne!(arc.content, stored_arc);
         let block = arc.affordance.map(|a| a.block).unwrap_or_default();
+        assert!(block.contains("[propose a tenet]"), "{block}");
         assert!(
-            block.contains("[append one ruling in the thread database]"),
+            block.contains("[append one open question in the thread database]"),
             "{block}"
         );
-        assert!(
-            block.contains("[supersede one ruling in the thread database]"),
-            "{block}"
-        );
+        assert!(!block.contains("_cairn_rulings"), "{block}");
 
         let raw =
             produce_cairn_resource(&orch, &request, "cairn://p/thr/thread-ux/arc?format=json")

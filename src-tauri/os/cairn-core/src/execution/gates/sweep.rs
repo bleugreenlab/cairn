@@ -267,6 +267,19 @@ async fn evaluate_gates(
                 continue;
             }
         };
+        // An approved tenet's decision reaches the issue before the work it
+        // releases starts, and before the gate latches: a latched gate is not
+        // resolved again, so a failed delivery here must leave it unlatched.
+        if outcome == GateOutcome::Satisfied {
+            if let Err(error) = deliver_tenet_decision(orch, db, execution, &clause, now).await {
+                all_satisfied = false;
+                log::warn!(
+                    "gate {} holds until its tenet's decision is delivered: {error}",
+                    gate.id
+                );
+                continue;
+            }
+        }
         record_outcome(db, gate, outcome, now).await?;
         if outcome == GateOutcome::Satisfied {
             continue;
@@ -323,6 +336,26 @@ async fn evaluate_gates(
         .await?;
     }
     Ok(evaluation)
+}
+
+/// For a satisfied `tenet_verdict` gate, the approved choice as a comment on
+/// the held issue, written once per tenet and issue.
+async fn deliver_tenet_decision(
+    orch: &Orchestrator,
+    db: &LocalDb,
+    execution: &HeldExecution,
+    clause: &TriggerClause,
+    now: i64,
+) -> Result<(), String> {
+    let is_tenet = clause.get("fact").and_then(serde_json::Value::as_str)
+        == Some(crate::tenets::TENET_GATE_FACT);
+    let (true, Some(issue_id)) = (is_tenet, execution.issue_id.as_deref()) else {
+        return Ok(());
+    };
+    if crate::tenets::ensure_decision_comment(db, clause, issue_id, now).await? {
+        orch.notifier.emit_change("comments");
+    }
+    Ok(())
 }
 
 /// Record a gate's newest resolution, latching satisfaction. Skips the write
@@ -557,8 +590,14 @@ fn foreclosure_message_id(gate_id: &str) -> String {
         .to_string()
 }
 
-/// Wake the thread that filed a foreclosed gate's execution, unless that wake
-/// was already delivered.
+/// Wake whoever owns a foreclosed gate's judgment, unless that wake was
+/// already delivered.
+///
+/// That is the thread that filed the execution (resolved as the held issue's
+/// coordinator), except for a `tenet_verdict` gate: its judgment belongs to
+/// the thread that PROPOSED the tenet, which is woken through its own session
+/// rather than through the held issue's parent edge. A tenet whose row is gone
+/// falls back to the filing thread, so the wake still lands somewhere.
 ///
 /// The foreclosure message is the delivery record: its absence means the wake
 /// is still owed, so a filer that could not be addressed when the gate
@@ -585,6 +624,12 @@ async fn deliver_foreclosure(
         .collect();
     let rendered = rendered.to_string();
     let reason = reason.to_string();
+    let tenet_clause = serde_json::from_str::<TriggerClause>(&gate.predicate_json)
+        .ok()
+        .filter(|clause| {
+            clause.get("fact").and_then(serde_json::Value::as_str)
+                == Some(crate::tenets::TENET_GATE_FACT)
+        });
     let delivered = db
         .write(|conn| {
             let execution = execution.clone();
@@ -592,6 +637,7 @@ async fn deliver_foreclosure(
             let remaining = remaining.clone();
             let rendered = rendered.clone();
             let reason = reason.clone();
+            let tenet_clause = tenet_clause.clone();
             Box::pin(async move {
                 let push_key = format!("gate:{gate_id}");
                 let message_id = foreclosure_message_id(&gate_id);
@@ -608,10 +654,19 @@ async fn deliver_foreclosure(
                 let Some(issue_id) = execution.issue_id.as_deref() else {
                     return Ok(None);
                 };
-                let Some(recipient) =
-                    crate::orchestrator::wakes::coordinating_job_for_child(conn, issue_id)
-                        .await?
-                else {
+                let recipient = match tenet_clause.as_ref() {
+                    Some(clause) => tenet_proposer_session_conn(conn, clause).await?,
+                    None => None,
+                };
+                let recipient = match recipient {
+                    Some(TenetRecipient::Session(job)) => Some(job),
+                    Some(TenetRecipient::Dormant) => None,
+                    None => {
+                        crate::orchestrator::wakes::coordinating_job_for_child(conn, issue_id)
+                            .await?
+                    }
+                };
+                let Some(recipient) = recipient else {
                     if latched_now {
                         log::warn!(
                             "gate {gate_id} foreclosed, but issue {issue_id} has no filing thread to wake yet; the wake stays owed"
@@ -634,7 +689,13 @@ async fn deliver_foreclosure(
                     return Ok(None);
                 };
                 let content = foreclosure_message(
-                    conn, &execution, issue_id, &rendered, &reason, &remaining,
+                    conn,
+                    &execution,
+                    issue_id,
+                    &rendered,
+                    &reason,
+                    &remaining,
+                    tenet_clause.as_ref(),
                 )
                 .await?;
                 cairn_attention::direct::insert_system_direct_push_with_message_id_conn(
@@ -665,9 +726,53 @@ async fn deliver_foreclosure(
     Ok(())
 }
 
+/// Who a tenet gate's foreclosure wakes.
+enum TenetRecipient {
+    /// The proposing thread's live session.
+    Session(String),
+    /// The proposing thread is closed: the wake stays owed until it reopens.
+    Dormant,
+}
+
+/// The proposing thread of the tenet `clause` names, through its own session.
+/// `None` when the tenet row is gone (its unanswered proposal was deleted with
+/// its thread), so the caller falls back to the filing thread.
+async fn tenet_proposer_session_conn(
+    conn: &cairn_db::turso::Connection,
+    clause: &TriggerClause,
+) -> DbResult<Option<TenetRecipient>> {
+    let Some(Ok((project, number))) = clause
+        .get("tenet")
+        .and_then(serde_json::Value::as_str)
+        .map(super::vocabulary::parse_tenet_uri)
+    else {
+        return Ok(None);
+    };
+    let crate::tenets::TenetLookup::Found(tenet) =
+        crate::tenets::lookup_conn(conn, &project, number).await?
+    else {
+        return Ok(None);
+    };
+    // Establishing a session is refused for a closed thread; checking first
+    // keeps that refusal from aborting the sweep's transaction.
+    let active = crate::threads::thread_status_conn(conn, &tenet.proposing_thread_id)
+        .await?
+        .is_some_and(|status| status.is_active());
+    if !active {
+        return Ok(Some(TenetRecipient::Dormant));
+    }
+    crate::threads::ensure_thread_session_conn(conn, &tenet.proposing_thread_id, None)
+        .await
+        .map(|job| Some(TenetRecipient::Session(job)))
+}
+
 /// The message a foreclosure delivers: which execution, on which issue, which
-/// predicate, what foreclosed it, and the two exits as writes the reader can
-/// send as-is.
+/// predicate, what foreclosed it, and the exits as writes the reader can send
+/// as-is.
+///
+/// A foreclosed tenet gate is the operator saying no (or the thread taking
+/// its question back), so its exits are to ask again or to drop the work;
+/// releasing the execution around the operator is not offered.
 async fn foreclosure_message(
     conn: &cairn_db::turso::Connection,
     execution: &HeldExecution,
@@ -675,6 +780,7 @@ async fn foreclosure_message(
     rendered: &str,
     reason: &str,
     remaining: &[serde_json::Value],
+    tenet_clause: Option<&TriggerClause>,
 ) -> DbResult<String> {
     let issue_uri = crate::issues::relations::issue_uri_for_id(conn, issue_id).await?;
     let seq = execution
@@ -682,6 +788,36 @@ async fn foreclosure_message(
         .map(|seq| seq.to_string())
         .unwrap_or_else(|| "?".to_string());
     let execution_uri = format!("{issue_uri}/executions/{seq}");
+    if let Some(clause) = tenet_clause {
+        let tenets_uri = match clause
+            .get("tenet")
+            .and_then(serde_json::Value::as_str)
+            .map(super::vocabulary::parse_tenet_uri)
+        {
+            Some(Ok((project, _))) => cairn_common::uri::build_project_tenets_uri(&project),
+            _ => "cairn://p/PROJECT/tenets".to_string(),
+        };
+        let mut regated = clause.clone();
+        regated.insert(
+            "tenet".into(),
+            serde_json::Value::String(format!("{tenets_uri}/NEW")),
+        );
+        let mut gates = remaining.to_vec();
+        gates.push(
+            serde_json::to_value(&regated)
+                .map_err(|error| DbError::internal(format!("unserializable gate: {error}")))?,
+        );
+        let gates = serde_json::to_string(&gates)
+            .map_err(|error| DbError::internal(format!("unserializable gates: {error}")))?;
+        return Ok(format!(
+            "Held execution {seq} on {issue_uri} can no longer start on its own: its gate \
+             `after {rendered}` is foreclosed \u{2014} {reason}.\n\n\
+             It stays held (not released, not cancelled). The verdict is the operator's, so do \
+             not release the work around it. Either:\n\
+             - ask again: propose a new tenet with write({{changes:[{{target:\"{tenets_uri}\",mode:\"append\",payload:{{question:\"...\",options:[\"...\"]}}}}]}}), then hold this execution on it (NEW is the new tenet's number): write({{changes:[{{target:\"{execution_uri}\",mode:\"patch\",payload:{{after:{gates}}}}}]}})\n\
+             - or drop the work: close {issue_uri}."
+        ));
+    }
     let remaining = serde_json::to_string(remaining)
         .map_err(|error| DbError::internal(format!("unserializable gates: {error}")))?;
     Ok(format!(
@@ -846,6 +982,7 @@ mod tests {
             None,
             LaunchIntent::NewAttempt,
             clauses,
+            crate::tenets::filing::TenetFiling::unattributed(),
         )
         .await
     }

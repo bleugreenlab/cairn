@@ -40,6 +40,7 @@ mod responses;
 mod routes;
 mod settings;
 mod skills;
+mod tenets;
 mod terminals;
 mod threads;
 mod todos;
@@ -185,6 +186,14 @@ fn gate_resource_change(
         return Err(build_failure(index, item, refusal));
     }
     let kind = resource.kind();
+    if matches!(
+        kind,
+        ResourceKind::Projects | ResourceKind::Project | ResourceKind::ProjectSettings
+    ) {
+        if let Some(refusal) = crate::tenets::operator_only_policy_refusal(item.payload.as_ref()) {
+            return Err(build_failure(index, item, refusal));
+        }
+    }
     let candidates = candidate_specs(kind, item.mode);
     if candidates.is_empty() {
         return Err(build_failure(
@@ -278,6 +287,9 @@ pub(crate) async fn dispatch_resource_change(
     let resource = target_resource_for_request(orch, request, item)
         .await
         .map_err(|e| build_failure(index, item, e))?;
+    if let Some(refusal) = tenets::edit_refusal(orch, &resource, item).await {
+        return Err(build_failure(index, item, refusal));
+    }
     gate_resource_change(index, item, &resource)?;
 
     // Optional structured echo of the post-mutation state, surfaced to UI
@@ -287,6 +299,10 @@ pub(crate) async fn dispatch_resource_change(
 
     let summary = if let Some(summary) =
         posts::dispatch(orch, request, index, item, dry_run, &resource).await?
+    {
+        summary
+    } else if let Some(summary) =
+        tenets::dispatch(orch, request, index, item, dry_run, &resource).await?
     {
         summary
     } else if let Some(summary) =

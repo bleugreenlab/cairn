@@ -500,6 +500,7 @@ impl OrchestratorBuilder {
             vibe_state: self.vibe_state,
             embed_tx: Arc::new(Mutex::new(None)),
             era_summary_tx: crate::threads::era_worker::sender_slot(),
+            tenet_evidence_hint: Arc::new(tokio::sync::Notify::new()),
             embed_client: std::sync::OnceLock::new(),
             semantic_search: std::sync::OnceLock::new(),
             anon_device_manager,
@@ -571,6 +572,7 @@ impl OrchestratorBuilder {
         }
         if tokio::runtime::Handle::try_current().is_ok() {
             crate::threads::era_worker::spawn(orchestrator.clone(), &orchestrator.era_summary_tx);
+            crate::tenets::evidence::spawn(orchestrator.clone());
             crate::orchestrator::wakes::conditions::install_evaluator(orchestrator.clone());
         }
         orchestrator
@@ -1255,6 +1257,9 @@ pub struct Orchestrator {
     embed_tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<EmbedJob>>>>,
     /// Bounded ingress for fallback-era summary upgrades. None only before startup wiring.
     era_summary_tx: crate::threads::era_worker::EraSummarySender,
+    /// Wakes the tenet evidence worker after a conclusion commits. Pending
+    /// event rows are the source of truth; this only shortens the wait.
+    tenet_evidence_hint: Arc<tokio::sync::Notify>,
     /// The `/embed` gateway client, built once so the embed worker and search's
     /// semantic lane share one connection pool. Built lazily because it needs
     /// the account managers, which are wired after the struct is assembled.
@@ -1524,6 +1529,15 @@ impl Orchestrator {
     /// is full; persistence remains authoritative and the startup sweep retries it.
     pub fn enqueue_thread_era_summary(&self, job_id: impl Into<String>, seq: i32) -> bool {
         crate::threads::era_worker::enqueue(&self.era_summary_tx, job_id, seq)
+    }
+
+    /// Tell the tenet evidence worker a conclusion's event just committed.
+    pub fn notify_tenet_evidence(&self) {
+        self.tenet_evidence_hint.notify_one();
+    }
+
+    pub(crate) fn tenet_evidence_hint(&self) -> Arc<tokio::sync::Notify> {
+        self.tenet_evidence_hint.clone()
     }
 
     pub fn invalidate_sidebar_active_issues(&self) {

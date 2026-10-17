@@ -29,6 +29,7 @@ pub const RESERVED_PROJECT_SEGMENTS: &[&str] = &[
     "skills",
     "symbols",
     "t",
+    "tenets",
     "terminal",
     "threads",
     "wakes",

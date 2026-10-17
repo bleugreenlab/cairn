@@ -1962,6 +1962,7 @@ fn project_parser_literals_are_reserved_thread_names() {
         "settings",
         "skills",
         "symbols",
+        "tenets",
         "threads",
         "workflows",
     ] {
@@ -1970,6 +1971,40 @@ fn project_parser_literals_are_reserved_thread_names() {
             "project parser literal must be reserved for thread names: {literal}"
         );
     }
+}
+
+#[test]
+fn tenet_uris_parse_build_and_keep_a_slug_alias_as_written() {
+    let collection = parse_uri("cairn://p/CAIRN/tenets").unwrap();
+    assert_eq!(
+        collection,
+        CairnResource::ProjectTenets {
+            project: "cairn".into()
+        }
+    );
+    assert_eq!(collection.to_uri(), "cairn://p/cairn/tenets");
+    assert_eq!(collection.kind(), ResourceKind::ProjectTenets);
+    assert_eq!(collection.to_route().as_deref(), Some("/p/cairn/tenets"));
+
+    for key in ["7", "rulings-become-tenets"] {
+        let uri = format!("cairn://p/cairn/tenets/{key}");
+        let entity = parse_uri(&uri).unwrap();
+        assert_eq!(
+            entity,
+            CairnResource::ProjectTenet {
+                project: "cairn".into(),
+                key: key.into(),
+            }
+        );
+        assert_eq!(entity.to_uri(), uri);
+        assert_eq!(entity.kind(), ResourceKind::ProjectTenet);
+        assert_eq!(entity.project_key(), Some("cairn"));
+        assert_eq!(entity.to_route().as_deref(), Some("/p/cairn/tenets"));
+    }
+    assert!(
+        crate::thread_name::validate_thread_name("tenets").is_err(),
+        "a thread named `tenets` would shadow the collection"
+    );
 }
 
 #[test]

@@ -405,9 +405,15 @@ pub(crate) async fn resolve_terminal(
         }
     }
 
-    let closed_sessions = crud::resolve(owning_db, &*orch.services.clock, issue_id, resolution)
-        .await
-        .map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;
+    let closed_sessions = crud::resolve(
+        owning_db,
+        &*orch.services.clock,
+        issue_id,
+        resolution,
+        &orch.anon_device_manager.device_id(),
+    )
+    .await
+    .map_err(|e| ResolutionRefusal::Rejected(e.to_string()))?;
 
     for session_id in &closed_sessions {
         if let Some(run_id) = orch.process_state.find_process_by_session(session_id) {
@@ -433,6 +439,7 @@ pub(crate) async fn resolve_terminal(
     // merge or close, the recipe action — so this is where `issue_resolution`
     // and `pr_state` gates hear about it.
     crate::execution::gates::sweep::notify_gate_evidence_changed();
+    orch.notify_tenet_evidence();
 
     Ok(())
 }

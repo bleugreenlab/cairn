@@ -1,5 +1,32 @@
 //! SQL statement scanning and policy shared by database resources.
 
+/// Where a thread's rulings went. Thread migration 0002 drops
+/// `_cairn_rulings` once its rows are imported as tenets, so SQL that still
+/// names the table is refused with this rather than with a missing-table error
+/// that does not say where the decisions live now.
+pub(crate) const RULINGS_ARE_TENETS: &str =
+    "rulings are project tenets now: propose with an append to cairn:@/tenets";
+
+/// The append that replaces a ruling insert.
+pub(crate) const TENET_APPEND_EXAMPLE: &str = "write({changes:[{target:\"cairn:@/tenets\",mode:\"append\",payload:{question:\"...\",options:[\"recommended\",\"alternative\"]}}]})";
+
+/// Refuse SQL that names the retired `_cairn_rulings` table, in any
+/// identifier form. A string literal that merely mentions it is not refused.
+///
+/// Called by the thread store's write policy, its `cairn:~/db` read, and wake
+/// condition arming.
+pub(crate) fn refuse_retired_rulings(sql: &str) -> Result<(), String> {
+    if sql_identifiers(sql)
+        .iter()
+        .any(|identifier| identifier.eq_ignore_ascii_case("_cairn_rulings"))
+    {
+        return Err(format!(
+            "{RULINGS_ARE_TENETS}, for example `{TENET_APPEND_EXAMPLE}`; read them at cairn:@/tenets"
+        ));
+    }
+    Ok(())
+}
+
 /// Validate the single, read-only statement accepted by SQL read projections.
 pub(crate) fn validate_read_only_sql(sql: &str) -> Result<(), String> {
     let statements = split_statements(sql);
@@ -255,6 +282,21 @@ mod tests {
             ),
             ["DROP", "TABLE", "_cairn_rulings", "SELECT"]
         );
+    }
+
+    #[test]
+    fn retired_rulings_are_refused_in_every_identifier_form_but_not_as_data() {
+        for sql in [
+            "SELECT * FROM _cairn_rulings",
+            "SELECT * FROM main.\"_CAIRN_RULINGS\"",
+            "DELETE FROM [_cairn_rulings]",
+        ] {
+            assert!(refuse_retired_rulings(sql)
+                .unwrap_err()
+                .starts_with(RULINGS_ARE_TENETS));
+        }
+        assert!(refuse_retired_rulings("SELECT '_cairn_rulings' -- _cairn_rulings").is_ok());
+        assert!(refuse_retired_rulings("SELECT * FROM _cairn_open_questions").is_ok());
     }
 
     #[test]

@@ -300,6 +300,10 @@ const COPY_ORDER: &[TableCopySpec] = &[
     spec("action_configs", "project_id = ?1"),
     spec("skill_configs", "project_id = ?1"),
     spec("threads", "project_id = ?1"),
+    spec("tenets", "project_id = ?1"),
+    spec("tenet_ruling_imports", "project_id = ?1"),
+    spec("tenet_evidence_events", "project_id = ?1"),
+    spec("tenet_evidence", "project_id = ?1"),
     owned("thread_read_positions", &[owner(OwnerSet::Threads, "thread_id IN {ids}")]),
     owned("wake_schedules", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
     owned("wake_conditions", &[owner(OwnerSet::Threads, "home_kind = 'thread' AND home_id IN {ids}")]),
@@ -1495,6 +1499,14 @@ mod tests {
               VALUES ('thread-delete', 0, 1);
             INSERT INTO thread_branches(id, thread_id, number, stage, git_ref, job_id, created_at, moved_at)
               VALUES ('branch-delete', 'thread-delete', 1, 'accumulating', 'agent/delete', 'job-delete', 1, 1);
+            INSERT INTO tenets(id, project_id, number, proposing_thread_id, question, options_json, status, origin, proposer_principal_json, created_at, updated_at)
+              VALUES ('tenet-delete', 'project-delete', 1, 'thread-delete', 'q', '["a"]', 'proposed', 'standing', '{"kind":"agent","node":"cairn://p/delete/thread-delete","run_id":null}', 1, 1);
+            INSERT INTO tenet_ruling_imports(thread_id, project_id, imported_at)
+              VALUES ('thread-delete', 'project-delete', 1);
+            INSERT INTO tenet_evidence_events(id, project_id, source_uri, source_kind, dedupe_key, owner_device_id, text, created_at)
+              VALUES ('evidence-event-delete', 'project-delete', 'cairn://p/delete/1', 'issue_resolution', 'issue:issue-delete:merged:0', 'device', 'work', 1);
+            INSERT INTO tenet_evidence(id, project_id, tenet_id, event_id, source_uri, sign, confidence, model, owner_device_id, evaluated_at)
+              VALUES ('evidence-delete', 'project-delete', 'tenet-delete', 'evidence-event-delete', 'cairn://p/delete/1', 'supports', 0.9, 'm', 'device', 1);
             INSERT INTO wake_schedules(id, home_kind, home_id, every_ms, anchor_at, reason, created_by)
               VALUES ('schedule-delete', 'thread', 'thread-delete', 1000, 1, 'reason', 'user');
             INSERT INTO wake_conditions(id, home_kind, home_id, sql, reason, created_by)

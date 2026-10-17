@@ -135,15 +135,114 @@ async fn upgrade(orch: &Orchestrator, job: &EraSummaryJob) -> Result<(), String>
         return Err("summary completion returned empty text".into());
     }
     let summary = &summary[..summary.floor_char_boundary(SUMMARY_LIMIT)];
-    let changed = db.execute(
-        "UPDATE thread_eras SET summary = ?1, summary_status = 'generated', summary_model = ?2, summarized_at = ?3
-         WHERE job_id = ?4 AND seq = ?5 AND summary_status = 'fallback'",
-        cairn_db::turso::params![summary, outcome.model, chrono::Utc::now().timestamp_millis(), job.job_id.clone(), job.seq],
-    ).await.map_err(|error| error.to_string())?;
-    if changed > 1 {
-        return Err("era upgrade changed more than one row".into());
+    let project_db = match project_key_for_job(&db, &job.job_id).await {
+        Some(key) => orch.db.for_project(&key).await,
+        None => db.clone(),
+    };
+    let upgraded = record_generated_summary(
+        &db,
+        &project_db,
+        job,
+        summary,
+        &outcome.model,
+        &orch.anon_device_manager.device_id(),
+        orch.services.clock.now(),
+    )
+    .await?;
+    if upgraded {
+        orch.notify_tenet_evidence();
     }
     Ok(())
+}
+
+/// Upgrade a fallback era to its generated summary, and snapshot the summary
+/// as a tenet evidence event owned by `device`. Reports whether this call
+/// upgraded the era; a lost compare-and-swap records nothing.
+///
+/// The event belongs in the project's routed database, where the tenets it is
+/// judged against live. `thread_eras` is private, so an era only ever persists
+/// where its thread's project routes to the private database and the two
+/// handles are the same; the event then commits with the upgrade. Should they
+/// ever differ, the event follows the upgrade's commit instead.
+pub(crate) async fn record_generated_summary(
+    db: &Arc<crate::storage::LocalDb>,
+    project_db: &Arc<crate::storage::LocalDb>,
+    job: &EraSummaryJob,
+    summary: &str,
+    model: &str,
+    device: &str,
+    now: i64,
+) -> Result<bool, String> {
+    let same_db = Arc::ptr_eq(project_db, db);
+    let summary = summary.to_string();
+    let device = device.to_string();
+    let job_id = job.job_id.clone();
+    let seq = job.seq;
+    let model = model.to_string();
+    let (changed, deferred) = db
+        .write(move |conn| {
+            let job_id = job_id.clone();
+            let summary = summary.clone();
+            let model = model.clone();
+            let device = device.clone();
+            Box::pin(async move {
+                let changed = conn.execute(
+                    "UPDATE thread_eras SET summary = ?1, summary_status = 'generated', summary_model = ?2, summarized_at = ?3
+                     WHERE job_id = ?4 AND seq = ?5 AND summary_status = 'fallback'",
+                    cairn_db::turso::params![summary.as_str(), model.as_str(), chrono::Utc::now().timestamp_millis(), job_id.as_str(), seq],
+                ).await?;
+                if changed > 1 {
+                    return Err(crate::storage::DbError::internal(
+                        "era upgrade changed more than one row".to_string(),
+                    ));
+                }
+                if changed == 0 {
+                    return Ok((0, None));
+                }
+                let event = crate::tenets::evidence::events::era_event_conn(
+                    conn, &job_id, seq, &summary, &device, now,
+                )
+                .await?;
+                match event {
+                    Some(event) if same_db => {
+                        crate::tenets::evidence::events::insert_event_conn(conn, &event).await?;
+                        Ok((changed, None))
+                    }
+                    event => Ok((changed, event)),
+                }
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(event) = deferred {
+        let inserted = project_db
+            .write(move |conn| {
+                let event = event.clone();
+                Box::pin(async move {
+                    crate::tenets::evidence::events::insert_event_conn(conn, &event).await
+                })
+            })
+            .await;
+        if let Err(error) = inserted {
+            log::warn!(
+                "tenet evidence event for era {}#{} was not recorded: {error}",
+                job.job_id,
+                job.seq
+            );
+        }
+    }
+    Ok(changed == 1)
+}
+
+async fn project_key_for_job(db: &crate::storage::LocalDb, job_id: &str) -> Option<String> {
+    db.query_opt(
+        "SELECT p.key FROM jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?1",
+        (job_id.to_string(),),
+        |row| crate::storage::RowExt::text(row, 0),
+    )
+    .await
+    .ok()
+    .flatten()
 }
 
 fn definition() -> ResponseDefinition {

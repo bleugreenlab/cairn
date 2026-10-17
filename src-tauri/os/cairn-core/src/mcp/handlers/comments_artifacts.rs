@@ -62,7 +62,11 @@ fn reject_retired_arc_collection_keys(payload: &serde_json::Value) -> Result<(),
         .iter()
         .any(|key| keys.contains_key(*key))
     {
-        return Err("Arc ruling artifact operations have retired. Write rulings through `cairn:~/db`, for example: `write({changes:[{target:\"cairn:~/db\",mode:\"patch\",payload:{sql:\"INSERT INTO _cairn_rulings(slug,text,status,rationale,provenance) VALUES(?,?,?,?,?)\",params:[\"short-handle\",\"...\",\"accepted\",\"...\",\"[\\\"cairn://p/PROJECT/NUMBER\\\"]\"]}}]})`".to_string());
+        return Err(format!(
+            "Arc ruling artifact operations have retired: {}, for example `{}`",
+            crate::resources::sql_policy::RULINGS_ARE_TENETS,
+            crate::resources::sql_policy::TENET_APPEND_EXAMPLE
+        ));
     }
     // Open questions left the artifact in the same move as rulings. The schema
     // refuses them either way as an undeclared field, which reports that the arc
@@ -1666,15 +1670,19 @@ mod tests {
     }
 
     #[test]
-    fn retired_arc_ruling_operations_name_the_sql_replacement() {
+    fn retired_arc_ruling_operations_point_at_tenets() {
         for payload in [
             json!({"ruling": {}}),
             json!({"ruling_slug": "old"}),
             json!({"rulings": []}),
         ] {
             let error = reject_retired_arc_collection_keys(&payload).unwrap_err();
-            assert!(error.contains("cairn:~/db"), "{error}");
-            assert!(error.contains("INSERT INTO _cairn_rulings"), "{error}");
+            assert!(
+                error.contains(crate::resources::sql_policy::RULINGS_ARE_TENETS),
+                "{error}"
+            );
+            assert!(error.contains("target:\"cairn:@/tenets\""), "{error}");
+            assert!(!error.contains("_cairn_rulings"), "{error}");
         }
         assert!(reject_retired_arc_collection_keys(&json!({"working": "now"})).is_ok());
     }

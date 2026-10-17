@@ -4094,8 +4094,14 @@ impl Fleet {
                 detail,
                 disk,
             } => {
+                // The id alone is not what an operator searches for: the
+                // colocated machine's id is `colocated`, while every surface
+                // calls it `local`. Both are named so either finds the line.
+                let executor = self
+                    .executor_public_name(executor_id)
+                    .unwrap_or_else(|| executor_id.to_string());
                 let line = format!(
-                    "executor_id={executor_id} declined entry {entry_id} ({reason:?}): {}{}",
+                    "executor_id={executor_id} executor={executor} declined entry {entry_id} ({reason:?}): {}{}",
                     detail.as_deref().unwrap_or("no detail"),
                     disk.as_ref()
                         .map(|disk| format!("; {}", queue::disk_decline_summary(disk)))
@@ -6205,8 +6211,10 @@ impl Fleet {
                     });
                 }
             }
+            // An acquisition is what provisions the environment, so it never
+            // names one to run inside.
             match self
-                .offer_once(&entry_id, &attempt_request, &selected, &mut decision)
+                .offer_once(&entry_id, &attempt_request, None, &selected, &mut decision)
                 .await
             {
                 OfferAnswer::Requeued => continue,
@@ -8886,7 +8894,15 @@ impl Fleet {
                     guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
                     return self.stopped_outcome(stopped_at, &key, None).into();
                 }
-                answer = self.offer_once(&entry_id, &attempt_request, &selected, &mut decision) => answer,
+                answer = self.offer_once(
+                    &entry_id,
+                    &attempt_request,
+                    attempt_batch
+                        .as_ref()
+                        .and_then(|batch| batch.execution_residency.as_ref()),
+                    &selected,
+                    &mut decision,
+                ) => answer,
             };
             match answer {
                 OfferAnswer::Claimed => {
@@ -9301,6 +9317,7 @@ impl Fleet {
         &self,
         entry_id: &str,
         attempt_request: &CellRequest,
+        execution_residency: Option<&ResidencyFence>,
         selected: &SelectedExecutor,
         decision: &mut PlacementDecision,
     ) -> OfferAnswer {
@@ -9331,6 +9348,7 @@ impl Fleet {
                     .learned_estimate
                     .as_ref()
                     .and_then(|estimate| estimate.upper_duration_ms),
+                execution_residency,
             )
         });
         let reached = summary.is_some_and(|summary| {

@@ -180,6 +180,10 @@ name = "backfill_resource_embeddings"
 required-features = ["internal-api"]
 
 [[example]]
+name = "tenet_evidence_dry_run"
+required-features = ["internal-api"]
+
+[[example]]
 name = "concurrent_db_probe"
 required-features = ["internal-api"]
 

@@ -2589,6 +2589,8 @@ fn sample_resource(kind: cairn_common::contract::ResourceKind, mode: ChangeMode)
         K::ProjectIssues => "cairn://p/cairn/issues",
         K::Posts => "cairn://posts",
         K::Post => "cairn://posts/1",
+        K::ProjectTenets => "cairn://p/cairn/tenets",
+        K::ProjectTenet => "cairn://p/cairn/tenets/1",
         K::ChannelsConversations => "cairn://channels/conversations",
         K::ProjectThreads => "cairn://p/cairn/threads",
         K::Thread => "cairn://p/cairn/design-review",
@@ -3498,4 +3500,182 @@ async fn project_id_for_key(orch: &Orchestrator, key: &str) -> String {
     crate::mcp::handlers::run_context::project_id_by_key(&orch.db.local, key)
         .await
         .unwrap()
+}
+
+fn tenet_item(target: &str, mode: ChangeMode, payload: serde_json::Value) -> ChangeItem {
+    ChangeItem {
+        target: target.to_string(),
+        mode,
+        payload: Some(payload),
+    }
+}
+
+/// The whole agent-facing tenet surface: a thread proposes and withdraws,
+/// nothing on this surface answers, a tenet's content cannot be edited, and
+/// the policy columns are out of an agent's reach.
+#[tokio::test]
+async fn a_thread_proposes_and_withdraws_tenets_but_never_answers_or_edits_them() {
+    let orch = seeded_orch().await;
+    let (issue_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &issue_id).await;
+    let (_, _, run) = seed_thread_session_run(&orch, &project_id, "design").await;
+
+    let propose = tenet_item(
+        "cairn://p/cairn/tenets",
+        ChangeMode::Append,
+        serde_json::json!({"question": "How do we ship X?", "options": ["via Y", "via Z"]}),
+    );
+    let proposed = apply_as_run(&orch, &propose, &run).await.unwrap();
+    assert!(proposed.contains("cairn://p/cairn/tenets/1"), "{proposed}");
+    let tenet = crate::tenets::get(&orch.db.local, &project_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tenet.row.origin, crate::tenets::TenetOrigin::Standing);
+    assert_eq!(
+        tenet.row.proposer,
+        cairn_common::identity::PrincipalRef::Agent {
+            node: "cairn://p/cairn/design".into(),
+            run_id: Some(run.clone()),
+        }
+    );
+
+    // No caller of this surface answers: not the thread, and not a request
+    // carrying no run identity, which an agent shell can forge.
+    let verdict = tenet_item(
+        "cairn://p/cairn/tenets/1",
+        ChangeMode::Patch,
+        serde_json::json!({"verdict": 1}),
+    );
+    for refusal in [
+        apply_as_run(&orch, &verdict, &run).await.unwrap_err(),
+        apply(&orch, &verdict).await.unwrap_err(),
+    ] {
+        assert!(
+            refusal.error.contains(crate::tenets::AGENT_VERDICT_REFUSAL),
+            "{}",
+            refusal.error
+        );
+    }
+
+    for edit in [
+        tenet_item(
+            "cairn://p/cairn/tenets/1",
+            ChangeMode::Patch,
+            serde_json::json!({"question": "Something else?"}),
+        ),
+        tenet_item(
+            "cairn://p/cairn/tenets/1",
+            ChangeMode::Replace,
+            serde_json::json!({"options": ["a"]}),
+        ),
+    ] {
+        let refusal = apply_as_run(&orch, &edit, &run).await.unwrap_err();
+        assert_eq!(refusal.error, crate::tenets::IMMUTABLE_REFUSAL);
+    }
+
+    let both = tenet_item(
+        "cairn://p/cairn/tenets/1",
+        ChangeMode::Patch,
+        serde_json::json!({"withdraw": true, "verdict": 1}),
+    );
+    assert!(apply_as_run(&orch, &both, &run).await.is_err());
+
+    let withdraw = tenet_item(
+        "cairn://p/cairn/tenets/1",
+        ChangeMode::Patch,
+        serde_json::json!({"withdraw": true}),
+    );
+    let withdrawn = apply_as_run(&orch, &withdraw, &run).await.unwrap();
+    assert!(
+        withdrawn.contains("Withdrew tenet cairn://p/cairn/tenets/1"),
+        "{withdrawn}"
+    );
+
+    let read = crate::resources::tenets::read_entity(&orch.db.local, "cairn", "1", &[]).await;
+    assert!(read.contains("# Tenet #1 · withdrawn"), "{read}");
+    assert!(
+        read.contains("Proposed by thread: [cairn/design]"),
+        "{read}"
+    );
+    let inbox = crate::resources::tenets::read_collection(
+        &orch.db.local,
+        "cairn",
+        &[cairn_common::query::QueryParam {
+            key: "status".into(),
+            value: "pending".into(),
+        }],
+    )
+    .await;
+    assert!(inbox.contains("0 tenets awaiting a verdict"), "{inbox}");
+
+    for (target, mode) in [
+        ("cairn://p/cairn", ChangeMode::Patch),
+        ("cairn://p/cairn/settings", ChangeMode::Patch),
+    ] {
+        for payload in [
+            serde_json::json!({"tenetRelease": "answered"}),
+            serde_json::json!({"tenet_gated_recipes": []}),
+        ] {
+            let refusal = apply(&orch, &tenet_item(target, mode, payload))
+                .await
+                .unwrap_err();
+            assert_eq!(refusal.error, crate::tenets::OPERATOR_ONLY_POLICY_REFUSAL);
+        }
+    }
+}
+
+/// After a verdict, the edit refusal names the successor path instead.
+#[tokio::test]
+async fn editing_an_answered_tenet_points_at_a_successor() {
+    let orch = seeded_orch().await;
+    let (issue_id, _) = seed_issue(&orch).await;
+    let project_id = project_id_of(&orch, &issue_id).await;
+    let (_, _, run) = seed_thread_session_run(&orch, &project_id, "design").await;
+    apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets",
+            ChangeMode::Append,
+            serde_json::json!({"question": "Q?", "options": ["a"]}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap();
+    crate::tenets::answer(
+        &orch.db.local,
+        orch.services.emitter.as_ref(),
+        5,
+        &project_id,
+        1,
+        crate::tenets::Answer {
+            verdict: crate::tenets::Verdict::YourCall,
+            comment: None,
+            principal: cairn_common::identity::PrincipalRef::Machine {
+                device_id: "dev".into(),
+            },
+        },
+    )
+    .await
+    .unwrap();
+    let refusal = apply_as_run(
+        &orch,
+        &tenet_item(
+            "cairn://p/cairn/tenets/1",
+            ChangeMode::Patch,
+            serde_json::json!({"options": ["b"]}),
+        ),
+        &run,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refusal.error, crate::tenets::successor_refusal(1));
+    let read = crate::resources::tenets::read_entity(&orch.db.local, "cairn", "1", &[]).await;
+    assert!(
+        read.contains(
+            "Approved: your call (the thread's recommendation, option 1) — anonymous device dev,"
+        ),
+        "the answerer sits beside the verdict: {read}"
+    );
 }

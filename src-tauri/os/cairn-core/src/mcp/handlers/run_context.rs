@@ -130,12 +130,26 @@ pub(crate) async fn authenticated_agent(
     dbs: &crate::db::DbState,
     request: &CallbackRequest,
 ) -> Result<AuthenticatedAgent, String> {
-    let (run, _) = lookup_run_routed(dbs, request).await?;
-    let live_run_id = required_run_id(request)?;
+    authenticated_agent_for_run(dbs, required_run_id(request)?).await
+}
+
+/// [`authenticated_agent`] for a run id a caller already took from its
+/// authenticated request, for a door that carries only the id onward.
+pub(crate) async fn authenticated_agent_for_run(
+    dbs: &crate::db::DbState,
+    live_run_id: &str,
+) -> Result<AuthenticatedAgent, String> {
+    if live_run_id.is_empty() {
+        return Err("Authenticated agent request is missing its run ID".to_string());
+    }
+    let db = crate::execution::routing::routing_db_for_id(dbs, live_run_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let run = lookup_run_by_id(&db, live_run_id).await?;
     if run.run_id != live_run_id {
         return Err("Authenticated agent run does not match the resolved live run".to_string());
     }
-    let home = lookup_home_uri_routed(dbs, request).await?;
+    let home = lookup_home_uri_by_run_id(&db, live_run_id).await?;
     cairn_common::identity::PrincipalRef::Agent {
         node: home.clone(),
         run_id: Some(live_run_id.to_string()),

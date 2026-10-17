@@ -701,28 +701,22 @@ pub(super) fn artifact_affordance_spec_with_schema(
         guidance: None,
     }];
 
-    // Arc collections live in the thread database. Keep their ordinary SQL path
-    // beside the prose artifact action so callers do not infer JSON collection writes.
+    // Decisions are project tenets and open questions live in the thread
+    // database. Keep both paths beside the prose artifact action so callers do
+    // not infer JSON collection writes.
     if addressed_name == Some(crate::threads::ARC_ARTIFACT_NAME) {
         actions.push(ActionSpec {
-            label: "append one ruling in the thread database".to_string(),
-            mode: ChangeMode::Patch.as_str().to_string(),
-            uri_template: "cairn:~/db".to_string(),
+            label: "propose a tenet".to_string(),
+            mode: ChangeMode::Append.as_str().to_string(),
+            uri_template: "cairn:@/tenets".to_string(),
             uri: None,
-            required: vec![schema_key("sql"), schema_key("params")],
-            optional: Vec::new(),
-            example: "write({changes:[{target:\"cairn:~/db\",mode:\"patch\",payload:{sql:\"INSERT INTO _cairn_rulings(slug,text,status,rationale,provenance) VALUES(?,?,?,?,?)\",params:[\"short-handle\",\"...\",\"accepted\",\"...\",\"[\\\"cairn://p/PROJECT/NUMBER\\\"]\"]}}]})".to_string(),
-            guidance: Some("; choose the shortest defensible author-supplied slug".to_string()),
-        });
-        actions.push(ActionSpec {
-            label: "supersede one ruling in the thread database".to_string(),
-            mode: ChangeMode::Patch.as_str().to_string(),
-            uri_template: "cairn:~/db".to_string(),
-            uri: None,
-            required: vec![schema_key("sql"), schema_key("params")],
-            optional: Vec::new(),
-            example: "write({changes:[{target:\"cairn:~/db\",mode:\"patch\",payload:{sql:\"UPDATE _cairn_rulings SET status='superseded', rationale=?, updated_at=unixepoch() WHERE slug=?\",params:[\"...\",\"short-handle\"]}}]})".to_string(),
-            guidance: None,
+            required: vec![schema_key("question"), schema_key("options")],
+            optional: vec![schema_key("supersedes")],
+            example: crate::resources::sql_policy::TENET_APPEND_EXAMPLE.to_string(),
+            guidance: Some(
+                "; a decision is a tenet the operator answers; option 1 is your recommendation"
+                    .to_string(),
+            ),
         });
         actions.push(ActionSpec {
             label: "append one open question in the thread database".to_string(),
@@ -735,14 +729,15 @@ pub(super) fn artifact_affordance_spec_with_schema(
             guidance: None,
         });
         actions.push(ActionSpec {
-            label: "read arc collections from the thread database".to_string(),
+            label: "read open questions from the thread database".to_string(),
             mode: "read".to_string(),
             uri_template: "cairn:~/db".to_string(),
             uri: None,
             required: Vec::new(),
             optional: Vec::new(),
-            example: "read({paths:[\"cairn:~/db?sql=SELECT * FROM _cairn_rulings ORDER BY id\"]})"
-                .to_string(),
+            example:
+                "read({paths:[\"cairn:~/db?sql=SELECT * FROM _cairn_open_questions ORDER BY id\"]})"
+                    .to_string(),
             guidance: Some("; the arc's format=json projection contains prose only".to_string()),
         });
     }
@@ -1597,19 +1592,17 @@ mod tests {
         let block =
             artifact_affordance_with_schema(ResourceKind::NodeArtifact, Some("arc"), &schema)
                 .unwrap();
-        let append = block
-            .find("[append one ruling in the thread database]")
-            .unwrap();
-        let edit = block
-            .find("[supersede one ruling in the thread database]")
+        let propose = block.find("[propose a tenet]").unwrap();
+        let question = block
+            .find("[append one open question in the thread database]")
             .unwrap();
         let generic = block
             .find("[edit, confirm, or act on a PR artifact]")
             .unwrap();
-        assert!(append < edit && edit < generic, "{block}");
-        assert!(block.contains("INSERT INTO _cairn_rulings"));
-        assert!(block.contains("UPDATE _cairn_rulings"));
-        assert!(block.contains("SELECT * FROM _cairn_rulings ORDER BY id"));
+        assert!(propose < question && question < generic, "{block}");
+        assert!(block.contains("cairn:@/tenets"));
+        assert!(block.contains("SELECT * FROM _cairn_open_questions ORDER BY id"));
+        assert!(!block.contains("_cairn_rulings"), "{block}");
         assert!(block.contains("format=json projection contains prose only"));
     }
 

@@ -26,6 +26,7 @@ mod responses;
 mod routes;
 mod specs;
 mod tasks;
+mod tenets;
 mod types;
 mod workspace;
 
@@ -84,6 +85,8 @@ pub const RESOURCE_CONTRACTS: &[ResourceContract] = &[
     posts::POST_CONTRACT,
     posts::POST_COMMENT_CONTRACT,
     posts::PROJECT_POSTS_CONTRACT,
+    tenets::PROJECT_TENETS_CONTRACT,
+    tenets::PROJECT_TENET_CONTRACT,
     posts::HOME_FEED_CONTRACT,
     projects::PROJECT_CODEMAP_CONTRACT,
     projects::PROJECT_MAP_CONTRACT,

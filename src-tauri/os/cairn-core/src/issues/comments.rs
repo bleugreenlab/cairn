@@ -136,20 +136,7 @@ pub async fn create(
         let source = source.clone();
         let source_text = source_text.clone();
         Box::pin(async move {
-            let seq = next_issue_comment_seq(conn, &issue_id).await?;
-            conn.execute(
-                "INSERT INTO comments (id, issue_id, content, source, created_at, seq)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    id.as_str(),
-                    issue_id.as_str(),
-                    content.as_str(),
-                    source_text.as_str(),
-                    created_at,
-                    seq
-                ],
-            )
-            .await?;
+            let seq = insert_conn(conn, &id, &issue_id, &content, &source_text, created_at).await?;
 
             Ok(Comment {
                 id,
@@ -163,6 +150,27 @@ pub async fn create(
     })
     .await
     .map_err(CairnError::from)
+}
+
+/// Insert comment `id` on `issue_id` under the issue's next seq, inside the
+/// caller's write transaction, returning that seq. The caller announces the
+/// insert after its transaction commits.
+pub(crate) async fn insert_conn(
+    conn: &cairn_db::turso::Connection,
+    id: &str,
+    issue_id: &str,
+    content: &str,
+    source: &str,
+    created_at: i64,
+) -> DbResult<i64> {
+    let seq = next_issue_comment_seq(conn, issue_id).await?;
+    conn.execute(
+        "INSERT INTO comments (id, issue_id, content, source, created_at, seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id, issue_id, content, source, created_at, seq],
+    )
+    .await?;
+    Ok(seq)
 }
 
 pub async fn update(db: &LocalDb, id: &str, content: &str) -> Result<Comment, CairnError> {

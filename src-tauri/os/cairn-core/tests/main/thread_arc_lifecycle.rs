@@ -12,15 +12,17 @@
 //!   write, which is why migrated threads never saw it);
 //! - the arc is a living document: writing it auto-confirms and never arms the
 //!   turn-ending handoff a terminal artifact arms;
-//! - the artifact is PROSE ONLY. Rulings and open questions are rows in the
-//!   thread's own database, so every surface that touches them here goes
-//!   through `_cairn_rulings` / `_cairn_open_questions` rather than through an
-//!   artifact field, and a write that still carries the retired keys is refused
-//!   with the SQL that replaces it;
-//! - the Markdown read projects those rows back beside the prose, byte-exact,
-//!   while `format=json` returns the stored artifact data and is therefore
-//!   prose only — and says so, rather than reading as though the decisions were
-//!   lost;
+//! - the artifact is PROSE ONLY. A thread's decisions are project tenets and
+//!   its open questions are rows in `_cairn_open_questions`, so a write that
+//!   still carries a retired key is refused with where its content went: the
+//!   tenets message for rulings, the SQL that replaced it for open questions;
+//! - SQL naming the retired `_cairn_rulings` table is refused with the tenets
+//!   message on both the thread database's write and read surfaces;
+//! - the Markdown read renders the thread's tenets (awaiting verdict, in full,
+//!   in the index, with a pointer to the rest) beside the prose, while
+//!   `format=json` returns the stored artifact data and is therefore prose only;
+//! - a migrated ruling's rationale renders byte-exact on its tenet's entity
+//!   read, addressed by its old slug;
 //! - the schema is enforced, not merely resolvable — including on the session
 //!   jobs live threads actually run on, which carry an execution (and often a
 //!   recipe node) the thread acquired by taking turns and delegating.
@@ -28,9 +30,26 @@
 use crate::common;
 use crate::common::orchestrator;
 
+use cairn_common::identity::PrincipalRef;
+use cairn_core::internal::services::EventEmitter;
 use cairn_core::internal::storage::{DbError, LocalDb, RowExt};
+use cairn_core::tenets::{AnswerSource, NewTenet, Proposal, Proposer, TenetOrigin, TenetStatus};
 use serde_json::{json, Value};
 use std::sync::Arc;
+
+const RULINGS_ARE_TENETS: &str = "rulings are project tenets now";
+
+struct NoopEmitter;
+
+impl EventEmitter for NoopEmitter {
+    fn emit(&self, _event: &str, _payload: Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn emit_empty(&self, _event: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 fn arc_uri(thread: &str) -> String {
     format!("cairn://p/thr/{thread}/arc")
@@ -112,38 +131,71 @@ async fn arc_contract(db: &LocalDb, thread_id: &str) -> Option<String> {
     .flatten()
 }
 
-/// Write a ruling the way a thread actually writes one: parameterized SQL into
-/// the thread's own database, never an artifact field.
-async fn insert_ruling(thread_id: &str, slug: &str, text: &str, rationale: &str, provenance: &str) {
-    let store = cairn_core::threads::db_store::open(thread_id)
-        .await
-        .expect("the thread database opens");
-    let (slug, text, rationale, provenance) = (
-        slug.to_string(),
-        text.to_string(),
-        rationale.to_string(),
-        provenance.to_string(),
-    );
-    store
-        .write(move |conn| {
-            let (slug, text, rationale, provenance) = (
-                slug.clone(),
-                text.clone(),
-                rationale.clone(),
-                provenance.clone(),
-            );
-            Box::pin(async move {
-                conn.execute(
-                    "INSERT INTO _cairn_rulings (slug, text, status, rationale, provenance) \
-                     VALUES (?1, ?2, 'accepted', ?3, ?4)",
-                    cairn_db::turso::params![slug, text, rationale, provenance],
-                )
-                .await?;
-                Ok::<_, DbError>(())
-            })
+fn thread_principal(thread_name: &str) -> PrincipalRef {
+    PrincipalRef::Agent {
+        node: format!("cairn://p/thr/{thread_name}"),
+        run_id: None,
+    }
+}
+
+/// Propose a tenet the way a thread does, through the tenets module.
+async fn propose_tenet(db: &LocalDb, thread_id: &str, question: &str, options: &[&str]) {
+    cairn_core::tenets::propose(
+        db,
+        &NoopEmitter,
+        100,
+        &Proposer {
+            project_id: "p-1".into(),
+            thread_id: thread_id.into(),
+            principal: thread_principal("library"),
+        },
+        Proposal {
+            question: question.into(),
+            options: options.iter().map(|option| option.to_string()).collect(),
+            supersedes: None,
+            origin: TenetOrigin::Standing,
+        },
+    )
+    .await
+    .expect("the tenet is proposed");
+}
+
+/// Insert a tenet that already carries a verdict.
+async fn insert_answered(db: &LocalDb, tenet: NewTenet) {
+    db.write(move |conn| {
+        let tenet = tenet.clone();
+        Box::pin(async move {
+            cairn_core::tenets::insert_conn(conn, &tenet).await?;
+            Ok::<_, DbError>(())
         })
-        .await
-        .expect("the ruling is stored");
+    })
+    .await
+    .expect("the tenet is stored");
+}
+
+fn answered(thread_id: &str, status: TenetStatus, options: &[&str]) -> NewTenet {
+    let selected = matches!(status, TenetStatus::Approved | TenetStatus::Superseded);
+    NewTenet {
+        project_id: "p-1".into(),
+        proposing_thread_id: thread_id.into(),
+        slug: None,
+        question: format!("Decide: {}?", options[0]),
+        options: options.iter().map(|option| option.to_string()).collect(),
+        status,
+        verdict: Some(if selected { "option" } else { "none" }),
+        selected_option: selected.then_some(0),
+        comment: None,
+        answered_by: Some(PrincipalRef::Machine {
+            device_id: "d-1".into(),
+        }),
+        answer_source: Some(AnswerSource::Device),
+        answered_at: Some(1_700_000_000),
+        supersedes: None,
+        origin: TenetOrigin::Standing,
+        legacy: None,
+        proposer: thread_principal("library"),
+        now: 100,
+    }
 }
 
 #[tokio::test]
@@ -220,18 +272,22 @@ async fn a_new_thread_creates_and_keeps_its_arc() {
         "the arc advertises its required field: {rendered}"
     );
     assert!(
-        rendered.contains("append one ruling") && rendered.contains("_cairn_rulings"),
-        "the arc advertises where its rulings live: {rendered}"
+        rendered.contains("[propose a tenet]") && rendered.contains("target:\"cairn:@/tenets\""),
+        "the arc advertises where decisions go: {rendered}"
+    );
+    assert!(
+        !rendered.contains("_cairn_rulings"),
+        "the arc never advertises the retired rulings table: {rendered}"
     );
 }
 
-/// Rulings left the artifact in #3747. The keys that used to write them are the
-/// ones an agent reaches for when a single ruling needs amending, so they must
-/// fail loudly and say where the collections went — in BOTH modes. A `create`
-/// carrying them is the hand-retyped wholesale replace, the shape most likely to
-/// drop an unrelated rejection on its way through.
+/// Rulings left the artifact in #3747 and became tenets in cairn/5030. The keys
+/// that used to write them are the ones an agent reaches for when a decision
+/// needs recording, so they must fail loudly and say where decisions went — in
+/// BOTH modes. A `create` carrying them is the hand-retyped wholesale replace,
+/// the shape most likely to drop an unrelated rejection on its way through.
 #[tokio::test]
-async fn retired_ruling_keys_are_refused_with_the_sql_that_replaced_them() {
+async fn retired_collection_keys_are_refused_naming_where_their_content_went() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
     seed(&db, &temp, "t-retired", "library").await;
@@ -249,47 +305,50 @@ async fn retired_ruling_keys_are_refused_with_the_sql_that_replaced_them() {
 
     // Both collections, in both modes. A `create` is the hand-retyped wholesale
     // replace; a `patch` is the incremental shape. Either way the refusal has to
-    // name the table, because "this artifact has no field" tells a caller only
-    // that its write bounced.
-    for (mode, payload, table) in [
+    // say where the content lives now, because "this artifact has no field"
+    // tells a caller only that its write bounced.
+    for (mode, payload, home) in [
         (
             "create",
             json!({"current_intent": "x", "rulings": []}),
-            "_cairn_rulings",
+            [RULINGS_ARE_TENETS, "mode:\\\"append\\\""],
         ),
-        ("patch", json!({"rulings": []}), "_cairn_rulings"),
+        (
+            "patch",
+            json!({"rulings": []}),
+            [RULINGS_ARE_TENETS, "mode:\\\"append\\\""],
+        ),
         (
             "patch",
             json!({"ruling": {"text": "a decision"}}),
-            "_cairn_rulings",
+            [RULINGS_ARE_TENETS, "mode:\\\"append\\\""],
         ),
         (
             "patch",
             json!({"ruling_slug": "a-decision"}),
-            "_cairn_rulings",
+            [RULINGS_ARE_TENETS, "mode:\\\"append\\\""],
         ),
         (
             "create",
             json!({"current_intent": "x", "open_questions": []}),
-            "_cairn_open_questions",
+            ["_cairn_open_questions", "cairn:~/db"],
         ),
         (
             "patch",
             json!({"open_questions": [{"question": "who owns aliases?"}]}),
-            "_cairn_open_questions",
+            ["_cairn_open_questions", "cairn:~/db"],
         ),
         (
             "patch",
             json!({"open_question": {"question": "who owns aliases?"}}),
-            "_cairn_open_questions",
+            ["_cairn_open_questions", "cairn:~/db"],
         ),
     ] {
         let refused =
             common::change_resource(&orch, write_to("library", mode, payload.clone())).await;
         assert!(
-            refused.contains(table) && refused.contains("cairn:~/db"),
-            "a {mode} carrying {payload} must name {table} and the SQL that \
-             replaced it, got: {refused}"
+            home.iter().all(|needle| refused.contains(needle)),
+            "a {mode} carrying {payload} must name {home:?}, got: {refused}"
         );
         assert!(
             !refused.contains("version 2"),
@@ -325,12 +384,28 @@ async fn the_json_projection_is_prose_only_and_still_reparses() {
         ),
     )
     .await;
-    insert_ruling(
+    insert_answered(
+        &db,
+        answered(
+            "t-json",
+            TenetStatus::Approved,
+            &[
+                "packs resolve by name, not by content hash",
+                "packs resolve by hash",
+            ],
+        ),
+    )
+    .await;
+    insert_answered(
+        &db,
+        answered("t-json", TenetStatus::Declined, &["vendor every pack"]),
+    )
+    .await;
+    propose_tenet(
+        &db,
         "t-json",
-        "packs-resolve-by-name",
-        "packs resolve by name, not by content hash",
-        "the catalog addresses them by name everywhere else",
-        "[\"cairn://p/thr/1\"]",
+        "Should packs carry a version?",
+        &["yes, semver", "no"],
     )
     .await;
 
@@ -349,30 +424,126 @@ async fn the_json_projection_is_prose_only_and_still_reparses() {
          projection must not carry them: {parsed}"
     );
 
-    // The Markdown read is the projection that carries them, and the one that
-    // says where they live.
+    assert!(
+        parsed.get("tenets").is_none(),
+        "tenets are never arc fields: {parsed}"
+    );
+
+    // The Markdown read is the projection that renders the thread's tenets, and
+    // the one that says where decisions and open questions live.
     let rendered = common::read_resource(&orch, arc_uri("library")).await;
-    assert!(
-        rendered.contains("packs resolve by name, not by content hash"),
-        "the Markdown read projects the collections beside the prose: {rendered}"
-    );
-    assert!(
-        rendered.contains("_cairn_rulings") && rendered.contains("_cairn_open_questions"),
-        "the Markdown read advertises where both collections live: {rendered}"
-    );
+    for needle in [
+        "### Awaiting verdict",
+        "- **#3** (proposed 1970-01-01) — Should packs carry a version?",
+        "  1. yes, semver (recommended)",
+        "### Tenets",
+        "- **#1** (approved by anonymous device",
+        "2023-11-14) — packs resolve by name, not by content hash",
+        "  rejected: packs resolve by hash",
+        "### Tenet index",
+        "- #2 · declined · Decide: vendor every pack?",
+        "Full text: cairn://p/thr/tenets/<n> · all of this thread's: cairn://p/thr/tenets?thread=library",
+        "cairn:@/tenets",
+        "_cairn_open_questions",
+    ] {
+        assert!(rendered.contains(needle), "missing {needle:?}: {rendered}");
+    }
 }
 
-/// A ruling's rationale is the expensive half — the argument in the terms it was
-/// actually argued — and a real one runs to several paragraphs. Provenance is
-/// the other half, and it is written canonically because the arc outlives the
-/// session that wrote it. Neither may be reflowed or rewritten on the way out.
+/// The retired table is refused by name, with where rulings went, on both
+/// surfaces of the thread database — including the read, because an older
+/// prompt still teaches `SELECT * FROM _cairn_rulings`.
 #[tokio::test]
-async fn a_multi_paragraph_rationale_and_canonical_provenance_render_byte_exact() {
+async fn sql_naming_the_retired_rulings_table_is_refused_on_write_and_read() {
+    let (temp, db) = common::migrated_db().await;
+    let db = Arc::new(db);
+    seed(&db, &temp, "t-sql", "library").await;
+    let orch = orchestrator(&temp, db.clone());
+    // The thread database exists, as it would for any running thread.
+    cairn_core::threads::db_store::open("t-sql").await.unwrap();
+
+    let written = common::change_resource(
+        &orch,
+        json!([{
+            "target": "cairn://p/thr/library/db",
+            "mode": "patch",
+            "payload": {
+                "sql": "INSERT INTO _cairn_rulings(slug,text,status,rationale,provenance) VALUES(?,?,?,?,?)",
+                "params": ["a", "b", "accepted", "c", "[\"cairn://p/thr/1\"]"]
+            }
+        }]),
+    )
+    .await;
+    assert!(written.contains(RULINGS_ARE_TENETS), "got: {written}");
+
+    let read = common::read_resource(
+        &orch,
+        "cairn://p/thr/library/db?sql=SELECT * FROM _cairn_rulings ORDER BY id",
+    )
+    .await;
+    assert!(read.contains(RULINGS_ARE_TENETS), "got: {read}");
+
+    let questions = common::read_resource(
+        &orch,
+        "cairn://p/thr/library/db?sql=SELECT COUNT(*) AS n FROM _cairn_open_questions",
+    )
+    .await;
+    assert!(!questions.contains(RULINGS_ARE_TENETS), "got: {questions}");
+}
+
+/// A migrated ruling's rationale is the expensive half — the argument in the
+/// terms it was actually argued — and a real one runs to several paragraphs. It
+/// must survive the move into a tenet byte-exact, and the ruling's old slug must
+/// still address it.
+#[tokio::test]
+async fn a_migrated_rulings_multi_paragraph_rationale_renders_byte_exact() {
     let (temp, db) = common::migrated_db().await;
     let db = Arc::new(db);
     seed(&db, &temp, "t-fidelity", "library").await;
     let orch = orchestrator(&temp, db.clone());
 
+    let rationale = "The builder followed the prescription and could not make the test fail.\n\
+                     \nCause: the command reports the refusal on stderr and still exits 0, so the \
+                     failure reached the wrapper looking like success.\n\nCOROLLARY: every caller \
+                     that already discards that verdict became a new defect site.";
+    let mut migrated = answered(
+        "t-fidelity",
+        TenetStatus::Approved,
+        &["A retry wrapper is a no-op unless the failure it retries is representable"],
+    );
+    migrated.slug = Some("retry-needs-a-representable-failure".into());
+    migrated.origin = TenetOrigin::MigratedRuling;
+    migrated.answer_source = Some(AnswerSource::Migrated);
+    migrated.answered_by = None;
+    migrated.legacy = Some(json!({
+        "rationale": rationale,
+        "provenance": ["cairn://p/thr/library"],
+        "legacy_key": "t-fidelity:retry-needs-a-representable-failure",
+        "original_slug": "retry-needs-a-representable-failure",
+    }));
+    insert_answered(&db, migrated).await;
+
+    let rendered = common::read_resource(
+        &orch,
+        "cairn://p/thr/tenets/retry-needs-a-representable-failure",
+    )
+    .await;
+    assert!(
+        rendered.contains("# Tenet #1"),
+        "the old slug addresses the migrated tenet: {rendered}"
+    );
+    assert!(
+        rendered.contains(&format!("- rationale: {rationale}\n")),
+        "a multi-paragraph rationale must render byte-exact, blank lines and \
+         all: {rendered}"
+    );
+    assert!(
+        rendered.contains("cairn://p/thr/library"),
+        "provenance renders in the canonical form it was stored in: {rendered}"
+    );
+    assert!(!rendered.contains("legacy_key"), "{rendered}");
+
+    // And the arc shows it in full under the migrated label, slug and all.
     common::change_resource(
         &orch,
         write_to(
@@ -382,33 +553,11 @@ async fn a_multi_paragraph_rationale_and_canonical_provenance_render_byte_exact(
         ),
     )
     .await;
-
-    let rationale = "The builder followed the prescription and could not make the test fail.\n\
-                     \nCause: the command reports the refusal on stderr and still exits 0, so the \
-                     failure reached the wrapper looking like success.\n\nCOROLLARY: every caller \
-                     that already discards that verdict became a new defect site.";
-    insert_ruling(
-        "t-fidelity",
-        "retry-needs-a-representable-failure",
-        "A retry wrapper is a no-op unless the failure it retries is representable",
-        rationale,
-        "[\"cairn://p/thr/library\"]",
-    )
-    .await;
-
-    let rendered = common::read_resource(&orch, arc_uri("library")).await;
+    let arc = common::read_resource(&orch, arc_uri("library")).await;
     assert!(
-        rendered.contains(rationale),
-        "a multi-paragraph rationale must render byte-exact, blank lines and \
-         all: {rendered}"
-    );
-    // Asserted on the provenance line itself rather than on the whole read: the
-    // affordance block quotes `cairn:~/db` in its own examples, which is correct
-    // there and says nothing about how a stored URI was written.
-    assert!(
-        rendered.contains("- provenance: cairn://p/thr/library"),
-        "provenance must render in the canonical form it was stored in, never \
-         rewritten to a session-relative one: {rendered}"
+        arc.contains("(approved by migrated ruling, 2023-11-14)")
+            && arc.contains("slug: `retry-needs-a-representable-failure`"),
+        "{arc}"
     );
 }
 
@@ -711,13 +860,13 @@ async fn a_live_session_job_enforces_and_advertises_the_arc_contract() {
             "{shape:?}: a well-formed preview still previews, got: {previewed_ok}"
         );
 
-        // The retired collection keys keep their SQL-naming refusal ahead of
-        // the generic one.
+        // The retired collection keys keep their specific refusal ahead of the
+        // generic one.
         let retired =
             common::change_resource(&orch, write_to("general", "patch", json!({"rulings": []})))
                 .await;
         assert!(
-            retired.contains("_cairn_rulings") && retired.contains("cairn:~/db"),
+            retired.contains(RULINGS_ARE_TENETS),
             "{shape:?}: got: {retired}"
         );
 
@@ -731,8 +880,8 @@ async fn a_live_session_job_enforces_and_advertises_the_arc_contract() {
         let rendered = common::read_resource(&orch, arc_uri("general")).await;
         assert!(
             rendered.contains("`current_intent(str)`")
-                && rendered.contains("append one ruling")
-                && rendered.contains("_cairn_rulings"),
+                && rendered.contains("[propose a tenet]")
+                && !rendered.contains("_cairn_rulings"),
             "{shape:?}: the read must render the arc-specific affordance, got: {rendered}"
         );
     }
@@ -826,7 +975,7 @@ async fn a_preview_on_a_never_run_thread_validates_without_starting_it() {
         (
             "create",
             json!({"current_intent": "x", "rulings": []}),
-            "_cairn_rulings",
+            RULINGS_ARE_TENETS,
         ),
         (
             "create",

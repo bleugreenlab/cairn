@@ -40,6 +40,7 @@ mod settings;
 pub(crate) mod sql_policy;
 pub(crate) mod sql_schema;
 pub(crate) mod symbols;
+pub(crate) mod tenets;
 pub(crate) mod thread_seed;
 mod threads;
 mod transcript;

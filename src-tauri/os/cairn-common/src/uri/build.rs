@@ -159,6 +159,16 @@ pub fn build_project_posts_uri(project: &str) -> String {
     format!("{}/posts", build_project_uri(project))
 }
 
+/// A project's tenets collection.
+pub fn build_project_tenets_uri(project: &str) -> String {
+    format!("{}/tenets", build_project_uri(project))
+}
+
+/// One tenet, by number (canonical) or migrated slug (alias).
+pub fn build_project_tenet_uri(project: &str, key: &str) -> String {
+    format!("{}/{key}", build_project_tenets_uri(project))
+}
+
 /// One project's code map — the data source the workspace map surface lays out.
 pub fn build_project_codemap_uri(project: &str) -> String {
     format!("{}/codemap", build_project_uri(project))
@@ -968,6 +978,8 @@ impl CairnResource {
                 comment_id,
             } => build_post_comment_uri(*post_id, *comment_id),
             Self::ProjectPosts { project } => build_project_posts_uri(project),
+            Self::ProjectTenets { project } => build_project_tenets_uri(project),
+            Self::ProjectTenet { project, key } => build_project_tenet_uri(project, key),
             Self::ProjectCodemap { project } => build_project_codemap_uri(project),
             Self::ProjectMap { project } => build_project_map_uri(project),
             Self::ProjectHome { project } => build_project_home_uri(project),

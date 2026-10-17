@@ -387,6 +387,7 @@ async fn spawn_triage_for_scope_inner(
             // The triage issue was just created here; it has no prior attempt.
             crate::execution::recipe::LaunchIntent::NewAttempt,
             Vec::new(),
+            crate::tenets::filing::TenetFiling::unattributed(),
         )
         .await
         {

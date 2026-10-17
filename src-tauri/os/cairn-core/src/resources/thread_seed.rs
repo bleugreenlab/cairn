@@ -27,7 +27,11 @@
 use cairn_db::turso::params;
 use cairn_tokenize::{count, Family};
 
+use std::collections::HashSet;
+
 use crate::storage::{LocalDb, RowExt};
+use crate::tenets::{TenetOrigin, TenetStatus, TenetView};
+use crate::threads::arc_store::ArcProjection;
 use crate::threads::compaction::{self, ChildMark, EntrySource, TocEntry};
 
 use super::common::{connect_for_read, job_status_icon};
@@ -93,7 +97,7 @@ fn seed_cut(text: &str, budget: usize) -> usize {
 /// The artifact a thread authors its arc into.
 const ARC_ARTIFACT_NAME: &str = "arc";
 
-const ARC_MISSING_NOTICE: &str = "_No arc has been authored for this thread yet. Write one to `cairn:~/arc` — decisions, the paths you rejected and why, and the questions still open, each with the URI it came from. It is the only part of this context that cannot be regenerated from the transcript, so nothing else in this seed substitutes for it._";
+const ARC_MISSING_NOTICE: &str = "_No arc has been authored for this thread yet. Write one to `cairn:~/arc` — your current intent and the work in motion, each with the URI it came from. Decisions are tenets, proposed at `cairn:@/tenets`; open questions go in `cairn:~/db`. The arc is the only part of this context that cannot be regenerated from the transcript, so nothing else in this seed substitutes for it._";
 
 const NO_HISTORY_NOTICE: &str =
     "_Nothing has been compacted yet; the whole session so far is below._";
@@ -242,7 +246,7 @@ pub(crate) async fn compose_thread_seed_with_policy(
         status: &coordinates.status,
     };
 
-    let arc = render_arc(db, job_id).await;
+    let arc = render_arc(db, job_id, now).await;
     let branches_census = render_branches(&branches, now);
     let census = render_children(&children, now);
     let store = thread_store_census(&conn, job_id, now).await;
@@ -1025,10 +1029,10 @@ fn cut_newest_turn(
     }
 }
 
-async fn render_arc(db: &LocalDb, job_id: &str) -> String {
+async fn render_arc(db: &LocalDb, job_id: &str, now: i64) -> String {
     match crate::artifacts::queries::get_named(db, job_id, ARC_ARTIFACT_NAME).await {
         Ok(Some(artifact)) => {
-            match crate::threads::arc_store::render(db, job_id, &artifact.data).await {
+            match crate::threads::arc_store::render(db, job_id, &artifact.data, now).await {
                 Ok(rendered) => rendered,
                 Err(error) => {
                     log::warn!("thread arc projection failed for job {job_id}: {error}");
@@ -1046,10 +1050,12 @@ async fn render_arc(db: &LocalDb, job_id: &str) -> String {
     }
 }
 
-/// Render the authored arc as stable Markdown, copying every authored string
-/// exactly. Anything this does not recognize is passed through rather than
-/// dropped: the compactor is not allowed to decide that authored intent was
-/// unimportant.
+/// Render the authored prose of an arc as stable Markdown, copying every
+/// authored string exactly. Anything this does not recognize is passed through
+/// rather than dropped: the compactor is not allowed to decide that authored
+/// intent was unimportant. The collections an older arc embedded (`rulings`,
+/// `open_questions`) are not prose and are not rendered here; their homes are
+/// tenets and the thread store.
 pub(crate) fn render_arc_data(data: &serde_json::Value) -> String {
     let mut out = String::new();
 
@@ -1074,78 +1080,449 @@ pub(crate) fn render_arc_data(data: &serde_json::Value) -> String {
         out.push('\n');
     }
 
-    if let Some(rulings) = data.get("rulings").and_then(|value| value.as_array()) {
-        if !rulings.is_empty() {
-            out.push_str("\n### Rulings\n\n");
-            for ruling in rulings {
-                out.push_str(&render_ruling(ruling));
-            }
-        }
-    }
-
-    if let Some(questions) = data
-        .get("open_questions")
-        .and_then(|value| value.as_array())
-    {
-        if !questions.is_empty() {
-            out.push_str("\n### Open questions\n\n");
-            for question in questions {
-                let text = question
-                    .get("question")
-                    .and_then(|value| value.as_str())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| compact_json(question));
-                out.push_str(&format!("- {text}"));
-                if let Some(provenance) = provenance_uris(question) {
-                    out.push_str(&format!(" (provenance: {provenance})"));
-                }
-                out.push('\n');
-            }
-        }
-    }
-
     if out.trim().is_empty() {
         // Not the provenance-first shape. Copy whatever the thread did author.
+        let mut rest = data.clone();
+        crate::threads::arc_store::retain_prose_only(&mut rest);
         return data
             .get("content")
             .or_else(|| data.get("body"))
             .and_then(|value| value.as_str())
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| compact_json(data));
+            .unwrap_or_else(|| match &rest {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::Object(object) if object.is_empty() => String::new(),
+                other => compact_json(other),
+            });
     }
     out
 }
 
-fn render_ruling(ruling: &serde_json::Value) -> String {
-    let text = ruling
-        .get("text")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| compact_json(ruling));
-    let status = ruling
-        .get("status")
-        .and_then(|value| value.as_str())
-        .unwrap_or("accepted");
-    let mut line = format!("- **{status}** — {text}\n");
-    if let Some(slug) = ruling.get("slug").and_then(|value| value.as_str()) {
-        line.push_str(&format!("  - slug: `{slug}`\n"));
+// ── Tenets in the arc ───────────────────────────────────────────────────────
+
+/// What the full-form tenets section may weigh. Tenets past it are still
+/// listed, one line each, in the index.
+pub(crate) const TENET_FULL_BUDGET_TOKENS: usize = 3_000;
+
+/// How long an index line's first sentence may run.
+const TENET_INDEX_SENTENCE_CHARS: usize = 160;
+
+/// The cosine similarity another thread's tenet needs to some piece of this
+/// thread's work to be shown as related.
+const RELATED_MIN_SIMILARITY: f32 = 0.5;
+
+/// What recent evidence adds to a tenet's relevance score.
+const RECENT_EVIDENCE_BOOST: f32 = 0.05;
+
+/// What a selector ranks from.
+pub(crate) struct TenetSelection<'a> {
+    pub thread_id: &'a str,
+    pub thread_name: &'a str,
+    pub project_id: &'a str,
+    pub project_key: &'a str,
+    /// Every tenet this thread proposed, oldest first.
+    pub own: &'a [TenetView],
+    /// The private database holding resource vectors. Composition only reads
+    /// stored vectors; it never reaches the embedding gateway.
+    pub vectors: &'a LocalDb,
+    pub now: i64,
+}
+
+/// One tenet a selector chose to show in full, in the order it should appear.
+#[derive(Debug, Clone)]
+pub(crate) struct RankedTenet {
+    pub tenet: TenetView,
+    /// Proposed by this thread, rather than related from another.
+    pub own: bool,
+}
+
+/// Which tenets an arc shows in full, best first. The composer owns the
+/// budget, the index, and the awaiting-verdict list; a selector only orders.
+#[async_trait::async_trait]
+pub(crate) trait TenetSelector: Send + Sync {
+    async fn rank(&self, db: &LocalDb, input: &TenetSelection<'_>) -> Vec<RankedTenet>;
+}
+
+/// The thread's own approved tenets, most recently answered first.
+pub(crate) struct RecencySelector;
+
+#[async_trait::async_trait]
+impl TenetSelector for RecencySelector {
+    async fn rank(&self, _db: &LocalDb, input: &TenetSelection<'_>) -> Vec<RankedTenet> {
+        recency_rank(input.own)
     }
-    if let Some(rationale) = ruling
-        .get("rationale")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+}
+
+fn recency_rank(own: &[TenetView]) -> Vec<RankedTenet> {
+    let mut approved: Vec<_> = own
+        .iter()
+        .filter(|view| view.row.status == TenetStatus::Approved)
+        .cloned()
+        .collect();
+    approved.sort_by_key(|view| {
+        (
+            std::cmp::Reverse(view.row.answered_at.unwrap_or(0)),
+            std::cmp::Reverse(view.row.number),
+        )
+    });
+    approved
+        .into_iter()
+        .map(|tenet| RankedTenet { tenet, own: true })
+        .collect()
+}
+
+/// Tenets ranked by how near they are to what the thread is working on: its
+/// arc and its open child issues. The thread's own approved tenets come first,
+/// best first, then its own tenets that have no vector yet in recency order;
+/// other threads' approved tenets follow when they are near enough. With no
+/// vector for the arc or any open child, this is [`RecencySelector`].
+pub(crate) struct RelevanceSelector;
+
+#[async_trait::async_trait]
+impl TenetSelector for RelevanceSelector {
+    async fn rank(&self, db: &LocalDb, input: &TenetSelection<'_>) -> Vec<RankedTenet> {
+        match relevance_rank(db, input).await {
+            Ok(Some(ranked)) => ranked,
+            Ok(None) => RecencySelector.rank(db, input).await,
+            Err(error) => {
+                log::warn!("tenet relevance ranking failed; ranking by recency: {error}");
+                RecencySelector.rank(db, input).await
+            }
+        }
+    }
+}
+
+async fn relevance_rank(
+    db: &LocalDb,
+    input: &TenetSelection<'_>,
+) -> Result<Option<Vec<RankedTenet>>, String> {
+    use crate::tenets::evidence::vectors::{project_tenet_vectors, resource_vector};
+
+    let mut work_uris = vec![format!(
+        "{}/arc",
+        cairn_common::uri::build_thread_uri(input.project_key, input.thread_name)
+    )];
+    let open_children = db
+        .query_all(
+            "SELECT number FROM issues
+             WHERE parent_thread_id = ?1 AND status NOT IN ('merged','closed')",
+            params![input.thread_id],
+            |row| row.i64(0),
+        )
+        .await
+        .map_err(|error| format!("failed to read open children: {error}"))?;
+    work_uris.extend(
+        open_children
+            .into_iter()
+            .map(|number| cairn_common::uri::build_issue_uri(input.project_key, number as i32)),
+    );
+    let mut work: Vec<Vec<f32>> = Vec::new();
+    for uri in &work_uris {
+        if let Some(vector) = resource_vector(input.vectors, uri)
+            .await
+            .map_err(|error| format!("failed to read the vector of {uri}: {error}"))?
+        {
+            work.push(vector);
+        }
+    }
+    if work.is_empty() {
+        return Ok(None);
+    }
+
+    let tenet_vectors = project_tenet_vectors(input.vectors, input.project_key)
+        .await
+        .map_err(|error| format!("failed to read tenet vectors: {error}"))?;
+    let similarity = |view: &TenetView| -> Option<f32> {
+        let vector = tenet_vectors.get(&view.uri)?;
+        work.iter()
+            .filter(|other| other.len() == vector.len())
+            .map(|other| crate::embeddings::vector::cosine_similarity(vector, other))
+            .reduce(f32::max)
+    };
+    let recent_since = input.now - crate::tenets::evidence::RECENT_EVIDENCE_SECS;
+    let score = |view: &TenetView, raw: f32| -> f32 {
+        let recent = view
+            .evidence
+            .iter()
+            .any(|evidence| evidence.evaluated_at >= recent_since);
+        raw + if recent { RECENT_EVIDENCE_BOOST } else { 0.0 }
+    };
+    let best_first = |a: &(f32, TenetView), b: &(f32, TenetView)| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.row.number.cmp(&b.1.row.number))
+    };
+
+    let mut scored_own: Vec<(f32, TenetView)> = Vec::new();
+    let mut unscored_own: Vec<TenetView> = Vec::new();
+    for view in input
+        .own
+        .iter()
+        .filter(|view| view.row.status == TenetStatus::Approved)
     {
-        line.push_str(&format!("  - why: {rationale}\n"));
+        match similarity(view) {
+            Some(raw) => scored_own.push((score(view, raw), view.clone())),
+            None => unscored_own.push(view.clone()),
+        }
     }
-    match provenance_uris(ruling) {
-        Some(provenance) => line.push_str(&format!("  - provenance: {provenance}\n")),
-        // A ruling without provenance gets relitigated, so say so where the
-        // reader will see it rather than rendering a confident bare claim.
-        None => line.push_str("  - provenance: none recorded\n"),
+    scored_own.sort_by(best_first);
+
+    let approved = crate::tenets::list(
+        db,
+        input.project_id,
+        &crate::tenets::TenetFilter {
+            statuses: vec![TenetStatus::Approved],
+            ..Default::default()
+        },
+    )
+    .await?;
+    let mut related: Vec<(f32, TenetView)> = approved
+        .into_iter()
+        .filter(|view| view.row.proposing_thread_id != input.thread_id)
+        .filter_map(|view| {
+            let raw = similarity(&view)?;
+            (raw >= RELATED_MIN_SIMILARITY).then(|| (score(&view, raw), view))
+        })
+        .collect();
+    related.sort_by(best_first);
+
+    let mut ranked: Vec<RankedTenet> = scored_own
+        .into_iter()
+        .map(|(_, tenet)| RankedTenet { tenet, own: true })
+        .collect();
+    ranked.extend(recency_rank(&unscored_own));
+    ranked.extend(
+        related
+            .into_iter()
+            .map(|(_, tenet)| RankedTenet { tenet, own: false }),
+    );
+    Ok(Some(ranked))
+}
+
+pub(crate) fn default_tenet_selector() -> &'static dyn TenetSelector {
+    &RelevanceSelector
+}
+
+/// Render an arc: the authored prose, the thread's tenets awaiting a verdict,
+/// its selected tenets in full under [`TENET_FULL_BUDGET_TOKENS`], a one-line
+/// index of the rest, and its open questions.
+///
+/// A withdrawn tenet never renders. A declined or superseded one is never in
+/// the full slice, so it always lands in the index.
+pub(crate) fn render_arc_projection(projection: &ArcProjection, ranked: &[RankedTenet]) -> String {
+    let mut out = render_arc_data(&projection.prose);
+
+    let visible: Vec<&TenetView> = projection
+        .tenets
+        .iter()
+        .filter(|view| view.row.status != TenetStatus::Withdrawn)
+        .collect();
+    let mut awaiting: Vec<&TenetView> = visible
+        .iter()
+        .copied()
+        .filter(|view| view.row.status == TenetStatus::Proposed)
+        .collect();
+    awaiting.sort_by_key(|view| view.row.number);
+    if !awaiting.is_empty() {
+        out.push_str("\n### Awaiting verdict\n\n");
+        for view in awaiting {
+            out.push_str(&render_awaiting_tenet(view));
+        }
     }
+
+    let mut full = String::new();
+    let mut shown: HashSet<i64> = HashSet::new();
+    for ranked in ranked.iter().filter(|ranked| ranked.own) {
+        let view = &ranked.tenet;
+        if view.row.status != TenetStatus::Approved || shown.contains(&view.row.number) {
+            continue;
+        }
+        let candidate = format!("{full}{}", render_full_tenet(view));
+        if seed_tokens(&candidate) <= TENET_FULL_BUDGET_TOKENS {
+            full = candidate;
+            shown.insert(view.row.number);
+        }
+    }
+    // Other threads' tenets take whatever budget the thread's own leave, and
+    // never reach the index, which lists only this thread's tenets.
+    let mut related = String::new();
+    for ranked in ranked.iter().filter(|ranked| !ranked.own) {
+        let view = &ranked.tenet;
+        if view.row.status != TenetStatus::Approved {
+            continue;
+        }
+        let candidate = format!("{related}{}", render_related_tenet(view));
+        if seed_tokens(&format!("{full}{candidate}")) <= TENET_FULL_BUDGET_TOKENS {
+            related = candidate;
+        }
+    }
+    if !full.is_empty() {
+        out.push_str("\n### Tenets\n\n");
+        out.push_str(&full);
+    }
+    if !related.is_empty() {
+        out.push_str("\n### Related tenets from other threads\n\n");
+        out.push_str(&related);
+    }
+
+    if !visible.is_empty() {
+        let mut index: Vec<&TenetView> = visible
+            .iter()
+            .copied()
+            .filter(|view| {
+                view.row.status != TenetStatus::Proposed && !shown.contains(&view.row.number)
+            })
+            .collect();
+        index.sort_by_key(|view| view.row.number);
+        if !index.is_empty() {
+            out.push_str("\n### Tenet index\n\n");
+            for view in index {
+                out.push_str(&render_index_tenet(view));
+            }
+        }
+
+        let tenets = cairn_common::uri::build_project_tenets_uri(&projection.project_key);
+        out.push_str(&format!(
+            "\nFull text: {tenets}/<n> · all of this thread's: {tenets}?thread={}\n",
+            projection.thread_name
+        ));
+    }
+
+    if !projection.open_questions.is_empty() {
+        out.push_str("\n### Open questions\n\n");
+        for question in &projection.open_questions {
+            let text = question
+                .get("question")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| compact_json(question));
+            out.push_str(&format!("- {text}"));
+            if let Some(provenance) = provenance_uris(question) {
+                out.push_str(&format!(" (provenance: {provenance})"));
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A UTC calendar date, as tenets print beside a verdict.
+fn tenet_date(at: i64) -> String {
+    chrono::DateTime::from_timestamp(at, 0)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| at.to_string())
+}
+
+fn render_awaiting_tenet(view: &TenetView) -> String {
+    let mut entry = format!(
+        "- **#{}** (proposed {}) — {}\n",
+        view.row.number,
+        tenet_date(view.row.created_at),
+        view.row.question
+    );
+    for (index, option) in view.row.options.iter().enumerate() {
+        let recommended = if index == 0 { " (recommended)" } else { "" };
+        entry.push_str(&format!("  {}. {option}{recommended}\n", index + 1));
+    }
+    entry
+}
+
+fn render_full_tenet(view: &TenetView) -> String {
+    render_tenet_entry(view, None)
+}
+
+/// Another thread's tenet, named by the thread that proposed it.
+fn render_related_tenet(view: &TenetView) -> String {
+    render_tenet_entry(view, Some(&view.proposing_thread))
+}
+
+fn render_tenet_entry(view: &TenetView, from_thread: Option<&str>) -> String {
+    let row = &view.row;
+    let from = from_thread
+        .map(|thread| format!("{thread}, "))
+        .unwrap_or_default();
+    let mut entry = format!(
+        "- **#{}** ({from}approved by {}, {}) — {}\n",
+        row.number,
+        view.answerer_label.as_deref().unwrap_or("the operator"),
+        tenet_date(row.answered_at.unwrap_or(row.updated_at)),
+        view.text.as_deref().unwrap_or(&row.question)
+    );
+    if !view.rejected.is_empty() {
+        entry.push_str(&format!("  rejected: {}\n", view.rejected.join("; ")));
+    }
+    if let Some(comment) = &row.comment {
+        entry.push_str(&format!("  comment: {comment}\n"));
+    }
+    if let Some(previous) = row.supersedes {
+        entry.push_str(&format!("  supersedes #{previous}\n"));
+    }
+    if row.origin == TenetOrigin::MigratedRuling {
+        if let Some(slug) = &row.slug {
+            entry.push_str(&format!("  slug: `{slug}`\n"));
+        }
+    }
+    // The newest few references; the tenet's own record carries them all.
+    if !view.evidence.is_empty() {
+        let references = view
+            .evidence
+            .iter()
+            .take(3)
+            .map(|evidence| {
+                format!(
+                    "{} {} ({:.2}, {})",
+                    evidence.sign,
+                    evidence.source_uri,
+                    evidence.confidence,
+                    crate::tenets::evidence::utc_date(evidence.evaluated_at, "%m-%d")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        entry.push_str(&format!("  evidence: {references}\n"));
+    }
+    entry
+}
+
+fn render_index_tenet(view: &TenetView) -> String {
+    let row = &view.row;
+    let text = view.text.as_deref().unwrap_or(&row.question);
+    let mut line = format!(
+        "- #{} · {} · {}",
+        row.number,
+        row.status.as_str(),
+        tenet_first_sentence(text, TENET_INDEX_SENTENCE_CHARS)
+    );
+    if let Some(slug) = &row.slug {
+        line.push_str(&format!(" [{slug}]"));
+    }
+    line.push('\n');
     line
+}
+
+/// The first sentence of a tenet, on one line, capped at `max` characters.
+/// Unlike a turn overview a tenet carries no clock stamp to strip, and its
+/// opening sentence is the claim itself, so it gets more room.
+fn tenet_first_sentence(text: &str, max: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let end = collapsed
+        .char_indices()
+        .find(|(index, ch)| {
+            matches!(ch, '.' | '!' | '?')
+                && collapsed[index + ch.len_utf8()..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace)
+        })
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(collapsed.len());
+    let sentence = collapsed[..end].trim();
+    if sentence.chars().count() <= max {
+        return sentence.to_string();
+    }
+    let truncated: String = sentence.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", truncated.trim_end())
 }
 
 fn provenance_uris(value: &serde_json::Value) -> Option<String> {
@@ -1895,13 +2272,216 @@ mod tests {
         );
     }
 
+    fn tenet(number: i64, status: TenetStatus, text: &str) -> TenetView {
+        use crate::tenets::{AnswerSource, TenetRow};
+        let answered = status.has_verdict();
+        let selected = matches!(status, TenetStatus::Approved | TenetStatus::Superseded);
+        let options = vec![text.to_string(), format!("Not {text}")];
+        let row = TenetRow {
+            id: format!("t{number}"),
+            project_id: "p".into(),
+            number,
+            proposing_thread_id: "thread".into(),
+            slug: None,
+            question: format!("Should we {text}?"),
+            options: options.clone(),
+            status,
+            verdict: answered.then(|| if selected { "option" } else { "none" }.to_string()),
+            selected_option: selected.then_some(0),
+            comment: None,
+            answered_by: None,
+            answer_source: answered.then_some(AnswerSource::Device),
+            answered_at: answered.then_some(1_700_000_000 + number),
+            supersedes: None,
+            origin: TenetOrigin::Standing,
+            legacy: None,
+            contradiction_alerted_at: None,
+            proposer: cairn_common::identity::PrincipalRef::Agent {
+                node: "cairn://p/prj/topic".into(),
+                run_id: None,
+            },
+            created_at: 1_699_000_000,
+            updated_at: 1_700_000_000,
+        };
+        TenetView {
+            uri: format!("cairn://p/prj/tenets/{number}"),
+            project_key: "prj".into(),
+            proposing_thread: "prj/topic".into(),
+            proposing_thread_name: Some("topic".into()),
+            text: selected.then(|| text.to_string()),
+            rejected: if answered {
+                options
+                    .iter()
+                    .skip(usize::from(selected))
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            superseded_by: None,
+            answerer_label: answered.then(|| "anonymous device d-1".to_string()),
+            policy_label: "Releases on: answered".into(),
+            gates: Vec::new(),
+            evidence: Vec::new(),
+            thread_your_calls: 0,
+            row,
+        }
+    }
+
+    fn projection(tenets: Vec<TenetView>) -> ArcProjection {
+        ArcProjection {
+            prose: serde_json::json!({"current_intent": "Keep going."}),
+            tenets,
+            open_questions: vec![serde_json::json!({"question": "What next?"})],
+            thread_id: "thread".into(),
+            project_id: "p".into(),
+            project_key: "prj".into(),
+            thread_name: "topic".into(),
+        }
+    }
+
+    fn render_tenets(tenets: Vec<TenetView>) -> String {
+        let ranked = recency_rank(&tenets);
+        render_arc_projection(&projection(tenets), &ranked)
+    }
+
     #[test]
-    fn ruling_slug_survives_into_the_rebuilt_seed() {
-        let rendered = render_arc_data(&serde_json::json!({"rulings": [{
-            "slug": "no-budget-kills", "text": "No budget kills", "status": "accepted",
-            "rationale": "Quality wins", "provenance": ["cairn://p/cairn/3404"]
-        }]}));
-        assert!(rendered.contains("slug: `no-budget-kills`"));
+    fn an_approved_tenet_renders_in_full_with_its_verdict_and_alternatives() {
+        let mut successor = tenet(4, TenetStatus::Approved, "Ship the lease change");
+        successor.row.comment = Some("Do it this week".into());
+        successor.row.supersedes = Some(2);
+        let rendered = render_tenets(vec![successor]);
+        assert!(
+            rendered.contains(
+                "- **#4** (approved by anonymous device d-1, 2023-11-14) — Ship the lease change\n  rejected: Not Ship the lease change\n  comment: Do it this week\n  supersedes #2\n"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_migrated_tenet_keeps_its_slug_and_says_it_was_migrated() {
+        let mut migrated = tenet(1, TenetStatus::Approved, "No budget kills");
+        migrated.row.origin = TenetOrigin::MigratedRuling;
+        migrated.row.slug = Some("no-budget-kills".into());
+        migrated.row.options = vec!["No budget kills".into()];
+        migrated.rejected = Vec::new();
+        migrated.answerer_label = Some("migrated ruling".into());
+        let rendered = render_tenets(vec![migrated]);
+        assert!(
+            rendered.contains("- **#1** (approved by migrated ruling, 2023-11-14) — No budget kills\n  slug: `no-budget-kills`\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("rejected:"), "{rendered}");
+    }
+
+    #[test]
+    fn sections_render_in_order_with_the_pointer_after_the_index() {
+        let rendered = render_tenets(vec![
+            tenet(1, TenetStatus::Approved, "Keep leases"),
+            tenet(2, TenetStatus::Declined, "Drop leases"),
+            tenet(3, TenetStatus::Proposed, "Add a timeout"),
+        ]);
+        let order = [
+            "Keep going.",
+            "### Awaiting verdict",
+            "### Tenets",
+            "### Tenet index",
+            "Full text: cairn://p/prj/tenets/<n> · all of this thread's: cairn://p/prj/tenets?thread=topic",
+            "### Open questions",
+        ]
+        .map(|needle| {
+            rendered
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {rendered}"))
+        });
+        assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{rendered}");
+        assert!(
+            rendered.contains("- **#3** (proposed 2023-11-03) — Should we Add a timeout?\n  1. Add a timeout (recommended)\n  2. Not Add a timeout\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn declined_and_superseded_tenets_always_land_in_the_index_and_withdrawn_never_render() {
+        let rendered = render_tenets(vec![
+            tenet(1, TenetStatus::Superseded, "Old rule"),
+            tenet(2, TenetStatus::Declined, "Rejected idea"),
+            tenet(3, TenetStatus::Withdrawn, "Withdrawn idea"),
+        ]);
+        assert!(!rendered.contains("### Tenets\n"), "{rendered}");
+        assert!(
+            rendered.contains("- #1 · superseded · Old rule\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("- #2 · declined · Should we Rejected idea?\n"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("Withdrawn idea"), "{rendered}");
+    }
+
+    #[test]
+    fn a_thread_without_tenets_renders_no_tenet_sections() {
+        let rendered = render_tenets(vec![tenet(1, TenetStatus::Withdrawn, "Gone")]);
+        for absent in [
+            "### Awaiting verdict",
+            "### Tenets",
+            "### Tenet index",
+            "Full text:",
+        ] {
+            assert!(!rendered.contains(absent), "{rendered}");
+        }
+        assert!(rendered.contains("### Open questions"));
+    }
+
+    #[test]
+    fn the_budget_fills_most_recent_first_and_overflow_moves_to_the_index() {
+        let long = "word ".repeat(400);
+        let tenets: Vec<TenetView> = (1..=12)
+            .map(|number| {
+                tenet(
+                    number,
+                    TenetStatus::Approved,
+                    &format!("Rule {number}. {long}"),
+                )
+            })
+            .collect();
+        let rendered = render_tenets(tenets);
+        let full = &rendered
+            [rendered.find("### Tenets").unwrap()..rendered.find("### Tenet index").unwrap()];
+        assert!(
+            seed_tokens(full) <= TENET_FULL_BUDGET_TOKENS + 10,
+            "{}",
+            seed_tokens(full)
+        );
+        // Most recently answered first, so the newest is in full and the oldest
+        // is an index line.
+        assert!(full.contains("**#12**"));
+        assert!(full.find("**#12**") < full.find("**#11**"));
+        assert!(!full.contains("**#1**"));
+        assert!(
+            rendered.contains("- #1 · approved · Rule 1.\n"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn an_index_line_carries_the_first_sentence_capped_at_160_characters() {
+        assert_eq!(
+            tenet_first_sentence("Keep it.  Then more.", 160),
+            "Keep it."
+        );
+        assert_eq!(
+            tenet_first_sentence("v1.2 ships first. Later", 160),
+            "v1.2 ships first."
+        );
+        let capped = tenet_first_sentence(&"x".repeat(400), 160);
+        assert_eq!(capped.chars().count(), 160);
+        assert!(capped.ends_with('…'));
+        let mut slugged = tenet(7, TenetStatus::Declined, "y");
+        slugged.row.slug = Some("old-handle".into());
+        assert!(render_index_tenet(&slugged).ends_with(" [old-handle]\n"));
     }
 
     #[test]
@@ -1922,6 +2502,20 @@ mod tests {
     /// still open.
     async fn thread_fixture(name: &str) -> LocalDb {
         let db = migrated_test_db(name).await;
+        // Every fixture shares the thread id, and the redirect is process-wide,
+        // so they share one temporary store rather than the real thread-database
+        // path. A per-fixture path would move under a parallel test mid-compose.
+        static STORE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        crate::threads::db_store::use_test_path(
+            "t-thread",
+            STORE
+                .get_or_init(|| tempfile::tempdir().unwrap().keep().join("t-thread.db"))
+                .clone(),
+        );
+        // A thread mints its store at creation; minting it here keeps a
+        // parallel fixture's first open from changing the store census between
+        // two composes of another test.
+        crate::threads::db_store::open("t-thread").await.unwrap();
         db.execute_script(
             "INSERT INTO projects(id, workspace_id, name, key, repo_path, created_at, updated_at)
                VALUES ('p','default','P','prj','/tmp/p',1,1);
@@ -2109,7 +2703,9 @@ mod tests {
         assert!(seed
             .content
             .contains("Getting the fleet onto lease-based residency."));
-        assert!(seed.content.contains("Do not rebuild the fleet view"));
+        // An embedded arc ruling is a tenet once the boot import runs; the seed
+        // never renders it from the arc itself.
+        assert!(!seed.content.contains("Do not rebuild the fleet view"));
         assert!(seed.content.contains("Who owns lease renewal?"));
         assert!(seed.content.contains("OPEN_CHILD_TURN_FOUR"));
         assert!(seed.content.contains("## Turn 14 ·"));
@@ -2812,19 +3408,19 @@ mod tests {
         let properties = schema["properties"]
             .as_object()
             .expect("the arc schema declares properties");
-        for field in ["current_intent", "rulings", "open_questions"] {
+        for field in ["current_intent", "working"] {
             assert!(
                 properties.contains_key(field),
-                "the arc schema dropped field"
+                "the arc schema dropped {field}"
             );
         }
-        let ruling_required = properties["rulings"]["items"]["required"]
-            .as_array()
-            .expect("a ruling declares required fields");
-        for field in ["text", "status", "rationale", "provenance"] {
-            assert!(ruling_required
-                .iter()
-                .any(|value| value.as_str() == Some(field)));
+        // Decisions are tenets and open questions live in the thread store;
+        // neither is an arc field.
+        for field in ["rulings", "open_questions"] {
+            assert!(
+                !properties.contains_key(field),
+                "the arc schema declares {field}"
+            );
         }
     }
 
@@ -2861,14 +3457,262 @@ mod tests {
     }
 
     #[test]
-    fn a_ruling_without_provenance_says_so() {
-        // An unprovenanced ruling gets relitigated; render the absence rather
-        // than a confident bare claim.
+    fn the_prose_fallback_ignores_embedded_collections() {
         let data = serde_json::json!({
             "rulings": [{ "text": "Park the migration", "status": "accepted" }]
         });
-        let rendered = render_arc_data(&data);
-        assert!(rendered.contains("Park the migration"));
-        assert!(rendered.contains("provenance: none recorded"));
+        assert_eq!(render_arc_data(&data), "");
+    }
+
+    // ── Relevance ranking ────────────────────────────────────────────────────────
+
+    const RANK_NOW: i64 = 1_800_000_000;
+
+    /// A project `prj` whose thread `topic` (the `projection()` thread) has a
+    /// sibling thread `other`.
+    async fn relevance_db(name: &str) -> LocalDb {
+        let db = migrated_test_db(name).await;
+        db.execute_script(
+            "INSERT INTO projects (id, workspace_id, name, key, repo_path, created_at, updated_at)
+               VALUES ('p', 'default', 'P', 'prj', '/tmp/p', 1, 1);
+             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('thread', 'p', 'topic', 'active', 'none', 1, 1);
+             INSERT INTO threads (id, project_id, name, status, attention, created_at, updated_at)
+               VALUES ('t-other', 'p', 'other', 'active', 'none', 1, 1);",
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    async fn store_vector(db: &LocalDb, uri: &str, vector: &[f32]) {
+        crate::embeddings::queries::upsert_resource_embedding_async(
+            db,
+            uri,
+            &crate::embeddings::vector::to_bytes(vector),
+            crate::embeddings::COHERE_MODEL,
+            crate::embeddings::COHERE_DIMS as i32,
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn other_thread_tenet(db: &LocalDb, number: i64, text: &str) {
+        db.execute(
+            "INSERT INTO tenets (id, project_id, number, proposing_thread_id, question, options_json,
+                 status, verdict, selected_option, answer_source, answered_at, origin,
+                 proposer_principal_json, created_at, updated_at)
+             VALUES (?1, 'p', ?2, 't-other', 'Which way?', ?3, 'approved', 'option', 0, 'device',
+                 10, 'standing', '{\"kind\":\"agent\",\"node\":\"cairn://p/prj/other\",\"run_id\":null}', 1, 1)",
+            params![
+                format!("other-{number}"),
+                number,
+                serde_json::to_string(&[text, "the other way"]).unwrap()
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn rank_with(db: &LocalDb, own: &[TenetView]) -> Vec<(i64, bool)> {
+        RelevanceSelector
+            .rank(
+                db,
+                &TenetSelection {
+                    thread_id: "thread",
+                    thread_name: "topic",
+                    project_id: "p",
+                    project_key: "prj",
+                    own,
+                    vectors: db,
+                    now: RANK_NOW,
+                },
+            )
+            .await
+            .into_iter()
+            .map(|ranked| (ranked.tenet.row.number, ranked.own))
+            .collect()
+    }
+
+    fn arc_uri() -> String {
+        format!(
+            "{}/arc",
+            cairn_common::uri::build_thread_uri("prj", "topic")
+        )
+    }
+
+    fn with_recent_evidence(mut view: TenetView, at: i64) -> TenetView {
+        view.evidence.push(crate::tenets::TenetEvidence {
+            source_uri: "cairn://p/prj/5012".into(),
+            sign: "contradicts".into(),
+            confidence: 0.82,
+            evaluated_at: at,
+        });
+        view
+    }
+
+    #[tokio::test]
+    async fn relevance_orders_own_tenets_by_score_then_appends_near_related_ones() {
+        let db = relevance_db("seed-relevance-order.db").await;
+        store_vector(&db, &arc_uri(), &[1.0, 0.0, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/tenets/1", &[0.6, 0.8, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/tenets/2", &[1.0, 0.0, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/tenets/4", &[0.6, 0.8, 0.0]).await;
+        other_thread_tenet(&db, 10, "Near rule").await;
+        other_thread_tenet(&db, 11, "Far rule").await;
+        store_vector(&db, "cairn://p/prj/tenets/10", &[0.8, 0.6, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/tenets/11", &[0.4, 0.9165, 0.0]).await;
+
+        let own = vec![
+            tenet(1, TenetStatus::Approved, "One"),
+            tenet(2, TenetStatus::Approved, "Two"),
+            tenet(3, TenetStatus::Approved, "Three, no vector yet"),
+            // Ties #1 on similarity; recent evidence lifts it ahead.
+            with_recent_evidence(tenet(4, TenetStatus::Approved, "Four"), RANK_NOW - 86_400),
+            tenet(5, TenetStatus::Declined, "Five"),
+        ];
+        assert_eq!(
+            rank_with(&db, &own).await,
+            [(2, true), (4, true), (1, true), (3, true), (10, false)],
+            "#11 is below the related floor; #5 is not approved"
+        );
+
+        // Old evidence is no boost, so the tie falls back to number order.
+        let mut stale = own.clone();
+        stale[3] = with_recent_evidence(
+            tenet(4, TenetStatus::Approved, "Four"),
+            RANK_NOW - 30 * 86_400,
+        );
+        assert_eq!(
+            rank_with(&db, &stale).await[..3],
+            [(2, true), (1, true), (4, true)]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_child_issue_counts_as_the_threads_work() {
+        let db = relevance_db("seed-relevance-child.db").await;
+        db.execute_script(
+            "INSERT INTO issues (id, project_id, number, title, status, parent_thread_id, created_at, updated_at)
+               VALUES ('open', 'p', 40, 'Open', 'active', 'thread', 1, 1);
+             INSERT INTO issues (id, project_id, number, title, status, parent_thread_id, created_at, updated_at)
+               VALUES ('done', 'p', 41, 'Done', 'merged', 'thread', 1, 1);",
+        )
+        .await
+        .unwrap();
+        store_vector(&db, "cairn://p/prj/40", &[0.0, 1.0, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/41", &[1.0, 0.0, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/tenets/1", &[1.0, 0.0, 0.0]).await;
+        store_vector(&db, "cairn://p/prj/tenets/2", &[0.0, 1.0, 0.0]).await;
+        let own = vec![
+            tenet(1, TenetStatus::Approved, "One"),
+            tenet(2, TenetStatus::Approved, "Two"),
+        ];
+        assert_eq!(
+            rank_with(&db, &own).await,
+            [(2, true), (1, true)],
+            "only the open child is work; the merged one is not"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_work_vectors_relevance_is_recency() {
+        let db = relevance_db("seed-relevance-fallback.db").await;
+        store_vector(&db, "cairn://p/prj/tenets/1", &[1.0, 0.0, 0.0]).await;
+        let own: Vec<TenetView> = (1..=3)
+            .map(|n| tenet(n, TenetStatus::Approved, "Rule"))
+            .collect();
+        let recency: Vec<(i64, bool)> = recency_rank(&own)
+            .into_iter()
+            .map(|ranked| (ranked.tenet.row.number, ranked.own))
+            .collect();
+        assert_eq!(rank_with(&db, &own).await, recency);
+    }
+
+    #[tokio::test]
+    async fn ranking_reads_stored_vectors_only_and_never_embeds() {
+        let db = relevance_db("seed-relevance-no-network.db").await;
+        store_vector(&db, &arc_uri(), &[1.0, 0.0, 0.0]).await;
+        let own: Vec<TenetView> = (1..=3)
+            .map(|n| tenet(n, TenetStatus::Approved, "Rule"))
+            .collect();
+        assert_eq!(
+            rank_with(&db, &own).await,
+            [(3, true), (2, true), (1, true)],
+            "tenets without vectors keep recency order"
+        );
+        assert_eq!(
+            crate::embeddings::queries::count_resource_embeddings_async(&db)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn related_tenets_fill_the_budget_after_own_and_never_reach_the_index() {
+        let own = with_recent_evidence(
+            tenet(1, TenetStatus::Approved, "Keep leases"),
+            1_768_435_200,
+        );
+        let mut related = tenet(10, TenetStatus::Approved, "Near rule");
+        related.proposing_thread = "prj/other".into();
+        related.row.proposing_thread_id = "t-other".into();
+        let ranked = vec![
+            RankedTenet {
+                tenet: own.clone(),
+                own: true,
+            },
+            RankedTenet {
+                tenet: related,
+                own: false,
+            },
+        ];
+        let rendered = render_arc_projection(
+            &projection(vec![own, tenet(2, TenetStatus::Declined, "Drop leases")]),
+            &ranked,
+        );
+        let tenets = rendered.find("### Tenets\n").unwrap();
+        let related_at = rendered
+            .find("### Related tenets from other threads\n")
+            .unwrap_or_else(|| panic!("{rendered}"));
+        let index = rendered.find("### Tenet index\n").unwrap();
+        assert!(tenets < related_at && related_at < index, "{rendered}");
+        assert!(
+            rendered.contains(
+                "- **#10** (prj/other, approved by anonymous device d-1, 2023-11-14) — Near rule\n"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("  evidence: contradicts cairn://p/prj/5012 (0.82, 01-15)\n"),
+            "{rendered}"
+        );
+        assert!(!rendered[index..].contains("#10"), "{rendered}");
+
+        // With the budget spent on the thread's own tenets, nothing related fits.
+        let long = "word ".repeat(1_100);
+        let big = tenet(3, TenetStatus::Approved, &format!("Big. {long}"));
+        let mut far = tenet(
+            11,
+            TenetStatus::Approved,
+            &format!("Far. {}", "w ".repeat(600)),
+        );
+        far.proposing_thread = "prj/other".into();
+        let rendered = render_arc_projection(
+            &projection(vec![big.clone()]),
+            &[
+                RankedTenet {
+                    tenet: big,
+                    own: true,
+                },
+                RankedTenet {
+                    tenet: far,
+                    own: false,
+                },
+            ],
+        );
+        assert!(rendered.contains("- **#3** (approved"), "own fits in full");
+        assert!(!rendered.contains("### Related tenets"), "{rendered}");
     }
 }

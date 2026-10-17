@@ -20,6 +20,8 @@ impl CairnResource {
             | ProjectAttachments { project, .. }
             | ProjectIssues { project, .. }
             | ProjectPosts { project, .. }
+            | ProjectTenets { project, .. }
+            | ProjectTenet { project, .. }
             | ProjectCodemap { project, .. }
             | ProjectMap { project, .. }
             | ProjectHome { project, .. }
@@ -249,6 +251,11 @@ impl CairnResource {
             Self::ProjectTerminal { slug, .. } => {
                 Some(format!("/p/{}/terminal?terminalId={}", project, slug))
             }
+            // The Tenets tab renders every tenet in full, so one tenet routes
+            // to the tab rather than to a page of its own.
+            Self::ProjectTenets { .. } | Self::ProjectTenet { .. } => {
+                Some(format!("/p/{}/tenets", project))
+            }
             Self::ProjectBrowser { slug, .. } | Self::ProjectBrowserNetworkRequest { slug, .. } => {
                 Some(format!("/p/{}/browser?browserId={}", project, slug))
             }
@@ -388,6 +395,8 @@ impl CairnResource {
             | Self::ProjectAttachments { project, .. }
             | Self::ProjectIssues { project }
             | Self::ProjectPosts { project }
+            | Self::ProjectTenets { project }
+            | Self::ProjectTenet { project, .. }
             | Self::ProjectCodemap { project }
             | Self::ProjectMap { project }
             | Self::ProjectHome { project }
@@ -599,6 +608,8 @@ impl CairnResource {
             | Self::Post { .. }
             | Self::PostComment { .. }
             | Self::ProjectPosts { .. }
+            | Self::ProjectTenets { .. }
+            | Self::ProjectTenet { .. }
             | Self::ProjectCodemap { .. }
             | Self::ProjectMap { .. }
             | Self::ProjectHome { .. }

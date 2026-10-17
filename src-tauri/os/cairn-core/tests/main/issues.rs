@@ -182,9 +182,15 @@ async fn resolve_and_unresolve_update_issue_and_close_open_sessions() {
     .await
     .unwrap();
 
-    let closed = crud::resolve(&db, &FixedClock(600), &issue.id, Resolution::Closed)
-        .await
-        .unwrap();
+    let closed = crud::resolve(
+        &db,
+        &FixedClock(600),
+        &issue.id,
+        Resolution::Closed,
+        "device-a",
+    )
+    .await
+    .unwrap();
     assert_eq!(closed, vec!["session-1".to_string()]);
 
     let closed_issue = crud::get(&db, &issue.id).await.unwrap().unwrap();
@@ -209,9 +215,15 @@ async fn resolve_and_unresolve_update_issue_and_close_open_sessions() {
     )
     .await
     .unwrap();
-    crud::resolve(&db, &FixedClock(650), &issue.id, Resolution::Merged)
-        .await
-        .unwrap();
+    crud::resolve(
+        &db,
+        &FixedClock(650),
+        &issue.id,
+        Resolution::Merged,
+        "device-a",
+    )
+    .await
+    .unwrap();
     let merged_issue = crud::get(&db, &issue.id).await.unwrap().unwrap();
     assert_eq!(merged_issue.status, IssueStatus::Merged);
     assert_eq!(merged_issue.progress, IssueProgress::Merged);

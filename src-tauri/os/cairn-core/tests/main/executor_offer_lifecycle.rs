@@ -34,6 +34,7 @@ fn offer(request_id: &str, project_id: &str) -> OfferSummary {
         waiting_since_unix_ms: 0,
         wait_horizon_unix_ms: common::unix_time_ms() + 60_000,
         predicted_cost_ms: None,
+        execution_residency: None,
     }
 }
 

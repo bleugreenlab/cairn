@@ -653,6 +653,8 @@ fn parse_condition_create(
         .and_then(serde_json::Value::as_str)
         .filter(|v| !v.trim().is_empty())
         .ok_or_else(|| build_failure(index, item, "payload.condition.sql is required"))?;
+    crate::resources::sql_policy::refuse_retired_rulings(sql)
+        .map_err(|refusal| build_failure(index, item, refusal))?;
     crate::resources::sql_policy::validate_read_only_sql(sql).map_err(|error| {
         build_failure(
             index,

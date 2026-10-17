@@ -33,6 +33,7 @@ pub mod scratch;
 pub mod search;
 pub mod sessions;
 pub use cairn_symbols::symbols;
+pub mod tenets;
 pub mod terminal_host;
 pub mod threads;
 pub mod todos;

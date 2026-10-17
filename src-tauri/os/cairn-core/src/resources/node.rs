@@ -2335,9 +2335,11 @@ pub(super) async fn read_node_artifact(
         Some(a) if format == ArtifactFormat::Json => a.data.clone(),
         Some(a) if artifact_name == Some(crate::threads::ARC_ARTIFACT_NAME) => {
             match serde_json::from_str(&a.data) {
-                Ok(data) => crate::threads::arc_store::render(db, &job.id, &data)
-                    .await
-                    .unwrap_or_else(|_| render_artifact_markdown(&a.data)),
+                Ok(data) => {
+                    crate::threads::arc_store::render(db, &job.id, &data, orch.services.clock.now())
+                        .await
+                        .unwrap_or_else(|_| render_artifact_markdown(&a.data))
+                }
                 Err(_) => render_artifact_markdown(&a.data),
             }
         }
