@@ -903,6 +903,9 @@ pub struct Fleet {
     /// because management is fleet state: the same projection that answers what
     /// machines exist has to answer what is currently becoming one.
     management: Arc<management::ExecutorManagementState>,
+    /// When this runner began shutting down, once it has. Every in-flight
+    /// request races its own lifecycle against it.
+    runner_stop: Arc<RunnerStop>,
     /// How long a claimed attempt may go without its machine accounting for
     /// it; see [`CLAIMED_ATTEMPT_SILENCE_BOUND_MS`].
     claimed_attempt_silence: ClaimedAttemptSilenceBound,
@@ -2373,6 +2376,11 @@ pub enum CancelOutcome {
 /// it, so nothing is sent. A claim the grant reached may have work running, so
 /// that machine is sent `Cancel`; a claim no grant reached holds only its
 /// ticket, which `Cancel` does not release, so that machine is sent `Lost`.
+///
+/// The entry's terminal journal row names why it was withdrawn and where it
+/// stood: a caller that went away, or this runner shutting down. A bare
+/// `cancelled` row is what let a dropped caller read, after the fact, like work
+/// nothing had ever ended.
 struct EntryDropGuard {
     pool: Fleet,
     request_id: String,
@@ -2380,7 +2388,19 @@ struct EntryDropGuard {
     entry_id: String,
     /// The machine a grant for this entry was delivered to, once one was.
     granted_to: Option<String>,
+    /// Why the runner itself is ending the entry, when it is. Absent, an
+    /// armed drop means the caller stopped awaiting it.
+    cause: Option<WithdrawalCause>,
     armed: bool,
+}
+
+/// The runner's own reasons for withdrawing an entry, as distinct from a
+/// caller that stopped awaiting it.
+enum WithdrawalCause {
+    RunnerStopped(u64),
+    /// The machine holding a granted attempt stopped accounting for it, for the
+    /// rendered duration.
+    ClaimedAttemptSilent(String),
 }
 
 /// Tell the machine that claimed an entry the grant is never coming.
@@ -2408,9 +2428,27 @@ impl Drop for EntryDropGuard {
         }
         let identity = (self.request_id.clone(), self.attempt_id.clone());
         let claimed_by = self.pool.queue.claimed_binding_of(&identity);
-        self.pool
-            .queue
-            .take(&identity, queue::TerminalState::Cancelled, unix_time_ms());
+        let phase = self
+            .pool
+            .withdrawal_phase(&identity, self.granted_to.as_deref());
+        let stopped_at = match &self.cause {
+            Some(WithdrawalCause::RunnerStopped(at)) => Some(*at),
+            Some(WithdrawalCause::ClaimedAttemptSilent(_)) => None,
+            None => self.pool.runner_stop.at(),
+        };
+        let cause = match (&self.cause, stopped_at) {
+            (Some(WithdrawalCause::ClaimedAttemptSilent(quiet)), _) => format!(
+                "withdrawn: the machine holding the request gave no account of it for {quiet}, so the runner stopped waiting while it was {phase}"
+            ),
+            (_, Some(stopped_at)) => format!(
+                "withdrawn: this runner began shutting down at {} while the request was {phase}",
+                describe_runner_stop(stopped_at)
+            ),
+            (_, None) => format!(
+                "withdrawn: the caller awaiting this request went away while it was {phase}"
+            ),
+        };
+        self.pool.queue.withdraw(&identity, cause, unix_time_ms());
         self.pool.binding_changed.notify_waiters();
         if let Some((executor_id, generation)) = claimed_by {
             let message = if self.granted_to.as_deref() == Some(executor_id.as_str()) {
@@ -2807,15 +2845,33 @@ impl Fleet {
             // queue: nothing was running behind an offer, so nothing can be run
             // twice by re-offering it, and an offer outliving its link is the
             // stuck placement this whole design exists to make impossible.
-            let cause = match origin {
-                ExecutorDisconnectOrigin::RunnerInitiated => queue::GenerationEndCause::MachineGone,
-                ExecutorDisconnectOrigin::PeerOrIo => queue::GenerationEndCause::LinkGap,
+            //
+            // A runner closing links because it is itself stopping is a third
+            // case, and the one most easily misread: the machine was not lost
+            // and the work did not fail. Answering it as a closed connection is
+            // what charged a runner restart to the substrate.
+            let stopped_at = self.runner_stop.at();
+            let diagnostic = match stopped_at {
+                Some(at) => format!(
+                    "this runner began shutting down at {} before the request returned a result",
+                    describe_runner_stop(at)
+                ),
+                None => "executor connection closed before returning a result".to_string(),
+            };
+            let cause = match (origin, stopped_at) {
+                (ExecutorDisconnectOrigin::RunnerInitiated, Some(stopped_at_unix_ms)) => {
+                    queue::GenerationEndCause::RunnerStopping { stopped_at_unix_ms }
+                }
+                (ExecutorDisconnectOrigin::RunnerInitiated, None) => {
+                    queue::GenerationEndCause::MachineGone
+                }
+                (ExecutorDisconnectOrigin::PeerOrIo, _) => queue::GenerationEndCause::LinkGap,
             };
             let sweep = self.queue.end_generation(
                 executor_id,
                 generation,
                 cause,
-                "executor connection closed before returning a result",
+                &diagnostic,
                 unix_time_ms(),
             );
             if !sweep.released_offers.is_empty() {
@@ -2826,10 +2882,7 @@ impl Fleet {
             }
             match origin {
                 ExecutorDisconnectOrigin::RunnerInitiated => {
-                    self.fail_calls_for_executor(
-                        executor_id,
-                        "executor connection closed before returning a result",
-                    );
+                    self.fail_calls_for_executor(executor_id, &diagnostic);
                 }
                 ExecutorDisconnectOrigin::PeerOrIo => {
                     self.hold_executions_across_link_gap(executor_id, sweep.held_claims);
@@ -3854,10 +3907,18 @@ impl Fleet {
         true
     }
 
-    /// Stop accepting colocated work and fail its outstanding requests before the
-    /// runner begins waiting for transport connections to drain. Managed peers are
-    /// not owned by this process and must survive a local daemon replacement.
-    pub fn begin_colocated_shutdown(&self) -> bool {
+    /// Record that this runner is shutting down, then stop the colocated
+    /// executor before the runner begins waiting for transport connections to
+    /// drain. Managed peers are not owned by this process and must survive a
+    /// local daemon replacement.
+    ///
+    /// The record comes first, and it is what every waiter is answered from:
+    /// each in-flight request withdraws itself naming the stop and the phase it
+    /// was in, and the colocated link's own sweep answers a claim the same way,
+    /// rather than as a connection that closed or a machine that does not exist.
+    /// Returns whether a colocated executor was attached.
+    pub fn begin_runner_shutdown(&self) -> bool {
+        self.runner_stop.begin(unix_time_ms());
         let target = self
             .lock_connections()
             .iter()
@@ -6068,6 +6129,7 @@ impl Fleet {
             attempt_id: identity.1.clone(),
             entry_id: entry_id.clone(),
             granted_to: None,
+            cause: None,
             armed: true,
         };
         'offer: loop {
@@ -8630,9 +8692,59 @@ impl Fleet {
             .outcome
     }
 
+    /// The answer for a request this runner withdraws because it is stopping,
+    /// naming where the request stood.
+    fn stopped_outcome(
+        &self,
+        stopped_at: u64,
+        identity: &RequestIdentity,
+        granted_to: Option<&str>,
+    ) -> CellOutcome {
+        let phase = self.withdrawal_phase(identity, granted_to);
+        runner_stopping(
+            stopped_at,
+            format!(
+                "this runner began shutting down at {} while this request was {phase}; it was withdrawn, and neither the machine nor the work is implicated",
+                describe_runner_stop(stopped_at)
+            ),
+        )
+    }
+
+    /// Where a live request stands, in the words a withdrawal names it by.
+    /// `granted_to` is the machine a grant was delivered to, when the caller
+    /// knows; a claim without one may not be running yet.
+    fn withdrawal_phase(&self, identity: &RequestIdentity, granted_to: Option<&str>) -> String {
+        let state = self
+            .queue
+            .with_entry_by_identity(identity, |entry| entry.state.clone());
+        match state {
+            None => "not held in the queue".to_string(),
+            Some(queue::EntryState::Queued) => "waiting to be placed".to_string(),
+            Some(queue::EntryState::Offered { executor_id, .. }) => {
+                format!("offered to {}", self.executor_name_for_text(&executor_id))
+            }
+            Some(queue::EntryState::Claimed { executor_id, .. }) => {
+                let name = self.executor_name_for_text(&executor_id);
+                if granted_to == Some(executor_id.as_str()) {
+                    format!("running on {name}")
+                } else {
+                    format!("claimed by {name}")
+                }
+            }
+        }
+    }
+
     /// [`Self::execute_prepared`], also reporting a grant it delivered that
     /// produced no result. Every path that returns before the grant converts
     /// its outcome with `into()`, which states that nothing was granted.
+    ///
+    /// The runner beginning to shut down is raced at each wait, and the order
+    /// differs on either side of the grant. Before it, the stop is checked
+    /// first: a request still being placed would otherwise see the colocated
+    /// machine the shutdown removes and be told no machine could run it. After
+    /// it, the result is checked first, so an answer the runner has already
+    /// accepted is never replaced, and a stop that does win keeps the account
+    /// of the grant, because the batch may already have run.
     async fn execute_prepared_accounted(
         &self,
         request: CellRequest,
@@ -8656,6 +8768,10 @@ impl Fleet {
         }
         let plan = ReservationPlan::new(db.clone(), &request, batch.as_ref());
         let key = (request.request_id.clone(), request.attempt_id.clone());
+        // Nothing queued after the stop could be waited on by anyone.
+        if let Some(stopped_at) = self.runner_stop.at() {
+            return self.stopped_outcome(stopped_at, &key, None).into();
+        }
         let batch_profile_identities = plan.batch_identities.clone();
         let profile_identity = request.command_resource_identity.clone();
         // One entry stands for this work from here until it settles. Placement
@@ -8678,6 +8794,7 @@ impl Fleet {
             attempt_id: key.1.clone(),
             entry_id: entry_id.clone(),
             granted_to: None,
+            cause: None,
             armed: true,
         };
         // Offer, and let the machine answer from its own live facts. A decline
@@ -8692,10 +8809,19 @@ impl Fleet {
                 reservation,
                 mut decision,
                 above_ceiling,
-            } = match self
-                .select_executor(&request, Some(&plan), &placement_policy, Some(&entry_id))
-                .await
-            {
+            } = match tokio::select! {
+                biased;
+                stopped_at = self.runner_stop.stopped() => {
+                    guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
+                    return self.stopped_outcome(stopped_at, &key, None).into();
+                }
+                selection = self.select_executor(
+                    &request,
+                    Some(&plan),
+                    &placement_policy,
+                    Some(&entry_id),
+                ) => selection,
+            } {
                 Ok(placement) => placement,
                 Err(outcome) => {
                     self.queue
@@ -8740,9 +8866,14 @@ impl Fleet {
                     });
                 }
             }
-            let answer = self
-                .offer_once(&entry_id, &attempt_request, &selected, &mut decision)
-                .await;
+            let answer = tokio::select! {
+                biased;
+                stopped_at = self.runner_stop.stopped() => {
+                    guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
+                    return self.stopped_outcome(stopped_at, &key, None).into();
+                }
+                answer = self.offer_once(&entry_id, &attempt_request, &selected, &mut decision) => answer,
+            };
             match answer {
                 OfferAnswer::Claimed => {
                     break (
@@ -8872,16 +9003,25 @@ impl Fleet {
             )
             .into();
         }
-        let (outcome, silent) = match self
-            .await_claimed_result(&key, granted_at_unix_ms, rx)
-            .await
-        {
-            ClaimedWait::Answered(outcome) => (*outcome, false),
-            ClaimedWait::ChannelClosed => (
+        let waited = tokio::select! {
+            biased;
+            waited = self.await_claimed_result(&key, granted_at_unix_ms, rx) => Ok(waited),
+            stopped_at = self.runner_stop.stopped() => Err(stopped_at),
+        };
+        let (outcome, ended_by_runner) = match waited {
+            Ok(ClaimedWait::Answered(outcome)) => (*outcome, false),
+            Ok(ClaimedWait::ChannelClosed) => (
                 executor_unavailable("executor result channel closed".into()),
                 false,
             ),
-            ClaimedWait::Silent(silence) => {
+            Err(stopped_at) => {
+                guard.cause = Some(WithdrawalCause::RunnerStopped(stopped_at));
+                (
+                    self.stopped_outcome(stopped_at, &key, Some(&selected.executor_id)),
+                    true,
+                )
+            }
+            Ok(ClaimedWait::Silent(silence)) => {
                 let executor_name = self.executor_name_for_text(&selected.executor_id);
                 log::warn!(
                     "no account of request {} attempt {} from {executor_name} for {}ms ({:?}, last progress {:?}); cancelling it",
@@ -8891,6 +9031,9 @@ impl Fleet {
                     silence.final_account,
                     silence.last_progress,
                 );
+                guard.cause = Some(WithdrawalCause::ClaimedAttemptSilent(compact_duration(
+                    silence.quiet_ms,
+                )));
                 (silence.outcome(&key, executor_name), true)
             }
         };
@@ -8930,9 +9073,10 @@ impl Fleet {
                     })
                     .flatten(),
             });
-        // Left armed, the guard takes the entry out of the queue and sends the
-        // machine `Cancel`, in case it is still running work nobody waits for.
-        if silent {
+        // Left armed, the guard takes the entry out of the queue with the cause
+        // set above and sends the machine `Cancel`, in case it is still running
+        // work nobody waits for.
+        if ended_by_runner {
             return ExecutedRequest {
                 outcome,
                 grant_without_result,
@@ -13830,6 +13974,68 @@ fn executor_unavailable(diagnostic: String) -> CellOutcome {
     }
 }
 
+/// The answer a request gets when this runner withdraws it because the runner
+/// itself is shutting down.
+fn runner_stopping(stopped_at_unix_ms: u64, diagnostic: String) -> CellOutcome {
+    CellOutcome::Unavailable {
+        reason: CellUnavailableReason::RunnerStopping { stopped_at_unix_ms },
+        diagnostic,
+    }
+}
+
+fn describe_runner_stop(stopped_at_unix_ms: u64) -> String {
+    crate::clock::stamp_millis_with_seconds(stopped_at_unix_ms as i64)
+        .unwrap_or_else(|| format!("unix ms {stopped_at_unix_ms}"))
+}
+
+/// The moment this runner began shutting down, published once.
+///
+/// Level-triggered on purpose: a request that starts waiting after the stop
+/// must see it at once, not wait for a wakeup that already happened.
+struct RunnerStop {
+    stopped_at: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+impl Default for RunnerStop {
+    fn default() -> Self {
+        let (stopped_at, _) = tokio::sync::watch::channel(None);
+        Self { stopped_at }
+    }
+}
+
+impl RunnerStop {
+    /// Record the stop. The first record stands; a second call changes nothing.
+    fn begin(&self, at_unix_ms: u64) {
+        self.stopped_at.send_if_modified(|stopped_at| {
+            if stopped_at.is_some() {
+                return false;
+            }
+            *stopped_at = Some(at_unix_ms);
+            true
+        });
+    }
+
+    fn at(&self) -> Option<u64> {
+        *self.stopped_at.borrow()
+    }
+
+    /// Resolves with the stop's instant once the runner has begun stopping.
+    async fn stopped(&self) -> u64 {
+        let mut observed = self.stopped_at.subscribe();
+        let stopped_at = observed
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|at| *at);
+        match stopped_at {
+            Some(at) => at,
+            // The sender lives as long as the fleet that owns it, so this is
+            // unreachable while anything can still be waiting on it.
+            None => std::future::pending().await,
+        }
+    }
+}
+
 /// Prefix a remote object-materialization refusal with the placement it came
 /// from, leaving the executor's own coordinate and the low-level cause intact
 /// as the tail. Every other outcome passes through untouched: this narrows a
@@ -14619,8 +14825,11 @@ mod tests {
         assert!(pool.queue.len() == 0);
     }
 
+    /// The runner's own shutdown answers a claim on its colocated machine at
+    /// once, and says what happened: the runner stopped. Answering it as a
+    /// closed connection is what recorded a restart as the machine's fault.
     #[tokio::test]
-    async fn colocated_shutdown_is_immediate_retryable_infrastructure() {
+    async fn runner_shutdown_answers_a_colocated_claim_with_the_stop() {
         let pool = Fleet::default();
         let (sender, mut executor) = mpsc::unbounded_channel();
         let generation = pool.attach_executor(sender);
@@ -14632,7 +14841,7 @@ mod tests {
         let result_rx = claim_entry(&pool, &key, COLOCATED_EXECUTOR_ID, generation, Some("job"));
 
         let started = std::time::Instant::now();
-        assert!(pool.begin_colocated_shutdown());
+        assert!(pool.begin_runner_shutdown());
         assert!(started.elapsed() < Duration::from_millis(100));
         assert!(matches!(
             executor.recv().await,
@@ -14641,9 +14850,9 @@ mod tests {
         assert!(matches!(
             result_rx.await.unwrap(),
             CellOutcome::Unavailable {
-                reason: CellUnavailableReason::ExecutorUnavailable,
+                reason: CellUnavailableReason::RunnerStopping { .. },
                 ref diagnostic,
-            } if diagnostic.contains("connection closed")
+            } if diagnostic.contains("began shutting down")
         ));
         assert_eq!(
             pool.take_disconnect_origin(COLOCATED_EXECUTOR_ID, generation),
@@ -15134,6 +15343,7 @@ mod tests {
             attempt_id: identity.1.clone(),
             entry_id,
             granted_to: None,
+            cause: None,
             armed: true,
         };
         drop(guard);
@@ -16560,6 +16770,7 @@ mod tests {
             attempt_id: first_key.1.clone(),
             entry_id: "entry-1".into(),
             granted_to: Some(COLOCATED_EXECUTOR_ID.into()),
+            cause: None,
             armed: true,
         };
         let outcome = tokio::time::timeout(Duration::from_millis(120), first_rx)
@@ -22120,6 +22331,31 @@ mod tests {
         tokio::task::JoinHandle<ExecutedRequest>,
         mpsc::UnboundedReceiver<ExecutorMessage>,
     ) {
+        let (generation, submitting, mut machine, offered) = offered_and_held(orch).await;
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Claim { entry_id: offered },
+        );
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), machine.recv()).await {
+                Ok(Some(ExecutorMessage::Granted { .. })) => break,
+                Ok(Some(_)) => continue,
+                other => panic!("the claimed work was never granted: {other:?}"),
+            }
+        }
+        (generation, submitting, machine)
+    }
+
+    /// The same batch, offered to the colocated machine and not yet answered.
+    async fn offered_and_held(
+        orch: &Arc<Orchestrator>,
+    ) -> (
+        u64,
+        tokio::task::JoinHandle<ExecutedRequest>,
+        mpsc::UnboundedReceiver<ExecutorMessage>,
+        String,
+    ) {
         let (sender, mut machine) = mpsc::unbounded_channel();
         let generation = orch.fleet.attach_executor(sender);
         orch.fleet.claimed_attempt_silence.0.store(
@@ -22165,19 +22401,7 @@ mod tests {
                 other => panic!("the runner never offered the work: {other:?}"),
             }
         };
-        orch.fleet.handle_executor_message(
-            COLOCATED_EXECUTOR_ID,
-            generation,
-            ExecutorMessage::Claim { entry_id: offered },
-        );
-        loop {
-            match tokio::time::timeout(Duration::from_secs(30), machine.recv()).await {
-                Ok(Some(ExecutorMessage::Granted { .. })) => break,
-                Ok(Some(_)) => continue,
-                other => panic!("the claimed work was never granted: {other:?}"),
-            }
-        }
-        (generation, submitting, machine)
+        (generation, submitting, machine, offered)
     }
 
     async fn settled(submitting: tokio::task::JoinHandle<ExecutedRequest>) -> ExecutedRequest {
@@ -22185,6 +22409,283 @@ mod tests {
             .await
             .expect("the silence bound ends the wait")
             .unwrap()
+    }
+
+    /// Route this fleet's queue journal to the test, so the terminal row each
+    /// entry leaves behind can be read.
+    fn journal_rows(orch: &Orchestrator) -> mpsc::UnboundedReceiver<queue::QueueJournalBatch> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        orch.fleet.queue.attach_journal(sender);
+        receiver
+    }
+
+    /// The terminal row journaled for one request, once it has one.
+    fn terminal_row(
+        journal: &mut mpsc::UnboundedReceiver<queue::QueueJournalBatch>,
+        request_id: &str,
+    ) -> queue::QueueJournalRow {
+        let mut rows = Vec::new();
+        while let Ok(batch) = journal.try_recv() {
+            rows.extend(batch);
+        }
+        rows.into_iter()
+            .rfind(|row| {
+                row.request_id == request_id
+                    && matches!(row.state.as_str(), "completed" | "cancelled" | "expired")
+            })
+            .unwrap_or_else(|| panic!("no terminal row journaled for {request_id}"))
+    }
+
+    /// The cairn/4966 property, for every caller: dropping the future that
+    /// awaits a granted request is a cancellation. The machine running it is
+    /// told to stop, the entry leaves the queue at once with a row that says a
+    /// caller went away and where the request stood, and the machine's own
+    /// terminal answer, arriving after, is accepted harmlessly rather than
+    /// reviving anything. Nothing is left for a restart to find.
+    #[tokio::test]
+    async fn dropping_the_caller_of_a_running_request_cancels_it_and_says_why() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let mut journal = journal_rows(&orch);
+        let (generation, submitting, mut machine) = granted_and_held(&orch).await;
+        let request = provenance_request();
+
+        submitting.abort();
+        match submitting.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(executed) => panic!(
+                "the caller was dropped, not answered: {:?}",
+                executed.outcome
+            ),
+        }
+
+        let cancelled = loop {
+            match tokio::time::timeout(Duration::from_secs(5), machine.recv()).await {
+                Ok(Some(ExecutorMessage::Cancel { request_id, .. })) => break request_id,
+                Ok(Some(_)) => continue,
+                other => panic!("the machine running the work was never told: {other:?}"),
+            }
+        };
+        assert_eq!(cancelled, request.request_id);
+        assert_eq!(orch.fleet.queue.len(), 0, "nothing is left for a restart");
+        let row = terminal_row(&mut journal, &request.request_id);
+        assert_eq!(row.state, "cancelled");
+        let detail = row.detail.expect("a withdrawal names its cause");
+        assert!(
+            detail.contains("the caller awaiting this request went away")
+                && detail.contains("running on"),
+            "{detail}"
+        );
+
+        // The executor ends the item and answers; the request is already
+        // settled, so the answer finds nothing to settle and changes nothing.
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Result {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                outcome: CellOutcome::Cancelled {
+                    request_id: request.request_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                },
+            },
+        );
+        assert_eq!(orch.fleet.queue.len(), 0);
+    }
+
+    /// Work still being placed when the runner begins to stop is withdrawn
+    /// naming the stop. Before, it went on waiting, found the colocated machine
+    /// gone once the shutdown removed it, and was recorded as work no machine
+    /// could run.
+    #[tokio::test]
+    async fn runner_shutdown_withdraws_an_offered_request_naming_the_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let mut journal = journal_rows(&orch);
+        let (_generation, submitting, _machine, _offered) = offered_and_held(&orch).await;
+
+        orch.fleet.begin_runner_shutdown();
+        let executed = settled(submitting).await;
+
+        match &executed.outcome {
+            CellOutcome::Unavailable {
+                reason: CellUnavailableReason::RunnerStopping { .. },
+                diagnostic,
+                // The shutdown's own close of the colocated link returns the
+                // unanswered offer to the queue before this request wakes, so the
+                // phase it names is where it stood when it was withdrawn.
+            } => assert!(
+                diagnostic.contains("began shutting down")
+                    && diagnostic.contains("waiting to be placed"),
+                "{diagnostic}"
+            ),
+            other => panic!("the stop is what this request is told: {other:?}"),
+        }
+        assert!(
+            executed.grant_without_result.is_none(),
+            "nothing was granted"
+        );
+        assert_eq!(orch.fleet.queue.len(), 0);
+        let row = terminal_row(&mut journal, &provenance_request().request_id);
+        assert_eq!(row.state, "cancelled");
+        assert!(
+            row.detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("began shutting down")),
+            "{:?}",
+            row.detail
+        );
+    }
+
+    /// Work running on the colocated machine when the runner begins to stop is
+    /// answered with the stop, never with the closed connection the shutdown
+    /// produces on its way out.
+    #[tokio::test]
+    async fn runner_shutdown_ends_a_running_request_with_the_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let mut journal = journal_rows(&orch);
+        let (_generation, submitting, _machine) = granted_and_held(&orch).await;
+
+        orch.fleet.begin_runner_shutdown();
+        let executed = settled(submitting).await;
+
+        assert!(
+            matches!(
+                executed.outcome,
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::RunnerStopping { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            executed.outcome
+        );
+        assert!(
+            executed.grant_without_result.is_some(),
+            "the batch was handed to a machine, so the run envelope may not say nothing ran"
+        );
+        let row = terminal_row(&mut journal, &provenance_request().request_id);
+        let detail = row.detail.unwrap_or_default();
+        assert!(detail.contains("began shutting down"), "{detail}");
+        assert!(!detail.contains("connection closed"), "{detail}");
+    }
+
+    /// A stop that reaches a granted request before its machine answers (an
+    /// enrolled machine, whose link the shutdown leaves alone) ends the wait,
+    /// tells the machine to stop, and keeps the account of the grant, so a run
+    /// batch is reported as handed over with no result rather than as never
+    /// having run.
+    #[tokio::test]
+    async fn a_stop_during_the_grant_wait_keeps_the_grant_and_cancels_the_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let mut journal = journal_rows(&orch);
+        let (_generation, submitting, mut machine) = granted_and_held(&orch).await;
+
+        orch.fleet.runner_stop.begin(unix_time_ms());
+        let executed = settled(submitting).await;
+
+        assert!(
+            matches!(
+                executed.outcome,
+                CellOutcome::Unavailable {
+                    reason: CellUnavailableReason::RunnerStopping { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            executed.outcome
+        );
+        let grant = executed
+            .grant_without_result
+            .expect("the grant's account survives the stop");
+        assert_eq!(
+            grant.executor_name,
+            orch.fleet.executor_name_for_text(COLOCATED_EXECUTOR_ID)
+        );
+        let cancelled = loop {
+            match tokio::time::timeout(Duration::from_secs(5), machine.recv()).await {
+                Ok(Some(ExecutorMessage::Cancel { request_id, .. })) => break request_id,
+                Ok(Some(_)) => continue,
+                other => panic!("the machine was never told to stop: {other:?}"),
+            }
+        };
+        assert_eq!(cancelled, provenance_request().request_id);
+        let detail = terminal_row(&mut journal, &provenance_request().request_id)
+            .detail
+            .unwrap_or_default();
+        assert!(
+            detail.contains("began shutting down") && detail.contains("running on"),
+            "{detail}"
+        );
+    }
+
+    /// A result the runner has already accepted is the answer, whatever
+    /// arrives after it. The machine's completion is settled into the queue
+    /// and the stop is recorded before the waiting task is polled at all; the
+    /// caller still receives the completion, and its bookkeeping runs.
+    #[tokio::test]
+    async fn a_result_accepted_before_the_stop_is_not_replaced_by_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let (generation, submitting, _machine) = granted_and_held(&orch).await;
+        let request = provenance_request();
+
+        orch.fleet.handle_executor_message(
+            COLOCATED_EXECUTOR_ID,
+            generation,
+            ExecutorMessage::Result {
+                request_id: request.request_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                outcome: completed_for(&request, COLOCATED_EXECUTOR_ID, generation),
+            },
+        );
+        orch.fleet.runner_stop.begin(unix_time_ms());
+        let executed = settled(submitting).await;
+
+        assert!(
+            matches!(executed.outcome, CellOutcome::Completed { .. }),
+            "{:?}",
+            executed.outcome
+        );
+        assert!(executed.grant_without_result.is_none());
+        assert_eq!(orch.fleet.queue.len(), 0);
+    }
+
+    /// A request that arrives after the stop never enters the queue: there is
+    /// no runner left to wait on its answer.
+    #[tokio::test]
+    async fn a_request_after_the_stop_is_refused_without_being_queued() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let mut journal = journal_rows(&orch);
+        orch.fleet.begin_runner_shutdown();
+
+        let mut request = provenance_request();
+        request.repository = RepositoryLocator::ScratchOnly {
+            owner_id: request.project_id.clone(),
+        };
+        let prepared = orch
+            .fleet
+            .prepare_execution(&orch, &mut request)
+            .await
+            .expect("a scratch request prepares");
+        let executed = orch
+            .fleet
+            .execute_prepared_accounted(request, None, prepared)
+            .await;
+
+        assert!(matches!(
+            executed.outcome,
+            CellOutcome::Unavailable {
+                reason: CellUnavailableReason::RunnerStopping { .. },
+                ..
+            }
+        ));
+        assert_eq!(orch.fleet.queue.len(), 0);
+        assert!(journal.try_recv().is_err(), "nothing was ever queued");
     }
 
     fn silent_accounts(
@@ -22275,6 +22776,7 @@ mod tests {
     async fn a_grant_the_machine_never_answers_is_reported_as_unanswered() {
         let temp = tempfile::tempdir().unwrap();
         let orch = Arc::new(test_orchestrator(temp.path()).await);
+        let mut journal = journal_rows(&orch);
         let (_generation, submitting, _machine) = granted_and_held(&orch).await;
         let executed = settled(submitting).await;
 
@@ -22290,6 +22792,16 @@ mod tests {
         assert!(
             diagnostic.contains("never listed the attempt after the grant"),
             "{diagnostic}"
+        );
+        // Ending the wait on the machine's silence is the runner's own
+        // decision, and its journal row says so rather than blaming a caller
+        // that is still waiting.
+        let detail = terminal_row(&mut journal, &provenance_request().request_id)
+            .detail
+            .unwrap_or_default();
+        assert!(
+            detail.contains("gave no account") && !detail.contains("caller"),
+            "{detail}"
         );
         let grant = executed
             .grant_without_result

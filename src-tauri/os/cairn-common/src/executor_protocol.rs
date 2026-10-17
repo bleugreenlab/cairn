@@ -4218,6 +4218,15 @@ pub struct LearnedResourceEstimate {
 /// [`DiskCategoryAccounting::retired_homes_bytes`], both defaulted, so a 145
 /// executor reports none and its retired homes stay in the unaccounted
 /// remainder exactly as before.
+///
+/// cairn/4966 names the runner's own shutdown without a bump.
+/// [`CellUnavailableReason::RunnerStopping`] is composed by the runner for its
+/// own waiters when it begins shutting down, and read only by its own check and
+/// placement surfaces; a `CellOutcome` travels executor to runner only, so no
+/// executor ever decodes it. The frames the shutdown sends are the existing
+/// `Cancel`, `Lost`, and `Shutdown`, at the moments a dropped caller and a
+/// runner-initiated close already sent them. A runner talking to an executor
+/// of any version therefore gets nothing wrong.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 146;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -6876,6 +6885,15 @@ pub enum CellUnavailableReason {
         ceiling: MemoryCeiling,
         alternative_executor_id: String,
         alternative_executor_name: String,
+    },
+    /// The runner began shutting down while this request was waiting to be
+    /// placed, offered, or running, and withdrew it. Neither the machine it was
+    /// bound to nor the work is implicated, and waiting on this runner relieves
+    /// nothing: the runner that replaces it asks the question again.
+    ///
+    /// Emitted by the runner alone; no executor produces or reads it.
+    RunnerStopping {
+        stopped_at_unix_ms: u64,
     },
     /// The runner stopped waiting for an attempt it had granted, because the
     /// machine holding it gave no account of it for `quiet_ms`: its link was

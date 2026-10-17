@@ -2991,6 +2991,7 @@ async fn submit_single_planned_check_batch(
             Some(wait.description.clone()),
         );
     }
+    let submitted_at = std::time::Instant::now();
     let submitted = if mutation_policy == MutationPolicy::PureVerdict {
         orch.fleet
             .submit_pure_verdict_batch(
@@ -3017,7 +3018,8 @@ async fn submit_single_planned_check_batch(
             )
             .await;
         let (item_outcomes, delta) = split_write_check_batch_outcome(outcome, indexed.len());
-        let results = indexed.iter().copied().zip(item_outcomes).collect();
+        let mut results = indexed.iter().copied().zip(item_outcomes).collect();
+        stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
         if let Err(error) =
             cleanup_check_commit_ref(orch, &batch.store_dir, &mut temporary_ref).await
         {
@@ -3033,7 +3035,7 @@ async fn submit_single_planned_check_batch(
     if let Err(error) = cleanup_check_commit_ref(orch, &batch.store_dir, &mut temporary_ref).await {
         report_cleanup_failure_without_discarding_verdicts(&error);
     }
-    let results = indexed
+    let mut results = indexed
         .into_iter()
         .zip(submitted)
         .map(|(index, submitted)| {
@@ -3046,12 +3048,27 @@ async fn submit_single_planned_check_batch(
             (index, result)
         })
         .collect();
+    stamp_substrate_elapsed(&mut results, submitted_at.elapsed());
     Ok(PlannedCheckBatchOutcome {
         results,
         request: Some(request),
         delta: None,
         store_dir: Some(batch.store_dir),
     })
+}
+
+/// Give every substrate failure in a settled batch the time its request was
+/// actually outstanding. A completed check carries its executor's own measured
+/// duration and is left alone.
+fn stamp_substrate_elapsed(
+    results: &mut HashMap<usize, Result<CheckExecResult, CheckExecutionFailure>>,
+    elapsed: std::time::Duration,
+) {
+    for result in results.values_mut() {
+        if let Err(CheckExecutionFailure::Substrate(failure)) = result {
+            failure.lasted(elapsed);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3367,6 +3384,10 @@ fn no_start_shape(
         // The pinned machine can never hold the work's measured memory: the
         // pin, not the fleet, is what left no machine to run it on.
         CellUnavailableReason::HomeCannotHold { .. } => SubstrateFailureShape::NoMachine,
+        // The runner withdrew the work because the runner itself was stopping.
+        // That is Cairn ending the check, not a machine lost or missing; naming
+        // either was how a runner restart came to be charged to the substrate.
+        CellUnavailableReason::RunnerStopping { .. } => SubstrateFailureShape::Cancelled,
         // What the machine said last cannot settle whether the check ran: the
         // runner reads its account between polls, an item can start and end
         // between two reads, and a completion record covers refusals too.
@@ -3582,6 +3603,11 @@ pub(crate) struct SubstrateFailure {
     /// identity of the work holding the machine is a fact about the world that
     /// explains the row and predicts its recovery.
     waited_on: Option<String>,
+    /// How long the request this failure answers was outstanding, when the
+    /// submission measured it. A batched check is handed its outcome only after
+    /// the whole batch settles, so the check's own timer reads zero however long
+    /// it actually waited or ran; this is the time it really spent.
+    elapsed_ms: Option<i64>,
 }
 
 impl SubstrateFailure {
@@ -3591,7 +3617,17 @@ impl SubstrateFailure {
             diagnostic: diagnostic.into(),
             build_service_implicated: false,
             waited_on: None,
+            elapsed_ms: None,
         }
+    }
+
+    /// Record how long the request behind this failure was outstanding.
+    pub(crate) fn lasted(&mut self, elapsed: std::time::Duration) {
+        self.elapsed_ms = Some(i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX));
+    }
+
+    pub(crate) fn elapsed_ms(&self) -> Option<i64> {
+        self.elapsed_ms
     }
 
     /// Record what this failure spent its patience waiting on.
@@ -6772,8 +6808,8 @@ where
                     output,
                     timed_out,
                     spawn_error,
-                    substrate_failure,
                     authoritative_duration_ms,
+                    substrate_failure,
                     provenance,
                     publication,
                 ) = match exec_outcome {
@@ -6789,8 +6825,8 @@ where
                         output,
                         timed_out,
                         false,
-                        None,
                         duration_ms,
+                        None,
                         provenance,
                         publication,
                     ),
@@ -6806,8 +6842,8 @@ where
                         failure.agent_message(),
                         false,
                         false,
+                        failure.elapsed_ms(),
                         Some(failure),
-                        None,
                         None,
                         None,
                     ),
@@ -10282,10 +10318,11 @@ cairn-common = { path = "../cairn-common" }
             );
             let expected: &[&str] = match name.as_str() {
                 "infra-stacks" => &["bun", "node", "npm"],
-                "rust-fmt" | "lockfile" | "rust-lint" | "rust-tests" | "external-host" => {
-                    &["bun", "rust"]
+                "rust-fmt" | "lockfile" | "licenses" | "rust-lint" | "rust-tests"
+                | "external-host" => &["bun", "rust"],
+                "executor-windows-check" | "executor-linux-check" | "executor-macos-check" => {
+                    &["rust"]
                 }
-                "executor-windows-check" | "executor-linux-check" => &["rust"],
                 _ if check
                     .command
                     .split_whitespace()
@@ -12228,6 +12265,7 @@ cairn-common = { path = "../cairn-common" }
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_)
             | CellUnavailableReason::HomeCannotHold { .. }
+            | CellUnavailableReason::RunnerStopping { .. }
             | CellUnavailableReason::ClaimedAttemptSilent { .. } => {}
         }
         let cases = [
@@ -12307,6 +12345,14 @@ cairn-common = { path = "../cairn-common" }
             (
                 CellUnavailableReason::NoMatchingExecutor,
                 SubstrateFailureShape::NoMachine,
+            ),
+            // The runner's own shutdown is neither of the two above, which are
+            // what it used to be reported as.
+            (
+                CellUnavailableReason::RunnerStopping {
+                    stopped_at_unix_ms: 1,
+                },
+                SubstrateFailureShape::Cancelled,
             ),
             (
                 CellUnavailableReason::Provisioning,
@@ -14194,6 +14240,65 @@ warning: this call to `clone` can be replaced with `std::slice::from_ref`
             "the reader gets the concrete failing step: {}",
             no_verdict.cause
         );
+    }
+
+    /// The cairn/4966 specimen: a write check queued behind a busy machine when
+    /// the runner restarted. It is recorded as Cairn ending the check because
+    /// the runner stopped, not as a lost machine or a missing one, and with the
+    /// time the request was really outstanding rather than the zero a batched
+    /// check's own timer reads once the batch has already settled.
+    #[tokio::test]
+    async fn a_runner_stop_is_recorded_as_such_with_the_time_it_was_outstanding() {
+        let db = cache_db().await;
+        let plans = vec![(plan("cargo-test", "cargo test"), "ih-stop".to_string())];
+        let mut results = HashMap::from([(
+            0,
+            check_result_from_cell_outcome(
+                CellOutcome::Unavailable {
+                    reason: cairn_common::executor_protocol::CellUnavailableReason::RunnerStopping {
+                        stopped_at_unix_ms: 1,
+                    },
+                    diagnostic: "this runner began shutting down while this request was waiting to be placed"
+                        .into(),
+                },
+                None,
+            ),
+        )]);
+        stamp_substrate_elapsed(&mut results, std::time::Duration::from_secs(190));
+        let batched = Arc::new(std::sync::Mutex::new(results));
+        let outcomes = run_planned_checks_at_commit(
+            db,
+            "project-a",
+            CheckRunCommit {
+                evaluated: "commit-target",
+                defined_by: "commit-target",
+            },
+            "tree-target",
+            "job-a",
+            &plans,
+            "write-checks:run-a",
+            CheckExecMode::Shared,
+            None,
+            move |index, _command, _stream_id| {
+                let batched = batched.clone();
+                async move { batched.lock().unwrap().remove(&index).unwrap() }
+            },
+            |_| {},
+        )
+        .await;
+
+        let outcome = outcomes.into_iter().next().unwrap();
+        assert_eq!(outcome.duration_ms, 190_000);
+        assert!(
+            outcome
+                .output_tail
+                .contains(SubstrateFailureShape::Cancelled.lead()),
+            "{}",
+            outcome.output_tail
+        );
+        assert!(outcome.output_tail.contains("began shutting down"));
+        assert!(!outcome.output_tail.contains("lost contact"));
+        assert!(!outcome.output_tail.contains("No machine available"));
     }
 
     /// A check Cairn declined to run says so, and an ordinary red stays an

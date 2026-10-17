@@ -238,6 +238,9 @@ pub(crate) fn classify_unavailable(
         // about the machine's size rather than its load: waiting on it waits
         // for nothing. Another machine can, and the caller is told which.
         CellUnavailableReason::HomeCannotHold { .. } => PlacementVerdict::Structural,
+        // The runner asking is going away. Nothing it could wait for would be
+        // waited for by anyone.
+        CellUnavailableReason::RunnerStopping { .. } => PlacementVerdict::Structural,
         // Work a machine was granted and then stopped accounting for. Some of
         // it may have run, so presenting it again could run it twice; the
         // caller is told the outcome is unknown instead.
@@ -366,6 +369,7 @@ mod tests {
             | CellUnavailableReason::AdmissionRejected { .. }
             | CellUnavailableReason::ObjectInfrastructure(_)
             | CellUnavailableReason::HomeCannotHold { .. }
+            | CellUnavailableReason::RunnerStopping { .. }
             | CellUnavailableReason::ClaimedAttemptSilent { .. } => {}
         }
         let waits = [
@@ -404,6 +408,9 @@ mod tests {
                 },
                 alternative_executor_id: "exec-big".into(),
                 alternative_executor_name: "bglab-mac".into(),
+            },
+            CellUnavailableReason::RunnerStopping {
+                stopped_at_unix_ms: 1,
             },
             CellUnavailableReason::ClaimedAttemptSilent {
                 executor_name: "bgsrv-ub".into(),

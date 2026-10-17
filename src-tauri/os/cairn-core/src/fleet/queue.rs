@@ -385,6 +385,10 @@ pub(crate) enum GenerationEndCause {
     /// The runner ended this link on purpose, or its supervisor declared the
     /// process gone. Claimed work is not coming back on this machine.
     MachineGone,
+    /// The runner itself is shutting down. Claimed work is answered as
+    /// withdrawn and never requeued: there is no machine to move it to that
+    /// this runner will still be here to wait on.
+    RunnerStopping { stopped_at_unix_ms: u64 },
 }
 
 pub(crate) struct ExecutionQueue {
@@ -819,6 +823,30 @@ impl ExecutionQueue {
         terminal: TerminalState,
         now_unix_ms: u64,
     ) -> Option<QueueEntry> {
+        self.take_with_detail(identity, terminal, None, now_unix_ms)
+    }
+
+    /// Take an entry out as cancelled, recording why on its terminal row.
+    ///
+    /// A withdrawal with no stated cause is indistinguishable in the journal
+    /// from every other cancellation, which is how a caller that went away
+    /// came to be mistaken for work that was never ended.
+    pub(crate) fn withdraw(
+        &self,
+        identity: &RequestIdentity,
+        cause: String,
+        now_unix_ms: u64,
+    ) -> Option<QueueEntry> {
+        self.take_with_detail(identity, TerminalState::Cancelled, Some(cause), now_unix_ms)
+    }
+
+    fn take_with_detail(
+        &self,
+        identity: &RequestIdentity,
+        terminal: TerminalState,
+        detail: Option<String>,
+        now_unix_ms: u64,
+    ) -> Option<QueueEntry> {
         let mut state = self.entries.lock().unwrap();
         let id = state.by_identity.remove(identity)?;
         let mut entry = state.entries.remove(&id)?;
@@ -830,7 +858,7 @@ impl ExecutionQueue {
         });
         let mut rows = Vec::new();
         entry.flush_reoffer(&mut rows);
-        rows.push(journal_row(
+        let mut row = journal_row(
             &mut entry,
             terminal.name(),
             bound
@@ -838,7 +866,9 @@ impl ExecutionQueue {
                 .map(|(executor, generation)| (executor.as_str(), *generation)),
             None,
             now_unix_ms,
-        ));
+        );
+        row.detail = detail;
+        rows.push(row);
         drop(state);
         self.journal(rows);
         Some(entry)
@@ -933,14 +963,20 @@ impl ExecutionQueue {
                     ));
                     sweep.requeued_claims.push(id);
                 }
-                GenerationEndCause::MachineGone => {
-                    rows.push(journal_row(
+                GenerationEndCause::MachineGone | GenerationEndCause::RunnerStopping { .. } => {
+                    let terminal = match cause {
+                        GenerationEndCause::RunnerStopping { .. } => TerminalState::Cancelled,
+                        _ => TerminalState::Completed,
+                    };
+                    let mut row = journal_row(
                         entry,
-                        TerminalState::Completed.name(),
+                        terminal.name(),
                         Some((executor_id, generation)),
                         None,
                         now_unix_ms,
-                    ));
+                    );
+                    row.detail = Some(diagnostic.to_string());
+                    rows.push(row);
                     answered.push(entry.identity());
                 }
             }
@@ -948,7 +984,12 @@ impl ExecutionQueue {
         for identity in answered {
             if let Some(id) = state.by_identity.remove(&identity) {
                 if let Some(mut entry) = state.entries.remove(&id) {
-                    entry.answer(super::executor_unavailable(diagnostic.to_string()));
+                    entry.answer(match cause {
+                        GenerationEndCause::RunnerStopping { stopped_at_unix_ms } => {
+                            super::runner_stopping(stopped_at_unix_ms, diagnostic.to_string())
+                        }
+                        _ => super::executor_unavailable(diagnostic.to_string()),
+                    });
                 }
             }
             sweep.failed_claims.push(identity);
