@@ -1,5 +1,7 @@
-//! The facet's one door for HTTP tokens: a completion over one of the three
-//! turn families (Chat, Messages, Responses) or the Decisions family.
+//! The facet's one door for HTTP model calls: a completion over one of the
+//! three turn families (Chat, Messages, Responses), the Decisions family, or
+//! one of the two embedding wires (OpenAI `embeddings`, Cairn's gateway
+//! `/embed`).
 //!
 //! The seam sits at the request body on purpose. Bodies already differ per
 //! provider (OpenRouter's routing object, Ollama's host, custom sampling), and
@@ -18,6 +20,8 @@ use crate::wire::anthropic_messages::http::MessagesEndpoint;
 use crate::wire::anthropic_messages::wire::MessagesResponse;
 use crate::wire::decisions::http::DecisionsEndpoint;
 use crate::wire::decisions::wire::DecisionsResponse;
+use crate::wire::embeddings::gateway::{GatewayEmbedEndpoint, GatewayEmbedResponse};
+use crate::wire::embeddings::openai::{EmbeddingsEndpoint, EmbeddingsResponse};
 use crate::wire::openai_compat::http::Endpoint;
 use crate::wire::openai_compat::wire::ChatResponse;
 use crate::wire::openai_responses::http::ResponsesEndpoint;
@@ -33,6 +37,10 @@ pub enum CompletionWire<'a> {
     Responses(&'a ResponsesEndpoint),
     /// Typed questions answered with probabilities; never streamed.
     Decisions(&'a DecisionsEndpoint),
+    /// Texts in, vectors out, over OpenAI's `embeddings`; never streamed.
+    Embeddings(&'a EmbeddingsEndpoint),
+    /// Texts in, vectors out, over Cairn's gateway `/embed`; never streamed.
+    GatewayEmbed(&'a GatewayEmbedEndpoint),
 }
 
 impl CompletionWire<'_> {
@@ -43,6 +51,8 @@ impl CompletionWire<'_> {
             Self::Messages(endpoint) => &endpoint.backend_key,
             Self::Responses(endpoint) => &endpoint.backend_key,
             Self::Decisions(endpoint) => &endpoint.backend_key,
+            Self::Embeddings(endpoint) => &endpoint.backend_key,
+            Self::GatewayEmbed(endpoint) => &endpoint.backend_key,
         }
     }
 
@@ -52,6 +62,8 @@ impl CompletionWire<'_> {
             Self::Messages(_) => "messages",
             Self::Responses(_) => "responses",
             Self::Decisions(_) => "decisions",
+            Self::Embeddings(_) => "embeddings",
+            Self::GatewayEmbed(_) => "gateway-embed",
         }
     }
 
@@ -64,6 +76,8 @@ impl CompletionWire<'_> {
             Self::Messages(_) => Wire::AnthropicMessages,
             Self::Responses(_) => Wire::OpenAiResponses,
             Self::Decisions(_) => Wire::OpenAiDecisions,
+            Self::Embeddings(_) => Wire::OpenAiEmbeddings,
+            Self::GatewayEmbed(_) => Wire::CairnEmbed,
         }
     }
 }
@@ -116,6 +130,8 @@ pub enum CompletionReply {
     Messages(MessagesResponse),
     Responses(ResponsesResponse),
     Decisions(DecisionsResponse),
+    Embeddings(EmbeddingsResponse),
+    GatewayEmbed(GatewayEmbedResponse),
 }
 
 fn mismatched(expected: &str, reply: &CompletionReply) -> CompletionError {
@@ -124,6 +140,8 @@ fn mismatched(expected: &str, reply: &CompletionReply) -> CompletionError {
         CompletionReply::Messages(_) => "messages",
         CompletionReply::Responses(_) => "responses",
         CompletionReply::Decisions(_) => "decisions",
+        CompletionReply::Embeddings(_) => "embeddings",
+        CompletionReply::GatewayEmbed(_) => "gateway-embed",
     };
     CompletionError::InvalidResponse(format!("expected a {expected} reply, got {got}"))
 }
@@ -156,9 +174,23 @@ impl CompletionReply {
             other => Err(mismatched("decisions", &other)),
         }
     }
+
+    pub fn into_embeddings(self) -> Result<EmbeddingsResponse, CompletionError> {
+        match self {
+            Self::Embeddings(response) => Ok(response),
+            other => Err(mismatched("embeddings", &other)),
+        }
+    }
+
+    pub fn into_gateway_embed(self) -> Result<GatewayEmbedResponse, CompletionError> {
+        match self {
+            Self::GatewayEmbed(response) => Ok(response),
+            other => Err(mismatched("gateway-embed", &other)),
+        }
+    }
 }
 
-/// Produces HTTP tokens. The only implementation that reaches a provider is
+/// Makes HTTP model calls. The only implementation that reaches a provider is
 /// [`crate::complete::HttpComplete`].
 ///
 /// A streamed call fails with [`CompletionError::Stream`], whose text is the

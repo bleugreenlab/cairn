@@ -43,13 +43,12 @@ use super::vector;
 use crate::storage::{DbResult, LocalDb, RowExt};
 use cairn_db::turso::{params, Value};
 
-/// Width of a stored span vector.
+/// The width span vectors are requested at.
 ///
-/// Cohere Embed v4 is Matryoshka-style, so the gateway's `dims` parameter
-/// returns a genuinely reduced vector rather than a truncation the caller has
-/// to renormalize. 256 dimensions keeps a 100k-turn workspace in the tens of
-/// megabytes, which is small enough that a project-scoped brute-force cosine
-/// scan needs no vector index.
+/// The gateway ignores it: `/embed` accepts `dims` but never reads it and always
+/// returns 1536-wide Cohere Embed v4 vectors (`api/src/routes/embed.ts`), and
+/// span rows store the width that came back, so turn vectors are stored at
+/// 1536, not 256.
 pub const SPAN_DIMS: u32 = 256;
 
 /// Character budget for one turn's text.

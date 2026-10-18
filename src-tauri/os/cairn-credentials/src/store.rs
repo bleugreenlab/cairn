@@ -182,6 +182,9 @@ enum AuthFile {
         sampling: CustomSampling,
         #[serde(default = "default_custom_max_output_tokens")]
         max_output_tokens: i64,
+        /// Declared embedding models; not secret.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        embeddings: Vec<crate::CustomEmbeddingModel>,
         /// Not secret: what an image server can draw.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Box<cairn_models_types::image::ImageCapabilities>>,
@@ -584,6 +587,7 @@ fn store_from_v2_file(
                 models,
                 sampling,
                 max_output_tokens,
+                embeddings,
                 images,
             } => {
                 let values: Vec<String> = match &encrypted_header_values {
@@ -612,6 +616,7 @@ fn store_from_v2_file(
                     models,
                     sampling,
                     max_output_tokens,
+                    embeddings,
                     images,
                 }
             }
@@ -707,6 +712,7 @@ fn store_to_v2_file(
                 models,
                 sampling,
                 max_output_tokens,
+                embeddings,
                 images,
             } => AuthFile::CustomEndpoint {
                 base_url: base_url.clone(),
@@ -731,6 +737,7 @@ fn store_to_v2_file(
                 models: models.clone(),
                 sampling: sampling.clone(),
                 max_output_tokens: *max_output_tokens,
+                embeddings: embeddings.clone(),
                 images: images.clone(),
             },
             ProviderAuth::ClaudeProfile { oauth } => AuthFile::ClaudeProfile {
@@ -1428,6 +1435,12 @@ accounts:
             },
             65_536,
         )
+        .unwrap()
+        .with_embedding_models(vec![crate::CustomEmbeddingModel {
+            id: "qwen/qwen3-embedding-4b".into(),
+            dims: 2560,
+            widths: Default::default(),
+        }])
         .unwrap();
         let account = configured_account(
             "acc_spark",
@@ -1470,11 +1483,16 @@ accounts:
             models,
             sampling,
             max_output_tokens,
+            embeddings,
             images,
         } = &restored.auth
         else {
             panic!("expected a custom endpoint");
         };
+        // Declared embedding models are not secret, and survive the round trip.
+        assert!(yaml.contains("qwen/qwen3-embedding-4b"), "{yaml}");
+        assert_eq!(embeddings.len(), 1);
+        assert_eq!(embeddings[0].dims, 2560);
         assert_eq!(*images, None);
         assert_eq!(base_url, "http://10.10.10.83:8000/v1");
         assert_eq!(*protocol, CustomProtocol::OpenAiChatCompletions);

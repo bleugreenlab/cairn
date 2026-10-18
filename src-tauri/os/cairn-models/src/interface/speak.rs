@@ -536,7 +536,9 @@ pub fn capabilities(wire: Wire, model: &str) -> Option<SpeechCapabilities> {
         | Wire::ClaudeStreamJson
         | Wire::CodexAppServer
         | Wire::OpenRouterImages
-        | Wire::OpenAiImages => None,
+        | Wire::OpenAiImages
+        | Wire::OpenAiEmbeddings
+        | Wire::CairnEmbed => None,
     }
 }
 

@@ -1,0 +1,1 @@
+{"object":"list","model":"nomic-embed-text:latest","usage":{"prompt_tokens":10,"total_tokens":10},"data":[{"object":"embedding","index":0,"embedding":[0.1,0.2,0.3]},{"object":"embedding","index":1,"embedding":[0.4,0.5,0.6]}]}

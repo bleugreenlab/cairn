@@ -1,6 +1,7 @@
 use crate::credentials::{ApiProvider, ProviderAuth};
 use crate::orchestrator::Orchestrator;
-use cairn_models::types::catalog::{DiscoveredModel, Modalities, Modality};
+use cairn_models::embed::{families, local_server_limits};
+use cairn_models::types::catalog::{DiscoveredModel, Modalities, Modality, ServedVerb, Verb, Wire};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -53,6 +54,10 @@ struct MergedModel {
     context_window: Option<i64>,
     supports_tools: bool,
     sees_images: bool,
+    completes: bool,
+    embeds: bool,
+    /// The width an embedding model's vectors come back at.
+    embedding_width: Option<u32>,
 }
 #[allow(dead_code)]
 pub(crate) fn discover_models_blocking(
@@ -176,15 +181,54 @@ fn context_length(info: &serde_json::Map<String, serde_json::Value>) -> Option<i
     info.iter()
         .find_map(|(k, v)| k.ends_with(".context_length").then(|| v.as_i64()).flatten())
 }
+/// An embedding model's output width: `model_info["<arch>.embedding_length"]`,
+/// where `<arch>` is its `general.architecture`. For a chat model the same key
+/// is its hidden size, which is why it is read only for embedding models.
+fn embedding_length(info: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
+    let architecture = info.get("general.architecture")?.as_str()?;
+    info.get(&format!("{architecture}.embedding_length"))?
+        .as_u64()
+        .and_then(|width| u32::try_from(width).ok())
+}
+
+/// What a model serves: nothing said for a chat model (the provider's
+/// conversation claim applies), and its own claim for one that embeds, so an
+/// embedding-only model never inherits a chat claim.
+fn served(tag: &str, entry: &MergedModel) -> Option<Vec<ServedVerb>> {
+    if !entry.embeds {
+        return None;
+    }
+    let mut serves = if entry.completes {
+        ServedVerb::conversation(Wire::OpenAiChatCompletions)
+    } else {
+        Vec::new()
+    };
+    // Ollama honours `dimensions` and re-normalises what it truncates, so a
+    // Matryoshka family's shorter widths are offered.
+    let limits = local_server_limits(
+        entry
+            .context_window
+            .and_then(|window| u32::try_from(window).ok()),
+    );
+    serves.push(ServedVerb {
+        verb: Verb::Embed(families::capabilities(
+            tag,
+            entry.embedding_width,
+            true,
+            limits,
+        )),
+        wire: Wire::OpenAiEmbeddings,
+    });
+    Some(serves)
+}
+
 fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
     let mut merged: BTreeMap<String, MergedModel> = BTreeMap::new();
     for host in hosts {
         for (tag, show) in host.models {
-            if !show
-                .capabilities
-                .iter()
-                .any(|capability| capability == "completion")
-            {
+            let completes = show.capabilities.iter().any(|c| c == "completion");
+            let embeds = show.capabilities.iter().any(|c| c == "embedding");
+            if !completes && !embeds {
                 continue;
             }
             let entry = merged.entry(tag).or_default();
@@ -197,12 +241,20 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
                 entry.context_window = context_length(&show.model_info);
                 entry.supports_tools = show.capabilities.iter().any(|c| c == "tools");
                 entry.sees_images = show.capabilities.iter().any(|c| c == "vision");
+                entry.completes = completes;
+                entry.embeds = embeds;
+                entry.embedding_width =
+                    embeds.then(|| embedding_length(&show.model_info)).flatten();
             }
         }
     }
     merged
         .into_iter()
         .map(|(tag, entry)| DiscoveredModel {
+            serves: served(&tag, &entry),
+            // A GGUF conversion carries its own vocabulary, not guaranteed
+            // identical to the repository's tokenizer.json, so no pin applies.
+            tokenizer: None,
             id: tag.clone(),
             model: tag.clone(),
             display_name: tag,
@@ -221,20 +273,22 @@ fn merge_hosts(hosts: Vec<HostModels>) -> Vec<DiscoveredModel> {
                 vec![]
             },
             router: false,
-            // Only `completion` models are listed, so every one reads and
-            // writes text; `vision` is Ollama's word for also reading images.
+            // `vision` is Ollama's word for also reading images; a model gives
+            // text when it completes and vectors when it embeds.
             modalities: Some(Modalities {
                 input: if entry.sees_images {
                     vec![Modality::Text, Modality::Image]
                 } else {
                     vec![Modality::Text]
                 },
-                output: vec![Modality::Text],
+                output: [
+                    entry.completes.then_some(Modality::Text),
+                    entry.embeds.then_some(Modality::Embeddings),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
             }),
-            serves: None,
-            // A GGUF conversion carries its own vocabulary, not guaranteed
-            // identical to the repository's tokenizer.json, so no pin applies.
-            tokenizer: None,
         })
         .collect()
 }
@@ -262,24 +316,132 @@ mod tests {
         }
     }
 
+    /// `/api/show` for an embedding model, as Ollama 0.40 answers it.
+    fn embedder(
+        capabilities: &[&str],
+        architecture: &str,
+        width: u32,
+        context: i64,
+    ) -> ShowResponse {
+        ShowResponse {
+            capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+            model_info: serde_json::from_value(serde_json::json!({
+                "general.architecture": architecture,
+                format!("{architecture}.embedding_length"): width,
+                format!("{architecture}.context_length"): context,
+            }))
+            .unwrap(),
+        }
+    }
+
+    fn embed_capabilities(
+        model: &DiscoveredModel,
+    ) -> cairn_models::types::embedding::EmbeddingCapabilities {
+        model
+            .serves
+            .as_ref()
+            .expect("an embedding model makes its own claim")
+            .iter()
+            .find_map(|served| match &served.verb {
+                Verb::Embed(capabilities) => Some(capabilities.clone()),
+                _ => None,
+            })
+            .expect("serves embed")
+    }
+
     #[test]
-    fn excludes_models_without_completion_capability() {
+    fn embedding_models_serve_only_embed_at_their_reported_width() {
+        use cairn_models::types::catalog::VerbKind;
+        use cairn_models::types::embedding::EmbeddingWidths;
         let models = merge_hosts(vec![HostModels {
             account_id: "host".into(),
             models: vec![
                 ("chat".into(), show(8192, false)),
                 (
-                    "embed".into(),
+                    "nomic-embed-text:latest".into(),
+                    embedder(&["embedding"], "nomic-bert", 768, 2048),
+                ),
+                (
+                    "qwen3-embedding:4b".into(),
+                    embedder(&["tools", "embedding"], "qwen3", 2560, 40960),
+                ),
+                (
+                    "neither".into(),
                     ShowResponse {
-                        capabilities: vec!["embedding".into()],
+                        capabilities: vec!["insert".into()],
                         model_info: serde_json::Map::new(),
                     },
                 ),
             ],
             errors: vec![],
         }]);
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].model, "chat");
+        assert_eq!(models.len(), 3);
+        let find = |id: &str| models.iter().find(|model| model.id == id).unwrap();
+        // A chat model is unchanged: no claim of its own.
+        assert_eq!(find("chat").serves, None);
+        assert_eq!(
+            find("chat").modalities.as_ref().unwrap().output,
+            vec![Modality::Text]
+        );
+
+        let nomic = find("nomic-embed-text:latest");
+        let served = nomic.serves.as_ref().unwrap();
+        assert_eq!(served.len(), 1);
+        assert_eq!(served[0].wire, Wire::OpenAiEmbeddings);
+        assert!(!served.iter().any(|s| s.verb.kind() == VerbKind::Session));
+        assert_eq!(
+            nomic.modalities.as_ref().unwrap().output,
+            vec![Modality::Embeddings]
+        );
+        let capabilities = embed_capabilities(nomic);
+        assert_eq!(capabilities.native_dims, Some(768));
+        assert_eq!(capabilities.widths, EmbeddingWidths::UpTo { min: 64 });
+        assert_eq!(capabilities.limits.max_input_tokens, Some(2048));
+
+        let qwen = embed_capabilities(find("qwen3-embedding:4b"));
+        assert_eq!(qwen.native_dims, Some(2560));
+        assert_eq!(qwen.widths, EmbeddingWidths::UpTo { min: 32 });
+    }
+
+    /// What discovery makes of a real Ollama host's embedding models. Run with
+    /// `--ignored --nocapture` beside a running Ollama.
+    #[test]
+    #[ignore = "reaches an Ollama host on localhost:11434"]
+    fn live_embedding_discovery() {
+        let models = discover_hosts(vec![(
+            "local".into(),
+            "Local".into(),
+            "http://localhost:11434".into(),
+        )])
+        .unwrap();
+        for model in &models {
+            match model.serves.as_ref().and_then(|serves| {
+                serves.iter().find_map(|served| match &served.verb {
+                    Verb::Embed(capabilities) => Some(capabilities),
+                    _ => None,
+                })
+            }) {
+                Some(capabilities) => println!("embed {}: {}", model.id, capabilities.summary()),
+                None => println!("chat  {}", model.id),
+            }
+        }
+    }
+
+    #[test]
+    fn a_model_that_completes_and_embeds_serves_both() {
+        let models = merge_hosts(vec![HostModels {
+            account_id: "host".into(),
+            models: vec![(
+                "both".into(),
+                embedder(&["completion", "embedding"], "llama", 4096, 8192),
+            )],
+            errors: vec![],
+        }]);
+        let served = models[0].serves.as_ref().unwrap();
+        let kinds: Vec<_> = served.iter().map(|s| s.verb.kind().as_str()).collect();
+        assert_eq!(kinds, ["complete", "session", "embed"]);
+        // An unknown family takes Ollama's width and no shorter ones.
+        assert_eq!(embed_capabilities(&models[0]).native_dims, Some(4096));
     }
 
     #[test]

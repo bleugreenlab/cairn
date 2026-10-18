@@ -40,7 +40,9 @@ fn carries(wire: Wire) -> Carries {
         | Wire::OpenAiDecisions
         | Wire::ClaudeStreamJson
         | Wire::ElevenLabsStreamInput
-        | Wire::OpenAiSpeech => Carries {
+        | Wire::OpenAiSpeech
+        | Wire::OpenAiEmbeddings
+        | Wire::CairnEmbed => Carries {
             aspect: false,
             pixels: false,
             native_edit: false,

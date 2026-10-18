@@ -160,8 +160,9 @@ fn modalities(modalities: &Modalities) -> Option<String> {
 /// The verbs grouped by the wire each rides, `complete, session
 /// (openai-chat)`, or `None` for serving nothing. A verb with capabilities
 /// says them inside its own group: `speak (openai-speech: segmented ·
-/// pcm_24000|mp3|opus · speed 25–400%)`, or `image (openrouter-images: ≤4 ·
-/// refs ≤16 · no mask)`.
+/// pcm_24000|mp3|opus · speed 25–400%)`, `image (openrouter-images: ≤4 ·
+/// refs ≤16 · no mask)`, or `embed (openai-embeddings: 2560 · native width
+/// only · query prefix · ≤32 texts)`.
 fn served(serves: &[ServedVerb]) -> Option<String> {
     enum Group<'a> {
         /// Capability-free verbs sharing a wire.
@@ -171,7 +172,10 @@ fn served(serves: &[ServedVerb]) -> Option<String> {
     }
     let mut groups: Vec<Group> = Vec::new();
     for served in serves {
-        if matches!(served.verb, Verb::Speak(_) | Verb::Image(_)) {
+        if matches!(
+            served.verb,
+            Verb::Speak(_) | Verb::Image(_) | Verb::Embed(_)
+        ) {
             groups.push(Group::Capable(served));
             continue;
         }
@@ -196,6 +200,9 @@ fn served(serves: &[ServedVerb]) -> Option<String> {
                     }
                     Verb::Image(capabilities) => {
                         format!("image ({}: {})", served.wire, capabilities.summary())
+                    }
+                    Verb::Embed(capabilities) => {
+                        format!("embed ({}: {})", served.wire, capabilities.summary())
                     }
                     other => format!("{} ({})", other.kind(), served.wire),
                 },
@@ -1242,7 +1249,7 @@ mod tests {
         let bad = read(&orch, "cairn://models/catalog?serves=speech").await;
         assert!(
             bad.starts_with(
-                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, image, speak."
+                "Unknown serves='speech' for cairn://models/catalog; expected one of complete, session, decide, image, speak, embed."
             ),
             "{bad}"
         );
@@ -1298,6 +1305,47 @@ mod tests {
             "{models}"
         );
         assert!(!models.contains("qwen3.8-27b"), "{models}");
+    }
+
+    #[test]
+    fn an_embedding_offer_renders_its_width_purpose_and_limits() {
+        use cairn_models::embed::{families, local_server_limits};
+        use cairn_models::types::catalog::{ServedVerb, Verb, Wire};
+        use cairn_models::types::embedding::EmbeddingCapabilities;
+        let hub = ServedVerb {
+            verb: Verb::Embed(families::capabilities(
+                "qwen/qwen3-embedding-4b",
+                Some(2560),
+                false,
+                local_server_limits(None),
+            )),
+            wire: Wire::OpenAiEmbeddings,
+        };
+        let gateway = ServedVerb {
+            verb: Verb::Embed(EmbeddingCapabilities::cairn_gateway()),
+            wire: Wire::CairnEmbed,
+        };
+        assert_eq!(
+            super::served(&[hub]).as_deref(),
+            Some("embed (openai-embeddings: 2560 · native width only · query prefix · ≤32 texts · ≤32000 chars)")
+        );
+        let mut both = ServedVerb::conversation(Wire::OpenAiChatCompletions);
+        both.push(gateway);
+        assert_eq!(
+            super::served(&both).as_deref(),
+            Some("complete, session (openai-chat); embed (cairn-embed: 1536 · native width only · native purpose · ≤96 texts)")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalog_filters_on_embed() {
+        let orch = seeded_orchestrator().await;
+        let embedding = read(&orch, "cairn://models/catalog?view=models&serves=embed").await;
+        assert!(
+            embedding.contains("Only offers that serve embed"),
+            "{embedding}"
+        );
+        assert!(!embedding.contains("`claude/opus`"), "{embedding}");
     }
 
     #[test]

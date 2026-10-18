@@ -32,7 +32,8 @@ use crate::backends::{
     ResolvedTools, SessionConfig,
 };
 use crate::credentials::{
-    ApiProvider, CustomModelPolicy, CustomProtocol, CustomSampling, ProviderAuth,
+    ApiProvider, CustomEmbeddingModel, CustomModelPolicy, CustomProtocol, CustomSampling,
+    ProviderAuth,
 };
 use crate::orchestrator::Orchestrator;
 use cairn_models::interface::decide::DecisionRoute;
@@ -61,6 +62,8 @@ pub(crate) struct CustomProviderConfig {
     pub(crate) models: CustomModelPolicy,
     pub(crate) sampling: CustomSampling,
     pub(crate) max_output_tokens: i64,
+    /// The embedding models declared beside the chat models, with widths.
+    pub(crate) embeddings: Vec<CustomEmbeddingModel>,
     /// What an OpenAI Images provider can draw; `None` for every other
     /// protocol.
     pub(crate) images: Option<ImageCapabilities>,
@@ -97,6 +100,7 @@ impl CustomProviderConfig {
             models,
             sampling,
             max_output_tokens,
+            embeddings,
             ..
         } = &account.auth
         else {
@@ -115,6 +119,7 @@ impl CustomProviderConfig {
             models: models.clone(),
             sampling: sampling.clone(),
             max_output_tokens: *max_output_tokens,
+            embeddings: embeddings.clone(),
             images: account.auth.image_capabilities(),
         })
     }

@@ -8,11 +8,23 @@
 //! caller to remember.
 
 use crate::config::settings::ProviderNames;
-use crate::credentials::{AccountInfo, ApiProvider, CustomHeader, CustomSampling, ProviderAuth};
+use crate::credentials::{
+    AccountInfo, ApiProvider, CustomEmbeddingModel, CustomHeader, CustomSampling, ProviderAuth,
+};
 use crate::models::{Settings, UpdateSettings};
 use cairn_models::types::catalog::{self, CustomProvider, ProviderDescriptor};
 
 use super::Orchestrator;
+
+/// What one custom provider holds that an edit must carry forward.
+#[derive(Debug, Clone)]
+pub struct InheritedCustomFields {
+    pub api_key: Option<String>,
+    pub headers: Vec<CustomHeader>,
+    pub sampling: CustomSampling,
+    pub max_output_tokens: i64,
+    pub embeddings: Vec<CustomEmbeddingModel>,
+}
 
 impl Orchestrator {
     /// The custom providers this workspace has defined, in account priority
@@ -76,19 +88,17 @@ impl Orchestrator {
 
     /// What one custom provider currently holds that an edit must not destroy:
     /// its bearer key, the values of its operator headers, its sampling
-    /// controls, and its maximum output budget.
+    /// controls, its maximum output budget, and its declared embedding models.
     ///
     /// Exists so that editing a provider can leave them alone. A stored
     /// credential never crosses the boundary to a UI, so a form that changes
     /// the address cannot echo the key back with it; without a way to carry the
     /// unchanged secrets forward, every rename or move would silently clear
-    /// them. Sampling and the output budget are carried for a different reason:
-    /// they are public, but a client written before either field existed omits
-    /// it, and an omission must not read as a request to reset it.
-    pub fn custom_provider_inherited_fields(
-        &self,
-        id: &str,
-    ) -> Option<(Option<String>, Vec<CustomHeader>, CustomSampling, i64)> {
+    /// them. Sampling, the output budget, and declared embedding models are
+    /// carried for a different reason: they are public, but a client written
+    /// before a field existed omits it, and an omission must not read as a
+    /// request to reset it.
+    pub fn custom_provider_inherited_fields(&self, id: &str) -> Option<InheritedCustomFields> {
         let store = self.get_credential_store()?;
         store
             .accounts
@@ -99,13 +109,17 @@ impl Orchestrator {
                     headers,
                     sampling,
                     max_output_tokens,
+                    embeddings,
                     ..
-                } if account.id == id && account.api_provider == ApiProvider::Custom => Some((
-                    api_key.clone(),
-                    headers.clone(),
-                    sampling.clone(),
-                    *max_output_tokens,
-                )),
+                } if account.id == id && account.api_provider == ApiProvider::Custom => {
+                    Some(InheritedCustomFields {
+                        api_key: api_key.clone(),
+                        headers: headers.clone(),
+                        sampling: sampling.clone(),
+                        max_output_tokens: *max_output_tokens,
+                        embeddings: embeddings.clone(),
+                    })
+                }
                 _ => None,
             })
     }

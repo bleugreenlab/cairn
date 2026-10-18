@@ -240,6 +240,7 @@ fn config(name: &str, base_url: &str, models: CustomModelPolicy) -> CustomProvid
         models,
         sampling: CustomSampling::default(),
         max_output_tokens: 32_768,
+        embeddings: Vec::new(),
         images: None,
     }
 }

@@ -18,6 +18,25 @@ mod tests;
 pub(crate) use models::discover_catalog_blocking;
 pub use usage::collect_openrouter_usage_snapshot;
 
+/// The root every OpenRouter API path hangs off.
+pub(crate) const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
+
+/// The embeddings route on this workspace's OpenRouter key, with the headers
+/// every OpenRouter request carries.
+pub(crate) fn embed_route(
+    orch: &Orchestrator,
+) -> Result<cairn_models::interface::embed::EmbedRoute, String> {
+    let api_key =
+        openrouter_api_key(orch).ok_or_else(|| "needs an OpenRouter API key".to_string())?;
+    Ok(cairn_models::embed::openai::route_for(
+        OPENROUTER_BACKEND_KEY,
+        OPENROUTER_BACKEND_NAME,
+        OPENROUTER_API_BASE,
+        None,
+        &http::openrouter_headers(&api_key),
+    ))
+}
+
 use crate::backends::{
     AgentBackend, CompletionError, CompletionOutcome, CompletionRequest, CompletionRole,
     CompletionShape, ResolvedTools, SessionConfig,
@@ -110,7 +129,7 @@ impl AgentBackend for OpenRouterBackend {
         let endpoint = Endpoint {
             provider_name: OPENROUTER_BACKEND_NAME.to_string(),
             backend_key: OPENROUTER_BACKEND_KEY.to_string(),
-            chat_url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            chat_url: format!("{OPENROUTER_API_BASE}/chat/completions"),
             headers: http::openrouter_headers(&api_key),
         };
         let started = Instant::now();
@@ -165,11 +184,11 @@ impl AgentBackend for OpenRouterBackend {
         ServedVerb::conversation(Wire::OpenAiChatCompletions)
     }
 
-    /// The chat listing with the image listing merged in. The catalog refresh
-    /// reads [`discover_catalog_blocking`] directly, so a failed image listing
-    /// is reported beside chat models that did load.
+    /// The chat listing with the image and embeddings listings merged in. The
+    /// catalog refresh reads [`discover_catalog_blocking`] directly, so a
+    /// failed media listing is reported beside chat models that did load.
     fn discover_models(&self) -> Result<Vec<DiscoveredModel>, String> {
-        match models::discover_catalog_blocking() {
+        match models::discover_catalog_blocking(&[]) {
             (models, Some(error)) if models.is_empty() => Err(error),
             (models, _) => Ok(models),
         }

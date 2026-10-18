@@ -23,6 +23,7 @@ pub mod custom_providers;
 mod decide;
 pub(crate) use decide::DecisionFailure;
 pub(crate) mod default_branch_sync;
+mod embed;
 pub use decide::DecisionDiagnostic;
 pub mod device_presence;
 pub mod docs;
@@ -3122,14 +3123,21 @@ impl Orchestrator {
             crate::backends::codex::discover_catalog_blocking(self)
         } else if backend_name == "ollama" {
             crate::backends::ollama::models::discover_catalog_blocking(self)
-        } else if backend_name == crate::backends::openrouter::OPENROUTER_BACKEND_KEY {
-            // Chat and image models come from two listings; one failing must
-            // neither hide the other nor go unsaid.
-            crate::backends::openrouter::discover_catalog_blocking()
         } else if backend_name == crate::backends::actual::ACTUAL_BACKEND_KEY {
             // Inventory is per target, so discovery needs the configured
             // accounts rather than a vendor-wide list.
             crate::backends::actual::models::discover_catalog_blocking(self)
+        } else if backend_name == crate::backends::openrouter::OPENROUTER_BACKEND_KEY {
+            // Chat, image and embeddings listings, read side by side; one
+            // failing must neither hide the others nor go unsaid, and a failed
+            // chat or embeddings listing keeps what the last good one found.
+            let previous = self
+                .model_catalog
+                .read()
+                .ok()
+                .and_then(|catalog| catalog.get(backend_name).map(|entry| entry.models.clone()))
+                .unwrap_or_default();
+            crate::backends::openrouter::discover_catalog_blocking(&previous)
         } else {
             match backend.discover_models() {
                 Ok(models) => (models, None),
@@ -3140,15 +3148,27 @@ impl Orchestrator {
         // A failed refresh must not erase the last usable catalog. The error is
         // retained so clients can label these models as stale and offer Retry;
         // the prior successful timestamp remains the truthful age of the data.
-        if error.is_some() && models.is_empty() {
+        if error.is_some() {
             if let Some(previous) = self
                 .model_catalog
                 .read()
                 .ok()
                 .and_then(|catalog| catalog.get(backend_name).cloned())
             {
-                models = previous.models;
-                refreshed_at = previous.refreshed_at;
+                if models.is_empty() {
+                    models = previous.models;
+                    refreshed_at = previous.refreshed_at;
+                } else if cairn_models::types::catalog::custom_account_id(backend_name).is_some() {
+                    // A custom provider's declared embedding models stay
+                    // offered when its listing fails; the chat models that
+                    // listing named are kept from the last good refresh
+                    // rather than dropped beside them.
+                    for model in previous.models {
+                        if !models.iter().any(|known| known.id == model.id) {
+                            models.push(model);
+                        }
+                    }
+                }
             }
         }
         let entry = ProviderModelCatalog {

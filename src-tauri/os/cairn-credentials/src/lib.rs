@@ -252,6 +252,13 @@ pub enum ProviderAuth {
         /// Maximum tokens the endpoint may generate for one agent-loop turn.
         #[serde(default = "default_custom_max_output_tokens")]
         max_output_tokens: i64,
+        /// The embedding models this endpoint serves beside its chat models,
+        /// each with its width. A chat hub serves both on one key, so they are
+        /// declared here rather than as a second provider; a declared id serves
+        /// `embed` and nothing else. Set through
+        /// [`ProviderAuth::with_embedding_models`].
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        embeddings: Vec<CustomEmbeddingModel>,
         /// What an OpenAI Images endpoint can draw, as its operator or host
         /// declared it. Absent means [`ImageCapabilities::openai_images_minimal`].
         /// Set through [`ProviderAuth::with_image_capabilities`]. Boxed: it is
@@ -259,6 +266,22 @@ pub enum ProviderAuth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         images: Option<Box<ImageCapabilities>>,
     },
+}
+
+/// One embedding model a custom provider declares, and the width its vectors
+/// come back at.
+///
+/// The width is the operator's word, because no OpenAI-compatible listing
+/// reports it. Shorter widths are declared only by a host that knows its
+/// server honours `dimensions`: many ignore the field and answer at full
+/// width, which the facet then refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEmbeddingModel {
+    pub id: String,
+    pub dims: u32,
+    #[serde(default)]
+    pub widths: cairn_models_types::embedding::EmbeddingWidths,
 }
 
 const REDACTED: &str = "<redacted>";
@@ -299,6 +322,7 @@ impl std::fmt::Debug for ProviderAuth {
                 models,
                 sampling,
                 max_output_tokens,
+                embeddings,
                 images,
             } => f
                 .debug_struct("CustomEndpoint")
@@ -312,6 +336,7 @@ impl std::fmt::Debug for ProviderAuth {
                 .field("models", models)
                 .field("sampling", sampling)
                 .field("max_output_tokens", max_output_tokens)
+                .field("embeddings", embeddings)
                 .field("images", images)
                 .finish(),
         }
@@ -648,8 +673,61 @@ impl ProviderAuth {
             models,
             sampling,
             max_output_tokens,
+            embeddings: Vec::new(),
             images: None,
         })
+    }
+
+    /// This custom endpoint with `models` as the embedding models it serves,
+    /// replacing any it declared. Anything but a custom endpoint is returned
+    /// unchanged.
+    ///
+    /// Refused: an id that is blank or declared twice, a zero width, a width
+    /// set that contradicts the native width, and any declaration on a
+    /// Decisions provider, which answers decisions and nothing else.
+    pub fn with_embedding_models(
+        mut self,
+        models: Vec<CustomEmbeddingModel>,
+    ) -> Result<Self, String> {
+        let mut resolved: Vec<CustomEmbeddingModel> = Vec::with_capacity(models.len());
+        for model in models {
+            let id = model.id.trim().to_string();
+            if id.is_empty() {
+                return Err("an embedding model needs an id".to_string());
+            }
+            if resolved.iter().any(|known| known.id == id) {
+                return Err(format!("embedding model '{id}' is declared twice"));
+            }
+            if model.dims == 0 {
+                return Err(format!(
+                    "embedding model '{id}' needs its width (the length of the vectors it returns)"
+                ));
+            }
+            cairn_models_types::embedding::EmbeddingCapabilities {
+                native_dims: Some(model.dims),
+                widths: model.widths.clone(),
+                purpose: cairn_models_types::embedding::PurposeHandling::Ignored,
+                limits: Default::default(),
+            }
+            .validate()
+            .map_err(|error| format!("embedding model '{id}': {error}"))?;
+            resolved.push(CustomEmbeddingModel { id, ..model });
+        }
+        if let Self::CustomEndpoint {
+            protocol,
+            embeddings,
+            ..
+        } = &mut self
+        {
+            if *protocol != CustomProtocol::OpenAiChatCompletions && !resolved.is_empty() {
+                return Err(format!(
+                    "embedding models are declared on an OpenAI chat provider, not an {} one",
+                    protocol.as_str()
+                ));
+            }
+            *embeddings = resolved;
+        }
+        Ok(self)
     }
 
     /// This custom endpoint, declaring what its images can do. A host that
@@ -1680,6 +1758,9 @@ pub struct AccountInfo {
     /// Non-secret generation settings for a custom provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sampling: Option<CustomSampling>,
+    /// The embedding models a custom provider declares, with their widths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    embedding_models: Vec<CustomEmbeddingModel>,
     compatible_backends: Vec<String>,
     project_id: Option<String>,
     sort_order: i32,
@@ -1744,6 +1825,10 @@ impl From<&ProviderAccount> for AccountInfo {
                     Some(sampling.clone())
                 }
                 _ => None,
+            },
+            embedding_models: match &account.auth {
+                ProviderAuth::CustomEndpoint { embeddings, .. } => embeddings.clone(),
+                _ => Vec::new(),
             },
             target_kind: match &account.auth {
                 ProviderAuth::ActualTarget { kind, .. } => Some(kind.as_str().to_string()),
@@ -3128,6 +3213,94 @@ mod tests {
             panic!("expected an explicit list");
         };
         assert_eq!(ids, &["qwen3.8-27b", "Meta-Llama-3.1-8B-Instruct"]);
+    }
+
+    fn embedding(id: &str, dims: u32) -> CustomEmbeddingModel {
+        CustomEmbeddingModel {
+            id: id.into(),
+            dims,
+            widths: Default::default(),
+        }
+    }
+
+    #[test]
+    fn embedding_models_are_declared_beside_chat_models_and_validated() {
+        use cairn_models_types::embedding::EmbeddingWidths;
+        let chat = custom(
+            "http://hub/v1",
+            Some("sk"),
+            &[],
+            CustomModelPolicy::Discover,
+        )
+        .unwrap();
+        let auth = chat
+            .clone()
+            .with_embedding_models(vec![embedding("  qwen/qwen3-embedding-4b ", 2560)])
+            .unwrap();
+        let ProviderAuth::CustomEndpoint { embeddings, .. } = &auth else {
+            panic!("a custom endpoint")
+        };
+        assert_eq!(embeddings, &[embedding("qwen/qwen3-embedding-4b", 2560)]);
+        assert!(format!("{auth:?}").contains("qwen/qwen3-embedding-4b"));
+
+        for (models, refusal) in [
+            (vec![embedding(" ", 768)], "needs an id"),
+            (
+                vec![embedding("a", 768), embedding("a", 768)],
+                "declared twice",
+            ),
+            (vec![embedding("a", 0)], "needs its width"),
+            (
+                vec![CustomEmbeddingModel {
+                    widths: EmbeddingWidths::UpTo { min: 1024 },
+                    ..embedding("a", 768)
+                }],
+                "floor of 1024",
+            ),
+        ] {
+            let error = chat.clone().with_embedding_models(models).unwrap_err();
+            assert!(error.contains(refusal), "{error}");
+        }
+
+        let decisions = ProviderAuth::custom_endpoint(
+            "http://gateway/v1",
+            CustomProtocol::Decisions,
+            None,
+            &[],
+            CustomModelPolicy::Explicit {
+                ids: vec!["typesafe-ai/jev".into()],
+            },
+            CustomSampling::default(),
+            DEFAULT_CUSTOM_MAX_OUTPUT_TOKENS,
+        )
+        .unwrap();
+        assert!(decisions
+            .clone()
+            .with_embedding_models(vec![embedding("e", 768)])
+            .unwrap_err()
+            .contains("not an openai-decisions one"));
+        assert!(decisions.with_embedding_models(Vec::new()).is_ok());
+    }
+
+    #[test]
+    fn a_stored_endpoint_reads_with_or_without_embedding_models() {
+        let without = custom("http://hub/v1", None, &[], CustomModelPolicy::Discover).unwrap();
+        let round_trip = |auth: &ProviderAuth| {
+            let json = serde_json::to_value(auth).unwrap();
+            let read: ProviderAuth = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&read).unwrap(), json);
+            json
+        };
+        let json = round_trip(&without);
+        assert!(json.get("embeddings").is_none(), "{json}");
+
+        let with = without
+            .with_embedding_models(vec![embedding("nomic-embed-text", 768)])
+            .unwrap();
+        assert_eq!(
+            round_trip(&with)["embeddings"],
+            serde_json::json!([{"id": "nomic-embed-text", "dims": 768, "widths": "nativeOnly"}])
+        );
     }
 
     #[test]

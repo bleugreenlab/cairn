@@ -10,11 +10,17 @@
 //! Model ids are preserved byte for byte in both shapes. The id is what goes
 //! back on the wire as `model`, so a tidied-up version of it is a name that no
 //! longer resolves.
+//!
+//! Embedding models the operator declared ride on top of either shape: a
+//! listed id they name serves `embed` (and only `embed`), and one the listing
+//! did not name is added. Because they are the operator's word, they stay
+//! offered when the listing fails.
 
 use super::CustomProviderConfig;
 use crate::credentials::{CustomModelPolicy, CustomProtocol};
+use cairn_models::embed::{families, local_server_limits};
 use cairn_models::interface::speak;
-use cairn_models::types::catalog::{DiscoveredModel, ServedVerb, Verb};
+use cairn_models::types::catalog::{DiscoveredModel, Modalities, Modality, ServedVerb, Verb, Wire};
 use cairn_models::types::tokenizers::tokenizer_for;
 use serde::Deserialize;
 use std::error::Error;
@@ -53,6 +59,46 @@ pub(crate) fn discover_blocking(
     if config.protocol.is_speech() {
         return discover_speech(config);
     }
+    let (mut models, error) = listed(config);
+    declare_embeddings(config, &mut models);
+    (models, error)
+}
+
+/// Each declared embedding model, serving `embed` over the embeddings route at
+/// its declared width. Purpose handling comes from the model's family.
+fn declare_embeddings(config: &CustomProviderConfig, models: &mut Vec<DiscoveredModel>) {
+    for declared in &config.embeddings {
+        let mut capabilities = families::capabilities(
+            &declared.id,
+            Some(declared.dims),
+            false,
+            local_server_limits(None),
+        );
+        capabilities.widths = declared.widths.clone();
+        let serves = Some(vec![ServedVerb {
+            verb: Verb::Embed(capabilities),
+            wire: Wire::OpenAiEmbeddings,
+        }]);
+        let modalities = Some(Modalities {
+            input: vec![Modality::Text],
+            output: vec![Modality::Embeddings],
+        });
+        match models.iter_mut().find(|model| model.id == declared.id) {
+            Some(model) => {
+                model.serves = serves;
+                model.modalities = modalities;
+            }
+            None => {
+                let mut model = model(config, declared.id.clone(), None, None);
+                model.serves = serves;
+                model.modalities = modalities;
+                models.push(model);
+            }
+        }
+    }
+}
+
+fn listed(config: &CustomProviderConfig) -> (Vec<DiscoveredModel>, Option<String>) {
     match &config.models {
         CustomModelPolicy::Explicit { ids } => (
             ids.iter()
@@ -260,4 +306,104 @@ fn with_causes(context: &str, error: &dyn Error) -> String {
         source = cause.source();
     }
     message
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::{CustomEmbeddingModel, CustomSampling};
+    use cairn_models::types::catalog::VerbKind;
+    use cairn_models::types::embedding::EmbeddingWidths;
+
+    fn config(base_url: &str, models: CustomModelPolicy) -> CustomProviderConfig {
+        CustomProviderConfig {
+            account_id: "acc_hub".into(),
+            display_name: "Hub".into(),
+            base_url: base_url.into(),
+            protocol: CustomProtocol::OpenAiChatCompletions,
+            headers: vec![],
+            models,
+            sampling: CustomSampling::default(),
+            max_output_tokens: 1,
+            images: None,
+            embeddings: vec![
+                CustomEmbeddingModel {
+                    id: "qwen/qwen3-embedding-4b".into(),
+                    dims: 2560,
+                    widths: EmbeddingWidths::NativeOnly,
+                },
+                CustomEmbeddingModel {
+                    id: "nomic-embed-text".into(),
+                    dims: 768,
+                    widths: EmbeddingWidths::UpTo { min: 64 },
+                },
+            ],
+        }
+    }
+
+    fn find<'a>(models: &'a [DiscoveredModel], id: &str) -> &'a DiscoveredModel {
+        models.iter().find(|model| model.id == id).expect(id)
+    }
+
+    fn embed_capabilities(
+        model: &DiscoveredModel,
+    ) -> &cairn_models::types::embedding::EmbeddingCapabilities {
+        let served = model.serves.as_ref().expect("a per-model claim");
+        assert_eq!(served.len(), 1, "serves only embed: {served:?}");
+        assert_eq!(served[0].wire, Wire::OpenAiEmbeddings);
+        match &served[0].verb {
+            Verb::Embed(capabilities) => capabilities,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_declared_id_serves_only_embed_and_an_unlisted_one_is_added() {
+        let (models, error) = discover_blocking(&config(
+            "http://hub.invalid/v1",
+            CustomModelPolicy::Explicit {
+                ids: vec!["big".into(), "qwen/qwen3-embedding-4b".into()],
+            },
+        ));
+        assert_eq!(error, None);
+        assert_eq!(models.len(), 3);
+        // A chat model keeps the provider-wide claim.
+        assert_eq!(find(&models, "big").serves, None);
+        let qwen = embed_capabilities(find(&models, "qwen/qwen3-embedding-4b"));
+        assert_eq!(qwen.native_dims, Some(2560));
+        // Purpose from the family: Qwen3 instructs its queries.
+        assert!(matches!(
+            &qwen.purpose,
+            cairn_models::types::embedding::PurposeHandling::Prefix { document, .. } if document.is_empty()
+        ));
+        let nomic = find(&models, "nomic-embed-text");
+        assert_eq!(nomic.serving_account_ids, vec!["acc_hub".to_string()]);
+        assert_eq!(
+            embed_capabilities(nomic).widths,
+            EmbeddingWidths::UpTo { min: 64 }
+        );
+        assert!(!nomic
+            .serves
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|served| served.verb.kind() == VerbKind::Complete));
+    }
+
+    #[test]
+    fn declared_models_stay_offered_when_the_listing_fails() {
+        // Nothing listens on port 9: the listing fails at once.
+        let (models, error) = discover_blocking(&config(
+            "http://127.0.0.1:9/v1",
+            CustomModelPolicy::Discover,
+        ));
+        assert!(error.unwrap().contains("model listing failed"));
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            ["qwen/qwen3-embedding-4b", "nomic-embed-text"]
+        );
+    }
 }

@@ -3,6 +3,10 @@
 //! cairn-core stays Tauri-free and AWS-free: embeddings are produced by the
 //! gateway, authenticated with the device JWT. The token is supplied by a
 //! provider closure so the host wires it to its account manager.
+//!
+//! This is the legacy path to the gateway. The facet's `embed` verb reaches the
+//! same gateway (and every other embedding provider) through
+//! `Orchestrator::embed`; callers move there, and this client goes, together.
 
 use std::sync::Arc;
 
@@ -11,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::ApiConfig;
 
 /// Cohere Embed v4 model name (as returned by the gateway) and vector width.
-pub const COHERE_MODEL: &str = "cohere-embed-v4";
+pub const COHERE_MODEL: &str = cairn_models::types::embedding::CAIRN_GATEWAY_EMBED_MODEL;
 pub const COHERE_DIMS: u32 = 1536;
 
 /// Asymmetric input type. Documents/corpus embed as `SearchDocument`; queries

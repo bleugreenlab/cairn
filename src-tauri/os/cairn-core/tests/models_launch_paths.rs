@@ -97,7 +97,7 @@ fn contains_word(code: &str, needle: &str) -> bool {
     })
 }
 
-/// The protocol families' POSTs, streamed and whole.
+/// The protocol families' POSTs, streamed and whole, and the embedding wires'.
 const WIRE_POSTS: &[&str] = &[
     "post_chat_completion",
     "post_chat_completion_streaming",
@@ -105,6 +105,8 @@ const WIRE_POSTS: &[&str] = &[
     "post_message_streaming",
     "post_response",
     "post_response_streaming",
+    "post_embeddings",
+    "post_gateway_embed",
 ];
 
 #[test]

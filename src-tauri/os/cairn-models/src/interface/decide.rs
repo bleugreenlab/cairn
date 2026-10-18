@@ -87,7 +87,9 @@ pub fn measured_by(wire: Wire) -> Option<MeasuredBy> {
         | Wire::OpenRouterImages
         | Wire::OpenAiImages
         | Wire::ElevenLabsStreamInput
-        | Wire::OpenAiSpeech => None,
+        | Wire::OpenAiSpeech
+        | Wire::OpenAiEmbeddings
+        | Wire::CairnEmbed => None,
     }
 }
 

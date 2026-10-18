@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use cairn_models::embed::families;
 use cairn_models::types::catalog::{
     DiscoveredModel, DiscoveredReasoningEffort, Modalities, Modality, ModelPricing, Price,
-    ServedVerb, Wire,
+    ServedVerb, Verb, Wire,
 };
+use cairn_models::types::embedding::BatchLimits;
 use cairn_models::types::tokenizers::tokenizer_for;
 use cairn_models::types::usage::{BillingUnit, Charge, Meter};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
@@ -11,30 +14,49 @@ use serde::Deserialize;
 use serde_json::Value;
 
 const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
+const OPENROUTER_EMBEDDING_MODELS_URL: &str = "https://openrouter.ai/api/v1/embeddings/models";
 
-/// Bounds each request of the image discovery pass.
-const IMAGE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Bounds the embeddings listing, read beside the chat listing on a refresh.
+const EMBEDDING_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Every model OpenRouter serves: the chat listing, with the image listing
-/// merged in, and what went wrong with either.
+/// At most this many texts per OpenRouter embeddings request. Its API states
+/// no cap; this keeps one request well under every upstream's (OpenAI's is
+/// 2048, Cohere's 96 is enforced by OpenRouter itself).
+const OPENROUTER_EMBED_MAX_TEXTS: u32 = 128;
+
+/// Every model OpenRouter serves: the chat listing, with the image and
+/// embeddings listings merged in, and what went wrong with any of them.
+/// `previous` is the last catalog the refresh kept.
 ///
-/// The two listings are read side by side. A failed image listing keeps the
-/// chat models and says `image models unavailable: ...`; it is never silent.
-pub(crate) fn discover_catalog_blocking() -> (Vec<DiscoveredModel>, Option<String>) {
-    let (chat, images) = std::thread::scope(|scope| {
+/// The three listings are read side by side, and a listing that fails is never
+/// silent. A failed chat listing answers no models, so the refresh keeps its
+/// last catalog whole rather than replacing it with media models alone. A
+/// failed image listing keeps the chat models and says `image models
+/// unavailable: ...`. A failed embeddings listing keeps the fresh chat models,
+/// carries the last listing's embedding offers onto them, and says `embedding
+/// models unavailable: ...`.
+pub(crate) fn discover_catalog_blocking(
+    previous: &[DiscoveredModel],
+) -> (Vec<DiscoveredModel>, Option<String>) {
+    let (chat, images, embeddings) = std::thread::scope(|scope| {
         let images =
             scope.spawn(|| cairn_models::image::openrouter::discover(IMAGE_DISCOVERY_TIMEOUT));
+        let embeddings = scope.spawn(discover_embedding_models_blocking);
         let chat = discover_models_blocking(None);
         let images = images
             .join()
             .unwrap_or_else(|_| Err("image discovery panicked".to_string()));
-        (chat, images)
+        let embeddings = embeddings
+            .join()
+            .unwrap_or_else(|_| Err("embedding discovery panicked".to_string()));
+        (chat, images, embeddings)
     });
-    let mut errors = Vec::new();
-    let mut models = chat.unwrap_or_else(|error| {
-        errors.push(error);
-        Vec::new()
-    });
+    let (mut models, embedding_error) = assemble(chat, embeddings, previous);
+    if models.is_empty() {
+        // The chat listing failed: answer nothing, keeping the last catalog.
+        return (models, embedding_error);
+    }
+    let mut errors: Vec<String> = embedding_error.into_iter().collect();
     match images {
         Ok(found) => {
             if let Some(first) = found.failures.first() {
@@ -49,6 +71,167 @@ pub(crate) fn discover_catalog_blocking() -> (Vec<DiscoveredModel>, Option<Strin
     }
     (models, (!errors.is_empty()).then(|| errors.join("; ")))
 }
+
+fn assemble(
+    chat: Result<Vec<DiscoveredModel>, String>,
+    embeddings: Result<Vec<DiscoveredModel>, String>,
+    previous: &[DiscoveredModel],
+) -> (Vec<DiscoveredModel>, Option<String>) {
+    let mut models = match chat {
+        Ok(models) => models,
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    match embeddings {
+        Ok(found) => {
+            merge_embedding_models(&mut models, found);
+            (models, None)
+        }
+        Err(error) => {
+            merge_embedding_models(&mut models, previous_embedding_offers(previous));
+            (
+                models,
+                Some(format!(
+                    "embedding models unavailable: {error}; the last listing's embedding models are kept"
+                )),
+            )
+        }
+    }
+}
+
+/// The embedding offers in a previous catalog, each reduced to the `embed`
+/// verbs it served, ready to merge onto a fresh chat listing.
+fn previous_embedding_offers(previous: &[DiscoveredModel]) -> Vec<DiscoveredModel> {
+    previous
+        .iter()
+        .filter_map(|model| {
+            let embed: Vec<ServedVerb> = model
+                .serves
+                .as_ref()?
+                .iter()
+                .filter(|served| matches!(served.verb, Verb::Embed(_)))
+                .cloned()
+                .collect();
+            (!embed.is_empty()).then(|| DiscoveredModel {
+                serves: Some(embed),
+                ..model.clone()
+            })
+        })
+        .collect()
+}
+
+/// Merge the embeddings listing into the chat listing by id. A model already
+/// listed keeps what it serves and gains `embed`; a new one is added as the
+/// embeddings listing describes it.
+pub(crate) fn merge_embedding_models(
+    models: &mut Vec<DiscoveredModel>,
+    embeddings: Vec<DiscoveredModel>,
+) {
+    for embedding in embeddings {
+        let Some(model) = models.iter_mut().find(|model| model.id == embedding.id) else {
+            models.push(embedding);
+            continue;
+        };
+        // No claim from chat discovery meant OpenRouter's provider-wide
+        // declaration, which is conversation over chat completions.
+        let mut serves = model
+            .serves
+            .take()
+            .unwrap_or_else(|| ServedVerb::conversation(Wire::OpenAiChatCompletions));
+        serves.extend(embedding.serves.unwrap_or_default());
+        model.serves = Some(serves);
+    }
+}
+
+/// The public `/api/v1/embeddings/models` listing.
+fn discover_embedding_models_blocking() -> Result<Vec<DiscoveredModel>, String> {
+    let body = listing(
+        OPENROUTER_EMBEDDING_MODELS_URL,
+        None,
+        "embedding model catalog",
+        Some(EMBEDDING_DISCOVERY_TIMEOUT),
+    )?;
+    decode_embedding_models(&body)
+}
+
+/// Each embeddings listing entry as a model serving `embed` over OpenAI's
+/// embeddings route.
+///
+/// The listing names no widths, so width and purpose come from the model's
+/// family; a model the family table does not know has an unknown width and is
+/// asked only for its native one. Shorter widths are offered only for OpenAI's
+/// `text-embedding-3` models, the one family OpenRouter is known to pass
+/// `dimensions` through for.
+pub(crate) fn decode_embedding_models(body: &str) -> Result<Vec<DiscoveredModel>, String> {
+    let response: ModelsResponse = serde_json::from_str(body)
+        .map_err(|error| format!("OpenRouter embedding model catalog JSON failed: {error}"))?;
+    Ok(response
+        .data
+        .into_iter()
+        .map(|entry| {
+            let mut model = map_model(entry);
+            let limits = BatchLimits {
+                max_texts: Some(OPENROUTER_EMBED_MAX_TEXTS),
+                max_chars: None,
+                max_input_tokens: model
+                    .context_window
+                    .and_then(|window| u32::try_from(window).ok()),
+            };
+            let matryoshka = model.id.starts_with("openai/text-embedding-3");
+            model.serves = Some(vec![ServedVerb {
+                verb: Verb::Embed(families::capabilities(&model.id, None, matryoshka, limits)),
+                wire: Wire::OpenAiEmbeddings,
+            }]);
+            model
+        })
+        .collect())
+}
+
+/// One GET of a public OpenRouter listing, with a key when there is one.
+fn listing(
+    url: &str,
+    api_key: Option<&str>,
+    what: &str,
+    timeout: Option<Duration>,
+) -> Result<String, String> {
+    let mut headers = HeaderMap::new();
+    if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
+        let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
+            .map_err(|error| format!("invalid OpenRouter API key header: {error}"))?;
+        headers.insert(AUTHORIZATION, value);
+    }
+    headers.insert(
+        "HTTP-Referer",
+        HeaderValue::from_static("https://cairn.computer"),
+    );
+    headers.insert("X-OpenRouter-Title", HeaderValue::from_static("Cairn"));
+
+    let mut client = reqwest::blocking::Client::builder();
+    if let Some(timeout) = timeout {
+        client = client.timeout(timeout);
+    }
+    let response = client
+        .build()
+        .map_err(|error| format!("OpenRouter {what} client failed: {error}"))?
+        .get(url)
+        .headers(headers)
+        .send()
+        .map_err(|error| format!("OpenRouter {what} request failed: {error}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .map_err(|error| format!("OpenRouter {what} body failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "OpenRouter {what} returned HTTP {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+    Ok(body)
+}
+
+/// Bounds each request of the image discovery pass.
+const IMAGE_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Merge the image listing into the chat listing by id. A model in both
 /// (Gemini's image models) keeps what it serves in chat and gains `image`;
@@ -143,34 +326,7 @@ struct OpenRouterReasoning {
 }
 
 pub fn discover_models_blocking(api_key: Option<&str>) -> Result<Vec<DiscoveredModel>, String> {
-    let mut headers = HeaderMap::new();
-    if let Some(api_key) = api_key.filter(|key| !key.trim().is_empty()) {
-        let value = HeaderValue::from_str(&format!("Bearer {api_key}"))
-            .map_err(|error| format!("invalid OpenRouter API key header: {error}"))?;
-        headers.insert(AUTHORIZATION, value);
-    }
-    headers.insert(
-        "HTTP-Referer",
-        HeaderValue::from_static("https://cairn.computer"),
-    );
-    headers.insert("X-OpenRouter-Title", HeaderValue::from_static("Cairn"));
-
-    let response = reqwest::blocking::Client::new()
-        .get(OPENROUTER_MODELS_URL)
-        .headers(headers)
-        .send()
-        .map_err(|error| format!("OpenRouter model catalog request failed: {error}"))?;
-    let status = response.status();
-    let body = response
-        .text()
-        .map_err(|error| format!("OpenRouter model catalog body failed: {error}"))?;
-    if !status.is_success() {
-        return Err(format!(
-            "OpenRouter model catalog returned HTTP {}: {}",
-            status.as_u16(),
-            body
-        ));
-    }
+    let body = listing(OPENROUTER_MODELS_URL, api_key, "model catalog", None)?;
     decode_models(&body)
 }
 
@@ -220,11 +376,11 @@ fn map_model(model: OpenRouterModel) -> DiscoveredModel {
     }
 }
 
-/// What a model takes and gives, and therefore what it serves. Every model
-/// OpenRouter routes is reached over chat completions, so a model that gives
-/// text serves Complete and Session there. One that gives no text (an image or
-/// embeddings model) serves nothing Cairn has, which is said rather than left
-/// to the provider-wide default.
+/// What a model takes and gives, and therefore what it serves over chat. A
+/// model that gives text serves Complete and Session there. One that gives no
+/// text (an image or embeddings model) serves nothing over chat, which is said
+/// rather than left to the provider-wide default; an embedding model gains
+/// `embed` from the embeddings listing.
 fn capabilities(
     architecture: Option<Architecture>,
 ) -> (Option<Modalities>, Option<Vec<ServedVerb>>) {
@@ -302,9 +458,132 @@ fn pricing(raw: BTreeMap<String, Value>) -> ModelPricing {
 
 #[cfg(test)]
 mod tests {
-    use super::decode_models;
-    use cairn_models::types::catalog::{DiscoveredModel, Modality, ServedVerb, VerbKind, Wire};
+    use super::{assemble, decode_embedding_models, decode_models};
+    use cairn_models::types::catalog::{
+        DiscoveredModel, Modality, ServedVerb, Verb, VerbKind, Wire,
+    };
+    use cairn_models::types::embedding::EmbeddingWidths;
     use cairn_models::types::usage::{BillingUnit, Charge};
+
+    /// A slice of the live `/api/v1/embeddings/models` listing (2026-10-17).
+    const EMBEDDINGS: &str = include_str!("testdata/embeddings_models.json");
+
+    fn embed_capabilities(
+        model: &DiscoveredModel,
+    ) -> &cairn_models::types::embedding::EmbeddingCapabilities {
+        model
+            .serves
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find_map(|served| match &served.verb {
+                Verb::Embed(capabilities) if served.wire == Wire::OpenAiEmbeddings => {
+                    Some(capabilities)
+                }
+                _ => None,
+            })
+            .expect("serves embed over the embeddings route")
+    }
+
+    #[test]
+    fn the_embeddings_listing_merges_into_the_chat_listing_by_id() {
+        let chat = decode_models(LIVE).unwrap();
+        let chat_count = chat.len();
+        let embeddings = decode_embedding_models(EMBEDDINGS).unwrap();
+        let (models, error) = assemble(Ok(chat), Ok(embeddings), &[]);
+        assert_eq!(error, None);
+        // voyage-code-4 is in both listings: merged, not duplicated.
+        assert_eq!(models.len(), chat_count + 3);
+        let voyage = model(&models, "voyageai/voyage-code-4");
+        assert_eq!(voyage.serves.as_ref().unwrap().len(), 1);
+        assert_eq!(embed_capabilities(voyage).native_dims, None);
+
+        let small = model(&models, "openai/text-embedding-3-small");
+        let capabilities = embed_capabilities(small);
+        assert_eq!(capabilities.native_dims, Some(1536));
+        assert_eq!(capabilities.widths, EmbeddingWidths::UpTo { min: 1 });
+        assert_eq!(capabilities.limits.max_texts, Some(128));
+        assert_eq!(capabilities.limits.max_input_tokens, Some(8192));
+        assert_eq!(
+            small.modalities.as_ref().unwrap().output,
+            vec![Modality::Embeddings]
+        );
+        assert_eq!(
+            small
+                .pricing
+                .as_ref()
+                .unwrap()
+                .usd_per(Charge::Input, None, BillingUnit::Tokens),
+            Some("0.00000002")
+        );
+
+        // OpenRouter is not known to pass `dimensions` through for Qwen: the
+        // family's width, native only.
+        let qwen = embed_capabilities(model(&models, "qwen/qwen3-embedding-4b"));
+        assert_eq!(qwen.native_dims, Some(2560));
+        assert_eq!(qwen.widths, EmbeddingWidths::NativeOnly);
+
+        // A model the family table does not know: width unknown, native only.
+        let liquid = embed_capabilities(model(&models, "liquid/lfm-2.5-embedding-350m:free"));
+        assert_eq!(liquid.native_dims, None);
+        assert_eq!(liquid.validate(), Ok(()));
+
+        // Chat models are untouched.
+        assert_eq!(
+            model(&models, "anthropic/claude-haiku-5.5").serves,
+            Some(ServedVerb::conversation(Wire::OpenAiChatCompletions))
+        );
+    }
+
+    #[test]
+    fn a_failed_embeddings_listing_keeps_fresh_chat_models_and_the_last_embedding_offers() {
+        let previous = previous_catalog();
+        let chat = decode_models(LIVE).unwrap();
+        let (models, error) = assemble(Ok(chat), Err("HTTP 503".into()), &previous);
+        assert_eq!(
+            error.as_deref(),
+            Some("embedding models unavailable: HTTP 503; the last listing's embedding models are kept")
+        );
+        assert_eq!(models.len(), previous.len());
+        // An embedding-only model the chat listing never names is kept.
+        assert_eq!(
+            embed_capabilities(model(&models, "qwen/qwen3-embedding-4b")).native_dims,
+            Some(2560)
+        );
+        // A model in both listings keeps its embed verb, once.
+        let voyage = model(&models, "voyageai/voyage-code-4");
+        assert_eq!(voyage.serves.as_ref().unwrap().len(), 1);
+        embed_capabilities(voyage);
+        // Chat models are the fresh listing's.
+        assert_eq!(
+            model(&models, "anthropic/claude-haiku-5.5").serves,
+            Some(ServedVerb::conversation(Wire::OpenAiChatCompletions))
+        );
+    }
+
+    #[test]
+    fn a_failed_chat_listing_answers_nothing_so_the_last_catalog_stands() {
+        // Embedding models alone would replace the chat catalog the refresh
+        // keeps; an empty answer with the error keeps it whole instead.
+        let (models, error) = assemble(
+            Err("chat down".into()),
+            decode_embedding_models(EMBEDDINGS),
+            &previous_catalog(),
+        );
+        assert!(models.is_empty());
+        assert_eq!(error.as_deref(), Some("chat down"));
+    }
+
+    /// The catalog a previous refresh kept: both listings, merged.
+    fn previous_catalog() -> Vec<DiscoveredModel> {
+        let (models, error) = assemble(
+            decode_models(LIVE),
+            decode_embedding_models(EMBEDDINGS),
+            &[],
+        );
+        assert_eq!(error, None);
+        models
+    }
 
     /// A slice of the live `/api/v1/models` listing (2026-10-15), descriptions
     /// trimmed, plus OpenRouter's own documented example entry (`openai/gpt-4`),
@@ -394,7 +673,7 @@ mod tests {
         let voyage = model(&models, "voyageai/voyage-code-4");
         assert_eq!(
             voyage.modalities.as_ref().unwrap().output,
-            vec![Modality::Other("embeddings".into())]
+            vec![Modality::Embeddings]
         );
     }
 
@@ -587,8 +866,32 @@ mod tests {
     #[ignore = "reaches openrouter.ai"]
     fn live_catalog_inventory() {
         use std::collections::BTreeSet;
-        let models = super::discover_models_blocking(None).unwrap();
-        println!("{} models", models.len());
+        let (models, error) = super::discover_catalog_blocking(&[]);
+        println!("{} models; error: {error:?}", models.len());
+        let embedders: Vec<_> = models
+            .iter()
+            .filter_map(|model| {
+                model
+                    .serves
+                    .as_ref()?
+                    .iter()
+                    .find_map(|served| match &served.verb {
+                        Verb::Embed(capabilities) => Some((model.id.as_str(), capabilities)),
+                        _ => None,
+                    })
+            })
+            .collect();
+        let known = embedders
+            .iter()
+            .filter(|(_, capabilities)| capabilities.native_dims.is_some())
+            .count();
+        println!(
+            "{} embedding models, {known} with a known width",
+            embedders.len()
+        );
+        for (id, capabilities) in &embedders {
+            println!("  {id}: {}", capabilities.summary());
+        }
         let mut other = BTreeSet::new();
         let mut unplaced = BTreeSet::new();
         for model in &models {

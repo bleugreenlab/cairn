@@ -414,6 +414,7 @@ impl Models for Orchestrator {
                 )
             })
             .collect();
+        providers.extend(self.embed_gateway_provider());
         providers.extend(
             descriptors
                 .into_iter()

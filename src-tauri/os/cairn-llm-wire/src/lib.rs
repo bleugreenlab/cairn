@@ -1,7 +1,8 @@
 //! Cairn's model wires: the three HTTP protocol families (Anthropic Messages,
 //! OpenAI-compatible chat, OpenAI Responses) with their generation assembly and
 //! replay, and the two CLI stream wires (Claude stream-json and the Codex
-//! app-server's JSON-RPC notifications).
+//! app-server's JSON-RPC notifications), plus the embedding wires (OpenAI's
+//! `embeddings` and Cairn's gateway `/embed`).
 //!
 //! A leaf: it reaches no other workspace crate, so a host that only needs to
 //! speak these protocols can depend on it without the session runtime.
@@ -13,6 +14,7 @@ pub mod anthropic_messages;
 pub mod claude_stream;
 pub mod codex_app_server;
 pub mod decisions;
+pub mod embeddings;
 pub mod openai_compat;
 pub mod openai_responses;
 pub mod repair;
@@ -64,20 +66,26 @@ pub fn context_fit_budget(context_window: i64) -> i64 {
 
 /// The sentence a provider wrote inside a JSON error body.
 ///
-/// Every family here nests the message the same way — `{"error": {"message":
-/// ...}}`, with or without a sibling `type` — so a refusal reaches the transcript
-/// as the explanation the provider gave ("No payment method", "Model X is not
-/// supported") instead of a wall of JSON the reader has to decode. Anything that
-/// is not JSON, or that carries no message, passes through untouched: an
-/// unrecognized body is still evidence, and dropping it would leave the failure
-/// unexplained.
+/// Most providers nest the message as `{"error": {"message": ...}}`, with or
+/// without a sibling `type` or `code`; some put the sentence straight in
+/// `{"error": "..."}` (Cairn's gateway, some llama.cpp builds), and FastAPI
+/// servers (vLLM) answer `{"detail": "..."}`. Any of them reaches the
+/// transcript as the explanation the provider gave ("No payment method",
+/// "Model X is not supported") instead of a wall of JSON the reader has to
+/// decode. Anything that is not JSON, or that carries no message, passes
+/// through untouched: an unrecognized body is still evidence, and dropping it
+/// would leave the failure unexplained.
 pub fn upstream_error_detail(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|parsed| {
+            if let Some(sentence) = parsed.get("error").and_then(Value::as_str) {
+                return Some(sentence.to_string());
+            }
             let error = parsed.get("error").unwrap_or(&parsed);
             error
                 .get("message")
+                .or_else(|| parsed.get("detail"))
                 .and_then(Value::as_str)
                 .map(str::to_string)
         })

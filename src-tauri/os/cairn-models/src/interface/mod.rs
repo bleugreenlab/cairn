@@ -21,6 +21,7 @@
 
 pub mod complete;
 pub mod decide;
+pub mod embed;
 pub mod image;
 pub mod session;
 pub mod speak;
@@ -360,7 +361,9 @@ impl SelectedOffer {
     pub fn measured_by(&self) -> Option<MeasuredBy> {
         match self.served.verb {
             Verb::Decide => decide::measured_by(self.served.wire),
-            Verb::Complete | Verb::Session | Verb::Image(_) | Verb::Speak(_) => None,
+            Verb::Complete | Verb::Session | Verb::Image(_) | Verb::Speak(_) | Verb::Embed(_) => {
+                None
+            }
         }
     }
 }
@@ -405,6 +408,7 @@ fn capable(verb: VerbKind) -> &'static str {
         VerbKind::Complete => "completion-capable",
         VerbKind::Session => "session-capable",
         VerbKind::Decide => "decision-capable",
+        VerbKind::Embed => "embedding-capable",
         VerbKind::Image => "image-capable",
         VerbKind::Speak => "speech-capable",
     }
@@ -416,6 +420,7 @@ fn cannot(verb: VerbKind) -> &'static str {
         VerbKind::Complete => "cannot serve completions",
         VerbKind::Session => "cannot run sessions",
         VerbKind::Decide => "cannot answer decisions",
+        VerbKind::Embed => "cannot embed",
         VerbKind::Image => "cannot generate images",
         VerbKind::Speak => "cannot speak",
     }
@@ -426,6 +431,7 @@ pub fn fixes(verb: VerbKind) -> &'static str {
     match verb {
         VerbKind::Complete | VerbKind::Session => CONVERSATION_FIXES,
         VerbKind::Decide => decide::DECISION_FIXES,
+        VerbKind::Embed => embed::EMBED_FIXES,
         VerbKind::Image => image::IMAGE_FIXES,
         VerbKind::Speak => speak::SPEECH_FIXES,
     }
@@ -443,7 +449,7 @@ fn preference(served: &ServedVerb) -> u8 {
             speak::InputStreaming::Native => 0,
             speak::InputStreaming::Segmented => 1,
         },
-        Verb::Complete | Verb::Session | Verb::Image(_) => 0,
+        Verb::Complete | Verb::Session | Verb::Image(_) | Verb::Embed(_) => 0,
     }
 }
 

@@ -17,8 +17,9 @@
 //! to, [`interface::complete::Complete`] and [`interface::session`], and the
 //! image verb, [`interface::image`].
 //! [`complete`], [`session`], and [`image`] are the implementations that reach
-//! providers, [`decide`] and [`speak`] the drivers of the decision and speech
-//! verbs.
+//! providers; [`decide`], [`speak`] and [`embed`] are the drivers of the
+//! decision, speech and embedding verbs (`decide` and `embed` post through
+//! [`complete`]'s transport).
 //! [`turn`] is the provider-neutral HTTP agent turn: the loop of generation
 //! and host-dispatched tool calls that every HTTP backend runs.
 //! [`continuation`] decides whether a session resumes natively or is rebuilt,
@@ -41,6 +42,7 @@ pub mod codex;
 pub mod complete;
 pub mod continuation;
 pub mod decide;
+pub mod embed;
 pub mod image;
 pub mod interface;
 pub mod openrouter;

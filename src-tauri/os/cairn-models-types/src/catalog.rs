@@ -32,6 +32,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::embedding::{EmbeddingCapabilities, CAIRN_GATEWAY_KEY};
 use crate::image::ImageCapabilities;
 use crate::provider_id::ApiProvider;
 use crate::speech::SpeechCapabilities;
@@ -273,6 +274,27 @@ pub fn custom_descriptor(provider: &CustomProvider) -> ProviderDescriptor {
     }
 }
 
+/// The descriptor for Cairn's own cloud embedding gateway.
+///
+/// Not in [`PROVIDER_CATALOG`]: nobody installs it. It is present wherever this
+/// device holds a Cairn token (every install registers an anonymous one), so it
+/// never appears in Add-provider, and its key is not [`is_supported`] as a
+/// backend: it runs no sessions or completions, only `embed`.
+pub fn cairn_gateway_descriptor() -> ProviderDescriptor {
+    ProviderDescriptor {
+        key: Cow::Borrowed(CAIRN_GATEWAY_KEY),
+        display_name: Cow::Borrowed("Cairn"),
+        category: ProviderCategory::Api,
+        api_provider: ApiProvider::Custom,
+        summary: "Cairn's cloud embedding gateway (Cohere Embed v4), on this device's Cairn token.",
+        setup_action: "Sign in",
+        setup_requirement: "This device has no Cairn token yet. Sign in to Cairn, or let it reach Cairn's API once to register.",
+        catalog_driven: false,
+        supports_mcp_install: false,
+        keywords: &[],
+    }
+}
+
 /// The descriptor for an installed key this build cannot place: a provider a
 /// newer or older Cairn ships, or a custom provider whose account is gone.
 ///
@@ -409,6 +431,8 @@ pub enum Modality {
     Audio,
     Video,
     File,
+    /// Vectors, as OpenRouter names an embedding model's output.
+    Embeddings,
     Other(String),
 }
 
@@ -420,6 +444,7 @@ impl Modality {
             Self::Audio => "audio",
             Self::Video => "video",
             Self::File => "file",
+            Self::Embeddings => "embeddings",
             Self::Other(value) => value,
         }
     }
@@ -433,6 +458,7 @@ impl From<&str> for Modality {
             "audio" => Self::Audio,
             "video" => Self::Video,
             "file" => Self::File,
+            "embeddings" => Self::Embeddings,
             other => Self::Other(other.to_string()),
         }
     }
@@ -493,8 +519,8 @@ impl fmt::Display for Modalities {
 }
 
 /// A protocol that carries a verb. This is a name, not the implementation: LLM
-/// families are implemented in cairn-llm-wire, and media wires in its sibling
-/// crates, cairn-image-wire and cairn-speech-wire.
+/// families and the embedding wires are implemented in cairn-llm-wire, and
+/// media wires in its sibling crates, cairn-image-wire and cairn-speech-wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Wire {
     /// OpenAI-compatible `chat/completions`.
@@ -516,6 +542,12 @@ pub enum Wire {
     /// The Codex CLI's app-server protocol.
     #[serde(rename = "codex-app-server")]
     CodexAppServer,
+    /// OpenAI-compatible `embeddings`.
+    #[serde(rename = "openai-embeddings")]
+    OpenAiEmbeddings,
+    /// Cairn's cloud gateway `/embed`.
+    #[serde(rename = "cairn-embed")]
+    CairnEmbed,
     /// OpenRouter's Image API: `POST /api/v1/images`, JSON in and out.
     #[serde(rename = "openrouter-images")]
     OpenRouterImages,
@@ -541,6 +573,8 @@ impl Wire {
             Self::OpenAiDecisions => "openai-decisions",
             Self::ClaudeStreamJson => "claude-stream-json",
             Self::CodexAppServer => "codex-app-server",
+            Self::OpenAiEmbeddings => "openai-embeddings",
+            Self::CairnEmbed => "cairn-embed",
             Self::OpenRouterImages => "openrouter-images",
             Self::OpenAiImages => "openai-images",
             Self::ElevenLabsStreamInput => "elevenlabs-stream-input",
@@ -557,15 +591,17 @@ impl fmt::Display for Wire {
 
 /// A facet verb an offer serves. Each variant carries that verb's capability
 /// type, which is where a verb with real capability differences (image sizes,
-/// speech formats) says what it can do. The conversational verbs and `decide`
-/// carry none; `image` and `speak` carry what the offer can do, flattened
-/// beside the tag (`{"verb": "image", "maxCount": 4, ...}`).
+/// speech formats, embedding widths) says what it can do. The conversational
+/// verbs and `decide` carry none; `image`, `speak` and `embed` carry what the
+/// offer can do, flattened beside the tag (`{"verb": "image", "maxCount": 4, ...}`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "verb", rename_all = "lowercase")]
 pub enum Verb {
     Complete,
     Session,
     Decide,
+    /// Texts in, one vector per text out.
+    Embed(EmbeddingCapabilities),
     Image(ImageCapabilities),
     /// Text in as a stream, audio out as a stream.
     Speak(SpeechCapabilities),
@@ -577,6 +613,7 @@ impl Verb {
             Self::Complete => VerbKind::Complete,
             Self::Session => VerbKind::Session,
             Self::Decide => VerbKind::Decide,
+            Self::Embed(_) => VerbKind::Embed,
             Self::Image(_) => VerbKind::Image,
             Self::Speak(_) => VerbKind::Speak,
         }
@@ -601,15 +638,17 @@ pub enum VerbKind {
     Decide,
     Image,
     Speak,
+    Embed,
 }
 
 impl VerbKind {
-    pub const ALL: [VerbKind; 5] = [
+    pub const ALL: [VerbKind; 6] = [
         Self::Complete,
         Self::Session,
         Self::Decide,
         Self::Image,
         Self::Speak,
+        Self::Embed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -617,6 +656,7 @@ impl VerbKind {
             Self::Complete => "complete",
             Self::Session => "session",
             Self::Decide => "decide",
+            Self::Embed => "embed",
             Self::Image => "image",
             Self::Speak => "speak",
         }
@@ -948,6 +988,8 @@ mod tests {
             Wire::OpenAiDecisions,
             Wire::ClaudeStreamJson,
             Wire::CodexAppServer,
+            Wire::OpenAiEmbeddings,
+            Wire::CairnEmbed,
             Wire::OpenRouterImages,
             Wire::OpenAiImages,
             Wire::ElevenLabsStreamInput,
@@ -979,6 +1021,41 @@ mod tests {
             Some(&ImageCapabilities::openai_images_minimal())
         );
         assert_eq!(Verb::Decide.image(), None);
+    }
+
+    #[test]
+    fn an_embed_verb_flattens_its_capabilities_beside_verb_and_wire() {
+        let served = ServedVerb {
+            verb: Verb::Embed(EmbeddingCapabilities::cairn_gateway()),
+            wire: Wire::CairnEmbed,
+        };
+        let json = serde_json::to_value(&served).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "verb": "embed",
+                "nativeDims": 1536,
+                "widths": "nativeOnly",
+                "purpose": "native",
+                "limits": {"maxTexts": 96},
+                "wire": "cairn-embed"
+            })
+        );
+        assert_eq!(serde_json::from_value::<ServedVerb>(json).unwrap(), served);
+        assert_eq!(served.verb.kind(), VerbKind::Embed);
+        assert_eq!(
+            Modality::from("embeddings"),
+            Modality::Embeddings,
+            "OpenRouter's embedding output is a known modality"
+        );
+    }
+
+    #[test]
+    fn the_gateway_descriptor_is_never_a_shipped_backend() {
+        let gateway = cairn_gateway_descriptor();
+        assert_eq!(gateway.key, CAIRN_GATEWAY_KEY);
+        assert!(descriptor(CAIRN_GATEWAY_KEY).is_none());
+        assert!(!is_supported(CAIRN_GATEWAY_KEY));
     }
 
     #[test]
