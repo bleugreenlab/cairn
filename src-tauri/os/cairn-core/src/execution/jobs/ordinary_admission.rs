@@ -106,6 +106,7 @@ fn resume_warm_race(
     lease: &OrdinaryLease,
     snapshot: &crate::storage::PreparedOrdinaryLaunch,
     warm_run_id: &str,
+    launch_guard: std::sync::MutexGuard<'_, ()>,
 ) -> Result<bool, String> {
     let owning = run_db({
         let dbs = orch.db.clone();
@@ -133,19 +134,13 @@ fn resume_warm_race(
     })?
     .ok_or_else(|| "prepared ordinary warm continuation is no longer durable".to_string())?;
     if run_status != "starting" || turn_state != "pending" {
-        return_undelivered_attention(
-            orch,
-            &snapshot.run_id,
-            &snapshot.turn_id,
-            TurnDelivery::Unknown,
-        );
-        finish(
+        return withdraw_unlaunched(
             orch,
             lease,
-            "cancelled",
-            Some("run or turn is no longer launchable"),
-        )?;
-        return Ok(false);
+            snapshot,
+            launch_guard,
+            "run or turn is no longer launchable",
+        );
     }
     let prompt = serde_json::from_str::<crate::agent_process::stream::TranscriptEvent>(&event_data)
         .map_err(|e| format!("decode ordinary launch event: {e}"))?
@@ -180,6 +175,8 @@ fn resume_warm_race(
         );
         return Err(error);
     }
+    // The unused cold run never had a process, so it ends `exited`, as a
+    // withdrawn launch does; its own exit reason says the warm process took it.
     let db = owning;
     let cold_run_id = snapshot.run_id.clone();
     run_db(async move {
@@ -188,7 +185,7 @@ fn resume_warm_race(
             Box::pin(async move {
                 let now = chrono::Utc::now().timestamp();
                 conn.execute(
-                    "UPDATE runs SET status='crashed',exit_reason='warm_race_reused',exited_at=?2,updated_at=?2 WHERE id=?1 AND status='starting'",
+                    "UPDATE runs SET status='exited',exit_reason='warm_race_reused',exited_at=?2,updated_at=?2 WHERE id=?1 AND status='starting'",
                     (cold_run_id.clone(), now),
                 )
                 .await?;
@@ -939,36 +936,31 @@ fn start_leased_inner(
     snapshot: crate::storage::PreparedOrdinaryLaunch,
 ) -> Result<bool, String> {
     let launch_lock = orch.job_launch_lock(&snapshot.job_id);
-    let _guard = launch_lock
+    let launch_guard = launch_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(warm_run_id) = orch
         .process_state
         .find_warm_by_session(&snapshot.session_id)
     {
-        return resume_warm_race(orch, lease, &snapshot, &warm_run_id);
+        return resume_warm_race(orch, lease, &snapshot, &warm_run_id, launch_guard);
     }
     // A same-session handle that is starting, serving a turn, or awaiting the
     // host is not reusable. In particular, never overwrite its occupancy and
-    // write a second prompt to its stdin.
+    // write a second prompt to its stdin. That process serves the returned
+    // attention at its next turn boundary.
     if orch
         .process_state
         .find_process_by_session(&snapshot.session_id)
         .is_some()
     {
-        return_undelivered_attention(
-            orch,
-            &snapshot.run_id,
-            &snapshot.turn_id,
-            TurnDelivery::Unknown,
-        );
-        finish(
+        return withdraw_unlaunched(
             orch,
             lease,
-            "cancelled",
-            Some("same-session process is not warm and idle"),
-        )?;
-        return Ok(false);
+            &snapshot,
+            launch_guard,
+            "same-session process is not warm and idle",
+        );
     }
     // A claim on this same run is the enqueuer's own preparation claim, which it
     // holds until the admission row is durable and drops right after: a promoter
@@ -978,19 +970,13 @@ fn start_leased_inner(
         .claimed_launch_run(&snapshot.job_id)
         .is_some_and(|claimed| claimed != snapshot.run_id)
     {
-        return_undelivered_attention(
-            orch,
-            &snapshot.run_id,
-            &snapshot.turn_id,
-            TurnDelivery::Unknown,
-        );
-        finish(
+        return withdraw_unlaunched(
             orch,
             lease,
-            "cancelled",
-            Some("session already has a process or competing launch"),
-        )?;
-        return Ok(false);
+            &snapshot,
+            launch_guard,
+            "session already has a process or competing launch",
+        );
     }
     let owning = run_db({
         let dbs = orch.db.clone();
@@ -1015,36 +1001,20 @@ fn start_leased_inner(
             .map_err(|e| e.to_string())
         }
     })?;
-    let Some((run_status, turn_state, project_id)) = launch_state else {
-        return_undelivered_attention(
-            orch,
-            &snapshot.run_id,
-            &snapshot.turn_id,
-            TurnDelivery::Unknown,
-        );
-        finish(
+    let launchable = launch_state
+        .as_ref()
+        .is_some_and(|(run_status, turn_state, _)| {
+            run_status == "starting" && turn_state == "pending"
+        });
+    let Some((_, _, project_id)) = launch_state.filter(|_| launchable) else {
+        return withdraw_unlaunched(
             orch,
             lease,
-            "cancelled",
-            Some("run or turn is no longer launchable"),
-        )?;
-        return Ok(false);
+            &snapshot,
+            launch_guard,
+            "run or turn is no longer launchable",
+        );
     };
-    if run_status != "starting" || turn_state != "pending" {
-        return_undelivered_attention(
-            orch,
-            &snapshot.run_id,
-            &snapshot.turn_id,
-            TurnDelivery::Unknown,
-        );
-        finish(
-            orch,
-            lease,
-            "cancelled",
-            Some("run or turn is no longer launchable"),
-        )?;
-        return Ok(false);
-    }
     transition(orch, lease, "leased", "starting")?;
     let prompt = snapshot.prompt.clone();
     let session_start = match snapshot.session_start {
@@ -1181,6 +1151,123 @@ fn start_leased_inner(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Exit reason for the run of a leased launch the promoter withdrew before any
+/// process existed for it, because something else already owns the session's
+/// launch: its live process, a competing launch, or whoever settled its turn.
+const LAUNCH_SUPERSEDED_EXIT_REASON: &str = "launch_superseded";
+
+/// End a leased launch the promoter will not start, before any process existed
+/// for it, and return `Ok(false)` (nothing started).
+///
+/// The leased admission row is the run's only launch cover, so the run and the
+/// pending turn it was created to serve are settled first, while the lease
+/// still stands and the job's launch lock is held: there is no instant in which
+/// the stale-run reaper could find the run uncovered and invent a crash for it.
+/// Only then does the lease close, in this generation's one terminal write.
+fn withdraw_unlaunched(
+    orch: &Orchestrator,
+    lease: &OrdinaryLease,
+    snapshot: &crate::storage::PreparedOrdinaryLaunch,
+    launch_guard: std::sync::MutexGuard<'_, ()>,
+    detail: &str,
+) -> Result<bool, String> {
+    return_undelivered_attention(
+        orch,
+        &snapshot.run_id,
+        &snapshot.turn_id,
+        TurnDelivery::Unknown,
+    );
+    let settled = settle_unlaunched_run(orch, &snapshot.run_id, &snapshot.turn_id)?;
+    finish(orch, lease, "cancelled", Some(detail))?;
+    // Re-deriving the job may launch it again, and the launch lock is not
+    // reentrant.
+    drop(launch_guard);
+    if settled {
+        log::info!(
+            "withdrew promoted launch of run {} for job {} before any process: {detail}",
+            &snapshot.run_id[..snapshot.run_id.len().min(8)],
+            &snapshot.job_id[..snapshot.job_id.len().min(8)],
+        );
+        if let Err(error) = crate::execution::advancement::recompute_job(orch, &snapshot.job_id) {
+            log::warn!(
+                "could not re-derive job {} after withdrawing its launch: {error}",
+                snapshot.job_id
+            );
+        }
+    }
+    Ok(false)
+}
+
+/// Settle a still-`starting` run whose launch is being withdrawn before it
+/// reached a process, with the pending turn bound to it. Returns whether this
+/// call settled it; a run no longer `starting` was settled by whoever ended it,
+/// and its turn is theirs too.
+///
+/// Nothing failed, so the run ends `exited` rather than `crashed`, and the turn
+/// `cancelled` as `launch_refused` rather than `failed`: the job projection
+/// reads a cancelled turn as resumable, never as failed work, so the job rests
+/// on whatever the session's live process does next.
+fn settle_unlaunched_run(orch: &Orchestrator, run_id: &str, turn_id: &str) -> Result<bool, String> {
+    let dbs = orch.db.clone();
+    let run_id = run_id.to_string();
+    let turn_id = turn_id.to_string();
+    let changes = run_db(async move {
+        let db = crate::execution::routing::owning_db_for_run(&dbs, &run_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let settled = db
+            .write({
+                let run_id = run_id.clone();
+                let turn_id = turn_id.clone();
+                move |conn| {
+                    let run_id = run_id.clone();
+                    let turn_id = turn_id.clone();
+                    Box::pin(async move {
+                        let now = chrono::Utc::now().timestamp();
+                        let changed = conn
+                            .execute(
+                                "UPDATE runs SET status='exited', exit_reason=?2, exited_at=?3, updated_at=?3 WHERE id=?1 AND status='starting'",
+                                cairn_db::turso::params![
+                                    run_id.as_str(),
+                                    LAUNCH_SUPERSEDED_EXIT_REASON,
+                                    now
+                                ],
+                            )
+                            .await?;
+                        if changed == 0 {
+                            return Ok(false);
+                        }
+                        conn.execute(
+                            "UPDATE turns SET state='cancelled', end_reason=?3, ended_at=?4, updated_at=?4 WHERE id=?1 AND run_id=?2 AND state='pending'",
+                            cairn_db::turso::params![
+                                turn_id.as_str(),
+                                run_id.as_str(),
+                                crate::models::TurnEndReason::LaunchRefused.to_string(),
+                                now
+                            ],
+                        )
+                        .await?;
+                        Ok(true)
+                    })
+                }
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        if !settled {
+            return Ok(None);
+        }
+        Ok(Some([
+            crate::notify::run_db_change_for_id(&db, &run_id, "update").await,
+            crate::notify::turn_db_change_for_id(&db, &turn_id, "update").await,
+        ]))
+    })?;
+    let settled = changes.is_some();
+    for change in changes.into_iter().flatten() {
+        let _ = orch.services.emitter.emit("db-change", change);
+    }
+    Ok(settled)
 }
 
 /// Return the attention delivery a queued launch's turn carried, because the
@@ -2990,16 +3077,15 @@ mod tests {
             state, "cancelled",
             "the unused cold lease must be generation-fenced and released"
         );
-        let cold = orch
-            .db
-            .local
-            .query_opt("SELECT status FROM runs WHERE id='cold'", (), |row| {
-                row.text(0)
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(cold, "crashed");
+        // No process ever ran for the cold run, so nothing crashed.
+        assert_eq!(
+            text(
+                &orch,
+                "SELECT status || ':' || COALESCE(exit_reason, '') FROM runs WHERE id='cold'"
+            )
+            .await,
+            "exited:warm_race_reused"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3055,6 +3141,155 @@ mod tests {
                 "cancelled"
             );
         }
+    }
+
+    /// The run, turn, wake and job a withdrawn launch must leave: the run
+    /// settled without a crash, its turn cancelled rather than failed, the wake
+    /// back in the queue, nothing left for the stale-run reaper to invent a
+    /// crash from, and a job that runs on `rival` (the run that superseded the
+    /// launch) and rests resumable once `rival` ends.
+    async fn assert_withdrawn_without_a_crash(orch: &Orchestrator, detail: &str, rival: &str) {
+        assert_eq!(
+            request_state(orch, "req").await,
+            ("cancelled".to_string(), Some(detail.to_string()))
+        );
+        assert_eq!(
+            text(
+                orch,
+                "SELECT status || ':' || COALESCE(exit_reason, '') FROM runs WHERE id='cold'"
+            )
+            .await,
+            format!("exited:{}", super::LAUNCH_SUPERSEDED_EXIT_REASON),
+            "the run is settled the moment the lease closes, not left to the reaper"
+        );
+        assert_eq!(
+            text(
+                orch,
+                "SELECT state || ':' || COALESCE(end_reason, '') FROM turns WHERE id='t'"
+            )
+            .await,
+            "cancelled:launch_refused",
+            "a superseded launch's turn is not failed work"
+        );
+        assert!(delivery_returned(orch, "j", "t").await);
+        // The run was created at t=1, far past the grace; were it still
+        // `starting`, this is the sweep that would have crashed it.
+        assert_eq!(crate::runs::reap::reap_stale_runs(orch), 0);
+        assert_eq!(
+            text(orch, "SELECT status FROM runs WHERE id='cold'").await,
+            "exited"
+        );
+        // The projection reads the job's node from its execution's recipe; a
+        // shipping recipe keeps the builder off the long-running (Idle) path.
+        let snapshot = serde_json::json!({
+            "recipe": {
+                "id": "r", "name": "R", "description": null, "trigger": "manual",
+                "nodes": [
+                    {"id": "builder", "nodeType": "agent", "name": "Builder", "position": {"x": 0.0, "y": 0.0}},
+                    {"id": "pr", "nodeType": "pr", "name": "PR", "position": {"x": 1.0, "y": 0.0}}
+                ],
+                "edges": []
+            },
+            "agents": {}, "skills": {},
+            "triggerContext": {"issueId": "i", "projectId": "p", "triggerType": "manual"},
+            "delegatedPackets": [], "createdAt": 1
+        })
+        .to_string();
+        orch.db
+            .local
+            .execute("UPDATE executions SET snapshot=?1 WHERE id='e'", [snapshot])
+            .await
+            .unwrap();
+        let derived = || async {
+            orch.db
+                .local
+                .read(|conn| {
+                    Box::pin(async move {
+                        crate::execution::advancement::recompute_job_status_conn(conn, "j").await
+                    })
+                })
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            derived().await,
+            crate::models::JobStatus::Running,
+            "the superseding run is the job's live work"
+        );
+        orch.db
+            .local
+            .execute(
+                "UPDATE runs SET status='exited', exited_at=2, updated_at=2 WHERE id=?1",
+                [rival],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            derived().await,
+            crate::models::JobStatus::Pending,
+            "with its live run gone the job rests resumable; a failed turn would read failed"
+        );
+    }
+
+    /// A promoted launch whose session's process is busy is withdrawn in favour
+    /// of that process, which serves the returned wake at its next turn
+    /// boundary. The launch's run must end with the withdrawal: left `starting`
+    /// with no process and no cover, the reaper would settle it as a crash.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_superseded_by_a_busy_same_session_process_settles_its_run_without_a_crash() {
+        let (orch, request, snapshot) =
+            lifecycle_fixture("ordinary-superseded-by-busy-process.db").await;
+        brief(&orch, "cold", "t", "j").await;
+        orch.db.local.execute("INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,started_at,created_at,updated_at) VALUES('existing','p','i','j','s','live',1,1,1)", ()).await.unwrap();
+        orch.process_state
+            .register_process(
+                "existing".into(),
+                crate::agent_process::process::RunHandle::test_handle(Some("s"), Some("j")),
+            )
+            .unwrap();
+        orch.process_state.begin_turn("existing", "existing-turn");
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::orchestrator::session::install_test_session_backend(Box::new(CountingBackend(
+            starts.clone(),
+        )));
+
+        assert!(
+            !super::start_leased(&orch, super::OrdinaryLease::Private(request), snapshot).unwrap()
+        );
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_withdrawn_without_a_crash(
+            &orch,
+            "same-session process is not warm and idle",
+            "existing",
+        )
+        .await;
+    }
+
+    /// The same withdrawal when another run of the job holds the launch claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_launch_superseded_by_a_competing_launch_settles_its_run_without_a_crash() {
+        let (orch, request, snapshot) =
+            lifecycle_fixture("ordinary-superseded-by-competing-launch.db").await;
+        brief(&orch, "cold", "t", "j").await;
+        orch.db.local.execute("INSERT INTO runs(id,project_id,issue_id,job_id,session_id,status,created_at,updated_at) VALUES('rival','p','i','j','s','starting',1,1)", ()).await.unwrap();
+        let _rival = orch.claim_job_launch("j", "rival");
+        let starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::orchestrator::session::install_test_session_backend(Box::new(CountingBackend(
+            starts.clone(),
+        )));
+
+        assert!(
+            !super::start_leased(&orch, super::OrdinaryLease::Private(request), snapshot).unwrap()
+        );
+
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_withdrawn_without_a_crash(
+            &orch,
+            "session already has a process or competing launch",
+            "rival",
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
