@@ -4342,7 +4342,15 @@ pub struct LearnedResourceEstimate {
 /// about it, and a 148 runner ignores the field. The same change makes
 /// re-quarantining a persisted slot authority idempotent per condition, which
 /// sends nothing new.
-pub const EXECUTOR_PROTOCOL_VERSION: u32 = 149;
+///
+/// Version 150 (cairn/5067) adds [`StorageReclaimRung::IdleCellScratch`]: under
+/// the pressure line the executor resets the scratch of idle, vacant cells
+/// before it trims any idle build target, and reports those bytes under the new
+/// rung. A 149 runner cannot decode a pressure report that names it, which is
+/// why this is a version and not a silent addition. The storage sweep also stops
+/// latching admission over a fault confined to one tree; that changes what an
+/// executor refuses, not any message shape.
+pub const EXECUTOR_PROTOCOL_VERSION: u32 = 150;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
 //
@@ -9449,6 +9457,10 @@ pub enum StorageReclaimRung {
     ManagedCaches,
     /// Build output inside quarantines still in their forensic window.
     QuarantineTargets,
+    /// The whole scratch directory (`$TMPDIR`) of idle cells no process is
+    /// using. Scratch is the previous occupant's leftovers, cheaper to lose
+    /// than any build output.
+    IdleCellScratch,
     /// Build output inside idle live cells.
     IdleTargets,
     /// Whole idle cells.

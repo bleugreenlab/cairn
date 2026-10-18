@@ -28,8 +28,8 @@ use cairn_common::executor_protocol::{
 };
 use cairn_common::executor_protocol::{
     DiskDecline, DiskReliefOutlook, OccupancyLineageReport, OccupancyRule, OccupiedTreeSkip,
-    QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, StorageReclaimRung,
-    StorageRungReclaim, StorageWithheld, StorageWithheldReason,
+    QuarantineTargetStrip, RetiredHomeAccounting, RetiredHomeState, SkippedEntry,
+    StorageReclaimRung, StorageRungReclaim, StorageWithheld, StorageWithheldReason,
 };
 
 /// This runner's own private agent-session lanes. Kept at collection scope
@@ -859,12 +859,42 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     let skipped = health.disk.cleanup_skipped_entries.unwrap_or(0);
     let partial = match skipped {
         0 => String::new(),
-        count => format!(", partial: {count} skipped"),
+        count => format!(
+            ", partial: {count} skipped ({})",
+            inline_skip_paths(&health.disk.cleanup_skipped, count)
+        ),
+    };
+    // A latched machine never reads as a sweep that merely completed: every
+    // admission is being refused, and the page is where an operator learns
+    // which write is holding it (CAIRN-5067).
+    let sweep = if health.disk.cleanup_blocked {
+        format!(
+            "{:?} with error — admission blocked",
+            health.disk.sweep_status
+        )
+    } else {
+        format!("{:?}", health.disk.sweep_status)
     };
     out.push_str(&format!(
-        "- Verdict: volume {:?}, custody {custodial}, sweep {:?}{partial}\n",
-        health.disk.status, health.disk.sweep_status
+        "- Verdict: volume {:?}, custody {custodial}, sweep {sweep}{partial}\n",
+        health.disk.status
     ));
+    if health.disk.cleanup_blocked {
+        out.push_str(&format!(
+            "- Cleanup blocking admission: {}{}\n",
+            health
+                .disk
+                .cleanup_last_error
+                .as_deref()
+                .unwrap_or("no error recorded"),
+            health
+                .disk
+                .cleanup_failing_path
+                .as_deref()
+                .map(|path| format!(" (failing path `{path}`)"))
+                .unwrap_or_default()
+        ));
+    }
     out.push_str(&render_storage_pressure(executor));
     if skipped > 0 {
         out.push_str("- Sweep skipped:\n");
@@ -1386,6 +1416,24 @@ fn render_storage(executor: &ExecutorInspection) -> String {
             for home in &accounting.retired_homes {
                 out.push_str(&retired_home_line(home));
             }
+            // A partial walk names what it could not price, so a directory
+            // the executor cannot read is a path on this page rather than a
+            // count nobody can act on.
+            if accounting.is_partial() {
+                out.push_str("- Accounting skipped:\n");
+                for entry in &accounting.skipped {
+                    out.push_str(&format!(
+                        "  - `{}` ({:?}, {:?})\n",
+                        entry.path, entry.operation, entry.reason
+                    ));
+                }
+                let unlisted = accounting
+                    .skipped_count()
+                    .saturating_sub(accounting.skipped.len());
+                if unlisted > 0 {
+                    out.push_str(&format!("  - and {unlisted} more not listed\n"));
+                }
+            }
             if let Some(volume) = machine.volume.value() {
                 // Unaccounted, never "not Cairn's": the walk covers what
                 // Cairn manages, and Cairn's processes write outside it too.
@@ -1504,7 +1552,7 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
             let retired = by_rung(StorageReclaimRung::RetiredCells);
             let retired_homes = by_rung(StorageReclaimRung::RetiredHomes);
             out.push_str(&format!(
-                "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} ({}retired trees {} · managed caches {} · quarantine targets {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
+                "- Last pressure pass {}: band {:?}, asked {}, reclaimed {} ({}retired trees {} · managed caches {} · quarantine targets {} · idle cell scratch {} · idle targets {} · {} cells retired {}) — {:?}{}\n",
                 age(captured.saturating_sub(pressure.at_unix_ms)),
                 pressure.band,
                 bytes(pressure.target_bytes),
@@ -1517,6 +1565,7 @@ fn render_storage_pressure(executor: &ExecutorInspection) -> String {
                 bytes(by_rung(StorageReclaimRung::RetiredTrees).bytes),
                 bytes(by_rung(StorageReclaimRung::ManagedCaches).bytes),
                 bytes(by_rung(StorageReclaimRung::QuarantineTargets).bytes),
+                bytes(by_rung(StorageReclaimRung::IdleCellScratch).bytes),
                 bytes(by_rung(StorageReclaimRung::IdleTargets).bytes),
                 retired.count,
                 bytes(retired.bytes),
@@ -3377,6 +3426,12 @@ mod storage_section_tests {
             "{rendered}"
         );
         assert!(!rendered.contains("inferred: volume used"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "- Accounting skipped:\n  - `build-slots/p/slot-3` (ReadMetadata, PermissionDenied)\n"
+            ),
+            "{rendered}"
+        );
     }
 
     /// A retired executor home is a named component with its bytes, inside
@@ -3474,6 +3529,7 @@ mod storage_section_tests {
             free_bytes_after: 54 * GIB + 31 * GIB,
             reclaimed_by_rung: vec![
                 rung(StorageReclaimRung::QuarantineTargets, 31 * GIB, 2),
+                rung(StorageReclaimRung::IdleCellScratch, 3 * GIB, 4),
                 rung(StorageReclaimRung::IdleTargets, 0, 0),
             ],
             outcome: StoragePressureOutcome::Unrelieved,
@@ -3513,11 +3569,12 @@ mod storage_section_tests {
         let rendered = render_executor(&executor);
         assert!(
             rendered.contains(
-                "Last pressure pass 3m ago: band Pressure, asked 74.0 GiB, reclaimed 31.0 GiB"
-            ) && rendered.contains("quarantine targets 31.0 GiB")
-                && rendered.contains(
-                    "— Unrelieved; 5.0 GiB held by policy; next pressure pass when free < 46.0 GiB"
-                ),
+                "Last pressure pass 3m ago: band Pressure, asked 74.0 GiB, reclaimed 34.0 GiB"
+            ) && rendered.contains(
+                "quarantine targets 31.0 GiB · idle cell scratch 3.0 GiB · idle targets 0 B"
+            ) && rendered.contains(
+                "— Unrelieved; 5.0 GiB held by policy; next pressure pass when free < 46.0 GiB"
+            ),
             "{rendered}"
         );
         assert!(
@@ -3892,7 +3949,9 @@ mod storage_verdict_tests {
 
         let rendered = render_executor(&executor);
         assert!(
-            rendered.contains("sweep Completed, partial: 3 skipped\n"),
+            rendered.contains(
+                "sweep Completed, partial: 3 skipped (`build-slots/p/slot-7.quarantine-1`, `build-slots/p/slot-8.quarantine-2`, …)\n"
+            ),
             "{rendered}"
         );
         assert!(
@@ -3905,6 +3964,73 @@ mod storage_verdict_tests {
         );
         assert!(rendered.contains("and 1 more not listed"), "{rendered}");
     }
+
+    /// A sweep whose error latched admission says so on the verdict line and
+    /// names the error and its path, so a machine refusing every admission
+    /// never reads as a sweep that merely completed.
+    #[test]
+    fn a_latched_sweep_names_what_is_blocking_admission() {
+        let mut executor = inspection("local", true);
+        executor.health.disk.status = DiskHealthStatus::Ok;
+        executor.health.disk.sweep_status = StorageSweepStatus::Completed;
+        executor.health.disk.cleanup_blocked = true;
+        executor.health.disk.cleanup_last_error = Some(
+            "write executor state failed for /h/build-slots/.authority/slot-1/state.json: No space left on device"
+                .into(),
+        );
+        executor.health.disk.cleanup_failing_path =
+            Some("/h/build-slots/.authority/slot-1/state.json".into());
+
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains("sweep Completed with error — admission blocked"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("sweep Completed\n"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "- Cleanup blocking admission: write executor state failed for /h/build-slots/.authority/slot-1/state.json: No space left on device (failing path `/h/build-slots/.authority/slot-1/state.json`)"
+            ),
+            "{rendered}"
+        );
+    }
+
+    /// One skip renders its path inline, with no ellipsis.
+    #[test]
+    fn a_single_skip_is_named_inline_on_the_verdict() {
+        let mut executor = inspection("local", true);
+        executor.health.disk.sweep_status = StorageSweepStatus::Completed;
+        executor.health.disk.cleanup_skipped_entries = Some(1);
+        executor.health.disk.cleanup_skipped = vec![SkippedEntry {
+            path: "build-slots/cairn/.authority/slot-42/scratch.discard-1-a".into(),
+            operation: SkippedEntryOperation::Remove,
+            reason: SkippedEntryReason::PermissionDenied,
+        }];
+
+        let rendered = render_executor(&executor);
+        assert!(
+            rendered.contains(
+                "partial: 1 skipped (`build-slots/cairn/.authority/slot-42/scratch.discard-1-a`)\n"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("admission blocked"), "{rendered}");
+    }
+}
+
+/// The first few skipped paths, for the verdict line, so the tree a partial
+/// sweep could not reach is named where the verdict is read.
+fn inline_skip_paths(skipped: &[SkippedEntry], count: usize) -> String {
+    const INLINE_SKIP_PATHS: usize = 3;
+    let mut paths = skipped
+        .iter()
+        .take(INLINE_SKIP_PATHS)
+        .map(|entry| format!("`{}`", entry.path))
+        .collect::<Vec<_>>();
+    if count > paths.len() {
+        paths.push("…".to_string());
+    }
+    paths.join(", ")
 }
 
 fn list_or(values: &[String], empty: &str) -> String {
