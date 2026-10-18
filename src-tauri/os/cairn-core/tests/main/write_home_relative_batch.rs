@@ -262,11 +262,14 @@ async fn a_home_relative_tasks_append_is_still_classified_as_a_blocking_append()
     )
     .await;
 
-    // Classification is explicit in the host envelope, not inferred from prose.
+    // Classification is explicit in the host envelope, not inferred from prose:
+    // the blocking group ran, and a task append that spawned nothing is that
+    // append's failure.
     let report: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(report["applied"], json!([]));
+    assert!(report.get("blocking").is_none(), "{result}");
     assert!(
-        report["blocking"]["text"]
+        report["failures"][0]["error"]
             .as_str()
             .unwrap()
             .contains("Agent config not found: Explore"),
@@ -311,11 +314,13 @@ async fn blocking_envelope_keeps_successes_and_failures_in_the_same_report() {
     let report: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(report["applied"].as_array().unwrap().len(), 1, "{result}");
     assert_eq!(report["applied"][0]["index"], 1);
-    assert_eq!(report["failures"].as_array().unwrap().len(), 1, "{result}");
+    assert_eq!(report["failures"].as_array().unwrap().len(), 2, "{result}");
     assert_eq!(report["failures"][0]["index"], 0);
-    assert_eq!(report["partial_success"], true);
-    assert!(report["blocking"]["text"]
+    assert_eq!(report["failures"][1]["index"], 2);
+    assert!(report["failures"][1]["error"]
         .as_str()
         .unwrap()
         .contains("Agent config not found: Explore"));
+    assert_eq!(report["partial_success"], true);
+    assert!(report.get("blocking").is_none(), "{result}");
 }

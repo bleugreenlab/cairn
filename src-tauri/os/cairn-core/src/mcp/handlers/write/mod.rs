@@ -2527,16 +2527,55 @@ async fn handle_write_attempt(
             match checkpoint {
                 Ok(()) => {
                     blocking_checkpointed = write_call.is_some();
-                    report.blocking = Some(
-                        run_blocking_group(
-                            orch,
-                            &blocking_request,
-                            &payload.changes,
-                            &blocking_indices,
-                            kind,
+                    let outcome = run_blocking_group(
+                        orch,
+                        &blocking_request,
+                        &payload.changes,
+                        &blocking_indices,
+                        kind,
+                    )
+                    .await;
+                    let lists_effects = !outcome.applied.is_empty() || !outcome.failures.is_empty();
+                    for applied in outcome.applied {
+                        let item = &payload.changes[applied.index];
+                        report.applied.push(AppliedChange {
+                            index: applied.index,
+                            target: item.target.clone(),
+                            mode: types::mode_name(item.mode).to_string(),
+                            kind: "resource".to_string(),
+                            summary: applied.summary,
+                            data: Some(applied.data),
+                        });
+                    }
+                    for (index, error) in outcome.failures {
+                        let IndexedFailure { failure, .. } =
+                            *build_failure(index, &payload.changes[index], error);
+                        report.failures.push(failure);
+                    }
+                    report.partial_success =
+                        !report.applied.is_empty() && !report.failures.is_empty();
+                    // The checkpoint above was taken before the group created
+                    // anything. Re-save it so the report a parked parent resumes
+                    // into, and the one a redelivery replays, list the tasks this
+                    // call created even if the final report is never written.
+                    if let (Some(call), true) = (write_call.as_ref(), lists_effects) {
+                        let outer = append_check_summary(
+                            serde_json::to_string(&report).expect("write report serializes"),
+                            &check_summary,
+                        );
+                        if let Err(error) = replay::update_blocking_checkpoint(
+                            &orch.db.local,
+                            call,
+                            replay_owner.as_ref(),
+                            ordinary_ledger_claim,
+                            &outer,
                         )
-                        .await,
-                    );
+                        .await
+                        {
+                            log::warn!("{error}");
+                        }
+                    }
+                    report.blocking = outcome.blocking;
                 }
                 Err(error) => {
                     for &index in &blocking_indices {

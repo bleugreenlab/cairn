@@ -32,7 +32,7 @@ pub use crate::pr_publish_attempts::{
 pub use actions::{
     advance_execution_with_actions, block_job, create_action_run, mark_action_run_failed,
     mark_job_failed, rearm_blocked_checkpoints, reevaluable_condition, reevaluate_condition,
-    rerun_checkpoint_job, wake_upstream_after_checkpoint_failure,
+    rerun_checkpoint_job, wake_upstream_after_checkpoint_failure, AdvanceError,
 };
 pub use core::advance_execution_impl;
 pub use inputs::{format_resolved_inputs, ResolvedInput};

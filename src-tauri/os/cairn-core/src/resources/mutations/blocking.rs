@@ -1,6 +1,6 @@
 use crate::execution::delegation::{
     DelegatedCallPayload, DelegatedTaskPayload, DelegatedTaskSessionMode, SpawnCallPacketsInput,
-    SpawnTaskPacketsInput,
+    SpawnTaskPacketsInput, TaskSpawnOutcome,
 };
 use crate::execution::jobs::{CallBranchPolicy, CreateChildTaskInput};
 #[cfg(test)]
@@ -113,6 +113,95 @@ impl From<CallbackResponse> for BlockingResult {
     }
 }
 
+/// A blocking append that created something the write report should list.
+#[derive(Debug)]
+pub(crate) struct BlockingApplied {
+    pub(crate) index: usize,
+    pub(crate) summary: String,
+    pub(crate) data: serde_json::Value,
+}
+
+/// What a blocking group did, per change index.
+///
+/// The blocking text stays opaque payload. A task append that created a child
+/// is an applied change and one that created nothing is a failure, so neither
+/// has to be read out of that text.
+#[derive(Debug, Default)]
+pub(crate) struct BlockingGroupOutcome {
+    pub(crate) blocking: Option<BlockingResult>,
+    pub(crate) applied: Vec<BlockingApplied>,
+    pub(crate) failures: Vec<(usize, String)>,
+}
+
+impl BlockingGroupOutcome {
+    fn refuse_all(indices: &[usize], error: impl Into<String>) -> Self {
+        let error = error.into();
+        Self {
+            failures: indices
+                .iter()
+                .map(|&index| (index, error.clone()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<BlockingResult> for BlockingGroupOutcome {
+    fn from(blocking: BlockingResult) -> Self {
+        Self {
+            blocking: Some(blocking),
+            ..Default::default()
+        }
+    }
+}
+
+impl From<String> for BlockingGroupOutcome {
+    fn from(text: String) -> Self {
+        BlockingResult::from(text).into()
+    }
+}
+
+impl From<CallbackResponse> for BlockingGroupOutcome {
+    fn from(response: CallbackResponse) -> Self {
+        BlockingResult::from(response).into()
+    }
+}
+
+/// Map a task spawn onto the change indices its payloads came from, one task
+/// per index in order.
+fn task_spawn_group_outcome(indices: &[usize], outcome: TaskSpawnOutcome) -> BlockingGroupOutcome {
+    let applied = outcome
+        .spawned
+        .into_iter()
+        .map(|task| {
+            let address = task.task_uri.clone().unwrap_or_else(|| task.job_id.clone());
+            let summary = match task.launch.waiting_note() {
+                Some(note) => format!("Spawned task {address}, {note}"),
+                None => format!("Spawned task {address}"),
+            };
+            BlockingApplied {
+                index: indices[task.index],
+                summary,
+                data: serde_json::json!({
+                    "taskUri": task.task_uri,
+                    "jobId": task.job_id,
+                    "description": task.description,
+                    "launch": task.launch,
+                }),
+            }
+        })
+        .collect();
+    BlockingGroupOutcome {
+        blocking: outcome.response.map(BlockingResult::from),
+        applied,
+        failures: outcome
+            .refused
+            .into_iter()
+            .map(|(index, error)| (indices[index], error))
+            .collect(),
+    }
+}
+
 /// Run the validated blocking group without discarding structured spawn metadata.
 pub(crate) async fn run_blocking_group(
     orch: &Orchestrator,
@@ -120,7 +209,7 @@ pub(crate) async fn run_blocking_group(
     changes: &[ChangeItem],
     indices: &[usize],
     kind: BlockingKind,
-) -> BlockingResult {
+) -> BlockingGroupOutcome {
     match kind {
         BlockingKind::Tasks => run_tasks_group(orch, request, changes, indices).await,
         BlockingKind::Calls => run_calls_group(orch, request, changes, indices).await,
@@ -220,34 +309,45 @@ fn classify_task_route(caller_job_id: &str, target_job_ids: &[String]) -> TaskRo
 /// Run a validated tasks-append group: parse every item, resolve the caller and
 /// each target node, then route to the self pipeline or the cross-node
 /// `create_child_task` path (or reject a mixed batch).
+///
+/// Anything that stops the group before a child exists is a failure of every
+/// task append in it, never blocking text.
 async fn run_tasks_group(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     changes: &[ChangeItem],
     indices: &[usize],
-) -> BlockingResult {
+) -> BlockingGroupOutcome {
     // Parse every item's payload and target coordinates up front.
     let mut tasks: Vec<TaskPayload> = Vec::with_capacity(indices.len());
     let mut coords: Vec<NodeTasksCoords> = Vec::with_capacity(indices.len());
     for &i in indices {
         let Some(payload) = changes[i].payload.clone() else {
-            return "Task append requires payload with at least subagentType"
-                .to_string()
-                .into();
+            return BlockingGroupOutcome::refuse_all(
+                indices,
+                "Task append requires payload with at least subagentType",
+            );
         };
         let task: TaskPayload = match serde_json::from_value(payload) {
             Ok(task) => task,
-            Err(e) => return format!("Invalid task append payload: {e}").into(),
+            Err(e) => {
+                return BlockingGroupOutcome::refuse_all(
+                    indices,
+                    format!("Invalid task append payload: {e}"),
+                )
+            }
         };
         // Belt-and-suspenders: items only reach here after `blocking_append_kind`
         // already matched `NodeTasks`, so re-parsing the same target always yields
         // `Some`. Guard anyway rather than index into a wrong assumption.
         let Some(node_coords) = node_tasks_coords(&changes[i].target) else {
-            return format!(
-                "Task append target is not a node tasks collection: {}",
-                changes[i].target
-            )
-            .into();
+            return BlockingGroupOutcome::refuse_all(
+                indices,
+                format!(
+                    "Task append target is not a node tasks collection: {}",
+                    changes[i].target
+                ),
+            );
         };
         tasks.push(task);
         coords.push(node_coords);
@@ -262,26 +362,33 @@ async fn run_tasks_group(
     // caller's owning DB by run id so `lookup_caller_job_id` and the target-node
     // lookups read the database the rows actually live in.
     let Some(run_id) = request.run_id.as_deref() else {
-        return "Failed to resolve caller node for task spawn: authenticated agent request is missing its run ID".to_string().into();
+        return BlockingGroupOutcome::refuse_all(
+            indices,
+            "Failed to resolve caller node for task spawn: authenticated agent request is missing its run ID",
+        );
     };
     let routing_db = match crate::execution::routing::routing_db_for_id(&orch.db, run_id).await {
         Ok(db) => db,
-        Err(e) => return format!("Failed to resolve caller node for task spawn: {e}").into(),
+        Err(e) => {
+            return BlockingGroupOutcome::refuse_all(
+                indices,
+                format!("Failed to resolve caller node for task spawn: {e}"),
+            )
+        }
     };
     let routing = match resolve_task_routing(&routing_db, run_id, &coords).await {
         Ok(routing) => routing,
         // Surface caller-resolution / "Node '…' not found" errors rather than
         // spawning under the caller.
-        Err(e) => return e.into(),
+        Err(e) => return BlockingGroupOutcome::refuse_all(indices, e),
     };
 
     match routing.route {
-        TaskRoute::Mixed => {
-            "A tasks append cannot mix self-targeted and cross-node targets in one call"
-                .to_string()
-                .into()
-        }
-        TaskRoute::SelfNode => run_self_task_spawn(orch, request, &tasks).await,
+        TaskRoute::Mixed => BlockingGroupOutcome::refuse_all(
+            indices,
+            "A tasks append cannot mix self-targeted and cross-node targets in one call",
+        ),
+        TaskRoute::SelfNode => run_self_task_spawn(orch, request, &tasks, indices).await,
         TaskRoute::CrossNode => {
             run_cross_node_task_spawn(orch, &tasks, &routing.target_job_ids, &coords)
                 .await
@@ -299,7 +406,7 @@ async fn run_calls_group(
     request: &McpCallbackRequest,
     changes: &[ChangeItem],
     indices: &[usize],
-) -> BlockingResult {
+) -> BlockingGroupOutcome {
     let mut calls: Vec<DelegatedCallPayload> = Vec::with_capacity(indices.len());
     let mut background: Option<bool> = None;
     for &i in indices {
@@ -423,14 +530,18 @@ async fn run_self_task_spawn(
     orch: &Orchestrator,
     request: &McpCallbackRequest,
     tasks: &[TaskPayload],
-) -> BlockingResult {
+    indices: &[usize],
+) -> BlockingGroupOutcome {
     let mut payloads = Vec::with_capacity(tasks.len());
     let mut background: Option<bool> = None;
     for task in tasks {
         let task_bg = task.run_in_background.unwrap_or(false);
         match background {
             Some(prev) if prev != task_bg => {
-                return "All task appends in a single change call must share the same background value".to_string().into();
+                return BlockingGroupOutcome::refuse_all(
+                    indices,
+                    "All task appends in a single change call must share the same background value",
+                );
             }
             _ => background = Some(task_bg),
         }
@@ -448,7 +559,7 @@ async fn run_self_task_spawn(
         .tool_use_id
         .as_deref()
         .or(resolved_tool_use_id.as_deref());
-    let response = crate::execution::delegation::spawn_task_packets(
+    let outcome = crate::execution::delegation::spawn_task_packets(
         orch,
         SpawnTaskPacketsInput {
             run_id: request.run_id.as_deref(),
@@ -459,7 +570,7 @@ async fn run_self_task_spawn(
         },
     )
     .await;
-    response.into()
+    task_spawn_group_outcome(indices, outcome)
 }
 
 /// Spawn each task as a detached child under its addressed node via

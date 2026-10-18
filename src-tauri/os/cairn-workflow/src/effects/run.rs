@@ -4,6 +4,7 @@
 
 use super::reduce::reduce_effect_result;
 use super::types::{EffectResult, WorkflowEffect};
+use crate::advancement::AdvanceError;
 use crate::runtime::{WorkflowOwner, WorkflowRuntime, Workload};
 
 /// Summary of what happened during effect execution.
@@ -16,6 +17,12 @@ pub struct EffectLoopReport {
 ///
 /// The engine handles workflow mutations and dispatches external workloads. `EffectResult`s
 /// feed back into `reduce_effect_result` which may produce more effects.
+///
+/// A cascading `AdvanceDag` claims jobs just as top-level advancement does, and
+/// queues their start as a later `StartAgentJobs` effect. When any effect fails,
+/// the error therefore carries every agent job claimed and not yet handed over:
+/// the failing reduction's own claims, every start still queued in this batch
+/// or the next, and a start whose handover itself failed.
 #[tracing::instrument(
     target = "profiler",
     name = "effect_loop",
@@ -25,164 +32,193 @@ pub struct EffectLoopReport {
 pub async fn execute_effects(
     runtime: &WorkflowRuntime,
     mut effects: Vec<WorkflowEffect>,
-) -> Result<EffectLoopReport, String> {
+) -> Result<EffectLoopReport, AdvanceError> {
     let mut report = EffectLoopReport::default();
 
     while !effects.is_empty() {
-        let batch = std::mem::take(&mut effects);
-        for effect in batch {
+        let mut batch = std::mem::take(&mut effects).into_iter();
+        while let Some(effect) = batch.next() {
             log::debug!("Executing effect: {:?}", effect);
-            match effect {
-                // ── DAG advancement ──
-                WorkflowEffect::AdvanceDag {
-                    execution_id,
-                    outbox_entry_id,
-                } => {
-                    let (agent_jobs, new_effects) =
-                        crate::effects::dag::reduce_dag(runtime, &execution_id)?;
-                    if !agent_jobs.is_empty() {
-                        effects.push(WorkflowEffect::StartAgentJobs(agent_jobs));
-                    }
-                    effects.extend(new_effects);
-
-                    // Mark the specific outbox entry as done (row-level acknowledgement).
-                    // Only root AdvanceDag effects from apply_step_outcome carry an
-                    // outbox_entry_id. Follow-on effects from reduce_dag have None.
-                    if let Some(ref entry_id) = outbox_entry_id {
-                        if let Err(error) = mark_outbox_done(runtime, entry_id).await {
-                            log::warn!("Failed to mark outbox entry done: {}", error);
+            match execute_effect(runtime, effect, &mut effects).await {
+                Ok(true) => report.effects_executed += 1,
+                Ok(false) => {}
+                Err(mut error) => {
+                    for unexecuted in batch.chain(effects.drain(..)) {
+                        if let WorkflowEffect::StartAgentJobs(jobs) = unexecuted {
+                            error.claimed_agent_jobs.extend(jobs);
                         }
                     }
-                }
-
-                // ── Lifecycle messaging ──
-                WorkflowEffect::EmitLifecycleMessage {
-                    job_id,
-                    run_id,
-                    event,
-                } => {
-                    runtime
-                        .host
-                        .lifecycle_message(&job_id, run_id.as_deref(), event);
-                }
-
-                // ── Condition evaluation ──
-                WorkflowEffect::StoreConditionEvaluation {
-                    execution_id,
-                    node_id,
-                    verdict,
-                } => {
-                    if record_condition_verdict(runtime, &execution_id, &node_id, &verdict)
-                        .await?
-                        .advances()
-                    {
-                        effects.push(WorkflowEffect::AdvanceDag {
-                            execution_id,
-                            outbox_entry_id: None,
-                        });
-                    }
-                }
-
-                WorkflowEffect::EvaluateCondition {
-                    execution_id,
-                    node_id,
-                    node_name,
-                    ..
-                } => {
-                    if let Some(verdict) =
-                        evaluate_condition(runtime, &execution_id, &node_id, &node_name).await
-                    {
-                        effects.extend(reduce_effect_result(EffectResult::ConditionEvaluated {
-                            execution_id,
-                            node_id,
-                            verdict,
-                        }));
-                    }
-                }
-
-                // ── Checkpoint handling ──
-                WorkflowEffect::ApplyCheckpointApproval { job_id } => {
-                    let new_effects =
-                        crate::effects::checkpoint::approve_job_pure(runtime, &job_id)?;
-                    effects.extend(new_effects);
-                }
-
-                WorkflowEffect::BlockCheckpointJob { job_id } => {
-                    // Command checkpoint failed: block the job (seed unconfirmed
-                    // artifact + recompute -> Blocked). Resumable, not terminal.
-                    crate::advancement::block_job(runtime, &job_id)?;
-                    // Then wake the upstream agent with the captured failure so it
-                    // can fix and commit; the checkpoint re-runs automatically when
-                    // the agent goes idle. Best-effort — a failed wake leaves the
-                    // checkpoint Blocked for manual resolution.
-                    if let Err(e) =
-                        crate::advancement::wake_upstream_after_checkpoint_failure(runtime, &job_id)
-                    {
-                        log::warn!(
-                            "Failed to wake upstream after checkpoint {} failed: {}",
-                            &job_id[..job_id.len().min(8)],
-                            e
-                        );
-                    }
-                }
-
-                WorkflowEffect::RunCheckpointCommand {
-                    job_id,
-                    node_name,
-                    command,
-                    cached_pass,
-                    ..
-                } => {
-                    let result =
-                        run_checkpoint(runtime, &job_id, &node_name, &command, cached_pass).await;
-                    effects.extend(reduce_effect_result(result));
-                }
-
-                // ── Failure marking ──
-                WorkflowEffect::MarkJobFailed { job_id, error } => {
-                    crate::advancement::mark_job_failed(runtime, &job_id, &error)?;
-                }
-
-                WorkflowEffect::MarkActionRunFailed {
-                    action_run_id,
-                    error,
-                } => {
-                    crate::advancement::mark_action_run_failed(runtime, &action_run_id, &error)?;
-                }
-
-                // Workload execution is the host's responsibility; only the
-                // workflow engine turns its result into subsequent effects.
-                WorkflowEffect::StartAgentJobs(jobs) => {
-                    runtime.host.execute(Workload::AgentJobs(jobs)).await?;
-                }
-                WorkflowEffect::ExecuteAction {
-                    action_run_id,
-                    execution_id,
-                    node_id,
-                    ctx,
-                } => {
-                    if !crate::pr_publish_attempts::claim_dispatch(runtime, &action_run_id).await? {
-                        continue;
-                    }
-                    if let Some(result) = runtime
-                        .host
-                        .execute(Workload::Action {
-                            action_run_id,
-                            execution_id,
-                            node_id,
-                            ctx,
-                        })
-                        .await?
-                    {
-                        effects.extend(reduce_effect_result(result));
-                    }
+                    return Err(error);
                 }
             }
-            report.effects_executed += 1;
         }
     }
 
     Ok(report)
+}
+
+/// Execute one effect, queueing any follow-on effects onto `effects`.
+/// Returns whether it executed: a PR dispatch another pass already claimed is
+/// skipped and not counted.
+async fn execute_effect(
+    runtime: &WorkflowRuntime,
+    effect: WorkflowEffect,
+    effects: &mut Vec<WorkflowEffect>,
+) -> Result<bool, AdvanceError> {
+    match effect {
+        // ── DAG advancement ──
+        WorkflowEffect::AdvanceDag {
+            execution_id,
+            outbox_entry_id,
+        } => {
+            let (agent_jobs, new_effects) =
+                crate::effects::dag::reduce_dag(runtime, &execution_id).await?;
+            if !agent_jobs.is_empty() {
+                effects.push(WorkflowEffect::StartAgentJobs(agent_jobs));
+            }
+            effects.extend(new_effects);
+
+            // Mark the specific outbox entry as done (row-level acknowledgement).
+            // Only root AdvanceDag effects from apply_step_outcome carry an
+            // outbox_entry_id. Follow-on effects from reduce_dag have None.
+            if let Some(ref entry_id) = outbox_entry_id {
+                if let Err(error) = mark_outbox_done(runtime, entry_id).await {
+                    log::warn!("Failed to mark outbox entry done: {}", error);
+                }
+            }
+        }
+
+        // ── Lifecycle messaging ──
+        WorkflowEffect::EmitLifecycleMessage {
+            job_id,
+            run_id,
+            event,
+        } => {
+            runtime
+                .host
+                .lifecycle_message(&job_id, run_id.as_deref(), event);
+        }
+
+        // ── Condition evaluation ──
+        WorkflowEffect::StoreConditionEvaluation {
+            execution_id,
+            node_id,
+            verdict,
+        } => {
+            if record_condition_verdict(runtime, &execution_id, &node_id, &verdict)
+                .await?
+                .advances()
+            {
+                effects.push(WorkflowEffect::AdvanceDag {
+                    execution_id,
+                    outbox_entry_id: None,
+                });
+            }
+        }
+
+        WorkflowEffect::EvaluateCondition {
+            execution_id,
+            node_id,
+            node_name,
+            ..
+        } => {
+            if let Some(verdict) =
+                evaluate_condition(runtime, &execution_id, &node_id, &node_name).await
+            {
+                effects.extend(reduce_effect_result(EffectResult::ConditionEvaluated {
+                    execution_id,
+                    node_id,
+                    verdict,
+                }));
+            }
+        }
+
+        // ── Checkpoint handling ──
+        WorkflowEffect::ApplyCheckpointApproval { job_id } => {
+            let new_effects = crate::effects::checkpoint::approve_job_pure(runtime, &job_id)?;
+            effects.extend(new_effects);
+        }
+
+        WorkflowEffect::BlockCheckpointJob { job_id } => {
+            // Command checkpoint failed: block the job (seed unconfirmed
+            // artifact + recompute -> Blocked). Resumable, not terminal.
+            crate::advancement::block_job(runtime, &job_id)?;
+            // Then wake the upstream agent with the captured failure so it
+            // can fix and commit; the checkpoint re-runs automatically when
+            // the agent goes idle. Best-effort — a failed wake leaves the
+            // checkpoint Blocked for manual resolution.
+            if let Err(e) =
+                crate::advancement::wake_upstream_after_checkpoint_failure(runtime, &job_id)
+            {
+                log::warn!(
+                    "Failed to wake upstream after checkpoint {} failed: {}",
+                    &job_id[..job_id.len().min(8)],
+                    e
+                );
+            }
+        }
+
+        WorkflowEffect::RunCheckpointCommand {
+            job_id,
+            node_name,
+            command,
+            cached_pass,
+            ..
+        } => {
+            let result = run_checkpoint(runtime, &job_id, &node_name, &command, cached_pass).await;
+            effects.extend(reduce_effect_result(result));
+        }
+
+        // ── Failure marking ──
+        WorkflowEffect::MarkJobFailed { job_id, error } => {
+            crate::advancement::mark_job_failed(runtime, &job_id, &error)?;
+        }
+
+        WorkflowEffect::MarkActionRunFailed {
+            action_run_id,
+            error,
+        } => {
+            crate::advancement::mark_action_run_failed(runtime, &action_run_id, &error)?;
+        }
+
+        // Workload execution is the host's responsibility; only the
+        // workflow engine turns its result into subsequent effects.
+        WorkflowEffect::StartAgentJobs(jobs) => {
+            if let Err(message) = runtime
+                .host
+                .execute(Workload::AgentJobs(jobs.clone()))
+                .await
+            {
+                return Err(AdvanceError {
+                    message,
+                    claimed_agent_jobs: jobs,
+                });
+            }
+        }
+        WorkflowEffect::ExecuteAction {
+            action_run_id,
+            execution_id,
+            node_id,
+            ctx,
+        } => {
+            if !crate::pr_publish_attempts::claim_dispatch(runtime, &action_run_id).await? {
+                return Ok(false);
+            }
+            if let Some(result) = runtime
+                .host
+                .execute(Workload::Action {
+                    action_run_id,
+                    execution_id,
+                    node_id,
+                    ctx,
+                })
+                .await?
+            {
+                effects.extend(reduce_effect_result(result));
+            }
+        }
+    }
+    Ok(true)
 }
 
 // ── Helper functions for effect handling ──────────────────────────────────

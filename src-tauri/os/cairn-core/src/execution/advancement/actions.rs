@@ -10,15 +10,84 @@ use super::*;
 /// This is the canonical entry point for DAG advancement. All callers —
 /// event listeners, direct async calls, scheduler — go through this function,
 /// which means all paths use `reduce_dag` as the single source of truth.
+///
+/// Every DAG reduction (this one and any cascading `AdvanceDag`) runs under the
+/// execution's snapshot lock, the one packet persistence and settlement take,
+/// through `WorkflowHost::execution_snapshot_guard`. So expanding delegated
+/// packets never interleaves with them: no reader sees a packet marked
+/// materialized whose job is still being created, and the reduction's snapshot
+/// rewrite cannot drop a packet persisted while it ran.
+///
+/// A failure after agent jobs were claimed hands those jobs to a runner here
+/// (see [`hand_over_claimed_jobs`]); callers see only the error, exactly as
+/// before.
 pub async fn advance_execution_with_actions(
     orch: &Orchestrator,
     execution_id: &str,
 ) -> Result<Vec<Job>, String> {
-    cairn_workflow::advancement::advance_execution_with_actions(
+    let result = cairn_workflow::advancement::advance_execution_with_actions(
         &crate::workflow_host::runtime(orch),
         execution_id,
     )
-    .await
+    .await;
+    settle_advance(orch, result).await
+}
+
+/// Turn a workflow-layer result into the host's, first settling any agent jobs
+/// the failure left claimed and unhanded. Every host entry into advancement or
+/// the effect loop goes through this.
+pub(crate) async fn settle_advance<T>(
+    orch: &Orchestrator,
+    result: Result<T, cairn_workflow::advancement::AdvanceError>,
+) -> Result<T, String> {
+    match result {
+        Ok(jobs) => Ok(jobs),
+        Err(error) => {
+            if !error.claimed_agent_jobs.is_empty() {
+                hand_over_claimed_jobs(orch, error.claimed_agent_jobs, &error.message).await;
+            }
+            Err(error.message)
+        }
+    }
+}
+
+/// Start the agent jobs a failed advancement had already claimed.
+///
+/// A caller given an advancement error dispatches nothing, and no later
+/// advancement scans a `running` job, so without this a claimed job would sit
+/// `running` with no run until boot repair — with any parent parked on it.
+/// They are handed to the runner exactly as a successful advancement's caller
+/// would; if even that fails, each is failed through `mark_job_start_failed`,
+/// which also answers whoever waits on it.
+async fn hand_over_claimed_jobs(orch: &Orchestrator, jobs: Vec<Job>, cause: &str) {
+    let handed = match orch.executor.get() {
+        Some(executor) => executor
+            .execute(
+                orch,
+                crate::effects::types::WorkflowEffect::StartAgentJobs(jobs.clone()),
+            )
+            .await
+            .map(|_| ()),
+        None => Err("no executor is configured".to_string()),
+    };
+    let Err(handover) = handed else {
+        return;
+    };
+    for job in jobs {
+        let db = crate::execution::routing::owning_db_for_job(&orch.db, &job.id)
+            .await
+            .unwrap_or_else(|_| orch.db.local.clone());
+        crate::execution::jobs::mark_job_start_failed(
+            orch,
+            &db,
+            &job.id,
+            &format!(
+                "advancement failed after claiming this job ({cause}), and handing it to a runner failed: {handover}"
+            ),
+            true,
+        )
+        .await;
+    }
 }
 
 pub fn block_job(orch: &Orchestrator, job_id: &str) -> Result<(), String> {
@@ -38,8 +107,12 @@ pub fn mark_job_failed(orch: &Orchestrator, job_id: &str, error: &str) -> Result
 /// attempt cycle, re-pends it (bypassing the SHA gate — explicit user intent),
 /// and advances the DAG so it re-runs. Returns any newly ready agent jobs.
 pub async fn rerun_checkpoint_job(orch: &Orchestrator, job_id: &str) -> Result<Vec<Job>, String> {
-    cairn_workflow::advancement::rerun_checkpoint_job(&crate::workflow_host::runtime(orch), job_id)
-        .await
+    let result = cairn_workflow::advancement::rerun_checkpoint_job(
+        &crate::workflow_host::runtime(orch),
+        job_id,
+    )
+    .await;
+    settle_advance(orch, result).await
 }
 
 /// Re-evaluate a condition that blocked and routed nowhere. Refuses a condition
@@ -49,12 +122,13 @@ pub async fn reevaluate_condition(
     execution_id: &str,
     node_id: &str,
 ) -> Result<cairn_workflow::conditions::ConditionVerdict, String> {
-    cairn_workflow::advancement::reevaluate_condition(
+    let result = cairn_workflow::advancement::reevaluate_condition(
         &crate::workflow_host::runtime(orch),
         execution_id,
         node_id,
     )
-    .await
+    .await;
+    settle_advance(orch, result).await
 }
 
 /// Whether `node_id` is a blocked condition that `reevaluate_condition` would

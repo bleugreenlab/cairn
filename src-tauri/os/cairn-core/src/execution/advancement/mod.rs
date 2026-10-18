@@ -8,6 +8,7 @@ use crate::orchestrator::Orchestrator;
 
 mod actions;
 mod recompute;
+pub(crate) use actions::settle_advance;
 pub use actions::{
     advance_execution_with_actions, block_job, mark_job_failed, rearm_failed_pr_actions,
     reevaluable_condition, reevaluate_condition, replay_pr_publish, rerun_checkpoint_job,

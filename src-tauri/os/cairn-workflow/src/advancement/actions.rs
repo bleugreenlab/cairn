@@ -1,5 +1,34 @@
 use super::*;
 
+/// A failed advancement, with the agent jobs it had already claimed.
+///
+/// Claiming moves a ready job `pending → running` and is the single claim point:
+/// no later advancement scans a `running` job again. Every step after the claim
+/// can still fail, and a caller handed only the error would drop jobs nobody
+/// will ever start. `claimed_agent_jobs` is what the caller must still hand to a
+/// runner (or fail) on the error path; it is empty when the failure came before
+/// any claim.
+#[derive(Debug)]
+pub struct AdvanceError {
+    pub message: String,
+    pub claimed_agent_jobs: Vec<Job>,
+}
+
+impl std::fmt::Display for AdvanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for AdvanceError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            claimed_agent_jobs: Vec::new(),
+        }
+    }
+}
+
 /// Advance execution DAG and handle action/condition/checkpoint nodes.
 ///
 /// Returns agent jobs that are ready to start. All operations flow through
@@ -13,13 +42,13 @@ use super::*;
 pub async fn advance_execution_with_actions(
     runtime: &WorkflowRuntime,
     execution_id: &str,
-) -> Result<Vec<Job>, String> {
+) -> Result<Vec<Job>, AdvanceError> {
     use crate::effects::dag::reduce_dag;
     use crate::effects::run::execute_effects;
     use crate::effects::types::WorkflowEffect;
 
-    // Step 1: Synchronous DAG reduction — produces typed effects
-    let (mut agent_jobs, effects) = reduce_dag(runtime, execution_id)?;
+    // Step 1: DAG reduction (under the host's snapshot guard) — produces typed effects
+    let (mut agent_jobs, effects) = reduce_dag(runtime, execution_id).await?;
 
     // Step 2: Separate StartAgentJobs from other effects (we accumulate them)
     let mut remaining_effects = Vec::new();
@@ -35,7 +64,15 @@ pub async fn advance_execution_with_actions(
     // Step 3: Execute remaining effects through the core effect loop.
     // Cascading StartAgentJobs are handled by the executor directly.
     if !remaining_effects.is_empty() {
-        let report = execute_effects(runtime, remaining_effects).await?;
+        let report = match execute_effects(runtime, remaining_effects).await {
+            Ok(report) => report,
+            Err(mut error) => {
+                // The loop's own unhanded claims, plus this reduction's, which
+                // were about to be returned for the caller to start.
+                error.claimed_agent_jobs.extend(agent_jobs);
+                return Err(error);
+            }
+        };
 
         log::debug!(
             "Effect loop completed: {} effects executed for execution {}",
@@ -475,18 +512,20 @@ pub fn rearm_blocked_checkpoints(
 pub async fn rerun_checkpoint_job(
     runtime: &WorkflowRuntime,
     job_id: &str,
-) -> Result<Vec<Job>, String> {
+) -> Result<Vec<Job>, AdvanceError> {
     let (status, session_id, recipe_node_id, execution_id) =
         load_rerun_job_fields(runtime, job_id)?;
     if status != "blocked" {
         return Err(format!(
             "Checkpoint can only be re-run while Blocked (current status: {status})"
-        ));
+        )
+        .into());
     }
     if session_id.is_some() {
         return Err(
             "This job ran an agent (it has a session) and is not a command checkpoint. Re-run only applies to command checkpoints."
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     let execution_id = execution_id.ok_or_else(|| "Checkpoint job has no execution".to_string())?;
@@ -498,7 +537,7 @@ pub async fn rerun_checkpoint_job(
         .iter()
         .any(|n| n.id == node_id && n.node_type == "checkpoint");
     if !is_checkpoint {
-        return Err("This job is not a command checkpoint.".to_string());
+        return Err("This job is not a command checkpoint.".to_string().into());
     }
 
     reset_checkpoint_runs(runtime, job_id)?;
@@ -522,7 +561,7 @@ pub async fn reevaluate_condition(
     runtime: &WorkflowRuntime,
     execution_id: &str,
     node_id: &str,
-) -> Result<crate::conditions::ConditionVerdict, String> {
+) -> Result<crate::conditions::ConditionVerdict, AdvanceError> {
     use crate::effects::run::{record_condition_verdict, RecordedVerdict};
     use crate::effects::types::WorkflowEffect;
 
@@ -552,9 +591,7 @@ pub async fn reevaluate_condition(
                 Err(reason) => reason,
                 Ok(_) => "its execution changed while it was evaluating".to_string(),
             };
-            Err(format!(
-                "Condition '{name}' re-evaluation was discarded: {why}"
-            ))
+            Err(format!("Condition '{name}' re-evaluation was discarded: {why}").into())
         }
     }
 }

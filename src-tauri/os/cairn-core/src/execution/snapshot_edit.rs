@@ -38,6 +38,13 @@ pub async fn update_execution_agent(
     let owning = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
     let db: &LocalDb = owning.as_ref();
 
+    // Serialize this snapshot read-modify-write with every other writer of the
+    // execution's snapshot: delegated-packet persistence and settlement, and
+    // advancement's DAG reduction. Held through the write only — provider
+    // changes and live-session propagation below run outside it.
+    let snapshot_lock = orch.execution_lock(execution_id);
+    let snapshot_guard = snapshot_lock.lock().await;
+
     let snapshot_json = load_execution_snapshot_json(db, execution_id)
         .await?
         .ok_or("Execution has no snapshot")?;
@@ -104,6 +111,7 @@ pub async fn update_execution_agent(
     let job_ids = load_agent_job_ids(db, execution_id, agent_id).await?;
 
     update_agent_snapshot(db, execution_id, &updated_json).await?;
+    drop(snapshot_guard);
 
     if let Some(selection) = normalized_snapshot.selection.as_ref() {
         for job_id in job_ids {

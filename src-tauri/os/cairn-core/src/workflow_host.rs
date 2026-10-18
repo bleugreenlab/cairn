@@ -176,6 +176,9 @@ impl WorkflowHost for CoreWorkflowHost {
         )
         .await
     }
+    async fn execution_snapshot_guard(&self, execution_id: &str) -> Box<dyn std::any::Any + Send> {
+        Box::new(self.0.execution_lock(execution_id).lock_owned().await)
+    }
     async fn execute(&self, workload: Workload) -> Result<Option<EffectResult>, String> {
         let effect = match workload {
             Workload::AgentJobs(jobs) => WorkflowEffect::StartAgentJobs(jobs),

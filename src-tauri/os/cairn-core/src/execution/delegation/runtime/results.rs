@@ -2,7 +2,7 @@ use crate::models::{AgentConfig, JobStatus};
 use crate::storage::{LocalDb, RowExt};
 use cairn_common::protocol::CallbackResponse;
 
-use super::common::select_optional_text;
+use super::common::{latest_run_for_job, select_optional_text};
 
 /// How a delegated child settled, as its own job reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,9 +48,33 @@ fn classify_task_outcome(job_status: Option<&str>, run_status: Option<&str>) -> 
     }
 }
 
+/// Whether a delegated child has settled, as [`classify_task_outcome`] reads it
+/// from the child's job and its latest run.
+///
+/// This is what an inline wait keys on. It needs only the job, so a child that
+/// was created without a run, or failed or was cancelled before it ever had
+/// one, settles here exactly like one that ran.
+pub(super) async fn task_has_settled(db: &LocalDb, job_id: &str) -> bool {
+    let job_status = select_optional_text(db, "SELECT status FROM jobs WHERE id = ?1", job_id)
+        .await
+        .ok()
+        .flatten();
+    let run_status = match latest_run_for_job(db, job_id).await.ok().flatten() {
+        Some(run_id) => select_optional_text(db, "SELECT status FROM runs WHERE id = ?1", &run_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    classify_task_outcome(job_status.as_deref(), run_status.as_deref()) != TaskOutcome::Unsettled
+}
+
+/// Render a delegated child's result. `run_id` is the run to read status and
+/// assistant text from; a child that never had a run renders from its job
+/// alone.
 pub(super) async fn build_task_callback_response(
     db: &LocalDb,
-    run_id: &str,
+    run_id: Option<&str>,
     node_id: &str,
     agent_config: &AgentConfig,
     task_description: &str,
@@ -60,10 +84,13 @@ pub(super) async fn build_task_callback_response(
         .await
         .ok()
         .flatten();
-    let run_status = select_optional_text(db, "SELECT status FROM runs WHERE id = ?1", run_id)
-        .await
-        .ok()
-        .flatten();
+    let run_status = match run_id {
+        Some(run_id) => select_optional_text(db, "SELECT status FROM runs WHERE id = ?1", run_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let outcome = classify_task_outcome(job_status.as_deref(), run_status.as_deref());
 
     // A written artifact is a real result whatever the child's status says, so
@@ -79,9 +106,11 @@ pub(super) async fn build_task_callback_response(
 
     let result = match (outcome, artifact) {
         (TaskOutcome::Succeeded, Some(content)) => content,
-        (TaskOutcome::Succeeded, None) => latest_nonempty_assistant_content(db, run_id)
-            .await
-            .unwrap_or_else(|| "Task completed.".to_string()),
+        (TaskOutcome::Succeeded, None) => match run_id {
+            Some(run_id) => latest_nonempty_assistant_content(db, run_id).await,
+            None => None,
+        }
+        .unwrap_or_else(|| "Task completed.".to_string()),
         (TaskOutcome::Failed, artifact) => failure_text(
             agent_config,
             task_description,
@@ -389,9 +418,15 @@ mod callback_response_tests {
     #[tokio::test]
     async fn a_warm_completed_child_returns_its_artifact_and_uri() {
         let db = warm_completed_child().await;
-        let response =
-            build_task_callback_response(&db, "r-task", "j-task", &agent(), "explore it", "return")
-                .await;
+        let response = build_task_callback_response(
+            &db,
+            Some("r-task"),
+            "j-task",
+            &agent(),
+            "explore it",
+            "return",
+        )
+        .await;
         assert_eq!(response.result, "the explored answer");
         assert_eq!(
             response.artifact_uri.as_deref(),
@@ -408,9 +443,15 @@ mod callback_response_tests {
         db.execute("UPDATE jobs SET status = 'failed' WHERE id = 'j-task'", ())
             .await
             .unwrap();
-        let response =
-            build_task_callback_response(&db, "r-task", "j-task", &agent(), "explore it", "return")
-                .await;
+        let response = build_task_callback_response(
+            &db,
+            Some("r-task"),
+            "j-task",
+            &agent(),
+            "explore it",
+            "return",
+        )
+        .await;
         assert!(response.result.contains("failed"), "{}", response.result);
         assert!(
             response.result.contains("the explored answer"),
@@ -431,13 +472,49 @@ mod callback_response_tests {
         db.execute("DELETE FROM artifacts WHERE job_id = 'j-task'", ())
             .await
             .unwrap();
-        let response =
-            build_task_callback_response(&db, "r-task", "j-task", &agent(), "explore it", "return")
-                .await;
+        let response = build_task_callback_response(
+            &db,
+            Some("r-task"),
+            "j-task",
+            &agent(),
+            "explore it",
+            "return",
+        )
+        .await;
         assert!(
             response.result.contains("job: running") && response.result.contains("run: live"),
             "{}",
             response.result
+        );
+    }
+
+    /// A child cancelled before it ever had a run still renders, from its job.
+    #[tokio::test]
+    async fn a_child_with_no_run_renders_from_its_job() {
+        let db = warm_completed_child().await;
+        db.execute_script(
+            "DELETE FROM runs WHERE job_id = 'j-task';
+             DELETE FROM artifacts WHERE job_id = 'j-task';
+             UPDATE jobs SET status = 'cancelled' WHERE id = 'j-task';",
+        )
+        .await
+        .unwrap();
+        let response =
+            build_task_callback_response(&db, None, "j-task", &agent(), "explore it", "return")
+                .await;
+        assert!(
+            response.result.contains("was cancelled"),
+            "{}",
+            response.result
+        );
+        assert!(super::task_has_settled(&db, "j-task").await);
+
+        db.execute("UPDATE jobs SET status = 'pending' WHERE id = 'j-task'", ())
+            .await
+            .unwrap();
+        assert!(
+            !super::task_has_settled(&db, "j-task").await,
+            "a created, unstarted child has not settled"
         );
     }
 }

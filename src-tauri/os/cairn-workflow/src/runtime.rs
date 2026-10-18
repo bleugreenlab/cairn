@@ -92,6 +92,14 @@ pub trait WorkflowHost: Send + Sync {
         command: &str,
     ) -> Result<ExecutedCheckpoint, String>;
     async fn execute(&self, workload: Workload) -> Result<Option<EffectResult>, String>;
+    /// Exclude every other writer of `execution_id`'s snapshot while the DAG is
+    /// reduced. The reduction expands delegated packets by rewriting that
+    /// snapshot, so a host that also writes packets into it (spawn persistence
+    /// and settlement) returns its per-execution lock here. The value is held
+    /// for exactly one reduction and dropped before any effect runs.
+    async fn execution_snapshot_guard(&self, _execution_id: &str) -> Box<dyn std::any::Any + Send> {
+        Box::new(())
+    }
 }
 
 /// Resources for workflow operations. The private outbox is distinct from each

@@ -457,6 +457,53 @@ pub(super) async fn checkpoint_blocking_report(
     }
 }
 
+/// Replace the still-pending blocking checkpoint with a report that now lists
+/// what the blocking group created.
+///
+/// [`checkpoint_blocking_report`] runs before the group, so its report cannot
+/// name the tasks the group goes on to create. This rewrites it without
+/// settling the call: a resource claim keeps its pending marker, so a
+/// redelivery still waits for the settled report rather than replaying a
+/// partial one.
+pub(super) async fn update_blocking_checkpoint(
+    db: &LocalDb,
+    call: &WriteCall,
+    owner: Option<&ReplayOwner>,
+    ordinary_claim: LedgerClaim,
+    report: &str,
+) -> Result<(), String> {
+    let saved = if let Some(owner) = owner {
+        checkpoint_owned_report(db, call, owner, report).await
+    } else if ordinary_claim == LedgerClaim::Claimed {
+        db.execute(
+            "UPDATE write_replay_ledger SET report=?3 WHERE run_id=?1 AND tool_use_id=?2",
+            cairn_db::turso::params![call.run_id.clone(), call.id.clone(), report.to_string()],
+        )
+        .await
+        .map_err(|e| e.to_string())?
+            == 1
+    } else {
+        db.execute(
+            "UPDATE write_replay_ledger SET report=?3
+             WHERE run_id=?1 AND tool_use_id=?2 AND substr(report, 1, length(?4)) = ?4",
+            cairn_db::turso::params![
+                call.run_id.clone(),
+                call.id.clone(),
+                format!("{RESOURCE_PENDING}\n{report}"),
+                RESOURCE_PENDING,
+            ],
+        )
+        .await
+        .map_err(|e| e.to_string())?
+            == 1
+    };
+    if saved {
+        Ok(())
+    } else {
+        Err("Could not update the blocking write checkpoint with the tasks it created".to_string())
+    }
+}
+
 /// A delayed task or answer is payload, never another host report. The replay
 /// ledger lives in the local database even when the transcript is team-owned.
 pub(crate) async fn complete_blocking_report(

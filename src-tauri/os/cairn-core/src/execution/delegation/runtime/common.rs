@@ -416,24 +416,6 @@ pub(super) async fn persist_call_packet(
     Ok(packet)
 }
 
-async fn lookup_packet_run(
-    db: &LocalDb,
-    execution_id: &str,
-    packet_id: &str,
-) -> Result<Option<(crate::models::DelegatedWorkPacket, String, String)>, String> {
-    let packet = match refresh_packet_state(db, execution_id, packet_id).await? {
-        Some(packet) => packet,
-        None => return Ok(None),
-    };
-    let Some(job_id) = packet.result_artifact_job_id.clone() else {
-        return Ok(None);
-    };
-    let Some(run_id) = latest_run_for_job(db, &job_id).await? else {
-        return Ok(None);
-    };
-    Ok(Some((packet, job_id, run_id)))
-}
-
 async fn update_execution_snapshot(
     db: &LocalDb,
     execution_id: &str,
@@ -455,7 +437,10 @@ async fn update_execution_snapshot(
     .await
 }
 
-async fn latest_run_for_job(db: &LocalDb, job_id: &str) -> Result<Option<String>, String> {
+pub(super) async fn latest_run_for_job(
+    db: &LocalDb,
+    job_id: &str,
+) -> Result<Option<String>, String> {
     let job_id = job_id.to_string();
     db.query_text(
         "
@@ -494,13 +479,14 @@ pub(super) async fn refresh_packet_state(
         .map_err(|e| format!("Failed to parse snapshot: {}", e))?;
 
     let mut changed = false;
-    let packet = snapshot
+    let Some(index) = snapshot
         .delegated_packets
-        .iter_mut()
-        .find(|packet| packet.id == packet_id);
-    let Some(packet) = packet else {
+        .iter()
+        .position(|packet| packet.id == packet_id)
+    else {
         return Ok(None);
     };
+    let packet = &mut snapshot.delegated_packets[index];
 
     if let Some(job_id) = &packet.result_artifact_job_id {
         let job_status = select_optional_text(db, "SELECT status FROM jobs WHERE id = ?1", job_id)
@@ -539,9 +525,9 @@ pub(super) async fn refresh_packet_state(
 
     let result = packet.clone();
     if changed {
-        let snapshot_json = serde_json::to_string(&snapshot)
-            .map_err(|e| format!("Failed to serialize snapshot: {}", e))?;
-        update_execution_snapshot(db, execution_id, snapshot_json)
+        let status = serde_json::to_value(&result.status)
+            .map_err(|e| format!("Failed to serialize packet status: {}", e))?;
+        write_packet_field(db, execution_id, &snapshot, index, "status", status)
             .await
             .map_err(|e| format!("Failed to update delegated packet status: {}", e))?;
     }
@@ -549,27 +535,144 @@ pub(super) async fn refresh_packet_state(
     Ok(Some(result))
 }
 
-pub(super) async fn wait_for_packet_run_materialization(
+/// Write one field of one delegated packet without rewriting the rest of the
+/// execution snapshot.
+///
+/// Packet state is written by callers that hold no common lock — the spawn, the
+/// resume gate a child's completion fires, a start-failure wake on its own
+/// thread — and each read the snapshot before writing it. Rewriting the whole
+/// snapshot from that earlier read would erase whatever another caller wrote in
+/// between: a retired packet would come back `Pending` and be expanded into an
+/// orphan child, a linked job would be unlinked. Patching just this field, and
+/// only while the packet is still at the index it was read from, cannot. A
+/// stored snapshot whose shape the in-place patch cannot address (one the loader
+/// migrates on read) falls back to writing the snapshot as loaded.
+async fn write_packet_field(
+    db: &LocalDb,
+    execution_id: &str,
+    loaded: &crate::models::ExecutionSnapshot,
+    index: usize,
+    field: &str,
+    value: serde_json::Value,
+) -> DbResult<()> {
+    let packet_id = loaded.delegated_packets[index].id.clone();
+    let patched = db
+        .execute(
+            "UPDATE executions
+             SET snapshot = json_set(snapshot, ?3, json(?4))
+             WHERE id = ?1 AND json_extract(snapshot, ?5) = ?2",
+            cairn_db::turso::params![
+                execution_id.to_string(),
+                packet_id,
+                format!("$.delegatedPackets[{index}].{field}"),
+                value.to_string(),
+                format!("$.delegatedPackets[{index}].id"),
+            ],
+        )
+        .await?;
+    if patched == 1 {
+        return Ok(());
+    }
+    let mut snapshot = loaded.clone();
+    let packet = serde_json::to_value(&snapshot.delegated_packets[index])
+        .and_then(|mut packet| {
+            packet[field] = value;
+            serde_json::from_value(packet)
+        })
+        .map_err(|e| crate::storage::DbError::internal(e.to_string()))?;
+    snapshot.delegated_packets[index] = packet;
+    let snapshot_json = serde_json::to_string(&snapshot)
+        .map_err(|e| crate::storage::DbError::internal(e.to_string()))?;
+    update_execution_snapshot(db, execution_id, snapshot_json).await
+}
+
+/// Settle a packet that advancement did not link to a child job: link it to the
+/// job its agent node did produce, or retire it so it can never produce one.
+///
+/// Advancement writes `result_artifact_job_id` in a second snapshot pass after
+/// creating the node's job, so an advancement that errored between the two can
+/// leave a real job its packet does not name. Such a job is found by its agent
+/// node and linked, which is what lets the resume gate and the spawn report see
+/// it. A packet with no job is marked failed: advancement expands every
+/// `Pending` packet it finds, so leaving one pending would create an orphan child
+/// on some later, unrelated advancement — after its spawn was already reported
+/// as refused — and a `Materialized` one left non-terminal would hold its batch
+/// siblings' resume gate open forever.
+///
+/// This runs under the execution's snapshot lock, which advancement's DAG
+/// reduction also holds while it expands packets (see
+/// `execution::advancement::advance_execution_with_actions`). So a packet seen
+/// without a job is never one whose expansion is still in flight: its creation
+/// either finished, linking a job found here, or failed for good.
+///
+/// Returns the child job id when one exists.
+pub(super) async fn link_or_retire_unmaterialized_packet(
     orch: &Orchestrator,
+    db: &LocalDb,
     execution_id: &str,
     packet_id: &str,
-) -> Result<(crate::models::DelegatedWorkPacket, String, String), String> {
-    let db = crate::execution::routing::owning_db_for_execution(&orch.db, execution_id).await?;
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+) -> Result<Option<String>, String> {
+    let lock = orch.execution_lock(execution_id);
+    let _guard = lock.lock().await;
 
-    loop {
-        let lookup = lookup_packet_run(&db, execution_id, packet_id).await?;
-
-        if let Some(result) = lookup {
-            return Ok(result);
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return Err("Delegated task did not materialize a child job".to_string());
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let snapshot_json = select_optional_text(
+        db,
+        "SELECT snapshot FROM executions WHERE id = ?1",
+        execution_id,
+    )
+    .await
+    .map_err(|e| format!("Failed to load execution: {}", e))?
+    .ok_or("Execution has no snapshot")?;
+    let snapshot = crate::config::snapshot_migrate::load(&snapshot_json)
+        .map_err(|e| format!("Failed to parse execution snapshot: {}", e))?;
+    let Some(index) = snapshot
+        .delegated_packets
+        .iter()
+        .position(|packet| packet.id == packet_id)
+    else {
+        return Ok(None);
+    };
+    let packet = &snapshot.delegated_packets[index];
+    if let Some(job_id) = packet.result_artifact_job_id.clone() {
+        return Ok(Some(job_id));
     }
+
+    let agent_node_id = packet
+        .materialized_node_ids
+        .iter()
+        .find(|node_id| node_id.ends_with("-agent"))
+        .cloned()
+        .unwrap_or_else(|| format!("delegated-{}-agent", packet.id));
+    let execution_owned = execution_id.to_string();
+    let node_job = db
+        .query_opt_text(
+            "SELECT id FROM jobs
+             WHERE execution_id = ?1 AND recipe_node_id = ?2 AND status <> 'cancelled'
+             ORDER BY created_at DESC LIMIT 1",
+            (execution_owned, agent_node_id),
+        )
+        .await
+        .map_err(|e| format!("Failed to look up delegated job: {}", e))?;
+
+    let (field, value) = match &node_job {
+        Some(job_id) => ("resultArtifactJobId", serde_json::json!(job_id)),
+        None if matches!(
+            packet.status,
+            DelegatedStatus::Pending | DelegatedStatus::Materialized
+        ) =>
+        {
+            (
+                "status",
+                serde_json::to_value(DelegatedStatus::Failed)
+                    .map_err(|e| format!("Failed to serialize packet status: {}", e))?,
+            )
+        }
+        None => return Ok(None),
+    };
+    write_packet_field(db, execution_id, &snapshot, index, field, value)
+        .await
+        .map_err(|e| format!("Failed to settle delegated packet: {}", e))?;
+    Ok(node_job)
 }
 
 pub(super) async fn dispatch_ready_agent_jobs(

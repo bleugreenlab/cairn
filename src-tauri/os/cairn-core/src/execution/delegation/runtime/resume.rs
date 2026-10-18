@@ -1303,7 +1303,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod background_completion_tests {
+pub(super) mod background_completion_tests {
     use super::{
         prepare_parent_for_delegated_wait, prepare_parent_for_delegated_wait_db,
         resume_suspended_parent_after_task_completion,
@@ -1319,7 +1319,9 @@ mod background_completion_tests {
     const ANCHOR: &str = "T1";
     const TASKS_KEY: &str = "tasks:T1";
 
-    fn test_orchestrator(db: LocalDb) -> Orchestrator {
+    pub(in crate::execution::delegation::runtime) fn test_orchestrator(
+        db: LocalDb,
+    ) -> Orchestrator {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.keep();
         let config_dir = root.join("config");
@@ -1394,7 +1396,10 @@ mod background_completion_tests {
     /// Seed a project/issue/execution, the spawning parent node `j-parent`, and a
     /// child job per packet. Each tuple is `(packet_id, child_job_id, background,
     /// child_status)`.
-    async fn seed(db: &LocalDb, children: &[(&str, &str, bool, &str)]) {
+    pub(in crate::execution::delegation::runtime) async fn seed(
+        db: &LocalDb,
+        children: &[(&str, &str, bool, &str)],
+    ) {
         db.execute_script(
             "INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('w','W',1,1);
              INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at)

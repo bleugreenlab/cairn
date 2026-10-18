@@ -222,7 +222,7 @@ pub async fn mark_job_start_failed(
         }
     };
 
-    if let Some(run_id) = latest_run_id {
+    if let Some(run_id) = latest_run_id.clone() {
         let _ = crate::transitions::transition_run(
             owning_db,
             &run_id,
@@ -265,6 +265,47 @@ pub async fn mark_job_start_failed(
                 serde_json::json!({"table": "jobs", "action": "update"}),
             );
         }
+    }
+
+    wake_waiters_after_start_failure(orch, job_id, latest_run_id.as_deref());
+}
+
+/// Answer whoever is waiting on a job that just failed to start.
+///
+/// A delegated parent is normally woken by its child's run finalizing, which a
+/// child that failed to start never does, so a parent parked on it would sit
+/// there until the boot heal. The completion broadcast tells an inline waiter
+/// to re-read its children; the resume gate wakes a parked one. The gate is
+/// idempotent and self-gating, so for a job no delegated packet names — or a
+/// sibling batch still in flight — it is a no-op.
+///
+/// The gate runs on its own thread, after every piece of the failure's
+/// bookkeeping above. It may launch the parent's next turn, and that launch must
+/// neither re-enter the admission path a promoted start failure arrives from
+/// nor make that path's bookkeeping wait on it.
+fn wake_waiters_after_start_failure(orch: &Orchestrator, job_id: &str, run_id: Option<&str>) {
+    if let Some(run_id) = run_id {
+        let _ = orch.run_completions.send(run_id.to_string());
+    }
+    let orch = orch.clone();
+    let job_id = job_id.to_string();
+    let thread_job_id = job_id.clone();
+    let spawned = std::thread::Builder::new()
+        .name("start-failure-wake".to_string())
+        .spawn(move || {
+            if let Err(error) =
+                crate::execution::delegation::resume_suspended_parent_after_task_completion(
+                    &orch,
+                    &thread_job_id,
+                )
+            {
+                log::warn!(
+                    "Failed to wake the parent of job {thread_job_id} after its start failed: {error}"
+                );
+            }
+        });
+    if let Err(error) = spawned {
+        log::error!("Could not wake the parent of job {job_id} after its start failed: {error}");
     }
 }
 

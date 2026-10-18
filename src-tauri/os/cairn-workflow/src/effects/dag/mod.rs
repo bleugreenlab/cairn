@@ -53,12 +53,24 @@ pub use graph::*;
 ///
 /// This is the synchronous replacement for `advance_execution_with_actions`.
 /// All DB mutations happen here; host-crossing operations are returned as effects.
-pub fn reduce_dag(
+///
+/// This is the only reduction entry point. It holds the host's execution
+/// snapshot guard (`WorkflowHost::execution_snapshot_guard`) for the reduction
+/// and nothing else, so top-level advancement and a cascading `AdvanceDag` in
+/// the effect loop are serialized with packet writers alike, and no effect — a
+/// checkpoint command can run for minutes — ever runs under it.
+pub async fn reduce_dag(
     runtime: &WorkflowRuntime,
     execution_id: &str,
-) -> Result<(Vec<Job>, Vec<WorkflowEffect>), String> {
-    let mut effects = Vec::new();
+) -> Result<(Vec<Job>, Vec<WorkflowEffect>), crate::advancement::AdvanceError> {
+    let _guard = runtime.host.execution_snapshot_guard(execution_id).await;
+    reduce_dag_under_guard(runtime, execution_id)
+}
 
+fn reduce_dag_under_guard(
+    runtime: &WorkflowRuntime,
+    execution_id: &str,
+) -> Result<(Vec<Job>, Vec<WorkflowEffect>), crate::advancement::AdvanceError> {
     // Resolve the execution's OWNING database once (CAIRN-2197). A team
     // execution's rows live in its synced replica, not the private DB; every
     // snapshot/job/node read below threads this handle so the DAG actually
@@ -77,30 +89,70 @@ pub fn reduce_dag(
 
     // Step 0b: Existing action rows are never readiness candidates. A revised
     // failed PR claims its same row and explicitly dispatches the next attempt.
-    for action in crate::advancement::rearm_failed_pr_actions(runtime, execution_id)? {
-        effects.push(action.effect());
-    }
+    let rearmed_pr_dispatches: Vec<WorkflowEffect> =
+        crate::advancement::rearm_failed_pr_actions(runtime, execution_id)?
+            .iter()
+            .map(|action| action.effect())
+            .collect();
 
     // Step 1: Materialize pending delegated packets, then advance the DAG.
     expand_delegated_packets(runtime, &owning_db, execution_id)?;
     let ready_jobs = advance_execution_impl(runtime, execution_id)?;
 
+    // Every ready job is now claimed, and no later advancement will see it
+    // again. A failure from here on must carry the claimed agent jobs back to
+    // the caller instead of dropping them, so they are named before anything
+    // else can fail.
+    let mut node_map: HashMap<String, DbRecipeNode> = HashMap::new();
+    if let Some(first_job) = ready_jobs.first() {
+        if let Some(exec_id) = &first_job.execution_id {
+            if let Ok(nodes) = load_nodes_from_execution(owning_db.clone(), exec_id) {
+                for node in nodes {
+                    node_map.insert(node.id.clone(), node);
+                }
+            }
+        }
+    }
+    let claimed_agent_jobs: Vec<Job> = ready_jobs
+        .iter()
+        .filter(|job| {
+            job.recipe_node_id
+                .as_ref()
+                .and_then(|node_id| node_map.get(node_id))
+                .is_none_or(|node| node.node_type == "agent")
+        })
+        .cloned()
+        .collect();
+    reduce_claimed_jobs(
+        runtime,
+        &owning_db,
+        execution_id,
+        ready_jobs,
+        &node_map,
+        rearmed_pr_dispatches,
+    )
+    .map_err(|message| crate::advancement::AdvanceError {
+        message,
+        claimed_agent_jobs,
+    })
+}
+
+/// The part of [`reduce_dag`] that runs after its claim: dispatch the claimed
+/// jobs by node type and produce the follow-on effects, after any `effects`
+/// produced before the claim.
+fn reduce_claimed_jobs(
+    runtime: &WorkflowRuntime,
+    owning_db: &Arc<LocalDb>,
+    execution_id: &str,
+    ready_jobs: Vec<Job>,
+    node_map: &HashMap<String, DbRecipeNode>,
+    mut effects: Vec<WorkflowEffect>,
+) -> Result<(Vec<Job>, Vec<WorkflowEffect>), String> {
     // Step 2: Categorize jobs by their node type
     let mut agent_jobs = Vec::new();
     let mut node_jobs: Vec<(DbJob, DbRecipeNode)> = Vec::new();
 
     {
-        let mut node_map: HashMap<String, DbRecipeNode> = HashMap::new();
-        if let Some(first_job) = ready_jobs.first() {
-            if let Some(exec_id) = &first_job.execution_id {
-                if let Ok(nodes) = load_nodes_from_execution(owning_db.clone(), exec_id) {
-                    for node in nodes {
-                        node_map.insert(node.id.clone(), node);
-                    }
-                }
-            }
-        }
-
         for job in ready_jobs {
             if let Some(node_id) = &job.recipe_node_id {
                 if let Some(node) = node_map.get(node_id) {
@@ -120,7 +172,7 @@ pub fn reduce_dag(
             "checkpoint" => {
                 handle_checkpoint_node(
                     runtime,
-                    &owning_db,
+                    owning_db,
                     &db_job,
                     &node,
                     execution_id,

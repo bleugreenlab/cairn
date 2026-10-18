@@ -651,7 +651,7 @@ async fn reevaluating_a_blocked_condition_routes_and_keeps_the_blocked_row() {
     let error = advancement::reevaluate_condition(&runtime, "exec", "condition")
         .await
         .unwrap_err();
-    assert!(error.contains("already routed to 'no'"), "{error}");
+    assert!(error.message.contains("already routed to 'no'"), "{error}");
 }
 
 /// Seed the decision node and block it once on a failed call, leaving one blocked
@@ -679,7 +679,7 @@ async fn reevaluating_a_superseded_execution_is_refused_before_asking() {
         .await
         .unwrap_err();
 
-    assert!(error.contains("superseded"), "{error}");
+    assert!(error.message.contains("superseded"), "{error}");
     assert_eq!(
         host.condition_requests.lock().unwrap().len(),
         1,
@@ -702,7 +702,7 @@ async fn reevaluating_a_resolved_issues_condition_is_refused() {
         .await
         .unwrap_err();
 
-    assert!(error.contains("issue is resolved"), "{error}");
+    assert!(error.message.contains("issue is resolved"), "{error}");
     assert_eq!(host.condition_requests.lock().unwrap().len(), 1);
 }
 
@@ -717,8 +717,8 @@ async fn supersession_during_reevaluation_discards_the_result() {
         .await
         .unwrap_err();
 
-    assert!(error.contains("discarded"), "{error}");
-    assert!(error.contains("superseded"), "{error}");
+    assert!(error.message.contains("discarded"), "{error}");
+    assert!(error.message.contains("superseded"), "{error}");
     assert_eq!(
         condition_rows(&host.owning).await.len(),
         1,
@@ -748,8 +748,8 @@ async fn a_route_recorded_during_reevaluation_wins_and_the_late_answer_is_discar
         .await
         .unwrap_err();
 
-    assert!(error.contains("discarded"), "{error}");
-    assert!(error.contains("already routed to 'yes'"), "{error}");
+    assert!(error.message.contains("discarded"), "{error}");
+    assert!(error.message.contains("already routed to 'yes'"), "{error}");
     assert_eq!(
         condition_rows(&host.owning).await,
         [
@@ -823,13 +823,16 @@ async fn reevaluating_a_condition_that_never_ran_is_refused() {
     let error = advancement::reevaluate_condition(&runtime, "exec", "condition")
         .await
         .unwrap_err();
-    assert!(error.contains("has not been evaluated yet"), "{error}");
+    assert!(
+        error.message.contains("has not been evaluated yet"),
+        "{error}"
+    );
     assert!(host.condition_requests.lock().unwrap().is_empty());
 
     let error = advancement::reevaluate_condition(&runtime, "exec", "agent")
         .await
         .unwrap_err();
-    assert!(error.contains("not a condition"), "{error}");
+    assert!(error.message.contains("not a condition"), "{error}");
 }
 
 #[tokio::test]
@@ -954,7 +957,7 @@ async fn pr_fixture(team: bool) -> (WorkflowRuntime, Arc<Host>, tempfile::TempDi
         vec![edge("trigger", "control-out", "pr")],
     )
     .await;
-    let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").unwrap();
+    let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").await.unwrap();
     let id = effects
         .iter()
         .find_map(|e| match e {
@@ -971,7 +974,7 @@ async fn reduce_dag_dispatches_a_rearmed_pr_action_once() {
         let (runtime, host, _dir, id) = pr_fixture(team).await;
         advancement::mark_action_run_failed(&runtime, &id, "push rejected").unwrap();
         *host.head.lock().unwrap() = "new-revision".into();
-        let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").unwrap();
+        let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").await.unwrap();
         let actions: Vec<_> = effects
             .iter()
             .filter_map(|e| match e {
@@ -988,6 +991,7 @@ async fn reduce_dag_dispatches_a_rearmed_pr_action_once() {
         assert_eq!(attempts[1].detail.as_deref(), Some("push rejected"));
         assert_eq!(attempts[1].outcome.as_deref(), Some("failed"));
         assert!(effects::dag::reduce_dag(&runtime, "exec")
+            .await
             .unwrap()
             .1
             .iter()
@@ -1274,7 +1278,7 @@ async fn initial_pr_revision_failure_keeps_a_durable_dispatch_and_unknown_baseli
         vec![edge("trigger", "control-out", "pr")],
     )
     .await;
-    let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").unwrap();
+    let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").await.unwrap();
     let id = effects
         .iter()
         .find_map(|e| match e {

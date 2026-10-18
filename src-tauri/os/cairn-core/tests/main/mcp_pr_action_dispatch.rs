@@ -302,30 +302,26 @@ async fn publish_action_dry_run_routes_to_publish_on_both_surfaces() {
 /// The reducer's effects are inspected, never executed: these fixtures prove
 /// redispatch without publishing to GitHub or needing a remote repository.
 async fn reduce_pr(orch: &Orchestrator) -> Vec<String> {
-    let orch = orch.clone();
-    tokio::task::spawn_blocking(move || {
-        let (jobs, effects) =
-            reduce_dag(&cairn_core::internal::workflow_runtime(&orch), "exec-1").unwrap();
-        assert!(jobs.is_empty(), "the completed builder must not restart");
-        effects
-            .into_iter()
-            .filter_map(|effect| match effect {
-                WorkflowEffect::ExecuteAction {
-                    action_run_id,
-                    execution_id,
-                    node_id,
-                    ..
-                } => {
-                    assert_eq!(execution_id, "exec-1");
-                    assert_eq!(node_id, "pr");
-                    Some(action_run_id)
-                }
-                _ => None,
-            })
-            .collect()
-    })
-    .await
-    .unwrap()
+    let (jobs, effects) = reduce_dag(&cairn_core::internal::workflow_runtime(orch), "exec-1")
+        .await
+        .unwrap();
+    assert!(jobs.is_empty(), "the completed builder must not restart");
+    effects
+        .into_iter()
+        .filter_map(|effect| match effect {
+            WorkflowEffect::ExecuteAction {
+                action_run_id,
+                execution_id,
+                node_id,
+                ..
+            } => {
+                assert_eq!(execution_id, "exec-1");
+                assert_eq!(node_id, "pr");
+                Some(action_run_id)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 async fn write_handoff(orch: &Orchestrator, mode: &str, version: i64) {
@@ -540,6 +536,98 @@ impl RetryFixture {
         );
         assert_eq!(attempt_count(&self.db).await, 2);
     }
+}
+
+/// The reduction that re-arms a failed PR node runs under the execution's
+/// snapshot lock, so drive it concurrently with packet writers taking that same
+/// lock. Each writer performs `persist_task_packet`'s critical section: lock,
+/// read the snapshot, append a packet, write. The packets are terminal, so
+/// expansion ignores them. It must finish within a bound — a self-deadlock
+/// fails here instead of hanging — re-arm exactly once, and lose no packet.
+#[tokio::test(flavor = "multi_thread")]
+async fn pr_rearm_reduction_and_concurrent_packet_writers_neither_deadlock_nor_lose_packets() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    write_handoff(&fixture.orch, "patch", 2).await;
+
+    const WRITERS: usize = 6;
+    let mut writers = Vec::new();
+    for writer in 0..WRITERS {
+        let orch = fixture.orch.clone();
+        let db = fixture.db.clone();
+        writers.push(tokio::spawn(async move {
+            let lock = orch.execution_lock("exec-1");
+            let _guard = lock.lock().await;
+            let stored = db
+                .query_text("SELECT snapshot FROM executions WHERE id = 'exec-1'", ())
+                .await
+                .unwrap()
+                .unwrap();
+            let mut snapshot: serde_json::Value = serde_json::from_str(&stored).unwrap();
+            let packets = snapshot
+                .as_object_mut()
+                .unwrap()
+                .entry("delegatedPackets")
+                .or_insert_with(|| json!([]));
+            packets.as_array_mut().unwrap().push(json!({
+                "id": format!("writer-{writer}"),
+                "parentJobId": "job-builder",
+                "origin": "task_tool",
+                "title": "concurrent writer",
+                "problemStatement": "x",
+                "agentConfigId": "Explore",
+                "ownership": { "cwd": "/tmp" },
+                "outputContract": { "schemaType": "return" },
+                "status": "cancelled",
+                "createdAt": 0
+            }));
+            db.execute(
+                "UPDATE executions SET snapshot = ?1 WHERE id = 'exec-1'",
+                (snapshot.to_string(),),
+            )
+            .await
+            .unwrap();
+        }));
+    }
+    let orch = fixture.orch.clone();
+    let reduction = tokio::spawn(async move { reduce_pr(&orch).await });
+
+    let rearmed = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        for writer in writers {
+            writer.await.unwrap();
+        }
+        reduction.await.unwrap()
+    })
+    .await
+    .expect("the PR re-arm reduction and concurrent packet writers deadlocked");
+
+    assert_eq!(
+        rearmed,
+        vec![fixture.action_run_id.clone()],
+        "the revised failed PR re-armed exactly once"
+    );
+    assert_eq!(attempt_count(&fixture.db).await, 2);
+    let stored = fixture
+        .db
+        .query_text("SELECT snapshot FROM executions WHERE id = 'exec-1'", ())
+        .await
+        .unwrap()
+        .unwrap();
+    let snapshot: serde_json::Value = serde_json::from_str(&stored).unwrap();
+    let writers_seen = snapshot["delegatedPackets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|packet| {
+            packet["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("writer-"))
+        })
+        .count();
+    assert_eq!(
+        writers_seen, WRITERS,
+        "the reduction's snapshot rewrite dropped no concurrently persisted packet"
+    );
 }
 
 #[tokio::test]
