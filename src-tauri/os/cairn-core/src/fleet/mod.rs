@@ -814,6 +814,14 @@ pub struct Fleet {
     /// Placement and attach both consult it, so neither has to read disk and
     /// neither depends on the machine being reachable enough to be asked.
     drained: Arc<Mutex<HashSet<String>>>,
+    /// What each machine is for, by executor identity; absent means general.
+    ///
+    /// A cache of [`FleetConfig::machine_roles`], which is the one authority:
+    /// it is only ever replaced whole by [`Fleet::hydrate_machine_roles`] from
+    /// a config just loaded or just persisted, so it cannot hold a role the
+    /// settings file does not. Attach stamps from it; the machine is never
+    /// told.
+    machine_roles: Arc<Mutex<HashMap<String, MachineRole>>>,
     /// Every recorded preparation refusal, by executor id then project id.
     ///
     /// The in-memory face of `executor_preparation_refusals`, hydrated when the
@@ -2099,6 +2107,10 @@ struct ExecutorConnectionState {
     /// so the placement gate reads one field on the candidate rather than
     /// reaching for fleet state it would have to lock separately.
     drained: bool,
+    /// What an operator holds this machine to be for. Stamped from
+    /// [`Fleet::machine_roles`] on attach and whenever the roles are
+    /// re-adopted, for the same reason `drained` is.
+    machine_role: MachineRole,
     /// Projects this machine recorded as unpreparable (a setup command not
     /// found), by project id. Stamped from [`Fleet::preparation_refusals`] on
     /// attach, keeping only refusals recorded against the environment this
@@ -2780,6 +2792,8 @@ impl Fleet {
             last_update,
             colocated,
             drained,
+            // Stamped below, under the table lock.
+            machine_role: MachineRole::General,
             preparation_refusals: HashMap::new(),
             link_clock: Arc::default(),
             link_path: None,
@@ -2797,6 +2811,14 @@ impl Fleet {
                 &mut self.preparation_refusals.lock().unwrap(),
                 &mut connection,
             );
+            // The role is read here, under the table lock that
+            // `hydrate_machine_roles` also holds while it replaces the roles
+            // and restamps entries, so an adoption is either seen by this
+            // read or restamps this entry once it is inserted. Read before the
+            // lock, an adoption could land in between and this insert would
+            // restore the role it replaced. Unlike a drain, the machine is not
+            // told: only this runner's placement reads it.
+            connection.machine_role = self.machine_role(&executor_id);
             connections
                 .insert(executor_id.clone(), connection)
                 .is_some()
@@ -3519,6 +3541,7 @@ impl Fleet {
         // the enrollment one, so this read never holds both at once.
         let attached: HashSet<String> = self.lock_connections().keys().cloned().collect();
         let drained: HashSet<String> = self.drained.lock().unwrap().clone();
+        let roles = self.machine_roles.lock().unwrap().clone();
         let mut values: Vec<_> = self
             .enrolled_remotes
             .lock()
@@ -3527,6 +3550,7 @@ impl Fleet {
             .filter(|(executor_id, _)| !attached.contains(*executor_id))
             .map(|(executor_id, record)| EnrolledRemote {
                 drained: drained.contains(executor_id),
+                role: roles.get(executor_id).copied().unwrap_or_default(),
                 executor_id: executor_id.clone(),
                 name: record.name.clone(),
                 os: record.os.clone(),
@@ -5822,6 +5846,50 @@ impl Fleet {
                 correlation_id: uuid::Uuid::new_v4().to_string(),
                 enabled: drained,
             });
+        }
+    }
+
+    /// The role stamped on a live connection, for tests that check the cache
+    /// and the entry placement reads agree.
+    #[cfg(test)]
+    pub(crate) fn live_machine_role_for_test(&self, executor_id: &str) -> Option<MachineRole> {
+        self.lock_connections()
+            .get(executor_id)
+            .map(|entry| entry.machine_role)
+    }
+
+    /// What this runner holds a machine to be for.
+    pub fn machine_role(&self, executor_id: &str) -> MachineRole {
+        self.machine_roles
+            .lock()
+            .unwrap()
+            .get(executor_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Adopt the durable machine roles, replacing the whole cache and
+    /// restamping every live connection.
+    ///
+    /// The only writer of [`Fleet::machine_roles`]. Callers pass
+    /// [`FleetConfig::role_executor_ids`] of a config they have just loaded or
+    /// just persisted, never a value of their own, so placement cannot enforce
+    /// a role the settings file does not hold (the split cairn/4464 found in
+    /// the drain stores). Restamping live entries makes the order against
+    /// attach irrelevant, as it is for drains.
+    pub fn hydrate_machine_roles(&self, roles: impl IntoIterator<Item = (String, MachineRole)>) {
+        let adopted: HashMap<String, MachineRole> = roles
+            .into_iter()
+            .filter(|(_, role)| *role != MachineRole::General)
+            .collect();
+        // Map and entries change under one hold of the table lock, the lock
+        // attach stamps under, so no attach can insert a role read from the
+        // map this replaces. Callers serialize adoptions themselves by
+        // publishing from inside `settings::mutate_fleet`.
+        let mut connections = self.lock_connections();
+        *self.machine_roles.lock().unwrap() = adopted.clone();
+        for (executor_id, entry) in connections.iter_mut() {
+            entry.machine_role = adopted.get(executor_id).copied().unwrap_or_default();
         }
     }
 
@@ -10920,6 +10988,8 @@ pub(crate) struct PlacementScope<'a> {
     /// What the project's setup and build need of any machine that would
     /// host this work, whether or not the work's own selector asks for it.
     pub(crate) project_requirements: &'a ProjectPlacementRequirements,
+    /// The class of work asking, which a machine's role accepts or refuses.
+    pub(crate) work_class: PlacementWorkClass,
 }
 
 /// A project's placement requirements as its checkout at `project_path`
@@ -10965,6 +11035,7 @@ impl<'a> PlacementScope<'a> {
             verdict_platforms: &request.verdict_platforms,
             avoided_executor_ids: &request.avoided_executor_ids,
             project_requirements: &request.project_requirements,
+            work_class: request.placement_work_class,
         }
     }
 
@@ -11032,7 +11103,18 @@ fn candidate_rejection(
     scope: PlacementScope<'_>,
     now_unix_ms: u64,
 ) -> Option<PlacementRejectionReason> {
-    if entry.drained && scope.pinned_executor_id != Some(entry.identity.executor_id.as_str()) {
+    let pinned_here = scope.pinned_executor_id == Some(entry.identity.executor_id.as_str());
+    if !entry.machine_role.accepts(scope.work_class) && !pinned_here {
+        // First, so a machine that is wrong for this class says so rather than
+        // reporting a drain or a stale link that could clear on its own. It
+        // binds the colocated machine and an explicit selector alike; only a
+        // residency pin is exempt, as for a drain, so work already resident
+        // there when the role changed may finish.
+        Some(PlacementRejectionReason::RoleExcluded {
+            role: entry.machine_role,
+            work_class: scope.work_class,
+        })
+    } else if entry.drained && !pinned_here {
         // The runner owns this refusal rather than asking the machine. A
         // residency pin is the exception: that work is already on the machine
         // and must be allowed to finish so the drain can empty it. Selectors and
@@ -11241,6 +11323,22 @@ fn survey_candidates<'a>(
     // the difference between a legible config error and a suite that silently
     // stalls out its horizon on every commit.
     if usable.is_empty() && !request.placement_mobility.may_spill() && !awaiting_decliner {
+        // Work that cannot leave home, on a home whose role refuses it, would
+        // wait out its horizon on a fact only an operator changes.
+        if let Some(rejection) = rejected.iter().find(|rejection| {
+            matches!(
+                rejection.reason,
+                PlacementRejectionReason::RoleExcluded { .. }
+            ) && connections
+                .get(&rejection.executor_id)
+                .is_some_and(|entry| entry.colocated)
+        }) {
+            return Err(format!(
+                "this request cannot leave {name}, and {name} {}. Nothing was run. Its role is set by an operator on cairn://executors/{name}.",
+                rejection.reason.describe(),
+                name = rejection.executor_name,
+            ));
+        }
         if let Some(rejection) = rejected.iter().find(|rejection| {
             matches!(
                 rejection.reason,
@@ -11321,6 +11419,7 @@ fn placement_rejection_signature(reason: &PlacementRejectionReason) -> String {
         PlacementRejectionReason::OutrankedBy { .. } => "outrankedBy",
         PlacementRejectionReason::UntrustedVerdictPlatform { .. } => "untrustedVerdictPlatform",
         PlacementRejectionReason::Drained => "drained",
+        PlacementRejectionReason::RoleExcluded { .. } => "roleExcluded",
         PlacementRejectionReason::AvoidedInfrastructure => "avoidedInfrastructure",
         PlacementRejectionReason::Declined { reason, .. } => return format!("declined:{reason:?}"),
         PlacementRejectionReason::Held { evidence } => {
@@ -13373,6 +13472,7 @@ fn executor_health_snapshot(
         // the one the executor reports. A machine that has not yet been told
         // about a drain is still drained, so the surfaces read the union.
         drain_mode: entry.drained || entry.health.drain_mode,
+        role: entry.machine_role,
         resident_processes: entry.health.resident_processes.clone(),
         command_processes: entry.health.command_processes.clone(),
         evicted_cells: entry.health.evicted_cells.clone(),
@@ -13860,8 +13960,14 @@ fn known_executor_inventory(connections: &HashMap<String, ExecutorConnectionStat
                     )
                 },
             );
+            // A role other than general is part of what the machine is, so a
+            // reader of the inventory sees why it took nothing.
+            let role = match entry.machine_role {
+                MachineRole::General => String::new(),
+                role => format!("{}, ", role.label()),
+            };
             format!(
-                "{} ({}, {toolchains}, {sandbox})",
+                "{} ({}, {role}{toolchains}, {sandbox})",
                 executor_public_name(entry),
                 capabilities.os
             )
@@ -14017,6 +14123,28 @@ fn no_matching_executor_diagnostic(
                 rejection.reason.describe()
             );
         }
+    }
+
+    // A caller that named the machine is owed the machine's role, the class
+    // it asked for, and who can change the one so it accepts the other.
+    let named = request
+        .executor
+        .as_ref()
+        .and_then(|selector| selector.name.as_deref());
+    let role_target = named.and_then(|named| {
+        rejected.iter().find(|rejection| {
+            matches!(
+                rejection.reason,
+                PlacementRejectionReason::RoleExcluded { .. }
+            ) && executor_names_match(named, &rejection.executor_name)
+        })
+    });
+    if let Some(rejection) = role_target {
+        return format!(
+            "{name} {}. Its role is set by an operator on cairn://executors/{name}.",
+            rejection.reason.describe(),
+            name = rejection.executor_name,
+        );
     }
 
     let drained_target = rejected.iter().find(|rejection| {
@@ -18286,6 +18414,7 @@ mod tests {
             id.into(),
             ExecutorConnectionState {
                 drained: false,
+                machine_role: MachineRole::General,
                 identity: identity.clone(),
                 advertisement: ExecutorAdvertisement {
                     identity,
@@ -21490,6 +21619,215 @@ mod tests {
         );
     }
 
+    /// A busy home and an idle, never-explored remote under a remote-first
+    /// profile: everything placement weighs (stance, load, and the exploration
+    /// the default state has due) favours the remote, so only its role can
+    /// keep work off it.
+    fn place_remote_first(
+        connections: &HashMap<String, ExecutorConnectionState>,
+        request: &CellRequest,
+    ) -> Result<PlacementDraft, String> {
+        place_with_profile(
+            connections,
+            request,
+            "low-power",
+            profile_with_routes(30, |_| PlacementStance::RemoteFirst),
+        )
+    }
+
+    fn busy_home_and_idle_remote(role: MachineRole) -> HashMap<String, ExecutorConnectionState> {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        let (remote_id, mut remote) = fleet_entry("sp1", "linux", 0, &[]);
+        measured(&mut local, 0.9, 8_000_000_000, 8_000_000_000);
+        measured(&mut remote, 0.05, 64_000_000_000, 800_000_000_000);
+        remote.machine_role = role;
+        HashMap::from([(local_id, local), (remote_id, remote)])
+    }
+
+    /// An inference-only machine is never chosen for any batch class, however
+    /// idle it is and however due exploration is; its sibling takes the work
+    /// and the record says why.
+    #[test]
+    fn an_inference_only_machine_is_passed_over_for_every_batch_class() {
+        let control = busy_home_and_idle_remote(MachineRole::General);
+        assert_eq!(
+            chosen(&place_remote_first(&control, &spillable_request()).unwrap()).executor_id,
+            "sp1",
+            "without a role the idle remote wins, so the role is what decides below"
+        );
+        let connections = busy_home_and_idle_remote(MachineRole::InferenceOnly);
+        for class in PlacementWorkClass::ALL {
+            let mut request = spillable_request();
+            request.placement_work_class = class;
+            let draft = place_remote_first(&connections, &request).unwrap();
+            assert_eq!(
+                chosen(&draft).executor_id,
+                COLOCATED_EXECUTOR_ID,
+                "{class:?}"
+            );
+            assert_eq!(
+                rejection_for(&draft, "sp1"),
+                &PlacementRejectionReason::RoleExcluded {
+                    role: MachineRole::InferenceOnly,
+                    work_class: class,
+                },
+                "{class:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn builds_only_and_general_machines_take_every_batch_class() {
+        for role in [MachineRole::BuildsOnly, MachineRole::General] {
+            let connections = busy_home_and_idle_remote(role);
+            for class in PlacementWorkClass::ALL {
+                let mut request = spillable_request();
+                request.placement_work_class = class;
+                assert_eq!(
+                    chosen(&place_remote_first(&connections, &request).unwrap()).executor_id,
+                    "sp1",
+                    "{role:?} {class:?}"
+                );
+            }
+        }
+    }
+
+    /// A pin by name is refused before anything runs, naming the machine, its
+    /// role, the class, and who can change it (cairn/4479).
+    #[test]
+    fn a_pin_by_name_onto_an_excluding_role_is_refused_naming_role_and_class() {
+        let mut connections = busy_home_and_idle_remote(MachineRole::InferenceOnly);
+        let mut request = targeted_request("linux");
+        request.placement_work_class = PlacementWorkClass::AgentSessions;
+        request.executor = Some(ExecutorSelector {
+            name: Some("sp1".into()),
+            ..ExecutorSelector::default()
+        });
+        let refusal = place(&connections, &request).expect_err("an excluded pin is refused");
+        assert_eq!(
+            refusal,
+            "sp1 is inference only; this request is agentSessions. Its role is set by an operator on cairn://executors/sp1."
+        );
+
+        // A permanent role outranks a drain an operator could clear.
+        connections.get_mut("sp1").unwrap().drained = true;
+        let refusal = place(&connections, &request).expect_err("still refused");
+        assert!(refusal.contains("inference only"), "{refusal}");
+        assert!(!refusal.contains("drained"), "{refusal}");
+    }
+
+    /// Work already resident on a machine when its role changed may finish, as
+    /// it may under a drain.
+    #[test]
+    fn a_residency_pin_crosses_a_role_that_changed_under_it() {
+        let connections = busy_home_and_idle_remote(MachineRole::InferenceOnly);
+        let mut request = targeted_request("linux");
+        request.executor = None;
+        request.pinned_executor_id = Some("sp1".into());
+        let selection = place(&connections, &request)
+            .expect("resident work crosses the role gate")
+            .selected
+            .expect("its home is the only destination")
+            .0;
+        assert_eq!(selection.executor_id, "sp1");
+    }
+
+    /// The colocated machine is bound by its role like any other, and work
+    /// that cannot leave it is told so at once rather than waiting out its
+    /// horizon on a fact only an operator changes.
+    #[test]
+    fn the_colocated_machine_is_not_exempt_from_its_role() {
+        let (local_id, mut local) = fleet_entry(COLOCATED_EXECUTOR_ID, "linux", 0, &[]);
+        measured(&mut local, 0.1, 8_000_000_000, 8_000_000_000);
+        local.machine_role = MachineRole::InferenceOnly;
+        let connections = HashMap::from([(local_id, local)]);
+        let mut request = spillable_request();
+        request.placement_mobility = PlacementMobility::PinnedOrColocated;
+        let refusal = place(&connections, &request).expect_err("immobile work is refused");
+        assert!(
+            refusal.contains("is inference only; this request is agentSessions"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("Nothing was run"), "{refusal}");
+
+        let mobile = spillable_request();
+        let draft = place(&connections, &mobile).expect("mobile work waits for a machine");
+        assert!(draft.selected.is_none());
+        assert!(matches!(
+            rejection_for(&draft, COLOCATED_EXECUTOR_ID),
+            PlacementRejectionReason::RoleExcluded { .. }
+        ));
+    }
+
+    /// An attach that is already under way when a role is adopted must come
+    /// out with the adopted role. The table lock is held here the way an
+    /// adoption holds it, so the attach parks at its insert; the role changes
+    /// while it waits. An attach that read the role before taking the lock
+    /// would insert the role it read and keep it until the next adoption.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attach_racing_a_role_adoption_comes_out_with_the_adopted_role() {
+        let fleet = Fleet::default();
+        let table = fleet.lock_connections();
+        let attaching = {
+            let fleet = fleet.clone();
+            tokio::task::spawn_blocking(move || {
+                let (sender, receiver) = mpsc::unbounded_channel();
+                fleet.attach_executor(sender);
+                receiver
+            })
+        };
+        // Long enough for the attach to do everything ahead of the table lock.
+        std::thread::sleep(Duration::from_millis(200));
+        // The adoption's write, made under the table lock as it makes it.
+        fleet.machine_roles.lock().unwrap().insert(
+            COLOCATED_EXECUTOR_ID.to_string(),
+            MachineRole::InferenceOnly,
+        );
+        drop(table);
+        let _receiver = attaching.await.unwrap();
+        assert_eq!(
+            fleet.live_machine_role_for_test(COLOCATED_EXECUTOR_ID),
+            Some(MachineRole::InferenceOnly)
+        );
+    }
+
+    /// Attach and hydrate both stamp the entry placement reads, in either
+    /// order, from the one cache.
+    #[tokio::test]
+    async fn attach_and_hydrate_stamp_the_machine_role_in_either_order() {
+        let attached_first = Fleet::default();
+        let (sender, _executor) = mpsc::unbounded_channel();
+        attached_first.attach_executor(sender);
+        assert_eq!(
+            attached_first.live_machine_role_for_test(COLOCATED_EXECUTOR_ID),
+            Some(MachineRole::General)
+        );
+        attached_first
+            .hydrate_machine_roles([(COLOCATED_EXECUTOR_ID.to_string(), MachineRole::BuildsOnly)]);
+        assert_eq!(
+            attached_first.live_machine_role_for_test(COLOCATED_EXECUTOR_ID),
+            Some(MachineRole::BuildsOnly)
+        );
+        attached_first.hydrate_machine_roles(Vec::new());
+        assert_eq!(
+            attached_first.live_machine_role_for_test(COLOCATED_EXECUTOR_ID),
+            Some(MachineRole::General),
+            "adopting a config with no role clears the stamp"
+        );
+
+        let hydrated_first = Fleet::default();
+        hydrated_first.hydrate_machine_roles([(
+            COLOCATED_EXECUTOR_ID.to_string(),
+            MachineRole::InferenceOnly,
+        )]);
+        let (sender, _executor) = mpsc::unbounded_channel();
+        hydrated_first.attach_executor(sender);
+        assert_eq!(
+            hydrated_first.live_machine_role_for_test(COLOCATED_EXECUTOR_ID),
+            Some(MachineRole::InferenceOnly)
+        );
+    }
+
     /// The posts/91 specimen: draining a machine with a live execution home on
     /// it must not strand that job. A pin is residency established before the
     /// drain, not a requester choosing the machine for new work. Letting it run
@@ -22561,6 +22899,7 @@ mod tests {
             verdict_platforms: &[],
             avoided_executor_ids: &[],
             project_requirements: &NO_PROJECT_REQUIREMENTS,
+            work_class: PlacementWorkClass::ReviewChecks,
         }
     }
 
@@ -22683,6 +23022,36 @@ mod tests {
     /// selector check cannot see, and either one alone would have the forecast
     /// predict relief from a machine the work will never reach — clamping the
     /// wait to the floor and printing that machine's occupant on the row.
+    /// A machine that can take no check never moves the capability identity a
+    /// check lane is keyed by, so enrolling one re-arms nothing.
+    #[test]
+    fn an_inference_only_machine_does_not_move_the_check_capability_identity() {
+        let repository = forecast_repository();
+        let scope = forecast_scope(&repository, None, PlacementMobility::SpillEligible);
+        // Stamped with the real clock, which is what this identity judges
+        // link freshness against.
+        let now = unix_time_ms();
+        let pool = Fleet::default();
+        let (id, builder) = fleet_entry_at("fedora", "linux", 0, &[], now);
+        pool.lock_connections().insert(id, builder);
+        let before = pool.capability_identity(scope);
+        assert_ne!(
+            before,
+            Fleet::default().capability_identity(scope),
+            "the builder is eligible, so the identity names it"
+        );
+        let (id, mut spark) = fleet_entry_at("sp1", "linux", 0, &[], now);
+        spark.machine_role = MachineRole::InferenceOnly;
+        pool.lock_connections().insert(id, spark);
+        assert_eq!(pool.capability_identity(scope), before);
+        pool.hydrate_machine_roles(Vec::new());
+        assert_ne!(
+            pool.capability_identity(scope),
+            before,
+            "the same machine as general is eligible, so the identity moves"
+        );
+    }
+
     #[test]
     fn a_forecast_reads_only_machines_placement_itself_would_keep() {
         let repository = forecast_repository();
@@ -25176,6 +25545,7 @@ mod tests {
             },
             last_attempt: None,
             drained: false,
+            role: Default::default(),
             last_seen_unix_ms: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),
@@ -25199,6 +25569,7 @@ mod tests {
             },
             last_attempt: None,
             drained: false,
+            role: Default::default(),
             last_seen_unix_ms: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),
@@ -25228,6 +25599,7 @@ mod tests {
             },
             last_attempt: None,
             drained: false,
+            role: Default::default(),
             last_seen_unix_ms: None,
             retired: Vec::new(),
             connection_timeline: Vec::new(),

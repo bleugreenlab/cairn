@@ -2888,6 +2888,68 @@ async fn thread_subtree_mutations_resolve_their_owning_job() {
     }
 }
 
+/// A role patch alone is a complete patch: it is described by a dry run,
+/// applies through the management code, and a bad value names the three it
+/// could have been.
+#[tokio::test]
+async fn an_executor_role_patch_is_described_applied_and_validated() {
+    let orch = seeded_orch().await;
+    let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+    orch.fleet.attach_executor(sender);
+    let patch = |payload: serde_json::Value| {
+        change_item("cairn://executors/local", ChangeMode::Patch, Some(payload))
+    };
+
+    let planned = dispatch_resource_change(
+        &orch,
+        &request(),
+        0,
+        &patch(serde_json::json!({ "role": "inferenceOnly" })),
+        true,
+    )
+    .await
+    .unwrap_or_else(|failure| panic!("{}", failure.error));
+    let planned = format!("{planned:?}");
+    assert!(
+        planned.contains("make local inference only, which accepts none of today's batch classes"),
+        "{planned}"
+    );
+    assert_eq!(
+        orch.fleet.machine_role(crate::fleet::COLOCATED_EXECUTOR_ID),
+        crate::fleet::MachineRole::General,
+        "a dry run changes nothing"
+    );
+
+    let applied = dispatch_resource_change(
+        &orch,
+        &request(),
+        0,
+        &patch(serde_json::json!({ "role": "inferenceOnly" })),
+        false,
+    )
+    .await
+    .unwrap_or_else(|failure| panic!("{}", failure.error));
+    let applied = format!("{applied:?}");
+    assert!(applied.contains("local is now inference only"), "{applied}");
+    assert_eq!(
+        orch.fleet.machine_role(crate::fleet::COLOCATED_EXECUTOR_ID),
+        crate::fleet::MachineRole::InferenceOnly
+    );
+
+    let refused = dispatch_resource_change(
+        &orch,
+        &request(),
+        0,
+        &patch(serde_json::json!({ "role": "gpu" })),
+        true,
+    )
+    .await
+    .expect_err("an unknown role is refused");
+    for spelling in ["buildsOnly", "general", "inferenceOnly"] {
+        assert!(refused.error.contains(spelling), "{}", refused.error);
+    }
+}
+
 /// Alias analogue of the parity test. Every alias a mutation advertises must
 /// be honored end-to-end (gate + dispatch arm), not merely matched by the
 /// gate's `satisfied_by`: dispatch each owning mutation with the aliased key

@@ -639,6 +639,17 @@ fn gate_accepts_enrollment_configuration_and_removal_only() {
         "configure an enrolled machine"
     );
 
+    let role = item(
+        "cairn://executors/sp1",
+        ChangeMode::Patch,
+        Some(serde_json::json!({ "role": "inferenceOnly" })),
+    );
+    assert_eq!(
+        gate(&role).unwrap().label,
+        "configure an enrolled machine",
+        "a role is configured in the same shape as draining"
+    );
+
     let remove = item("cairn://executors/bglab-ub", ChangeMode::Delete, None);
     assert!(gate(&remove).is_ok());
 

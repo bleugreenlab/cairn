@@ -33,6 +33,10 @@ pub(crate) enum ExecutorCommand {
         /// Extra argument passed to ssh. Repeat once per argument.
         #[arg(long = "ssh-arg", allow_hyphen_values = true)]
         extra_ssh_args: Vec<String>,
+        /// What the machine is for. Omitted means general for a new machine
+        /// and the role it already holds for one enrolled again.
+        #[arg(long, value_parser = ["buildsOnly", "general", "inferenceOnly"])]
+        role: Option<String>,
     },
     /// Tear down an executor and revoke its enrollment, by public name.
     Remove {
@@ -316,6 +320,8 @@ struct AddRequest {
     project_keys: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     extra_ssh_args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -461,6 +467,7 @@ fn add_request(command: ExecutorCommand) -> Result<AddRequest, String> {
         display_name,
         projects,
         extra_ssh_args,
+        role,
     } = command
     else {
         unreachable!()
@@ -476,6 +483,7 @@ fn add_request(command: ExecutorCommand) -> Result<AddRequest, String> {
         display_name,
         project_keys: projects,
         extra_ssh_args,
+        role,
     })
 }
 
@@ -632,6 +640,7 @@ mod tests {
             display_name: None,
             projects: vec![],
             extra_ssh_args: vec![],
+            role: None,
         })
         .unwrap();
         assert_eq!(request.host, "builder.local");
@@ -639,6 +648,35 @@ mod tests {
         assert!(request.project_keys.is_empty());
         let json = serde_json::to_value(request).unwrap();
         assert!(json.get("binaryPath").is_none());
+        assert!(
+            json.get("role").is_none(),
+            "an omitted role is left to the runner"
+        );
+    }
+
+    #[test]
+    fn role_is_parsed_with_its_three_spellings_and_sent_as_given() {
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            command: ExecutorCommand,
+        }
+        let cli = Cli::try_parse_from(["cairn", "add", "dev@sp1.local", "--role", "inferenceOnly"])
+            .unwrap();
+        let request = add_request(cli.command).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap().get("role"),
+            Some(&json!("inferenceOnly"))
+        );
+        let refused = Cli::try_parse_from(["cairn", "add", "dev@sp1.local", "--role", "gpu"])
+            .err()
+            .expect("an unknown role is refused")
+            .to_string();
+        assert!(
+            refused.contains("buildsOnly") && refused.contains("inferenceOnly"),
+            "{refused}"
+        );
     }
 
     #[test]
@@ -652,6 +690,7 @@ mod tests {
             display_name: None,
             projects: vec![],
             extra_ssh_args: vec!["-4".into()],
+            role: None,
         })
         .unwrap();
         assert_eq!(request.ssh_user, "dell workstation");
@@ -780,6 +819,7 @@ mod tests {
             display_name: None,
             projects: vec![],
             extra_ssh_args: vec![],
+            role: None,
         })
         .unwrap();
         assert_eq!(ssh_copy_id_guidance(&request), "SSH key authentication is not ready for dev@builder.local. Run `ssh-copy-id dev@builder.local`, then re-run `cairn executor add dev@builder.local`. Verify the SSH username if the copy command rejects it.");
@@ -796,6 +836,7 @@ mod tests {
             display_name: None,
             projects: vec![],
             extra_ssh_args: vec!["-p".into(), "2222".into(), "-J".into(), "jump host".into()],
+            role: None,
         })
         .unwrap();
         assert_eq!(

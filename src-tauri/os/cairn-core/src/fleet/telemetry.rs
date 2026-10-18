@@ -297,6 +297,7 @@ mod tests {
                 connection_generation: 1,
                 applied_policy: report.applied_policy,
                 drain_mode: false,
+                role: Default::default(),
                 resident_processes: Default::default(),
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),

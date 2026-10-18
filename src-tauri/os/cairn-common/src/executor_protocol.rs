@@ -2960,6 +2960,149 @@ pub enum PlacementWorkClass {
     Services,
 }
 
+impl PlacementWorkClass {
+    /// Every class, in the order surfaces list them.
+    pub const ALL: [Self; 5] = [
+        Self::ReviewChecks,
+        Self::WriteChecks,
+        Self::AgentSessions,
+        Self::DevInstances,
+        Self::Services,
+    ];
+
+    /// The wire spelling, for refusal text that has to match what a caller
+    /// writes in a profile or reads in a placement record.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReviewChecks => "reviewChecks",
+            Self::WriteChecks => "writeChecks",
+            Self::AgentSessions => "agentSessions",
+            Self::DevInstances => "devInstances",
+            Self::Services => "services",
+        }
+    }
+}
+
+/// What one machine is FOR: the kinds of work an operator lets this runner
+/// place on it.
+///
+/// The runner holds this value and enforces it in placement's eligibility
+/// relation; it is never sent to an executor, which admits or declines what it
+/// is offered without knowing it. That is why it is not a wire change: only the
+/// runner reads it, so no two peers can disagree about it.
+///
+/// The role is stored as itself, and the classes it accepts are derived from
+/// it in [`MachineRole::accepts`] alone. A stored list of classes with the
+/// roles as presets over it would be two representations of one setting; a
+/// finer split, if one is ever needed, is a new role value.
+///
+/// [`PlacementWorkClass`] is the one vocabulary for kinds of work, and a role
+/// is a predicate over it (what the machine offers). If work ever comes to
+/// REQUIRE a kind of machine (cairn/4531, the mirror of this), it should select
+/// on this type, for example as a role on the executor selector, rather than
+/// mint a parallel "machine class" term.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "camelCase")]
+pub enum MachineRole {
+    /// Every batch class, and never an inference deployment.
+    BuildsOnly,
+    /// Everything. The default when omitted, so no machine enrolled before
+    /// roles existed changes behaviour.
+    #[default]
+    General,
+    /// Inference deployments only: never surveyed, ranked, explored or chosen
+    /// for any batch class.
+    InferenceOnly,
+}
+
+impl MachineRole {
+    pub const ALL: [Self; 3] = [Self::BuildsOnly, Self::General, Self::InferenceOnly];
+
+    /// The wire spelling, which is also what the CLI and the settings file take.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuildsOnly => "buildsOnly",
+            Self::General => "general",
+            Self::InferenceOnly => "inferenceOnly",
+        }
+    }
+
+    /// The words an operator reads on the executors page and in refusals.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::BuildsOnly => "builds only",
+            Self::General => "general",
+            Self::InferenceOnly => "inference only",
+        }
+    }
+
+    /// Parse an operator-supplied spelling, naming the three accepted values
+    /// when it is none of them.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|role| role.as_str() == value)
+            .ok_or_else(|| {
+                format!(
+                    "unknown machine role {value:?}; expected one of {}",
+                    Self::ALL.map(Self::as_str).join(", ")
+                )
+            })
+    }
+
+    /// Whether a machine with this role may be offered work of `class`.
+    ///
+    /// The ONLY place a role is mapped to classes: placement, the executors
+    /// page and every summary ask here. The non-general arms match `class`
+    /// exhaustively with no wildcard, so adding a class fails to compile until
+    /// it is answered here. The `Inference` class (deployments) is intended to
+    /// read: builds only false, inference only true, general true.
+    pub fn accepts(self, class: PlacementWorkClass) -> bool {
+        match self {
+            Self::General => true,
+            Self::BuildsOnly => match class {
+                PlacementWorkClass::ReviewChecks
+                | PlacementWorkClass::WriteChecks
+                | PlacementWorkClass::AgentSessions
+                | PlacementWorkClass::DevInstances
+                | PlacementWorkClass::Services => true,
+            },
+            Self::InferenceOnly => match class {
+                PlacementWorkClass::ReviewChecks
+                | PlacementWorkClass::WriteChecks
+                | PlacementWorkClass::AgentSessions
+                | PlacementWorkClass::DevInstances
+                | PlacementWorkClass::Services => false,
+            },
+        }
+    }
+
+    /// What this role accepts of today's classes, in words: "accepts every
+    /// batch class", "accepts none of today's batch classes", or the list.
+    pub fn describe_accepted(self) -> String {
+        let accepted: Vec<&str> = PlacementWorkClass::ALL
+            .into_iter()
+            .filter(|class| self.accepts(*class))
+            .map(PlacementWorkClass::as_str)
+            .collect();
+        if accepted.len() == PlacementWorkClass::ALL.len() {
+            "accepts every batch class".to_string()
+        } else if accepted.is_empty() {
+            "accepts none of today's batch classes".to_string()
+        } else {
+            format!("accepts {}", accepted.join(", "))
+        }
+    }
+
+    /// Today's classes this role refuses, by wire name.
+    pub fn refused_classes(self) -> Vec<PlacementWorkClass> {
+        PlacementWorkClass::ALL
+            .into_iter()
+            .filter(|class| !self.accepts(*class))
+            .collect()
+    }
+}
+
 /// Cadence and freshness bound for measured CPU admission decisions.
 pub const CPU_ADMISSION_SAMPLE_INTERVAL_MS: u64 = 5_000;
 
@@ -4375,6 +4518,20 @@ pub struct LearnedResourceEstimate {
 /// older executor does not post reads as no hold, which is the ranking every
 /// runner had until now, and the executor still declines anything its
 /// admission refuses.
+///
+/// cairn/5070 adds [`MachineRole`] and
+/// [`PlacementRejectionReason::RoleExcluded`] without a bump. Both live only in
+/// the runner: the role is stored in the runner's fleet settings, enforced in
+/// its placement, and rendered on its surfaces (the defaulted `role` on
+/// [`ExecutorHealthSnapshot`] and [`EnrolledRemote`], views only the runner
+/// builds from its own state), and no frame, advertisement or executor config
+/// carries it. The executor is never told its role, and its
+/// admission is unchanged, so an executor of any version answers an offer
+/// exactly as before. The handshake admits only equal versions, so no executor
+/// has a peer that disagrees with it about what it may admit. One residual is
+/// accepted: an operator who downgrades their own runner to a pre-5070 build at
+/// this version keeps a settings file whose `machineRoles` that build ignores,
+/// and would offer batch work to a machine enrolled as inference only.
 pub const EXECUTOR_PROTOCOL_VERSION: u32 = 150;
 
 // Why some enums below carry `rename_all_fields`, and why not all of them do.
@@ -10261,6 +10418,10 @@ pub struct ExecutorHealthSnapshot {
     /// and the surfaces render it as one.
     #[serde(default)]
     pub drain_mode: bool,
+    /// What the runner holds this machine to be for. Unlike the drain it has
+    /// one witness: the runner fills it in, and no executor reports it.
+    #[serde(default)]
+    pub role: MachineRole,
     #[serde(default)]
     pub resident_processes: ResidentProcessHealth,
     #[serde(default)]
@@ -10661,6 +10822,10 @@ pub struct EnrolledRemote {
     /// state that decides what happens when this one comes back.
     #[serde(default)]
     pub drained: bool,
+    /// What the runner holds this machine to be for, known whether or not it
+    /// is attached, like the drain above.
+    #[serde(default)]
+    pub role: MachineRole,
     /// When this machine's link was last up, or `None` if it has not attached
     /// since this runner started.
     pub last_seen_unix_ms: Option<u64>,
@@ -11793,6 +11958,13 @@ pub enum PlacementRejectionReason {
     /// because a drain is the runner's own fact and holds whether or not the
     /// machine is in any condition to answer.
     Drained,
+    /// An operator gave this machine a role that does not accept this class of
+    /// work. Permanent until an operator changes the role, so it is reported
+    /// ahead of anything that could clear on its own, a drain included.
+    RoleExcluded {
+        role: MachineRole,
+        work_class: PlacementWorkClass,
+    },
     /// A check this request carries has spent its retry budget on this machine's
     /// current environment. The machine may be perfectly healthy for other work;
     /// it is this check that must go elsewhere. Carries no payload because the
@@ -11926,6 +12098,11 @@ impl PlacementRejectionReason {
                 trusted.join(", ")
             ),
             Self::Drained => "drained by an operator; refusing new work".into(),
+            Self::RoleExcluded { role, work_class } => format!(
+                "is {}; this request is {}",
+                role.label(),
+                work_class.as_str()
+            ),
             Self::AvoidedInfrastructure => {
                 "a check in this request is infrastructure-suppressed on this machine's current environment"
                     .into()
@@ -14201,6 +14378,77 @@ mod tests {
         );
     }
 
+    /// The three spellings are the ones every surface takes, and an omitted
+    /// role is general so no existing machine changes behaviour.
+    #[test]
+    fn machine_role_round_trips_its_three_spellings_and_defaults_to_general() {
+        assert_eq!(MachineRole::default(), MachineRole::General);
+        for (role, spelling) in [
+            (MachineRole::BuildsOnly, "buildsOnly"),
+            (MachineRole::General, "general"),
+            (MachineRole::InferenceOnly, "inferenceOnly"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(role).unwrap(),
+                serde_json::json!(spelling)
+            );
+            assert_eq!(
+                serde_json::from_value::<MachineRole>(serde_json::json!(spelling)).unwrap(),
+                role
+            );
+            assert_eq!(role.as_str(), spelling);
+            assert_eq!(MachineRole::parse(spelling), Ok(role));
+        }
+        let error = MachineRole::parse("inference-only").unwrap_err();
+        assert!(
+            error.contains("buildsOnly, general, inferenceOnly"),
+            "a bad role names the three it could have been: {error}"
+        );
+    }
+
+    /// The whole derivation, role by class. Inference-only refuses every class
+    /// that exists today; the other two accept all of them.
+    #[test]
+    fn machine_role_accepts_is_the_role_by_class_table() {
+        for class in PlacementWorkClass::ALL {
+            assert!(MachineRole::General.accepts(class), "{class:?}");
+            assert!(MachineRole::BuildsOnly.accepts(class), "{class:?}");
+            assert!(!MachineRole::InferenceOnly.accepts(class), "{class:?}");
+        }
+        assert_eq!(
+            MachineRole::InferenceOnly.describe_accepted(),
+            "accepts none of today's batch classes"
+        );
+        assert_eq!(
+            MachineRole::BuildsOnly.describe_accepted(),
+            "accepts every batch class"
+        );
+        assert_eq!(
+            MachineRole::InferenceOnly.refused_classes(),
+            PlacementWorkClass::ALL.to_vec()
+        );
+        assert!(MachineRole::General.refused_classes().is_empty());
+    }
+
+    #[test]
+    fn role_excluded_names_the_role_and_the_class() {
+        assert_eq!(
+            PlacementRejectionReason::RoleExcluded {
+                role: MachineRole::InferenceOnly,
+                work_class: PlacementWorkClass::AgentSessions,
+            }
+            .describe(),
+            "is inference only; this request is agentSessions"
+        );
+        for class in PlacementWorkClass::ALL {
+            assert_eq!(
+                serde_json::to_value(class).unwrap(),
+                serde_json::json!(class.as_str()),
+                "as_str is the wire spelling"
+            );
+        }
+    }
+
     /// Absence of a selector is not permission to move, and a peer that never
     /// heard of mobility must decode as the conservative thing rather than as
     /// the permissive one.
@@ -15480,6 +15728,7 @@ mod tests {
                     retired: Vec::new(),
                     connection_timeline: Vec::new(),
                     drained: false,
+                    role: Default::default(),
                 },
                 EnrolledRemote {
                     executor_id: "bglab-ub".into(),
@@ -15501,6 +15750,7 @@ mod tests {
                     // the fact travels on the wire whether or not the machine
                     // is there to confirm it.
                     drained: true,
+                    role: Default::default(),
                 },
                 EnrolledRemote {
                     executor_id: "bglab-win".into(),
@@ -15515,6 +15765,7 @@ mod tests {
                     retired: Vec::new(),
                     connection_timeline: Vec::new(),
                     drained: false,
+                    role: Default::default(),
                 },
             ],
             compile_cache: Some(CompileCacheHealth {
@@ -15601,6 +15852,7 @@ mod tests {
                 connection_generation: 2,
                 applied_policy: ExecutorRuntimePolicy::default(),
                 drain_mode: true,
+                role: Default::default(),
                 resident_processes: ResidentProcessHealth::default(),
                 command_processes: CommandProcessHealth::default(),
                 evicted_cells: Vec::new(),
@@ -16194,6 +16446,7 @@ mod tests {
                 retired: Vec::new(),
                 connection_timeline: Vec::new(),
                 drained: false,
+                role: Default::default(),
             }],
             status: SubstrateHealthStatus::Degraded,
             warming_up: false,

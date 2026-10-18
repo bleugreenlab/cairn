@@ -1,8 +1,8 @@
 //! Persisted fleet policy and executor declarations; no running fleet.
-pub use cairn_common::executor_protocol::PlacementWorkClass;
 use cairn_common::executor_protocol::{
     normalize_executor_name, EXECUTOR_NAME_RULE, LOCAL_EXECUTOR_NAME,
 };
+pub use cairn_common::executor_protocol::{MachineRole, PlacementWorkClass};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 pub const COLOCATED_EXECUTOR_ID: &str = "colocated";
@@ -114,13 +114,7 @@ impl PlacementProfile {
 }
 
 fn placement_work_classes() -> [PlacementWorkClass; 5] {
-    [
-        PlacementWorkClass::ReviewChecks,
-        PlacementWorkClass::WriteChecks,
-        PlacementWorkClass::AgentSessions,
-        PlacementWorkClass::DevInstances,
-        PlacementWorkClass::Services,
-    ]
+    PlacementWorkClass::ALL
 }
 
 pub fn profile_with_routes(
@@ -245,6 +239,18 @@ pub struct FleetConfig {
     /// dogpiled again the moment it came back (CAIRN-4360).
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub drained_machines: BTreeSet<String>,
+    /// What each machine is for, by the key [`FleetConfig::drain_key`] gives
+    /// it. Only roles other than general are stored, so an absent entry IS
+    /// general and a fleet that never set one serializes nothing here.
+    ///
+    /// Like a drain, a role is a fact the RUNNER holds and enforces in its own
+    /// placement; the machine is never told. Unlike a drain it is not a
+    /// refusal of everything: it says which classes of work this runner will
+    /// offer the machine at all, derived from the role in
+    /// [`MachineRole::accepts`]. This map is the one authority; the fleet's
+    /// in-memory copy is rebuilt from it whenever it is written or loaded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub machine_roles: BTreeMap<String, MachineRole>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -366,6 +372,11 @@ pub struct RemoteExecutorDeclaration {
     pub legacy_tunnel_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_ssh_args: Vec<String>,
+    /// What the machine is for. Carried by the ceremony and persisted to
+    /// [`FleetConfig::machine_roles`] in the same write as the machine's
+    /// configuration, never to the machine itself.
+    #[serde(default)]
+    pub role: MachineRole,
 }
 
 impl RemoteExecutorDeclaration {
@@ -638,23 +649,68 @@ impl FleetConfig {
         }
     }
 
-    /// Drop a removed machine's drain along with it, so a name that is enrolled
-    /// again does not inherit a refusal nobody asked for.
-    pub fn forget_drain(&mut self, executor_id: &str) {
-        self.drained_machines.remove(Self::drain_key(executor_id));
+    /// Drop a removed machine's runner-held facts (its drain and its role)
+    /// along with it, so a host that is enrolled again does not inherit a
+    /// refusal or a purpose nobody asked for.
+    pub fn forget_machine(&mut self, executor_id: &str) {
+        let key = Self::drain_key(executor_id);
+        self.drained_machines.remove(key);
+        self.machine_roles.remove(key);
+    }
+
+    /// What this runner holds a machine to be for. Absent means general.
+    pub fn machine_role(&self, executor_id: &str) -> MachineRole {
+        self.machine_roles
+            .get(Self::drain_key(executor_id))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Record a machine's role. General removes the entry, since absence is
+    /// general. Returns whether the stored state changed.
+    pub fn set_machine_role(&mut self, executor_id: &str, role: MachineRole) -> bool {
+        let key = Self::drain_key(executor_id).to_string();
+        if role == MachineRole::General {
+            self.machine_roles.remove(&key).is_some()
+        } else {
+            self.machine_roles.insert(key, role) != Some(role)
+        }
+    }
+
+    /// Take `roles` as this config's roles, keeping only those for machines it
+    /// declares, so a write that removes a machine also drops its role.
+    pub fn carry_machine_roles(&mut self, roles: BTreeMap<String, MachineRole>) {
+        let known = self.known_profile_executor_ids();
+        let kept: BTreeMap<String, MachineRole> = roles
+            .into_iter()
+            .filter(|(key, role)| known.contains(key.as_str()) && *role != MachineRole::General)
+            .collect();
+        self.machine_roles = kept;
+    }
+
+    /// Every machine with a role other than general, by executor identity.
+    pub fn role_executor_ids(&self) -> Vec<(String, MachineRole)> {
+        self.machine_roles
+            .iter()
+            .map(|(key, role)| (Self::executor_id_for_key(key), *role))
+            .collect()
+    }
+
+    /// The executor identity a durable key names: the inverse of
+    /// [`Self::drain_key`].
+    fn executor_id_for_key(key: &str) -> String {
+        if key == LOCAL_EXECUTOR_NAME {
+            COLOCATED_EXECUTOR_ID.to_string()
+        } else {
+            key.to_string()
+        }
     }
 
     /// Every machine this runner is holding drained, by executor identity.
     pub fn drained_executor_ids(&self) -> Vec<String> {
         self.drained_machines
             .iter()
-            .map(|key| {
-                if key == LOCAL_EXECUTOR_NAME {
-                    COLOCATED_EXECUTOR_ID.to_string()
-                } else {
-                    key.clone()
-                }
-            })
+            .map(|key| Self::executor_id_for_key(key))
             .collect()
     }
 
@@ -772,6 +828,14 @@ impl FleetConfig {
             validate_custom_profile_name(name)?;
             profile.validate(&known)?;
         }
+        for (key, role) in &self.machine_roles {
+            if !known.contains(key.as_str()) {
+                return Err(format!(
+                    "machineRoles names unknown executor ID {key} (role {})",
+                    role.as_str()
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -790,6 +854,7 @@ impl Default for FleetConfig {
             desktop_automation: DesktopAutomationConfig::default(),
             executor_listener: None,
             drained_machines: BTreeSet::new(),
+            machine_roles: BTreeMap::new(),
         }
     }
 }
@@ -823,6 +888,70 @@ fn default_timeout_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_absent_machine_roles_block_is_every_machine_general() {
+        let config: FleetConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.machine_roles.is_empty());
+        assert_eq!(
+            config.machine_role(COLOCATED_EXECUTOR_ID),
+            MachineRole::General
+        );
+        assert_eq!(config.machine_role("sp1"), MachineRole::General);
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(
+            serialized.get("machineRoles").is_none(),
+            "a fleet with no roles writes none"
+        );
+    }
+
+    #[test]
+    fn machine_roles_are_keyed_like_drains_and_general_is_absence() {
+        let mut config = FleetConfig::default();
+        assert!(config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::BuildsOnly));
+        assert!(!config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::BuildsOnly));
+        assert_eq!(
+            config.machine_roles.get(LOCAL_EXECUTOR_NAME),
+            Some(&MachineRole::BuildsOnly),
+            "the colocated executor is keyed by the name that addresses it"
+        );
+        assert_eq!(
+            config.role_executor_ids(),
+            vec![(COLOCATED_EXECUTOR_ID.to_string(), MachineRole::BuildsOnly)]
+        );
+        assert!(config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::General));
+        assert!(
+            config.machine_roles.is_empty(),
+            "general is stored as absence"
+        );
+        assert!(!config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::General));
+    }
+
+    #[test]
+    fn forgetting_a_machine_drops_its_drain_and_its_role() {
+        let mut config = FleetConfig::default();
+        config.set_machine_drained("sp1", true);
+        config.set_machine_role("sp1", MachineRole::InferenceOnly);
+        config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::BuildsOnly);
+        config.forget_machine("sp1");
+        assert!(!config.is_machine_drained("sp1"));
+        assert_eq!(config.machine_role("sp1"), MachineRole::General);
+        assert_eq!(
+            config.machine_role(COLOCATED_EXECUTOR_ID),
+            MachineRole::BuildsOnly,
+            "only the forgotten machine loses its facts"
+        );
+    }
+
+    #[test]
+    fn validate_refuses_a_role_for_an_unknown_machine() {
+        let mut config = FleetConfig::default();
+        config.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::BuildsOnly);
+        assert_eq!(config.validate(), Ok(()));
+        config.set_machine_role("sp1", MachineRole::InferenceOnly);
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("unknown executor ID sp1"), "{error}");
+    }
     /// A machine's desktop configuration is keyed by the name it answers to, so
     /// the two operations that change which names exist have to move it.
     #[test]

@@ -98,21 +98,88 @@ pub fn load_fleet(config_dir: &std::path::Path) -> crate::fleet::FleetConfig {
         .healed()
 }
 
+/// Serializes every write of the fleet block, and keeps a role write and the
+/// runner's adoption of it together (see [`mutate_fleet`]).
+static FLEET_MUTATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn fleet_mutation_guard() -> std::sync::MutexGuard<'static, ()> {
+    FLEET_MUTATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+const BUILD_SLOTS_KEY: &str = "buildSlots";
+
+fn insert_fleet(
+    root: &mut serde_yaml::Mapping,
+    config: &crate::fleet::FleetConfig,
+) -> Result<(), String> {
+    config.validate()?;
+    root.insert(
+        serde_yaml::Value::String(BUILD_SLOTS_KEY.to_string()),
+        serde_yaml::to_value(config)
+            .map_err(|error| format!("Failed to serialize build slots: {error}"))?,
+    );
+    Ok(())
+}
+
 /// Replace the runner-owned fleet capability in `settings.yaml` without
 /// routing it through the general Settings DTO. Only `buildSlots` is touched.
+///
+/// Machine roles are the one part this does NOT replace: the roles already on
+/// disk are kept (less any for a machine `config` no longer declares), whatever
+/// `config` carries. Every caller of this writes back a snapshot it read
+/// earlier, so letting it write roles would let a stale snapshot undo a role an
+/// operator set in between, on disk and, at the next start, in placement. Roles
+/// change only through [`mutate_fleet`], which reads, writes and publishes them
+/// as one step.
 pub fn set_fleet(
     config_dir: &std::path::Path,
     config: &crate::fleet::FleetConfig,
 ) -> Result<(), String> {
-    config.validate()?;
+    let _fleet = fleet_mutation_guard();
     mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
-        root.insert(
-            serde_yaml::Value::String("buildSlots".to_string()),
-            serde_yaml::to_value(config)
-                .map_err(|error| format!("Failed to serialize build slots: {error}"))?,
-        );
-        Ok(())
+        let held_roles = root
+            .get(BUILD_SLOTS_KEY)
+            .and_then(|slots| slots.get("machineRoles"))
+            .and_then(|roles| serde_yaml::from_value(roles.clone()).ok())
+            .unwrap_or_default();
+        let mut next = config.clone();
+        next.carry_machine_roles(held_roles);
+        insert_fleet(root, &next)
     })
+}
+
+/// Read the fleet block, change it, write it, and publish the result, as one
+/// step no other fleet write can interleave with.
+///
+/// This is the path for anything that changes a machine's role. The block is
+/// read under the lock rather than taken from the caller, so a write cannot
+/// restore what it read before someone else's change. `publish` runs after the
+/// write succeeds and before the lock is released, so the runner adopts writes
+/// in the order they reached disk. A block that does not parse is refused, not
+/// replaced with defaults.
+pub fn mutate_fleet<T>(
+    config_dir: &std::path::Path,
+    mutate: impl FnOnce(&mut crate::fleet::FleetConfig) -> Result<T, String>,
+    publish: impl FnOnce(&crate::fleet::FleetConfig),
+) -> Result<T, String> {
+    let _fleet = fleet_mutation_guard();
+    let (result, config) =
+        mutate_workspace_settings(config_dir, "cairn: update settings", |root| {
+            let mut config = match root.get(BUILD_SLOTS_KEY) {
+                None => crate::fleet::FleetConfig::default(),
+                Some(slots) => serde_yaml::from_value::<crate::fleet::FleetConfig>(slots.clone())
+                    .map_err(|error| format!("Failed to parse buildSlots: {error}"))?
+                    .healed(),
+            };
+            let result = mutate(&mut config)?;
+            insert_fleet(root, &config)?;
+            Ok((result, config))
+        })?;
+    publish(&config);
+    Ok(result)
 }
 
 /// Settings as stored in YAML file.
@@ -2954,6 +3021,60 @@ extraSshArgs: []
         fleet.remote_executors.insert("bglab-ub".into(), remote);
         super::set_fleet(temp.path(), &fleet).unwrap();
         assert_eq!(super::load_fleet(temp.path()), fleet);
+    }
+
+    /// A whole-fleet write carries a snapshot read earlier, so it must not
+    /// be able to set, clear, or restore a role; only `mutate_fleet` can.
+    #[test]
+    fn set_fleet_keeps_the_roles_on_disk_and_mutate_fleet_changes_them() {
+        use crate::fleet::{FleetConfig, MachineRole, COLOCATED_EXECUTOR_ID};
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path();
+
+        let stale = super::load_fleet(dir);
+        let published = std::cell::RefCell::new(Vec::new());
+        super::mutate_fleet(
+            dir,
+            |fleet| {
+                fleet.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::InferenceOnly);
+                Ok(())
+            },
+            |fleet| published.borrow_mut().push(fleet.role_executor_ids()),
+        )
+        .unwrap();
+        assert_eq!(
+            published.into_inner(),
+            vec![vec![(
+                COLOCATED_EXECUTOR_ID.to_string(),
+                MachineRole::InferenceOnly
+            )]],
+            "the written roles are published"
+        );
+
+        // A snapshot taken before the role was set, written back.
+        super::set_fleet(dir, &stale).unwrap();
+        assert_eq!(
+            super::load_fleet(dir).machine_role(COLOCATED_EXECUTOR_ID),
+            MachineRole::InferenceOnly,
+            "a stale whole-fleet write does not undo the role"
+        );
+
+        // Nor can a whole-fleet write set one.
+        let mut forged = super::load_fleet(dir);
+        forged.set_machine_role(COLOCATED_EXECUTOR_ID, MachineRole::General);
+        super::set_fleet(dir, &forged).unwrap();
+        assert_eq!(
+            super::load_fleet(dir).machine_role(COLOCATED_EXECUTOR_ID),
+            MachineRole::InferenceOnly
+        );
+
+        // A broken block is refused, not overwritten with defaults.
+        std::fs::write(
+            super::get_settings_path(dir),
+            "buildSlots: [not, a, mapping]\n",
+        )
+        .unwrap();
+        assert!(super::mutate_fleet(dir, |_| Ok(()), |_: &FleetConfig| {}).is_err());
     }
 
     #[test]

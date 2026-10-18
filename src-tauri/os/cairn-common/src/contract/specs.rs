@@ -641,6 +641,11 @@ pub(crate) const EXECUTOR_DRAINING: KeySpec = KeySpec::new(
     KeyType::Bool,
     "true refuses new admissions without terminating resident work; durable runner-side state, so it needs no generation, works on an unreachable machine, and survives reconnect until cleared",
 );
+pub(crate) const EXECUTOR_ROLE: KeySpec = KeySpec::new(
+    "role",
+    KeyType::Str,
+    "buildsOnly | general | inferenceOnly: what this machine is for; omitted means general (or, re-enrolling, the role it holds). Durable runner-side state like draining: unfenced, works on an unreachable machine, and the machine is never told. inferenceOnly is never offered any batch class",
+);
 pub(crate) const EXECUTOR_EXPECTED_GENERATION: KeySpec = KeySpec::with_aliases(
     "expectedGeneration",
     &["expected_generation"],

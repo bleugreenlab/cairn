@@ -254,6 +254,10 @@ mod tests {
             enroll.optional.iter().any(|key| key.key == "projectKeys"),
             "project restriction is optional, so an omitted list means every project"
         );
+        assert!(
+            enroll.optional.iter().any(|key| key.key == "role"),
+            "a role is optional at enrollment, so an omitted one means general"
+        );
 
         let machine = contract_for(ResourceKind::Executor).expect("the machine is registered");
         assert_eq!(machine.mutations.len(), 2);
@@ -270,6 +274,7 @@ mod tests {
                 "newName",
                 "runtimePolicy",
                 "draining",
+                "role",
                 "desktopAutomation",
                 "repaired",
                 "expectedGeneration"

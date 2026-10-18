@@ -21,9 +21,9 @@
 //!   inspecting the fleet costs nothing that running work would notice.
 
 use cairn_common::executor_protocol::{
-    BindingEvent, DeclineReason, ExecutorHealthStatus, ExecutorInspection, Measurement,
-    MeasurementReading, PlacementDecision, PlacementOutcome, PlacementPrediction, PlacementReason,
-    PlacementRejectionReason, PlacementSyncCost, ReservationRationale,
+    BindingEvent, DeclineReason, ExecutorHealthStatus, ExecutorInspection, MachineRole,
+    Measurement, MeasurementReading, PlacementDecision, PlacementOutcome, PlacementPrediction,
+    PlacementReason, PlacementRejectionReason, PlacementSyncCost, ReservationRationale,
     MIN_CONFIDENT_RESERVATION_SAMPLES,
 };
 use cairn_common::executor_protocol::{
@@ -363,6 +363,9 @@ pub(crate) fn render_executors(
             }
         }
         out.push_str(&format!("- Link: {}\n", link_summary(executor)));
+        if executor.health.role != MachineRole::General {
+            out.push_str(&machine_role_line(executor.health.role));
+        }
         if executor.health.drain_mode {
             out.push_str("- Draining: yes (refusing new work)\n");
         }
@@ -382,6 +385,9 @@ pub(crate) fn render_executors(
             out.push_str(&format!("### {}\n", remote.name));
             out.push_str(&format!("- Platform: {} / {}\n", remote.os, remote.arch));
             out.push_str(&format!("- Link: {}\n", enrolled_link_summary(remote)));
+            if remote.role != MachineRole::General {
+                out.push_str(&machine_role_line(remote.role));
+            }
             if remote.drained {
                 out.push_str("- Draining: yes (held by the runner)\n");
             }
@@ -470,11 +476,18 @@ pub(crate) fn render_enrollment(
 /// admission, queues, the work resident on a machine — comes from the machine
 /// itself, and none of it was measured. Printing those sections as zeroes would
 /// describe an idle machine rather than an absent one.
+/// What a machine is for, and what that means for today's classes of work,
+/// derived from the role's own [`MachineRole::accepts`].
+fn machine_role_line(role: MachineRole) -> String {
+    format!("- Role: {} ({})\n", role.label(), role.describe_accepted())
+}
+
 pub(crate) fn render_enrolled_remote(remote: &EnrolledRemote, captured_at_unix_ms: u64) -> String {
     let mut out = format!("# Executor {}\n\n", remote.name);
     out.push_str("## Identity\n");
     out.push_str(&format!("- Name: {}\n", remote.name));
-    out.push_str("- Role: enrolled (attached over the executor protocol)\n");
+    out.push_str("- Attachment: enrolled (attached over the executor protocol)\n");
+    out.push_str(&machine_role_line(remote.role));
     out.push_str(&format!("- Platform: {} / {}\n\n", remote.os, remote.arch));
 
     out.push_str("## Link\n");
@@ -680,13 +693,14 @@ pub(crate) fn render_executor(executor: &ExecutorInspection) -> String {
     out.push_str("## Identity\n");
     out.push_str(&format!("- Name: {}\n", executor.name));
     out.push_str(&format!(
-        "- Role: {}\n",
+        "- Attachment: {}\n",
         if executor.colocated {
             "colocated (supervised inside the runner's own process tree)"
         } else {
             "enrolled (attached over the executor protocol)"
         }
     ));
+    out.push_str(&machine_role_line(health.role));
     out.push_str(&format!(
         "- Platform: {} / {}\n",
         capabilities.os, capabilities.arch
@@ -4303,6 +4317,7 @@ mod tests {
                 connection_generation: 3,
                 applied_policy: ExecutorSubstrateReport::default().applied_policy,
                 drain_mode: false,
+                role: Default::default(),
                 resident_processes: Default::default(),
                 command_processes: Default::default(),
                 evicted_cells: Vec::new(),
@@ -5110,6 +5125,7 @@ mod tests {
             retired: Vec::new(),
             connection_timeline: Vec::new(),
             drained: false,
+            role: Default::default(),
         }
     }
 
@@ -5299,6 +5315,49 @@ mod tests {
     /// A machine that is not reporting still has one operational fact worth
     /// stating: whether the runner is holding it drained. It decides what
     /// happens the moment the machine comes back.
+    #[test]
+    fn a_machine_page_states_its_role_and_its_attachment_attached_or_not() {
+        let mut executor = inspection("sp1", false);
+        let general = render_executor(&executor);
+        assert!(
+            general.contains("- Attachment: enrolled (attached over the executor protocol)\n"),
+            "{general}"
+        );
+        assert!(
+            general.contains("- Role: general (accepts every batch class)\n"),
+            "{general}"
+        );
+        executor.health.role = MachineRole::InferenceOnly;
+        let inference = render_executor(&executor);
+        assert!(
+            inference.contains("- Role: inference only (accepts none of today's batch classes)\n"),
+            "{inference}"
+        );
+        let listed = render_executors(
+            std::slice::from_ref(&executor),
+            &[],
+            &[],
+            None,
+            CAPTURED_AT,
+            false,
+        );
+        assert!(listed.contains("- Role: inference only"), "{listed}");
+
+        let mut remote = enrolled(
+            "sp2",
+            RemoteLinkState::Absent {
+                last_beat_unix_ms: Some(REMOTE_CAPTURED_AT - 60_000),
+                last_reason: String::new(),
+            },
+        );
+        remote.role = MachineRole::InferenceOnly;
+        let detached = render_enrolled_remote(&remote, REMOTE_CAPTURED_AT);
+        assert!(detached.contains("- Attachment: enrolled"), "{detached}");
+        assert!(detached.contains("- Role: inference only"), "{detached}");
+        let overview = render_executors(&[], &[remote], &[], None, REMOTE_CAPTURED_AT, false);
+        assert!(overview.contains("- Role: inference only"), "{overview}");
+    }
+
     #[test]
     fn a_detached_machine_states_the_drain_it_is_under() {
         let mut remote = enrolled(

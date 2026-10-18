@@ -1396,6 +1396,7 @@ pub async fn run_manual_configured_check_with_progress(
             commit_sha: &commit_sha,
             repository: &repository_path,
             mutation_policy: MutationPolicy::PureVerdict,
+            work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
         },
         &[CheckPlacementQuestion {
             selector: command_check.executor.clone(),
@@ -2345,6 +2346,9 @@ pub(crate) struct InfraScopeInputs<'a> {
     pub commit_sha: &'a str,
     pub repository: &'a str,
     pub mutation_policy: MutationPolicy,
+    /// The class the wave's checks are placed as, which a machine's role
+    /// accepts or refuses like any other eligibility fact.
+    pub work_class: crate::fleet::PlacementWorkClass,
 }
 
 /// The suppression scope set for each planned check in a wave.
@@ -2406,6 +2410,7 @@ pub(crate) async fn plan_infra_scopes(
                 // identities move with the counters they are meant to bound.
                 avoided_executor_ids: &[],
                 project_requirements: &project_requirements,
+                work_class: inputs.work_class,
             };
             InfraScopes {
                 head: head.clone(),
@@ -2524,6 +2529,7 @@ const CAPACITY_RETRY_BACKOFF_MS: u64 = 2_000;
 
 struct CheckPatience {
     mobility: PlacementMobility,
+    work_class: crate::fleet::PlacementWorkClass,
 }
 
 struct GroupWait {
@@ -2534,6 +2540,7 @@ impl CheckPatience {
     fn declare(batch: &PlannedCheckBatchRequest) -> Self {
         Self {
             mobility: batch_placement_mobility(&batch.mutation_policy),
+            work_class: crate::execution::wire::check_placement_work_class(batch.priority),
         }
     }
 
@@ -2563,6 +2570,7 @@ impl CheckPatience {
             verdict_platforms,
             avoided_executor_ids,
             project_requirements: &project_requirements,
+            work_class: self.work_class,
         }))
     }
 }
@@ -8179,6 +8187,7 @@ pub(crate) async fn verify_review_tree(
             commit_sha: commit_id,
             repository: &repository,
             mutation_policy: MutationPolicy::PureVerdict,
+            work_class: crate::execution::wire::check_placement_work_class(priority),
         },
         &(0..keyed.len())
             .map(|index| CheckPlacementQuestion {

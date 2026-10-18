@@ -24,6 +24,9 @@ struct ConfigureRequest {
     #[serde(alias = "runtime_policy")]
     runtime_policy: Option<cairn_common::executor_protocol::ExecutorRuntimePolicy>,
     draining: Option<bool>,
+    /// What the machine is for: buildsOnly, general, or inferenceOnly. Runner
+    /// state like draining, so it is durable and unfenced.
+    role: Option<cairn_common::executor_protocol::MachineRole>,
     #[serde(alias = "desktop_automation")]
     desktop_automation: Option<bool>,
     /// Declare this machine repaired, re-arming every check its old environment
@@ -178,19 +181,20 @@ pub(super) async fn dispatch(
                     build_failure(
                         index,
                         item,
-                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, desktopAutomation, repaired, and expectedGeneration."),
+                        format!("invalid executor configuration: {error}. A patch accepts newName, runtimePolicy, draining, role (buildsOnly, general, or inferenceOnly), desktopAutomation, repaired, and expectedGeneration."),
                     )
                 })?;
             if request.new_name.is_none()
                 && request.runtime_policy.is_none()
                 && request.draining.is_none()
+                && request.role.is_none()
                 && request.desktop_automation.is_none()
                 && request.repaired.is_none()
             {
                 return Err(build_failure(
                     index,
                     item,
-                    "a patch changes newName, runtimePolicy, draining, desktopAutomation, or repaired; none was supplied",
+                    "a patch changes newName, runtimePolicy, draining, role, desktopAutomation, or repaired; none was supplied",
                 ));
             }
             // Resolve first, so an unknown machine is refused identically whether
@@ -230,6 +234,13 @@ pub(super) async fn dispatch(
                     } else {
                         "stop draining".to_string()
                     });
+                }
+                if let Some(role) = request.role {
+                    planned.push(format!(
+                        "make {name} {}, which {}",
+                        role.label(),
+                        role.describe_accepted()
+                    ));
                 }
                 if request.repaired == Some(true) {
                     planned.push(format!(
@@ -280,6 +291,11 @@ pub(super) async fn dispatch(
                 if let Some(draining) = request.draining {
                     let outcome = management::set_drain_mode(orch, name, draining)
                         .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                    applied.push(outcome.summary());
+                }
+                if let Some(role) = request.role {
+                    let outcome = management::set_machine_role(orch, name, role)
                         .map_err(|error| build_failure(index, item, error))?;
                     applied.push(outcome.summary());
                 }

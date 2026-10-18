@@ -11,6 +11,9 @@ use crate::fleet::{
 };
 use sha2::{Digest, Sha256};
 
+// A short-lived input, built once per check and read by reference to derive a
+// key; boxing the larger variant would buy an allocation and nothing else.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum CheckResourceIdentityInput {
     Configured { name: String, check: CheckCommand },
@@ -111,6 +114,21 @@ pub(crate) fn batch_placement_mobility(policy: &MutationPolicy) -> PlacementMobi
     }
 }
 
+/// The placement class a check batch of this priority is. One answer, read by
+/// the request this module builds and by every caller that asks placement's
+/// eligibility question before a request exists.
+pub(crate) fn check_placement_work_class(
+    priority: CellPriority,
+) -> crate::fleet::PlacementWorkClass {
+    use crate::fleet::PlacementWorkClass;
+    match priority {
+        CellPriority::ReviewCheck => PlacementWorkClass::ReviewChecks,
+        CellPriority::WriteCheck | CellPriority::AgentInteractive => {
+            PlacementWorkClass::WriteChecks
+        }
+    }
+}
+
 pub(crate) struct CheckBatchWire {
     pub(crate) request: CellRequest,
     pub(crate) items: Vec<PureVerdictBatchItem>,
@@ -145,12 +163,7 @@ pub(crate) fn build_check_batch_wire(
         },
         base_commit: batch.sealed_commit.clone(),
         command_class: batch_command_class(&batch.items),
-        placement_work_class: match batch.priority {
-            CellPriority::ReviewCheck => PlacementWorkClass::ReviewChecks,
-            CellPriority::WriteCheck | CellPriority::AgentInteractive => {
-                PlacementWorkClass::WriteChecks
-            }
-        },
+        placement_work_class: check_placement_work_class(batch.priority),
         command,
         owner: Some(batch.owner.clone()),
         cwd: String::new(),

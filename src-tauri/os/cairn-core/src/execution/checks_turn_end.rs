@@ -1075,6 +1075,7 @@ async fn run_turn_end_checks_inner(
                     commit_sha: &cache_commit,
                     repository: &coords.repository_path,
                     mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
+                    work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
                 },
                 &plans
                     .iter()
@@ -1266,6 +1267,7 @@ async fn run_turn_end_checks_inner(
             commit_sha: &sealed_commit,
             repository: &coords.repository_path,
             mutation_policy: crate::fleet::MutationPolicy::PureVerdict,
+            work_class: crate::fleet::PlacementWorkClass::ReviewChecks,
         },
         &to_run
             .iter()

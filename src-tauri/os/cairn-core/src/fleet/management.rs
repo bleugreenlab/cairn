@@ -650,20 +650,37 @@ pub fn public_name(orch: &Orchestrator, executor_id: &str) -> String {
 /// an omitted field means "derive it" while a blank one is a value the runner
 /// rejects — which is why every optional field is an `Option<String>` rather
 /// than a defaulted `String`.
+///
+/// Unknown keys are refused rather than dropped: a misspelled `role` would
+/// otherwise enroll an inference-only machine as general, which is the one
+/// mistake that lets batch work crush it.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EnrollmentRequest {
     pub host: String,
+    // The snake_case aliases are the ones the `cairn://executors` contract
+    // advertises; refusing unknown keys makes honouring them load-bearing.
+    #[serde(alias = "ssh_user")]
     pub ssh_user: String,
+    #[serde(alias = "binary_path")]
     pub binary_path: Option<String>,
+    #[serde(alias = "cairn_home")]
     pub cairn_home: Option<String>,
+    #[serde(alias = "executor_id")]
     pub executor_id: Option<String>,
+    #[serde(alias = "device_id")]
     pub device_id: Option<String>,
+    #[serde(alias = "display_name")]
     pub display_name: Option<String>,
     /// Project keys this machine serves. Omitted or empty means every project;
     /// a nonempty list restricts it to exactly those.
+    #[serde(alias = "project_keys")]
     pub project_keys: Option<Vec<String>>,
+    #[serde(alias = "extra_ssh_args")]
     pub extra_ssh_args: Option<Vec<String>>,
+    /// What the machine is for. Omitted means general for a new machine and
+    /// the role it already holds for one being enrolled again.
+    pub role: Option<crate::fleet::MachineRole>,
 }
 
 /// What starting an enrollment answers with, immediately.
@@ -706,6 +723,7 @@ pub fn declaration_defaults(
             project_ids: existing.project_ids.clone(),
             legacy_tunnel_port: None,
             extra_ssh_args: existing.extra_ssh_args.clone(),
+            role: configured.machine_role(&existing.executor_id),
         });
     }
     Ok(RemoteExecutorDeclaration {
@@ -719,6 +737,7 @@ pub fn declaration_defaults(
         project_ids: Vec::new(),
         legacy_tunnel_port: None,
         extra_ssh_args: Vec::new(),
+        role: crate::fleet::MachineRole::General,
     })
 }
 
@@ -801,6 +820,7 @@ pub async fn build_declaration(
         project_ids,
         legacy_tunnel_port: None,
         extra_ssh_args: request.extra_ssh_args.unwrap_or(defaults.extra_ssh_args),
+        role: request.role.unwrap_or(defaults.role),
     })
 }
 
@@ -1225,6 +1245,84 @@ impl DrainOutcome {
     }
 }
 
+/// Set what a machine is for, so an operator can change its purpose without
+/// enrolling it again.
+///
+/// Durable and unfenced, like a drain: the role is this runner's own placement
+/// rule rather than a setting on the machine, so it needs no live link and the
+/// machine is not told. The settings write comes first and the fleet's cache is
+/// re-adopted from what was written, so placement never enforces a role the
+/// settings file does not hold. A failed write changes nothing.
+pub fn set_machine_role(
+    orch: &Orchestrator,
+    reference: &str,
+    role: crate::fleet::MachineRole,
+) -> Result<RoleOutcome, String> {
+    let executor_id = resolve_executor_reference(orch, reference)?;
+    mutate_fleet(orch, |config| {
+        config.set_machine_role(&executor_id, role);
+        Ok(())
+    })?;
+    Ok(RoleOutcome {
+        name: public_name(orch, &executor_id),
+        role,
+    })
+}
+
+/// Change the fleet settings as one serialized step: read the current block,
+/// apply `mutate`, write it, and have placement adopt the roles it now holds
+/// before any other fleet write can run.
+///
+/// Every write that can change a machine's role goes through here, never
+/// through a snapshot read earlier and written back: a snapshot taken before
+/// an operator's role change would restore the old role on disk and in
+/// placement. Other fleet writes use `settings::set_fleet`, which keeps the
+/// roles on disk, so they cannot change a role at all.
+pub fn mutate_fleet<T>(
+    orch: &Orchestrator,
+    mutate: impl FnOnce(&mut FleetConfig) -> Result<T, String>,
+) -> Result<T, String> {
+    crate::config::settings::mutate_fleet(&orch.config_dir, mutate, |config| {
+        orch.fleet.hydrate_machine_roles(config.role_executor_ids())
+    })
+}
+
+/// What a role write recorded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoleOutcome {
+    pub name: String,
+    pub role: crate::fleet::MachineRole,
+}
+
+impl RoleOutcome {
+    /// One sentence naming the role and what it now refuses, computed from the
+    /// role's own derivation rather than written out here.
+    pub fn summary(&self) -> String {
+        let refused = self.role.refused_classes();
+        if refused.is_empty() {
+            format!(
+                "{} is now {}: it {}.",
+                self.name,
+                self.role.label(),
+                self.role.describe_accepted()
+            )
+        } else {
+            let names: Vec<&str> = refused.iter().map(|class| class.as_str()).collect();
+            let list = match names.split_last() {
+                Some((last, [])) => (*last).to_string(),
+                Some((last, rest)) => format!("{} or {last}", rest.join(", ")),
+                None => String::new(),
+            };
+            format!(
+                "{} is now {}: it will not be offered {list}; work already holding a residency there may finish.",
+                self.name,
+                self.role.label()
+            )
+        }
+    }
+}
+
 /// Refuse a fenced control whose generation is not the one that is live.
 pub fn ensure_current_generation(
     orch: &Orchestrator,
@@ -1380,6 +1478,122 @@ mod tests {
                 .is_machine_drained(crate::fleet::COLOCATED_EXECUTOR_ID),
             "clearing has to reach disk too, or a cleared machine comes back drained"
         );
+    }
+
+    /// A role patch reaches disk and the live entry together, and reads back
+    /// the same through the config a restart would load.
+    #[tokio::test]
+    async fn a_role_is_persisted_and_adopted_from_what_was_persisted() {
+        let temp = tempfile::tempdir().unwrap();
+        let orch = test_orchestrator(temp.path()).await;
+        let (sender, _executor) = tokio::sync::mpsc::unbounded_channel();
+        orch.fleet.attach_executor(sender);
+
+        let outcome = set_machine_role(
+            &orch,
+            crate::fleet::LOCAL_EXECUTOR_NAME,
+            crate::fleet::MachineRole::InferenceOnly,
+        )
+        .expect("a role resolves and records");
+        assert_eq!(
+            outcome.summary(),
+            "local is now inference only: it will not be offered reviewChecks, writeChecks, agentSessions, devInstances or services; work already holding a residency there may finish."
+        );
+        let reloaded = crate::config::settings::load_fleet(&orch.config_dir);
+        assert_eq!(
+            reloaded.machine_role(crate::fleet::COLOCATED_EXECUTOR_ID),
+            crate::fleet::MachineRole::InferenceOnly,
+            "the role has to be on disk, or the next runner does not know about it"
+        );
+        assert_eq!(
+            orch.fleet.machine_role(crate::fleet::COLOCATED_EXECUTOR_ID),
+            crate::fleet::MachineRole::InferenceOnly
+        );
+        assert!(
+            orch.fleet
+                .live_machine_role_for_test(crate::fleet::COLOCATED_EXECUTOR_ID)
+                == Some(crate::fleet::MachineRole::InferenceOnly),
+            "the attached entry placement reads is restamped"
+        );
+
+        let cleared = set_machine_role(
+            &orch,
+            crate::fleet::LOCAL_EXECUTOR_NAME,
+            crate::fleet::MachineRole::General,
+        )
+        .unwrap();
+        assert_eq!(
+            cleared.summary(),
+            "local is now general: it accepts every batch class."
+        );
+        assert!(crate::config::settings::load_fleet(&orch.config_dir)
+            .machine_roles
+            .is_empty());
+        assert_eq!(
+            orch.fleet
+                .live_machine_role_for_test(crate::fleet::COLOCATED_EXECUTOR_ID),
+            Some(crate::fleet::MachineRole::General)
+        );
+    }
+
+    /// A misspelled key must not enroll a machine as something it is not.
+    #[test]
+    fn an_enrollment_request_refuses_unknown_keys_and_names_bad_roles() {
+        let typo = serde_json::from_value::<EnrollmentRequest>(serde_json::json!({
+            "host": "sp1.local", "sshUser": "dev", "rol": "inferenceOnly"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(typo.contains("rol"), "{typo}");
+        let bad = serde_json::from_value::<EnrollmentRequest>(serde_json::json!({
+            "host": "sp1.local", "sshUser": "dev", "role": "gpu"
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            bad.contains("buildsOnly") && bad.contains("general") && bad.contains("inferenceOnly"),
+            "{bad}"
+        );
+        let good = serde_json::from_value::<EnrollmentRequest>(serde_json::json!({
+            "host": "sp1.local", "sshUser": "dev", "role": "inferenceOnly"
+        }))
+        .unwrap();
+        assert_eq!(good.role, Some(crate::fleet::MachineRole::InferenceOnly));
+        let aliased = serde_json::from_value::<EnrollmentRequest>(serde_json::json!({
+            "host": "sp1.local", "ssh_user": "dev", "project_keys": ["CAIRN"]
+        }))
+        .expect("the snake_case aliases the contract advertises decode");
+        assert_eq!(aliased.project_keys, Some(vec!["CAIRN".to_string()]));
+    }
+
+    /// Enrolling a machine again keeps the role it holds unless the request
+    /// names another.
+    #[test]
+    fn a_repeated_enrollment_keeps_the_stored_role() {
+        let first = declaration_defaults(&request("sp1.local"), &FleetConfig::default()).unwrap();
+        assert_eq!(first.role, crate::fleet::MachineRole::General);
+        let mut configured = FleetConfig::default();
+        configured.remote_executors.insert(
+            first.executor_id.clone(),
+            RemoteExecutorConfig {
+                host: first.host.clone(),
+                ssh_user: first.ssh_user.clone(),
+                platform: super::super::RemotePlatform::LinuxArm64,
+                binary_path: "/home/dev/.local/bin/cairn-exec".into(),
+                cairn_home: "/home/dev/.cairn-exec".into(),
+                executor_id: first.executor_id.clone(),
+                device_id: first.device_id.clone(),
+                display_name: first.display_name.clone(),
+                project_ids: Vec::new(),
+                bootstrapped_at_unix_ms: None,
+                legacy_retired_at_unix_ms: None,
+                legacy_tunnel_port: None,
+                extra_ssh_args: Vec::new(),
+            },
+        );
+        configured.set_machine_role(&first.executor_id, crate::fleet::MachineRole::InferenceOnly);
+        let repeated = declaration_defaults(&request("sp1.local"), &configured).unwrap();
+        assert_eq!(repeated.role, crate::fleet::MachineRole::InferenceOnly);
     }
 
     fn request(host: &str) -> EnrollmentRequest {
