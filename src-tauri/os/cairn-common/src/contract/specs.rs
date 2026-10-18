@@ -288,7 +288,7 @@ pub(crate) const PR_METHOD: KeySpec = KeySpec::new(
 pub(crate) const NODE_ACTION: KeySpec = KeySpec::new(
     "action",
     KeyType::Str,
-    "stop|merge|close|refresh|publish — stop interrupts the node's active turn and parks the session warm (resumable, not a kill; cascades to child runs); merge|close|refresh|publish operate on the PR a `pr` action node produced (mutually exclusive with confirmed)",
+    "stop|retry|merge|close|refresh|publish — retry starts a fresh publication attempt cycle on a failed `pr` action node only (published nodes use refresh); stop interrupts the node's active turn and parks the session warm (resumable, not a kill; cascades to child runs); merge|close|refresh|publish operate on the PR a `pr` action node produced (mutually exclusive with confirmed)",
 );
 /// Dedicated to the attachment member, and deliberately not shared: no sibling
 /// contract can copy a durable object into a cell.

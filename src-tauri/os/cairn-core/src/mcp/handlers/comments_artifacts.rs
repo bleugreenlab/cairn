@@ -879,6 +879,22 @@ pub(crate) async fn write_artifact_change(
         log::warn!("recompute_job after artifact write failed for {job_id}: {e}");
     }
 
+    // A revised terminal handoff can unblock a failed PR publication even when
+    // the producing job was already Complete, so no status transition occurred.
+    // Living documents never advance the DAG. Both create and patch are inputs.
+    if !contract.is_ctx_self {
+        let job = crate::jobs::queries::get_job(&db, &job_id)
+            .await
+            .map_err(|error| format!("Failed to load artifact producer: {error}"))?;
+        if let (Some(execution_id), Some(_)) =
+            (job.execution_id.as_deref(), job.recipe_node_id.as_deref())
+        {
+            crate::workflow_host::runtime(orch)
+                .enqueue_advance(execution_id)
+                .await?;
+        }
+    }
+
     if should_arm_terminal_interrupt {
         arm_terminal_interrupt_for_job(orch, &job_id);
     }

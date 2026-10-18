@@ -161,6 +161,9 @@ pub async fn execute_effects(
                     node_id,
                     ctx,
                 } => {
+                    if !crate::pr_publish_attempts::claim_dispatch(runtime, &action_run_id).await? {
+                        continue;
+                    }
                     if let Some(result) = runtime
                         .host
                         .execute(Workload::Action {

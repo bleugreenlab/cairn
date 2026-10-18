@@ -368,6 +368,7 @@ const COPY_ORDER: &[TableCopySpec] = &[
     spec("merge_requests", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     delete_only("merge_attempt_events", "project_id = ?1 OR merge_request_id IN (SELECT id FROM merge_requests WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("action_runs", "project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1) OR parent_job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
+    spec("pr_publish_attempts", "action_run_id IN (SELECT id FROM action_runs WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1) OR execution_id IN (SELECT id FROM executions WHERE project_id = ?1) OR parent_job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
     spec("pr_node_port_fires", "execution_id IN (SELECT id FROM executions WHERE project_id = ?1 OR issue_id IN (SELECT id FROM issues WHERE project_id = ?1))"),
     spec("wake_subscriptions", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1)"),
     spec("suppressed_wakes", "job_id IN (SELECT id FROM jobs WHERE project_id = ?1) OR subscription_id IN (SELECT id FROM wake_subscriptions WHERE job_id IN (SELECT id FROM jobs WHERE project_id = ?1))"),
@@ -689,16 +690,19 @@ async fn live_process_job(
 }
 
 /// Executions with undelivered DAG advancement queued in the effect outbox
-/// (`advance_dag` rows are keyed by execution id). Reported as [`BlockingJob`]s
+/// (`advance_dag` is keyed by execution; PR dispatch carries it in its payload).
+/// PR publication intents must drain before their journal can move. Reported as [`BlockingJob`]s
 /// with the synthetic [`ADVANCING_STATUS`] so the surfaced list names them.
 async fn advancing_executions(db: &LocalDb, project_id: &str) -> Result<Vec<BlockingJob>, DbError> {
     let project_id = project_id.to_string();
     db.query_all(
-        "SELECT DISTINCT eo.dedupe_key, i.number
+        "SELECT DISTINCT e.id, i.number
          FROM effect_outbox eo
-         JOIN executions e ON e.id = eo.dedupe_key
+         JOIN executions e ON e.id = CASE eo.kind
+             WHEN 'advance_dag' THEN eo.dedupe_key
+             WHEN 'pr_publish' THEN json_extract(eo.payload_json, '$.execution_id') END
          LEFT JOIN issues i ON i.id = e.issue_id
-         WHERE eo.kind = 'advance_dag'
+         WHERE eo.kind IN ('advance_dag', 'pr_publish')
            AND eo.state IN ('pending', 'running')
            AND (e.project_id = ?1
                 OR e.issue_id IN (SELECT id FROM issues WHERE project_id = ?1))",
@@ -2932,6 +2936,27 @@ mod tests {
             .await
             .unwrap();
         assert!(blocking.is_empty(), "got {blocking:?}");
+    }
+
+    #[tokio::test]
+    async fn gate_blocks_on_pr_publish_until_settled() {
+        let db = gate_db().await;
+        insert_issue(&db, "iss", 3, "active").await;
+        insert_execution(&db, "exec", "iss").await;
+        db.execute("INSERT INTO effect_outbox(id,kind,dedupe_key,payload_json,state,created_at,updated_at) VALUES('pr-intent','pr_publish','attempt','{\"execution_id\":\"exec\"}','pending',1,1)",()).await.unwrap();
+        let blocking = blocking_work(&db, "proj", &HashSet::new()).await.unwrap();
+        assert_eq!(blocking.len(), 1);
+        assert_eq!(blocking[0].id, "exec");
+        db.execute(
+            "UPDATE effect_outbox SET state='done' WHERE id='pr-intent'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert!(blocking_work(&db, "proj", &HashSet::new())
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

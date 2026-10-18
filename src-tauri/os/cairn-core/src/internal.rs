@@ -35,6 +35,14 @@
 //! purely internal to `cairn-core` (their submodules are private, with no host
 //! caller) are intentionally omitted.
 
+/// Build the real host adapter for integration tests of workflow reduction.
+#[cfg(feature = "test-utils")]
+pub fn workflow_runtime(
+    orch: &crate::orchestrator::Orchestrator,
+) -> cairn_workflow::runtime::WorkflowRuntime {
+    crate::workflow_host::runtime(orch)
+}
+
 pub mod account {
     pub use crate::account::*;
 }

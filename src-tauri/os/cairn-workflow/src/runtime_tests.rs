@@ -45,6 +45,13 @@ impl WorkflowHost for Host {
     fn job_head(&self, _: &str) -> Result<String, String> {
         Ok(self.head.lock().unwrap().clone())
     }
+    fn pr_publish_input_revision(&self, _: &str) -> Result<Option<String>, String> {
+        let head = self.head.lock().unwrap().clone();
+        if head == "revision-unavailable" {
+            return Err("revision lookup failed".into());
+        }
+        Ok(Some(head))
+    }
     async fn decide(&self, request: DecisionRequest) -> Result<Decision, String> {
         let answer = self
             .condition_answer
@@ -170,9 +177,19 @@ fn edge(from: &str, port: &str, to: &str) -> serde_json::Value {
     serde_json::json!({"id": format!("{from}-{to}"), "edgeType": "control", "sourceNodeId": from, "sourceHandle": port, "targetNodeId": to, "targetHandle": "control-in"})
 }
 async fn seed(db: &LocalDb, nodes: Vec<serde_json::Value>, edges: Vec<serde_json::Value>) {
-    db.execute_script("INSERT INTO teams(id,name,created_at,updated_at) VALUES('team','Team',1,1);
-        INSERT INTO projects(id,team_id,name,key,repo_path,created_at,updated_at) VALUES('p','team','P','proj','/tmp/workflow',1,1);
-        INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('issue','p',1,'Issue','active','active','none',1,1);").await.unwrap();
+    use storage::RowExt;
+    let columns = db
+        .query_all("PRAGMA table_info(projects)", (), |row| row.text(1))
+        .await
+        .unwrap();
+    if columns.iter().any(|column| column == "team_id") {
+        db.execute_script("INSERT INTO teams(id,name,created_at,updated_at) VALUES('team','Team',1,1);
+            INSERT INTO projects(id,team_id,name,key,repo_path,created_at,updated_at) VALUES('p','team','P','proj','/tmp/workflow',1,1);").await.unwrap();
+    } else {
+        db.execute_script("INSERT INTO workspaces(id,name,created_at,updated_at) VALUES('workspace','Workspace',1,1);
+            INSERT INTO projects(id,workspace_id,name,key,repo_path,created_at,updated_at) VALUES('p','workspace','P','proj','/tmp/workflow',1,1);").await.unwrap();
+    }
+    db.execute_script("INSERT INTO issues(id,project_id,number,title,status,progress,attention,created_at,updated_at) VALUES('issue','p',1,'Issue','active','active','none',1,1);").await.unwrap();
     let snapshot = serde_json::json!({"recipe": {"id":"recipe", "name":"Recipe", "description":null, "trigger":"manual", "nodes":nodes, "edges":edges}, "agents":{}, "skills":{}, "triggerContext":{"issueId":"issue","projectId":"p","triggerType":"manual"}, "delegatedPackets":[], "createdAt":1});
     db.execute("INSERT INTO executions(id,recipe_id,issue_id,project_id,status,started_at,seq,snapshot) VALUES('exec','recipe','issue','p','running',1,1,?1)", (snapshot.to_string(),)).await.unwrap();
 }
@@ -925,4 +942,400 @@ async fn checkpoint_retry_requires_new_head_and_keeps_attempt_history() {
         2
     );
     assert_eq!(count(&host.owning,"SELECT COUNT(*) FROM checkpoint_runs WHERE attempt = 2 AND passed = 1 AND commit_sha = 'head-two'").await,1);
+}
+
+async fn pr_fixture(team: bool) -> (WorkflowRuntime, Arc<Host>, tempfile::TempDir, String) {
+    let (runtime, host, dir) = fixture(team).await;
+    let mut pr = node("pr", "pr");
+    pr["actionConfig"] = serde_json::json!({});
+    seed(
+        &host.owning,
+        vec![node("trigger", "trigger"), pr],
+        vec![edge("trigger", "control-out", "pr")],
+    )
+    .await;
+    let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").unwrap();
+    let id = effects
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEffect::ExecuteAction { action_run_id, .. } => Some(action_run_id.clone()),
+            _ => None,
+        })
+        .expect("first PR dispatch");
+    (runtime, host, dir, id)
+}
+
+#[tokio::test]
+async fn reduce_dag_dispatches_a_rearmed_pr_action_once() {
+    for team in [false, true] {
+        let (runtime, host, _dir, id) = pr_fixture(team).await;
+        advancement::mark_action_run_failed(&runtime, &id, "push rejected").unwrap();
+        *host.head.lock().unwrap() = "new-revision".into();
+        let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").unwrap();
+        let actions: Vec<_> = effects
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEffect::ExecuteAction { action_run_id, .. } => Some(action_run_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actions, vec![&id]);
+        let attempts = pr_publish_attempts::list_publish_attempts(&host.owning, &id)
+            .await
+            .unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt, 2);
+        assert_eq!(attempts[1].detail.as_deref(), Some("push rejected"));
+        assert_eq!(attempts[1].outcome.as_deref(), Some("failed"));
+        assert!(effects::dag::reduce_dag(&runtime, "exec")
+            .unwrap()
+            .1
+            .iter()
+            .all(|e| !matches!(e, WorkflowEffect::ExecuteAction { .. })));
+        assert_eq!(
+            count(&host.owning, "SELECT COUNT(*) FROM action_runs").await,
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn pr_retry_unchanged_failure_stays_terminal_and_cap_stops_changed_inputs() {
+    let (runtime, host, _dir, id) = pr_fixture(false).await;
+    advancement::mark_action_run_failed(&runtime, &id, "permanent").unwrap();
+    for _ in 0..3 {
+        assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+            .unwrap()
+            .is_empty());
+    }
+    for number in 2..=5 {
+        *host.head.lock().unwrap() = format!("revision-{number}");
+        assert_eq!(
+            advancement::rearm_failed_pr_actions(&runtime, "exec")
+                .unwrap()
+                .len(),
+            1
+        );
+        advancement::mark_action_run_failed(&runtime, &id, "still rejected").unwrap();
+    }
+    *host.head.lock().unwrap() = "revision-6".into();
+    assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        pr_publish_attempts::publish_attempt_count(&host.owning, &id)
+            .await
+            .unwrap(),
+        5
+    );
+}
+
+#[tokio::test]
+async fn explicit_pr_retry_preserves_history_resets_cycle_and_persists_dispatch() {
+    let (runtime, host, _dir, id) = pr_fixture(true).await;
+    advancement::mark_action_run_failed(&runtime, &id, "timeout").unwrap();
+    pr_publish_attempts::retry_pr_publish(&runtime, &id)
+        .await
+        .unwrap();
+    let attempts = pr_publish_attempts::list_publish_attempts(&host.owning, &id)
+        .await
+        .unwrap();
+    assert_eq!((attempts[0].cycle, attempts[0].attempt), (2, 1));
+    assert_eq!(attempts[1].detail.as_deref(), Some("timeout"));
+    assert_eq!(attempts[0].input_revision, attempts[1].input_revision);
+    let intents = runtime
+        .private_db
+        .query_all(
+            "SELECT payload_json FROM effect_outbox WHERE kind='pr_publish' AND dedupe_key=?1",
+            (attempts[0].id.clone(),),
+            |r| {
+                use storage::RowExt;
+                r.text(0)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(intents.len(), 1);
+    let replay = pr_publish_attempts::replay_dispatch(&runtime, &intents[0], i64::MAX)
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay,Some(WorkflowEffect::ExecuteAction {action_run_id,..}) if action_run_id==id)
+    );
+    assert!(pr_publish_attempts::claim_dispatch(&runtime, &id)
+        .await
+        .unwrap());
+    assert!(!pr_publish_attempts::claim_dispatch(&runtime, &id)
+        .await
+        .unwrap());
+    // A startup replay can recover a claim left running by the previous host.
+    assert!(
+        pr_publish_attempts::replay_dispatch(&runtime, &intents[0], i64::MAX)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(pr_publish_attempts::claim_dispatch(&runtime, &id)
+        .await
+        .unwrap());
+    advancement::mark_action_run_failed(&runtime, &id, "failed again").unwrap();
+    assert!(
+        pr_publish_attempts::replay_dispatch(&runtime, &intents[0], i64::MAX)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn published_pr_and_generic_actions_are_never_rearmed() {
+    let (runtime, host, _dir, id) = pr_fixture(false).await;
+    host.owning
+        .execute(
+            "UPDATE action_runs SET status='blocked' WHERE id=?1",
+            (id.clone(),),
+        )
+        .await
+        .unwrap();
+    *host.head.lock().unwrap() = "changed".into();
+    assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+        .unwrap()
+        .is_empty());
+    assert!(
+        pr_publish_attempts::validate_pr_publish_retry(&runtime, &id)
+            .await
+            .unwrap_err()
+            .contains("refresh")
+    );
+    host.owning
+        .execute(
+            "UPDATE action_runs SET status='failed',action_config_id='builtin:shell' WHERE id=?1",
+            (id.clone(),),
+        )
+        .await
+        .unwrap();
+    assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+        .unwrap()
+        .is_empty());
+    assert!(pr_publish_attempts::retry_pr_publish(&runtime, &id)
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn pr_replay_does_not_steal_a_live_claim_and_discards_orphans() {
+    let (runtime, host, _dir, id) = pr_fixture(false).await;
+    let attempt = pr_publish_attempts::latest_publish_attempt(&host.owning, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    let payload = runtime
+        .private_db
+        .query_one(
+            "SELECT payload_json FROM effect_outbox WHERE dedupe_key=?1",
+            (attempt.id.clone(),),
+            |r| {
+                use storage::RowExt;
+                r.text(0)
+            },
+        )
+        .await
+        .unwrap();
+    assert!(pr_publish_attempts::claim_dispatch(&runtime, &id)
+        .await
+        .unwrap());
+    assert!(pr_publish_attempts::replay_dispatch(&runtime, &payload, 0)
+        .await
+        .unwrap()
+        .is_none());
+    let mut older_intent: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    older_intent["created_at_millis"] = serde_json::json!(0);
+    assert!(
+        pr_publish_attempts::replay_dispatch(&runtime, &older_intent.to_string(), 1)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        count(
+            &runtime.private_db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE kind='pr_publish' AND state='pending'"
+        )
+        .await,
+        1
+    );
+    let mut orphan: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    orphan["attempt_id"] = serde_json::json!("orphan");
+    effects::outbox::insert_pending_with_payload_async(
+        &runtime.private_db,
+        "pr_publish",
+        "orphan",
+        &orphan.to_string(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        pr_publish_attempts::replay_dispatch(&runtime, &orphan.to_string(), i64::MAX)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        count(
+            &runtime.private_db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE dedupe_key='orphan' AND state='done'"
+        )
+        .await,
+        1
+    );
+    advancement::mark_action_run_failed(&runtime, &id, "failure").unwrap();
+    assert_eq!(
+        count(
+            &runtime.private_db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE kind='pr_publish' AND state!='done'"
+        )
+        .await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn pr_retry_missing_baseline_snapshot_type_and_supersession_fail_closed() {
+    let (runtime, host, _dir, id) = pr_fixture(false).await;
+    advancement::mark_action_run_failed(&runtime, &id, "failure").unwrap();
+    host.owning
+        .execute(
+            "UPDATE pr_publish_attempts SET input_revision=NULL WHERE action_run_id=?1",
+            (id.clone(),),
+        )
+        .await
+        .unwrap();
+    *host.head.lock().unwrap() = "new".into();
+    assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+        .unwrap()
+        .is_empty());
+    // The SQL builtin marker alone must never authorize an ordinary action.
+    host.owning.execute_script("UPDATE executions SET snapshot=replace(snapshot,'\"nodeType\":\"pr\"','\"nodeType\":\"action\"') WHERE id='exec'").await.unwrap();
+    assert!(
+        pr_publish_attempts::validate_pr_publish_retry(&runtime, &id)
+            .await
+            .unwrap_err()
+            .contains("Only a PR")
+    );
+    host.owning.execute_script("UPDATE executions SET snapshot=replace(snapshot,'\"nodeType\":\"action\"','\"nodeType\":\"pr\"'),lifecycle='superseded' WHERE id='exec'").await.unwrap();
+    assert!(
+        pr_publish_attempts::validate_pr_publish_retry(&runtime, &id)
+            .await
+            .unwrap_err()
+            .contains("superseded")
+    );
+    assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_pr_rearm_claims_one_attempt() {
+    let (runtime, host, _dir, id) = pr_fixture(false).await;
+    advancement::mark_action_run_failed(&runtime, &id, "failure").unwrap();
+    *host.head.lock().unwrap() = "changed".into();
+    let first = runtime.clone();
+    let second = runtime.clone();
+    let a = std::thread::spawn(move || advancement::rearm_failed_pr_actions(&first, "exec"));
+    let b = std::thread::spawn(move || advancement::rearm_failed_pr_actions(&second, "exec"));
+    let results = (a.join().unwrap().unwrap(), b.join().unwrap().unwrap());
+    assert_eq!(results.0.len() + results.1.len(), 1);
+    assert_eq!(
+        pr_publish_attempts::list_publish_attempts(&host.owning, &id)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        count(
+            &runtime.private_db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE kind='pr_publish' AND state!='done'"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn initial_pr_revision_failure_keeps_a_durable_dispatch_and_unknown_baseline() {
+    let (runtime, host, _dir) = fixture(false).await;
+    *host.head.lock().unwrap() = "revision-unavailable".into();
+    let mut pr = node("pr", "pr");
+    pr["actionConfig"] = serde_json::json!({});
+    seed(
+        &host.owning,
+        vec![node("trigger", "trigger"), pr],
+        vec![edge("trigger", "control-out", "pr")],
+    )
+    .await;
+    let (_, effects) = effects::dag::reduce_dag(&runtime, "exec").unwrap();
+    let id = effects
+        .iter()
+        .find_map(|e| match e {
+            WorkflowEffect::ExecuteAction { action_run_id, .. } => Some(action_run_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let attempt = pr_publish_attempts::latest_publish_attempt(&host.owning, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(attempt.input_revision.is_none());
+    assert_eq!(
+        count(
+            &runtime.private_db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE kind='pr_publish' AND state='pending'"
+        )
+        .await,
+        1
+    );
+    assert!(pr_publish_attempts::claim_dispatch(&runtime, &id)
+        .await
+        .unwrap());
+    advancement::mark_action_run_failed(&runtime, &id, "failed before publication").unwrap();
+    *host.head.lock().unwrap() = "now-known".into();
+    assert!(advancement::rearm_failed_pr_actions(&runtime, "exec")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn initial_pr_insert_failure_acknowledges_unclaimed_intent() {
+    let (runtime, host, _dir) = fixture(false).await;
+    let mut pr = node("pr", "pr");
+    pr["actionConfig"] = serde_json::json!({});
+    seed(
+        &host.owning,
+        vec![node("trigger", "trigger"), pr],
+        vec![edge("trigger", "control-out", "pr")],
+    )
+    .await;
+    let node = advancement::load_nodes_from_execution(host.owning.clone(), "exec")
+        .unwrap()
+        .into_iter()
+        .find(|n| n.id == "pr")
+        .unwrap();
+    assert!(advancement::create_action_run(&runtime, "missing-execution", &node).is_err());
+    assert_eq!(
+        count(&host.owning, "SELECT COUNT(*) FROM action_runs").await,
+        0
+    );
+    assert_eq!(
+        count(&host.owning, "SELECT COUNT(*) FROM pr_publish_attempts").await,
+        0
+    );
+    assert_eq!(
+        count(
+            &runtime.private_db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE kind='pr_publish' AND state='done'"
+        )
+        .await,
+        1
+    );
 }

@@ -1,10 +1,12 @@
-//! Dispatch-level coverage for the PR action branch on the NodeArtifact patch
-//! arm: `change patch {action:"merge|close|refresh"}`. Verifies routing,
-//! the no-PR rejection, and action/confirmed mutual exclusion. Exercised in
-//! preview (dry-run) mode so no GitHub/git side effects run.
+//! PR action routing and failed-publication retry regressions. Preview requests
+//! cover publication operations; lifecycle fixtures inspect reducer effects
+//! against a local branch without executing GitHub publication.
 
 use crate::common;
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 
 use crate::common::orchestrator;
@@ -12,15 +14,73 @@ use cairn_core::internal::mcp::handlers::write::handle_write;
 use cairn_core::internal::mcp::types::McpCallbackRequest;
 use cairn_core::internal::orchestrator::Orchestrator;
 use cairn_core::internal::storage::LocalDb;
+use cairn_core::models::{
+    ExecutionSnapshot, RecipeNode, RecipeSnapshot, RecipeTrigger, TriggerContext, TriggerType,
+};
 use cairn_db::turso::params;
+use cairn_workflow::effects::{dag::reduce_dag, types::WorkflowEffect};
 use serde_json::json;
+
+fn pr_recipe_nodes() -> Vec<RecipeNode> {
+    serde_json::from_value(json!([
+        {
+            "id": "builder", "nodeType": "agent", "name": "builder",
+            "position": {"x": 0, "y": 0}, "agentConfig": {"agentConfigId": "builder"}
+        },
+        {
+            "id": "pr", "nodeType": "pr", "name": "pr",
+            "position": {"x": 200, "y": 0},
+            "actionConfig": {"inputSchema": {
+                "name": "create-pr",
+                "schema": {
+                    "type": "object", "required": ["title", "body"],
+                    "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+                    "additionalProperties": false
+                }
+            }}
+        }
+    ]))
+    .unwrap()
+}
+
+fn pr_snapshot(project_id: &str, issue_id: &str) -> String {
+    ExecutionSnapshot::new(
+        RecipeSnapshot {
+            id: "recipe".into(),
+            name: "PR retry".into(),
+            description: None,
+            trigger: RecipeTrigger::Manual,
+            nodes: pr_recipe_nodes(),
+            edges: serde_json::from_value(json!([
+                {"id": "control", "edgeType": "control", "sourceNodeId": "builder",
+                 "sourceHandle": "control-out", "targetNodeId": "pr", "targetHandle": "control-in"},
+                {"id": "context", "edgeType": "context", "sourceNodeId": "builder",
+                 "sourceHandle": "context-out", "targetNodeId": "pr", "targetHandle": "context-in"}
+            ]))
+            .unwrap(),
+        },
+        HashMap::new(),
+        HashMap::new(),
+        TriggerContext {
+            issue_id: Some(issue_id.into()),
+            project_id: project_id.into(),
+            trigger_type: TriggerType::Manual,
+            event_payload: None,
+            initiated_via: None,
+        },
+    )
+    .to_json()
+    .unwrap()
+}
 
 async fn insert_node(db: &LocalDb, project_id: &str, issue_id: &str) {
     let project_id = project_id.to_string();
     let issue_id = issue_id.to_string();
+    let snapshot = pr_snapshot(&project_id, &issue_id);
     db.write(|conn| {
         let project_id = project_id.clone();
         let issue_id = issue_id.clone();
+        let snapshot = snapshot.clone();
         Box::pin(async move {
             conn.execute(
                 "INSERT INTO issues (id, project_id, number, title, status, progress, attention, created_at, updated_at)
@@ -29,9 +89,9 @@ async fn insert_node(db: &LocalDb, project_id: &str, issue_id: &str) {
             )
             .await?;
             conn.execute(
-                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq)
-                 VALUES ('exec-1', 'recipe', ?1, ?2, 'running', 1, 1)",
-                params![issue_id.as_str(), project_id.as_str()],
+                "INSERT INTO executions(id, recipe_id, issue_id, project_id, status, started_at, seq, snapshot)
+                 VALUES ('exec-1', 'recipe', ?1, ?2, 'running', 1, 1, ?3)",
+                params![issue_id.as_str(), project_id.as_str(), snapshot.as_str()],
             )
             .await?;
             conn.execute(
@@ -237,4 +297,527 @@ async fn publish_action_dry_run_routes_to_publish_on_both_surfaces() {
         node.contains("Would publish the PR branch"),
         "expected publish dry-run summary on the pr node, got: {node}"
     );
+}
+
+/// The reducer's effects are inspected, never executed: these fixtures prove
+/// redispatch without publishing to GitHub or needing a remote repository.
+async fn reduce_pr(orch: &Orchestrator) -> Vec<String> {
+    let orch = orch.clone();
+    tokio::task::spawn_blocking(move || {
+        let (jobs, effects) =
+            reduce_dag(&cairn_core::internal::workflow_runtime(&orch), "exec-1").unwrap();
+        assert!(jobs.is_empty(), "the completed builder must not restart");
+        effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                WorkflowEffect::ExecuteAction {
+                    action_run_id,
+                    execution_id,
+                    node_id,
+                    ..
+                } => {
+                    assert_eq!(execution_id, "exec-1");
+                    assert_eq!(node_id, "pr");
+                    Some(action_run_id)
+                }
+                _ => None,
+            })
+            .collect()
+    })
+    .await
+    .unwrap()
+}
+
+async fn write_handoff(orch: &Orchestrator, mode: &str, version: i64) {
+    let result = common::change_resource(
+        orch,
+        json!([{
+            "target": "cairn://p/pra/1/1/builder/create-pr",
+            "mode": mode,
+            "payload": {"title": "Ready to publish", "body": format!("Handoff {version}")}
+        }]),
+    )
+    .await;
+    assert!(result.contains(&format!("version {version}")), "{result}");
+}
+
+async fn builder_status(db: &LocalDb) -> String {
+    db.query_text("SELECT status FROM jobs WHERE id = 'job-builder'", ())
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn attempt_count(db: &LocalDb) -> i64 {
+    common::query_i64(db, "SELECT COUNT(*) FROM pr_publish_attempts")
+        .await
+        .unwrap()
+}
+
+fn git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+struct RetryFixture {
+    temp: tempfile::TempDir,
+    db: Arc<LocalDb>,
+    orch: Orchestrator,
+    project_id: String,
+    issue_id: String,
+    workspace: std::path::PathBuf,
+    action_run_id: String,
+}
+
+impl RetryFixture {
+    async fn new() -> Self {
+        let (temp, db, project_id, issue_id) = pr_action_node_fixture().await;
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.name", "PR fixture"]);
+        git(&repo, &["config", "user.email", "fixture@example.test"]);
+        git(&repo, &["commit", "--allow-empty", "-q", "-m", "base"]);
+        let workspace = temp.path().join("builder-workspace");
+        common::provision_jj_workspace(&common::config_dir(&temp), &repo, &workspace, "feature");
+        db.execute(
+            "UPDATE projects SET repo_path = ?1 WHERE id = ?2",
+            params![repo.to_string_lossy().as_ref(), project_id.as_str()],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE jobs SET branch = 'feature', base_branch = 'main' WHERE id = 'job-builder'",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "INSERT INTO sessions (id, job_id, backend, status, sequence, created_at, updated_at)
+                    VALUES ('builder-session', 'job-builder', 'codex', 'open', 1, 1, 1)",
+            (),
+        )
+        .await
+        .unwrap();
+        db.execute("INSERT INTO turns (id, session_id, job_id, sequence, state, start_reason, created_at, ended_at, updated_at)
+                    VALUES ('builder-turn', 'builder-session', 'job-builder', 1, 'complete', 'initial', 1, 2, 2)", ()).await.unwrap();
+        let orch = orchestrator(&temp, db.clone());
+        write_handoff(&orch, "create", 1).await;
+        assert_eq!(builder_status(&db).await, "complete");
+        let ids = reduce_pr(&orch).await;
+        assert_eq!(ids.len(), 1, "first dispatch creates one PR action");
+        let action_run_id = ids[0].clone();
+        assert_eq!(
+            attempt_count(&db).await,
+            1,
+            "initial dispatch records its input revision"
+        );
+        assert!(
+            db.query_text(
+                "SELECT input_revision FROM pr_publish_attempts WHERE attempt = 1",
+                ()
+            )
+            .await
+            .unwrap()
+            .is_some(),
+            "real branch and artifact must resolve to a revision"
+        );
+        Self {
+            temp,
+            db,
+            orch,
+            project_id,
+            issue_id,
+            workspace,
+            action_run_id,
+        }
+    }
+
+    async fn fail(&self) {
+        let orch = self.orch.clone();
+        let id = self.action_run_id.clone();
+        tokio::task::spawn_blocking(move || {
+            cairn_workflow::advancement::mark_action_run_failed(
+                &cairn_core::internal::workflow_runtime(&orch),
+                &id,
+                "push lease rejected",
+            )
+            .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            self.db
+                .query_text(
+                    "SELECT outcome || ':' || detail FROM pr_publish_attempts WHERE attempt = 1",
+                    ()
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("failed:push lease rejected")
+        );
+    }
+
+    fn repair_head(&self) {
+        let jj = cairn_core::internal::jj::environment(
+            &self.orch.jj_binary_path,
+            &common::config_dir(&self.temp),
+        );
+        std::fs::write(self.workspace.join("repair.txt"), "repaired branch\n").unwrap();
+        cairn_core::internal::jj::seal(&jj, &self.workspace, "repair branch", None).unwrap();
+    }
+
+    async fn assert_identity_and_status(&self, status: &str) {
+        assert_eq!(
+            common::query_i64(&self.db, "SELECT COUNT(*) FROM action_runs")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            common::query_i64(&self.db, "SELECT COUNT(*) FROM executions")
+                .await
+                .unwrap(),
+            1
+        );
+        let identity = self
+            .db
+            .query_text(
+                "SELECT id || ':' || uri_segment || ':' || status FROM action_runs",
+                (),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity, format!("{}:pr:{status}", self.action_run_id));
+    }
+
+    async fn assert_retried_once(&self) {
+        // This assertion must fail if reduce_dag's PR rearm step is removed.
+        assert_eq!(
+            reduce_pr(&self.orch).await,
+            vec![self.action_run_id.clone()],
+            "a revised failed PR must redispatch its existing action_run"
+        );
+        self.assert_identity_and_status("pending").await;
+        assert_eq!(
+            self.db
+                .query_text("SELECT status FROM executions WHERE id = 'exec-1'", ())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("running")
+        );
+        assert_eq!(common::query_i64(&self.db,
+            "SELECT COUNT(*) FROM action_runs WHERE error_message IS NULL AND completed_at IS NULL"
+        ).await.unwrap(), 1);
+        assert_eq!(attempt_count(&self.db).await, 2);
+        assert_eq!(
+            common::query_i64(
+                &self.db,
+                "SELECT COUNT(DISTINCT input_revision) FROM pr_publish_attempts"
+            )
+            .await
+            .unwrap(),
+            2,
+            "the retried attempt journals the new revision"
+        );
+        assert_eq!(common::query_i64(&self.db,
+            "SELECT COUNT(*) FROM pr_publish_attempts WHERE attempt = 2 AND outcome IS NULL AND settled_at IS NULL"
+        ).await.unwrap(), 1);
+        assert!(
+            reduce_pr(&self.orch).await.is_empty(),
+            "pending attempt must not dispatch twice"
+        );
+        assert_eq!(attempt_count(&self.db).await, 2);
+    }
+}
+
+#[tokio::test]
+async fn failed_pr_action_retries_on_a_later_create_pr_handoff() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    fixture.repair_head();
+    write_handoff(&fixture.orch, "create", 2).await;
+    fixture.assert_retried_once().await;
+}
+
+/// The push-lease specimen: the branch already has the right tip; only the
+/// fresh artifact version changes after a failed publication.
+#[tokio::test]
+async fn failed_pr_action_retries_on_artifact_only_revision() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    write_handoff(&fixture.orch, "patch", 2).await;
+    fixture.assert_retried_once().await;
+}
+
+#[tokio::test]
+async fn failed_pr_action_retries_on_head_only_revision() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    fixture.repair_head();
+    fixture.assert_retried_once().await;
+}
+
+#[tokio::test]
+async fn unchanged_pr_failure_stays_terminal_and_does_not_loop() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    for _ in 0..3 {
+        assert!(reduce_pr(&fixture.orch).await.is_empty());
+        fixture.assert_identity_and_status("failed").await;
+        assert_eq!(attempt_count(&fixture.db).await, 1);
+    }
+}
+
+async fn publish_fixture(fixture: &RetryFixture) {
+    insert_merge_request(&fixture.db, &fixture.project_id, &fixture.issue_id).await;
+    cairn_core::internal::execution::actions::complete_action_run(
+        &fixture.orch,
+        &fixture.action_run_id,
+        &pr_recipe_nodes()[1],
+        Some(json!({"pr_url": "https://github.com/o/r/pull/7"})),
+    )
+    .await
+    .unwrap();
+    fixture.assert_identity_and_status("blocked").await;
+    assert_eq!(
+        fixture
+            .db
+            .query_text(
+                "SELECT outcome || ':' || detail FROM pr_publish_attempts WHERE attempt = 1",
+                ()
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("published:https://github.com/o/r/pull/7")
+    );
+}
+
+#[tokio::test]
+async fn published_pr_action_is_not_retried_by_a_later_handoff() {
+    let fixture = RetryFixture::new().await;
+    publish_fixture(&fixture).await;
+    fixture.repair_head();
+    // Seed the later authoritative version directly: a write against a bound
+    // remote PR also edits GitHub metadata, outside this redispatch fixture.
+    fixture.db.execute(
+        "INSERT INTO artifacts(id,job_id,artifact_type,schema_version,data,version,parent_version_id,output_name,confirmed,created_at,updated_at)
+         SELECT 'later-handoff',job_id,artifact_type,schema_version,'{\"title\":\"Revised\",\"body\":\"Later handoff\"}',2,id,output_name,1,3,3
+         FROM artifacts WHERE job_id='job-builder' AND artifact_type='create-pr' AND version=1",
+        (),
+    ).await.unwrap();
+    assert!(reduce_pr(&fixture.orch).await.is_empty());
+    fixture.assert_identity_and_status("blocked").await;
+    assert_eq!(attempt_count(&fixture.db).await, 1);
+    assert_eq!(
+        common::query_i64(&fixture.db, "SELECT COUNT(*) FROM merge_requests")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn retry_action_is_refused_on_a_published_pr_node() {
+    let fixture = RetryFixture::new().await;
+    publish_fixture(&fixture).await;
+    for preview in [true, false] {
+        let result = change_target(
+            &fixture.orch,
+            "cairn://p/pra/1/1/pr",
+            json!({"action": "retry"}),
+            preview,
+        )
+        .await;
+        assert!(
+            result.contains("refresh"),
+            "published retry must name refresh: {result}"
+        );
+        fixture.assert_identity_and_status("blocked").await;
+        assert_eq!(attempt_count(&fixture.db).await, 1);
+        assert!(reduce_pr(&fixture.orch).await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn terminal_artifact_write_enqueues_advance_dag_when_builder_already_complete() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    for (mode, version) in [("create", 2), ("patch", 3)] {
+        // Mark earlier notifications consumed, so this write must independently
+        // enqueue rather than borrowing an outbox entry from initial completion.
+        fixture
+            .db
+            .execute(
+                "UPDATE effect_outbox SET state = 'done' WHERE kind = 'advance_dag'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(builder_status(&fixture.db).await, "complete");
+        write_handoff(&fixture.orch, mode, version).await;
+        assert_eq!(builder_status(&fixture.db).await, "complete");
+        assert_eq!(common::query_i64(&fixture.db,
+            "SELECT COUNT(*) FROM effect_outbox WHERE kind = 'advance_dag' AND dedupe_key = 'exec-1' AND state = 'pending'"
+        ).await.unwrap(), 1, "{mode} must enqueue even without a builder status transition");
+    }
+}
+
+#[tokio::test]
+async fn failed_pr_action_renders_attempt_cause_and_revision_eligibility() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    let before = common::read_resource(&fixture.orch, "cairn://p/pra/1/1/pr").await;
+    for expected in [
+        "Publication attempts",
+        "failed",
+        "push lease rejected",
+        "waiting on a new Create-PR handoff",
+        "action:\"retry\"",
+    ] {
+        assert!(before.contains(expected), "missing {expected:?}: {before}");
+    }
+    write_handoff(&fixture.orch, "patch", 2).await;
+    let after = common::read_resource(&fixture.orch, "cairn://p/pra/1/1/pr").await;
+    assert!(after.contains("retry-eligible"), "{after}");
+    // Reading the explanation is not a retry and must not mutate the journal.
+    fixture.assert_identity_and_status("failed").await;
+    assert_eq!(attempt_count(&fixture.db).await, 1);
+}
+
+#[tokio::test]
+async fn failed_pr_action_explicit_retry_preserves_history_without_revision_change() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    let preview = change_target(
+        &fixture.orch,
+        "cairn://p/pra/1/1/pr",
+        json!({"action": "retry"}),
+        true,
+    )
+    .await;
+    assert!(preview.contains("Would retry PR publication"), "{preview}");
+    fixture.assert_identity_and_status("failed").await;
+    assert_eq!(attempt_count(&fixture.db).await, 1);
+
+    let result = change_target(
+        &fixture.orch,
+        "cairn://p/pra/1/1/pr",
+        json!({"action": "retry"}),
+        false,
+    )
+    .await;
+    assert!(result.contains("Queued PR publication retry"), "{result}");
+    fixture.assert_identity_and_status("pending").await;
+    assert_eq!(attempt_count(&fixture.db).await, 2);
+    assert_eq!(
+        common::query_i64(
+            &fixture.db,
+            "SELECT COUNT(DISTINCT input_revision) FROM pr_publish_attempts"
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(common::query_i64(&fixture.db,
+        "SELECT COUNT(*) FROM pr_publish_attempts WHERE cycle = 1 AND outcome = 'failed' AND detail = 'push lease rejected'").await.unwrap(), 1);
+    assert_eq!(common::query_i64(&fixture.db,
+        "SELECT COUNT(*) FROM pr_publish_attempts WHERE cycle = 2 AND attempt = 1 AND outcome IS NULL").await.unwrap(), 1);
+    let payload = fixture.db.query_text(
+        "SELECT payload_json FROM effect_outbox WHERE kind = 'pr_publish' AND dedupe_key = (SELECT id FROM pr_publish_attempts WHERE cycle = 2)", ()
+    ).await.unwrap().expect("manual retry must persist a dispatch intent");
+    let effect = cairn_workflow::pr_publish_attempts::replay_dispatch(
+        &cairn_core::internal::workflow_runtime(&fixture.orch),
+        &payload,
+        i64::MAX,
+    )
+    .await
+    .unwrap()
+    .expect("a later host boot must replay the queued retry without GitHub");
+    assert!(
+        matches!(effect, WorkflowEffect::ExecuteAction { action_run_id, .. }
+        if action_run_id == fixture.action_run_id)
+    );
+}
+
+#[tokio::test]
+async fn retry_action_is_refused_on_a_non_pr_action_node() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    fixture
+        .db
+        .execute(
+            "UPDATE action_runs SET action_config_id = 'builtin:shell'",
+            (),
+        )
+        .await
+        .unwrap();
+    for preview in [true, false] {
+        let result = change_target(
+            &fixture.orch,
+            "cairn://p/pra/1/1/pr",
+            json!({"action": "retry"}),
+            preview,
+        )
+        .await;
+        assert!(result.contains("Only a PR action node"), "{result}");
+        fixture.assert_identity_and_status("failed").await;
+        assert_eq!(attempt_count(&fixture.db).await, 1);
+    }
+}
+
+#[tokio::test]
+async fn legacy_failed_pr_action_requires_one_explicit_retry_to_establish_baseline() {
+    let fixture = RetryFixture::new().await;
+    fixture.fail().await;
+    // Represent a failed action persisted before the attempt journal existed.
+    fixture
+        .db
+        .execute("DELETE FROM pr_publish_attempts", ())
+        .await
+        .unwrap();
+    write_handoff(&fixture.orch, "patch", 2).await;
+    fixture.repair_head();
+    for _ in 0..3 {
+        assert!(reduce_pr(&fixture.orch).await.is_empty());
+        fixture.assert_identity_and_status("failed").await;
+        assert_eq!(attempt_count(&fixture.db).await, 0);
+    }
+    let rendered = common::read_resource(&fixture.orch, "cairn://p/pra/1/1/pr").await;
+    assert!(
+        rendered.contains("no attempt history from before publication journaling"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("Use action:\"retry\" once to establish a baseline."),
+        "{rendered}"
+    );
+    let result = change_target(
+        &fixture.orch,
+        "cairn://p/pra/1/1/pr",
+        json!({"action": "retry"}),
+        false,
+    )
+    .await;
+    assert!(result.contains("Queued PR publication retry"), "{result}");
+    fixture.assert_identity_and_status("pending").await;
+    assert_eq!(attempt_count(&fixture.db).await, 1);
+    assert_eq!(common::query_i64(&fixture.db,
+        "SELECT COUNT(*) FROM pr_publish_attempts WHERE cycle=1 AND attempt=1 AND input_revision IS NOT NULL").await.unwrap(), 1);
+    fixture.fail().await;
+    assert!(reduce_pr(&fixture.orch).await.is_empty());
+    write_handoff(&fixture.orch, "patch", 3).await;
+    fixture.assert_retried_once().await;
 }

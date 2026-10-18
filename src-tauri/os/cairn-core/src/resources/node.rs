@@ -1677,6 +1677,14 @@ async fn render_action_node(
     // The bare node URI is both the content address and the action target.
     let node_uri = build_node_uri(project_key, number, exec_seq, node_name);
 
+    match render_pr_publish_history(orch, &action_run.id, &node_uri).await {
+        Ok(Some(history)) => output.push_str(&history),
+        Ok(None) => {}
+        Err(error) => output.push_str(&format!(
+            "Publication attempt history unavailable: {error}\n\n"
+        )),
+    }
+
     // If this action_run owns a PR, append the live PR section (state / review /
     // mergeable / CI / file stats) plus a merge/close/refresh actions block
     // while the PR is open. Owner-generic: keyed on the action_run id, the same
@@ -1698,6 +1706,81 @@ async fn render_action_node(
     }
 
     output
+}
+
+async fn render_pr_publish_history(
+    orch: &crate::orchestrator::Orchestrator,
+    action_run_id: &str,
+    node_uri: &str,
+) -> Result<Option<String>, String> {
+    use crate::pr_data::publish_attempts::{
+        is_pr_publish_retry_eligible, list_publish_attempts, PR_PUBLISH_MAX_ATTEMPTS,
+    };
+
+    let action =
+        crate::execution::actions::get_action_run_for_orchestrator(orch, action_run_id).await?;
+    if action.action_config_id != "builtin:pr" {
+        return Ok(None);
+    }
+    let node =
+        crate::execution::actions::load_action_node(orch, action_run_id, &action.execution_id)
+            .await?;
+    if node.node_type != crate::models::RecipeNodeType::Pr {
+        return Ok(None);
+    }
+    let attempts = list_publish_attempts(orch, action_run_id).await?;
+    let mut output = String::from("## Publication attempts\n\n");
+    for attempt in &attempts {
+        output.push_str(&format!(
+            "- Cycle {}, attempt {}: {}. {}\n",
+            attempt.cycle,
+            attempt.attempt,
+            attempt.outcome.as_deref().unwrap_or("in flight"),
+            attempt
+                .detail
+                .as_deref()
+                .unwrap_or("No terminal cause recorded yet."),
+        ));
+    }
+    if attempts.is_empty() {
+        output.push_str("No publication attempt has been recorded for this node.\n");
+    }
+    if action.status == crate::models::ActionRunStatus::Failed {
+        if let Some(error) = &action.error_message {
+            output.push_str(&format!("\nLast publication error: {error}\n"));
+        }
+        let current = crate::execution::actions::pr_publish_input_revision(orch, &action).await?;
+        let last = attempts
+            .iter()
+            .max_by_key(|attempt| (attempt.cycle, attempt.attempt));
+        let last_revision = last.and_then(|attempt| attempt.input_revision.as_deref());
+        let count = last.map_or(0, |attempt| attempt.attempt);
+        let reason = if attempts.is_empty() {
+            "Automatic retry has no attempt history from before publication journaling. Use action:\"retry\" once to establish a baseline."
+        } else if count >= PR_PUBLISH_MAX_ATTEMPTS {
+            "The automatic retry limit has been reached."
+        } else if current.is_none() {
+            "Automatic retry is waiting for resolvable Create-PR artifact and implementation branch inputs."
+        } else if last_revision.is_none() {
+            "Automatic retry has no recorded input revision to compare against."
+        } else if is_pr_publish_retry_eligible(
+            current.as_deref(),
+            last_revision,
+            count,
+            PR_PUBLISH_MAX_ATTEMPTS,
+        ) {
+            "A new input revision is retry-eligible on the next workflow advance."
+        } else {
+            "Automatic retry is waiting on a new Create-PR handoff or a changed implementation branch head."
+        };
+        output.push_str(&format!(
+            "\n{reason} Explicit retry starts a fresh attempt cycle without requiring changed inputs.\n\nRetry this failed PR node in place: `write({{changes:[{{target:\"{node_uri}\",mode:\"patch\",payload:{{action:\"retry\"}}}}]}})`.\n",
+        ));
+    } else if action.status == crate::models::ActionRunStatus::Blocked {
+        output.push_str("\nPublication succeeded; use `action:\"refresh\"` to refresh the existing PR, not retry.\n");
+    }
+    output.push('\n');
+    Ok(Some(output))
 }
 
 /// Map each turn in the job's primary session to its `turns.sequence` so digest

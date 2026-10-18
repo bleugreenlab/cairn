@@ -63,6 +63,7 @@ pub trait WorkflowHost: Send + Sync {
     fn claimed_launch_job_ids(&self) -> HashSet<String>;
     fn resolve_coordinate(&self, repository: &Path, branch: &str) -> Result<String, String>;
     fn job_head(&self, job_id: &str) -> Result<String, String>;
+    fn pr_publish_input_revision(&self, action_run_id: &str) -> Result<Option<String>, String>;
     /// Answer a decision node's questions. A refused question is an answer,
     /// not an error; an error means nothing answered (no decision-capable
     /// offer, or the provider failed), and blocks the node with that text.

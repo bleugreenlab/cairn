@@ -10,8 +10,8 @@
 
 use crate::action_runs::queries::action_run_from_row;
 use crate::models::{
-    interpolate_template, ActionConfig, ActionNodeConfig, ActionRun, ActionRunStatus, Artifact,
-    ExecutionSnapshot, RecipeEdge, RecipeNode,
+    interpolate_template, ActionConfig, ActionNodeConfig, ActionRun, Artifact, ExecutionSnapshot,
+    RecipeEdge, RecipeNode,
 };
 use crate::orchestrator::Orchestrator;
 use crate::services::GitClient;
@@ -82,18 +82,29 @@ pub async fn complete_action_run(
     // Resolution therefore always comes from an explicit node/artifact patch by
     // the parent thread or operator.
     if node.node_type == crate::models::RecipeNodeType::Pr {
-        update_action_run_status(
-            &db,
-            action_run_id,
-            ActionRunStatus::Blocked,
-            output_json.as_deref(),
-            now,
-        )
-        .await?;
+        db.write(|conn| {
+            let id = action_run_id.to_owned();
+            let output = output_json.clone();
+            let detail = result.as_ref().and_then(|r| r.get("pr_url")).and_then(|v| v.as_str()).unwrap_or("PR published").to_owned();
+            Box::pin(async move {
+                conn.execute("UPDATE action_runs SET status='blocked',output=?2,error_message=NULL WHERE id=?1",
+                    params![id.as_str(),output.as_deref()]).await?;
+                cairn_workflow::pr_publish_attempts::settle_publish_attempt_conn(conn,&id,"published",&detail).await?;
+                Ok(())
+            })
+        }).await.map_err(|e|e.to_string())?;
         let _ = orch.services.emitter.emit(
             "db-change",
             serde_json::json!({"table": "action_runs", "action": "update"}),
         );
+        if let Err(error) = cairn_workflow::pr_publish_attempts::acknowledge_settled_dispatch(
+            &crate::workflow_host::runtime(orch),
+            action_run_id,
+        )
+        .await
+        {
+            log::warn!("Could not acknowledge settled PR dispatch: {error}");
+        }
         // Recompute execution + issue status so the open PR surfaces as
         // `NeedsApproval` immediately (the blocked action_run is non-terminal, so
         // the execution stays running and the issue moves to `waiting`). The
@@ -182,7 +193,7 @@ pub async fn execute_action_node(
 }
 
 /// Load an action_run from the database.
-async fn get_action_run_for_orchestrator(
+pub(crate) async fn get_action_run_for_orchestrator(
     orch: &Orchestrator,
     action_run_id: &str,
 ) -> Result<ActionRun, String> {
@@ -1325,6 +1336,46 @@ struct ImplementationContext {
     base_branch: Option<String>,
 }
 
+/// Authoritative publication revision: the producer's Create-PR artifact and
+/// the implementation branch/head. Missing coordinates never authorize retry.
+pub async fn pr_publish_input_revision(
+    orch: &Orchestrator,
+    action_run: &ActionRun,
+) -> Result<Option<String>, String> {
+    use sha2::{Digest, Sha256};
+    let Some(parent) = action_run.parent_job_id.as_deref() else {
+        return Ok(None);
+    };
+    let db = crate::execution::routing::owning_db_for_action_run(&orch.db, &action_run.id).await?;
+    let artifact = db.query_all(
+        "SELECT id, version FROM artifacts WHERE job_id = ?1 AND artifact_type = 'create-pr' ORDER BY version DESC, updated_at DESC, id DESC LIMIT 1",
+        (parent.to_owned(),),
+        |row| Ok((row.text(0)?, row.i64(1)?)),
+    ).await.map_err(|e| e.to_string())?.into_iter().next();
+    let Some((artifact_id, version)) = artifact else {
+        return Ok(None);
+    };
+    let Ok(implementation) = find_implementation_context(orch, action_run).await else {
+        return Ok(None);
+    };
+    let Ok(head) = crate::execution::cache::get_job_logical_head_sha(orch, &implementation.job_id)
+    else {
+        return Ok(None);
+    };
+    if head.is_empty() || implementation.branch.is_empty() {
+        return Ok(None);
+    }
+    let input = serde_json::json!({
+        "artifact": {"id": artifact_id, "version": version},
+        "branch": implementation.branch,
+        "head": head,
+    });
+    Ok(Some(format!(
+        "{:x}",
+        Sha256::digest(input.to_string().as_bytes())
+    )))
+}
+
 /// Find the implementation job's durable branch coordinate via context edges.
 async fn find_implementation_context(
     orch: &Orchestrator,
@@ -1454,58 +1505,6 @@ async fn get_action_config(db: &LocalDb, config_id: &str) -> Result<ActionConfig
     })
     .await
     .map_err(|e| format!("Action config not found: {}", e))
-}
-
-/// Set an action_run's status, persisting its output and stamping `completed_at`
-/// only for terminal states (`Complete`/`Failed`). `Blocked` is non-terminal — it
-/// records output but leaves `completed_at` NULL, since the run is still open.
-async fn update_action_run_status(
-    db: &LocalDb,
-    action_run_id: &str,
-    status: ActionRunStatus,
-    output_json: Option<&str>,
-    now: i32,
-) -> Result<(), String> {
-    let action_run_id = action_run_id.to_string();
-    let status_str = status.to_string();
-    let terminal = matches!(status, ActionRunStatus::Complete | ActionRunStatus::Failed);
-    let output_json = output_json.map(ToOwned::to_owned);
-    db.write(|conn| {
-        let action_run_id = action_run_id.clone();
-        let status_str = status_str.clone();
-        let output_json = output_json.clone();
-        Box::pin(async move {
-            if terminal {
-                conn.execute(
-                    "UPDATE action_runs
-                     SET status = ?1, output = ?2, completed_at = ?3
-                     WHERE id = ?4",
-                    params![
-                        status_str.as_str(),
-                        output_json.as_deref(),
-                        now,
-                        action_run_id.as_str()
-                    ],
-                )
-                .await?;
-            } else {
-                conn.execute(
-                    "UPDATE action_runs
-                     SET status = ?1, output = ?2
-                     WHERE id = ?3",
-                    params![
-                        status_str.as_str(),
-                        output_json.as_deref(),
-                        action_run_id.as_str()
-                    ],
-                )
-                .await?;
-            }
-            Ok(())
-        })
-    })
-    .await
-    .map_err(|e| format!("Failed to update action_run status: {e}"))
 }
 
 async fn update_action_run_complete(
@@ -2921,7 +2920,7 @@ mod tests {
             action_config_id: String::new(),
             issue_id: Some("i-7".to_string()),
             project_id: "p-1".to_string(),
-            status: ActionRunStatus::Running,
+            status: crate::models::ActionRunStatus::Running,
             inputs: None,
             output: None,
             error_message: None,

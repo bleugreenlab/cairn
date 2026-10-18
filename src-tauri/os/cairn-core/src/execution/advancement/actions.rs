@@ -71,3 +71,43 @@ pub async fn reevaluable_condition(
     )
     .await
 }
+
+pub fn rearm_failed_pr_actions(
+    orch: &Orchestrator,
+    execution_id: &str,
+) -> Result<Vec<cairn_workflow::pr_publish_attempts::RearmedPrAction>, String> {
+    cairn_workflow::advancement::rearm_failed_pr_actions(
+        &crate::workflow_host::runtime(orch),
+        execution_id,
+    )
+}
+pub async fn validate_pr_publish_retry(
+    orch: &Orchestrator,
+    action_run_id: &str,
+) -> Result<(), String> {
+    cairn_workflow::advancement::validate_pr_publish_retry(
+        &crate::workflow_host::runtime(orch),
+        action_run_id,
+    )
+    .await
+}
+pub async fn retry_pr_publish(orch: &Orchestrator, action_run_id: &str) -> Result<(), String> {
+    cairn_workflow::advancement::retry_pr_publish(
+        &crate::workflow_host::runtime(orch),
+        action_run_id,
+    )
+    .await
+}
+
+/// Recover a persisted PR dispatch after host restart.
+pub async fn replay_pr_publish(
+    orch: &Orchestrator,
+    payload: &str,
+) -> Result<Option<crate::effects::types::WorkflowEffect>, String> {
+    cairn_workflow::pr_publish_attempts::replay_dispatch(
+        &crate::workflow_host::runtime(orch),
+        payload,
+        orch.boot_at.saturating_mul(1000),
+    )
+    .await
+}

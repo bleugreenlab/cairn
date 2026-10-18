@@ -1,4 +1,4 @@
-//! Bare-node patch (stop/merge/close/refresh) dispatch, relocated from dispatch.rs.
+//! Bare-node patch dispatch for session control and PR publication/resolution.
 
 use super::super::{build_failure, payload_str, ResourceMutationResult};
 use crate::mcp::types::{ChangeItem, ChangeMode, McpCallbackRequest};
@@ -55,7 +55,7 @@ pub(super) async fn dispatch(
                 build_failure(
                     index,
                     item,
-                    "payload.action must be a string (stop|merge|close|refresh|publish)",
+                    "payload.action must be a string (stop|retry|merge|close|refresh|publish)",
                 )
             })?;
             let owner_id = crate::resources::resolve_node_owner_id(
@@ -111,6 +111,20 @@ pub(super) async fn dispatch(
                             )
                         }
                     }
+                }
+            } else if action == "retry" {
+                // A failed publication may have no merge request yet. Validate
+                // the PR node itself before the published-PR resolution gate.
+                crate::execution::advancement::validate_pr_publish_retry(orch, &owner_id)
+                    .await
+                    .map_err(|error| build_failure(index, item, error))?;
+                if dry_run {
+                    format!("Would retry PR publication for {node_id} in place")
+                } else {
+                    crate::execution::advancement::retry_pr_publish(orch, &owner_id)
+                        .await
+                        .map_err(|error| build_failure(index, item, error))?;
+                    format!("Queued PR publication retry for {node_id} on the same node")
                 }
             } else {
                 let mr_context = crate::pr_data::actions::try_resolve_mr_context_for_job(
@@ -201,7 +215,7 @@ pub(super) async fn dispatch(
                             index,
                             item,
                             format!(
-                                "unknown node action '{other}'; expected stop|merge|close|refresh|publish"
+                                "unknown node action '{other}'; expected stop|retry|merge|close|refresh|publish"
                             ),
                         ))
                     }

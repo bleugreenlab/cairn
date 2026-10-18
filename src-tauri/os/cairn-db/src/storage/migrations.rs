@@ -201,6 +201,13 @@ macro_rules! shared_tail_retire_issue_dependencies {
     };
 }
 
+/// Publication history follows its action run in either database lineage.
+macro_rules! shared_tail_pr_publish_attempts {
+    () => {
+        migration!("0266_pr_publish_attempts")
+    };
+}
+
 /// cairn/4987: the base and incoming side a conflict session's committed
 /// resolution was resolved against, and the tip and destination of an
 /// outstanding take-committed-tip request. `jj_reconcile_items` is carried by
@@ -1425,6 +1432,7 @@ macro_rules! team_lineage {
             shared_tail_tenet_ruling_imports!(),
             shared_tail_tenet_evidence!(),
             shared_tail_tenet_evidence_measured_by!(),
+            shared_tail_pr_publish_attempts!(),
             // ── TEAM_TAIL ───────────────────────────────────────────────────
             // Intentionally empty for now. CAIRN-2277's team-side removal of
             // `projects.server_id` lives in the team snapshot instead of a
@@ -1694,6 +1702,7 @@ macro_rules! private_lineage {
             shared_tail_tenet_evidence!(),
             shared_tail_tenet_evidence_measured_by!(),
             private_command_outcome_history!(),
+            shared_tail_pr_publish_attempts!(),
         ]
     };
 }
@@ -2016,6 +2025,7 @@ pub const TABLE_SCOPES: &[(&str, TableScope)] = &[
     ("check_test_results", TableScope::ProjectScoped),
     ("checkpoint_command_cache", TableScope::ProjectScoped),
     ("checkpoint_runs", TableScope::ProjectScoped),
+    ("pr_publish_attempts", TableScope::ProjectScoped),
     // A code map is a projection of a commit, not a fact about the work. Any
     // replica holding that commit rebuilds it locally in one walk, so shipping
     // the payload would be pure transfer for nothing.
@@ -2585,6 +2595,10 @@ pub const PROJECT_REKEY_MANIFEST: &[RekeyTableManifest] = &[
     RekeyTableManifest {
         table: "checkpoint_runs",
         id_columns: &["id", "job_id"],
+    },
+    RekeyTableManifest {
+        table: "pr_publish_attempts",
+        id_columns: &["id", "action_run_id"],
     },
     RekeyTableManifest {
         table: "comments",
@@ -3404,6 +3418,7 @@ mod tests {
                 "tenet_evidence",
                 "tenet_evidence_measured_by",
                 "command_outcome_history",
+                "pr_publish_attempts",
             ]
         );
         assert_eq!(
@@ -6682,6 +6697,7 @@ mod tests {
                 "tenet_evidence",
                 // cairn/5064: evidence rows record how they were measured.
                 "tenet_evidence_measured_by",
+                "pr_publish_attempts",
             ]
         );
         assert_eq!(

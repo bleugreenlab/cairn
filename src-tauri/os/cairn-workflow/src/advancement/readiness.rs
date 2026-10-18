@@ -245,6 +245,7 @@ async fn find_ready_nodes_conn(
     let node_map = node_map(&all_nodes);
 
     let completed_sql = match completed_table {
+        // Existing rows retain their URI; the PR re-arm pass dispatches retries.
         "action_runs" => "SELECT recipe_node_id FROM action_runs WHERE execution_id = ?1",
         // Any row parks a condition, blocked ones included: advancing must not
         // re-spend a model call on every pass. Re-evaluation is explicit.
@@ -258,9 +259,9 @@ async fn find_ready_nodes_conn(
         }
     };
     let mut completed_rows = conn.query(completed_sql, (execution_id,)).await?;
-    let mut completed_node_ids = HashSet::new();
+    let mut dispatched_node_ids = HashSet::new();
     while let Some(row) = completed_rows.next().await? {
-        completed_node_ids.insert(row.text(0)?);
+        dispatched_node_ids.insert(row.text(0)?);
     }
 
     let mut ready_nodes = Vec::new();
@@ -268,7 +269,7 @@ async fn find_ready_nodes_conn(
         .iter()
         .filter(|node| node_types.contains(&node.node_type.as_str()))
     {
-        if completed_node_ids.contains(&node.id) {
+        if dispatched_node_ids.contains(&node.id) {
             continue;
         }
         if is_action_node_ready_with_snapshot_conn(

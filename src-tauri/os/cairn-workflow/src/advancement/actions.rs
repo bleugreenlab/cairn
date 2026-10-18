@@ -127,18 +127,30 @@ pub fn create_action_run(
 
     let now = chrono::Utc::now().timestamp() as i32;
     let action_run_id = ids::mint_child(execution_id);
+    let initial_pr_attempt = if node.node_type == "pr" {
+        Some(crate::pr_publish_attempts::prepare_initial_publish_attempt(
+            runtime,
+            &action_run_id,
+            execution_id,
+            &node.id,
+        )?)
+    } else {
+        None
+    };
     let execution_id_owned = execution_id.to_string();
     let db = runtime.database(WorkflowOwner::Execution(&execution_id_owned))?;
     let node_id = node.id.clone();
     let node_name = node.name.clone();
     let action_run_id_for_db = action_run_id.clone();
-    run_advancement_db(async move {
+    let initial_intent = initial_pr_attempt.as_ref().map(|a| a.id.clone());
+    let inserted = run_advancement_db(async move {
         db.write(|conn| {
             let execution_id = execution_id_owned.clone();
             let node_id = node_id.clone();
             let node_name = node_name.clone();
             let action_config_id = action_config_id.clone();
             let action_run_id = action_run_id_for_db.clone();
+            let initial_pr_attempt = initial_pr_attempt.clone();
             Box::pin(async move {
                 let mut execution_rows = conn
                     .query(
@@ -217,18 +229,35 @@ pub fn create_action_run(
                     ],
                 )
                 .await?;
+                if let Some(attempt) = initial_pr_attempt {
+                    crate::pr_publish_attempts::insert_attempt(conn,&attempt).await?;
+                }
                 Ok(())
             })
         })
         .await
         .map_err(|e| format!("Failed to insert action_run: {e}"))
-    })?;
+    });
+    if let Err(error) = inserted {
+        if let Some(intent) = initial_intent {
+            let runtime = runtime.clone();
+            if let Err(ack_error) = run_advancement_db(async move {
+                crate::pr_publish_attempts::finish_dispatch_intent(&runtime, &intent).await
+            }) {
+                log::warn!("Could not acknowledge unclaimed initial PR intent: {ack_error}");
+            }
+        }
+        return Err(error);
+    }
 
     let _ = runtime.emitter.emit(
         "db-change",
         serde_json::json!({"table": "action_runs", "action": "insert"}),
     );
 
+    if node.node_type == "pr" {
+        crate::pr_publish_attempts::capture_initial_publish_revision(runtime, &action_run_id);
+    }
     Ok(action_run_id)
 }
 
@@ -784,18 +813,27 @@ pub fn mark_action_run_failed(
     let log_action_run_id = action_run_id.clone();
     let log_error = error.clone();
     run_advancement_db(async move {
-        db.execute(
-            "UPDATE action_runs
-             SET status = 'failed',
-                 error_message = ?1,
-                 completed_at = ?2
-             WHERE id = ?3",
-            params![error.as_str(), now, action_run_id.as_str()],
-        )
-        .await
-        .map_err(|e| format!("Failed to update action_run: {e}"))
+        db.write(|conn| {
+            let (id,error) = (action_run_id.clone(), error.clone());
+            Box::pin(async move {
+                conn.execute(
+                    "UPDATE action_runs SET status='failed',error_message=?1,completed_at=?2 WHERE id=?3",
+                    params![error.as_str(),now,id.as_str()],
+                ).await?;
+                crate::pr_publish_attempts::settle_publish_attempt_conn(conn,&id,"failed",&error).await?;
+                Ok(())
+            })
+        }).await.map_err(|e|format!("Failed to update action_run: {e}"))
     })?;
 
+    let runtime_for_ack = runtime.clone();
+    let id_for_ack = log_action_run_id.clone();
+    if let Err(error) = run_advancement_db(async move {
+        crate::pr_publish_attempts::acknowledge_settled_dispatch(&runtime_for_ack, &id_for_ack)
+            .await
+    }) {
+        log::warn!("Could not acknowledge settled PR dispatch: {error}");
+    }
     log::error!("Action run {} failed: {}", log_action_run_id, log_error);
 
     let _ = runtime.emitter.emit(

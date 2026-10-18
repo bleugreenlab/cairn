@@ -92,6 +92,15 @@ impl WorkflowHost for CoreWorkflowHost {
     fn job_head(&self, job_id: &str) -> Result<String, String> {
         crate::execution::cache::get_job_logical_head_sha(&self.0, job_id)
     }
+    fn pr_publish_input_revision(&self, action_run_id: &str) -> Result<Option<String>, String> {
+        let orch = self.0.clone();
+        let id = action_run_id.to_owned();
+        run_advancement_db(async move {
+            let action =
+                crate::execution::actions::get_action_run_for_orchestrator(&orch, &id).await?;
+            crate::execution::actions::pr_publish_input_revision(&orch, &action).await
+        })
+    }
     async fn decide(
         &self,
         request: DecisionRequest,

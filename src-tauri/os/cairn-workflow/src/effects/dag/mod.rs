@@ -75,6 +75,12 @@ pub fn reduce_dag(
     // it is a cheap no-op on every other advance.
     crate::advancement::rearm_blocked_checkpoints(runtime, execution_id)?;
 
+    // Step 0b: Existing action rows are never readiness candidates. A revised
+    // failed PR claims its same row and explicitly dispatches the next attempt.
+    for action in crate::advancement::rearm_failed_pr_actions(runtime, execution_id)? {
+        effects.push(action.effect());
+    }
+
     // Step 1: Materialize pending delegated packets, then advance the DAG.
     expand_delegated_packets(runtime, &owning_db, execution_id)?;
     let ready_jobs = advance_execution_impl(runtime, execution_id)?;

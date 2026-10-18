@@ -26,6 +26,9 @@ mod snapshot_edit;
 mod snapshots;
 mod status;
 
+pub use crate::pr_publish_attempts::{
+    rearm_failed_pr_actions, retry_pr_publish, validate_pr_publish_retry, RearmedPrAction,
+};
 pub use actions::{
     advance_execution_with_actions, block_job, create_action_run, mark_action_run_failed,
     mark_job_failed, rearm_blocked_checkpoints, reevaluable_condition, reevaluate_condition,

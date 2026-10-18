@@ -9,8 +9,9 @@ use crate::orchestrator::Orchestrator;
 mod actions;
 mod recompute;
 pub use actions::{
-    advance_execution_with_actions, block_job, mark_job_failed, reevaluable_condition,
-    reevaluate_condition, rerun_checkpoint_job,
+    advance_execution_with_actions, block_job, mark_job_failed, rearm_failed_pr_actions,
+    reevaluable_condition, reevaluate_condition, replay_pr_publish, rerun_checkpoint_job,
+    retry_pr_publish, validate_pr_publish_retry,
 };
 pub(crate) use cairn_workflow::advancement::{
     cancel_job_conn, create_jobs_for_execution, create_jobs_for_execution_conn,
